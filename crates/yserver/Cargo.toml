@@ -1,0 +1,17 @@
+[package]
+name = "yserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yserver-core.workspace = true
+
+[[bin]]
+name = "ynest"
+path = "src/bin/ynest.rs"
+
+[[bin]]
+name = "yserver"
+path = "src/bin/yserver.rs"

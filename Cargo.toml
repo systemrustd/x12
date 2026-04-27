@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/yserver",
+    "crates/yserver-core",
+    "crates/yserver-protocol",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = ""
+
+[workspace.dependencies]
+yserver-core = { path = "crates/yserver-core" }
+yserver-protocol = { path = "crates/yserver-protocol" }
