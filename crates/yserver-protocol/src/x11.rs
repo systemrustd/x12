@@ -308,6 +308,84 @@ pub fn request_atom(body: &[u8]) -> AtomId {
     AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
 }
 
+pub fn create_window_ids(body: &[u8]) -> Option<(ResourceId, ResourceId)> {
+    Some((
+        ResourceId(read_u32_le(body.get(0..4)?)),
+        ResourceId(read_u32_le(body.get(4..8)?)),
+    ))
+}
+
+pub fn create_gc_id(body: &[u8]) -> Option<u32> {
+    Some(read_u32_le(body.get(0..4)?))
+}
+
+pub fn change_gc_id(body: &[u8]) -> Option<u32> {
+    Some(read_u32_le(body.get(0..4)?))
+}
+
+pub fn free_gc_id(body: &[u8]) -> Option<u32> {
+    Some(read_u32_le(body.get(0..4)?))
+}
+
+pub fn gc_foreground_from_create(body: &[u8]) -> Option<u32> {
+    let value_mask = read_u32_le(body.get(8..12)?);
+    gc_foreground_from_values(value_mask, body.get(12..)?)
+}
+
+pub fn gc_foreground_from_change(body: &[u8]) -> Option<u32> {
+    let value_mask = read_u32_le(body.get(4..8)?);
+    gc_foreground_from_values(value_mask, body.get(8..)?)
+}
+
+pub fn poly_fill_arc_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    arc_request_data(body)
+}
+
+pub fn poly_arc_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    arc_request_data(body)
+}
+
+pub fn poly_fill_rectangle_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    let gc_id = read_u32_le(body.get(4..8)?);
+    let rectangles = body.get(8..)?;
+    if rectangles.len() % 8 != 0 {
+        return None;
+    }
+    Some((gc_id, rectangles))
+}
+
+pub fn map_window_id(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn write_expose_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    window: ResourceId,
+) -> io::Result<()> {
+    let mut event = Vec::with_capacity(32);
+    event.push(12); // Expose
+    event.push(0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, 800);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, 600);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, 0); // count
+    event.extend_from_slice(&[0; 14]);
+    writer.write_all(&event)
+}
+
+fn arc_request_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    let gc_id = read_u32_le(body.get(4..8)?);
+    let arcs = body.get(8..)?;
+    if arcs.len() % 12 != 0 {
+        return None;
+    }
+    Some((gc_id, arcs))
+}
+
 pub fn query_colors_pixels(body: &[u8]) -> Vec<u32> {
     if body.len() <= 4 {
         return Vec::new();
@@ -317,6 +395,22 @@ pub fn query_colors_pixels(body: &[u8]) -> Vec<u32> {
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+fn gc_foreground_from_values(value_mask: u32, values: &[u8]) -> Option<u32> {
+    let mut offset = 0;
+    for bit in 0..32 {
+        if value_mask & (1 << bit) == 0 {
+            continue;
+        }
+
+        let value = read_u32_le(values.get(offset..offset + 4)?);
+        if bit == 2 {
+            return Some(value);
+        }
+        offset += 4;
+    }
+    None
 }
 
 pub fn query_extension_name(body: &[u8]) -> String {
@@ -609,15 +703,20 @@ pub fn write_query_pointer_reply(
     sequence: SequenceNumber,
     root: ResourceId,
     child: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    win_x: i16,
+    win_y: i16,
+    mask: u16,
 ) -> io::Result<()> {
     let mut reply = fixed_reply(sequence, 1, 0);
     write_u32(ClientByteOrder::LittleEndian, &mut reply, root.0);
     write_u32(ClientByteOrder::LittleEndian, &mut reply, child.0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, root_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, root_y);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, win_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, win_y);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, mask);
     reply.extend_from_slice(&[0; 6]);
     writer.write_all(&reply)
 }
@@ -788,6 +887,10 @@ fn read_u16(byte_order: ClientByteOrder, bytes: &[u8]) -> u16 {
         ClientByteOrder::LittleEndian => u16::from_le_bytes([bytes[0], bytes[1]]),
         ClientByteOrder::BigEndian => u16::from_be_bytes([bytes[0], bytes[1]]),
     }
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn write_u16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u16) {

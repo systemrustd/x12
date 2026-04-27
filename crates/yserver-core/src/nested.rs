@@ -4,6 +4,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use yserver_protocol::x11::{
@@ -34,26 +35,27 @@ pub fn run(display: u16) -> io::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     println!("ynest listening on DISPLAY=:{display}");
 
-    let mut host = match HostX11::open_from_env() {
+    let host = match HostX11::open_from_env() {
         Ok(host) => {
             println!("ynest host X11 container window: 0x{:x}", host.window_id());
-            Some(host)
+            Some(Arc::new(Mutex::new(host)))
         }
         Err(err) => {
             eprintln!("ynest: could not open host X11 window: {err}");
             None
         }
     };
-    if let Some(host) = host.as_mut() {
-        let _ = host.ping();
+    if let Some(host) = host.as_ref() {
+        let _ = host.lock().map(|mut host| host.ping());
     }
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let client_id = ClientId(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
+                let host = host.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(client_id, stream) {
+                    if let Err(err) = handle_client(client_id, stream, host) {
                         eprintln!("client {} disconnected: {err}", client_id.0);
                     }
                 });
@@ -65,7 +67,11 @@ pub fn run(display: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_client(client_id: ClientId, mut stream: UnixStream) -> io::Result<()> {
+fn handle_client(
+    client_id: ClientId,
+    mut stream: UnixStream,
+    host: Option<Arc<Mutex<HostX11>>>,
+) -> io::Result<()> {
     let setup = x11::read_setup_request(&mut stream)?;
     if setup.byte_order != ClientByteOrder::LittleEndian {
         x11::write_setup_failed(
@@ -127,14 +133,29 @@ fn handle_client(client_id: ClientId, mut stream: UnixStream) -> io::Result<()> 
             return Ok(());
         };
         sequence = sequence.next();
-        handle_request(client_id, &mut state, &mut stream, sequence, header, &body)?;
+        handle_request(
+            client_id,
+            &mut state,
+            host.as_ref(),
+            &mut stream,
+            sequence,
+            header,
+            &body,
+        )?;
     }
 }
 
 struct ClientState {
     atoms_by_name: HashMap<String, AtomId>,
     atom_names: HashMap<u32, String>,
+    window_children: HashMap<u32, Vec<ResourceId>>,
+    gcs: HashMap<u32, GuestGc>,
     next_atom_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestGc {
+    foreground: u32,
 }
 
 impl ClientState {
@@ -142,6 +163,8 @@ impl ClientState {
         Self {
             atoms_by_name: HashMap::new(),
             atom_names: HashMap::new(),
+            window_children: HashMap::new(),
+            gcs: HashMap::new(),
             next_atom_id: 69,
         }
     }
@@ -169,18 +192,66 @@ impl ClientState {
     fn atom_name(&self, atom: AtomId) -> Option<&str> {
         x11::well_known_atom_name(atom).or_else(|| self.atom_names.get(&atom.0).map(String::as_str))
     }
+
+    fn create_window(&mut self, body: &[u8]) {
+        let Some((window, parent)) = x11::create_window_ids(body) else {
+            return;
+        };
+        self.window_children
+            .entry(parent.0)
+            .or_default()
+            .push(window);
+    }
+
+    fn child_windows(&self, parent: ResourceId) -> &[ResourceId] {
+        self.window_children
+            .get(&parent.0)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn create_gc(&mut self, body: &[u8]) {
+        let Some(gc_id) = x11::create_gc_id(body) else {
+            return;
+        };
+        let foreground = x11::gc_foreground_from_create(body).unwrap_or(0);
+        self.gcs.insert(gc_id, GuestGc { foreground });
+    }
+
+    fn change_gc(&mut self, body: &[u8]) {
+        let Some(gc_id) = x11::change_gc_id(body) else {
+            return;
+        };
+        let gc = self.gcs.entry(gc_id).or_insert(GuestGc { foreground: 0 });
+        if let Some(foreground) = x11::gc_foreground_from_change(body) {
+            gc.foreground = foreground;
+        }
+    }
+
+    fn free_gc(&mut self, body: &[u8]) {
+        if let Some(gc_id) = x11::free_gc_id(body) {
+            self.gcs.remove(&gc_id);
+        }
+    }
+
+    fn gc_foreground(&self, gc_id: u32) -> u32 {
+        self.gcs.get(&gc_id).map_or(0, |gc| gc.foreground)
+    }
 }
 
 fn handle_request(
     client_id: ClientId,
     state: &mut ClientState,
+    host: Option<&Arc<Mutex<HostX11>>>,
     stream: &mut UnixStream,
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<()> {
     match header.opcode {
-        1 => log_void(client_id, sequence, "CreateWindow"),
+        1 => {
+            state.create_window(body);
+            log_void(client_id, sequence, "CreateWindow")
+        }
         2 => log_void(client_id, sequence, "ChangeWindowAttributes"),
         3 => {
             log_reply(client_id, sequence, "GetWindowAttributes");
@@ -188,8 +259,20 @@ fn handle_request(
         }
         4 => log_void(client_id, sequence, "DestroyWindow"),
         7 => log_void(client_id, sequence, "ReparentWindow"),
-        8 => log_void(client_id, sequence, "MapWindow"),
-        9 => log_void(client_id, sequence, "MapSubwindows"),
+        8 => {
+            if let Some(window) = x11::map_window_id(body) {
+                x11::write_expose_event(stream, sequence, window)?;
+            }
+            log_void(client_id, sequence, "MapWindow")
+        }
+        9 => {
+            if let Some(parent) = x11::map_window_id(body) {
+                for child in state.child_windows(parent) {
+                    x11::write_expose_event(stream, sequence, *child)?;
+                }
+            }
+            log_void(client_id, sequence, "MapSubwindows")
+        }
         10 => log_void(client_id, sequence, "UnmapWindow"),
         12 => log_void(client_id, sequence, "ConfigureWindow"),
         14 => {
@@ -248,7 +331,34 @@ fn handle_request(
         37 => log_void(client_id, sequence, "UngrabServer"),
         38 => {
             log_reply(client_id, sequence, "QueryPointer");
-            x11::write_query_pointer_reply(stream, sequence, ROOT_WINDOW, ROOT_WINDOW)
+            let pointer = host
+                .and_then(|host| host.lock().ok()?.query_pointer().ok())
+                .filter(|pointer| pointer.same_screen);
+            if let Some(pointer) = pointer {
+                x11::write_query_pointer_reply(
+                    stream,
+                    sequence,
+                    ROOT_WINDOW,
+                    ROOT_WINDOW,
+                    pointer.root_x,
+                    pointer.root_y,
+                    pointer.win_x,
+                    pointer.win_y,
+                    pointer.mask,
+                )
+            } else {
+                x11::write_query_pointer_reply(
+                    stream,
+                    sequence,
+                    ROOT_WINDOW,
+                    ROOT_WINDOW,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
         }
         40 => {
             log_reply(client_id, sequence, "TranslateCoordinates");
@@ -267,19 +377,65 @@ fn handle_request(
         46 => log_void(client_id, sequence, "CloseFont"),
         53 => log_void(client_id, sequence, "CreatePixmap"),
         54 => log_void(client_id, sequence, "FreePixmap"),
-        55 => log_void(client_id, sequence, "CreateGC"),
-        56 => log_void(client_id, sequence, "ChangeGC"),
-        60 => log_void(client_id, sequence, "FreeGC"),
-        61 => log_void(client_id, sequence, "ClearArea"),
+        55 => {
+            state.create_gc(body);
+            log_void(client_id, sequence, "CreateGC")
+        }
+        56 => {
+            state.change_gc(body);
+            log_void(client_id, sequence, "ChangeGC")
+        }
+        60 => {
+            state.free_gc(body);
+            log_void(client_id, sequence, "FreeGC")
+        }
+        61 => {
+            if let Some(host) = host {
+                if let Ok(mut host) = host.lock() {
+                    host.clear()?;
+                }
+            }
+            log_void(client_id, sequence, "ClearArea")
+        }
         62 => log_void(client_id, sequence, "CopyArea"),
         64 => log_void(client_id, sequence, "PolyPoint"),
         65 => log_void(client_id, sequence, "PolyLine"),
         66 => log_void(client_id, sequence, "PolySegment"),
         67 => log_void(client_id, sequence, "PolyRectangle"),
-        68 => log_void(client_id, sequence, "PolyArc"),
+        68 => {
+            if let Some((gc_id, arcs)) = x11::poly_arc_data(body) {
+                let foreground = state.gc_foreground(gc_id);
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.poly_arc(foreground, arcs)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PolyArc")
+        }
         69 => log_void(client_id, sequence, "FillPoly"),
-        70 => log_void(client_id, sequence, "PolyFillRectangle"),
-        71 => log_void(client_id, sequence, "PolyFillArc"),
+        70 => {
+            if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body) {
+                let foreground = state.gc_foreground(gc_id);
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.poly_fill_rectangle(foreground, rectangles)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PolyFillRectangle")
+        }
+        71 => {
+            if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body) {
+                let foreground = state.gc_foreground(gc_id);
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.poly_fill_arc(foreground, arcs)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PolyFillArc")
+        }
         72 => log_void(client_id, sequence, "PutImage"),
         76 => log_void(client_id, sequence, "ImageText8"),
         78 => log_void(client_id, sequence, "CreateColormap"),

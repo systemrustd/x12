@@ -9,6 +9,9 @@ const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 pub struct HostX11 {
     stream: UnixStream,
     window_id: u32,
+    gc_id: u32,
+    current_foreground: u32,
+    sequence: u16,
 }
 
 impl HostX11 {
@@ -28,11 +31,19 @@ impl HostX11 {
 
         let setup = read_setup_reply(&mut stream)?;
         let window_id = setup.resource_id_base;
+        let gc_id = setup.resource_id_base + 1;
         create_window(&mut stream, &setup, window_id)?;
+        create_gc(&mut stream, window_id, gc_id, setup.black_pixel)?;
         map_window(&mut stream, window_id)?;
         stream.flush()?;
 
-        Ok(Self { stream, window_id })
+        Ok(Self {
+            stream,
+            window_id,
+            gc_id,
+            current_foreground: setup.black_pixel,
+            sequence: 4,
+        })
     }
 
     pub fn window_id(&self) -> u32 {
@@ -40,8 +51,135 @@ impl HostX11 {
     }
 
     pub fn ping(&mut self) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
         self.stream.write_all(&[127, 0, 1, 0])
     }
+
+    pub fn query_pointer(&mut self) -> io::Result<PointerPosition> {
+        self.sequence = self.sequence.wrapping_add(1);
+
+        let mut out = Vec::new();
+        out.push(38);
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, self.window_id);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        let mut reply = [0; 32];
+        self.stream.read_exact(&mut reply)?;
+        if reply[0] != 1 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("expected QueryPointer reply, got response {}", reply[0]),
+            ));
+        }
+
+        Ok(PointerPosition {
+            same_screen: reply[1] != 0,
+            root_x: read_i16(&reply[16..18]),
+            root_y: read_i16(&reply[18..20]),
+            win_x: read_i16(&reply[20..22]),
+            win_y: read_i16(&reply[22..24]),
+            mask: read_u16(&reply[24..26]),
+        })
+    }
+
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(61);
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, self.window_id);
+        write_i16(&mut out, 0);
+        write_i16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn poly_fill_arc(&mut self, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+        self.draw_arcs(71, foreground, arcs)
+    }
+
+    pub fn poly_arc(&mut self, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+        self.draw_arcs(68, foreground, arcs)
+    }
+
+    pub fn poly_fill_rectangle(&mut self, foreground: u32, rectangles: &[u8]) -> io::Result<()> {
+        if rectangles.is_empty() {
+            return Ok(());
+        }
+        if self.current_foreground != foreground {
+            self.change_foreground(foreground)?;
+        }
+
+        let length_units = 3 + u16::try_from(rectangles.len() / 4).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "too many rectangles for one X11 request",
+            )
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(70);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(rectangles);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    fn draw_arcs(&mut self, opcode: u8, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+        if arcs.is_empty() {
+            return Ok(());
+        }
+        if self.current_foreground != foreground {
+            self.change_foreground(foreground)?;
+        }
+
+        let length_units = 3 + u16::try_from(arcs.len() / 4).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "too many arcs for one X11 request")
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(arcs);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    fn change_foreground(&mut self, foreground: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(56);
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, 1 << 2);
+        write_u32(&mut out, foreground);
+        self.stream.write_all(&out)?;
+        self.current_foreground = foreground;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PointerPosition {
+    pub same_screen: bool,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub win_x: i16,
+    pub win_y: i16,
+    pub mask: u16,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,6 +236,7 @@ struct HostSetup {
     root: u32,
     root_visual: u32,
     root_depth: u8,
+    white_pixel: u32,
     black_pixel: u32,
 }
 
@@ -179,6 +318,7 @@ fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
         root: read_u32(&screen[0..4]),
         root_visual: read_u32(&screen[32..36]),
         root_depth: screen[38],
+        white_pixel: read_u32(&screen[8..12]),
         black_pixel: read_u32(&screen[12..16]),
     })
 }
@@ -198,8 +338,25 @@ fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> 
     write_u16(&mut out, 1);
     write_u32(&mut out, setup.root_visual);
     write_u32(&mut out, (1 << 1) | (1 << 11));
-    write_u32(&mut out, setup.black_pixel);
+    write_u32(&mut out, setup.white_pixel);
     write_u32(&mut out, 0x0000_8000 | 0x0002_0000);
+    stream.write_all(&out)
+}
+
+fn create_gc(
+    stream: &mut UnixStream,
+    drawable: u32,
+    gc_id: u32,
+    foreground: u32,
+) -> io::Result<()> {
+    let mut out = Vec::new();
+    out.push(55);
+    out.push(0);
+    write_u16(&mut out, 5);
+    write_u32(&mut out, gc_id);
+    write_u32(&mut out, drawable);
+    write_u32(&mut out, 1 << 2);
+    write_u32(&mut out, foreground);
     stream.write_all(&out)
 }
 
@@ -229,6 +386,10 @@ fn read_record_field(bytes: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
 
 fn read_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn read_i16(bytes: &[u8]) -> i16 {
+    i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
 fn read_u32(bytes: &[u8]) -> u32 {
