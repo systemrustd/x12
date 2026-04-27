@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use yserver_protocol::x11::{
     ChangeWindowAttributesRequest, ConfigureWindowRequest, CreateGcRequest, CreatePixmapRequest,
-    CreateWindowRequest, GcChange, OpenFontRequest, ResourceId,
+    CreateWindowRequest, FontMetrics, GcChange, ResourceId,
 };
 
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
@@ -184,6 +184,7 @@ impl ResourceTable {
                 foreground: request.foreground.unwrap_or(0),
                 background: request.background.unwrap_or(0x00ff_ffff),
                 line_width: request.line_width.unwrap_or(0),
+                font: request.font,
             },
         );
     }
@@ -195,6 +196,7 @@ impl ResourceTable {
             foreground: 0,
             background: 0x00ff_ffff,
             line_width: 0,
+            font: None,
         });
         if let Some(foreground) = request.foreground {
             gc.foreground = foreground;
@@ -204,6 +206,9 @@ impl ResourceTable {
         }
         if let Some(line_width) = request.line_width {
             gc.line_width = line_width;
+        }
+        if let Some(font) = request.font {
+            gc.font = Some(font);
         }
     }
 
@@ -223,26 +228,39 @@ impl ResourceTable {
         self.gc(id).map_or(0x00ff_ffff, |gc| gc.background)
     }
 
-    pub fn open_font(&mut self, request: OpenFontRequest) {
+    pub fn install_font(
+        &mut self,
+        id: ResourceId,
+        name: String,
+        host_xid: u32,
+        metrics: FontMetrics,
+    ) {
         self.fonts.insert(
-            request.font.0,
+            id.0,
             Font {
-                id: request.font,
-                name: request.name,
-                ascent: 10,
-                descent: 3,
-                min_bounds_width: 6,
-                max_bounds_width: 8,
+                id,
+                name,
+                host_xid,
+                metrics,
             },
         );
     }
 
-    pub fn close_font(&mut self, id: ResourceId) {
-        self.fonts.remove(&id.0);
+    pub fn close_font(&mut self, id: ResourceId) -> Option<Font> {
+        self.fonts.remove(&id.0)
     }
 
     pub fn font(&self, id: ResourceId) -> Option<&Font> {
         self.fonts.get(&id.0)
+    }
+
+    /// Resolve a FONTABLE id (either a Font or a GC carrying a font) to a `&Font`.
+    pub fn fontable(&self, id: ResourceId) -> Option<&Font> {
+        if let Some(font) = self.fonts.get(&id.0) {
+            return Some(font);
+        }
+        let gc_font = self.gcs.get(&id.0).and_then(|gc| gc.font)?;
+        self.fonts.get(&gc_font.0)
     }
 
     pub fn create_glyph_cursor(&mut self, id: ResourceId) {
@@ -358,16 +376,15 @@ pub struct Gc {
     pub foreground: u32,
     pub background: u32,
     pub line_width: u16,
+    pub font: Option<ResourceId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Font {
     pub id: ResourceId,
     pub name: String,
-    pub ascent: i16,
-    pub descent: i16,
-    pub min_bounds_width: i16,
-    pub max_bounds_width: i16,
+    pub host_xid: u32,
+    pub metrics: FontMetrics,
 }
 
 #[derive(Clone, Debug)]

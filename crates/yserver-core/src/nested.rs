@@ -1,19 +1,24 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::{self, ErrorKind};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    collections::HashMap,
+    fs,
+    io::{self, ErrorKind, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, AtomicU32, Ordering},
+    },
+    thread,
+};
 
+use log::{debug, error, info, warn};
 use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
 };
 
-use crate::host_x11::{HostKeyboard, HostX11};
-use crate::resources::{
-    Font, MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ResourceTable, Window,
+use crate::{
+    host_x11::{HostEvent, HostKeyboard, HostX11},
+    resources::{MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ResourceTable, Window},
 };
 
 const RESOURCE_ID_BASE: u32 = 0x0020_0000;
@@ -33,15 +38,15 @@ pub fn run(display: u16) -> io::Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
-    println!("ynest listening on DISPLAY=:{display}");
+    info!("ynest listening on DISPLAY=:{display}");
 
     let host = match HostX11::open_from_env() {
         Ok(host) => {
-            println!("ynest host X11 container window: 0x{:x}", host.window_id());
+            info!("host X11 container window: 0x{:x}", host.window_id());
             Some(Arc::new(Mutex::new(host)))
         }
         Err(err) => {
-            eprintln!("ynest: could not open host X11 window: {err}");
+            error!("could not open host X11 window: {err}");
             None
         }
     };
@@ -52,19 +57,22 @@ pub fn run(display: u16) -> io::Result<()> {
         .as_ref()
         .and_then(|host| host.lock().ok().map(|host| host.window_id()));
 
+    if let Some(window_id) = host_window_id {
+        spawn_window_close_watcher(window_id);
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let client_id = ClientId(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
                 let host = host.clone();
-                let host_window_id = host_window_id;
                 thread::spawn(move || {
                     if let Err(err) = handle_client(client_id, stream, host, host_window_id) {
-                        eprintln!("client {} disconnected: {err}", client_id.0);
+                        info!("client {} disconnected: {err}", client_id.0);
                     }
                 });
             }
-            Err(err) => eprintln!("accept failed: {err}"),
+            Err(err) => error!("accept failed: {err}"),
         }
     }
 
@@ -87,7 +95,7 @@ fn handle_client(
         return Ok(());
     }
 
-    println!(
+    info!(
         "client {} setup: protocol {}.{}, auth_name_len={}, auth_data_len={}",
         client_id.0,
         setup.protocol_major,
@@ -144,7 +152,7 @@ fn handle_client(
                 focused_window.clone(),
                 last_sequence.clone(),
             ),
-            Err(err) => eprintln!("client {} keyboard forwarding disabled: {err}", client_id.0),
+            Err(err) => warn!("client {} keyboard forwarding disabled: {err}", client_id.0),
         }
     }
 
@@ -163,13 +171,40 @@ fn handle_client(
             client_id,
             &mut state,
             host.as_ref(),
-            &mut *writer,
+            &mut writer,
             &focused_window,
             sequence,
             header,
             &body,
         )?;
     }
+}
+
+fn spawn_window_close_watcher(window_id: u32) {
+    thread::spawn(move || {
+        debug!("window-close watcher starting for 0x{window_id:x}");
+        let mut watcher = match HostKeyboard::open_from_env(window_id) {
+            Ok(w) => w,
+            Err(err) => {
+                error!("could not start window-close watcher: {err}");
+                return;
+            }
+        };
+        debug!("window-close watcher ready");
+        loop {
+            match watcher.read_event() {
+                Ok(HostEvent::Key(_)) => {}
+                Ok(HostEvent::Closed) => {
+                    info!("host window closed, exiting");
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    info!("host connection lost ({err}), exiting");
+                    std::process::exit(0);
+                }
+            }
+        }
+    });
 }
 
 fn spawn_keyboard_forwarder(
@@ -181,11 +216,15 @@ fn spawn_keyboard_forwarder(
 ) {
     thread::spawn(move || {
         loop {
-            let event = match keyboard.read_key_event() {
-                Ok(event) => event,
+            let event = match keyboard.read_event() {
+                Ok(HostEvent::Key(event)) => event,
+                Ok(HostEvent::Closed) => {
+                    info!("host window closed, exiting");
+                    std::process::exit(0);
+                }
                 Err(err) => {
-                    eprintln!("client {} keyboard forwarding stopped: {err}", client_id.0);
-                    return;
+                    info!("host connection lost ({err}), exiting");
+                    std::process::exit(0);
                 }
             };
             let focus = focused_window
@@ -196,7 +235,7 @@ fn spawn_keyboard_forwarder(
                 continue;
             }
 
-            println!(
+            debug!(
                 "client {} key {} {} -> 0x{:x}",
                 client_id.0,
                 if event.pressed { "press" } else { "release" },
@@ -222,7 +261,7 @@ fn spawn_keyboard_forwarder(
                     state: event.state & 0x004d,
                 },
             ) {
-                eprintln!("client {} keyboard forwarding stopped: {err}", client_id.0);
+                warn!("client {} keyboard forwarding stopped: {err}", client_id.0);
                 return;
             }
         }
@@ -267,7 +306,7 @@ fn focus_if_window_wants_keys(
         window.map_state == MapState::Viewable
             && window.event_mask & (KEY_PRESS_MASK | KEY_RELEASE_MASK) != 0
     }) {
-        println!("focus key window 0x{:x}", window.0);
+        debug!("focus key window 0x{:x}", window.0);
         set_focused_window(focused_window, stream, sequence, window)?;
     }
     Ok(())
@@ -327,6 +366,7 @@ impl ClientState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     client_id: ClientId,
     state: &mut ClientState,
@@ -340,7 +380,7 @@ fn handle_request(
     match header.opcode {
         1 => {
             if let Some(request) = x11::create_window_request(header.data, body) {
-                println!(
+                debug!(
                     "client {} create window 0x{:x} parent=0x{:x} mask=0x{:x}",
                     client_id.0,
                     request.window.0,
@@ -354,7 +394,7 @@ fn handle_request(
         2 => {
             if let Some(request) = x11::change_window_attributes_request(body) {
                 if let Some(event_mask) = request.event_mask {
-                    println!(
+                    debug!(
                         "client {} attrs window 0x{:x} mask=0x{:x}",
                         client_id.0, request.window.0, event_mask
                     );
@@ -433,18 +473,18 @@ fn handle_request(
             log_void(client_id, sequence, "UnmapWindow")
         }
         12 => {
-            if let Some(request) = x11::configure_window_request(body) {
-                if let Some(window_state) = state.resources.configure_window(request) {
-                    let geometry = window_geometry(window_state);
-                    x11::write_configure_notify_event(
-                        stream,
-                        sequence,
-                        window_state.id,
-                        window_state.id,
-                        geometry,
-                        window_state.override_redirect,
-                    )?;
-                }
+            if let Some(request) = x11::configure_window_request(body)
+                && let Some(window_state) = state.resources.configure_window(request)
+            {
+                let geometry = window_geometry(window_state);
+                x11::write_configure_notify_event(
+                    stream,
+                    sequence,
+                    window_state.id,
+                    window_state.id,
+                    geometry,
+                    window_state.override_redirect,
+                )?;
             }
             log_void(client_id, sequence, "ConfigureWindow")
         }
@@ -485,7 +525,7 @@ fn handle_request(
         16 => {
             let name = x11::intern_atom_name(body);
             let atom = state.intern_atom(&name, header.data != 0);
-            println!(
+            debug!(
                 "client {} #{} InternAtom {:?} -> {}",
                 client_id.0, sequence.0, name, atom.0
             );
@@ -494,7 +534,7 @@ fn handle_request(
         17 => {
             let atom = x11::request_atom(body);
             let name = state.atom_name(atom).unwrap_or("UNKNOWN");
-            println!(
+            debug!(
                 "client {} #{} GetAtomName {} -> {:?}",
                 client_id.0, sequence.0, atom.0, name
             );
@@ -533,31 +573,24 @@ fn handle_request(
             let pointer = host
                 .and_then(|host| host.lock().ok()?.query_pointer().ok())
                 .filter(|pointer| pointer.same_screen);
-            if let Some(pointer) = pointer {
-                x11::write_query_pointer_reply(
-                    stream,
-                    sequence,
-                    ROOT_WINDOW,
-                    ROOT_WINDOW,
-                    pointer.root_x,
-                    pointer.root_y,
-                    pointer.win_x,
-                    pointer.win_y,
-                    pointer.mask,
-                )
+            let reply_data = if let Some(pointer) = pointer {
+                x11::QueryPointerReply {
+                    root: ROOT_WINDOW,
+                    child: ROOT_WINDOW,
+                    root_x: pointer.root_x,
+                    root_y: pointer.root_y,
+                    win_x: pointer.win_x,
+                    win_y: pointer.win_y,
+                    mask: pointer.mask,
+                }
             } else {
-                x11::write_query_pointer_reply(
-                    stream,
-                    sequence,
-                    ROOT_WINDOW,
-                    ROOT_WINDOW,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )
-            }
+                x11::QueryPointerReply {
+                    root: ROOT_WINDOW,
+                    child: ROOT_WINDOW,
+                    ..Default::default()
+                }
+            };
+            x11::write_query_pointer_reply(stream, sequence, reply_data)
         }
         40 => {
             log_reply(client_id, sequence, "TranslateCoordinates");
@@ -583,29 +616,91 @@ fn handle_request(
         }
         45 => {
             if let Some(request) = x11::open_font_request(body) {
-                println!(
+                debug!(
                     "client {} #{} OpenFont {:?}",
                     client_id.0, sequence.0, request.name
                 );
-                state.resources.open_font(request);
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    match host.open_font(&request.name) {
+                        Ok((host_xid, metrics)) => {
+                            state.resources.install_font(
+                                request.font,
+                                request.name,
+                                host_xid,
+                                metrics,
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                "client {} OpenFont {:?} failed on host: {err}",
+                                client_id.0, request.name
+                            );
+                        }
+                    }
+                }
                 Ok(())
             } else {
                 log_void(client_id, sequence, "OpenFont")
             }
         }
         46 => {
-            if let Some(font) = x11::free_resource_id(body) {
-                state.resources.close_font(font);
+            if let Some(font) = x11::free_resource_id(body)
+                && let Some(removed) = state.resources.close_font(font)
+                && let Some(host) = host
+                && let Ok(mut host) = host.lock()
+            {
+                let _ = host.close_font(removed.host_xid);
             }
             log_void(client_id, sequence, "CloseFont")
         }
         47 => {
             log_reply(client_id, sequence, "QueryFont");
-            let info = x11::drawable_request_id(body)
-                .and_then(|id| state.resources.font(id))
-                .map(font_info)
-                .unwrap_or_else(default_font_info);
-            x11::write_query_font_reply(stream, sequence, info)
+            let metrics = x11::drawable_request_id(body)
+                .and_then(|id| state.resources.fontable(id))
+                .map(|font| font.metrics.clone())
+                .unwrap_or_default();
+            x11::write_query_font_reply(stream, sequence, &metrics)
+        }
+        48 => {
+            log_reply(client_id, sequence, "QueryTextExtents");
+            let extents = x11::query_text_extents_request(header.data, body)
+                .and_then(|req| {
+                    state
+                        .resources
+                        .fontable(req.fontable)
+                        .map(|font| font.metrics.text_extents(&req.chars))
+                })
+                .unwrap_or_default();
+            x11::write_query_text_extents_reply(stream, sequence, extents)
+        }
+        49 => {
+            log_reply(client_id, sequence, "ListFonts");
+            if let Some(request) = x11::list_fonts_request(body)
+                && let Some(host) = host
+                && let Ok(mut host) = host.lock()
+                && let Ok(mut reply) = host.list_fonts_proxy(request.max_names, &request.pattern)
+            {
+                rewrite_reply_sequence(&mut reply, sequence);
+                stream.write_all(&reply)?;
+            }
+            Ok(())
+        }
+        50 => {
+            log_reply(client_id, sequence, "ListFontsWithInfo");
+            if let Some(request) = x11::list_fonts_request(body)
+                && let Some(host) = host
+                && let Ok(mut host) = host.lock()
+                && let Ok(replies) =
+                    host.list_fonts_with_info_proxy(request.max_names, &request.pattern)
+            {
+                for mut reply in replies {
+                    rewrite_reply_sequence(&mut reply, sequence);
+                    stream.write_all(&reply)?;
+                }
+            }
+            Ok(())
         }
         53 => {
             if let Some(request) = x11::create_pixmap_request(header.data, body) {
@@ -639,23 +734,23 @@ fn handle_request(
             log_void(client_id, sequence, "FreeGC")
         }
         61 => {
-            if let Some(request) = x11::clear_area_request(body) {
-                if let Some(window) = state.resources.window(request.window) {
-                    let width = clear_extent(request.width, request.x, window.width);
-                    let height = clear_extent(request.height, request.y, window.height);
-                    if width != 0
-                        && height != 0
-                        && let Some(host) = host
-                        && let Ok(mut host) = host.lock()
-                    {
-                        host.fill_rectangle(
-                            window.background_pixel,
-                            request.x,
-                            request.y,
-                            width,
-                            height,
-                        )?;
-                    }
+            if let Some(request) = x11::clear_area_request(body)
+                && let Some(window) = state.resources.window(request.window)
+            {
+                let width = clear_extent(request.width, request.x, window.width);
+                let height = clear_extent(request.height, request.y, window.height);
+                if width != 0
+                    && height != 0
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.fill_rectangle(
+                        window.background_pixel,
+                        request.x,
+                        request.y,
+                        width,
+                        height,
+                    )?;
                 }
             }
             log_void(client_id, sequence, "ClearArea")
@@ -665,10 +760,10 @@ fn handle_request(
         65 => {
             if let Some((gc_id, points)) = x11::poly_line_data(body) {
                 let foreground = state.resources.gc_foreground(ResourceId(gc_id));
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.poly_line(foreground, header.data, points)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.poly_line(foreground, header.data, points)?;
                 }
             }
             log_void(client_id, sequence, "PolyLine")
@@ -678,10 +773,10 @@ fn handle_request(
         68 => {
             if let Some((gc_id, arcs)) = x11::poly_arc_data(body) {
                 let foreground = state.resources.gc_foreground(ResourceId(gc_id));
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.poly_arc(foreground, arcs)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.poly_arc(foreground, arcs)?;
                 }
             }
             log_void(client_id, sequence, "PolyArc")
@@ -690,10 +785,10 @@ fn handle_request(
         70 => {
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body) {
                 let foreground = state.resources.gc_foreground(ResourceId(gc_id));
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.poly_fill_rectangle(foreground, rectangles)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.poly_fill_rectangle(foreground, rectangles)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillRectangle")
@@ -701,10 +796,10 @@ fn handle_request(
         71 => {
             if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body) {
                 let foreground = state.resources.gc_foreground(ResourceId(gc_id));
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.poly_fill_arc(foreground, arcs)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.poly_fill_arc(foreground, arcs)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillArc")
@@ -713,25 +808,25 @@ fn handle_request(
         74 => {
             if let Some((_drawable, gc_id, text_body)) = x11::poly_text_data(body) {
                 let foreground = state.resources.gc_foreground(ResourceId(gc_id));
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.poly_text8(foreground, text_body)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.poly_text8(foreground, text_body)?;
                 }
             }
             log_void(client_id, sequence, "PolyText8")
         }
         76 => {
             if let Some((drawable, gc_id, text_body)) = x11::image_text8_data(body) {
-                println!("focus text drawable 0x{drawable:x}");
+                debug!("focus text drawable 0x{drawable:x}");
                 set_focused_window(focused_window, stream, sequence, ResourceId(drawable))?;
                 let gc = ResourceId(gc_id);
                 let foreground = state.resources.gc_foreground(gc);
                 let background = state.resources.gc_background(gc);
-                if let Some(host) = host {
-                    if let Ok(mut host) = host.lock() {
-                        host.image_text8(foreground, background, header.data, text_body)?;
-                    }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.image_text8(foreground, background, header.data, text_body)?;
                 }
             }
             log_void(client_id, sequence, "ImageText8")
@@ -745,7 +840,7 @@ fn handle_request(
         85 => {
             let name = x11::alloc_named_color_name(body);
             let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
-                println!(
+                debug!(
                     "client {} #{} AllocNamedColor unknown name {:?} -> fallback gray",
                     client_id.0, sequence.0, name
                 );
@@ -755,7 +850,7 @@ fn handle_request(
                     blue: 0xc0c0,
                 }
             });
-            println!(
+            debug!(
                 "client {} #{} AllocNamedColor {:?}",
                 client_id.0, sequence.0, name
             );
@@ -763,7 +858,7 @@ fn handle_request(
         }
         91 => {
             let pixels = x11::query_colors_pixels(body);
-            println!(
+            debug!(
                 "client {} #{} QueryColors {} pixels",
                 client_id.0,
                 sequence.0,
@@ -774,7 +869,7 @@ fn handle_request(
         92 => {
             let name = x11::alloc_named_color_name(body);
             let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
-                println!(
+                debug!(
                     "client {} #{} LookupColor unknown name {:?} -> fallback gray",
                     client_id.0, sequence.0, name
                 );
@@ -784,7 +879,7 @@ fn handle_request(
                     blue: 0xc0c0,
                 }
             });
-            println!(
+            debug!(
                 "client {} #{} LookupColor {:?}",
                 client_id.0, sequence.0, name
             );
@@ -805,7 +900,7 @@ fn handle_request(
         96 => log_void(client_id, sequence, "RecolorCursor"),
         98 => {
             let name = x11::query_extension_name(body);
-            println!(
+            debug!(
                 "client {} #{} QueryExtension {:?} -> absent",
                 client_id.0, sequence.0, name
             );
@@ -844,7 +939,7 @@ fn handle_request(
         }
         127 => log_void(client_id, sequence, "NoOperation"),
         opcode => {
-            println!(
+            debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
                 client_id.0,
                 sequence.0,
@@ -856,13 +951,21 @@ fn handle_request(
     }
 }
 
+fn rewrite_reply_sequence(reply: &mut [u8], sequence: SequenceNumber) {
+    if reply.len() >= 4 {
+        let bytes = sequence.0.to_le_bytes();
+        reply[2] = bytes[0];
+        reply[3] = bytes[1];
+    }
+}
+
 fn log_void(client_id: ClientId, sequence: SequenceNumber, name: &str) -> io::Result<()> {
-    println!("client {} #{} {name}", client_id.0, sequence.0);
+    debug!("client {} #{} {name}", client_id.0, sequence.0);
     Ok(())
 }
 
 fn log_reply(client_id: ClientId, sequence: SequenceNumber, name: &str) {
-    println!("client {} #{} {name}", client_id.0, sequence.0);
+    debug!("client {} #{} {name}", client_id.0, sequence.0);
 }
 
 fn window_attributes(window: Option<&Window>) -> x11::WindowAttributes {
@@ -906,23 +1009,5 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
         height: pixmap.height,
         border_width: 0,
         depth: pixmap.depth,
-    }
-}
-
-fn font_info(font: &Font) -> x11::FontInfo {
-    x11::FontInfo {
-        ascent: font.ascent,
-        descent: font.descent,
-        min_bounds_width: font.min_bounds_width,
-        max_bounds_width: font.max_bounds_width,
-    }
-}
-
-fn default_font_info() -> x11::FontInfo {
-    x11::FontInfo {
-        ascent: 10,
-        descent: 3,
-        min_bounds_width: 6,
-        max_bounds_width: 8,
     }
 }

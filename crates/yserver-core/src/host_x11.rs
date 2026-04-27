@@ -1,8 +1,11 @@
-use std::env;
-use std::fs;
-use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::{
+    env, fs,
+    io::{self, ErrorKind, Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+};
+
+use yserver_protocol::x11::{self, FontMetrics};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 
@@ -13,6 +16,7 @@ pub struct HostX11 {
     current_foreground: u32,
     current_background: u32,
     sequence: u16,
+    next_xid: u32,
 }
 
 pub struct HostKeyboard {
@@ -46,7 +50,109 @@ impl HostX11 {
             current_foreground: setup.black_pixel,
             current_background: setup.white_pixel,
             sequence: 5,
+            next_xid: setup.resource_id_base + 3,
         })
+    }
+
+    fn allocate_xid(&mut self) -> u32 {
+        let xid = self.next_xid;
+        self.next_xid = self.next_xid.wrapping_add(1);
+        xid
+    }
+
+    pub fn open_font(&mut self, name: &str) -> io::Result<(u32, FontMetrics)> {
+        let host_xid = self.allocate_xid();
+        let open_seq = self.sequence;
+        write_open_font(&mut self.stream, host_xid, name.as_bytes())?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let query_seq = self.sequence;
+        write_query_font(&mut self.stream, host_xid)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.flush()?;
+
+        // OpenFont yields no response on success and one error on failure.
+        // QueryFont always yields exactly one response (reply or error).
+        // Drain by sequence to keep the host stream aligned.
+        let mut open_error: Option<u8> = None;
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == open_seq && resp.bytes[0] == 0 {
+                open_error = Some(resp.bytes[1]);
+                continue;
+            }
+            if resp.sequence == query_seq {
+                if resp.bytes[0] == 0 {
+                    let code = open_error.unwrap_or(resp.bytes[1]);
+                    return Err(io::Error::other(format!(
+                        "host OpenFont {name:?} failed (error {code})"
+                    )));
+                }
+                if let Some(code) = open_error {
+                    return Err(io::Error::other(format!(
+                        "host OpenFont {name:?} failed (error {code})"
+                    )));
+                }
+                let metrics = x11::parse_query_font_reply(&resp.bytes[8..]).ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        "could not parse host QueryFont reply",
+                    )
+                })?;
+                return Ok((host_xid, metrics));
+            }
+        }
+    }
+
+    pub fn close_font(&mut self, host_xid: u32) -> io::Result<()> {
+        let mut out = Vec::new();
+        out.push(46);
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    /// Send a `ListFonts` request to the host and return the full reply
+    /// bytes (including the 32-byte standard reply header).
+    pub fn list_fonts_proxy(&mut self, max_names: u16, pattern: &str) -> io::Result<Vec<u8>> {
+        let target = self.sequence;
+        write_list_fonts(&mut self.stream, 49, max_names, pattern.as_bytes())?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.flush()?;
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == target {
+                return Ok(resp.bytes);
+            }
+        }
+    }
+
+    /// Send a `ListFontsWithInfo` request and return all replies (one per
+    /// match plus the trailing sentinel reply with name length 0).
+    pub fn list_fonts_with_info_proxy(
+        &mut self,
+        max_names: u16,
+        pattern: &str,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let target = self.sequence;
+        write_list_fonts(&mut self.stream, 50, max_names, pattern.as_bytes())?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.flush()?;
+
+        let mut replies = Vec::new();
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence != target {
+                continue;
+            }
+            let name_len = resp.bytes[1];
+            replies.push(resp.bytes);
+            if name_len == 0 || replies.last().is_some_and(|r| r[0] == 0) {
+                return Ok(replies);
+            }
+        }
     }
 
     pub fn window_id(&self) -> u32 {
@@ -313,27 +419,35 @@ impl HostKeyboard {
         Ok(Self { stream })
     }
 
-    pub fn read_key_event(&mut self) -> io::Result<HostKeyEvent> {
+    pub fn read_event(&mut self) -> io::Result<HostEvent> {
         loop {
             let mut event = [0; 32];
             self.stream.read_exact(&mut event)?;
             let event_type = event[0] & 0x7f;
-            if event_type != 2 && event_type != 3 {
-                continue;
+            match event_type {
+                2 | 3 => {
+                    return Ok(HostEvent::Key(HostKeyEvent {
+                        pressed: event_type == 2,
+                        keycode: event[1],
+                        time: read_u32(&event[4..8]),
+                        root_x: read_i16(&event[20..22]),
+                        root_y: read_i16(&event[22..24]),
+                        event_x: read_i16(&event[24..26]),
+                        event_y: read_i16(&event[26..28]),
+                        state: read_u16(&event[28..30]),
+                    }));
+                }
+                17 => return Ok(HostEvent::Closed),
+                _ => continue,
             }
-
-            return Ok(HostKeyEvent {
-                pressed: event_type == 2,
-                keycode: event[1],
-                time: read_u32(&event[4..8]),
-                root_x: read_i16(&event[20..22]),
-                root_y: read_i16(&event[22..24]),
-                event_x: read_i16(&event[24..26]),
-                event_y: read_i16(&event[26..28]),
-                state: read_u16(&event[28..30]),
-            });
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum HostEvent {
+    Key(HostKeyEvent),
+    Closed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -526,7 +640,8 @@ fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result
     write_u16(&mut out, 4);
     write_u32(&mut out, window_id);
     write_u32(&mut out, 1 << 11);
-    write_u32(&mut out, (1 << 0) | (1 << 1));
+    // KeyPress | KeyRelease | StructureNotify
+    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17));
     stream.write_all(&out)
 }
 
@@ -625,7 +740,75 @@ fn padded_len(len: usize) -> usize {
 }
 
 fn pad4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
+}
+
+fn write_open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
+    open_font(stream, font_id, name)
+}
+
+fn write_query_font(stream: &mut UnixStream, font_id: u32) -> io::Result<()> {
+    let mut out = Vec::new();
+    out.push(47);
+    out.push(0);
+    write_u16(&mut out, 2);
+    write_u32(&mut out, font_id);
+    stream.write_all(&out)
+}
+
+fn write_list_fonts(
+    stream: &mut UnixStream,
+    opcode: u8,
+    max_names: u16,
+    pattern: &[u8],
+) -> io::Result<()> {
+    let padded = padded_len(pattern.len());
+    let length_units = 2 + u16::try_from(padded / 4)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?;
+
+    let mut out = Vec::new();
+    out.push(opcode);
+    out.push(0);
+    write_u16(&mut out, length_units);
+    write_u16(&mut out, max_names);
+    write_u16(
+        &mut out,
+        u16::try_from(pattern.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?,
+    );
+    out.extend_from_slice(pattern);
+    out.resize(8 + padded, 0);
+    stream.write_all(&out)
+}
+
+struct HostResponse {
+    sequence: u16,
+    bytes: Vec<u8>,
+}
+
+fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse> {
+    let mut header = [0u8; 32];
+    loop {
+        stream.read_exact(&mut header)?;
+        match header[0] {
+            0 | 1 => break,
+            _ => continue,
+        }
+    }
+    let sequence = u16::from_le_bytes([header[2], header[3]]);
+    let extra = if header[0] == 1 {
+        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4
+    } else {
+        0
+    };
+    let mut bytes = Vec::with_capacity(32 + extra);
+    bytes.extend_from_slice(&header);
+    if extra > 0 {
+        let mut tail = vec![0u8; extra];
+        stream.read_exact(&mut tail)?;
+        bytes.extend_from_slice(&tail);
+    }
+    Ok(HostResponse { sequence, bytes })
 }

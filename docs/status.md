@@ -31,15 +31,16 @@ resource IDs, atoms, properties, windows, basic events, and errors. Run
 
 In rough priority order:
 
-- [ ] **Real font metrics in `QueryFont`.** `QueryFont` currently returns
-      zero per-character `CharInfo` entries and hardcoded ascent/descent.
-      Source metrics from the host's `fixed` font and emit a real
-      `CharInfo` array. Fixes xterm cell-width / right-prompt alignment.
-- [ ] **`QueryTextExtents` (opcode 48).** Currently returns
-      "unsupported opcode". xterm uses it to measure text it can't deduce
-      from per-char metrics.
-- [ ] **`ListFonts` / `ListFontsWithInfo` (opcode 49).** At minimum
-      return `fixed` so xterm font discovery doesn't fall over.
+- [x] **Real font metrics in `QueryFont`.** `OpenFont` now opens the
+      same font on the host server, issues `QueryFont`, and caches the
+      full `FontMetrics` (header + properties + per-glyph `CharInfo`).
+      `QueryFont` replies with the cached data. `FONTABLE` resolution
+      handles both Font and GC ids (GC carries a `font` attribute).
+- [x] **`QueryTextExtents` (opcode 48).** Computed locally from the
+      cached `CharInfo` array — no host round trip per call.
+- [x] **`ListFonts` / `ListFontsWithInfo` (opcode 49 / 50).** Proxied
+      to the host. `ListFontsWithInfo` forwards each per-font reply
+      until the trailing sentinel reply.
 - [ ] **Property storage.** `ChangeProperty`, `DeleteProperty`, and
       `GetProperty` are no-ops; `GetProperty` always returns `type=None`.
       Implement real per-window property storage and emit

@@ -9,7 +9,7 @@ pub enum ClientByteOrder {
 #[derive(Clone, Copy, Debug)]
 pub struct ClientId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ResourceId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -149,6 +149,7 @@ pub struct CreateGcRequest {
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub font: Option<ResourceId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,6 +158,7 @@ pub struct GcChange {
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub font: Option<ResourceId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,12 +176,119 @@ pub struct OpenFontRequest {
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct FontInfo {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CharInfo {
+    pub left_side_bearing: i16,
+    pub right_side_bearing: i16,
+    pub character_width: i16,
     pub ascent: i16,
     pub descent: i16,
-    pub min_bounds_width: i16,
-    pub max_bounds_width: i16,
+    pub attributes: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FontMetrics {
+    pub min_bounds: CharInfo,
+    pub max_bounds: CharInfo,
+    pub min_char_or_byte2: u16,
+    pub max_char_or_byte2: u16,
+    pub default_char: u16,
+    pub draw_direction: u8,
+    pub min_byte1: u8,
+    pub max_byte1: u8,
+    pub all_chars_exist: bool,
+    pub font_ascent: i16,
+    pub font_descent: i16,
+    pub properties: Vec<u8>,
+    pub char_infos: Vec<CharInfo>,
+}
+
+impl FontMetrics {
+    pub fn char_info(&self, byte1: u8, byte2: u8) -> Option<&CharInfo> {
+        let byte2_u16 = u16::from(byte2);
+        if u16::from(byte1) < u16::from(self.min_byte1)
+            || u16::from(byte1) > u16::from(self.max_byte1)
+        {
+            return None;
+        }
+        if byte2_u16 < self.min_char_or_byte2 || byte2_u16 > self.max_char_or_byte2 {
+            return None;
+        }
+
+        if self.min_byte1 == 0 && self.max_byte1 == 0 {
+            let index = usize::from(byte2_u16 - self.min_char_or_byte2);
+            return self.char_infos.get(index);
+        }
+
+        let row_len = usize::from(self.max_char_or_byte2 - self.min_char_or_byte2 + 1);
+        let row = usize::from(byte1 - self.min_byte1);
+        let col = usize::from(byte2_u16 - self.min_char_or_byte2);
+        self.char_infos.get(row * row_len + col)
+    }
+
+    pub fn text_extents(&self, chars: &[(u8, u8)]) -> TextExtents {
+        let mut extents = TextExtents {
+            draw_direction: self.draw_direction,
+            font_ascent: self.font_ascent,
+            font_descent: self.font_descent,
+            ..Default::default()
+        };
+        if chars.is_empty() {
+            return extents;
+        }
+
+        let fallback = if self.all_chars_exist {
+            None
+        } else {
+            self.char_info(
+                u8::try_from(self.default_char >> 8).unwrap_or(0),
+                u8::try_from(self.default_char & 0xff).unwrap_or(0),
+            )
+        };
+
+        let mut running_width: i32 = 0;
+        let mut overall_left = i32::MAX;
+        let mut overall_right = i32::MIN;
+        let mut overall_ascent: i16 = 0;
+        let mut overall_descent: i16 = 0;
+
+        for &(byte1, byte2) in chars {
+            let info = self.char_info(byte1, byte2).or(fallback);
+            let Some(info) = info else {
+                continue;
+            };
+            let left = running_width + i32::from(info.left_side_bearing);
+            let right = running_width + i32::from(info.right_side_bearing);
+            if left < overall_left {
+                overall_left = left;
+            }
+            if right > overall_right {
+                overall_right = right;
+            }
+            if info.ascent > overall_ascent {
+                overall_ascent = info.ascent;
+            }
+            if info.descent > overall_descent {
+                overall_descent = info.descent;
+            }
+            running_width += i32::from(info.character_width);
+        }
+
+        extents.overall_width = running_width;
+        extents.overall_ascent = overall_ascent;
+        extents.overall_descent = overall_descent;
+        extents.overall_left = if overall_left == i32::MAX {
+            0
+        } else {
+            overall_left
+        };
+        extents.overall_right = if overall_right == i32::MIN {
+            0
+        } else {
+            overall_right
+        };
+        extents
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -530,6 +639,7 @@ pub fn create_gc_request(body: &[u8]) -> Option<CreateGcRequest> {
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        font: values.value(14).map(ResourceId),
     })
 }
 
@@ -541,6 +651,7 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        font: values.value(14).map(ResourceId),
     })
 }
 
@@ -568,6 +679,54 @@ pub fn open_font_request(body: &[u8]) -> Option<OpenFontRequest> {
     })
 }
 
+#[derive(Clone, Debug)]
+pub struct QueryTextExtentsRequest {
+    pub fontable: ResourceId,
+    pub chars: Vec<(u8, u8)>,
+}
+
+pub fn query_text_extents_request(odd_length: u8, body: &[u8]) -> Option<QueryTextExtentsRequest> {
+    let fontable = ResourceId(read_u32_le(body.get(0..4)?));
+    let string_bytes = body.get(4..)?;
+    let pad = if odd_length != 0 { 2 } else { 0 };
+    let useful = string_bytes.len().checked_sub(pad)?;
+    let mut chars = Vec::with_capacity(useful / 2);
+    let mut i = 0;
+    while i + 2 <= useful {
+        chars.push((string_bytes[i], string_bytes[i + 1]));
+        i += 2;
+    }
+    Some(QueryTextExtentsRequest { fontable, chars })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextExtents {
+    pub draw_direction: u8,
+    pub font_ascent: i16,
+    pub font_descent: i16,
+    pub overall_ascent: i16,
+    pub overall_descent: i16,
+    pub overall_width: i32,
+    pub overall_left: i32,
+    pub overall_right: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListFontsRequest {
+    pub max_names: u16,
+    pub pattern: String,
+}
+
+pub fn list_fonts_request(body: &[u8]) -> Option<ListFontsRequest> {
+    let max_names = read_u16_le(body.get(0..2)?);
+    let pattern_len = read_u16_le(body.get(2..4)?) as usize;
+    let pattern = body.get(4..4 + pattern_len)?;
+    Some(ListFontsRequest {
+        max_names,
+        pattern: String::from_utf8_lossy(pattern).into_owned(),
+    })
+}
+
 pub fn create_glyph_cursor_id(body: &[u8]) -> Option<ResourceId> {
     Some(ResourceId(read_u32_le(body.get(0..4)?)))
 }
@@ -592,7 +751,7 @@ pub fn poly_fill_rectangle_data(body: &[u8]) -> Option<(u32, &[u8])> {
 pub fn poly_line_data(body: &[u8]) -> Option<(u32, &[u8])> {
     let gc_id = read_u32_le(body.get(4..8)?);
     let points = body.get(8..)?;
-    if points.len() % 4 != 0 {
+    if !points.len().is_multiple_of(4) {
         return None;
     }
     Some((gc_id, points))
@@ -1164,25 +1323,34 @@ pub fn write_grab_reply(
     writer.write_all(&reply)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryPointerReply {
+    pub root: ResourceId,
+    pub child: ResourceId,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub win_x: i16,
+    pub win_y: i16,
+    pub mask: u16,
+}
+
 pub fn write_query_pointer_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
-    root: ResourceId,
-    child: ResourceId,
-    root_x: i16,
-    root_y: i16,
-    win_x: i16,
-    win_y: i16,
-    mask: u16,
+    reply_data: QueryPointerReply,
 ) -> io::Result<()> {
     let mut reply = fixed_reply(sequence, 1, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, root.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, child.0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, root_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, root_y);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, win_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, win_y);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, mask);
+    write_u32(ClientByteOrder::LittleEndian, &mut reply, reply_data.root.0);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        reply_data.child.0,
+    );
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.root_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.root_y);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.win_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.win_y);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, reply_data.mask);
     reply.extend_from_slice(&[0; 6]);
     writer.write_all(&reply)
 }
@@ -1437,24 +1605,108 @@ fn keysyms_for_keycode(keycode: u8) -> (u32, u32) {
 pub fn write_query_font_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
-    info: FontInfo,
+    metrics: &FontMetrics,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 7);
-    write_char_info(&mut reply, info.min_bounds_width, info.ascent, info.descent);
-    reply.extend_from_slice(&[0; 4]); // min-bounds padding
-    write_char_info(&mut reply, info.max_bounds_width, info.ascent, info.descent);
-    reply.extend_from_slice(&[0; 4]); // max-bounds padding
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 1); // min-char-or-byte2
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 255); // max-char-or-byte2
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // default-char
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // properties
-    reply.push(0); // draw-direction LeftToRight
-    reply.push(0); // min-byte1
-    reply.push(0); // max-byte1
-    reply.push(0); // all-chars-exist
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, info.ascent);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, info.descent);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // char-infos
+    // Reply length is in 4-byte units beyond the 32-byte minimum reply.
+    // Body after the 32-byte header carries 8n bytes of properties
+    // (n = properties.len() / 8) plus 12m bytes of CHARINFOs.
+    let n = metrics.properties.len() / 8;
+    let m = metrics.char_infos.len();
+    let reply_length = 7 + 2 * u32::try_from(n).unwrap_or(0) + 3 * u32::try_from(m).unwrap_or(0);
+
+    let mut reply = fixed_reply(sequence, 0, reply_length);
+    write_full_char_info(&mut reply, &metrics.min_bounds);
+    reply.extend_from_slice(&[0; 4]);
+    write_full_char_info(&mut reply, &metrics.max_bounds);
+    reply.extend_from_slice(&[0; 4]);
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        metrics.min_char_or_byte2,
+    );
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        metrics.max_char_or_byte2,
+    );
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        metrics.default_char,
+    );
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        u16::try_from(n).unwrap_or(0),
+    );
+    reply.push(metrics.draw_direction);
+    reply.push(metrics.min_byte1);
+    reply.push(metrics.max_byte1);
+    reply.push(u8::from(metrics.all_chars_exist));
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        metrics.font_ascent,
+    );
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        metrics.font_descent,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        u32::try_from(m).unwrap_or(0),
+    );
+    reply.extend_from_slice(&metrics.properties[..n * 8]);
+    for char_info in &metrics.char_infos {
+        write_full_char_info(&mut reply, char_info);
+    }
+    writer.write_all(&reply)
+}
+
+pub fn write_query_text_extents_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    extents: TextExtents,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, extents.draw_direction, 0);
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.font_ascent,
+    );
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.font_descent,
+    );
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.overall_ascent,
+    );
+    write_i16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.overall_descent,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.overall_width as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.overall_left as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        extents.overall_right as u32,
+    );
+    reply.extend_from_slice(&[0; 4]);
     writer.write_all(&reply)
 }
 
@@ -1495,7 +1747,7 @@ fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
 }
 
 fn checked_units(byte_len: usize) -> io::Result<u16> {
-    if byte_len % 4 != 0 {
+    if !byte_len.is_multiple_of(4) {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("length {byte_len} is not 4-byte aligned"),
@@ -1542,13 +1794,72 @@ fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
     }
 }
 
-fn write_char_info(out: &mut Vec<u8>, width: i16, ascent: i16, descent: i16) {
-    write_i16(ClientByteOrder::LittleEndian, out, 0); // left-side-bearing
-    write_i16(ClientByteOrder::LittleEndian, out, width); // right-side-bearing
-    write_i16(ClientByteOrder::LittleEndian, out, width); // character-width
-    write_i16(ClientByteOrder::LittleEndian, out, ascent);
-    write_i16(ClientByteOrder::LittleEndian, out, descent);
-    write_u16(ClientByteOrder::LittleEndian, out, 0); // attributes
+fn write_full_char_info(out: &mut Vec<u8>, info: &CharInfo) {
+    write_i16(ClientByteOrder::LittleEndian, out, info.left_side_bearing);
+    write_i16(ClientByteOrder::LittleEndian, out, info.right_side_bearing);
+    write_i16(ClientByteOrder::LittleEndian, out, info.character_width);
+    write_i16(ClientByteOrder::LittleEndian, out, info.ascent);
+    write_i16(ClientByteOrder::LittleEndian, out, info.descent);
+    write_u16(ClientByteOrder::LittleEndian, out, info.attributes);
+}
+
+fn read_char_info(bytes: &[u8]) -> Option<CharInfo> {
+    Some(CharInfo {
+        left_side_bearing: read_i16_le(bytes.get(0..2)?),
+        right_side_bearing: read_i16_le(bytes.get(2..4)?),
+        character_width: read_i16_le(bytes.get(4..6)?),
+        ascent: read_i16_le(bytes.get(6..8)?),
+        descent: read_i16_le(bytes.get(8..10)?),
+        attributes: read_u16_le(bytes.get(10..12)?),
+    })
+}
+
+/// Parse the body of a `QueryFont` reply (the 60 bytes after the standard
+/// 8-byte reply header, plus the trailing properties and CHARINFOs).
+///
+/// `body` must start at byte 8 of the reply (immediately after the
+/// `reply length` field) and span the rest of the reply payload.
+pub fn parse_query_font_reply(body: &[u8]) -> Option<FontMetrics> {
+    let min_bounds = read_char_info(body.get(0..12)?)?;
+    let max_bounds = read_char_info(body.get(16..28)?)?;
+    let min_char_or_byte2 = read_u16_le(body.get(32..34)?);
+    let max_char_or_byte2 = read_u16_le(body.get(34..36)?);
+    let default_char = read_u16_le(body.get(36..38)?);
+    let n = usize::from(read_u16_le(body.get(38..40)?));
+    let draw_direction = *body.get(40)?;
+    let min_byte1 = *body.get(41)?;
+    let max_byte1 = *body.get(42)?;
+    let all_chars_exist = *body.get(43)? != 0;
+    let font_ascent = read_i16_le(body.get(44..46)?);
+    let font_descent = read_i16_le(body.get(46..48)?);
+    let m = read_u32_le(body.get(48..52)?) as usize;
+
+    let props_offset = 52;
+    let props_len = n.checked_mul(8)?;
+    let properties = body.get(props_offset..props_offset + props_len)?.to_vec();
+
+    let chars_offset = props_offset + props_len;
+    let mut char_infos = Vec::with_capacity(m);
+    for i in 0..m {
+        let start = chars_offset + i * 12;
+        char_infos.push(read_char_info(body.get(start..start + 12)?)?);
+    }
+
+    Some(FontMetrics {
+        min_bounds,
+        max_bounds,
+        min_char_or_byte2,
+        max_char_or_byte2,
+        default_char,
+        draw_direction,
+        min_byte1,
+        max_byte1,
+        all_chars_exist,
+        font_ascent,
+        font_descent,
+        properties,
+        char_infos,
+    })
 }
 
 fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {
@@ -1570,7 +1881,7 @@ fn pad4(len: usize) -> usize {
 }
 
 fn pad_vec4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
