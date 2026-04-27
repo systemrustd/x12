@@ -742,6 +742,25 @@ fn handle_request(
             let color = x11::alloc_color_request(body).unwrap_or_default();
             x11::write_alloc_color_reply(stream, sequence, color)
         }
+        85 => {
+            let name = x11::alloc_named_color_name(body);
+            let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+                println!(
+                    "client {} #{} AllocNamedColor unknown name {:?} -> fallback gray",
+                    client_id.0, sequence.0, name
+                );
+                x11::Rgb16 {
+                    red: 0xc0c0,
+                    green: 0xc0c0,
+                    blue: 0xc0c0,
+                }
+            });
+            println!(
+                "client {} #{} AllocNamedColor {:?}",
+                client_id.0, sequence.0, name
+            );
+            x11::write_alloc_named_color_reply(stream, sequence, color)
+        }
         91 => {
             let pixels = x11::query_colors_pixels(body);
             println!(
@@ -753,8 +772,23 @@ fn handle_request(
             x11::write_query_colors_reply(stream, sequence, &pixels)
         }
         92 => {
-            log_void(client_id, sequence, "StoreColors")?;
-            x11::write_error(stream, sequence, 10, 0, 0, 92)
+            let name = x11::alloc_named_color_name(body);
+            let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+                println!(
+                    "client {} #{} LookupColor unknown name {:?} -> fallback gray",
+                    client_id.0, sequence.0, name
+                );
+                x11::Rgb16 {
+                    red: 0xc0c0,
+                    green: 0xc0c0,
+                    blue: 0xc0c0,
+                }
+            });
+            println!(
+                "client {} #{} LookupColor {:?}",
+                client_id.0, sequence.0, name
+            );
+            x11::write_lookup_color_reply(stream, sequence, color)
         }
         94 => {
             if let Some(cursor) = x11::create_glyph_cursor_id(body) {
@@ -785,13 +819,7 @@ fn handle_request(
             log_reply(client_id, sequence, "GetKeyboardMapping");
             let first_keycode = body.first().copied().unwrap_or(0);
             let keycode_count = body.get(1).copied().unwrap_or(0);
-            x11::write_get_keyboard_mapping_reply(
-                stream,
-                sequence,
-                first_keycode,
-                keycode_count,
-                4,
-            )
+            x11::write_get_keyboard_mapping_reply(stream, sequence, first_keycode, keycode_count, 4)
         }
         103 => log_void(client_id, sequence, "Bell"),
         104 => log_void(client_id, sequence, "ChangeKeyboardControl"),

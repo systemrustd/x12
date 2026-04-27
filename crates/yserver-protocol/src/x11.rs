@@ -749,6 +749,83 @@ pub fn alloc_color_request(body: &[u8]) -> Option<Rgb16> {
     })
 }
 
+pub fn alloc_named_color_name(body: &[u8]) -> String {
+    let Some(name_len) = body.get(4..6).map(read_u16_le) else {
+        return String::new();
+    };
+    let name = body.get(8..8 + name_len as usize).unwrap_or_default();
+    String::from_utf8_lossy(name).into_owned()
+}
+
+pub fn lookup_color_name(name: &str) -> Option<Rgb16> {
+    let normalized: String = name
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    let gray_n = normalized
+        .strip_prefix("gray")
+        .or_else(|| normalized.strip_prefix("grey"));
+    if let Some(rest) = gray_n {
+        if rest.is_empty() {
+            return Some(rgb8(190, 190, 190));
+        }
+        if let Ok(percent) = rest.parse::<u32>() {
+            let value = u8::try_from(percent.min(100) * 255 / 100).unwrap_or(u8::MAX);
+            return Some(rgb8(value, value, value));
+        }
+    }
+
+    let (r, g, b) = match normalized.as_str() {
+        "black" => (0, 0, 0),
+        "white" => (255, 255, 255),
+        "red" | "red1" => (255, 0, 0),
+        "red2" => (238, 0, 0),
+        "red3" => (205, 0, 0),
+        "red4" => (139, 0, 0),
+        "green" | "green1" => (0, 255, 0),
+        "green2" => (0, 238, 0),
+        "green3" => (0, 205, 0),
+        "green4" => (0, 139, 0),
+        "blue" | "blue1" => (0, 0, 255),
+        "blue2" => (0, 0, 238),
+        "blue3" => (0, 0, 205),
+        "blue4" => (0, 0, 139),
+        "yellow" | "yellow1" => (255, 255, 0),
+        "yellow2" => (238, 238, 0),
+        "yellow3" => (205, 205, 0),
+        "yellow4" => (139, 139, 0),
+        "cyan" | "cyan1" => (0, 255, 255),
+        "cyan2" => (0, 238, 238),
+        "cyan3" => (0, 205, 205),
+        "cyan4" => (0, 139, 139),
+        "magenta" | "magenta1" => (255, 0, 255),
+        "magenta2" => (238, 0, 238),
+        "magenta3" => (205, 0, 205),
+        "magenta4" => (139, 0, 139),
+        "orange" => (255, 165, 0),
+        "pink" => (255, 192, 203),
+        "brown" => (165, 42, 42),
+        "purple" => (160, 32, 240),
+        "navy" | "navyblue" => (0, 0, 128),
+        "gold" => (255, 215, 0),
+        "lightgray" | "lightgrey" => (211, 211, 211),
+        "darkgray" | "darkgrey" => (169, 169, 169),
+        _ => return None,
+    };
+
+    Some(rgb8(r, g, b))
+}
+
+fn rgb8(r: u8, g: u8, b: u8) -> Rgb16 {
+    Rgb16 {
+        red: u16::from(r) * 257,
+        green: u16::from(g) * 257,
+        blue: u16::from(b) * 257,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ValueList<'a> {
     value_mask: u32,
@@ -1161,6 +1238,43 @@ pub fn write_alloc_color_reply(
         rgb16_to_pixel(color),
     );
     reply.extend_from_slice(&[0; 12]);
+    writer.write_all(&reply)
+}
+
+pub fn write_lookup_color_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    color: Rgb16,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, 0, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    reply.extend_from_slice(&[0; 12]);
+    writer.write_all(&reply)
+}
+
+pub fn write_alloc_named_color_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    color: Rgb16,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, 0, 0);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        rgb16_to_pixel(color),
+    );
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    reply.extend_from_slice(&[0; 8]);
     writer.write_all(&reply)
 }
 
