@@ -1,5 +1,17 @@
 use std::io::{self, ErrorKind, Read, Write};
 
+mod atoms;
+pub use atoms::{well_known_atom, well_known_atom_name};
+
+mod colors;
+pub use colors::lookup_color_name;
+
+mod keysyms;
+use keysyms::keysyms_for_keycode;
+
+mod wire;
+use wire::*;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientByteOrder {
     LittleEndian,
@@ -991,75 +1003,6 @@ pub fn alloc_named_color_name(body: &[u8]) -> String {
     String::from_utf8_lossy(name).into_owned()
 }
 
-pub fn lookup_color_name(name: &str) -> Option<Rgb16> {
-    let normalized: String = name
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-
-    let gray_n = normalized
-        .strip_prefix("gray")
-        .or_else(|| normalized.strip_prefix("grey"));
-    if let Some(rest) = gray_n {
-        if rest.is_empty() {
-            return Some(rgb8(190, 190, 190));
-        }
-        if let Ok(percent) = rest.parse::<u32>() {
-            let value = u8::try_from(percent.min(100) * 255 / 100).unwrap_or(u8::MAX);
-            return Some(rgb8(value, value, value));
-        }
-    }
-
-    let (r, g, b) = match normalized.as_str() {
-        "black" => (0, 0, 0),
-        "white" => (255, 255, 255),
-        "red" | "red1" => (255, 0, 0),
-        "red2" => (238, 0, 0),
-        "red3" => (205, 0, 0),
-        "red4" => (139, 0, 0),
-        "green" | "green1" => (0, 255, 0),
-        "green2" => (0, 238, 0),
-        "green3" => (0, 205, 0),
-        "green4" => (0, 139, 0),
-        "blue" | "blue1" => (0, 0, 255),
-        "blue2" => (0, 0, 238),
-        "blue3" => (0, 0, 205),
-        "blue4" => (0, 0, 139),
-        "yellow" | "yellow1" => (255, 255, 0),
-        "yellow2" => (238, 238, 0),
-        "yellow3" => (205, 205, 0),
-        "yellow4" => (139, 139, 0),
-        "cyan" | "cyan1" => (0, 255, 255),
-        "cyan2" => (0, 238, 238),
-        "cyan3" => (0, 205, 205),
-        "cyan4" => (0, 139, 139),
-        "magenta" | "magenta1" => (255, 0, 255),
-        "magenta2" => (238, 0, 238),
-        "magenta3" => (205, 0, 205),
-        "magenta4" => (139, 0, 139),
-        "orange" => (255, 165, 0),
-        "pink" => (255, 192, 203),
-        "brown" => (165, 42, 42),
-        "purple" => (160, 32, 240),
-        "navy" | "navyblue" => (0, 0, 128),
-        "gold" => (255, 215, 0),
-        "lightgray" | "lightgrey" => (211, 211, 211),
-        "darkgray" | "darkgrey" => (169, 169, 169),
-        _ => return None,
-    };
-
-    Some(rgb8(r, g, b))
-}
-
-fn rgb8(r: u8, g: u8, b: u8) -> Rgb16 {
-    Rgb16 {
-        red: u16::from(r) * 257,
-        green: u16::from(g) * 257,
-        blue: u16::from(b) * 257,
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ValueList<'a> {
     value_mask: u32,
@@ -1095,156 +1038,6 @@ pub fn query_extension_name(body: &[u8]) -> String {
     let len = u16::from_le_bytes([body[0], body[1]]) as usize;
     let name = body.get(4..4 + len).unwrap_or_default();
     String::from_utf8_lossy(name).into_owned()
-}
-
-pub fn well_known_atom(name: &str) -> Option<AtomId> {
-    let id = match name {
-        "PRIMARY" => 1,
-        "SECONDARY" => 2,
-        "ARC" => 3,
-        "ATOM" => 4,
-        "BITMAP" => 5,
-        "CARDINAL" => 6,
-        "COLORMAP" => 7,
-        "CURSOR" => 8,
-        "CUT_BUFFER0" => 9,
-        "CUT_BUFFER1" => 10,
-        "CUT_BUFFER2" => 11,
-        "CUT_BUFFER3" => 12,
-        "CUT_BUFFER4" => 13,
-        "CUT_BUFFER5" => 14,
-        "CUT_BUFFER6" => 15,
-        "CUT_BUFFER7" => 16,
-        "DRAWABLE" => 17,
-        "FONT" => 18,
-        "INTEGER" => 19,
-        "PIXMAP" => 20,
-        "POINT" => 21,
-        "RECTANGLE" => 22,
-        "RESOURCE_MANAGER" => 23,
-        "RGB_COLOR_MAP" => 24,
-        "RGB_BEST_MAP" => 25,
-        "RGB_BLUE_MAP" => 26,
-        "RGB_DEFAULT_MAP" => 27,
-        "RGB_GRAY_MAP" => 28,
-        "RGB_GREEN_MAP" => 29,
-        "RGB_RED_MAP" => 30,
-        "STRING" => 31,
-        "VISUALID" => 32,
-        "WINDOW" => 33,
-        "WM_COMMAND" => 34,
-        "WM_HINTS" => 35,
-        "WM_CLIENT_MACHINE" => 36,
-        "WM_ICON_NAME" => 37,
-        "WM_ICON_SIZE" => 38,
-        "WM_NAME" => 39,
-        "WM_NORMAL_HINTS" => 40,
-        "WM_SIZE_HINTS" => 41,
-        "WM_ZOOM_HINTS" => 42,
-        "MIN_SPACE" => 43,
-        "NORM_SPACE" => 44,
-        "MAX_SPACE" => 45,
-        "END_SPACE" => 46,
-        "SUPERSCRIPT_X" => 47,
-        "SUPERSCRIPT_Y" => 48,
-        "SUBSCRIPT_X" => 49,
-        "SUBSCRIPT_Y" => 50,
-        "UNDERLINE_POSITION" => 51,
-        "UNDERLINE_THICKNESS" => 52,
-        "STRIKEOUT_ASCENT" => 53,
-        "STRIKEOUT_DESCENT" => 54,
-        "ITALIC_ANGLE" => 55,
-        "X_HEIGHT" => 56,
-        "QUAD_WIDTH" => 57,
-        "WEIGHT" => 58,
-        "POINT_SIZE" => 59,
-        "RESOLUTION" => 60,
-        "COPYRIGHT" => 61,
-        "NOTICE" => 62,
-        "FONT_NAME" => 63,
-        "FAMILY_NAME" => 64,
-        "FULL_NAME" => 65,
-        "CAP_HEIGHT" => 66,
-        "WM_CLASS" => 67,
-        "WM_TRANSIENT_FOR" => 68,
-        _ => return None,
-    };
-    Some(AtomId(id))
-}
-
-pub fn well_known_atom_name(atom: AtomId) -> Option<&'static str> {
-    let name = match atom.0 {
-        1 => "PRIMARY",
-        2 => "SECONDARY",
-        3 => "ARC",
-        4 => "ATOM",
-        5 => "BITMAP",
-        6 => "CARDINAL",
-        7 => "COLORMAP",
-        8 => "CURSOR",
-        9 => "CUT_BUFFER0",
-        10 => "CUT_BUFFER1",
-        11 => "CUT_BUFFER2",
-        12 => "CUT_BUFFER3",
-        13 => "CUT_BUFFER4",
-        14 => "CUT_BUFFER5",
-        15 => "CUT_BUFFER6",
-        16 => "CUT_BUFFER7",
-        17 => "DRAWABLE",
-        18 => "FONT",
-        19 => "INTEGER",
-        20 => "PIXMAP",
-        21 => "POINT",
-        22 => "RECTANGLE",
-        23 => "RESOURCE_MANAGER",
-        24 => "RGB_COLOR_MAP",
-        25 => "RGB_BEST_MAP",
-        26 => "RGB_BLUE_MAP",
-        27 => "RGB_DEFAULT_MAP",
-        28 => "RGB_GRAY_MAP",
-        29 => "RGB_GREEN_MAP",
-        30 => "RGB_RED_MAP",
-        31 => "STRING",
-        32 => "VISUALID",
-        33 => "WINDOW",
-        34 => "WM_COMMAND",
-        35 => "WM_HINTS",
-        36 => "WM_CLIENT_MACHINE",
-        37 => "WM_ICON_NAME",
-        38 => "WM_ICON_SIZE",
-        39 => "WM_NAME",
-        40 => "WM_NORMAL_HINTS",
-        41 => "WM_SIZE_HINTS",
-        42 => "WM_ZOOM_HINTS",
-        43 => "MIN_SPACE",
-        44 => "NORM_SPACE",
-        45 => "MAX_SPACE",
-        46 => "END_SPACE",
-        47 => "SUPERSCRIPT_X",
-        48 => "SUPERSCRIPT_Y",
-        49 => "SUBSCRIPT_X",
-        50 => "SUBSCRIPT_Y",
-        51 => "UNDERLINE_POSITION",
-        52 => "UNDERLINE_THICKNESS",
-        53 => "STRIKEOUT_ASCENT",
-        54 => "STRIKEOUT_DESCENT",
-        55 => "ITALIC_ANGLE",
-        56 => "X_HEIGHT",
-        57 => "QUAD_WIDTH",
-        58 => "WEIGHT",
-        59 => "POINT_SIZE",
-        60 => "RESOLUTION",
-        61 => "COPYRIGHT",
-        62 => "NOTICE",
-        63 => "FONT_NAME",
-        64 => "FAMILY_NAME",
-        65 => "FULL_NAME",
-        66 => "CAP_HEIGHT",
-        67 => "WM_CLASS",
-        68 => "WM_TRANSIENT_FOR",
-        _ => return None,
-    };
-    Some(name)
 }
 
 pub fn write_get_window_attributes_reply(
@@ -1619,78 +1412,6 @@ pub fn write_get_keyboard_mapping_reply(
     writer.write_all(&reply)
 }
 
-fn keysyms_for_keycode(keycode: u8) -> (u32, u32) {
-    match keycode {
-        9 => (0xff1b, 0xff1b), // Escape
-        10 => (b'1' as u32, b'!' as u32),
-        11 => (b'2' as u32, b'@' as u32),
-        12 => (b'3' as u32, b'#' as u32),
-        13 => (b'4' as u32, b'$' as u32),
-        14 => (b'5' as u32, b'%' as u32),
-        15 => (b'6' as u32, b'^' as u32),
-        16 => (b'7' as u32, b'&' as u32),
-        17 => (b'8' as u32, b'*' as u32),
-        18 => (b'9' as u32, b'(' as u32),
-        19 => (b'0' as u32, b')' as u32),
-        20 => (b'-' as u32, b'_' as u32),
-        21 => (b'=' as u32, b'+' as u32),
-        22 => (0xff08, 0xff08), // Backspace
-        23 => (0xff09, 0xff09), // Tab
-        24 => (b'q' as u32, b'Q' as u32),
-        25 => (b'w' as u32, b'W' as u32),
-        26 => (b'e' as u32, b'E' as u32),
-        27 => (b'r' as u32, b'R' as u32),
-        28 => (b't' as u32, b'T' as u32),
-        29 => (b'y' as u32, b'Y' as u32),
-        30 => (b'u' as u32, b'U' as u32),
-        31 => (b'i' as u32, b'I' as u32),
-        32 => (b'o' as u32, b'O' as u32),
-        33 => (b'p' as u32, b'P' as u32),
-        34 => (b'[' as u32, b'{' as u32),
-        35 => (b']' as u32, b'}' as u32),
-        36 => (0xff0d, 0xff0d), // Return
-        38 => (b'a' as u32, b'A' as u32),
-        39 => (b's' as u32, b'S' as u32),
-        40 => (b'd' as u32, b'D' as u32),
-        41 => (b'f' as u32, b'F' as u32),
-        42 => (b'g' as u32, b'G' as u32),
-        43 => (b'h' as u32, b'H' as u32),
-        44 => (b'j' as u32, b'J' as u32),
-        45 => (b'k' as u32, b'K' as u32),
-        46 => (b'l' as u32, b'L' as u32),
-        47 => (b';' as u32, b':' as u32),
-        48 => (b'\'' as u32, b'"' as u32),
-        49 => (b'`' as u32, b'~' as u32),
-        50 => (0xffe1, 0xffe1), // Shift_L
-        51 => (b'\\' as u32, b'|' as u32),
-        52 => (b'z' as u32, b'Z' as u32),
-        53 => (b'x' as u32, b'X' as u32),
-        54 => (b'c' as u32, b'C' as u32),
-        55 => (b'v' as u32, b'V' as u32),
-        56 => (b'b' as u32, b'B' as u32),
-        57 => (b'n' as u32, b'N' as u32),
-        58 => (b'm' as u32, b'M' as u32),
-        59 => (b',' as u32, b'<' as u32),
-        60 => (b'.' as u32, b'>' as u32),
-        61 => (b'/' as u32, b'?' as u32),
-        62 => (0xffe2, 0xffe2), // Shift_R
-        65 => (b' ' as u32, b' ' as u32),
-        66 => (0xffe5, 0xffe5),  // Caps_Lock
-        37 => (0xffe3, 0xffe3),  // Control_L
-        64 => (0xffe9, 0xffe9),  // Alt_L
-        105 => (0xffe4, 0xffe4), // Control_R
-        108 => (0xffea, 0xffea), // Alt_R
-        113 => (0xff51, 0xff51), // Left
-        114 => (0xff53, 0xff53), // Right
-        111 => (0xff52, 0xff52), // Up
-        116 => (0xff54, 0xff54), // Down
-        119 => (0xffff, 0xffff), // Delete
-        133 => (0xffeb, 0xffeb), // Super_L
-        134 => (0xffec, 0xffec), // Super_R
-        _ => (0, 0),
-    }
-}
-
 pub fn write_query_font_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
@@ -1826,63 +1547,6 @@ pub fn write_get_modifier_mapping_reply(
     writer.write_all(&reply)
 }
 
-fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
-    let mut reply = Vec::with_capacity(32);
-    reply.push(1);
-    reply.push(data);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, length);
-    reply
-}
-
-fn checked_units(byte_len: usize) -> io::Result<u16> {
-    if !byte_len.is_multiple_of(4) {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("length {byte_len} is not 4-byte aligned"),
-        ));
-    }
-    u16::try_from(byte_len / 4).map_err(|_| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("length {byte_len} is too large"),
-        )
-    })
-}
-
-fn read_u16(byte_order: ClientByteOrder, bytes: &[u8]) -> u16 {
-    match byte_order {
-        ClientByteOrder::LittleEndian => u16::from_le_bytes([bytes[0], bytes[1]]),
-        ClientByteOrder::BigEndian => u16::from_be_bytes([bytes[0], bytes[1]]),
-    }
-}
-
-fn read_u32_le(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn read_u16_le(bytes: &[u8]) -> u16 {
-    u16::from_le_bytes([bytes[0], bytes[1]])
-}
-
-fn read_i16_le(bytes: &[u8]) -> i16 {
-    i16::from_le_bytes([bytes[0], bytes[1]])
-}
-
-fn write_u16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u16) {
-    match byte_order {
-        ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
-        ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
-    }
-}
-
-fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
-    match byte_order {
-        ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
-        ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
-    }
-}
-
 fn write_full_char_info(out: &mut Vec<u8>, info: &CharInfo) {
     write_i16(ClientByteOrder::LittleEndian, out, info.left_side_bearing);
     write_i16(ClientByteOrder::LittleEndian, out, info.right_side_bearing);
@@ -1949,30 +1613,6 @@ pub fn parse_query_font_reply(body: &[u8]) -> Option<FontMetrics> {
         properties,
         char_infos,
     })
-}
-
-fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {
-    match byte_order {
-        ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
-        ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
-    }
-}
-
-fn byte_order_value(byte_order: ClientByteOrder) -> u8 {
-    match byte_order {
-        ClientByteOrder::LittleEndian => 0,
-        ClientByteOrder::BigEndian => 1,
-    }
-}
-
-fn pad4(len: usize) -> usize {
-    (len + 3) & !3
-}
-
-fn pad_vec4(out: &mut Vec<u8>) {
-    while !out.len().is_multiple_of(4) {
-        out.push(0);
-    }
 }
 
 pub fn encode_property_notify_event(
