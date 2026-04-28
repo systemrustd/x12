@@ -68,6 +68,40 @@ In rough priority order:
 - [ ] **`CopyArea` and `PutImage`.** Both are stubs; xterm uses them for
       scrolling and some text paths.
 
+### Known follow-ups
+
+Small items already identified during recent work, captured here so
+they don't get lost. Not yet sized into punch-list bullets; mostly
+contingent on landed work.
+
+- **`UnmapSubwindows` (opcode 11).** Currently a stub. Per X11 spec,
+  performs `UnmapWindow` on every mapped child bottom-to-top. Becomes
+  a thin loop over the child list reusing
+  `ResourceTable::unmap_window` and the `UnmapNotify` fanout
+  introduced for opcode 10. Spec:
+  [`2026-04-28-unmap-notify-design.md`](superpowers/specs/2026-04-28-unmap-notify-design.md)
+  ("Non-goals").
+- **`UnmapNotify.from_configure = true`.** Encoder accepts the byte
+  for wire correctness; every call site currently passes `false`. The
+  `true` path fires when a parent's `ConfigureWindow` shrinks a child
+  out of view. Wire it once we track parent-resize-driven implicit
+  unmaps.
+- **`SendEvent` (opcode 25).** Lets clients synthesize events for any
+  window. Required by ICCCM (`WM_DELETE_WINDOW` etc.) so Phase 2 work
+  unblocks on it. Same fanout machinery as the existing `*Notify`
+  events, plus the `SEND_EVENT` flag (high bit of event byte 0).
+- **Handler-level integration tests for opcode 10 / opcode 4 fanout.**
+  Today only the encoder, the `subscribers()` snapshot, and the
+  `ResourceTable` state machine are unit-tested; a true
+  request → fanout → wire-bytes test would require driving
+  `handle_request` against mock writers. Deferred — spec already
+  notes the gap.
+- **`PendingDestroy` struct.** The 5-tuple
+  `(window, parent, was_mapped, on_window, on_parent)` carried
+  through opcode 4 and disconnect cleanup is currently silenced with
+  `#[allow(clippy::type_complexity)]`. Extract a named struct the
+  next time an event joins the destroy path (e.g. `ReparentNotify`).
+
 ### Out of scope for Phase 1
 
 - BIG-REQUESTS, MIT-SHM, RANDR, XKB, XFIXES, DAMAGE, COMPOSITE, SYNC,
