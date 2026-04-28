@@ -10,6 +10,10 @@ via opcode 4 `DestroyWindow` or via client disconnect cleanup).
 - `from_configure = true` semantics — we don't yet track parent-resize-driven
   unmaps. Encoder takes the parameter for wire correctness; callers always
   pass `false`.
+- Opcode 11 `UnmapSubwindows` — performs `UnmapWindow` on all mapped children
+  bottom-to-top per X11 spec. Currently a stub; out of scope here. Once this
+  plan lands, opcode 11 becomes a thin loop over the child list reusing this
+  plan's `unmap_window` helper. Tracked separately.
 - ReparentNotify, ClientMessage, SendEvent — separate plans.
 
 **Spec reference:** X11 protocol spec §11 (Events), event 18 (UnmapNotify).
@@ -35,8 +39,14 @@ window (Stage 5 of property storage). Reuse those snapshots to fan out
 State-change detection is the only new requirement.
 `ResourceTable::unmap_window` currently sets `map_state = Unmapped`
 unconditionally. Change it to return `bool` indicating whether the call
-caused a transition. Per X11 spec, `UnmapNotify` fires only on actual
-transitions.
+caused a mapped → `Unmapped` transition (where "mapped" means either
+`Viewable` or `Unviewable`). Per X11 spec, `UnmapNotify` fires only on
+actual transitions.
+
+The root window is never unmappable per X11 spec. Encode that as a
+no-op-and-return-`false` directly inside `unmap_window` so every caller
+(opcode 10, future opcode 11, internal paths) gets root protection
+without each having to re-check.
 
 Per-X11 ordering: when both `UnmapNotify` and `DestroyNotify` fire for the
 same window, the spec leaves order undefined. We emit `UnmapNotify` first
@@ -77,6 +87,9 @@ Change the existing helper:
 
 ```rust
 pub fn unmap_window(&mut self, id: ResourceId) -> bool {
+    if id == ROOT_WINDOW {
+        return false;
+    }
     let Some(window) = self.windows.get_mut(&id.0) else { return false; };
     let was_mapped = window.map_state != MapState::Unmapped;
     window.map_state = MapState::Unmapped;
@@ -86,10 +99,15 @@ pub fn unmap_window(&mut self, id: ResourceId) -> bool {
 
 Return value semantics:
 
-- `true` — window existed and transitioned (`Viewable` → `Unmapped`).
-- `false` — window did not exist, or was already unmapped.
+- `true` — window existed and transitioned from `Viewable` or `Unviewable`
+  to `Unmapped`.
+- `false` — window did not exist, was already `Unmapped`, or is the root
+  window. The root case is silently no-op'd here (no state change, no
+  emission) since the root is never unmappable per X11 spec.
 
-This is a private struct method already; no visibility change.
+`unmap_window` is `pub` (used by `nested.rs`); signature change is
+source-incompatible for any future internal caller, so update all call
+sites in this plan.
 
 ### `crates/yserver-core/src/nested.rs`
 
@@ -219,7 +237,7 @@ types.
 |--------------------------------------------|-----------------------------------|
 | `UnmapWindow` on unknown window            | `unmap_window` returns `false`; no event. Pre-existing silent behavior. |
 | `UnmapWindow` on already-unmapped window   | Returns `false`; no event (per X11 spec). |
-| `UnmapWindow` on the root                  | Sets root `map_state = Unmapped` (pre-existing oddity); transition, so we'd emit `UnmapNotify`. To stay conservative, **skip emission when `target == ROOT_WINDOW`** in the handler. |
+| `UnmapWindow` on the root                  | `unmap_window` no-ops and returns `false`; root `map_state` is unchanged; no event emitted. Root protection lives in `unmap_window` itself, not the handler. |
 | Window destroyed while unmapped            | No `UnmapNotify`; `DestroyNotify` only. |
 | Subscriber writer poisoned                 | Skipped via `if let Ok(mut w) = target.writer.lock()`. Same as existing fanouts. |
 
@@ -231,50 +249,85 @@ types.
 
 `crates/yserver-core/src/resources.rs` (new `#[cfg(test)] mod tests`):
 
-1. `unmap_window_returns_true_on_transition` — create + map a window, call
-   `unmap_window`, assert returns `true`, assert `map_state == Unmapped`.
-2. `unmap_window_returns_false_when_already_unmapped` — call `unmap_window`
+1. `unmap_window_returns_true_on_transition_from_viewable` — create + map a
+   window (Viewable), call `unmap_window`, assert returns `true`, assert
+   `map_state == Unmapped`.
+2. `unmap_window_returns_true_on_transition_from_unviewable` — set
+   `map_state = Unviewable` directly, call `unmap_window`, assert returns
+   `true`, assert `map_state == Unmapped`.
+3. `unmap_window_returns_false_when_already_unmapped` — call `unmap_window`
    twice, assert second returns `false`.
-3. `unmap_window_returns_false_for_unknown_window` — call on a never-created
+4. `unmap_window_returns_false_for_unknown_window` — call on a never-created
    id, assert `false`.
+5. `unmap_window_no_ops_on_root` — call `unmap_window(ROOT_WINDOW)` after
+   the table is initialized (root is Viewable by default), assert returns
+   `false`, assert root `map_state` is still `Viewable`.
 
 `crates/yserver-protocol/src/x11/mod.rs::tests` (new submodule
 `unmap_notify_tests`):
 
-4. `shape` — encode with known values, assert byte 0 = 18, sequence at 2..4,
+6. `shape` — encode with known values, assert byte 0 = 18, sequence at 2..4,
    `event_window` at 4..8, `window` at 8..12, `from_configure` at 12, total
    length 32.
+
+`crates/yserver-core/src/server.rs::tests` (new — colocated with
+`subscribers` tests, which already use `UnixStream::pair()`):
+
+7. `unmap_notify_fanout_reaches_only_subscribed_clients` — given two
+   clients with a `UnixStream::pair()` writer each, where client A has
+   `StructureNotify` (mask 0x0002_0000) on window 0x100 and client B has
+   only `KeyPress` on the same window, call `subscribers(0x100, 0x0002_0000)`
+   and verify exactly one target. Encode an `UnmapNotify` to A's writer
+   peer and read 32 bytes back; assert byte 0 == 18. (Verifies that the
+   subscriber-snapshot + encode pipeline produces a wire-correct unmap
+   event; the actual handler integration is exercised by smoke tests.)
 
 ### Property tests
 
 `crates/yserver-core/src/resources.rs::tests`:
 
-5. `unmap_window_state_machine` (proptest) — for `n ∈ 1..=5` calls on a
-   freshly mapped window, assert: first call returns `true`, all subsequent
-   calls return `false`, final state is `Unmapped`.
+8. `unmap_window_state_machine` (proptest) — for any `initial_state ∈
+   {Viewable, Unviewable, Unmapped}` and `n ∈ 1..=5` calls on a window
+   seeded with that state, assert:
+   - First call returns `true` iff `initial_state != Unmapped`.
+   - All subsequent calls return `false`.
+   - Final `map_state == Unmapped`.
 
 `crates/yserver-protocol/src/x11/mod.rs::tests::unmap_notify_tests`:
 
-6. `encoder_round_trip` (proptest) — for arbitrary
-   `(sequence, event_window, window, from_configure)`:
+9. `encoder_round_trip` (proptest) — for arbitrary
+   `(sequence, event_window, window, from_configure, order ∈ {LE, BE})`:
    - Buffer length is 32.
    - Bytes 0=18, 1=0.
-   - Bytes 2..4 = `sequence` little-endian.
-   - Bytes 4..8 = `event_window.0` little-endian.
-   - Bytes 8..12 = `window.0` little-endian.
+   - Bytes 2..4 = `sequence` in `order`.
+   - Bytes 4..8 = `event_window.0` in `order`.
+   - Bytes 8..12 = `window.0` in `order`.
    - Byte 12 = `u8::from(from_configure)`.
    - Bytes 13..32 are all zero (catches padding bugs).
+
+### Test plan limitations
+
+The handler-level integration (opcode 10 → fanout → subscribed clients
+receive bytes) is not covered by an automated test in this plan. Test 7
+verifies the subscriber-snapshot + encoder primitives that the handler
+composes. End-to-end correctness is verified by the existing `xev`-based
+smoke test described in the property-storage spec (`xev` on a window,
+`xdotool windowunmap`, observe `UnmapNotify` print). Adding a true
+handler-level integration test would require mocking the request loop
+and is deferred.
 
 ### Expected counts
 
 | Crate              | Before | After |
 |--------------------|--------|-------|
-| `yserver-core`     | 42     | 45    |
+| `yserver-core`     | 42     | 47    |
 | `yserver-protocol` | 7      | 9     |
-| **Total**          | **49** | **54** |
+| **Total**          | **49** | **56** |
 
-(One unit + one proptest = 2 added in protocol; two units + one proptest = 3
-added in core. Total 5 new tests.)
+(Five unit + one proptest = 6 added in core; one unit + one proptest = 2
+added in protocol. Total 7 new tests, but one of the core tests
+(`unmap_notify_fanout_reaches_only_subscribed_clients`) lands in
+`server.rs::tests`, not `resources.rs::tests`.)
 
 ---
 
@@ -284,11 +337,20 @@ Single small plan, three commits:
 
 1. **Add `encode_unmap_notify_event` + tests** in `yserver-protocol`. Pure
    addition; no callers.
-2. **Change `unmap_window` to return `bool`** in `yserver-core/resources.rs`,
-   add unit + proptest. The two existing callers (opcode 10 handler and the
-   destroy path) ignore the return value at this commit.
+2. **Change `unmap_window` to return `bool` + add root no-op** in
+   `yserver-core/resources.rs`, with the new unit + proptest coverage.
+   The single existing caller (opcode 10 handler in `nested.rs`) needs
+   to be updated to compile; for this commit it just `let _ =
+   s.resources.unmap_window(window);` to discard the new return value.
+   The destroy path doesn't call `unmap_window` (it uses
+   `destroy_window` which removes windows directly), so it isn't
+   affected at this commit.
 3. **Wire opcode 10, opcode 4, and disconnect cleanup** in `nested.rs` to
-   emit `UnmapNotify`. Updates the existing destroy `pending` tuple shape.
+   emit `UnmapNotify`. Updates the existing destroy `pending` tuple shape
+   to carry `was_mapped` (read from `Window.map_state` under the lock,
+   alongside the existing `parent` snapshot). Adds the
+   `server::tests::unmap_notify_fanout_reaches_only_subscribed_clients`
+   integration-style test alongside the existing `subscribers` tests.
 
 Each commit compiles, passes its tests, and ends with `cargo fmt`,
 `cargo clippy -- -W clippy::pedantic`, `cargo test`.
