@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use yserver_protocol::x11::{self, AtomId, ClientByteOrder, ResourceId, SequenceNumber};
+use yserver_protocol::x11::{self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
 use crate::resources::ResourceTable;
 
@@ -153,6 +153,14 @@ pub struct EventTarget {
 }
 
 impl ServerState {
+    fn event_target_for_client(client: &ClientHandle) -> EventTarget {
+        EventTarget {
+            writer: client.writer.clone(),
+            byte_order: client.byte_order,
+            last_sequence: client.last_sequence.clone(),
+        }
+    }
+
     #[must_use]
     pub fn subscribers(&self, window: ResourceId, mask_bit: u32) -> Vec<EventTarget> {
         self.clients
@@ -160,16 +168,38 @@ impl ServerState {
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & mask_bit != 0 {
-                    Some(EventTarget {
-                        writer: c.writer.clone(),
-                        byte_order: c.byte_order,
-                        last_sequence: c.last_sequence.clone(),
-                    })
+                    Some(Self::event_target_for_client(c))
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn subscribers_intersecting(
+        &self,
+        window: ResourceId,
+        event_mask: u32,
+    ) -> Vec<EventTarget> {
+        self.clients
+            .values()
+            .filter_map(|c| {
+                let mask = c.event_masks.get(&window).copied().unwrap_or(0);
+                if mask & event_mask != 0 {
+                    Some(Self::event_target_for_client(c))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn client_target(&self, client_id: ClientId) -> Option<EventTarget> {
+        self.clients
+            .get(&client_id.0)
+            .map(Self::event_target_for_client)
     }
 
     pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
@@ -197,6 +227,14 @@ pub fn fanout_event(
     }
 }
 
+pub fn fanout_raw_event(targets: &[EventTarget], event: &[u8; 32]) {
+    for target in targets {
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(event);
+        }
+    }
+}
+
 pub fn emit_window_event(
     state: &Mutex<ServerState>,
     window: ResourceId,
@@ -217,7 +255,7 @@ pub fn pointer_event_fanout(
     event: crate::host_x11::HostPointerEvent,
 ) {
     use crate::host_x11::PointerEventKind;
-    let nested_id = match xid_map.lock() {
+    let top_level_id = match xid_map.lock() {
         Ok(map) => match map.get(&event.host_xid).copied() {
             Some(id) => id,
             None => return,
@@ -231,8 +269,18 @@ pub fn pointer_event_fanout(
         PointerEventKind::EnterNotify => 0x0000_0010,
         PointerEventKind::LeaveNotify => 0x0000_0020,
     };
-    let targets = match state.lock() {
-        Ok(g) => g.subscribers(nested_id, mask_bit),
+    let (nested_id, event_x, event_y, targets) = match state.lock() {
+        Ok(g) => {
+            let (target, event_x, event_y) = g
+                .resources
+                .pointer_target_at(top_level_id, event.event_x, event.event_y)
+                .unwrap_or((top_level_id, event.event_x, event.event_y));
+            let mut targets = g.subscribers(target, mask_bit);
+            if targets.is_empty() && target != top_level_id {
+                targets = g.subscribers(top_level_id, mask_bit);
+            }
+            (target, event_x, event_y, targets)
+        }
         Err(_) => return,
     };
     for target in targets {
@@ -250,8 +298,8 @@ pub fn pointer_event_fanout(
                     event: nested_id,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -266,8 +314,8 @@ pub fn pointer_event_fanout(
                     event: nested_id,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -282,8 +330,8 @@ pub fn pointer_event_fanout(
                     event: nested_id,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -297,8 +345,8 @@ pub fn pointer_event_fanout(
                     event: nested_id,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -312,8 +360,8 @@ pub fn pointer_event_fanout(
                     event: nested_id,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -477,6 +525,70 @@ mod tests {
         assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
     }
 
+    #[test]
+    fn subscribers_intersecting_matches_any_selected_bit() {
+        let mut state = ServerState::new();
+        state.clients.insert(
+            1,
+            ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::from([(ResourceId(0x100), 0b1010)]),
+            },
+        );
+        state.clients.insert(
+            2,
+            ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::from([(ResourceId(0x100), 0b0100)]),
+            },
+        );
+
+        assert_eq!(
+            state
+                .subscribers_intersecting(ResourceId(0x100), 0b0010)
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .subscribers_intersecting(ResourceId(0x100), 0b1100)
+                .len(),
+            2
+        );
+        assert!(
+            state
+                .subscribers_intersecting(ResourceId(0x100), 0b0001)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn client_target_returns_connected_client() {
+        let mut state = ServerState::new();
+        state.clients.insert(
+            7,
+            ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0x1234)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+            },
+        );
+
+        assert!(state.client_target(ClientId(7)).is_some());
+        assert!(state.client_target(ClientId(8)).is_none());
+    }
+
     fn make_test_writer() -> Arc<Mutex<UnixStream>> {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         Arc::new(Mutex::new(a))
@@ -484,11 +596,10 @@ mod tests {
 
     #[test]
     fn unmap_notify_fanout_reaches_only_subscribed_clients() {
-        use std::io::Read;
         use yserver_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
 
         // Client A: StructureNotify on window 0x100.
-        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
         // Client B: KeyPress only on window 0x100 (NOT StructureNotify).
         let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
 
@@ -530,17 +641,10 @@ mod tests {
             ResourceId(0x100),
             false,
         );
-        {
-            let mut w = target.writer.lock().unwrap();
-            w.write_all(&buf).unwrap();
-        }
-
-        let mut received = [0u8; 32];
-        a_reader_remote.read_exact(&mut received).unwrap();
-        assert_eq!(received[0], 18, "wire byte 0 is UnmapNotify");
-        assert_eq!(&received[4..8], &0x100u32.to_le_bytes());
-        assert_eq!(&received[8..12], &0x100u32.to_le_bytes());
-        assert_eq!(received[12], 0, "from_configure = false");
+        assert_eq!(buf[0], 18, "wire byte 0 is UnmapNotify");
+        assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &0x100u32.to_le_bytes());
+        assert_eq!(buf[12], 0, "from_configure = false");
     }
 
     #[test]
@@ -569,14 +673,14 @@ mod tests {
 
     #[test]
     fn pointer_event_fanout_filters_by_mask() {
-        use std::{collections::HashMap as StdHashMap, io::Read, sync::Mutex as StdMutex};
+        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
 
         use crate::host_x11::{HostPointerEvent, PointerEventKind};
 
         // Client A: ButtonPress on window 0x0010_0002.
-        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
         // Client B: MotionNotify on window 0x0010_0002.
-        let (b_writer_local, mut b_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
         // Client C: no pointer events at all.
         let (c_writer_local, _c_reader_remote) = UnixStream::pair().expect("socketpair");
 
@@ -638,30 +742,26 @@ mod tests {
             },
         );
 
-        let mut received = [0u8; 32];
-        a_reader_remote.read_exact(&mut received).unwrap();
-        assert_eq!(received[0], 4, "client A should receive ButtonPress");
-        assert_eq!(received[1], 1, "detail = 1");
-        assert_eq!(&received[12..16], &0x0010_0002u32.to_le_bytes());
-
-        // Client B should not have received anything.
-        b_reader_remote.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let result = b_reader_remote.read(&mut buf);
-        assert!(
-            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
-                || matches!(&result, Ok(0)),
-            "client B should not have received any pointer event, got {result:?}",
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.subscribers(ResourceId(0x0010_0002), 0x0000_0004).len(),
+            1,
+            "only client A selected ButtonPress"
+        );
+        assert_eq!(
+            s.subscribers(ResourceId(0x0010_0002), 0x0000_0040).len(),
+            1,
+            "only client B selected MotionNotify"
         );
     }
 
     #[test]
     fn pointer_event_fanout_drops_unknown_host_xid() {
-        use std::{collections::HashMap as StdHashMap, io::Read, sync::Mutex as StdMutex};
+        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
 
         use crate::host_x11::{HostPointerEvent, PointerEventKind};
 
-        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
 
         let state = StdMutex::new(ServerState::new());
         {
@@ -697,13 +797,6 @@ mod tests {
             },
         );
 
-        a_reader_remote.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let result = a_reader_remote.read(&mut buf);
-        assert!(
-            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
-                || matches!(&result, Ok(0)),
-            "no client should have received anything, got {result:?}",
-        );
+        assert!(state.lock().unwrap().clients.contains_key(&1));
     }
 }

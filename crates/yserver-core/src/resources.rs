@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use yserver_protocol::x11::{
-    AtomId, ChangeWindowAttributesRequest, ClientId, ConfigureWindowRequest, CreateGcRequest,
-    CreatePixmapRequest, CreateWindowRequest, FontMetrics, GcChange, ResourceId,
+    AtomId, ChangeWindowAttributesRequest, ClientId, ClipRectangles, ConfigureWindowRequest,
+    CreateGcRequest, CreatePixmapRequest, CreateWindowRequest, FontMetrics, GcChange,
+    ReparentWindowRequest, ResourceId, SetClipRectanglesRequest,
 };
 
 use crate::properties::PropertyValue;
@@ -43,11 +44,48 @@ pub enum HostDrawableTarget {
 }
 
 impl HostDrawableTarget {
+    pub fn host_xid(self) -> u32 {
+        match self {
+            Self::Window { host_xid, .. } | Self::Pixmap { host_xid, .. } => host_xid,
+        }
+    }
+
+    pub fn x_offset(self) -> i16 {
+        match self {
+            Self::Window { x_offset, .. } => x_offset,
+            Self::Pixmap { .. } => 0,
+        }
+    }
+
+    pub fn y_offset(self) -> i16 {
+        match self {
+            Self::Window { y_offset, .. } => y_offset,
+            Self::Pixmap { .. } => 0,
+        }
+    }
+
     pub fn depth(self) -> u8 {
         match self {
             Self::Window { depth, .. } | Self::Pixmap { depth, .. } => depth,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReparentResult {
+    pub window: ResourceId,
+    pub old_parent: ResourceId,
+    pub new_parent: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub override_redirect: bool,
+    pub host_xid: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReparentWindowError {
+    BadWindow,
+    BadMatch,
 }
 
 #[derive(Debug)]
@@ -244,6 +282,143 @@ impl ResourceTable {
             .map_or(&[], |window| window.children.as_slice())
     }
 
+    pub fn mapped_children_bottom_to_top(&self, parent: ResourceId) -> Option<Vec<ResourceId>> {
+        let parent = self.windows.get(&parent.0)?;
+        Some(
+            parent
+                .children
+                .iter()
+                .copied()
+                .filter(|child| {
+                    self.windows
+                        .get(&child.0)
+                        .is_some_and(|w| w.map_state != MapState::Unmapped)
+                })
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn is_descendant_of(&self, candidate: ResourceId, ancestor: ResourceId) -> bool {
+        let mut current = candidate;
+        let mut seen = 0usize;
+        while current != ROOT_WINDOW && seen <= self.windows.len() {
+            let Some(window) = self.windows.get(&current.0) else {
+                return false;
+            };
+            if window.parent == ancestor {
+                return true;
+            }
+            if window.parent == current {
+                return false;
+            }
+            current = window.parent;
+            seen += 1;
+        }
+        false
+    }
+
+    pub fn window_owner(&self, id: ResourceId) -> Option<ClientId> {
+        self.windows.get(&id.0).map(|w| w.owner)
+    }
+
+    pub fn parent_of(&self, id: ResourceId) -> Option<ResourceId> {
+        self.windows.get(&id.0).map(|w| w.parent)
+    }
+
+    pub fn pointer_target_at(
+        &self,
+        top_level: ResourceId,
+        x: i16,
+        y: i16,
+    ) -> Option<(ResourceId, i16, i16)> {
+        let top = self.windows.get(&top_level.0)?;
+        if top.map_state == MapState::Unmapped {
+            return None;
+        }
+        let mut best = (top_level, x, y);
+        self.pointer_target_at_inner(top_level, x, y, &mut best);
+        Some(best)
+    }
+
+    fn pointer_target_at_inner(
+        &self,
+        parent: ResourceId,
+        parent_x: i16,
+        parent_y: i16,
+        best: &mut (ResourceId, i16, i16),
+    ) {
+        let Some(parent_window) = self.windows.get(&parent.0) else {
+            return;
+        };
+        for child_id in parent_window.children.iter().rev() {
+            let Some(child) = self.windows.get(&child_id.0) else {
+                continue;
+            };
+            if child.map_state == MapState::Unmapped {
+                continue;
+            }
+            let child_x = parent_x.wrapping_sub(child.x);
+            let child_y = parent_y.wrapping_sub(child.y);
+            if child_x < 0
+                || child_y < 0
+                || child_x >= i16::try_from(child.width).unwrap_or(i16::MAX)
+                || child_y >= i16::try_from(child.height).unwrap_or(i16::MAX)
+            {
+                continue;
+            }
+            *best = (*child_id, child_x, child_y);
+            self.pointer_target_at_inner(*child_id, child_x, child_y, best);
+            return;
+        }
+    }
+
+    pub fn reparent_window(
+        &mut self,
+        request: ReparentWindowRequest,
+    ) -> Result<ReparentResult, ReparentWindowError> {
+        if request.window == ROOT_WINDOW
+            || request.window == request.parent
+            || self.is_descendant_of(request.parent, request.window)
+        {
+            return Err(ReparentWindowError::BadMatch);
+        }
+        let Some(window) = self.windows.get(&request.window.0) else {
+            return Err(ReparentWindowError::BadWindow);
+        };
+        if !self.windows.contains_key(&request.parent.0) {
+            return Err(ReparentWindowError::BadWindow);
+        }
+
+        let old_parent = window.parent;
+        let override_redirect = window.override_redirect;
+        let host_xid = window.host_xid;
+
+        if let Some(parent) = self.windows.get_mut(&old_parent.0) {
+            parent.children.retain(|child| *child != request.window);
+        }
+        if let Some(parent) = self.windows.get_mut(&request.parent.0) {
+            parent.children.push(request.window);
+        }
+        let window = self
+            .windows
+            .get_mut(&request.window.0)
+            .expect("window validated above");
+        window.parent = request.parent;
+        window.x = request.x;
+        window.y = request.y;
+
+        Ok(ReparentResult {
+            window: request.window,
+            old_parent,
+            new_parent: request.parent,
+            x: request.x,
+            y: request.y,
+            override_redirect,
+            host_xid,
+        })
+    }
+
     #[must_use]
     pub fn window_property(&self, w: ResourceId, atom: AtomId) -> Option<&PropertyValue> {
         self.windows.get(&w.0)?.properties.get(&atom)
@@ -326,6 +501,7 @@ impl ResourceTable {
                 background: request.background.unwrap_or(0x00ff_ffff),
                 line_width: request.line_width.unwrap_or(0),
                 font: request.font,
+                clip_rectangles: None,
                 owner,
             },
         );
@@ -339,6 +515,7 @@ impl ResourceTable {
             background: 0x00ff_ffff,
             line_width: 0,
             font: None,
+            clip_rectangles: None,
             owner: SERVER_OWNER,
         });
         if let Some(foreground) = request.foreground {
@@ -355,6 +532,20 @@ impl ResourceTable {
         }
     }
 
+    pub fn set_clip_rectangles(&mut self, request: SetClipRectanglesRequest) {
+        let gc = self.gcs.entry(request.gc.0).or_insert(Gc {
+            id: request.gc,
+            drawable: ResourceId(0),
+            foreground: 0,
+            background: 0x00ff_ffff,
+            line_width: 0,
+            font: None,
+            clip_rectangles: None,
+            owner: SERVER_OWNER,
+        });
+        gc.clip_rectangles = Some(request.clip);
+    }
+
     pub fn free_gc(&mut self, id: ResourceId) {
         self.gcs.remove(&id.0);
     }
@@ -369,6 +560,10 @@ impl ResourceTable {
 
     pub fn gc_background(&self, id: ResourceId) -> u32 {
         self.gc(id).map_or(0x00ff_ffff, |gc| gc.background)
+    }
+
+    pub fn gc_clip_rectangles(&self, id: ResourceId) -> Option<ClipRectangles> {
+        self.gc(id).and_then(|gc| gc.clip_rectangles.clone())
     }
 
     pub fn install_font(
@@ -585,6 +780,7 @@ pub struct Gc {
     pub background: u32,
     pub line_width: u16,
     pub font: Option<ResourceId>,
+    pub clip_rectangles: Option<ClipRectangles>,
     pub owner: ClientId,
 }
 
@@ -936,6 +1132,162 @@ mod tests {
         } else {
             panic!("Expected Window variant with depth 32");
         }
+    }
+
+    #[test]
+    fn is_descendant_of_handles_child_grandchild_and_unrelated() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 0, 0);
+        make_child(&mut table, 0x0010_0004, 0x0010_0003, 0, 0);
+        make_window(&mut table, 0x0010_0005);
+
+        assert!(table.is_descendant_of(ResourceId(0x0010_0003), ResourceId(0x0010_0002)));
+        assert!(table.is_descendant_of(ResourceId(0x0010_0004), ResourceId(0x0010_0002)));
+        assert!(!table.is_descendant_of(ResourceId(0x0010_0005), ResourceId(0x0010_0002)));
+        assert!(!table.is_descendant_of(ResourceId(0xdead_beef), ResourceId(0x0010_0002)));
+    }
+
+    #[test]
+    fn mapped_children_bottom_to_top_filters_unmapped_and_preserves_order() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 0, 0);
+        make_child(&mut table, 0x0010_0004, 0x0010_0002, 0, 0);
+        make_child(&mut table, 0x0010_0005, 0x0010_0002, 0, 0);
+        table.map_window(ResourceId(0x0010_0003));
+        table.map_window(ResourceId(0x0010_0005));
+
+        assert_eq!(
+            table.mapped_children_bottom_to_top(ResourceId(0x0010_0002)),
+            Some(vec![ResourceId(0x0010_0003), ResourceId(0x0010_0005)])
+        );
+        assert_eq!(
+            table.mapped_children_bottom_to_top(ResourceId(0xdead_beef)),
+            None
+        );
+    }
+
+    #[test]
+    fn reparent_window_moves_child_and_updates_position() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_window(&mut table, 0x0010_0003);
+        make_child(&mut table, 0x0010_0004, 0x0010_0002, 1, 2);
+
+        let result = table
+            .reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0004),
+                parent: ResourceId(0x0010_0003),
+                x: 10,
+                y: 20,
+            })
+            .unwrap();
+
+        assert_eq!(result.old_parent, ResourceId(0x0010_0002));
+        assert_eq!(result.new_parent, ResourceId(0x0010_0003));
+        assert!(
+            !table
+                .children(ResourceId(0x0010_0002))
+                .contains(&ResourceId(0x0010_0004))
+        );
+        assert_eq!(
+            table.children(ResourceId(0x0010_0003)),
+            &[ResourceId(0x0010_0004)]
+        );
+        let window = table.window(ResourceId(0x0010_0004)).unwrap();
+        assert_eq!(window.parent, ResourceId(0x0010_0003));
+        assert_eq!((window.x, window.y), (10, 20));
+    }
+
+    #[test]
+    fn reparent_window_rejects_invalid_relationships() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 0, 0);
+
+        assert_eq!(
+            table.reparent_window(ReparentWindowRequest {
+                window: ROOT_WINDOW,
+                parent: ResourceId(0x0010_0002),
+                x: 0,
+                y: 0,
+            }),
+            Err(ReparentWindowError::BadMatch)
+        );
+        assert_eq!(
+            table.reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0002),
+                parent: ResourceId(0x0010_0002),
+                x: 0,
+                y: 0,
+            }),
+            Err(ReparentWindowError::BadMatch)
+        );
+        assert_eq!(
+            table.reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0002),
+                parent: ResourceId(0x0010_0003),
+                x: 0,
+                y: 0,
+            }),
+            Err(ReparentWindowError::BadMatch)
+        );
+    }
+
+    #[test]
+    fn reparent_window_rejects_unknown_windows() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+
+        assert_eq!(
+            table.reparent_window(ReparentWindowRequest {
+                window: ResourceId(0xdead_beef),
+                parent: ResourceId(0x0010_0002),
+                x: 0,
+                y: 0,
+            }),
+            Err(ReparentWindowError::BadWindow)
+        );
+        assert_eq!(
+            table.reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0002),
+                parent: ResourceId(0xdead_beef),
+                x: 0,
+                y: 0,
+            }),
+            Err(ReparentWindowError::BadWindow)
+        );
+    }
+
+    #[test]
+    fn pointer_target_at_returns_deepest_mapped_child_and_relative_coords() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        make_child(&mut table, 0x0010_0004, 0x0010_0003, 5, 6);
+        table.map_window(ResourceId(0x0010_0002));
+        table.map_window(ResourceId(0x0010_0003));
+        table.map_window(ResourceId(0x0010_0004));
+
+        assert_eq!(
+            table.pointer_target_at(ResourceId(0x0010_0002), 20, 30),
+            Some((ResourceId(0x0010_0004), 5, 4))
+        );
+    }
+
+    #[test]
+    fn pointer_target_at_falls_back_to_top_level_outside_children() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        table.map_window(ResourceId(0x0010_0002));
+        table.map_window(ResourceId(0x0010_0003));
+
+        assert_eq!(
+            table.pointer_target_at(ResourceId(0x0010_0002), 2, 3),
+            Some((ResourceId(0x0010_0002), 2, 3))
+        );
     }
 
     proptest! {

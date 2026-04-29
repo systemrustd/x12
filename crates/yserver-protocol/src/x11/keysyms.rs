@@ -59,10 +59,15 @@ pub(super) fn keysyms_for_keycode(keycode: u8) -> (u32, u32) {
         64 => (0xffe9, 0xffe9),  // Alt_L
         105 => (0xffe4, 0xffe4), // Control_R
         108 => (0xffea, 0xffea), // Alt_R
+        110 => (0xff50, 0xff50), // Home
         113 => (0xff51, 0xff51), // Left
         114 => (0xff53, 0xff53), // Right
+        115 => (0xff57, 0xff57), // End
         111 => (0xff52, 0xff52), // Up
         116 => (0xff54, 0xff54), // Down
+        112 => (0xff55, 0xff55), // Page_Up
+        117 => (0xff56, 0xff56), // Page_Down
+        118 => (0xff63, 0xff63), // Insert
         119 => (0xffff, 0xffff), // Delete
         133 => (0xffeb, 0xffeb), // Super_L
         134 => (0xffec, 0xffec), // Super_R

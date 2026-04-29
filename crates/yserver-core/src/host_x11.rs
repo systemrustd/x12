@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use yserver_protocol::x11::{self, FontMetrics, ResourceId};
+use yserver_protocol::x11::{self, ClipRectangles, FontMetrics, ResourceId};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 
@@ -17,8 +17,17 @@ pub struct HostX11 {
     gc_id: u32,
     current_foreground: u32,
     current_background: u32,
+    current_clip: Option<HostClipRectangles>,
     sequence: u16,
     next_xid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostClipRectangles {
+    pub ordering: u8,
+    pub x_origin: i16,
+    pub y_origin: i16,
+    pub rectangles: Vec<u8>,
 }
 
 pub type HostXidMap = Arc<Mutex<HashMap<u32, ResourceId>>>;
@@ -60,6 +69,7 @@ impl HostX11 {
             gc_id,
             current_foreground: setup.black_pixel,
             current_background: setup.white_pixel,
+            current_clip: None,
             sequence: 5,
             next_xid: setup.resource_id_base + 3,
         })
@@ -376,6 +386,63 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn set_clip_rectangles(
+        &mut self,
+        clip: Option<ClipRectangles>,
+        x_offset: i16,
+        y_offset: i16,
+    ) -> io::Result<()> {
+        let clip = clip.map(|clip| HostClipRectangles {
+            ordering: clip.ordering,
+            x_origin: clip.x_origin.wrapping_add(x_offset),
+            y_origin: clip.y_origin.wrapping_add(y_offset),
+            rectangles: clip.rectangles,
+        });
+        self.set_host_clip_rectangles(clip)
+    }
+
+    pub fn clear_clip_rectangles(&mut self) -> io::Result<()> {
+        self.set_host_clip_rectangles(None)
+    }
+
+    fn set_host_clip_rectangles(&mut self, clip: Option<HostClipRectangles>) -> io::Result<()> {
+        if self.current_clip == clip {
+            return Ok(());
+        }
+
+        if let Some(clip) = &clip {
+            let length_units = 3 + u16::try_from(clip.rectangles.len() / 4).map_err(|_| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "too many clip rectangles for one X11 request",
+                )
+            })?;
+            self.sequence = self.sequence.wrapping_add(1);
+            let mut out = Vec::new();
+            out.push(59); // SetClipRectangles
+            out.push(clip.ordering);
+            write_u16(&mut out, length_units);
+            write_u32(&mut out, self.gc_id);
+            write_i16(&mut out, clip.x_origin);
+            write_i16(&mut out, clip.y_origin);
+            out.extend_from_slice(&clip.rectangles);
+            self.stream.write_all(&out)?;
+        } else {
+            self.sequence = self.sequence.wrapping_add(1);
+            let mut out = Vec::new();
+            out.push(56); // ChangeGC
+            out.push(0);
+            write_u16(&mut out, 4);
+            write_u32(&mut out, self.gc_id);
+            write_u32(&mut out, 1 << 19); // clip-mask
+            write_u32(&mut out, 0); // None
+            self.stream.write_all(&out)?;
+        }
+
+        self.current_clip = clip;
+        self.stream.flush()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn copy_area(
         &mut self,
@@ -448,9 +515,28 @@ impl HostX11 {
         self.draw_arcs(host_xid, 68, foreground, arcs)
     }
 
+    pub fn poly_rectangle(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        rectangles: &[u8],
+    ) -> io::Result<()> {
+        self.draw_rectangles(host_xid, 67, foreground, rectangles)
+    }
+
     pub fn poly_fill_rectangle(
         &mut self,
         host_xid: u32,
+        foreground: u32,
+        rectangles: &[u8],
+    ) -> io::Result<()> {
+        self.draw_rectangles(host_xid, 70, foreground, rectangles)
+    }
+
+    fn draw_rectangles(
+        &mut self,
+        host_xid: u32,
+        opcode: u8,
         foreground: u32,
         rectangles: &[u8],
     ) -> io::Result<()> {
@@ -469,7 +555,7 @@ impl HostX11 {
         })?;
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
-        out.push(70);
+        out.push(opcode);
         out.push(0);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
@@ -547,6 +633,35 @@ impl HostX11 {
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(76);
+        out.push(text_len);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(&body[8..12]);
+        out.extend_from_slice(text);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn image_text16(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
+    ) -> io::Result<()> {
+        if body.len() < 12 {
+            return Ok(());
+        }
+        self.change_colors(foreground, background)?;
+
+        let text = &body[12..];
+        let length_units = 4 + u16::try_from(text.len() / 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(77);
         out.push(text_len);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);

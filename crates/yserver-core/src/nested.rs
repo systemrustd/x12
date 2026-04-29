@@ -19,9 +19,9 @@ use yserver_protocol::x11::{
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
     resources::{
-        HostDrawableTarget, MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, Window,
+        MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ReparentWindowError, Window,
     },
-    server::{ClientHandle, ServerState, fanout_event},
+    server::{ClientHandle, EventTarget, ServerState, fanout_event, fanout_raw_event},
 };
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
@@ -169,6 +169,32 @@ fn collect_destroy_order(
     out.push(root);
 }
 
+struct PendingDestroy {
+    window: ResourceId,
+    parent: ResourceId,
+    was_mapped: bool,
+    host_xid: Option<u32>,
+    on_window: Vec<EventTarget>,
+    on_parent: Vec<EventTarget>,
+}
+
+fn fanout_destroy_sequence(pending: &PendingDestroy) {
+    if pending.was_mapped {
+        fanout_event(&pending.on_window, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, pending.window, pending.window, false);
+        });
+        fanout_event(&pending.on_parent, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, pending.parent, pending.window, false);
+        });
+    }
+    fanout_event(&pending.on_window, |buf, seq, order| {
+        x11::encode_destroy_notify_event(buf, seq, order, pending.window, pending.window);
+    });
+    fanout_event(&pending.on_parent, |buf, seq, order| {
+        x11::encode_destroy_notify_event(buf, seq, order, pending.parent, pending.window);
+    });
+}
+
 // `server` and `host` are Arc clones that are logically "owned" by this
 // thread; `input_handle` holds a shared handle we keep alive for the session.
 // Clippy pedantic flags these as needless_pass_by_value but they cannot be
@@ -312,15 +338,7 @@ fn handle_client(
         s.resources
             .collect_owned_window_roots(client_id, &mut owned_roots);
 
-        #[allow(clippy::type_complexity)]
-        let mut pending: Vec<(
-            ResourceId,
-            ResourceId,
-            bool,
-            Option<u32>,
-            Vec<crate::server::EventTarget>,
-            Vec<crate::server::EventTarget>,
-        )> = Vec::new();
+        let mut pending: Vec<PendingDestroy> = Vec::new();
         let mut all_destroyed: Vec<ResourceId> = Vec::new();
         for root in owned_roots {
             let mut order = Vec::new();
@@ -338,7 +356,14 @@ fn handle_client(
                         });
                 let on_w = s.subscribers(*w, 0x0002_0000);
                 let on_p = s.subscribers(parent, 0x0008_0000);
-                pending.push((*w, parent, was_mapped, host_xid, on_w, on_p));
+                pending.push(PendingDestroy {
+                    window: *w,
+                    parent,
+                    was_mapped,
+                    host_xid,
+                    on_window: on_w,
+                    on_parent: on_p,
+                });
             }
             let _ = s.resources.destroy_window(root);
             all_destroyed.extend(order);
@@ -348,8 +373,8 @@ fn handle_client(
         s.clients.remove(&client_id.0);
         (fonts, freed_pixmaps, pending)
     };
-    for (w, parent, was_mapped, host_xid, subs_w, subs_p) in pending_destroys {
-        if let Some(xid) = host_xid {
+    for pending in pending_destroys {
+        if let Some(xid) = pending.host_xid {
             if let Some(host) = host.as_ref()
                 && let Ok(mut h) = host.lock()
             {
@@ -359,20 +384,7 @@ fn handle_client(
                 input_handle.unregister_top_level(xid);
             }
         }
-        if was_mapped {
-            fanout_event(&subs_w, |buf, seq, order| {
-                x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
-            });
-            fanout_event(&subs_p, |buf, seq, order| {
-                x11::encode_unmap_notify_event(buf, seq, order, parent, w, false);
-            });
-        }
-        fanout_event(&subs_w, |buf, seq, order| {
-            x11::encode_destroy_notify_event(buf, seq, order, w, w);
-        });
-        fanout_event(&subs_p, |buf, seq, order| {
-            x11::encode_destroy_notify_event(buf, seq, order, parent, w);
-        });
+        fanout_destroy_sequence(&pending);
     }
     if let Some(host) = host.as_ref()
         && let Ok(mut h) = host.lock()
@@ -699,15 +711,7 @@ fn handle_request(
                     let mut s = lock_server(server)?;
                     let mut order = Vec::new();
                     collect_destroy_order(&s.resources, window, &mut order);
-                    #[allow(clippy::type_complexity)]
-                    let mut pending: Vec<(
-                        ResourceId,
-                        ResourceId,
-                        bool,
-                        Option<u32>,
-                        Vec<crate::server::EventTarget>,
-                        Vec<crate::server::EventTarget>,
-                    )> = Vec::new();
+                    let mut pending: Vec<PendingDestroy> = Vec::new();
                     for w in &order {
                         let (parent, was_mapped, host_xid) =
                             s.resources
@@ -721,14 +725,21 @@ fn handle_request(
                                 });
                         let on_window = s.subscribers(*w, 0x0002_0000); // StructureNotify
                         let on_parent = s.subscribers(parent, 0x0008_0000); // SubstructureNotify
-                        pending.push((*w, parent, was_mapped, host_xid, on_window, on_parent));
+                        pending.push(PendingDestroy {
+                            window: *w,
+                            parent,
+                            was_mapped,
+                            host_xid,
+                            on_window,
+                            on_parent,
+                        });
                     }
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
                     pending
                 };
-                for (w, parent, was_mapped, host_xid, subs_w, subs_p) in pending {
-                    if let Some(xid) = host_xid {
+                for pending in pending {
+                    if let Some(xid) = pending.host_xid {
                         if let Some(host) = host
                             && let Ok(mut h) = host.lock()
                         {
@@ -738,25 +749,89 @@ fn handle_request(
                             input_handle.unregister_top_level(xid);
                         }
                     }
-                    if was_mapped {
-                        fanout_event(&subs_w, |buf, seq, order| {
-                            x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
-                        });
-                        fanout_event(&subs_p, |buf, seq, order| {
-                            x11::encode_unmap_notify_event(buf, seq, order, parent, w, false);
-                        });
-                    }
-                    fanout_event(&subs_w, |buf, seq, order| {
-                        x11::encode_destroy_notify_event(buf, seq, order, w, w);
-                    });
-                    fanout_event(&subs_p, |buf, seq, order| {
-                        x11::encode_destroy_notify_event(buf, seq, order, parent, w);
-                    });
+                    fanout_destroy_sequence(&pending);
                 }
             }
             log_void(client_id, sequence, "DestroyWindow")
         }
-        7 => log_void(client_id, sequence, "ReparentWindow"),
+        7 => {
+            if let Some(request) = x11::reparent_window_request(body) {
+                let snapshot = {
+                    let mut s = lock_server(server)?;
+                    match s.resources.reparent_window(request) {
+                        Ok(result) => {
+                            let on_window = s.subscribers(result.window, 0x0002_0000);
+                            let on_old_parent = s.subscribers(result.old_parent, 0x0008_0000);
+                            let on_new_parent = if result.old_parent == result.new_parent {
+                                Vec::new()
+                            } else {
+                                s.subscribers(result.new_parent, 0x0008_0000)
+                            };
+                            Ok((result, on_window, on_old_parent, on_new_parent))
+                        }
+                        Err(ReparentWindowError::BadWindow) => {
+                            Err((x11::error::BAD_WINDOW, request.window.0))
+                        }
+                        Err(ReparentWindowError::BadMatch) => {
+                            Err((x11::error::BAD_MATCH, request.window.0))
+                        }
+                    }
+                };
+                let (result, on_window, on_old_parent, on_new_parent) = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err((code, bad_value)) => {
+                        return emit_x11_error(writer, sequence, code, bad_value, 7);
+                    }
+                };
+                if let Some(xid) = result.host_xid
+                    && result.new_parent == ROOT_WINDOW
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    let _ = h.configure_subwindow(xid, Some(result.x), Some(result.y), None, None);
+                }
+                fanout_event(&on_window, |buf, seq, order| {
+                    x11::encode_reparent_notify_event(
+                        buf,
+                        seq,
+                        order,
+                        result.window,
+                        result.window,
+                        result.new_parent,
+                        result.x,
+                        result.y,
+                        result.override_redirect,
+                    );
+                });
+                fanout_event(&on_old_parent, |buf, seq, order| {
+                    x11::encode_reparent_notify_event(
+                        buf,
+                        seq,
+                        order,
+                        result.old_parent,
+                        result.window,
+                        result.new_parent,
+                        result.x,
+                        result.y,
+                        result.override_redirect,
+                    );
+                });
+                fanout_event(&on_new_parent, |buf, seq, order| {
+                    x11::encode_reparent_notify_event(
+                        buf,
+                        seq,
+                        order,
+                        result.new_parent,
+                        result.window,
+                        result.new_parent,
+                        result.x,
+                        result.y,
+                        result.override_redirect,
+                    );
+                });
+            }
+            log_void(client_id, sequence, "ReparentWindow")
+        }
         8 => {
             if let Some(window) = x11::map_window_id(body) {
                 let (map_info, host_xid) = {
@@ -903,6 +978,58 @@ fn handle_request(
                 }
             }
             log_void(client_id, sequence, "UnmapWindow")
+        }
+        11 => {
+            if let Some(parent) = x11::map_window_id(body) {
+                struct PendingUnmap {
+                    child: ResourceId,
+                    host_xid: Option<u32>,
+                    on_child: Vec<EventTarget>,
+                    on_parent: Vec<EventTarget>,
+                }
+                let pending = {
+                    let mut s = lock_server(server)?;
+                    let Some(children) = s.resources.mapped_children_bottom_to_top(parent) else {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_WINDOW,
+                            parent.0,
+                            11,
+                        );
+                    };
+                    let mut pending = Vec::new();
+                    for child in children {
+                        let host_xid = s.resources.window(child).and_then(|w| w.host_xid);
+                        if s.resources.unmap_window(child) {
+                            pending.push(PendingUnmap {
+                                child,
+                                host_xid,
+                                on_child: s.subscribers(child, 0x0002_0000),
+                                on_parent: s.subscribers(parent, 0x0008_0000),
+                            });
+                        }
+                    }
+                    pending
+                };
+                for item in pending {
+                    if let Some(xid) = item.host_xid
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.unmap_subwindow(xid);
+                    }
+                    fanout_event(&item.on_child, |buf, seq, order| {
+                        x11::encode_unmap_notify_event(
+                            buf, seq, order, item.child, item.child, false,
+                        );
+                    });
+                    fanout_event(&item.on_parent, |buf, seq, order| {
+                        x11::encode_unmap_notify_event(buf, seq, order, parent, item.child, false);
+                    });
+                }
+            }
+            log_void(client_id, sequence, "UnmapSubwindows")
         }
         12 => {
             if let Some(request) = x11::configure_window_request(body) {
@@ -1308,7 +1435,97 @@ fn handle_request(
             log_reply(client_id, sequence, "GetSelectionOwner");
             x11::write_get_selection_owner_reply(&mut *lock_writer()?, sequence, ResourceId(0))
         }
-        25 => log_void(client_id, sequence, "SendEvent"),
+        25 => {
+            if let Some(req) = x11::send_event_request(header.data, body) {
+                let event_type = req.event[0] & 0x7f;
+                if event_type != 33 {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(event_type),
+                        25,
+                    );
+                }
+                let format = req.event[1];
+                if !matches!(format, 8 | 16 | 32) {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(format),
+                        25,
+                    );
+                }
+                let message_window = ResourceId(u32::from_le_bytes(
+                    req.event[4..8].try_into().expect("fixed slice"),
+                ));
+                let message_type = AtomId(u32::from_le_bytes(
+                    req.event[8..12].try_into().expect("fixed slice"),
+                ));
+
+                let targets = {
+                    let s = lock_server(server)?;
+                    if s.resources.window(req.destination).is_none() {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_WINDOW,
+                            req.destination.0,
+                            25,
+                        );
+                    }
+                    if message_window != req.destination
+                        && s.resources.window(message_window).is_none()
+                    {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_WINDOW,
+                            message_window.0,
+                            25,
+                        );
+                    }
+                    if !s.atoms.exists(message_type) {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_ATOM,
+                            message_type.0,
+                            25,
+                        );
+                    }
+
+                    if req.event_mask == 0 {
+                        s.resources
+                            .window_owner(req.destination)
+                            .and_then(|owner| s.client_target(owner))
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    } else {
+                        let mut current = req.destination;
+                        loop {
+                            let targets = s.subscribers_intersecting(current, req.event_mask);
+                            if !targets.is_empty() || !req.propagate {
+                                break targets;
+                            }
+                            let Some(parent) = s.resources.parent_of(current) else {
+                                break Vec::new();
+                            };
+                            if parent == current {
+                                break Vec::new();
+                            }
+                            current = parent;
+                        }
+                    }
+                };
+
+                let mut event = *req.event;
+                event[0] |= 0x80;
+                fanout_raw_event(&targets, &event);
+            }
+            log_void(client_id, sequence, "SendEvent")
+        }
         26 => {
             log_reply(client_id, sequence, "GrabPointer");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
@@ -1603,7 +1820,13 @@ fn handle_request(
             }
             log_void(client_id, sequence, "ChangeGC")
         }
-        59 => log_void(client_id, sequence, "SetClipRectangles"),
+        59 => {
+            if let Some(request) = x11::set_clip_rectangles_request(header.data, body) {
+                let mut s = lock_server(server)?;
+                s.resources.set_clip_rectangles(request);
+            }
+            log_void(client_id, sequence, "SetClipRectangles")
+        }
         60 => {
             if let Some(gc) = x11::free_resource_id(body) {
                 let mut s = lock_server(server)?;
@@ -1622,12 +1845,8 @@ fn handle_request(
                     let target = s.resources.top_level_host_target(request.window);
                     (extents, target)
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some((background_pixel, w_width, w_height)) = extents
                     && let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                 {
                     let width = clear_extent(request.width, request.x, w_width);
                     let height = clear_extent(request.height, request.y, w_height);
@@ -1636,11 +1855,12 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
+                        host.clear_clip_rectangles()?;
                         host.fill_rectangle(
                             target.host_xid,
                             background_pixel,
-                            request.x,
-                            request.y,
+                            translate_i16(request.x, target.x_offset),
+                            translate_i16(request.y, target.y_offset),
                             width,
                             height,
                         )?;
@@ -1655,7 +1875,7 @@ fn handle_request(
                     return log_void(client_id, sequence, "CopyArea");
                 }
 
-                let (gc_exists, src_exists, dst_exists, src, dst) = {
+                let (gc_exists, src_exists, dst_exists, clip, src, dst) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc(request.gc).is_some(),
@@ -1663,6 +1883,7 @@ fn handle_request(
                             || s.resources.pixmap(request.src).is_some(),
                         s.resources.window(request.dst).is_some()
                             || s.resources.pixmap(request.dst).is_some(),
+                        s.resources.gc_clip_rectangles(request.gc),
                         s.resources.host_drawable_target(request.src),
                         s.resources.host_drawable_target(request.dst),
                     )
@@ -1699,18 +1920,17 @@ fn handle_request(
                             62,
                         );
                     }
-                    if let (Some(src_host_xid), Some(dst_host_xid)) =
-                        (routed_host_xid(src), routed_host_xid(dst))
-                        && let Some(host) = host
+                    if let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
+                        host.set_clip_rectangles(clip, dst.x_offset(), dst.y_offset())?;
                         host.copy_area(
-                            src_host_xid,
-                            dst_host_xid,
-                            request.src_x,
-                            request.src_y,
-                            request.dst_x,
-                            request.dst_y,
+                            src.host_xid(),
+                            dst.host_xid(),
+                            translate_i16(request.src_x, src.x_offset()),
+                            translate_i16(request.src_y, src.y_offset()),
+                            translate_i16(request.dst_x, dst.x_offset()),
+                            translate_i16(request.dst_y, dst.y_offset()),
                             request.width,
                             request.height,
                         )?;
@@ -1724,48 +1944,70 @@ fn handle_request(
             if let Some((gc_id, points)) = x11::poly_line_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, target) = {
+                let (foreground, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
                         s.resources.top_level_host_target(drawable),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_line(target.host_xid, foreground, header.data, points)?;
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_points(points, header.data, target.x_offset, target.y_offset);
+                    host.poly_line(target.host_xid, foreground, header.data, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyLine")
         }
         66 => log_void(client_id, sequence, "PolySegment"),
-        67 => log_void(client_id, sequence, "PolyRectangle"),
+        67 => {
+            if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_records(rectangles, 8, target.x_offset, target.y_offset);
+                    host.poly_rectangle(target.host_xid, foreground, &translated)?;
+                }
+            }
+            log_void(client_id, sequence, "PolyRectangle")
+        }
         68 => {
             if let Some((gc_id, arcs)) = x11::poly_arc_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, target) = {
+                let (foreground, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
                         s.resources.top_level_host_target(drawable),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_arc(target.host_xid, foreground, arcs)?;
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated = translated_records(arcs, 12, target.x_offset, target.y_offset);
+                    host.poly_arc(target.host_xid, foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyArc")
@@ -1775,22 +2017,22 @@ fn handle_request(
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, target) = {
+                let (foreground, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
                         s.resources.top_level_host_target(drawable),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_fill_rectangle(target.host_xid, foreground, rectangles)?;
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_records(rectangles, 8, target.x_offset, target.y_offset);
+                    host.poly_fill_rectangle(target.host_xid, foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillRectangle")
@@ -1799,22 +2041,21 @@ fn handle_request(
             if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, target) = {
+                let (foreground, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
                         s.resources.top_level_host_target(drawable),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_fill_arc(target.host_xid, foreground, arcs)?;
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated = translated_records(arcs, 12, target.x_offset, target.y_offset);
+                    host.poly_fill_arc(target.host_xid, foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillArc")
@@ -1825,12 +2066,13 @@ fn handle_request(
                     return log_void(client_id, sequence, "PutImage");
                 }
 
-                let (gc_exists, drawable_exists, target) = {
+                let (gc_exists, drawable_exists, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc(request.gc).is_some(),
                         s.resources.window(request.drawable).is_some()
                             || s.resources.pixmap(request.drawable).is_some(),
+                        s.resources.gc_clip_rectangles(request.gc),
                         s.resources.host_drawable_target(request.drawable),
                     )
                 };
@@ -1873,17 +2115,17 @@ fn handle_request(
                         return log_void(client_id, sequence, "PutImage");
                     }
 
-                    if let Some(host_xid) = routed_host_xid(target)
-                        && let Some(host) = host
+                    if let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
+                        host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                         host.put_image(
-                            host_xid,
+                            target.host_xid(),
                             request.depth,
                             request.width,
                             request.height,
-                            request.dst_x,
-                            request.dst_y,
+                            translate_i16(request.dst_x, target.x_offset()),
+                            translate_i16(request.dst_y, target.y_offset()),
                             &request.data[..expected_len],
                         )?;
                     }
@@ -1894,22 +2136,22 @@ fn handle_request(
         74 => {
             if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
                 let drawable = ResourceId(drawable_raw);
-                let (foreground, target) = {
+                let (foreground, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
                         s.resources.top_level_host_target(drawable),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_text8(target.host_xid, foreground, text_body)?;
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_text_body(text_body, target.x_offset, target.y_offset);
+                    host.poly_text8(target.host_xid, foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyText8")
@@ -1919,32 +2161,64 @@ fn handle_request(
                 debug!("focus text drawable 0x{drawable:x}");
                 set_focused_window(focused_window, server, ResourceId(drawable))?;
                 let gc = ResourceId(gc_id);
-                let (foreground, background, target) = {
+                let (foreground, background, clip, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(gc),
                         s.resources.gc_background(gc),
+                        s.resources.gc_clip_rectangles(gc),
                         s.resources.top_level_host_target(ResourceId(drawable)),
                     )
                 };
-                // Phase 1: only route to top-level drawables (no coordinate
-                // translation for child windows).
                 if let Some(target) = target
-                    && target.x_offset == 0
-                    && target.y_offset == 0
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_text_body(text_body, target.x_offset, target.y_offset);
                     host.image_text8(
                         target.host_xid,
                         foreground,
                         background,
                         header.data,
-                        text_body,
+                        &translated,
                     )?;
                 }
             }
             log_void(client_id, sequence, "ImageText8")
+        }
+        77 => {
+            if let Some((drawable, gc_id, text_body)) = x11::image_text8_data(body) {
+                debug!("focus text drawable 0x{drawable:x}");
+                set_focused_window(focused_window, server, ResourceId(drawable))?;
+                let gc = ResourceId(gc_id);
+                let (foreground, background, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(gc),
+                        s.resources.gc_background(gc),
+                        s.resources.gc_clip_rectangles(gc),
+                        s.resources.top_level_host_target(ResourceId(drawable)),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    let translated =
+                        translated_text_body(text_body, target.x_offset, target.y_offset);
+                    host.image_text16(
+                        target.host_xid,
+                        foreground,
+                        background,
+                        header.data,
+                        &translated,
+                    )?;
+                }
+            }
+            log_void(client_id, sequence, "ImageText16")
         }
         78 => log_void(client_id, sequence, "CreateColormap"),
         84 => {
@@ -2113,18 +2387,56 @@ fn zpixmap_expected_len(width: u16, height: u16, depth: u8) -> Option<usize> {
     stride_bytes.checked_mul(usize::from(height))
 }
 
-#[allow(clippy::match_same_arms)] // Window zero-offset and Pixmap are semantically distinct
-fn routed_host_xid(target: HostDrawableTarget) -> Option<u32> {
-    match target {
-        HostDrawableTarget::Window {
-            host_xid,
-            x_offset: 0,
-            y_offset: 0,
-            ..
-        } => Some(host_xid),
-        HostDrawableTarget::Pixmap { host_xid, .. } => Some(host_xid),
-        HostDrawableTarget::Window { .. } => None,
+fn translate_i16(value: i16, offset: i16) -> i16 {
+    value.wrapping_add(offset)
+}
+
+fn read_i16_from(bytes: &[u8], offset: usize) -> Option<i16> {
+    Some(i16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn write_i16_to(bytes: &mut [u8], offset: usize, value: i16) -> Option<()> {
+    bytes
+        .get_mut(offset..offset + 2)?
+        .copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+fn translate_i16_pair(bytes: &mut [u8], offset: usize, x_offset: i16, y_offset: i16) -> Option<()> {
+    let x = translate_i16(read_i16_from(bytes, offset)?, x_offset);
+    let y = translate_i16(read_i16_from(bytes, offset + 2)?, y_offset);
+    write_i16_to(bytes, offset, x)?;
+    write_i16_to(bytes, offset + 2, y)
+}
+
+fn translated_records(data: &[u8], record_len: usize, x_offset: i16, y_offset: i16) -> Vec<u8> {
+    let mut out = data.to_vec();
+    for record in out.chunks_exact_mut(record_len) {
+        let _ = translate_i16_pair(record, 0, x_offset, y_offset);
     }
+    out
+}
+
+fn translated_points(points: &[u8], coordinate_mode: u8, x_offset: i16, y_offset: i16) -> Vec<u8> {
+    let mut out = points.to_vec();
+    if coordinate_mode == 0 {
+        for point in out.chunks_exact_mut(4) {
+            let _ = translate_i16_pair(point, 0, x_offset, y_offset);
+        }
+    } else if out.len() >= 4 {
+        let _ = translate_i16_pair(&mut out, 0, x_offset, y_offset);
+    }
+    out
+}
+
+fn translated_text_body(body: &[u8], x_offset: i16, y_offset: i16) -> Vec<u8> {
+    let mut out = body.to_vec();
+    if out.len() >= 12 {
+        let _ = translate_i16_pair(&mut out, 8, x_offset, y_offset);
+    }
+    out
 }
 
 fn log_void(client_id: ClientId, sequence: SequenceNumber, name: &str) -> io::Result<()> {

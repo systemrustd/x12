@@ -22,8 +22,10 @@ resource IDs, atoms, properties, windows, basic events, and errors. Run
   `UnmapWindow`, `ConfigureWindow`, `GetGeometry`, `QueryTree`,
   `ChangeWindowAttributes`, `GetWindowAttributes`.
 - Drawing forwarded to host: `PolyLine`, `PolyArc`, `PolyFillArc`,
-  `PolyFillRectangle`, `ClearArea`, `ImageText8`, `PolyText8`.
-- GC lifecycle: `CreateGC`, `ChangeGC`, `FreeGC`.
+  `PolyRectangle`, `PolyFillRectangle`, `ClearArea`, `CopyArea`,
+  `PutImage`, `ImageText8`, `ImageText16`, `PolyText8`.
+- GC lifecycle/state: `CreateGC`, `ChangeGC`, `FreeGC`,
+  `SetClipRectangles`.
 - Pixmap/cursor lifecycle (allocation only).
 - Events emitted: `Expose`, `MapNotify`, `ConfigureNotify`, `KeyPress`,
   `KeyRelease`, `FocusIn`, `FocusOut`, `PropertyNotify`,
@@ -55,22 +57,32 @@ In rough priority order:
       client-disconnect cleanup). Cross-client subscriber fanout via
       the same per-(client, window) event masks; root window is
       protected from unmap inside `ResourceTable::unmap_window`.
-- [ ] **Lifecycle / WM events.** Emit `ReparentNotify` and
-      `ClientMessage` so window managers and toolkits behave.
-      (`DestroyNotify` and `UnmapNotify` already shipped.)
+- [x] **Lifecycle / WM events.** `ReparentWindow` now updates the
+      resource tree and emits `ReparentNotify`. `SendEvent` supports
+      synthetic `ClientMessage` delivery for the Phase 1 route.
+      (`DestroyNotify` and `UnmapNotify` already shipped.) Design:
+      [`2026-04-29-phase1-outstanding-design.md`](superpowers/specs/2026-04-29-phase1-outstanding-design.md).
+      Plan:
+      [`2026-04-29-phase1-outstanding.md`](superpowers/plans/2026-04-29-phase1-outstanding.md).
 - [x] **Per-window clipping in the ynest backend.** Each nested
       top-level now gets its own host subwindow; drawing is routed via
-      `top_level_host_target`. Child-window drawing offset translation
-      is a known follow-up (Phase 1 only routes when offsets are zero).
+      `top_level_host_target`. Child-window drawing now applies
+      accumulated host offsets for the existing host-routed drawing
+      paths.
 - [x] **Pointer events.** `ButtonPress` / `ButtonRelease`,
       `MotionNotify`, `EnterNotify` / `LeaveNotify` delivered via
       `HostInputPump` + `xid_map` fanout. `xeyes` now tracks cursor
       via real `MotionNotify` events.
 - [x] **`CopyArea` and `PutImage`.** Phase 1 supports `ZPixmap` into
       host-backed windows and pixmaps; host-backed pixmaps created for
-      depths 1, 24, and 32. `XYBitmap`/`XYPixmap`, non-zero
-      child-window coordinate translation, and xterm scrollback remain
-      follow-ups.
+      depths 1, 24, and 32. `CopyArea` handles host-backed
+      window/window, pixmap/window, window/pixmap, and pixmap/pixmap
+      copies with drawable-depth validation. `XYBitmap`/`XYPixmap`
+      remain follow-ups.
+- [x] **xterm redraw requests observed so far.** Added forwarding for
+      `PolyRectangle` and `ImageText16`, plus per-GC
+      `SetClipRectangles` storage and host application. These removed
+      the unsupported/stubbed requests seen in scrollback logs.
 
 ### Known follow-ups
 
@@ -78,22 +90,20 @@ Small items already identified during recent work, captured here so
 they don't get lost. Not yet sized into punch-list bullets; mostly
 contingent on landed work.
 
-- **`UnmapSubwindows` (opcode 11).** Currently a stub. Per X11 spec,
-  performs `UnmapWindow` on every mapped child bottom-to-top. Becomes
-  a thin loop over the child list reusing
-  `ResourceTable::unmap_window` and the `UnmapNotify` fanout
-  introduced for opcode 10. Spec:
-  [`2026-04-28-unmap-notify-design.md`](superpowers/specs/2026-04-28-unmap-notify-design.md)
-  ("Non-goals").
+Consolidated design:
+[`2026-04-29-phase1-outstanding-design.md`](superpowers/specs/2026-04-29-phase1-outstanding-design.md).
+Implementation plan:
+[`2026-04-29-phase1-outstanding.md`](superpowers/plans/2026-04-29-phase1-outstanding.md).
+
 - **`UnmapNotify.from_configure = true`.** Encoder accepts the byte
   for wire correctness; every call site currently passes `false`. The
   `true` path fires when a parent's `ConfigureWindow` shrinks a child
   out of view. Wire it once we track parent-resize-driven implicit
   unmaps.
-- **`SendEvent` (opcode 25).** Lets clients synthesize events for any
-  window. Required by ICCCM (`WM_DELETE_WINDOW` etc.) so Phase 2 work
-  unblocks on it. Same fanout machinery as the existing `*Notify`
-  events, plus the `SEND_EVENT` flag (high bit of event byte 0).
+- **Broader `SendEvent` event types.** Opcode 25 currently supports
+  synthetic `ClientMessage`, which is the Phase 1/ICCCM-critical path.
+  Other synthetic core events remain unsupported until a real client
+  requires them.
 - **Handler-level integration tests for opcode 10 / opcode 4 fanout.**
   Today only the encoder, the `subscribers()` snapshot, and the
   `ResourceTable` state machine are unit-tested; a true
@@ -101,14 +111,13 @@ contingent on landed work.
   `handle_request` against mock writers. Deferred — spec already
   notes the gap.
 - **xterm scrollback.** `seq 1 200` scrolls forward cleanly via
-  `CopyArea`. Scrollback via the scrollbar or shift-pageup does not
-  yet work; likely requires `XCopyArea` from scrollback buffer, which
-  depends on xterm's scroll-mode pixmap allocation.
-- **`PendingDestroy` struct.** The 5-tuple
-  `(window, parent, was_mapped, on_window, on_parent)` carried
-  through opcode 4 and disconnect cleanup is currently silenced with
-  `#[allow(clippy::type_complexity)]`. Extract a named struct the
-  next time an event joins the destroy path (e.g. `ReparentNotify`).
+  `CopyArea`, and xterm otherwise renders/accepts input. Scrollback via
+  scrollbar, mouse wheel, PageUp, and Shift+PageUp still does not behave
+  correctly after implementing `ImageText16`, `PolyRectangle`, and
+  `SetClipRectangles`. Latest logs show no unsupported opcodes on the
+  tested path, so this is parked for now; next investigation should
+  focus on xterm input semantics, scrollbar state/grabs, or a subtler
+  copy/clip coordinate mismatch rather than a plainly missing opcode.
 
 ### Out of scope for Phase 1
 

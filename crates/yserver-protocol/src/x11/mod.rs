@@ -27,7 +27,7 @@ pub struct ResourceId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AtomId(pub u32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SequenceNumber(pub u16);
 
 impl SequenceNumber {
@@ -172,6 +172,14 @@ pub struct ConfigureWindowRequest {
     pub border_width: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReparentWindowRequest {
+    pub window: ResourceId,
+    pub parent: ResourceId,
+    pub x: i16,
+    pub y: i16,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CreatePixmapRequest {
     pub depth: u8,
@@ -198,6 +206,20 @@ pub struct GcChange {
     pub background: Option<u32>,
     pub line_width: Option<u16>,
     pub font: Option<ResourceId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipRectangles {
+    pub ordering: u8,
+    pub x_origin: i16,
+    pub y_origin: i16,
+    pub rectangles: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetClipRectanglesRequest {
+    pub gc: ResourceId,
+    pub clip: ClipRectangles,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +264,24 @@ pub struct PutImageRequest<'a> {
     pub left_pad: u8,
     pub depth: u8,
     pub data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SendEventRequest<'a> {
+    pub propagate: bool,
+    pub destination: ResourceId,
+    pub event_mask: u32,
+    pub event: &'a [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientMessageEvent {
+    pub sequence: SequenceNumber,
+    pub send_event: bool,
+    pub format: u8,
+    pub window: ResourceId,
+    pub r#type: AtomId,
+    pub data: [u8; 20],
 }
 
 #[derive(Clone, Debug)]
@@ -812,8 +852,33 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
     })
 }
 
+pub fn set_clip_rectangles_request(ordering: u8, body: &[u8]) -> Option<SetClipRectanglesRequest> {
+    let rectangles = body.get(8..)?.to_vec();
+    if !rectangles.len().is_multiple_of(8) {
+        return None;
+    }
+    Some(SetClipRectanglesRequest {
+        gc: ResourceId(read_u32_le(body.get(0..4)?)),
+        clip: ClipRectangles {
+            ordering,
+            x_origin: read_i16_le(body.get(4..6)?),
+            y_origin: read_i16_le(body.get(6..8)?),
+            rectangles,
+        },
+    })
+}
+
 pub fn drawable_request_id(body: &[u8]) -> Option<ResourceId> {
     Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn reparent_window_request(body: &[u8]) -> Option<ReparentWindowRequest> {
+    Some(ReparentWindowRequest {
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        parent: ResourceId(read_u32_le(body.get(4..8)?)),
+        x: read_i16_le(body.get(8..10)?),
+        y: read_i16_le(body.get(10..12)?),
+    })
 }
 
 pub fn clear_area_request(body: &[u8]) -> Option<ClearAreaRequest> {
@@ -863,6 +928,16 @@ pub fn put_image_request(format: u8, body: &[u8]) -> Option<PutImageRequest<'_>>
         left_pad: *body.get(16)?,
         depth: *body.get(17)?,
         data: body.get(20..)?,
+    })
+}
+
+pub fn send_event_request(propagate: u8, body: &[u8]) -> Option<SendEventRequest<'_>> {
+    let event: &[u8; 32] = body.get(8..40)?.try_into().ok()?;
+    Some(SendEventRequest {
+        propagate: propagate != 0,
+        destination: ResourceId(read_u32_le(body.get(0..4)?)),
+        event_mask: read_u32_le(body.get(4..8)?),
+        event,
     })
 }
 
@@ -1789,6 +1864,43 @@ pub fn encode_unmap_notify_event(
     out.extend_from_slice(&[0; 19]);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn encode_reparent_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    event_window: ResourceId,
+    window: ResourceId,
+    parent: ResourceId,
+    x: i16,
+    y: i16,
+    override_redirect: bool,
+) {
+    out.push(21); // ReparentNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    write_u32(order, out, parent.0);
+    write_i16(order, out, x);
+    write_i16(order, out, y);
+    out.push(u8::from(override_redirect));
+    out.extend_from_slice(&[0; 11]);
+}
+
+pub fn encode_client_message_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    event: ClientMessageEvent,
+) {
+    out.push(33 | if event.send_event { 0x80 } else { 0 });
+    out.push(event.format);
+    write_u16(order, out, event.sequence.0);
+    write_u32(order, out, event.window.0);
+    write_u32(order, out, event.r#type.0);
+    out.extend_from_slice(&event.data);
+}
+
 fn encode_pointer_event(
     out: &mut Vec<u8>,
     event_code: u8,
@@ -2131,6 +2243,114 @@ mod tests {
                 prop_assert_eq!(buf[12], u8::from(from_configure));
                 prop_assert!(buf[13..32].iter().all(|&b| b == 0));
             }
+        }
+    }
+
+    mod reparent_tests {
+        use super::*;
+
+        #[test]
+        fn reparent_window_request_parses_all_fields() {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x100002);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x100003);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, -10);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 20);
+
+            let req = reparent_window_request(&body).unwrap();
+            assert_eq!(
+                req,
+                ReparentWindowRequest {
+                    window: ResourceId(0x100002),
+                    parent: ResourceId(0x100003),
+                    x: -10,
+                    y: 20,
+                }
+            );
+        }
+
+        #[test]
+        fn reparent_window_request_rejects_short_body() {
+            assert!(reparent_window_request(&[0; 11]).is_none());
+        }
+
+        #[test]
+        fn reparent_notify_shape() {
+            let mut buf = Vec::new();
+            encode_reparent_notify_event(
+                &mut buf,
+                SequenceNumber(0x1234),
+                ClientByteOrder::LittleEndian,
+                ResourceId(0x100),
+                ResourceId(0x100002),
+                ResourceId(0x100003),
+                -5,
+                7,
+                true,
+            );
+
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 21);
+            assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
+            assert_eq!(&buf[8..12], &0x100002u32.to_le_bytes());
+            assert_eq!(&buf[12..16], &0x100003u32.to_le_bytes());
+            assert_eq!(&buf[16..18], &(-5i16).to_le_bytes());
+            assert_eq!(&buf[18..20], &7i16.to_le_bytes());
+            assert_eq!(buf[20], 1);
+            assert!(buf[21..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    mod send_event_tests {
+        use super::*;
+
+        #[test]
+        fn send_event_request_parses_payload() {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x100002);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x00ff_0000);
+            let event = [0xabu8; 32];
+            body.extend_from_slice(&event);
+
+            let req = send_event_request(1, &body).unwrap();
+            assert!(req.propagate);
+            assert_eq!(req.destination, ResourceId(0x100002));
+            assert_eq!(req.event_mask, 0x00ff_0000);
+            assert_eq!(req.event, &event);
+        }
+
+        #[test]
+        fn send_event_request_rejects_short_body() {
+            assert!(send_event_request(0, &[0; 39]).is_none());
+        }
+
+        #[test]
+        fn client_message_encoder_shape() {
+            let mut data = [0u8; 20];
+            data[0] = 0xaa;
+            data[19] = 0xbb;
+            let mut buf = Vec::new();
+            encode_client_message_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                ClientMessageEvent {
+                    sequence: SequenceNumber(0x1234),
+                    send_event: true,
+                    format: 32,
+                    window: ResourceId(0x100002),
+                    r#type: AtomId(0x44),
+                    data,
+                },
+            );
+
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 33 | 0x80);
+            assert_eq!(buf[1], 32);
+            assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&buf[4..8], &0x100002u32.to_le_bytes());
+            assert_eq!(&buf[8..12], &0x44u32.to_le_bytes());
+            assert_eq!(&buf[12..32], &data);
         }
     }
 
