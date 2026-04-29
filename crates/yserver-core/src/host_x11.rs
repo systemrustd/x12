@@ -967,7 +967,7 @@ pub enum HostEvent {
     Closed,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PointerEventKind {
     ButtonPress,
     ButtonRelease,

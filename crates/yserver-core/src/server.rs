@@ -97,6 +97,18 @@ impl AtomTable {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PassiveButtonGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    /// 0 = AnyButton
+    pub button: u8,
+    /// 0x8000 = AnyModifier
+    pub modifiers: u16,
+    pub event_mask: u32,
+    pub pointer_mode: u8,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -110,6 +122,12 @@ pub struct ServerState {
     /// Active pointer grab: (grab owner, grab window). When set, all pointer
     /// events are redirected to the grab owner regardless of where the cursor is.
     pub pointer_grab: Option<(ClientId, ResourceId)>,
+    /// Registered passive button grabs.
+    pub button_grabs: Vec<PassiveButtonGrab>,
+    /// True when `pointer_grab` was activated by a passive button grab.
+    pub pointer_grab_is_passive: bool,
+    /// Frozen pointer event held by a sync passive grab.
+    pub frozen_pointer_event: Option<crate::host_x11::HostPointerEvent>,
 }
 
 impl ServerState {
@@ -124,6 +142,9 @@ impl ServerState {
             randr: RandrState::nested(0, 800, 600),
             selections: HashMap::new(),
             pointer_grab: None,
+            button_grabs: Vec::new(),
+            pointer_grab_is_passive: false,
+            frozen_pointer_event: None,
         }
     }
 
@@ -217,6 +238,39 @@ impl ServerState {
                 client.event_masks.remove(w);
             }
         }
+    }
+
+    pub fn find_passive_grab(
+        &self,
+        window: ResourceId,
+        button: u8,
+        state_mask: u16,
+    ) -> Option<PassiveButtonGrab> {
+        let mut current = window;
+        let mut depth = 0usize;
+        loop {
+            for grab in &self.button_grabs {
+                if grab.grab_window != current {
+                    continue;
+                }
+                let button_match = grab.button == 0 || grab.button == button;
+                let mod_match = grab.modifiers == 0x8000
+                    || (grab.modifiers & 0xff) == (state_mask & 0xff);
+                if button_match && mod_match {
+                    return Some(grab.clone());
+                }
+            }
+            let w = self.resources.window(current)?;
+            if w.parent == current || w.parent == crate::resources::ROOT_WINDOW {
+                break;
+            }
+            current = w.parent;
+            depth += 1;
+            if depth > 256 {
+                break;
+            }
+        }
+        None
     }
 }
 
@@ -329,7 +383,69 @@ pub fn pointer_event_fanout(
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
         }
+        if event.kind == PointerEventKind::ButtonRelease
+            && let Ok(mut s) = state.lock()
+            && s.pointer_grab_is_passive
+        {
+            s.pointer_grab = None;
+            s.pointer_grab_is_passive = false;
+            s.frozen_pointer_event = None;
+        }
         return;
+    }
+
+    // Passive button grab matching for ButtonPress events.
+    if event.kind == PointerEventKind::ButtonPress {
+        let top_level_id_opt = xid_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&event.host_xid).copied());
+        let matched = top_level_id_opt.and_then(|top| {
+            let s = state.lock().ok()?;
+            let (hit_window, _, _) = s
+                .resources
+                .pointer_target_at(top, event.event_x, event.event_y)
+                .unwrap_or((top, event.event_x, event.event_y));
+            s.find_passive_grab(hit_window, event.detail, event.state)
+        });
+        if let Some(grab) = matched {
+            let target_opt = match state.lock() {
+                Ok(mut s) => {
+                    let target = s.client_target(grab.owner);
+                    if grab.pointer_mode == 0 {
+                        s.frozen_pointer_event = Some(event);
+                    }
+                    s.pointer_grab = Some((grab.owner, grab.grab_window));
+                    s.pointer_grab_is_passive = true;
+                    target
+                }
+                Err(_) => return,
+            };
+            if let Some(target) = target_opt {
+                let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+                let mut buf = Vec::with_capacity(32);
+                x11::encode_button_press_event(
+                    &mut buf,
+                    target.byte_order,
+                    x11::PointerEvent {
+                        sequence: seq,
+                        detail: event.detail,
+                        time: event.time,
+                        root: crate::resources::ROOT_WINDOW,
+                        event: grab.grab_window,
+                        root_x: event.root_x,
+                        root_y: event.root_y,
+                        event_x: event.event_x,
+                        event_y: event.event_y,
+                        state: event.state,
+                    },
+                );
+                if let Ok(mut w) = target.writer.lock() {
+                    let _ = w.write_all(&buf);
+                }
+            }
+            return;
+        }
     }
 
     let top_level_id = match xid_map.lock() {

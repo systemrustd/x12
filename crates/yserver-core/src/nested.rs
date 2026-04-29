@@ -376,6 +376,14 @@ fn handle_client(
         s.drop_window_subscriptions(&all_destroyed);
         let (fonts, freed_pixmaps) = s.resources.remove_non_window_resources_owned_by(client_id);
         s.clients.remove(&client_id.0);
+        s.button_grabs.retain(|g| g.owner != client_id);
+        if s.pointer_grab
+            .is_some_and(|(owner, _)| owner == client_id)
+        {
+            s.pointer_grab = None;
+            s.pointer_grab_is_passive = false;
+            s.frozen_pointer_event = None;
+        }
         (fonts, freed_pixmaps, pending)
     };
     for pending in pending_destroys {
@@ -1995,17 +2003,67 @@ fn handle_request(
             if body.len() >= 4 {
                 let grab_window =
                     ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-                lock_server(server)?.pointer_grab = Some((client_id, grab_window));
+                let mut s = lock_server(server)?;
+                s.pointer_grab = Some((client_id, grab_window));
+                s.pointer_grab_is_passive = false;
             }
             log_reply(client_id, sequence, "GrabPointer");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
         }
         27 => {
-            lock_server(server)?.pointer_grab = None;
+            let mut s = lock_server(server)?;
+            s.pointer_grab = None;
+            s.pointer_grab_is_passive = false;
+            s.frozen_pointer_event = None;
+            drop(s);
             log_void(client_id, sequence, "UngrabPointer")
         }
-        28 => log_void(client_id, sequence, "GrabButton"),
-        29 => log_void(client_id, sequence, "UngrabButton"),
+        28 => {
+            if body.len() >= 20 {
+                let button = header.data;
+                let grab_window =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let event_mask = u32::from(u16::from_le_bytes([body[4], body[5]]));
+                let pointer_mode = body[6];
+                let modifiers = u16::from_le_bytes([body[18], body[19]]);
+                let mut s = lock_server(server)?;
+                s.button_grabs.retain(|g| {
+                    !(g.owner == client_id
+                        && g.grab_window == grab_window
+                        && g.button == button
+                        && g.modifiers == modifiers)
+                });
+                s.button_grabs.push(crate::server::PassiveButtonGrab {
+                    owner: client_id,
+                    grab_window,
+                    button,
+                    modifiers,
+                    event_mask,
+                    pointer_mode,
+                });
+                debug!(
+                    "client {} GrabButton window=0x{:x} button={} modifiers=0x{:x}",
+                    client_id.0, grab_window.0, button, modifiers
+                );
+            }
+            log_void(client_id, sequence, "GrabButton")
+        }
+        29 => {
+            if body.len() >= 6 {
+                let button = header.data;
+                let grab_window =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let modifiers = u16::from_le_bytes([body[4], body[5]]);
+                let mut s = lock_server(server)?;
+                s.button_grabs.retain(|g| {
+                    !(g.owner == client_id
+                        && g.grab_window == grab_window
+                        && (g.button == button || button == 0)
+                        && (g.modifiers == modifiers || modifiers == 0x8000))
+                });
+            }
+            log_void(client_id, sequence, "UngrabButton")
+        }
         31 => {
             log_reply(client_id, sequence, "GrabKeyboard");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
@@ -2968,6 +3026,23 @@ fn handle_request(
             header.data, // RANDR minor opcode
             body,
         ),
+        35 => {
+            let mode = header.data;
+            if mode == 0 || mode == 1 || mode == 2 {
+                let mut s = lock_server(server)?;
+                s.frozen_pointer_event = None;
+                if mode == 0 || mode == 1 {
+                    // AsyncPointer / SyncPointer: release passive grab
+                    if s.pointer_grab_is_passive {
+                        s.pointer_grab = None;
+                        s.pointer_grab_is_passive = false;
+                    }
+                }
+                // ReplayPointer (mode==2): frozen event is cleared; normal routing will
+                // handle next events. Full replay needs inter-thread plumbing (follow-up).
+            }
+            log_void(client_id, sequence, "AllowEvents")
+        }
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
