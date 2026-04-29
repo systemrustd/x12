@@ -232,6 +232,14 @@ impl ServerState {
             .map(Self::event_target_for_client)
     }
 
+    #[must_use]
+    pub fn selection_owner_target(&self, selection: AtomId) -> Option<(ResourceId, EventTarget)> {
+        let owner_window = *self.selections.get(&selection)?;
+        let owner_client = self.resources.window_owner(owner_window)?;
+        let target = self.client_target(owner_client)?;
+        Some((owner_window, target))
+    }
+
     pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
         for client in self.clients.values_mut() {
             for w in windows {

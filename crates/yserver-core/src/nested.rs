@@ -1892,15 +1892,47 @@ fn handle_request(
             if body.len() >= 8 {
                 let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let selection = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-                let name = {
+                let time_val = if body.len() >= 12 {
+                    u32::from_le_bytes([body[8], body[9], body[10], body[11]])
+                } else {
+                    0u32
+                };
+
+                let (old_owner_info, name) = {
                     let mut s = lock_server(server)?;
+                    // Capture old owner before modification
+                    let old = s.selection_owner_target(selection);
+                    let old_window = s.selections.get(&selection).copied();
+                    // Perform the update
                     if window.0 == 0 {
                         s.selections.remove(&selection);
                     } else {
                         s.selections.insert(selection, window);
                     }
-                    s.atoms.name(selection).map(str::to_owned)
+                    let name = s.atoms.name(selection).map(str::to_owned);
+                    // Only send SelectionClear if old owner ≠ new owner
+                    let send_clear = old_window.is_some()
+                        && old_window != (if window.0 == 0 { None } else { Some(window) });
+                    (if send_clear { old } else { None }, name)
                 };
+
+                // Send SelectionClear to displaced owner
+                if let Some((old_window, old_target)) = old_owner_info {
+                    let seq = SequenceNumber(old_target.last_sequence.load(Ordering::Relaxed));
+                    let mut buf = Vec::with_capacity(32);
+                    x11::encode_selection_clear_event(
+                        &mut buf,
+                        seq,
+                        old_target.byte_order,
+                        time_val,
+                        old_window,
+                        selection,
+                    );
+                    if let Ok(mut w) = old_target.writer.lock() {
+                        let _ = w.write_all(&buf);
+                    }
+                }
+
                 debug!(
                     "client {} #{} SetSelectionOwner {} -> 0x{:x}",
                     client_id.0,
@@ -1934,94 +1966,119 @@ fn handle_request(
             );
             x11::write_get_selection_owner_reply(&mut *lock_writer()?, sequence, owner)
         }
+        24 => {
+            // ConvertSelection: requestor(4) selection(4) target(4) property(4) time(4)
+            if body.len() >= 20 {
+                let requestor =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let selection = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let target_atom =
+                    AtomId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+                let property = AtomId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
+                let time_val = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+
+                let owner_info = {
+                    let s = lock_server(server)?;
+                    s.selection_owner_target(selection)
+                };
+
+                if let Some((owner_window, owner_target)) = owner_info {
+                    // Deliver SelectionRequest to owner
+                    let seq = SequenceNumber(owner_target.last_sequence.load(Ordering::Relaxed));
+                    let mut buf = Vec::with_capacity(32);
+                    x11::encode_selection_request_event(
+                        &mut buf,
+                        seq,
+                        owner_target.byte_order,
+                        time_val,
+                        owner_window,
+                        requestor,
+                        selection,
+                        target_atom,
+                        property,
+                    );
+                    if let Ok(mut w) = owner_target.writer.lock() {
+                        let _ = w.write_all(&buf);
+                    }
+                    debug!(
+                        "client {} #{} ConvertSelection -> owner 0x{:x}",
+                        client_id.0, sequence.0, owner_window.0
+                    );
+                } else {
+                    // No owner: send SelectionNotify with property=None to requestor
+                    let requestor_target = {
+                        let s = lock_server(server)?;
+                        s.resources
+                            .window_owner(requestor)
+                            .and_then(|cid| s.client_target(cid))
+                    };
+                    if let Some(rt) = requestor_target {
+                        let seq = SequenceNumber(rt.last_sequence.load(Ordering::Relaxed));
+                        let mut buf = [0u8; 32];
+                        buf[0] = 31; // SelectionNotify
+                        buf[2] = (seq.0 & 0xff) as u8;
+                        buf[3] = ((seq.0 >> 8) & 0xff) as u8;
+                        buf[4..8].copy_from_slice(&time_val.to_le_bytes());
+                        buf[8..12].copy_from_slice(&requestor.0.to_le_bytes());
+                        buf[12..16].copy_from_slice(&selection.0.to_le_bytes());
+                        buf[16..20].copy_from_slice(&target_atom.0.to_le_bytes());
+                        // property = 0 (None): conversion failed
+                        if let Ok(mut w) = rt.writer.lock() {
+                            let _ = w.write_all(&buf);
+                        }
+                    }
+                    debug!(
+                        "client {} #{} ConvertSelection: no owner, sent SelectionNotify(None)",
+                        client_id.0, sequence.0
+                    );
+                }
+            }
+            Ok(())
+        }
         25 => {
             if let Some(req) = x11::send_event_request(header.data, body) {
-                let event_type = req.event[0] & 0x7f;
-                if event_type != 33 {
-                    return emit_x11_error(
-                        writer,
-                        sequence,
-                        x11::error::BAD_VALUE,
-                        u32::from(event_type),
-                        25,
-                    );
-                }
-                let format = req.event[1];
-                if !matches!(format, 8 | 16 | 32) {
-                    return emit_x11_error(
-                        writer,
-                        sequence,
-                        x11::error::BAD_VALUE,
-                        u32::from(format),
-                        25,
-                    );
-                }
-                let message_window = ResourceId(u32::from_le_bytes(
-                    req.event[4..8].try_into().expect("fixed slice"),
-                ));
-                let message_type = AtomId(u32::from_le_bytes(
-                    req.event[8..12].try_into().expect("fixed slice"),
-                ));
+                // Set the sent-event bit (bit 7 of first byte)
+                let mut event_copy = *req.event;
+                event_copy[0] |= 0x80;
 
                 let targets = {
                     let s = lock_server(server)?;
-                    if s.resources.window(req.destination).is_none() {
-                        return emit_x11_error(
-                            writer,
-                            sequence,
-                            x11::error::BAD_WINDOW,
-                            req.destination.0,
-                            25,
-                        );
-                    }
-                    if message_window != req.destination
-                        && s.resources.window(message_window).is_none()
-                    {
-                        return emit_x11_error(
-                            writer,
-                            sequence,
-                            x11::error::BAD_WINDOW,
-                            message_window.0,
-                            25,
-                        );
-                    }
-                    if !s.atoms.exists(message_type) {
-                        return emit_x11_error(
-                            writer,
-                            sequence,
-                            x11::error::BAD_ATOM,
-                            message_type.0,
-                            25,
-                        );
-                    }
-
-                    if req.event_mask == 0 {
-                        s.resources
-                            .window_owner(req.destination)
-                            .and_then(|owner| s.client_target(owner))
-                            .into_iter()
-                            .collect::<Vec<_>>()
+                    if req.destination.0 == 0xffff_ffff {
+                        // Broadcast to root subscribers
+                        s.subscribers_intersecting(ROOT_WINDOW, req.event_mask)
                     } else {
-                        let mut current = req.destination;
-                        loop {
-                            let targets = s.subscribers_intersecting(current, req.event_mask);
-                            if !targets.is_empty() || !req.propagate {
-                                break targets;
+                        if req.event_mask == 0 {
+                            s.resources
+                                .window_owner(req.destination)
+                                .and_then(|owner| s.client_target(owner))
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        } else {
+                            let mut current = req.destination;
+                            loop {
+                                let targets = s.subscribers_intersecting(current, req.event_mask);
+                                if !targets.is_empty() || !req.propagate {
+                                    break targets;
+                                }
+                                let Some(parent) = s.resources.parent_of(current) else {
+                                    break Vec::new();
+                                };
+                                if parent == current {
+                                    break Vec::new();
+                                }
+                                current = parent;
                             }
-                            let Some(parent) = s.resources.parent_of(current) else {
-                                break Vec::new();
-                            };
-                            if parent == current {
-                                break Vec::new();
-                            }
-                            current = parent;
                         }
                     }
                 };
-
-                let mut event = *req.event;
-                event[0] |= 0x80;
-                fanout_raw_event(&targets, &event);
+                fanout_raw_event(&targets, &event_copy);
+                debug!(
+                    "client {} #{} SendEvent type={} dest=0x{:x}",
+                    client_id.0,
+                    sequence.0,
+                    req.event[0] & 0x7f,
+                    req.destination.0
+                );
             }
             log_void(client_id, sequence, "SendEvent")
         }

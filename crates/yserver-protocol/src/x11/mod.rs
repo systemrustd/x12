@@ -2086,6 +2086,48 @@ pub fn encode_leave_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, even
     encode_crossing_event(out, 8, order, event);
 }
 
+pub fn encode_selection_request_event(
+    out: &mut Vec<u8>,
+    seq: SequenceNumber,
+    _order: ClientByteOrder,
+    time: u32,
+    owner: ResourceId,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) {
+    let mut buf = [0u8; 32];
+    buf[0] = 30;
+    buf[2] = (seq.0 & 0xff) as u8;
+    buf[3] = ((seq.0 >> 8) & 0xff) as u8;
+    buf[4..8].copy_from_slice(&time.to_le_bytes());
+    buf[8..12].copy_from_slice(&owner.0.to_le_bytes());
+    buf[12..16].copy_from_slice(&requestor.0.to_le_bytes());
+    buf[16..20].copy_from_slice(&selection.0.to_le_bytes());
+    buf[20..24].copy_from_slice(&target.0.to_le_bytes());
+    buf[24..28].copy_from_slice(&property.0.to_le_bytes());
+    out.extend_from_slice(&buf);
+}
+
+pub fn encode_selection_clear_event(
+    out: &mut Vec<u8>,
+    seq: SequenceNumber,
+    _order: ClientByteOrder,
+    time: u32,
+    owner: ResourceId,
+    selection: AtomId,
+) {
+    let mut buf = [0u8; 32];
+    buf[0] = 29;
+    buf[2] = (seq.0 & 0xff) as u8;
+    buf[3] = ((seq.0 >> 8) & 0xff) as u8;
+    buf[4..8].copy_from_slice(&time.to_le_bytes());
+    buf[8..12].copy_from_slice(&owner.0.to_le_bytes());
+    buf[12..16].copy_from_slice(&selection.0.to_le_bytes());
+    out.extend_from_slice(&buf);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
