@@ -742,6 +742,95 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn poly_text16(&mut self, host_xid: u32, foreground: u32, body: &[u8]) -> io::Result<()> {
+        if body.len() < 12 {
+            return Ok(());
+        }
+        self.change_foreground(foreground)?;
+
+        let length_units = 1 + u16::try_from(body.len() / 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(75);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(&body[8..]);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn poly_point(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        coordinate_mode: u8,
+        points: &[u8],
+    ) -> io::Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        if self.current_foreground != foreground {
+            self.change_foreground(foreground)?;
+        }
+
+        let length_units = 3 + u16::try_from(points.len() / 4).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "too many points for one X11 request",
+            )
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(64);
+        out.push(coordinate_mode);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(points);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn fill_poly(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        coord_mode: u8,
+        points: &[u8],
+    ) -> io::Result<()> {
+        if points.len() < 4 {
+            return Ok(());
+        }
+        if self.current_foreground != foreground {
+            self.change_foreground(foreground)?;
+        }
+
+        // FillPoly opcode 69: drawable, gc, shape(1), coord-mode(1), pad(2), points...
+        // length = 4 (header words) + npoints
+        let length_units = 4 + u16::try_from(points.len() / 4).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "too many points for one X11 request",
+            )
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(69);
+        out.push(0); // unused
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.gc_id);
+        out.push(0); // shape = Complex
+        out.push(coord_mode);
+        write_u16(&mut out, 0); // pad
+        out.extend_from_slice(points);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     fn draw_arcs(
         &mut self,
         host_xid: u32,

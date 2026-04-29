@@ -2349,6 +2349,16 @@ fn handle_request(
             }
             log_void(client_id, sequence, "ChangeGC")
         }
+        57 => {
+            if body.len() >= 12 {
+                let src_gc = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let dst_gc = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let value_mask = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+                let mut s = lock_server(server)?;
+                s.resources.copy_gc(src_gc, dst_gc, value_mask);
+            }
+            log_void(client_id, sequence, "CopyGC")
+        }
         59 => {
             if let Some(request) = x11::set_clip_rectangles_request(header.data, body) {
                 let mut s = lock_server(server)?;
@@ -2484,7 +2494,35 @@ fn handle_request(
             }
             log_void(client_id, sequence, "CopyArea")
         }
-        64 => log_void(client_id, sequence, "PolyPoint"),
+        64 => {
+            if body.len() >= 8 {
+                let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let points = &body[8..];
+                let (foreground, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.host_drawable_target(drawable),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated = translated_points(
+                        points,
+                        header.data,
+                        target.x_offset(),
+                        target.y_offset(),
+                    );
+                    host.poly_point(target.host_xid(), foreground, header.data, &translated)?;
+                }
+            }
+            log_void(client_id, sequence, "PolyPoint")
+        }
         65 => {
             if let Some((gc_id, points)) = x11::poly_line_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
@@ -2585,7 +2623,32 @@ fn handle_request(
             }
             log_void(client_id, sequence, "PolyArc")
         }
-        69 => log_void(client_id, sequence, "FillPoly"),
+        69 => {
+            if body.len() >= 12 {
+                let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let coord_mode = body[9];
+                let points = &body[12..];
+                let (foreground, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.host_drawable_target(drawable),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated =
+                        translated_points(points, coord_mode, target.x_offset(), target.y_offset());
+                    host.fill_poly(target.host_xid(), foreground, coord_mode, &translated)?;
+                }
+            }
+            log_void(client_id, sequence, "FillPoly")
+        }
         70 => {
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
@@ -2799,6 +2862,29 @@ fn handle_request(
                 }
             }
             log_void(client_id, sequence, "PolyText8")
+        }
+        75 => {
+            if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
+                let drawable = ResourceId(drawable_raw);
+                let (foreground, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.host_drawable_target(drawable),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated =
+                        translated_text_body(text_body, target.x_offset(), target.y_offset());
+                    host.poly_text16(target.host_xid(), foreground, &translated)?;
+                }
+            }
+            log_void(client_id, sequence, "PolyText16")
         }
         76 => {
             if let Some((drawable, gc_id, text_body)) = x11::image_text8_data(body) {

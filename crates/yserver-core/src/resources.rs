@@ -570,6 +570,39 @@ impl ResourceTable {
         gc.clip_rectangles = Some(request.clip);
     }
 
+    pub fn copy_gc(&mut self, src: ResourceId, dst: ResourceId, value_mask: u32) {
+        let src_data = self.gcs.get(&src.0).map(|g| {
+            (
+                g.foreground,
+                g.background,
+                g.line_width,
+                g.font,
+                g.clip_rectangles.clone(),
+            )
+        });
+        let Some((fg, bg, lw, font, clip)) = src_data else {
+            return;
+        };
+        let Some(dst_gc) = self.gcs.get_mut(&dst.0) else {
+            return;
+        };
+        if value_mask & (1 << 3) != 0 {
+            dst_gc.foreground = fg;
+        }
+        if value_mask & (1 << 4) != 0 {
+            dst_gc.background = bg;
+        }
+        if value_mask & (1 << 8) != 0 {
+            dst_gc.line_width = lw;
+        }
+        if value_mask & (1 << 14) != 0 {
+            dst_gc.font = font;
+        }
+        if value_mask & (1 << 22) != 0 {
+            dst_gc.clip_rectangles = clip;
+        }
+    }
+
     pub fn free_gc(&mut self, id: ResourceId) {
         self.gcs.remove(&id.0);
     }
