@@ -586,19 +586,20 @@ impl ResourceTable {
         let Some(dst_gc) = self.gcs.get_mut(&dst.0) else {
             return;
         };
-        if value_mask & (1 << 3) != 0 {
+        if value_mask & (1 << 2) != 0 {
             dst_gc.foreground = fg;
         }
-        if value_mask & (1 << 4) != 0 {
+        if value_mask & (1 << 3) != 0 {
             dst_gc.background = bg;
         }
-        if value_mask & (1 << 8) != 0 {
+        if value_mask & (1 << 4) != 0 {
             dst_gc.line_width = lw;
         }
         if value_mask & (1 << 14) != 0 {
             dst_gc.font = font;
         }
-        if value_mask & (1 << 22) != 0 {
+        if value_mask & (1 << 19) != 0 {
+            // GCClipMask — copy internal clip-rectangle list
             dst_gc.clip_rectangles = clip;
         }
     }
