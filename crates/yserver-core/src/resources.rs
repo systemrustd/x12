@@ -662,7 +662,35 @@ impl ResourceTable {
     }
 
     pub fn create_glyph_cursor(&mut self, owner: ClientId, id: ResourceId) {
-        self.cursors.insert(id.0, Cursor { id, owner });
+        self.cursors.insert(
+            id.0,
+            Cursor {
+                id,
+                owner,
+                host_xid: None,
+            },
+        );
+    }
+
+    pub fn create_cursor(&mut self, owner: ClientId, id: ResourceId) {
+        self.cursors.insert(
+            id.0,
+            Cursor {
+                id,
+                owner,
+                host_xid: None,
+            },
+        );
+    }
+
+    pub fn set_cursor_host_xid(&mut self, id: ResourceId, xid: u32) {
+        if let Some(c) = self.cursors.get_mut(&id.0) {
+            c.host_xid = Some(xid);
+        }
+    }
+
+    pub fn cursor_host_xid(&self, id: ResourceId) -> Option<u32> {
+        self.cursors.get(&id.0)?.host_xid
     }
 
     pub fn free_cursor(&mut self, id: ResourceId) {
@@ -915,6 +943,7 @@ pub struct Font {
 pub struct Cursor {
     pub id: ResourceId,
     pub owner: ClientId,
+    pub host_xid: Option<u32>,
 }
 
 #[cfg(test)]

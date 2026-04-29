@@ -964,6 +964,7 @@ fn handle_request(
                     );
                 }
                 let target_window = request.window;
+                let cursor_id = request.cursor;
                 let want_focus_check;
                 let viewable;
                 {
@@ -989,6 +990,20 @@ fn handle_request(
                 }
                 if viewable && want_focus_check & 0x3 != 0 {
                     set_focused_window(focused_window, server, target_window)?;
+                }
+                if let Some(cid) = cursor_id {
+                    let (host_window_xid, cursor_host_xid) = {
+                        let s = lock_server(server)?;
+                        let hw = s.resources.window(target_window).and_then(|w| w.host_xid);
+                        let ch = s.resources.cursor_host_xid(cid);
+                        (hw, ch)
+                    };
+                    if let (Some(hw), Some(ch)) = (host_window_xid, cursor_host_xid)
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.define_cursor(hw, ch);
+                    }
                 }
             }
             log_void(client_id, sequence, "ChangeWindowAttributes")
@@ -3069,6 +3084,67 @@ fn handle_request(
                 client_id.0, sequence.0, name
             );
             x11::write_lookup_color_reply(&mut *lock_writer()?, sequence, color)
+        }
+        93 => {
+            if body.len() >= 28 {
+                let cursor_id =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let source_id =
+                    ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let mask_id =
+                    ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+                let fore = (
+                    u16::from_le_bytes([body[12], body[13]]),
+                    u16::from_le_bytes([body[14], body[15]]),
+                    u16::from_le_bytes([body[16], body[17]]),
+                );
+                let back = (
+                    u16::from_le_bytes([body[18], body[19]]),
+                    u16::from_le_bytes([body[20], body[21]]),
+                    u16::from_le_bytes([body[22], body[23]]),
+                );
+                let hot_x = u16::from_le_bytes([body[24], body[25]]);
+                let hot_y = u16::from_le_bytes([body[26], body[27]]);
+
+                let (src_host, mask_host) = {
+                    let s = lock_server(server)?;
+                    let src = s
+                        .resources
+                        .pixmap(source_id)
+                        .and_then(|p| p.host_xid)
+                        .unwrap_or(0);
+                    let mask = if mask_id.0 == 0 {
+                        0
+                    } else {
+                        s.resources
+                            .pixmap(mask_id)
+                            .and_then(|p| p.host_xid)
+                            .unwrap_or(0)
+                    };
+                    (src, mask)
+                };
+
+                {
+                    let mut s = lock_server(server)?;
+                    s.resources.create_cursor(client_id, cursor_id);
+                }
+
+                if src_host != 0
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    match h.create_cursor(src_host, mask_host, fore, back, hot_x, hot_y) {
+                        Ok(host_xid) => {
+                            let mut s = lock_server(server)?;
+                            s.resources.set_cursor_host_xid(cursor_id, host_xid);
+                        }
+                        Err(err) => {
+                            warn!("client {} CreateCursor failed: {err}", client_id.0);
+                        }
+                    }
+                }
+            }
+            log_void(client_id, sequence, "CreateCursor")
         }
         94 => {
             if let Some(cursor) = x11::create_glyph_cursor_id(body) {

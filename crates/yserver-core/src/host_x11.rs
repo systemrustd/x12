@@ -404,6 +404,49 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn create_cursor(
+        &mut self,
+        source_pixmap_xid: u32,
+        mask_pixmap_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+        hot_x: u16,
+        hot_y: u16,
+    ) -> io::Result<u32> {
+        let cursor_xid = self.allocate_xid();
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut buf = Vec::with_capacity(32);
+        buf.push(93u8);
+        buf.push(0u8);
+        write_u16(&mut buf, 8u16);
+        write_u32(&mut buf, cursor_xid);
+        write_u32(&mut buf, source_pixmap_xid);
+        write_u32(&mut buf, mask_pixmap_xid);
+        write_u16(&mut buf, fore.0);
+        write_u16(&mut buf, fore.1);
+        write_u16(&mut buf, fore.2);
+        write_u16(&mut buf, back.0);
+        write_u16(&mut buf, back.1);
+        write_u16(&mut buf, back.2);
+        write_u16(&mut buf, hot_x);
+        write_u16(&mut buf, hot_y);
+        self.stream.write_all(&buf)?;
+        self.stream.flush()?;
+        Ok(cursor_xid)
+    }
+
+    pub fn define_cursor(&mut self, host_window_xid: u32, cursor_host_xid: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut buf = Vec::with_capacity(12);
+        buf.push(43u8);
+        buf.push(0u8);
+        write_u16(&mut buf, 3u16);
+        write_u32(&mut buf, host_window_xid);
+        write_u32(&mut buf, cursor_host_xid);
+        self.stream.write_all(&buf)?;
+        self.stream.flush()
+    }
+
     pub fn set_clip_rectangles(
         &mut self,
         clip: Option<ClipRectangles>,
