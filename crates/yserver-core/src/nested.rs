@@ -2142,6 +2142,35 @@ fn handle_request(
                 dst_y,
             )
         }
+        41 => {
+            if body.len() >= 20 {
+                let dst_window =
+                    ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let dst_x = i16::from_le_bytes([body[16], body[17]]);
+                let dst_y = i16::from_le_bytes([body[18], body[19]]);
+                let host_target = {
+                    let s = lock_server(server)?;
+                    if dst_window.0 == 0 {
+                        None
+                    } else {
+                        s.resources.host_drawable_target(dst_window).map(|t| {
+                            (
+                                t.host_xid(),
+                                dst_x.wrapping_add(t.x_offset()),
+                                dst_y.wrapping_add(t.y_offset()),
+                            )
+                        })
+                    }
+                };
+                if let Some((host_xid, x, y)) = host_target
+                    && let Some(h) = host
+                    && let Ok(mut h) = h.lock()
+                {
+                    let _ = h.warp_pointer(host_xid, x, y);
+                }
+            }
+            log_void(client_id, sequence, "WarpPointer")
+        }
         42 => {
             if let Some(window) = x11::input_focus_window(body) {
                 set_focused_window(focused_window, server, window)?;

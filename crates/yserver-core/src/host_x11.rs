@@ -355,6 +355,24 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn warp_pointer(&mut self, dst_host_xid: u32, dst_x: i16, dst_y: i16) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(41); // WarpPointer
+        out.push(0);
+        write_u16(&mut out, 6); // length: 6 units = 24 bytes
+        write_u32(&mut out, 0); // src_window = None
+        write_u32(&mut out, dst_host_xid);
+        write_i16(&mut out, 0); // src_x
+        write_i16(&mut out, 0); // src_y
+        write_u16(&mut out, 0); // src_width
+        write_u16(&mut out, 0); // src_height
+        write_i16(&mut out, dst_x);
+        write_i16(&mut out, dst_y);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     pub fn create_pixmap(
         &mut self,
         host_xid: u32,
