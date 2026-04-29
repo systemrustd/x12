@@ -726,13 +726,16 @@ fn handle_render_request(
                 (host_src, host_mask, host_dst, x_off, y_off)
             };
             debug!(
-                "client {} #{} RENDER::Composite op={} src=0x{:x} mask=0x{:x} dst=0x{:x} dst_xy=({},{}) size={}x{}",
+                "client {} #{} RENDER::Composite op={} src=0x{:x}->{:?} mask=0x{:x}->{:?} dst=0x{:x}->{:?} dst_xy=({},{}) size={}x{}",
                 client_id.0,
                 sequence.0,
                 req.op,
                 req.src.0,
+                host_src,
                 req.mask.0,
+                host_mask,
                 req.dst.0,
+                host_dst,
                 req.dst_x,
                 req.dst_y,
                 req.width,
@@ -754,6 +757,11 @@ fn handle_render_request(
                     req.dst_y.wrapping_add(dst_y_off),
                     req.width,
                     req.height,
+                );
+            } else {
+                debug!(
+                    "client {} #{} RENDER::Composite SKIPPED (host_src={:?} host_mask={:?} host_dst={:?})",
+                    client_id.0, sequence.0, host_src, host_mask, host_dst
                 );
             }
             Ok(())

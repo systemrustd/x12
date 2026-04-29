@@ -35,6 +35,11 @@ pub struct HostX11 {
     // the drain loop for window N discards the GetGeometry reply for window N+k,
     // causing the subsequent drain loop to hang forever.
     reply_buffer: Vec<HostResponse>,
+    // GCs cached per pixmap depth. The default `gc_id` is bound to a depth-24
+    // drawable so PutImage onto pixmaps with a different depth (e.g. depth-8
+    // alpha masks for RENDER) would BadMatch. We lazily create one GC per
+    // depth using the target drawable as the screen-and-depth reference.
+    depth_gcs: HashMap<u8, u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +94,7 @@ impl HostX11 {
             next_xid: setup.resource_id_base + 3,
             render: None,
             reply_buffer: Vec::new(),
+            depth_gcs: HashMap::new(),
         };
         this.render = this.init_render().ok();
         Ok(this)
@@ -272,7 +278,12 @@ impl HostX11 {
                 resp.bytes[0], resp.sequence
             );
             if resp.sequence == fmt_seq {
-                return parse_host_pict_formats(&resp.bytes, opcode);
+                let info = parse_host_pict_formats(&resp.bytes, opcode)?;
+                debug!(
+                    "init_render: host formats a1=0x{:x} a8=0x{:x} rgb24=0x{:x} argb32=0x{:x}",
+                    info.fmt_a1, info.fmt_a8, info.fmt_rgb24, info.fmt_argb32
+                );
+                return Ok(info);
             }
         }
     }
@@ -1028,6 +1039,31 @@ impl HostX11 {
         }
     }
 
+    /// Returns a host GC bound to a drawable of the given depth, creating
+    /// one on demand. The default `gc_id` is depth-24; pass that drawable
+    /// (or any depth-24 drawable) for that case to reuse it.
+    fn ensure_gc_for_depth(&mut self, depth: u8, drawable: u32) -> io::Result<u32> {
+        if depth == 24 {
+            return Ok(self.gc_id);
+        }
+        if let Some(&gc) = self.depth_gcs.get(&depth) {
+            return Ok(gc);
+        }
+        let gc = self.allocate_xid();
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(55); // CreateGC opcode
+        out.push(0);
+        write_u16(&mut out, 4); // length units (no values)
+        write_u32(&mut out, gc);
+        write_u32(&mut out, drawable);
+        write_u32(&mut out, 0); // value-mask = 0
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.depth_gcs.insert(depth, gc);
+        Ok(gc)
+    }
+
     pub fn put_image(
         &mut self,
         host_xid: u32,
@@ -1038,6 +1074,10 @@ impl HostX11 {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
+        // GCs are bound to a drawable's root and depth at creation; using the
+        // default depth-24 GC against a depth-1/8/32 pixmap would BadMatch and
+        // silently discard the image data on the host.
+        let gc = self.ensure_gc_for_depth(depth, host_xid)?;
         let padded_data_len = padded_len(data.len());
         let length_units = 6 + u16::try_from(padded_data_len / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "image data too large"))?;
@@ -1047,7 +1087,7 @@ impl HostX11 {
         out.push(2); // ZPixmap format
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         write_u16(&mut out, width);
         write_u16(&mut out, height);
         write_i16(&mut out, dst_x);
