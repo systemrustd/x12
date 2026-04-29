@@ -1421,18 +1421,13 @@ pub fn write_list_properties_reply(
     sequence: SequenceNumber,
     atoms: &[AtomId],
 ) -> io::Result<()> {
-    let n = atoms.len() as u32;
-    let mut buf = [0u8; 32];
-    buf[0] = 1;
-    buf[2] = (sequence.0 & 0xff) as u8;
-    buf[3] = ((sequence.0 >> 8) & 0xff) as u8;
-    // length = n (each AtomId is 4 bytes = 1 unit)
-    buf[4..8].copy_from_slice(&n.to_le_bytes());
-    // num_atoms in bytes 8-9
-    let n16 = atoms.len() as u16;
-    buf[8..10].copy_from_slice(&n16.to_le_bytes());
-    writer.write_all(&buf)?;
-    for atom in atoms {
+    let n = u16::try_from(atoms.len()).unwrap_or(u16::MAX);
+    // length = number of extra 4-byte units beyond the fixed 32-byte header
+    let mut reply = wire::fixed_reply(sequence, 0, u32::from(n));
+    wire::write_u16(ClientByteOrder::LittleEndian, &mut reply, n);
+    reply.resize(32, 0);
+    writer.write_all(&reply)?;
+    for atom in &atoms[..usize::from(n)] {
         writer.write_all(&atom.0.to_le_bytes())?;
     }
     Ok(())
