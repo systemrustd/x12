@@ -407,6 +407,11 @@ impl ResourceTable {
         window.parent = request.parent;
         window.x = request.x;
         window.y = request.y;
+        // Moving a former top-level into the tree: its host subwindow is no longer
+        // the rendering target (top_level_host_target will follow the new top-level).
+        if old_parent == ROOT_WINDOW && request.parent != ROOT_WINDOW {
+            window.host_xid = None;
+        }
 
         Ok(ReparentResult {
             window: request.window,

@@ -1063,12 +1063,32 @@ fn handle_request(
                         return emit_x11_error(writer, sequence, code, bad_value, 7);
                     }
                 };
-                if let Some(xid) = result.host_xid
-                    && result.new_parent == ROOT_WINDOW
-                    && let Some(host) = host
-                    && let Ok(mut h) = host.lock()
-                {
-                    let _ = h.configure_subwindow(xid, Some(result.x), Some(result.y), None, None);
+                if let Some(xid) = result.host_xid {
+                    if result.new_parent == ROOT_WINDOW {
+                        // Window moved back to root: reposition its host subwindow.
+                        if let Some(host) = host
+                            && let Ok(mut h) = host.lock()
+                        {
+                            let _ = h.configure_subwindow(
+                                xid,
+                                Some(result.x),
+                                Some(result.y),
+                                None,
+                                None,
+                            );
+                        }
+                    } else if result.old_parent == ROOT_WINDOW {
+                        // Window moved away from root: its host subwindow is stale.
+                        // top_level_host_target will route drawing through the new top-level.
+                        if let Some(host) = host
+                            && let Ok(mut h) = host.lock()
+                        {
+                            let _ = h.destroy_subwindow(xid);
+                        }
+                        if let Some(input_handle) = input_handle {
+                            input_handle.unregister_top_level(xid);
+                        }
+                    }
                 }
                 fanout_event(&on_window, |buf, seq, order| {
                     x11::encode_reparent_notify_event(
