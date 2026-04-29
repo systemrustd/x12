@@ -382,6 +382,10 @@ fn handle_client(
             s.pointer_grab_is_passive = false;
             s.frozen_pointer_event = None;
         }
+        let dead_windows: std::collections::HashSet<ResourceId> =
+            all_destroyed.iter().copied().collect();
+        s.selections
+            .retain(|_, owner_window| !dead_windows.contains(owner_window));
         (fonts, freed_pixmaps, pending)
     };
     for pending in pending_destroys {

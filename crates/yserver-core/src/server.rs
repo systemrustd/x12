@@ -299,8 +299,12 @@ pub fn fanout_event(
 
 pub fn fanout_raw_event(targets: &[EventTarget], event: &[u8; 32]) {
     for target in targets {
+        let seq = target.last_sequence.load(Ordering::Relaxed);
+        let mut buf = *event;
+        buf[2] = (seq & 0xff) as u8;
+        buf[3] = ((seq >> 8) & 0xff) as u8;
         if let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(event);
+            let _ = w.write_all(&buf);
         }
     }
 }
