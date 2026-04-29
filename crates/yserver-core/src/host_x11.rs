@@ -320,6 +320,50 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_composite(
+        &mut self,
+        op: u8,
+        host_src: u32,
+        host_mask: u32,
+        host_dst: u32,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        // header(4) + op_pad(4) + src(4) + mask(4) + dst(4) + src_xy(4)
+        // + mask_xy(4) + dst_xy(4) + size(4) = 36 bytes = 9 units
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(36);
+        out.push(opcode);
+        out.push(8); // Composite
+        write_u16(&mut out, 9);
+        out.push(op);
+        out.extend_from_slice(&[0, 0, 0]); // pad
+        write_u32(&mut out, host_src);
+        write_u32(&mut out, host_mask);
+        write_u32(&mut out, host_dst);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+        write_i16(&mut out, mask_x);
+        write_i16(&mut out, mask_y);
+        write_i16(&mut out, dst_x);
+        write_i16(&mut out, dst_y);
+        write_u16(&mut out, width);
+        write_u16(&mut out, height);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     pub fn render_free_picture(&mut self, host_pic: u32) -> io::Result<()> {
         let Some(r) = self.render.as_ref() else {
             return Ok(());

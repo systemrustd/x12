@@ -705,6 +705,59 @@ fn handle_render_request(
             );
             Ok(())
         }
+        // Composite (minor=8): src + mask -> dst at (dst_x, dst_y)
+        8 => {
+            let Some(req) = x11::render_composite_request(body) else {
+                return Ok(());
+            };
+            let (host_src, host_mask, host_dst, dst_x_off, dst_y_off) = {
+                let s = lock_server(server)?;
+                let host_src = s.resources.picture(req.src).map(|p| p.host_picture_xid);
+                // mask is optional; xid 0 means None
+                let host_mask = if req.mask.0 == 0 {
+                    Some(0)
+                } else {
+                    s.resources.picture(req.mask).map(|p| p.host_picture_xid)
+                };
+                let (host_dst, x_off, y_off) =
+                    s.resources.picture(req.dst).map_or((None, 0, 0), |p| {
+                        (Some(p.host_picture_xid), p.x_offset, p.y_offset)
+                    });
+                (host_src, host_mask, host_dst, x_off, y_off)
+            };
+            debug!(
+                "client {} #{} RENDER::Composite op={} src=0x{:x} mask=0x{:x} dst=0x{:x} dst_xy=({},{}) size={}x{}",
+                client_id.0,
+                sequence.0,
+                req.op,
+                req.src.0,
+                req.mask.0,
+                req.dst.0,
+                req.dst_x,
+                req.dst_y,
+                req.width,
+                req.height
+            );
+            if let (Some(host_src), Some(host_mask), Some(host_dst), Some(mut h)) =
+                (host_src, host_mask, host_dst, lock_host())
+            {
+                let _ = h.render_composite(
+                    req.op,
+                    host_src,
+                    host_mask,
+                    host_dst,
+                    req.src_x,
+                    req.src_y,
+                    req.mask_x,
+                    req.mask_y,
+                    req.dst_x.wrapping_add(dst_x_off),
+                    req.dst_y.wrapping_add(dst_y_off),
+                    req.width,
+                    req.height,
+                );
+            }
+            Ok(())
+        }
         // FreePicture (minor=7)
         7 => {
             let Some(pic_id) = x11::render_free_resource_id(body) else {

@@ -3055,6 +3055,21 @@ pub struct RenderFillRectanglesRequest {
     pub rects: Vec<u8>,
 }
 
+pub struct RenderCompositeRequest {
+    pub op: u8,
+    pub src: ResourceId,
+    pub mask: ResourceId,
+    pub dst: ResourceId,
+    pub src_x: i16,
+    pub src_y: i16,
+    pub mask_x: i16,
+    pub mask_y: i16,
+    pub dst_x: i16,
+    pub dst_y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
 pub fn render_create_picture_request(body: &[u8]) -> Option<RenderCreatePictureRequest> {
     if body.len() < 16 {
         return None;
@@ -3142,6 +3157,40 @@ pub fn render_create_solid_fill_request(body: &[u8]) -> Option<(ResourceId, [u8;
     let picture = ResourceId(read_u32_le(body.get(0..4)?));
     let color: [u8; 8] = body.get(4..12)?.try_into().ok()?;
     Some((picture, color))
+}
+
+pub fn render_composite_request(body: &[u8]) -> Option<RenderCompositeRequest> {
+    // op(1) + pad(3) + src(4) + mask(4) + dst(4) + src_xy(4) + mask_xy(4)
+    // + dst_xy(4) + size(4) = 32 bytes after the 4-byte request header.
+    if body.len() < 32 {
+        return None;
+    }
+    let op = body[0];
+    let src = ResourceId(read_u32_le(body.get(4..8)?));
+    let mask = ResourceId(read_u32_le(body.get(8..12)?));
+    let dst = ResourceId(read_u32_le(body.get(12..16)?));
+    let src_x = i16::from_le_bytes(body.get(16..18)?.try_into().ok()?);
+    let src_y = i16::from_le_bytes(body.get(18..20)?.try_into().ok()?);
+    let mask_x = i16::from_le_bytes(body.get(20..22)?.try_into().ok()?);
+    let mask_y = i16::from_le_bytes(body.get(22..24)?.try_into().ok()?);
+    let dst_x = i16::from_le_bytes(body.get(24..26)?.try_into().ok()?);
+    let dst_y = i16::from_le_bytes(body.get(26..28)?.try_into().ok()?);
+    let width = u16::from_le_bytes(body.get(28..30)?.try_into().ok()?);
+    let height = u16::from_le_bytes(body.get(30..32)?.try_into().ok()?);
+    Some(RenderCompositeRequest {
+        op,
+        src,
+        mask,
+        dst,
+        src_x,
+        src_y,
+        mask_x,
+        mask_y,
+        dst_x,
+        dst_y,
+        width,
+        height,
+    })
 }
 
 /// Write QueryPictFormats reply. Advertises 4 picture formats (A1, A8, X8R8G8B8, A8R8G8B8)
