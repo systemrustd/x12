@@ -1859,6 +1859,19 @@ fn handle_request(
             }
             Ok(())
         }
+        21 => {
+            let atoms: Vec<AtomId> = if body.len() >= 4 {
+                let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let s = lock_server(server)?;
+                s.resources
+                    .window(window)
+                    .map(|w| w.properties.keys().copied().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            x11::write_list_properties_reply(&mut *lock_writer()?, sequence, &atoms)
+        }
         22 => {
             // SetSelectionOwner: window(4) selection(4) time(4)
             if body.len() >= 8 {
@@ -2097,12 +2110,36 @@ fn handle_request(
         }
         40 => {
             log_reply(client_id, sequence, "TranslateCoordinates");
+            let (child, dst_x, dst_y) = if body.len() >= 12 {
+                let src_window =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let dst_window =
+                    ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let src_x = i16::from_le_bytes([body[8], body[9]]);
+                let src_y = i16::from_le_bytes([body[10], body[11]]);
+                let s = lock_server(server)?;
+                let (src_abs_x, src_abs_y) = s.resources.window_absolute_position(src_window);
+                let abs_x = src_abs_x + i32::from(src_x);
+                let abs_y = src_abs_y + i32::from(src_y);
+                let (dst_abs_x, dst_abs_y) = s.resources.window_absolute_position(dst_window);
+                #[allow(clippy::cast_possible_truncation)]
+                let dst_x = (abs_x - dst_abs_x) as i16;
+                #[allow(clippy::cast_possible_truncation)]
+                let dst_y = (abs_y - dst_abs_y) as i16;
+                let child = s
+                    .resources
+                    .child_containing_point(dst_window, abs_x, abs_y)
+                    .unwrap_or(ResourceId(0));
+                (child, dst_x, dst_y)
+            } else {
+                (ResourceId(0), 0i16, 0i16)
+            };
             x11::write_translate_coordinates_reply(
                 &mut *lock_writer()?,
                 sequence,
-                ResourceId(0),
-                0,
-                0,
+                child,
+                dst_x,
+                dst_y,
             )
         }
         42 => {

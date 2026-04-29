@@ -725,6 +725,64 @@ impl ResourceTable {
             || self.fonts.contains_key(&id.0)
             || self.cursors.contains_key(&id.0)
     }
+
+    /// Returns the screen-absolute (x, y) of the top-left corner of `id`.
+    /// Walks up the parent chain accumulating x/y offsets. Returns (0, 0) for ROOT_WINDOW.
+    #[must_use]
+    pub fn window_absolute_position(&self, id: ResourceId) -> (i32, i32) {
+        if id == ROOT_WINDOW {
+            return (0, 0);
+        }
+        let mut ax: i32 = 0;
+        let mut ay: i32 = 0;
+        let mut current = id;
+        let mut depth = 0usize;
+        while current != ROOT_WINDOW && depth < 256 {
+            let Some(w) = self.windows.get(&current.0) else {
+                break;
+            };
+            ax += i32::from(w.x);
+            ay += i32::from(w.y);
+            if w.parent == current {
+                break;
+            }
+            current = w.parent;
+            depth += 1;
+        }
+        (ax, ay)
+    }
+
+    /// Returns the child of `parent` (in the nested window tree) that contains
+    /// the screen-absolute point (abs_x, abs_y), or None if no mapped child contains it.
+    /// Children are checked in reverse order (top of stacking = last in list).
+    #[must_use]
+    pub fn child_containing_point(
+        &self,
+        parent: ResourceId,
+        abs_x: i32,
+        abs_y: i32,
+    ) -> Option<ResourceId> {
+        let (px, py) = self.window_absolute_position(parent);
+        let local_x = abs_x - px;
+        let local_y = abs_y - py;
+        let w = self.windows.get(&parent.0)?;
+        for &child_id in w.children.iter().rev() {
+            let Some(child) = self.windows.get(&child_id.0) else {
+                continue;
+            };
+            if child.map_state == MapState::Unmapped {
+                continue;
+            }
+            let cx = i32::from(child.x);
+            let cy = i32::from(child.y);
+            let cw = i32::from(child.width);
+            let ch = i32::from(child.height);
+            if local_x >= cx && local_x < cx + cw && local_y >= cy && local_y < cy + ch {
+                return Some(child_id);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
