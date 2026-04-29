@@ -377,9 +377,7 @@ fn handle_client(
         let (fonts, freed_pixmaps) = s.resources.remove_non_window_resources_owned_by(client_id);
         s.clients.remove(&client_id.0);
         s.button_grabs.retain(|g| g.owner != client_id);
-        if s.pointer_grab
-            .is_some_and(|(owner, _)| owner == client_id)
-        {
+        if s.pointer_grab.is_some_and(|(owner, _)| owner == client_id) {
             s.pointer_grab = None;
             s.pointer_grab_is_passive = false;
             s.frozen_pointer_event = None;
@@ -2020,7 +2018,7 @@ fn handle_request(
         }
         28 => {
             if body.len() >= 20 {
-                let button = header.data;
+                let button = if body.len() >= 17 { body[16] } else { 0 };
                 let grab_window =
                     ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let event_mask = u32::from(u16::from_le_bytes([body[4], body[5]]));

@@ -254,8 +254,7 @@ impl ServerState {
                     continue;
                 }
                 let button_match = grab.button == 0 || grab.button == button;
-                let mod_match = grab.modifiers == 0x8000
-                    || (grab.modifiers & 0xff) == (state_mask & 0xff);
+                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
                 if button_match && mod_match {
                     return Some(grab.clone());
                 }
