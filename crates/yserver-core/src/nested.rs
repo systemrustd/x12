@@ -1166,7 +1166,7 @@ fn handle_request(
                     } else {
                         let (map_info, host_xid) = {
                             let mut s = lock_server(server)?;
-                            s.resources.map_window(window);
+                            let _ = s.resources.map_window(window);
                             let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
                             let map_info = s
                                 .resources
@@ -1236,12 +1236,16 @@ fn handle_request(
                     s.resources.children(parent).to_vec()
                 };
                 for child in children {
-                    let (extents, host_xid) = {
+                    let (extents, host_xid, was_unmapped, override_redirect) = {
                         let mut s = lock_server(server)?;
-                        s.resources.map_window(child);
+                        let was_unmapped = s.resources.map_window(child);
                         let host_xid = s.resources.window(child).and_then(|w| w.host_xid);
                         let extents = s.resources.window(child).map(|w| (w.width, w.height));
-                        (extents, host_xid)
+                        let override_redirect = s
+                            .resources
+                            .window(child)
+                            .is_some_and(|w| w.override_redirect);
+                        (extents, host_xid, was_unmapped, override_redirect)
                     };
                     if let Some(xid) = host_xid
                         && let Some(host) = host
@@ -1265,6 +1269,23 @@ fn handle_request(
                     if wants_focus {
                         debug!("focus key window 0x{:x}", child.0);
                         set_focused_window(focused_window, server, child)?;
+                    }
+                    if was_unmapped {
+                        crate::server::emit_window_event(
+                            server,
+                            child,
+                            0x0002_0000,
+                            |buf, seq, order| {
+                                x11::encode_map_notify_event(
+                                    buf,
+                                    seq,
+                                    order,
+                                    child,
+                                    child,
+                                    override_redirect,
+                                );
+                            },
+                        );
                     }
                     if let Some((width, height)) = extents {
                         crate::server::emit_window_event(

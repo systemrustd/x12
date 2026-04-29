@@ -221,9 +221,14 @@ impl ResourceTable {
         Some(window)
     }
 
-    pub fn map_window(&mut self, id: ResourceId) {
+    #[must_use]
+    pub fn map_window(&mut self, id: ResourceId) -> bool {
         if let Some(window) = self.windows.get_mut(&id.0) {
+            let was_unmapped = window.map_state == MapState::Unmapped;
             window.map_state = MapState::Viewable;
+            was_unmapped
+        } else {
+            false
         }
     }
 
