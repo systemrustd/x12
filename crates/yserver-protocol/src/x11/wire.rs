@@ -1,5 +1,4 @@
-use std::io;
-use std::io::ErrorKind;
+use std::{io, io::ErrorKind};
 
 use super::{ClientByteOrder, SequenceNumber};
 

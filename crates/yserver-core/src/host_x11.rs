@@ -345,6 +345,101 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn create_pixmap(
+        &mut self,
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(53); // CreatePixmap opcode
+        out.push(depth);
+        write_u16(&mut out, 4); // length: 4 units = 16 bytes
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.window_id); // screen-compatible drawable
+        write_u16(&mut out, width);
+        write_u16(&mut out, height);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn free_pixmap(&mut self, host_xid: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(54); // FreePixmap opcode
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_area(
+        &mut self,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(62); // CopyArea opcode
+        out.push(0);
+        write_u16(&mut out, 7); // length: 7 units = 28 bytes
+        write_u32(&mut out, src_host_xid);
+        write_u32(&mut out, dst_host_xid);
+        write_u32(&mut out, self.gc_id);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+        write_i16(&mut out, dst_x);
+        write_i16(&mut out, dst_y);
+        write_u16(&mut out, width);
+        write_u16(&mut out, height);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_image(
+        &mut self,
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let padded_data_len = padded_len(data.len());
+        let length_units = 6 + u16::try_from(padded_data_len / 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "image data too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(72); // PutImage opcode
+        out.push(2); // ZPixmap format
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.gc_id);
+        write_u16(&mut out, width);
+        write_u16(&mut out, height);
+        write_i16(&mut out, dst_x);
+        write_i16(&mut out, dst_y);
+        out.push(0); // left-pad
+        out.push(depth);
+        write_u16(&mut out, 0); // unused
+        out.extend_from_slice(data);
+        out.resize(24 + padded_data_len, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     pub fn poly_fill_arc(&mut self, host_xid: u32, foreground: u32, arcs: &[u8]) -> io::Result<()> {
         self.draw_arcs(host_xid, 71, foreground, arcs)
     }

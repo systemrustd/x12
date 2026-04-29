@@ -18,7 +18,9 @@ use yserver_protocol::x11::{
 
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
-    resources::{MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, Window},
+    resources::{
+        HostDrawableTarget, MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, Window,
+    },
     server::{ClientHandle, ServerState, fanout_event},
 };
 
@@ -304,7 +306,7 @@ fn handle_client(
         }
     })();
 
-    let (closed_fonts, pending_destroys) = {
+    let (closed_fonts, freed_pixmaps, pending_destroys) = {
         let mut s = lock_server(&server)?;
         let mut owned_roots: Vec<ResourceId> = Vec::new();
         s.resources
@@ -342,9 +344,9 @@ fn handle_client(
             all_destroyed.extend(order);
         }
         s.drop_window_subscriptions(&all_destroyed);
-        let fonts = s.resources.remove_non_window_resources_owned_by(client_id);
+        let (fonts, freed_pixmaps) = s.resources.remove_non_window_resources_owned_by(client_id);
         s.clients.remove(&client_id.0);
-        (fonts, pending)
+        (fonts, freed_pixmaps, pending)
     };
     for (w, parent, was_mapped, host_xid, subs_w, subs_p) in pending_destroys {
         if let Some(xid) = host_xid {
@@ -377,6 +379,9 @@ fn handle_client(
     {
         for xid in closed_fonts {
             let _ = h.close_font(xid);
+        }
+        for xid in freed_pixmaps {
+            let _ = h.free_pixmap(xid);
         }
     }
     result
@@ -1492,7 +1497,7 @@ fn handle_request(
         53 => {
             if let Some(request) = x11::create_pixmap_request(header.data, body) {
                 let new_id = request.pixmap.0;
-                let validation_failed = {
+                let (validation_failed, drawable_exists) = {
                     let s = lock_server(server)?;
                     let handle = s.clients.get(&client_id.0).expect("client registered");
                     let owned = crate::server::IdAllocator::validate_owned(
@@ -1501,22 +1506,69 @@ fn handle_request(
                         handle.resource_id_mask,
                     );
                     let in_use = s.resources.any_resource_exists(request.pixmap);
-                    !owned || in_use
+                    let drawable_exists = s.resources.window(request.drawable).is_some()
+                        || s.resources.pixmap(request.drawable).is_some();
+                    (!owned || in_use, drawable_exists)
                 };
                 if validation_failed {
                     return emit_x11_error(writer, sequence, x11::error::BAD_ID_CHOICE, new_id, 53);
                 }
+                if !drawable_exists {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        request.drawable.0,
+                        53,
+                    );
+                }
+                if !supported_pixmap_depth(request.depth) {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(request.depth),
+                        53,
+                    );
+                }
+                let host_xid = if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    let xid = host.allocate_xid();
+                    match host.create_pixmap(xid, request.depth, request.width, request.height) {
+                        Ok(()) => Some(xid),
+                        Err(err) => {
+                            warn!("client {} host CreatePixmap failed: {err}", client_id.0);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 {
                     let mut s = lock_server(server)?;
                     s.resources.create_pixmap(client_id, request);
+                    if let Some(xid) = host_xid {
+                        let updated = s.resources.set_pixmap_host_xid(request.pixmap, xid);
+                        debug_assert!(updated, "pixmap was just inserted above");
+                    }
                 }
             }
             log_void(client_id, sequence, "CreatePixmap")
         }
         54 => {
             if let Some(pixmap) = x11::free_resource_id(body) {
-                let mut s = lock_server(server)?;
-                s.resources.free_pixmap(pixmap);
+                let removed = {
+                    let mut s = lock_server(server)?;
+                    s.resources.free_pixmap(pixmap)
+                };
+                if let Some(removed_pixmap) = removed
+                    && let Some(xid) = removed_pixmap.host_xid
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.free_pixmap(xid)?;
+                }
             }
             log_void(client_id, sequence, "FreePixmap")
         }
@@ -1597,7 +1649,76 @@ fn handle_request(
             }
             log_void(client_id, sequence, "ClearArea")
         }
-        62 => log_void(client_id, sequence, "CopyArea"),
+        62 => {
+            if let Some(request) = x11::copy_area_request(body) {
+                if request.width == 0 || request.height == 0 {
+                    return log_void(client_id, sequence, "CopyArea");
+                }
+
+                let (gc_exists, src_exists, dst_exists, src, dst) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc(request.gc).is_some(),
+                        s.resources.window(request.src).is_some()
+                            || s.resources.pixmap(request.src).is_some(),
+                        s.resources.window(request.dst).is_some()
+                            || s.resources.pixmap(request.dst).is_some(),
+                        s.resources.host_drawable_target(request.src),
+                        s.resources.host_drawable_target(request.dst),
+                    )
+                };
+                if !gc_exists {
+                    return emit_x11_error(writer, sequence, x11::error::BAD_GC, request.gc.0, 62);
+                }
+                if !src_exists {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        request.src.0,
+                        62,
+                    );
+                }
+                if !dst_exists {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        request.dst.0,
+                        62,
+                    );
+                }
+                // src/dst exist but have no host backing yet — silently drop
+                if let (Some(src), Some(dst)) = (src, dst) {
+                    if src.depth() != dst.depth() {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            request.dst.0,
+                            62,
+                        );
+                    }
+                    if let (Some(src_host_xid), Some(dst_host_xid)) =
+                        (routed_host_xid(src), routed_host_xid(dst))
+                        && let Some(host) = host
+                        && let Ok(mut host) = host.lock()
+                    {
+                        host.copy_area(
+                            src_host_xid,
+                            dst_host_xid,
+                            request.src_x,
+                            request.src_y,
+                            request.dst_x,
+                            request.dst_y,
+                            request.width,
+                            request.height,
+                        )?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "CopyArea")
+        }
         64 => log_void(client_id, sequence, "PolyPoint"),
         65 => {
             if let Some((gc_id, points)) = x11::poly_line_data(body)
@@ -1698,7 +1819,78 @@ fn handle_request(
             }
             log_void(client_id, sequence, "PolyFillArc")
         }
-        72 => log_void(client_id, sequence, "PutImage"),
+        72 => {
+            if let Some(request) = x11::put_image_request(header.data, body) {
+                if request.width == 0 || request.height == 0 {
+                    return log_void(client_id, sequence, "PutImage");
+                }
+
+                let (gc_exists, drawable_exists, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc(request.gc).is_some(),
+                        s.resources.window(request.drawable).is_some()
+                            || s.resources.pixmap(request.drawable).is_some(),
+                        s.resources.host_drawable_target(request.drawable),
+                    )
+                };
+                if !gc_exists {
+                    return emit_x11_error(writer, sequence, x11::error::BAD_GC, request.gc.0, 72);
+                }
+                if !drawable_exists {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        request.drawable.0,
+                        72,
+                    );
+                }
+
+                // XYBitmap and XYPixmap are out of scope for Phase 1; drop silently
+                // rather than returning BadValue, which kills clients (xeyes, xterm).
+                if request.format != x11::ImageFormat::ZPixmap {
+                    return log_void(client_id, sequence, "PutImage");
+                }
+                // left_pad must be 0 for ZPixmap; malformed requests are dropped.
+                if request.left_pad != 0 {
+                    return log_void(client_id, sequence, "PutImage");
+                }
+
+                // target is None when the drawable has no host backing yet — drop silently.
+                // Depth mismatches and unsupported depths are also dropped silently for Phase 1
+                // compatibility; returning BadMatch kills clients (xterm).
+                if let Some(target) = target {
+                    if request.depth != target.depth() {
+                        return log_void(client_id, sequence, "PutImage");
+                    }
+                    let Some(expected_len) =
+                        zpixmap_expected_len(request.width, request.height, request.depth)
+                    else {
+                        return log_void(client_id, sequence, "PutImage");
+                    };
+                    if request.data.len() < expected_len {
+                        return log_void(client_id, sequence, "PutImage");
+                    }
+
+                    if let Some(host_xid) = routed_host_xid(target)
+                        && let Some(host) = host
+                        && let Ok(mut host) = host.lock()
+                    {
+                        host.put_image(
+                            host_xid,
+                            request.depth,
+                            request.width,
+                            request.height,
+                            request.dst_x,
+                            request.dst_y,
+                            &request.data[..expected_len],
+                        )?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PutImage")
+        }
         74 => {
             if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
                 let drawable = ResourceId(drawable_raw);
@@ -1907,6 +2099,34 @@ fn rewrite_reply_sequence(reply: &mut [u8], sequence: SequenceNumber) {
     }
 }
 
+fn supported_pixmap_depth(depth: u8) -> bool {
+    matches!(depth, 1 | 24 | 32)
+}
+
+fn zpixmap_expected_len(width: u16, height: u16, depth: u8) -> Option<usize> {
+    let bits_per_pixel: usize = match depth {
+        24 | 32 => 32,
+        _ => return None,
+    };
+    let stride_bits = usize::from(width).checked_mul(bits_per_pixel)?;
+    let stride_bytes = stride_bits.div_ceil(32).checked_mul(4)?;
+    stride_bytes.checked_mul(usize::from(height))
+}
+
+#[allow(clippy::match_same_arms)] // Window zero-offset and Pixmap are semantically distinct
+fn routed_host_xid(target: HostDrawableTarget) -> Option<u32> {
+    match target {
+        HostDrawableTarget::Window {
+            host_xid,
+            x_offset: 0,
+            y_offset: 0,
+            ..
+        } => Some(host_xid),
+        HostDrawableTarget::Pixmap { host_xid, .. } => Some(host_xid),
+        HostDrawableTarget::Window { .. } => None,
+    }
+}
+
 fn log_void(client_id: ClientId, sequence: SequenceNumber, name: &str) -> io::Result<()> {
     debug!("client {} #{} {name}", client_id.0, sequence.0);
     Ok(())
@@ -1961,5 +2181,31 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
         height: pixmap.height,
         border_width: 0,
         depth: pixmap.depth,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zpixmap_expected_len;
+
+    #[test]
+    fn zpixmap_expected_len_depth24_2x3() {
+        assert_eq!(zpixmap_expected_len(2, 3, 24), Some(24));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth32_2x3() {
+        assert_eq!(zpixmap_expected_len(2, 3, 32), Some(24));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_unsupported_depth_returns_none() {
+        assert_eq!(zpixmap_expected_len(2, 3, 16), None);
+        assert_eq!(zpixmap_expected_len(2, 3, 1), None);
+    }
+
+    #[test]
+    fn zpixmap_expected_len_zero_width_returns_zero() {
+        assert_eq!(zpixmap_expected_len(0, 3, 24), Some(0));
     }
 }

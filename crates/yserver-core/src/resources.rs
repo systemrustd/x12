@@ -23,6 +23,33 @@ pub struct TopLevelTarget {
     pub y_offset: i16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostDrawableTarget {
+    Window {
+        nested: ResourceId,
+        top_level: ResourceId,
+        host_xid: u32,
+        x_offset: i16,
+        y_offset: i16,
+        depth: u8,
+    },
+    Pixmap {
+        nested: ResourceId,
+        host_xid: u32,
+        width: u16,
+        height: u16,
+        depth: u8,
+    },
+}
+
+impl HostDrawableTarget {
+    pub fn depth(self) -> u8 {
+        match self {
+            Self::Window { depth, .. } | Self::Pixmap { depth, .. } => depth,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ResourceTable {
     windows: HashMap<u32, Window>,
@@ -78,7 +105,11 @@ impl ResourceTable {
             width: request.width,
             height: request.height,
             border_width: request.border_width,
-            depth: request.depth,
+            depth: if request.depth == 0 {
+                self.windows.get(&request.parent.0).map_or(24, |p| p.depth)
+            } else {
+                request.depth
+            },
             visual: if request.visual.0 == 0 {
                 ROOT_VISUAL
             } else {
@@ -238,16 +269,51 @@ impl ResourceTable {
                 height: request.height,
                 depth: request.depth,
                 owner,
+                host_xid: None,
             },
         );
     }
 
-    pub fn free_pixmap(&mut self, id: ResourceId) {
-        self.pixmaps.remove(&id.0);
+    pub fn free_pixmap(&mut self, id: ResourceId) -> Option<Pixmap> {
+        self.pixmaps.remove(&id.0)
     }
 
     pub fn pixmap(&self, id: ResourceId) -> Option<&Pixmap> {
         self.pixmaps.get(&id.0)
+    }
+
+    #[must_use]
+    pub fn set_pixmap_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
+        if let Some(pixmap) = self.pixmaps.get_mut(&id.0) {
+            pixmap.host_xid = Some(host_xid);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn host_drawable_target(&self, id: ResourceId) -> Option<HostDrawableTarget> {
+        if let Some(window) = self.windows.get(&id.0) {
+            let target = self.top_level_host_target(id)?;
+            return Some(HostDrawableTarget::Window {
+                nested: id,
+                top_level: target.top_level,
+                host_xid: target.host_xid,
+                x_offset: target.x_offset,
+                y_offset: target.y_offset,
+                depth: window.depth,
+            });
+        }
+
+        let pixmap = self.pixmaps.get(&id.0)?;
+        Some(HostDrawableTarget::Pixmap {
+            nested: id,
+            host_xid: pixmap.host_xid?,
+            width: pixmap.width,
+            height: pixmap.height,
+            depth: pixmap.depth,
+        })
     }
 
     pub fn create_gc(&mut self, owner: ClientId, request: CreateGcRequest) {
@@ -366,10 +432,24 @@ impl ResourceTable {
     }
 
     /// Remove every non-window resource owned by `client`. Returns the
-    /// `host_xid` of every removed font so the caller can issue host-side
-    /// `CloseFont` after dropping the `ServerState` lock.
-    pub fn remove_non_window_resources_owned_by(&mut self, client: ClientId) -> Vec<u32> {
-        self.pixmaps.retain(|_, p| p.owner != client);
+    /// `host_xid` of every removed font and every removed host-backed pixmap so
+    /// the caller can issue host-side `CloseFont` / `FreePixmap` after dropping
+    /// the `ServerState` lock.
+    pub fn remove_non_window_resources_owned_by(
+        &mut self,
+        client: ClientId,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut freed_pixmaps = Vec::new();
+        self.pixmaps.retain(|_, p| {
+            if p.owner == client {
+                if let Some(xid) = p.host_xid {
+                    freed_pixmaps.push(xid);
+                }
+                false
+            } else {
+                true
+            }
+        });
         self.gcs.retain(|_, g| g.owner != client);
         self.cursors.retain(|_, c| c.owner != client);
         let mut closed_fonts = Vec::new();
@@ -381,7 +461,7 @@ impl ResourceTable {
                 true
             }
         });
-        closed_fonts
+        (closed_fonts, freed_pixmaps)
     }
 
     #[must_use]
@@ -494,6 +574,7 @@ pub struct Pixmap {
     pub height: u16,
     pub depth: u8,
     pub owner: ClientId,
+    pub host_xid: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -730,6 +811,131 @@ mod tests {
         // Build a child whose parent is a non-existent window (chain breaks).
         make_child(&mut table, 0x0010_0003, 0x9999_9999, 10, 20);
         assert_eq!(table.top_level_host_target(ResourceId(0x0010_0003)), None);
+    }
+
+    #[test]
+    fn host_drawable_target_top_level_window_with_host_xid() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
+        let target = table.host_drawable_target(ResourceId(0x0010_0002));
+        assert_eq!(
+            target,
+            Some(HostDrawableTarget::Window {
+                nested: ResourceId(0x0010_0002),
+                top_level: ResourceId(0x0010_0002),
+                host_xid: 0xAA,
+                x_offset: 0,
+                y_offset: 0,
+                depth: 24,
+            })
+        );
+    }
+
+    #[test]
+    fn host_drawable_target_child_window_with_accumulated_offsets() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xBB);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        let target = table.host_drawable_target(ResourceId(0x0010_0003));
+        assert_eq!(
+            target,
+            Some(HostDrawableTarget::Window {
+                nested: ResourceId(0x0010_0003),
+                top_level: ResourceId(0x0010_0002),
+                host_xid: 0xBB,
+                x_offset: 10,
+                y_offset: 20,
+                depth: 24,
+            })
+        );
+    }
+
+    #[test]
+    fn host_drawable_target_pixmap_with_host_xid() {
+        let mut table = ResourceTable::new();
+        let request = CreatePixmapRequest {
+            pixmap: ResourceId(0x0020_0002),
+            drawable: ROOT_WINDOW,
+            width: 256,
+            height: 256,
+            depth: 32,
+        };
+        table.create_pixmap(ClientId(1), request);
+        assert!(table.set_pixmap_host_xid(ResourceId(0x0020_0002), 0xDEAD_BEEF));
+        let target = table.host_drawable_target(ResourceId(0x0020_0002));
+        assert_eq!(
+            target,
+            Some(HostDrawableTarget::Pixmap {
+                nested: ResourceId(0x0020_0002),
+                host_xid: 0xDEAD_BEEF,
+                width: 256,
+                height: 256,
+                depth: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn host_drawable_target_pixmap_without_host_xid_returns_none() {
+        let mut table = ResourceTable::new();
+        let request = CreatePixmapRequest {
+            pixmap: ResourceId(0x0020_0002),
+            drawable: ROOT_WINDOW,
+            width: 128,
+            height: 128,
+            depth: 24,
+        };
+        table.create_pixmap(ClientId(1), request);
+        // host_xid is None by default
+        let target = table.host_drawable_target(ResourceId(0x0020_0002));
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn host_drawable_target_unknown_drawable_returns_none() {
+        let table = ResourceTable::new();
+        let target = table.host_drawable_target(ResourceId(0x9999_9999));
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn set_pixmap_host_xid_unknown_id_returns_false() {
+        let mut table = ResourceTable::new();
+        let result = table.set_pixmap_host_xid(ResourceId(0xDEAD), 0x1234);
+        assert!(!result);
+    }
+
+    #[test]
+    fn set_pixmap_host_xid_sets_value_and_returns_true() {
+        let mut table = ResourceTable::new();
+        let request = CreatePixmapRequest {
+            pixmap: ResourceId(0x0020_0002),
+            drawable: ROOT_WINDOW,
+            width: 128,
+            height: 128,
+            depth: 24,
+        };
+        table.create_pixmap(ClientId(1), request);
+        let result = table.set_pixmap_host_xid(ResourceId(0x0020_0002), 0x5678);
+        assert!(result);
+        assert_eq!(
+            table.pixmap(ResourceId(0x0020_0002)).unwrap().host_xid,
+            Some(0x5678)
+        );
+    }
+
+    #[test]
+    fn host_drawable_target_window_depth_matches_window_depth() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0x1234);
+        // Set depth to 32
+        table.windows.get_mut(&0x0010_0002).unwrap().depth = 32;
+        let target = table.host_drawable_target(ResourceId(0x0010_0002));
+        if let Some(HostDrawableTarget::Window { depth, .. }) = target {
+            assert_eq!(depth, 32);
+        } else {
+            panic!("Expected Window variant with depth 32");
+        }
     }
 
     proptest! {

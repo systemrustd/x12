@@ -209,6 +209,41 @@ pub struct ClearAreaRequest {
     pub height: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyAreaRequest {
+    pub src: ResourceId,
+    pub dst: ResourceId,
+    pub gc: ResourceId,
+    pub src_x: i16,
+    pub src_y: i16,
+    pub dst_x: i16,
+    pub dst_y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageFormat {
+    XyBitmap,
+    XyPixmap,
+    ZPixmap,
+    Unknown(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PutImageRequest<'a> {
+    pub format: ImageFormat,
+    pub drawable: ResourceId,
+    pub gc: ResourceId,
+    pub width: u16,
+    pub height: u16,
+    pub dst_x: i16,
+    pub dst_y: i16,
+    pub left_pad: u8,
+    pub depth: u8,
+    pub data: &'a [u8],
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenFontRequest {
     pub font: ResourceId,
@@ -788,6 +823,46 @@ pub fn clear_area_request(body: &[u8]) -> Option<ClearAreaRequest> {
         y: read_i16_le(body.get(6..8)?),
         width: read_u16_le(body.get(8..10)?),
         height: read_u16_le(body.get(10..12)?),
+    })
+}
+
+#[must_use]
+pub fn copy_area_request(body: &[u8]) -> Option<CopyAreaRequest> {
+    Some(CopyAreaRequest {
+        src: ResourceId(read_u32_le(body.get(0..4)?)),
+        dst: ResourceId(read_u32_le(body.get(4..8)?)),
+        gc: ResourceId(read_u32_le(body.get(8..12)?)),
+        src_x: read_i16_le(body.get(12..14)?),
+        src_y: read_i16_le(body.get(14..16)?),
+        dst_x: read_i16_le(body.get(16..18)?),
+        dst_y: read_i16_le(body.get(18..20)?),
+        width: read_u16_le(body.get(20..22)?),
+        height: read_u16_le(body.get(22..24)?),
+    })
+}
+
+fn image_format(value: u8) -> ImageFormat {
+    match value {
+        0 => ImageFormat::XyBitmap,
+        1 => ImageFormat::XyPixmap,
+        2 => ImageFormat::ZPixmap,
+        other => ImageFormat::Unknown(other),
+    }
+}
+
+#[must_use]
+pub fn put_image_request(format: u8, body: &[u8]) -> Option<PutImageRequest<'_>> {
+    Some(PutImageRequest {
+        format: image_format(format),
+        drawable: ResourceId(read_u32_le(body.get(0..4)?)),
+        gc: ResourceId(read_u32_le(body.get(4..8)?)),
+        width: read_u16_le(body.get(8..10)?),
+        height: read_u16_le(body.get(10..12)?),
+        dst_x: read_i16_le(body.get(12..14)?),
+        dst_y: read_i16_le(body.get(14..16)?),
+        left_pad: *body.get(16)?,
+        depth: *body.get(17)?,
+        data: body.get(20..)?,
     })
 }
 
@@ -2383,6 +2458,115 @@ mod tests {
             }
         }
     }
+
+    mod copy_area_tests {
+        use super::*;
+
+        #[test]
+        fn all_fields_parse_correctly() {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x11111111);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x22222222);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x33333333);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 100);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 200);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 300);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 400);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 500);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 600);
+
+            let req = copy_area_request(&body).unwrap();
+            assert_eq!(req.src, ResourceId(0x11111111));
+            assert_eq!(req.dst, ResourceId(0x22222222));
+            assert_eq!(req.gc, ResourceId(0x33333333));
+            assert_eq!(req.src_x, 100);
+            assert_eq!(req.src_y, 200);
+            assert_eq!(req.dst_x, 300);
+            assert_eq!(req.dst_y, 400);
+            assert_eq!(req.width, 500);
+            assert_eq!(req.height, 600);
+        }
+
+        #[test]
+        fn short_body_returns_none() {
+            let body = [0u8; 23]; // 1 byte short
+            assert!(copy_area_request(&body).is_none());
+        }
+    }
+
+    mod put_image_tests {
+        use super::*;
+
+        #[test]
+        fn z_pixmap_parses_all_scalar_fields_and_preserves_data_slice() {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x12345678);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 0x9abcdef0);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 100);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 200);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 50);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 75);
+            body.push(5); // left_pad
+            body.push(32); // depth
+            body.extend_from_slice(&[0, 0]); // padding
+            let data_slice = [0xAA, 0xBB, 0xCC, 0xDD];
+            body.extend_from_slice(&data_slice);
+
+            let req = put_image_request(2, &body).unwrap();
+            assert_eq!(req.format, ImageFormat::ZPixmap);
+            assert_eq!(req.drawable, ResourceId(0x12345678));
+            assert_eq!(req.gc, ResourceId(0x9abcdef0));
+            assert_eq!(req.width, 100);
+            assert_eq!(req.height, 200);
+            assert_eq!(req.dst_x, 50);
+            assert_eq!(req.dst_y, 75);
+            assert_eq!(req.left_pad, 5);
+            assert_eq!(req.depth, 32);
+            assert_eq!(req.data, &data_slice);
+        }
+
+        fn minimal_body() -> Vec<u8> {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 1);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, 2);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 3);
+            write_u16(ClientByteOrder::LittleEndian, &mut body, 4);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 5);
+            write_i16(ClientByteOrder::LittleEndian, &mut body, 6);
+            body.push(7);
+            body.push(8);
+            body.extend_from_slice(&[0, 0]);
+            body.push(0xAB);
+            body
+        }
+
+        #[test]
+        fn format_byte_0_maps_to_xy_bitmap() {
+            let body = minimal_body();
+            let req = put_image_request(0, &body).unwrap();
+            assert_eq!(req.format, ImageFormat::XyBitmap);
+        }
+
+        #[test]
+        fn format_byte_1_maps_to_xy_pixmap() {
+            let body = minimal_body();
+            let req = put_image_request(1, &body).unwrap();
+            assert_eq!(req.format, ImageFormat::XyPixmap);
+        }
+
+        #[test]
+        fn unknown_format_maps_to_unknown_value() {
+            let body = minimal_body();
+            let req = put_image_request(42, &body).unwrap();
+            assert_eq!(req.format, ImageFormat::Unknown(42));
+        }
+
+        #[test]
+        fn short_body_returns_none() {
+            let body = [0u8; 19]; // 1 byte short of required 20 bytes
+            assert!(put_image_request(2, &body).is_none());
+        }
+    }
 }
 
 pub mod error {
@@ -2391,7 +2575,9 @@ pub mod error {
     pub const BAD_WINDOW: u8 = 3;
     pub const BAD_ATOM: u8 = 5;
     pub const BAD_MATCH: u8 = 8;
+    pub const BAD_DRAWABLE: u8 = 9;
     pub const BAD_ALLOC: u8 = 11;
+    pub const BAD_GC: u8 = 13;
     pub const BAD_ID_CHOICE: u8 = 14;
     pub const BAD_LENGTH: u8 = 16;
 }

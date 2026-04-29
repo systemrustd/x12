@@ -66,9 +66,11 @@ In rough priority order:
       `MotionNotify`, `EnterNotify` / `LeaveNotify` delivered via
       `HostInputPump` + `xid_map` fanout. `xeyes` now tracks cursor
       via real `MotionNotify` events.
-- [ ] **`CopyArea` and `PutImage`.** Both are stubs; xterm uses them for
-      scrolling and some text paths. Spec:
-      [`2026-04-29-copyarea-putimage-design.md`](superpowers/specs/2026-04-29-copyarea-putimage-design.md).
+- [x] **`CopyArea` and `PutImage`.** Phase 1 supports `ZPixmap` into
+      host-backed windows and pixmaps; host-backed pixmaps created for
+      depths 1, 24, and 32. `XYBitmap`/`XYPixmap`, non-zero
+      child-window coordinate translation, and xterm scrollback remain
+      follow-ups.
 
 ### Known follow-ups
 
@@ -98,6 +100,10 @@ contingent on landed work.
   request → fanout → wire-bytes test would require driving
   `handle_request` against mock writers. Deferred — spec already
   notes the gap.
+- **xterm scrollback.** `seq 1 200` scrolls forward cleanly via
+  `CopyArea`. Scrollback via the scrollbar or shift-pageup does not
+  yet work; likely requires `XCopyArea` from scrollback buffer, which
+  depends on xterm's scroll-mode pixmap allocation.
 - **`PendingDestroy` struct.** The 5-tuple
   `(window, parent, was_mapped, on_window, on_parent)` carried
   through opcode 4 and disconnect cleanup is currently silenced with
