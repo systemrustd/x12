@@ -20,7 +20,8 @@ use yserver_protocol::x11::{
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
     resources::{
-        MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ReparentWindowError, Window,
+        GlyphSetState, MapState, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW,
+        ReparentWindowError, Window,
     },
     server::{ClientHandle, EventTarget, ServerState, fanout_event, fanout_raw_event},
 };
@@ -30,6 +31,10 @@ static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 const RANDR_MAJOR_OPCODE: u8 = 128;
 const RANDR_FIRST_EVENT: u8 = 89;
 const RANDR_FIRST_ERROR: u8 = 147;
+
+const RENDER_MAJOR_OPCODE: u8 = 133;
+const RENDER_FIRST_EVENT: u8 = 0;
+const RENDER_FIRST_ERROR: u8 = 152;
 
 struct OwnedGetPropertyReply {
     format: u8,
@@ -337,7 +342,7 @@ fn handle_client(
         }
     })();
 
-    let (closed_fonts, freed_pixmaps, pending_destroys) = {
+    let (removed, pending_destroys) = {
         let mut s = lock_server(&server)?;
         let mut owned_roots: Vec<ResourceId> = Vec::new();
         s.resources
@@ -374,7 +379,7 @@ fn handle_client(
             all_destroyed.extend(order);
         }
         s.drop_window_subscriptions(&all_destroyed);
-        let (fonts, freed_pixmaps) = s.resources.remove_non_window_resources_owned_by(client_id);
+        let removed = s.resources.remove_non_window_resources_owned_by(client_id);
         s.clients.remove(&client_id.0);
         s.button_grabs.retain(|g| g.owner != client_id);
         if s.pointer_grab.is_some_and(|(owner, _)| owner == client_id) {
@@ -386,7 +391,7 @@ fn handle_client(
             all_destroyed.iter().copied().collect();
         s.selections
             .retain(|_, owner_window| !dead_windows.contains(owner_window));
-        (fonts, freed_pixmaps, pending)
+        (removed, pending)
     };
     for pending in pending_destroys {
         if let Some(xid) = pending.host_xid {
@@ -404,11 +409,20 @@ fn handle_client(
     if let Some(host) = host.as_ref()
         && let Ok(mut h) = host.lock()
     {
-        for xid in closed_fonts {
+        for xid in removed.closed_fonts {
             let _ = h.close_font(xid);
         }
-        for xid in freed_pixmaps {
+        for xid in removed.freed_pixmaps {
             let _ = h.free_pixmap(xid);
+        }
+        for (pic_xid, owned_pix) in removed.freed_pictures {
+            let _ = h.render_free_picture(pic_xid);
+            if let Some(pix_xid) = owned_pix {
+                let _ = h.free_pixmap(pix_xid);
+            }
+        }
+        for gs_xid in removed.freed_glyphsets {
+            let _ = h.render_free_glyphset(gs_xid);
         }
     }
     result
@@ -570,6 +584,303 @@ fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
         window_extent
     } else {
         window_extent.saturating_sub(offset as u16)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_render_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+    let lock_host = || -> Option<std::sync::MutexGuard<'_, HostX11>> { host?.lock().ok() };
+
+    match minor {
+        // QueryVersion
+        0 => {
+            let (major, minor_ver) = lock_host()
+                .and_then(|mut h| h.render_query_version().ok())
+                .unwrap_or((0, 11));
+            debug!(
+                "client {} #{} RENDER::QueryVersion -> {}.{}",
+                client_id.0, sequence.0, major, minor_ver
+            );
+            x11::write_render_query_version_reply(&mut *lock_writer()?, sequence, major, minor_ver)
+        }
+        // QueryPictFormats
+        1 => {
+            debug!(
+                "client {} #{} RENDER::QueryPictFormats",
+                client_id.0, sequence.0
+            );
+            x11::write_render_query_pict_formats_reply(
+                &mut *lock_writer()?,
+                sequence,
+                crate::resources::ROOT_VISUAL,
+            )
+        }
+        // CreatePicture (minor=4)
+        4 => {
+            let Some(req) = x11::render_create_picture_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::CreatePicture pic=0x{:x} drawable=0x{:x} fmt={}",
+                client_id.0, sequence.0, req.picture.0, req.drawable.0, req.format
+            );
+            let (host_drawable_xid, x_off, y_off) = {
+                let s = lock_server(server)?;
+                match s.resources.host_drawable_target(req.drawable) {
+                    Some(crate::resources::HostDrawableTarget::Window {
+                        host_xid,
+                        x_offset,
+                        y_offset,
+                        ..
+                    }) => (Some(host_xid), x_offset, y_offset),
+                    Some(crate::resources::HostDrawableTarget::Pixmap { host_xid, .. }) => {
+                        (Some(host_xid), 0, 0)
+                    }
+                    None => (None, 0, 0),
+                }
+            };
+            if let Some(host_drawable) = host_drawable_xid {
+                let host_pic = req.picture.0;
+                if let Some(mut h) = lock_host() {
+                    let _ = h.render_create_picture(
+                        host_pic,
+                        host_drawable,
+                        req.format,
+                        req.value_mask,
+                        &req.values,
+                    );
+                }
+                let mut s = lock_server(server)?;
+                s.resources.create_picture(
+                    req.picture,
+                    PictureState {
+                        client: client_id,
+                        host_picture_xid: host_pic,
+                        host_owned_pixmap: None,
+                        x_offset: x_off,
+                        y_offset: y_off,
+                    },
+                );
+            }
+            Ok(())
+        }
+        // ChangePicture (minor=5) — stub: accept and ignore
+        5 => {
+            debug!(
+                "client {} #{} RENDER::ChangePicture (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        // FreePicture (minor=7)
+        7 => {
+            let Some(pic_id) = x11::render_free_resource_id(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::FreePicture pic=0x{:x}",
+                client_id.0, sequence.0, pic_id.0
+            );
+            let state = {
+                let mut s = lock_server(server)?;
+                s.resources.free_picture(pic_id)
+            };
+            if let (Some(state), Some(mut h)) = (state, lock_host()) {
+                let _ = h.render_free_picture(state.host_picture_xid);
+                if let Some(pix) = state.host_owned_pixmap {
+                    let _ = h.free_pixmap(pix);
+                }
+            }
+            Ok(())
+        }
+        // CreateGlyphSet (minor=17)
+        17 => {
+            let Some((gs_id, fmt)) = x11::render_create_glyphset_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::CreateGlyphSet gs=0x{:x} fmt={}",
+                client_id.0, sequence.0, gs_id.0, fmt
+            );
+            let host_gs = gs_id.0;
+            if let Some(mut h) = lock_host() {
+                let _ = h.render_create_glyphset(host_gs, fmt);
+            }
+            let mut s = lock_server(server)?;
+            s.resources.create_glyphset(
+                gs_id,
+                GlyphSetState {
+                    client: client_id,
+                    host_glyphset_xid: host_gs,
+                },
+            );
+            Ok(())
+        }
+        // ReferenceGlyphSet (minor=18) — stub
+        18 => {
+            debug!(
+                "client {} #{} RENDER::ReferenceGlyphSet (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        // FreeGlyphSet (minor=19)
+        19 => {
+            let Some(gs_id) = x11::render_free_resource_id(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::FreeGlyphSet gs=0x{:x}",
+                client_id.0, sequence.0, gs_id.0
+            );
+            let state = {
+                let mut s = lock_server(server)?;
+                s.resources.free_glyphset(gs_id)
+            };
+            if let (Some(state), Some(mut h)) = (state, lock_host()) {
+                let _ = h.render_free_glyphset(state.host_glyphset_xid);
+            }
+            Ok(())
+        }
+        // AddGlyphs (minor=20)
+        20 => {
+            let Some((gs_id, tail)) = x11::render_add_glyphs_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::AddGlyphs gs=0x{:x}",
+                client_id.0, sequence.0, gs_id.0
+            );
+            let host_gs = {
+                let s = lock_server(server)?;
+                s.resources.glyphset(gs_id).map(|g| g.host_glyphset_xid)
+            };
+            if let (Some(host_gs), Some(mut h)) = (host_gs, lock_host()) {
+                let _ = h.render_add_glyphs(host_gs, &tail);
+            }
+            Ok(())
+        }
+        // FreeGlyphs (minor=22) — stub
+        22 => {
+            debug!(
+                "client {} #{} RENDER::FreeGlyphs (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        // CompositeGlyphs8/16/32 (minor=23/24/25)
+        23..=25 => {
+            let Some(req) = x11::render_composite_glyphs_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::CompositeGlyphs{} dst=0x{:x}",
+                client_id.0,
+                sequence.0,
+                match minor {
+                    23 => "8",
+                    24 => "16",
+                    _ => "32",
+                },
+                req.dst.0
+            );
+            let (host_src, host_dst, host_gs, x_off, y_off, mask_fmt) = {
+                let s = lock_server(server)?;
+                let host_src = s.resources.picture(req.src).map(|p| p.host_picture_xid);
+                let (host_dst, x_off, y_off) =
+                    s.resources.picture(req.dst).map_or((None, 0, 0), |p| {
+                        (Some(p.host_picture_xid), p.x_offset, p.y_offset)
+                    });
+                let host_gs = s
+                    .resources
+                    .glyphset(req.glyphset)
+                    .map(|g| g.host_glyphset_xid);
+                let mask_fmt = if req.mask_format == 0 {
+                    0
+                } else {
+                    s.resources
+                        .picture(ResourceId(req.mask_format))
+                        .map_or(req.mask_format, |p| p.host_picture_xid)
+                };
+                (host_src, host_dst, host_gs, x_off, y_off, mask_fmt)
+            };
+            if let (Some(host_src), Some(host_dst), Some(host_gs), Some(mut h)) =
+                (host_src, host_dst, host_gs, lock_host())
+            {
+                let _ = h.render_composite_glyphs(
+                    minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x, req.src_y,
+                    &req.items, x_off, y_off,
+                );
+            }
+            Ok(())
+        }
+        // FillRectangles (minor=26)
+        26 => {
+            let Some(req) = x11::render_fill_rectangles_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::FillRectangles dst=0x{:x}",
+                client_id.0, sequence.0, req.dst.0
+            );
+            let (host_dst, x_off, y_off) = {
+                let s = lock_server(server)?;
+                s.resources.picture(req.dst).map_or((None, 0, 0), |p| {
+                    (Some(p.host_picture_xid), p.x_offset, p.y_offset)
+                })
+            };
+            if let (Some(host_dst), Some(mut h)) = (host_dst, lock_host()) {
+                let _ =
+                    h.render_fill_rectangles(host_dst, req.op, req.color, &req.rects, x_off, y_off);
+            }
+            Ok(())
+        }
+        // CreateSolidFill (minor=33)
+        33 => {
+            let Some((pic_id, color)) = x11::render_create_solid_fill_request(body) else {
+                return Ok(());
+            };
+            debug!(
+                "client {} #{} RENDER::CreateSolidFill pic=0x{:x}",
+                client_id.0, sequence.0, pic_id.0
+            );
+            let host_pic = pic_id.0;
+            if let Some(mut h) = lock_host() {
+                let _ = h.render_create_solid_fill(host_pic, color);
+            }
+            let mut s = lock_server(server)?;
+            s.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    x_offset: 0,
+                    y_offset: 0,
+                },
+            );
+            Ok(())
+        }
+        _ => {
+            debug!(
+                "client {} #{} RENDER::unknown minor={}",
+                client_id.0, sequence.0, minor
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1480,8 +1791,12 @@ fn handle_request(
                         );
                     });
                 } else {
-                    let (configure, host_xid) = {
+                    let (configure, host_xid, old_size) = {
                         let mut s = lock_server(server)?;
+                        let old_size = s
+                            .resources
+                            .window(request.window)
+                            .map(|w| (w.width, w.height));
                         let configure = s
                             .resources
                             .configure_window(request)
@@ -1489,7 +1804,7 @@ fn handle_request(
                         let host_xid = configure.as_ref().and_then(|(id, _, _)| {
                             s.resources.window(*id).and_then(|w| w.host_xid)
                         });
-                        (configure, host_xid)
+                        (configure, host_xid, old_size)
                     };
                     if let Some(xid) = host_xid
                         && let Some(host) = host
@@ -1520,6 +1835,27 @@ fn handle_request(
                                 );
                             },
                         );
+                        let grew = old_size.map_or(false, |(ow, oh)| {
+                            geometry.width > ow || geometry.height > oh
+                        });
+                        if grew {
+                            crate::server::emit_window_event(
+                                server,
+                                window_id,
+                                0x0000_8000,
+                                |buf, seq, order| {
+                                    x11::encode_expose_event(
+                                        buf,
+                                        seq,
+                                        order,
+                                        window_id,
+                                        geometry.width,
+                                        geometry.height,
+                                    );
+                                },
+                            );
+                            emit_expose_subtree(server, window_id);
+                        }
                     }
                 }
             }
@@ -3248,6 +3584,20 @@ fn handle_request(
                     RANDR_FIRST_EVENT,
                     RANDR_FIRST_ERROR,
                 )
+            } else if name == "RENDER" {
+                let has_render = host
+                    .and_then(|h| h.lock().ok())
+                    .map_or(false, |h| h.render_opcode().is_some());
+                if has_render {
+                    (
+                        true,
+                        RENDER_MAJOR_OPCODE,
+                        RENDER_FIRST_EVENT,
+                        RENDER_FIRST_ERROR,
+                    )
+                } else {
+                    (false, 0, 0, 0)
+                }
             } else {
                 (false, 0, 0, 0)
             };
@@ -3311,6 +3661,15 @@ fn handle_request(
             writer,
             sequence,
             header.data, // RANDR minor opcode
+            body,
+        ),
+        RENDER_MAJOR_OPCODE => handle_render_request(
+            client_id,
+            server,
+            host,
+            writer,
+            sequence,
+            header.data, // RENDER minor opcode
             body,
         ),
         35 => {

@@ -11,6 +11,14 @@ use yserver_protocol::x11::{self, ClipRectangles, FontMetrics, ResourceId};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 
+struct HostRenderInfo {
+    opcode: u8,
+    fmt_a1: u32,
+    fmt_a8: u32,
+    fmt_rgb24: u32,
+    fmt_argb32: u32,
+}
+
 pub struct HostX11 {
     stream: UnixStream,
     window_id: u32,
@@ -20,6 +28,7 @@ pub struct HostX11 {
     current_clip: Option<HostClipRectangles>,
     sequence: u16,
     next_xid: u32,
+    render: Option<HostRenderInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,7 +72,7 @@ impl HostX11 {
         map_window(&mut stream, window_id)?;
         stream.flush()?;
 
-        Ok(Self {
+        let mut this = Self {
             stream,
             window_id,
             gc_id,
@@ -72,7 +81,10 @@ impl HostX11 {
             current_clip: None,
             sequence: 5,
             next_xid: setup.resource_id_base + 3,
-        })
+            render: None,
+        };
+        this.render = this.init_render().ok();
+        Ok(this)
     }
 
     pub fn allocate_xid(&mut self) -> u32 {
@@ -178,6 +190,324 @@ impl HostX11 {
 
     pub fn window_id(&self) -> u32 {
         self.window_id
+    }
+
+    pub fn render_opcode(&self) -> Option<u8> {
+        self.render.as_ref().map(|r| r.opcode)
+    }
+
+    #[allow(dead_code)]
+    pub fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
+        let r = self.render.as_ref()?;
+        match ynest_fmt {
+            1 => Some(r.fmt_a1),
+            2 => Some(r.fmt_a8),
+            3 => Some(r.fmt_rgb24),
+            4 => Some(r.fmt_argb32),
+            _ => None,
+        }
+    }
+
+    fn init_render(&mut self) -> io::Result<HostRenderInfo> {
+        let ext_name = b"RENDER";
+        let padded = padded_len(ext_name.len());
+        let length_units = 2 + (padded / 4) as u16;
+        self.sequence = self.sequence.wrapping_add(1);
+        let ext_seq = self.sequence;
+        let mut out = Vec::new();
+        out.push(98u8);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u16(&mut out, ext_name.len() as u16);
+        write_u16(&mut out, 0);
+        out.extend_from_slice(ext_name);
+        out.resize(8 + padded, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        let opcode;
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == ext_seq {
+                if resp.bytes[8] == 0 {
+                    return Err(io::Error::other("host RENDER extension not present"));
+                }
+                opcode = resp.bytes[9];
+                break;
+            }
+        }
+
+        self.sequence = self.sequence.wrapping_add(1);
+        let fmt_seq = self.sequence;
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(1); // QueryPictFormats
+        write_u16(&mut out, 1);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == fmt_seq {
+                return parse_host_pict_formats(&resp.bytes, opcode);
+            }
+        }
+    }
+
+    pub fn render_create_picture(
+        &mut self,
+        host_pic: u32,
+        host_drawable: u32,
+        ynest_format: u32,
+        value_mask: u32,
+        values: &[u8],
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let host_fmt = if ynest_format == 0 {
+            0u32
+        } else {
+            match ynest_format {
+                1 => r.fmt_a1,
+                2 => r.fmt_a8,
+                3 => r.fmt_rgb24,
+                4 => r.fmt_argb32,
+                _ => 0,
+            }
+        };
+        if host_fmt == 0 && ynest_format != 0 {
+            return Ok(());
+        }
+        let opcode = r.opcode;
+        let nvals = (values.len() / 4) as u16;
+        let length_units = 4 + nvals;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(4); // CreatePicture
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_pic);
+        write_u32(&mut out, host_drawable);
+        write_u32(&mut out, host_fmt);
+        write_u32(&mut out, value_mask);
+        out.extend_from_slice(values);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_free_picture(&mut self, host_pic: u32) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(7); // FreePicture
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_pic);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_create_glyphset(&mut self, host_gs: u32, ynest_format: u32) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let host_fmt = match ynest_format {
+            1 => r.fmt_a1,
+            2 => r.fmt_a8,
+            3 => r.fmt_rgb24,
+            4 => r.fmt_argb32,
+            _ => r.fmt_a8,
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(17); // CreateGlyphSet
+        write_u16(&mut out, 3);
+        write_u32(&mut out, host_gs);
+        write_u32(&mut out, host_fmt);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_free_glyphset(&mut self, host_gs: u32) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(19); // FreeGlyphSet
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_gs);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_add_glyphs(&mut self, host_gs: u32, body_tail: &[u8]) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        // body_tail: num_glyphs(4) + glyph_ids + glyph_infos + glyph_data
+        let payload_len = 4 + body_tail.len();
+        let padded_payload = padded_len(payload_len);
+        let length_units = 2 + (padded_payload / 4) as u16;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(20); // AddGlyphs
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_gs);
+        out.extend_from_slice(body_tail);
+        out.resize(8 + padded_payload, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_composite_glyphs(
+        &mut self,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        // Patch coordinates: add (x_off, y_off) to the first non-255 element's delta
+        let mut patched = items.to_vec();
+        if x_off != 0 || y_off != 0 {
+            let mut pos = 0;
+            while pos + 8 <= patched.len() {
+                let count = patched[pos];
+                if count == 255 {
+                    pos += 8;
+                    continue;
+                }
+                // patch delta_x at pos+4..pos+6, delta_y at pos+6..pos+8
+                let dx =
+                    i16::from_le_bytes([patched[pos + 4], patched[pos + 5]]).wrapping_add(x_off);
+                let dy =
+                    i16::from_le_bytes([patched[pos + 6], patched[pos + 7]]).wrapping_add(y_off);
+                patched[pos + 4..pos + 6].copy_from_slice(&dx.to_le_bytes());
+                patched[pos + 6..pos + 8].copy_from_slice(&dy.to_le_bytes());
+                break;
+            }
+        }
+        let padded_items = padded_len(patched.len());
+        let length_units = 7 + (padded_items / 4) as u16;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(minor);
+        write_u16(&mut out, length_units);
+        out.push(op);
+        out.extend_from_slice(&[0, 0, 0]); // pad
+        write_u32(&mut out, host_src);
+        write_u32(&mut out, host_dst);
+        write_u32(&mut out, mask_fmt);
+        write_u32(&mut out, host_gs);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+        out.extend_from_slice(&patched);
+        out.resize(28 + padded_items, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_create_solid_fill(&mut self, host_pic: u32, color: [u8; 8]) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(33); // CreateSolidFill
+        write_u16(&mut out, 4);
+        write_u32(&mut out, host_pic);
+        out.extend_from_slice(&color);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_fill_rectangles(
+        &mut self,
+        host_dst: u32,
+        op: u8,
+        color: [u8; 8],
+        rects: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        let nrects = rects.len() / 8;
+        let length_units = 4 + (nrects * 2) as u16;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(26); // FillRectangles
+        write_u16(&mut out, length_units);
+        out.push(op);
+        out.extend_from_slice(&[0, 0, 0]); // pad
+        write_u32(&mut out, host_dst);
+        out.extend_from_slice(&color);
+        // Translate rectangles
+        for rect in rects.chunks_exact(8) {
+            let x = i16::from_le_bytes([rect[0], rect[1]]).wrapping_add(x_off);
+            let y = i16::from_le_bytes([rect[2], rect[3]]).wrapping_add(y_off);
+            let w = u16::from_le_bytes([rect[4], rect[5]]);
+            let h = u16::from_le_bytes([rect[6], rect[7]]);
+            write_i16(&mut out, x);
+            write_i16(&mut out, y);
+            write_u16(&mut out, w);
+            write_u16(&mut out, h);
+        }
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn render_query_version(&mut self) -> io::Result<(u32, u32)> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok((0, 0));
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let seq = self.sequence;
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(0); // QueryVersion
+        write_u16(&mut out, 3);
+        write_u32(&mut out, 0); // client major
+        write_u32(&mut out, 11); // client minor
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == seq {
+                let major = read_u32(&resp.bytes[8..12]);
+                let minor = read_u32(&resp.bytes[12..16]);
+                return Ok((major, minor));
+            }
+        }
     }
 
     pub fn ping(&mut self) -> io::Result<()> {
@@ -1470,6 +1800,46 @@ fn write_list_fonts(
     out.extend_from_slice(pattern);
     out.resize(8 + padded, 0);
     stream.write_all(&out)
+}
+
+fn parse_host_pict_formats(bytes: &[u8], opcode: u8) -> io::Result<HostRenderInfo> {
+    if bytes.len() < 32 {
+        return Err(io::Error::other("QueryPictFormats reply too short"));
+    }
+    let num_formats = read_u32(&bytes[8..12]) as usize;
+    let mut fmt_a1 = 0u32;
+    let mut fmt_a8 = 0u32;
+    let mut fmt_rgb24 = 0u32;
+    let mut fmt_argb32 = 0u32;
+    for i in 0..num_formats {
+        let base = 32 + i * 28;
+        if base + 28 > bytes.len() {
+            break;
+        }
+        let id = read_u32(&bytes[base..base + 4]);
+        let type_ = bytes[base + 4];
+        let depth = bytes[base + 5];
+        let alpha_shift = read_u16(&bytes[base + 20..base + 22]);
+        let alpha_mask = read_u16(&bytes[base + 22..base + 24]);
+        let red_shift = read_u16(&bytes[base + 8..base + 10]);
+        let red_mask = read_u16(&bytes[base + 10..base + 12]);
+        if type_ == 1 {
+            match depth {
+                1 if alpha_mask == 1 => fmt_a1 = id,
+                8 if alpha_mask == 0xFF && alpha_shift == 0 => fmt_a8 = id,
+                24 if red_mask == 0xFF && red_shift == 16 && alpha_mask == 0 => fmt_rgb24 = id,
+                32 if alpha_mask == 0xFF && alpha_shift == 24 => fmt_argb32 = id,
+                _ => {}
+            }
+        }
+    }
+    Ok(HostRenderInfo {
+        opcode,
+        fmt_a1,
+        fmt_a8,
+        fmt_rgb24,
+        fmt_argb32,
+    })
 }
 
 struct HostResponse {

@@ -12,6 +12,14 @@ use crate::properties::PropertyValue;
 
 pub const SERVER_OWNER: ClientId = ClientId(0);
 
+#[derive(Debug, Default)]
+pub struct ClientRemovedResources {
+    pub closed_fonts: Vec<u32>,
+    pub freed_pixmaps: Vec<u32>,
+    pub freed_pictures: Vec<(u32, Option<u32>)>,
+    pub freed_glyphsets: Vec<u32>,
+}
+
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
@@ -89,12 +97,29 @@ pub enum ReparentWindowError {
 }
 
 #[derive(Debug)]
+pub struct PictureState {
+    pub client: ClientId,
+    pub host_picture_xid: u32,
+    pub host_owned_pixmap: Option<u32>,
+    pub x_offset: i16,
+    pub y_offset: i16,
+}
+
+#[derive(Debug)]
+pub struct GlyphSetState {
+    pub client: ClientId,
+    pub host_glyphset_xid: u32,
+}
+
+#[derive(Debug)]
 pub struct ResourceTable {
     windows: HashMap<u32, Window>,
     pixmaps: HashMap<u32, Pixmap>,
     gcs: HashMap<u32, Gc>,
     fonts: HashMap<u32, Font>,
     cursors: HashMap<u32, Cursor>,
+    pub pictures: HashMap<u32, PictureState>,
+    pub glyphsets: HashMap<u32, GlyphSetState>,
 }
 
 impl ResourceTable {
@@ -131,6 +156,8 @@ impl ResourceTable {
             gcs: HashMap::new(),
             fonts: HashMap::new(),
             cursors: HashMap::new(),
+            pictures: HashMap::new(),
+            glyphsets: HashMap::new(),
         }
     }
 
@@ -624,6 +651,30 @@ impl ResourceTable {
         self.gc(id).and_then(|gc| gc.clip_rectangles.clone())
     }
 
+    pub fn create_picture(&mut self, id: ResourceId, state: PictureState) {
+        self.pictures.insert(id.0, state);
+    }
+
+    pub fn free_picture(&mut self, id: ResourceId) -> Option<PictureState> {
+        self.pictures.remove(&id.0)
+    }
+
+    pub fn picture(&self, id: ResourceId) -> Option<&PictureState> {
+        self.pictures.get(&id.0)
+    }
+
+    pub fn create_glyphset(&mut self, id: ResourceId, state: GlyphSetState) {
+        self.glyphsets.insert(id.0, state);
+    }
+
+    pub fn free_glyphset(&mut self, id: ResourceId) -> Option<GlyphSetState> {
+        self.glyphsets.remove(&id.0)
+    }
+
+    pub fn glyphset(&self, id: ResourceId) -> Option<&GlyphSetState> {
+        self.glyphsets.get(&id.0)
+    }
+
     pub fn install_font(
         &mut self,
         owner: ClientId,
@@ -719,7 +770,7 @@ impl ResourceTable {
     pub fn remove_non_window_resources_owned_by(
         &mut self,
         client: ClientId,
-    ) -> (Vec<u32>, Vec<u32>) {
+    ) -> ClientRemovedResources {
         let mut freed_pixmaps = Vec::new();
         self.pixmaps.retain(|_, p| {
             if p.owner == client {
@@ -742,7 +793,30 @@ impl ResourceTable {
                 true
             }
         });
-        (closed_fonts, freed_pixmaps)
+        let mut freed_pictures: Vec<(u32, Option<u32>)> = Vec::new();
+        self.pictures.retain(|_, p| {
+            if p.client == client {
+                freed_pictures.push((p.host_picture_xid, p.host_owned_pixmap));
+                false
+            } else {
+                true
+            }
+        });
+        let mut freed_glyphsets = Vec::new();
+        self.glyphsets.retain(|_, g| {
+            if g.client == client {
+                freed_glyphsets.push(g.host_glyphset_xid);
+                false
+            } else {
+                true
+            }
+        });
+        ClientRemovedResources {
+            closed_fonts,
+            freed_pixmaps,
+            freed_pictures,
+            freed_glyphsets,
+        }
     }
 
     #[must_use]

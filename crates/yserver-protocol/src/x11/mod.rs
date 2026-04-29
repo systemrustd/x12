@@ -2952,6 +2952,244 @@ mod tests {
     }
 }
 
+// RENDER extension protocol: ynest format IDs
+pub const RENDER_FMT_A1: u32 = 1;
+pub const RENDER_FMT_A8: u32 = 2;
+pub const RENDER_FMT_RGB24: u32 = 3;
+pub const RENDER_FMT_ARGB32: u32 = 4;
+
+pub struct RenderCreatePictureRequest {
+    pub picture: ResourceId,
+    pub drawable: ResourceId,
+    pub format: u32,
+    pub value_mask: u32,
+    pub values: Vec<u8>,
+}
+
+pub struct RenderCompositeGlyphsRequest {
+    pub op: u8,
+    pub src: ResourceId,
+    pub dst: ResourceId,
+    pub mask_format: u32,
+    pub glyphset: ResourceId,
+    pub src_x: i16,
+    pub src_y: i16,
+    pub items: Vec<u8>,
+}
+
+pub struct RenderFillRectanglesRequest {
+    pub op: u8,
+    pub dst: ResourceId,
+    pub color: [u8; 8],
+    pub rects: Vec<u8>,
+}
+
+pub fn render_create_picture_request(body: &[u8]) -> Option<RenderCreatePictureRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    let picture = ResourceId(read_u32_le(body.get(0..4)?));
+    let drawable = ResourceId(read_u32_le(body.get(4..8)?));
+    let format = read_u32_le(body.get(8..12)?);
+    let value_mask = read_u32_le(body.get(12..16)?);
+    let values = body.get(16..).unwrap_or(&[]).to_vec();
+    Some(RenderCreatePictureRequest {
+        picture,
+        drawable,
+        format,
+        value_mask,
+        values,
+    })
+}
+
+pub fn render_free_resource_id(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn render_create_glyphset_request(body: &[u8]) -> Option<(ResourceId, u32)> {
+    if body.len() < 8 {
+        return None;
+    }
+    let gs = ResourceId(read_u32_le(body.get(0..4)?));
+    let fmt = read_u32_le(body.get(4..8)?);
+    Some((gs, fmt))
+}
+
+pub fn render_add_glyphs_request(body: &[u8]) -> Option<(ResourceId, Vec<u8>)> {
+    if body.len() < 8 {
+        return None;
+    }
+    let gs = ResourceId(read_u32_le(body.get(0..4)?));
+    let tail = body.get(4..).unwrap_or(&[]).to_vec();
+    Some((gs, tail))
+}
+
+pub fn render_composite_glyphs_request(body: &[u8]) -> Option<RenderCompositeGlyphsRequest> {
+    if body.len() < 24 {
+        return None;
+    }
+    let op = body[0];
+    let src = ResourceId(read_u32_le(body.get(4..8)?));
+    let dst = ResourceId(read_u32_le(body.get(8..12)?));
+    let mask_format = read_u32_le(body.get(12..16)?);
+    let glyphset = ResourceId(read_u32_le(body.get(16..20)?));
+    let src_x = i16::from_le_bytes(body.get(20..22)?.try_into().ok()?);
+    let src_y = i16::from_le_bytes(body.get(22..24)?.try_into().ok()?);
+    let items = body.get(24..).unwrap_or(&[]).to_vec();
+    Some(RenderCompositeGlyphsRequest {
+        op,
+        src,
+        dst,
+        mask_format,
+        glyphset,
+        src_x,
+        src_y,
+        items,
+    })
+}
+
+pub fn render_fill_rectangles_request(body: &[u8]) -> Option<RenderFillRectanglesRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    let op = body[0];
+    let dst = ResourceId(read_u32_le(body.get(4..8)?));
+    let color: [u8; 8] = body.get(8..16)?.try_into().ok()?;
+    let rects = body.get(16..).unwrap_or(&[]).to_vec();
+    Some(RenderFillRectanglesRequest {
+        op,
+        dst,
+        color,
+        rects,
+    })
+}
+
+pub fn render_create_solid_fill_request(body: &[u8]) -> Option<(ResourceId, [u8; 8])> {
+    if body.len() < 12 {
+        return None;
+    }
+    let picture = ResourceId(read_u32_le(body.get(0..4)?));
+    let color: [u8; 8] = body.get(4..12)?.try_into().ok()?;
+    Some((picture, color))
+}
+
+/// Write QueryPictFormats reply. Advertises 4 picture formats (A1, A8, X8R8G8B8, A8R8G8B8)
+/// and maps the root visual (depth 24) to X8R8G8B8.
+pub fn write_render_query_pict_formats_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    root_visual: ResourceId,
+) -> io::Result<()> {
+    // 4 formats × 28 bytes = 112 bytes
+    // 1 screen: 4 (fallback) + [depth24: 8 header + 8 visual = 16] = 20 bytes
+    // Total body = 132 bytes = 33 × 4-byte units
+    let num_formats: u32 = 4;
+    let num_screens: u32 = 1;
+    let num_depths: u32 = 1;
+    let num_visuals: u32 = 1;
+    let body_units: u32 = (112 + 20) / 4; // 33
+
+    let mut out = Vec::new();
+    out.push(1u8); // Reply
+    out.push(0u8); // unused
+    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, body_units);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, num_formats);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, num_screens);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, num_depths);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, num_visuals);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_subpixel
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
+
+    // Format 1: A1 (depth=1, alpha only)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_A1);
+    out.push(1); // type=Direct
+    out.push(1); // depth=1
+    out.extend_from_slice(&[0, 0]); // pad
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // red-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // red-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // green-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // green-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // alpha-mask
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // colormap
+
+    // Format 2: A8 (depth=8, alpha only)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_A8);
+    out.push(1); // type=Direct
+    out.push(8); // depth=8
+    out.extend_from_slice(&[0, 0]);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift=0
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // alpha-mask=0xFF
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+
+    // Format 3: X8R8G8B8 (depth=24, no alpha)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24);
+    out.push(1); // type=Direct
+    out.push(24); // depth=24
+    out.extend_from_slice(&[0, 0]);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 16); // red-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // red-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 8); // green-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // green-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // blue-mask
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-mask=0 (no alpha)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+
+    // Format 4: A8R8G8B8 (depth=32, with alpha)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_ARGB32);
+    out.push(1); // type=Direct
+    out.push(32); // depth=32
+    out.extend_from_slice(&[0, 0]);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 16); // red-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 8); // green-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 24); // alpha-shift
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // alpha-mask
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+
+    // Screen info: fallback=RGB24, 1 depth (24), 1 visual (root_visual → RGB24)
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24); // fallback
+    // Depth 24 entry: depth(1) + pad(1) + num_visuals(2) + pad(4) = 8 bytes
+    out.push(24); // depth
+    out.push(0); // pad
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // 1 visual
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
+    // Visual entry: visual_id(4) + format_id(4) = 8 bytes
+    write_u32(ClientByteOrder::LittleEndian, &mut out, root_visual.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24);
+
+    writer.write_all(&out)
+}
+
+pub fn write_render_query_version_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    major: u32,
+    minor: u32,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
+    write_u32(ClientByteOrder::LittleEndian, &mut out, major);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, minor);
+    out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
+    writer.write_all(&out)
+}
+
 pub mod error {
     pub const BAD_REQUEST: u8 = 1;
     pub const BAD_VALUE: u8 = 2;
