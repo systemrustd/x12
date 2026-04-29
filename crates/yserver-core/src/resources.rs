@@ -897,7 +897,7 @@ mod tests {
     fn unmap_window_returns_true_on_transition_from_viewable() {
         let mut table = ResourceTable::new();
         make_window(&mut table, 0x100002);
-        table.map_window(ResourceId(0x100002));
+        let _ = table.map_window(ResourceId(0x100002));
         assert_eq!(
             table.window(ResourceId(0x100002)).unwrap().map_state,
             MapState::Viewable
@@ -1181,8 +1181,8 @@ mod tests {
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 0, 0);
         make_child(&mut table, 0x0010_0004, 0x0010_0002, 0, 0);
         make_child(&mut table, 0x0010_0005, 0x0010_0002, 0, 0);
-        table.map_window(ResourceId(0x0010_0003));
-        table.map_window(ResourceId(0x0010_0005));
+        let _ = table.map_window(ResourceId(0x0010_0003));
+        let _ = table.map_window(ResourceId(0x0010_0005));
 
         assert_eq!(
             table.mapped_children_bottom_to_top(ResourceId(0x0010_0002)),
@@ -1292,9 +1292,9 @@ mod tests {
         make_window(&mut table, 0x0010_0002);
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
         make_child(&mut table, 0x0010_0004, 0x0010_0003, 5, 6);
-        table.map_window(ResourceId(0x0010_0002));
-        table.map_window(ResourceId(0x0010_0003));
-        table.map_window(ResourceId(0x0010_0004));
+        let _ = table.map_window(ResourceId(0x0010_0002));
+        let _ = table.map_window(ResourceId(0x0010_0003));
+        let _ = table.map_window(ResourceId(0x0010_0004));
 
         assert_eq!(
             table.pointer_target_at(ResourceId(0x0010_0002), 20, 30),
@@ -1307,8 +1307,8 @@ mod tests {
         let mut table = ResourceTable::new();
         make_window(&mut table, 0x0010_0002);
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
-        table.map_window(ResourceId(0x0010_0002));
-        table.map_window(ResourceId(0x0010_0003));
+        let _ = table.map_window(ResourceId(0x0010_0002));
+        let _ = table.map_window(ResourceId(0x0010_0003));
 
         assert_eq!(
             table.pointer_target_at(ResourceId(0x0010_0002), 2, 3),
