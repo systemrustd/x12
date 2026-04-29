@@ -20,8 +20,8 @@ use yserver_protocol::x11::{
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
     resources::{
-        GlyphSetState, MapState, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW,
-        ReparentWindowError, Window,
+        ARGB_VISUAL, GlyphSetState, MapState, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL,
+        ROOT_WINDOW, ReparentWindowError, Window,
     },
     server::{ClientHandle, EventTarget, ServerState, fanout_event, fanout_raw_event},
 };
@@ -281,6 +281,7 @@ fn handle_client(
                 min_installed_maps: 1,
                 max_installed_maps: 1,
                 root_visual: ROOT_VISUAL,
+                argb_visual: ARGB_VISUAL,
                 root_depth: 24,
             },
         },
@@ -626,6 +627,7 @@ fn handle_render_request(
                 &mut *lock_writer()?,
                 sequence,
                 crate::resources::ROOT_VISUAL,
+                ARGB_VISUAL,
             )
         }
         // CreatePicture (minor=4)
@@ -879,6 +881,35 @@ fn handle_render_request(
                         y_offset: 0,
                     },
                 );
+            }
+            Ok(())
+        }
+        // CreateCursor (minor=27): create a cursor from a RENDER picture
+        27 => {
+            if body.len() < 12 {
+                return Ok(());
+            }
+            let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let x = u16::from_le_bytes([body[8], body[9]]);
+            let y = u16::from_le_bytes([body[10], body[11]]);
+            debug!(
+                "client {} #{} RENDER::CreateCursor cur=0x{:x} src=0x{:x} x={} y={}",
+                client_id.0, sequence.0, cursor_id.0, src_pic_id.0, x, y
+            );
+            let host_src = {
+                let s = lock_server(server)?;
+                s.resources.picture(src_pic_id).map(|p| p.host_picture_xid)
+            };
+            if let Some(host_src) = host_src
+                && let Some(mut h) = lock_host()
+            {
+                let cursor_xid = h.allocate_xid();
+                let _ = h.render_create_cursor(cursor_xid, host_src, x, y);
+                drop(h);
+                let mut s = lock_server(server)?;
+                s.resources.create_glyph_cursor(client_id, cursor_id);
+                s.resources.set_cursor_host_xid(cursor_id, cursor_xid);
             }
             Ok(())
         }
@@ -3697,6 +3728,21 @@ fn handle_request(
             }
             log_void(client_id, sequence, "AllowEvents")
         }
+        97 => {
+            // QueryBestSize — return the requested dimensions unchanged
+            let width = if body.len() >= 8 {
+                u16::from_le_bytes([body[4], body[5]])
+            } else {
+                0
+            };
+            let height = if body.len() >= 8 {
+                u16::from_le_bytes([body[6], body[7]])
+            } else {
+                0
+            };
+            log_reply(client_id, sequence, "QueryBestSize");
+            x11::write_query_best_size_reply(&mut *lock_writer()?, sequence, width, height)
+        }
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -3719,16 +3765,19 @@ fn rewrite_reply_sequence(reply: &mut [u8], sequence: SequenceNumber) {
 }
 
 fn supported_pixmap_depth(depth: u8) -> bool {
-    matches!(depth, 1 | 24 | 32)
+    matches!(depth, 1 | 4 | 8 | 24 | 32)
 }
 
 fn zpixmap_expected_len(width: u16, height: u16, depth: u8) -> Option<usize> {
-    let bits_per_pixel: usize = match depth {
-        24 | 32 => 32,
+    let stride_bytes: usize = match depth {
+        24 | 32 => {
+            let stride_bits = usize::from(width).checked_mul(32)?;
+            stride_bits.div_ceil(32).checked_mul(4)?
+        }
+        8 => usize::from(width).div_ceil(4).checked_mul(4)?,
+        4 => usize::from(width).div_ceil(8).checked_mul(4)?,
         _ => return None,
     };
-    let stride_bits = usize::from(width).checked_mul(bits_per_pixel)?;
-    let stride_bytes = stride_bits.div_ceil(32).checked_mul(4)?;
     stride_bytes.checked_mul(usize::from(height))
 }
 
@@ -3862,6 +3911,30 @@ mod tests {
     #[test]
     fn zpixmap_expected_len_depth32_2x3() {
         assert_eq!(zpixmap_expected_len(2, 3, 32), Some(24));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth8_4x3() {
+        // 4 pixels * 8bpp = 32 bits = 4 bytes/row (already 32-bit aligned)
+        assert_eq!(zpixmap_expected_len(4, 3, 8), Some(12));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth8_padding() {
+        // 5 pixels * 8bpp = 40 bits → padded to 64 bits = 8 bytes/row
+        assert_eq!(zpixmap_expected_len(5, 2, 8), Some(16));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth4_4x3() {
+        // 4 pixels * 4bpp = 16 bits → padded to 32 bits = 4 bytes/row
+        assert_eq!(zpixmap_expected_len(4, 3, 4), Some(12));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth4_padding() {
+        // 9 pixels * 4bpp = 36 bits → padded to 64 bits = 8 bytes/row
+        assert_eq!(zpixmap_expected_len(9, 2, 4), Some(16));
     }
 
     #[test]

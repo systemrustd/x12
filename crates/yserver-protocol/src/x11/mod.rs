@@ -87,6 +87,7 @@ pub struct Screen {
     pub min_installed_maps: u16,
     pub max_installed_maps: u16,
     pub root_visual: ResourceId,
+    pub argb_visual: ResourceId,
     pub root_depth: u8,
 }
 
@@ -545,7 +546,7 @@ pub fn write_setup_success(writer: &mut impl Write, setup: SetupSuccess<'_>) -> 
         setup.maximum_request_length,
     );
     extra.push(1); // roots
-    extra.push(1); // pixmap formats
+    extra.push(5); // pixmap formats: depth=1, depth=4, depth=8, depth=24, depth=32
     extra.push(byte_order_value(setup.image_byte_order));
     extra.push(byte_order_value(setup.bitmap_format_bit_order));
     extra.push(setup.bitmap_format_scanline_unit);
@@ -557,9 +558,34 @@ pub fn write_setup_success(writer: &mut impl Write, setup: SetupSuccess<'_>) -> 
     extra.extend_from_slice(vendor);
     pad_vec4(&mut extra);
 
-    extra.push(24); // depth
-    extra.push(32); // bits per pixel
-    extra.push(32); // scanline pad
+    // pixmap format: depth=1, bits-per-pixel=1, scanline-pad=32
+    extra.push(1);
+    extra.push(1);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=4, bits-per-pixel=4, scanline-pad=32
+    extra.push(4);
+    extra.push(4);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=8, bits-per-pixel=8, scanline-pad=32
+    extra.push(8);
+    extra.push(8);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=24, bits-per-pixel=32, scanline-pad=32
+    extra.push(24);
+    extra.push(32);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=32, bits-per-pixel=32, scanline-pad=32
+    extra.push(32);
+    extra.push(32);
+    extra.push(32);
     extra.extend_from_slice(&[0; 5]);
 
     write_screen(&mut extra, setup.root);
@@ -615,13 +641,31 @@ fn write_screen(out: &mut Vec<u8>, screen: Screen) {
     out.push(0); // backing stores: Never
     out.push(0); // save unders: false
     out.push(screen.root_depth);
-    out.push(1); // allowed depths
+    out.push(5); // allowed depths: depth=1, depth=4, depth=8, depth=24, depth=32
 
-    out.push(screen.root_depth);
+    // depth=1, no visuals
+    out.push(1);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 1); // visuals
+    write_u16(ClientByteOrder::LittleEndian, out, 0);
     write_u32(ClientByteOrder::LittleEndian, out, 0);
 
+    // depth=4, no visuals
+    out.push(4);
+    out.push(0);
+    write_u16(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+
+    // depth=8, no visuals
+    out.push(8);
+    out.push(0);
+    write_u16(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+
+    // depth=24 (root depth), 1 visual: TrueColor RGB
+    out.push(24);
+    out.push(0);
+    write_u16(ClientByteOrder::LittleEndian, out, 1);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
     write_u32(ClientByteOrder::LittleEndian, out, screen.root_visual.0);
     out.push(4); // TrueColor
     out.push(8); // bits per rgb
@@ -630,6 +674,20 @@ fn write_screen(out: &mut Vec<u8>, screen: Screen) {
     write_u32(ClientByteOrder::LittleEndian, out, 0x0000_ff00);
     write_u32(ClientByteOrder::LittleEndian, out, 0x0000_00ff);
     write_u32(ClientByteOrder::LittleEndian, out, 0);
+
+    // depth=32, 1 visual: TrueColor ARGB
+    out.push(32);
+    out.push(0);
+    write_u16(ClientByteOrder::LittleEndian, out, 1);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, screen.argb_visual.0);
+    out.push(4); // TrueColor
+    out.push(8); // bits per rgb
+    write_u16(ClientByteOrder::LittleEndian, out, 256);
+    write_u32(ClientByteOrder::LittleEndian, out, 0x00ff_0000);
+    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_ff00);
+    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_00ff);
+    write_u32(ClientByteOrder::LittleEndian, out, 0xff00_0000); // alpha mask
 }
 
 pub fn read_request(reader: &mut impl Read) -> io::Result<Option<(RequestHeader, Vec<u8>)>> {
@@ -1822,6 +1880,19 @@ pub fn write_list_hosts_reply(writer: &mut impl Write, sequence: SequenceNumber)
     let mut reply = fixed_reply(sequence, 0, 0);
     write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
     reply.extend_from_slice(&[0; 22]);
+    writer.write_all(&reply)
+}
+
+pub fn write_query_best_size_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, 0, 0);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, width);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, height);
+    reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
@@ -3074,20 +3145,21 @@ pub fn render_create_solid_fill_request(body: &[u8]) -> Option<(ResourceId, [u8;
 }
 
 /// Write QueryPictFormats reply. Advertises 4 picture formats (A1, A8, X8R8G8B8, A8R8G8B8)
-/// and maps the root visual (depth 24) to X8R8G8B8.
+/// and maps the root visual (depth 24) to X8R8G8B8 and the ARGB visual (depth 32) to A8R8G8B8.
 pub fn write_render_query_pict_formats_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
     root_visual: ResourceId,
+    argb_visual: ResourceId,
 ) -> io::Result<()> {
     // 4 formats × 28 bytes = 112 bytes
-    // 1 screen: 4 (fallback) + [depth24: 8 header + 8 visual = 16] = 20 bytes
-    // Total body = 132 bytes = 33 × 4-byte units
+    // 1 screen: nDepth(4) + fallback(4) + [depth24: 8+8 + depth32: 8+8] = 40 bytes
+    // Total body = 152 bytes = 38 × 4-byte units
     let num_formats: u32 = 4;
     let num_screens: u32 = 1;
-    let num_depths: u32 = 1;
-    let num_visuals: u32 = 1;
-    let body_units: u32 = (112 + 20) / 4; // 33
+    let num_depths: u32 = 2;
+    let num_visuals: u32 = 2;
+    let body_units: u32 = (112 + 40) / 4; // 38
 
     let mut out = Vec::new();
     out.push(1u8); // Reply
@@ -3161,16 +3233,23 @@ pub fn write_render_query_pict_formats_reply(
     write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // alpha-mask
     write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
 
-    // Screen info: fallback=RGB24, 1 depth (24), 1 visual (root_visual → RGB24)
+    // Screen info: 1 screen with 2 depths
+    write_u32(ClientByteOrder::LittleEndian, &mut out, num_depths); // nDepth per screen
     write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24); // fallback
-    // Depth 24 entry: depth(1) + pad(1) + num_visuals(2) + pad(4) = 8 bytes
-    out.push(24); // depth
-    out.push(0); // pad
+    // Depth 24 entry: 8-byte header + 1 visual (8 bytes)
+    out.push(24);
+    out.push(0);
     write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // 1 visual
     write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
-    // Visual entry: visual_id(4) + format_id(4) = 8 bytes
     write_u32(ClientByteOrder::LittleEndian, &mut out, root_visual.0);
     write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24);
+    // Depth 32 entry: 8-byte header + 1 visual (8 bytes)
+    out.push(32);
+    out.push(0);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // 1 visual
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
+    write_u32(ClientByteOrder::LittleEndian, &mut out, argb_visual.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_ARGB32);
 
     writer.write_all(&out)
 }

@@ -30,6 +30,11 @@ pub struct HostX11 {
     sequence: u16,
     next_xid: u32,
     render: Option<HostRenderInfo>,
+    // Responses read during create_subwindow drain loops that belong to future
+    // requests (sequence > geom_seq at time of read). Without this buffer,
+    // the drain loop for window N discards the GetGeometry reply for window N+k,
+    // causing the subsequent drain loop to hang forever.
+    reply_buffer: Vec<HostResponse>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +88,7 @@ impl HostX11 {
             sequence: 5,
             next_xid: setup.resource_id_base + 3,
             render: None,
+            reply_buffer: Vec::new(),
         };
         this.render = this.init_render().ok();
         Ok(this)
@@ -298,7 +304,8 @@ impl HostX11 {
         }
         let opcode = r.opcode;
         let nvals = (values.len() / 4) as u16;
-        let length_units = 4 + nvals;
+        // header(4) + pid(4) + drawable(4) + format(4) + value-mask(4) = 20 bytes = 5 units
+        let length_units = 5 + nvals;
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(opcode);
@@ -477,7 +484,8 @@ impl HostX11 {
         };
         let opcode = r.opcode;
         let nrects = rects.len() / 8;
-        let length_units = 4 + (nrects * 2) as u16;
+        // header(4) + op_pad(4) + dst(4) + color(8) = 20 bytes = 5 units, plus 2 units per rect
+        let length_units = 5 + (nrects * 2) as u16;
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(opcode);
@@ -571,6 +579,7 @@ impl HostX11 {
         height: u16,
     ) -> io::Result<()> {
         // 1. CreateWindow request — parent is the container (self.window_id).
+        let cw_seq = self.sequence;
         let mut out = Vec::new();
         out.push(1); // CreateWindow opcode
         out.push(0); // depth = CopyFromParent
@@ -590,28 +599,57 @@ impl HostX11 {
         self.stream.write_all(&out)?;
         self.sequence = self.sequence.wrapping_add(1);
 
-        // 2. GetGeometry round-trip — forces the host to commit CreateWindow
-        //    before any later request (e.g. ChangeWindowAttributes from the
-        //    pump's connection) can be processed. See spec §"Cross-connection
-        //    ordering hazard".
-        let geom_seq = self.sequence;
-        let mut geom = Vec::new();
-        geom.push(14); // GetGeometry opcode
-        geom.push(0);
-        write_u16(&mut geom, 2);
-        write_u32(&mut geom, host_xid);
-        self.stream.write_all(&geom)?;
+        // 2. GetInputFocus round-trip — always returns a reply, ensuring
+        //    CreateWindow has been committed by the host before we return.
+        //    (GetGeometry can fail with BadDrawable if CreateWindow failed,
+        //    and the error response is identical in layout to a real answer.)
+        let sync_seq = self.sequence;
+        let mut sync = Vec::new();
+        sync.push(43); // GetInputFocus opcode
+        sync.push(0);
+        write_u16(&mut sync, 1);
+        self.stream.write_all(&sync)?;
         self.sequence = self.sequence.wrapping_add(1);
         self.stream.flush()?;
 
-        // Drain replies/errors until we see geom_seq.
+        log::debug!(
+            "create_subwindow: host_xid=0x{:x} cw_seq={} sync_seq={} buf_len={}",
+            host_xid,
+            cw_seq,
+            sync_seq,
+            self.reply_buffer.len()
+        );
+
+        // Drain replies/errors until we see the GetInputFocus reply at sync_seq.
+        // Check buffered responses first — a previous call's drain loop may have
+        // read past sync_seq and saved the reply here.
+        if let Some(pos) = self
+            .reply_buffer
+            .iter()
+            .position(|r| r.sequence == sync_seq)
+        {
+            log::debug!("create_subwindow: found in buffer at pos={}", pos);
+            self.reply_buffer.remove(pos);
+            return Ok(());
+        }
         loop {
             let resp = read_response(&mut self.stream)?;
-            if resp.sequence == geom_seq {
+            let detail = if resp.bytes[0] == 0 {
+                format!("err_code={}", resp.bytes[1])
+            } else {
+                String::new()
+            };
+            log::debug!(
+                "create_subwindow: stream resp type={} seq={} {} (want {})",
+                resp.bytes[0],
+                resp.sequence,
+                detail,
+                sync_seq
+            );
+            if resp.sequence == sync_seq {
                 return Ok(());
             }
-            // Ignore any earlier responses (e.g. an error on CreateWindow);
-            // GetGeometry will then also fail and we'll see its reply here.
+            self.reply_buffer.push(resp);
         }
     }
 
@@ -780,6 +818,30 @@ impl HostX11 {
         self.stream.write_all(&buf)?;
         self.stream.flush()?;
         Ok(cursor_xid)
+    }
+
+    pub fn render_create_cursor(
+        &mut self,
+        cursor_xid: u32,
+        host_src_pic: u32,
+        x: u16,
+        y: u16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut buf = Vec::with_capacity(16);
+        buf.push(opcode);
+        buf.push(27); // CreateCursor minor opcode
+        write_u16(&mut buf, 4u16);
+        write_u32(&mut buf, cursor_xid);
+        write_u32(&mut buf, host_src_pic);
+        write_u16(&mut buf, x);
+        write_u16(&mut buf, y);
+        self.stream.write_all(&buf)?;
+        self.stream.flush()
     }
 
     pub fn define_cursor(&mut self, host_window_xid: u32, cursor_host_xid: u32) -> io::Result<()> {
@@ -1870,7 +1932,30 @@ fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse> {
         stream.read_exact(&mut header)?;
         match header[0] {
             0 | 1 => break,
-            _ => continue,
+            35 => {
+                // GenericEvent: may have extra data beyond the 32-byte header.
+                // Read and discard any extra bytes to keep the stream aligned.
+                let extra =
+                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
+                log::debug!(
+                    "read_response: GenericEvent extra={} seq={}",
+                    extra,
+                    u16::from_le_bytes([header[2], header[3]])
+                );
+                if extra > 0 {
+                    let mut tail = vec![0u8; extra];
+                    stream.read_exact(&mut tail)?;
+                }
+                continue;
+            }
+            t => {
+                log::debug!(
+                    "read_response: skipping event type={} seq={}",
+                    t,
+                    u16::from_le_bytes([header[2], header[3]])
+                );
+                continue;
+            }
         }
     }
     let sequence = u16::from_le_bytes([header[2], header[3]]);

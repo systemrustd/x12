@@ -23,6 +23,7 @@ pub struct ClientRemovedResources {
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
+pub const ARGB_VISUAL: ResourceId = ResourceId(0x103);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TopLevelTarget {
