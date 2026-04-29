@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use log::debug;
 use yserver_protocol::x11::{self, ClipRectangles, FontMetrics, ResourceId};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
@@ -212,8 +213,8 @@ impl HostX11 {
         let ext_name = b"RENDER";
         let padded = padded_len(ext_name.len());
         let length_units = 2 + (padded / 4) as u16;
+        let ext_seq = self.sequence; // use current BEFORE increment (matches open_font pattern)
         self.sequence = self.sequence.wrapping_add(1);
-        let ext_seq = self.sequence;
         let mut out = Vec::new();
         out.push(98u8);
         out.push(0);
@@ -224,30 +225,47 @@ impl HostX11 {
         out.resize(8 + padded, 0);
         self.stream.write_all(&out)?;
         self.stream.flush()?;
+        debug!(
+            "init_render: sent QueryExtension RENDER, expecting seq={}",
+            ext_seq
+        );
 
         let opcode;
         loop {
             let resp = read_response(&mut self.stream)?;
+            debug!(
+                "init_render: got response byte0={} seq={}",
+                resp.bytes[0], resp.sequence
+            );
             if resp.sequence == ext_seq {
                 if resp.bytes[8] == 0 {
                     return Err(io::Error::other("host RENDER extension not present"));
                 }
                 opcode = resp.bytes[9];
+                debug!("init_render: RENDER present, opcode={}", opcode);
                 break;
             }
         }
 
+        let fmt_seq = self.sequence; // use current BEFORE increment
         self.sequence = self.sequence.wrapping_add(1);
-        let fmt_seq = self.sequence;
         let mut out = Vec::new();
         out.push(opcode);
         out.push(1); // QueryPictFormats
         write_u16(&mut out, 1);
         self.stream.write_all(&out)?;
         self.stream.flush()?;
+        debug!(
+            "init_render: sent QueryPictFormats, expecting seq={}",
+            fmt_seq
+        );
 
         loop {
             let resp = read_response(&mut self.stream)?;
+            debug!(
+                "init_render: got response byte0={} seq={}",
+                resp.bytes[0], resp.sequence
+            );
             if resp.sequence == fmt_seq {
                 return parse_host_pict_formats(&resp.bytes, opcode);
             }
@@ -490,8 +508,8 @@ impl HostX11 {
             return Ok((0, 0));
         };
         let opcode = r.opcode;
+        let seq = self.sequence; // use current BEFORE increment
         self.sequence = self.sequence.wrapping_add(1);
-        let seq = self.sequence;
         let mut out = Vec::new();
         out.push(opcode);
         out.push(0); // QueryVersion
