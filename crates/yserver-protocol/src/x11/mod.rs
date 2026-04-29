@@ -1420,7 +1420,8 @@ pub fn write_grab_reply(
     sequence: SequenceNumber,
     status: u8,
 ) -> io::Result<()> {
-    let reply = fixed_reply(sequence, status, 0);
+    let mut reply = fixed_reply(sequence, status, 0);
+    reply.extend_from_slice(&[0; 24]);
     writer.write_all(&reply)
 }
 
@@ -1600,7 +1601,8 @@ pub fn write_list_extensions_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let reply = fixed_reply(sequence, 0, 0);
+    let mut reply = fixed_reply(sequence, 0, 0);
+    reply.extend_from_slice(&[0; 24]);
     writer.write_all(&reply)
 }
 

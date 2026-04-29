@@ -1121,10 +1121,20 @@ fn handle_request(
                     win.map(|w| (w.parent, w.override_redirect))
                 };
                 if let Some((parent, override_redirect)) = pre {
+                    // Redirect to WM only when: not override_redirect, and a DIFFERENT client
+                    // (not the requester) holds SubstructureRedirectMask on the parent.
                     let redirect_targets = if !override_redirect {
                         let s = lock_server(server)?;
-                        // SubstructureRedirectMask = 1 << 20
-                        s.subscribers(parent, 0x0010_0000)
+                        let requester_has = s
+                            .clients
+                            .get(&client_id.0)
+                            .and_then(|c| c.event_masks.get(&parent).copied())
+                            .map_or(false, |m| m & 0x0010_0000 != 0);
+                        if requester_has {
+                            Vec::new()
+                        } else {
+                            s.subscribers(parent, 0x0010_0000)
+                        }
                     } else {
                         Vec::new()
                     };
@@ -1346,7 +1356,16 @@ fn handle_request(
                 };
                 let redirect_targets = if let Some((parent, false)) = pre {
                     let s = lock_server(server)?;
-                    s.subscribers(parent, 0x0010_0000)
+                    let requester_has = s
+                        .clients
+                        .get(&client_id.0)
+                        .and_then(|c| c.event_masks.get(&parent).copied())
+                        .map_or(false, |m| m & 0x0010_0000 != 0);
+                    if requester_has {
+                        Vec::new()
+                    } else {
+                        s.subscribers(parent, 0x0010_0000)
+                    }
                 } else {
                     Vec::new()
                 };

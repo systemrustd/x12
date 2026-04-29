@@ -1,0 +1,199 @@
+   Compiling yserver-protocol v0.1.0 (/home/jos/Projects/yserver/crates/yserver-protocol)
+   Compiling yserver-core v0.1.0 (/home/jos/Projects/yserver/crates/yserver-core)
+   Compiling yserver v0.1.0 (/home/jos/Projects/yserver/crates/yserver)
+    Finished `release` profile [optimized] target(s) in 2.08s
+     Running `target/release/ynest 99`
+[2026-04-29T12:43:29Z INFO  yserver_core::nested] ynest listening on DISPLAY=:99
+[2026-04-29T12:43:29Z INFO  yserver_core::nested] host X11 container window: 0x400000
+[2026-04-29T12:43:29Z DEBUG yserver_core::nested] window-close watcher starting for 0x400000
+[2026-04-29T12:43:29Z DEBUG yserver_core::nested] window-close watcher ready
+[2026-04-29T12:43:37Z INFO  yserver_core::nested] client 1 setup: protocol 11.0, base=0x100000
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #1 QueryExtension "BIG-REQUESTS" -> absent
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #2 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #4 QueryExtension "XKEYBOARD" -> absent
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #5 InternAtom "Custom Init" -> 69
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #6 InternAtom "Custom Data" -> 70
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #7 InternAtom "SCREEN_RESOURCES" -> 0
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #8 CreatePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #10 FreePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #12 FreePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #13 CreatePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #14 FreePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #15 GetInputFocus
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #16 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #17 PutImage
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #18 FreeGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #19 CreatePixmap
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #20 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #21 PutImage
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #22 FreeGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #23 OpenFont "-*-*-*-R-*-*-*-120-*-*-*-*-ISO8859-*"
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #24 QueryFont
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #25 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #26 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #27 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #28 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #29 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #30 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #31 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #32 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #33 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #34 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #35 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #36 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #37 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #38 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #39 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #40 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #41 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #42 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #43 ListFonts
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #44 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #45 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #46 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #47 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #48 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #49 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #50 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #51 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #52 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #53 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #54 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #55 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #56 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #57 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #58 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #59 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #60 ListFontsWithInfo
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #61 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #62 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #63 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #64 CreateGC
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 create window 0x10000d parent=0x100 mask=0x620030
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #65 CreateWindow
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #73 InternAtom "WM_LOCALE_NAME" -> 71
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #76 InternAtom "WM_CLIENT_LEADER" -> 72
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 create window 0x10000e parent=0x10000d mask=0x28000
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #78 CreateWindow
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #79 MapSubwindows
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #80 MapWindow
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #81 InternAtom "WM_DELETE_WINDOW" -> 73
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #82 InternAtom "WM_PROTOCOLS" -> 74
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #84 InternAtom "_NET_WM_PID" -> 75
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #86 PolySegment
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #87 FillPoly
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #88 PolyLine
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #89 FillPoly
+[2026-04-29T12:43:37Z DEBUG yserver_core::nested] client 1 #90 PolyLine
+[2026-04-29T12:43:38Z INFO  yserver_core::nested] client 2 setup: protocol 11.0, base=0x200000
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #1 QueryExtension "BIG-REQUESTS" -> absent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #2 CreateGC
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #4 QueryExtension "XKEYBOARD" -> absent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #5 QueryExtension "RANDR" -> present
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #6 QueryExtension "Generic Event Extension" -> absent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #7 RANDR::QueryVersion -> 1.5
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #8 RANDR::GetScreenResources(Current) minor=8
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #9 RANDR::GetMonitors
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #10 GetAtomName 76 -> "ynest-0"
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #11 RANDR::SelectInput (accepted, not stored)
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #12 QueryExtension "SHAPE" -> absent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #13 QueryExtension "RENDER" -> absent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #14 InternAtom "_MIT_PRIORITY_COLORS" -> 77
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #15 InternAtom "WM_CHANGE_STATE" -> 78
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #16 InternAtom "WM_STATE" -> 79
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #17 InternAtom "WM_COLORMAP_WINDOWS" -> 80
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #18 InternAtom "WM_PROTOCOLS" -> 74
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #19 InternAtom "WM_TAKE_FOCUS" -> 81
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #20 InternAtom "WM_DELETE_WINDOW" -> 73
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #21 InternAtom "WM_DESKTOP" -> 82
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #22 InternAtom "_MOTIF_WM_HINTS" -> 83
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #23 InternAtom "_MOTIF_WM_INFO" -> 84
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #24 InternAtom "_OL_WIN_ATTR" -> 85
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #25 InternAtom "_OL_WT_BASE" -> 86
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #26 InternAtom "_OL_WT_CMD" -> 87
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #27 InternAtom "_OL_WT_HELP" -> 88
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #28 InternAtom "_OL_WT_NOTICE" -> 89
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #29 InternAtom "_OL_WT_OTHER" -> 90
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #30 InternAtom "_OL_DECOR_ADD" -> 91
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #31 InternAtom "_OL_DECOR_DEL" -> 92
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #32 InternAtom "_OL_DECOR_CLOSE" -> 93
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #33 InternAtom "_OL_DECOR_RESIZE" -> 94
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #34 InternAtom "_OL_DECOR_HEADER" -> 95
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #35 InternAtom "_OL_DECOR_ICON_NAME" -> 96
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #36 InternAtom "WM_WINDOW_ROLE" -> 97
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #37 InternAtom "WINDOW_ROLE" -> 98
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #38 InternAtom "WM_CLIENT_LEADER" -> 72
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #39 InternAtom "SM_CLIENT_ID" -> 99
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #40 InternAtom "_XROOTPMAP_ID" -> 100
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #41 InternAtom "_XSETROOT_ID" -> 101
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #43 OpenFont "cursor"
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #45 FreePixmap
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #47 FreePixmap
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #48 CreatePixmap
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #49 FreePixmap
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #50 GetInputFocus
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #51 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #52 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #53 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #54 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #55 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #56 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #57 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #58 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #59 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #60 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #61 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #62 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #63 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #64 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #65 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #66 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #67 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #68 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #69 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #70 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #71 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #72 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #73 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #74 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #75 ChangeWindowAttributes
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 create window 0x20001d parent=0x100 mask=0x200003
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #76 CreateWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] focus key window 0x20001d
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #77 MapWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #78 SetInputFocus
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 create window 0x20001e parent=0x100 mask=0x0
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #79 CreateWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 create window 0x20001f parent=0x100 mask=0x0
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #80 CreateWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 create window 0x200020 parent=0x100 mask=0x0
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #81 CreateWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 create window 0x200021 parent=0x100 mask=0x0
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #82 CreateWindow
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #83 InternAtom "WM_S0" -> 102
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #84 InternAtom "MANAGER" -> 103
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #85 InternAtom "ATOM_PAIR" -> 104
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #86 InternAtom "TARGETS" -> 105
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #87 InternAtom "MULTIPLE" -> 106
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #88 InternAtom "TIMESTAMP" -> 107
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #89 InternAtom "VERSION" -> 108
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #90 InternAtom "WM_COLORMAP_NOTIFY" -> 109
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #91 GetSelectionOwner -> 0x0
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 attrs window 0x20001d mask=0x400000
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #92 ChangeWindowAttributes
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 attrs window 0x20001d mask=0x200003
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #94 ChangeWindowAttributes
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #95 SetSelectionOwner WM_S0 -> 0x20001d
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #96 GetSelectionOwner -> 0x20001d
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #97 SendEvent
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 attrs window 0x20001d mask=0x200003
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #98 ChangeWindowAttributes
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #99 GetInputFocus
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 attrs window 0x100 mask=0xd8003f
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #100 ChangeWindowAttributes
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #101 GetInputFocus
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #102 CreateGlyphCursor
+[2026-04-29T12:43:38Z DEBUG yserver_core::nested] client 2 #103 GrabPointer
+[2026-04-29T12:43:47Z INFO  yserver_core::nested] host window closed, exiting
+[2026-04-29T12:43:47Z INFO  yserver_core::nested] host window closed, exiting
+[2026-04-29T12:43:47Z INFO  yserver_core::nested] host pump: window closed, exiting
