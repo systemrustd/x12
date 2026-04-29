@@ -121,8 +121,10 @@ Implementation plan:
 ### Out of scope for Phase 1
 
 - BIG-REQUESTS, MIT-SHM, XKB, XFIXES, DAMAGE, COMPOSITE, SYNC,
-  PRESENT, SHAPE, RENDER, XInput2, GLX. These are Phase 3+.
+  PRESENT, SHAPE, XInput2, GLX. These are Phase 3+.
 - RANDR moved to Phase 2 (compatibility stub landed).
+- RENDER: partial implementation landed in Phase 2 to satisfy fvwm3
+  cursor + Xft-based title text rendering. Full coverage still Phase 3.
 - Big-endian clients.
 - Selections / clipboard (Phase 2).
 
@@ -173,6 +175,20 @@ In rough priority order:
       WarpPointer, ConvertSelection/SelectionRequest/SelectionClear, and
       SendEvent for all event types. See plan:
       [`2026-04-29-phase2-fvwm3.md`](superpowers/plans/2026-04-29-phase2-fvwm3.md).
+
+- [x] **RENDER extension proxy (subset).** Forwards CreatePicture,
+      FreePicture, CreateGlyphSet, FreeGlyphSet, AddGlyphs,
+      CompositeGlyphs8/16/32, FillRectangles, CreateSolidFill,
+      CreateCursor, and QueryVersion/QueryPictFormats to the host.
+      Glyphset and picture XIDs are mapped between client and host
+      ID spaces. ChangePicture is a no-op stub. Coordinate offsets
+      (top-level → host) are patched into the first glyphcmd of
+      CompositeGlyphs and the rectangles of FillRectangles. Window
+      bg-pixmap retention is tracked on the Window struct so fvwm3's
+      "render to pixmap → set as bg → free pixmap → ClearArea" pattern
+      works. See [RENDER opcode table](#render-extension-major-opcode-139).
+      **Validated:** xclock under fvwm3 shows title bar text and the
+      coords popup; cursor creation works.
 
 ### Known follow-ups
 
@@ -373,7 +389,7 @@ Not started.
 | 94 | CreateGlyphCursor     | ✓ | cursor ID allocated and tracked |
 | 95 | FreeCursor            | ✓ | |
 | 96 | RecolorCursor         | ∅ | |
-| 97 | QueryBestSize         | ✗ | |
+| 97 | QueryBestSize         | ↩ | echoes requested width/height |
 
 #### Extensions and misc
 
@@ -398,3 +414,58 @@ Not started.
 
 Fully described in the Phase 2 RANDR item above. All read-only queries
 implemented as stubs; mutation paths return `BadValue`.
+
+### RENDER extension (major opcode 139)
+
+Subset implementation landed during Phase 2 to support fvwm3's
+cursor allocation and Xft-based title bar text rendering. Picture and
+glyphset resources are tracked in `ResourceTable`; XIDs are mapped
+between client and host ID spaces.
+
+| Minor | Name                  | Status | Notes |
+|-------|-----------------------|--------|-------|
+|   0   | QueryVersion          | ↩ | proxied — replies with host's version |
+|   1   | QueryPictFormats      | ↩ | replies with 4 synthetic formats (A1, A8, RGB24, ARGB32) |
+|   2   | QueryPictIndexValues  | ✗ | |
+|   4   | CreatePicture         | ✓ | format ID translated; coord offset stored on `PictureState` |
+|   5   | ChangePicture         | ∅ | clip mask / repeat not applied to host picture |
+|   6   | SetPictureClipRectangles | ✗ | |
+|   7   | FreePicture           | ✓ | |
+|   8   | Composite             | ✗ | |
+|  17   | CreateGlyphSet        | ✓ | format ID translated to host equivalent |
+|  18   | ReferenceGlyphSet     | ∅ | |
+|  19   | FreeGlyphSet          | ✓ | |
+|  20   | AddGlyphs             | ✓ | body padding/length corrected against Xephyr trace |
+|  22   | FreeGlyphs            | ∅ | |
+|  23   | CompositeGlyphs8      | ✓ | first glyphcmd's deltax/deltay patched with picture offset |
+|  24   | CompositeGlyphs16     | ✓ | same patching as 8 |
+|  25   | CompositeGlyphs32     | ✓ | same patching as 8 |
+|  26   | FillRectangles        | ✓ | rectangle coords offset by picture's x/y offset |
+|  27   | CreateCursor          | ✓ | from picture; cursor XID allocated locally |
+|  33   | CreateSolidFill       | ✓ | |
+|  35   | AddTraps              | ✗ | |
+
+Notes:
+- Wire encoding parity with the host was verified against
+  `docs/assets/xephyr-xclock-fvwm3-trace.log`. Three off-by-one length
+  bugs were fixed (CreatePicture, FillRectangles, AddGlyphs); each
+  caused either wire misalignment with the host or trailing-zero
+  pollution of glyph data.
+- `host_x11.rs::create_subwindow` uses `GetInputFocus` (not
+  `GetGeometry`) for sync, with a `reply_buffer` for over-read
+  responses, so unrelated RENDER errors interleaved with sync replies
+  no longer cause the drain loop to hang.
+
+### Known follow-ups (RENDER)
+
+- ChangePicture is a no-op stub; clip-mask and repeat values aren't
+  forwarded. fvwm3 doesn't seem to need them, but proper Xft clipping
+  would require this.
+- DestroyWindow should release any retained bg-pixmap host XIDs
+  (`Window.background_pixmap_host_xid`); currently they leak on
+  window destroy.
+- Sub-window expose handling: when the host top-level is re-exposed,
+  ynest doesn't re-paint fvwm3 sub-window backgrounds because the
+  sub-windows themselves have no host backing. Currently fine because
+  the host's own backing store keeps the rendered output, but tiled
+  bg pixmaps wouldn't survive a forced expose.
