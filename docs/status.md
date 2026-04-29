@@ -262,8 +262,8 @@ Not started.
 | Op | Name                      | Status | Notes |
 |----|---------------------------|--------|-------|
 | 25 | SendEvent                 | ✓ | ClientMessage delivery; other types unsupported |
-| 26 | GrabPointer               | ↩ | stub — returns GrabSuccess, no real grab |
-| 27 | UngrabPointer             | ∅ | |
+| 26 | GrabPointer               | ✓ | records grab owner; all pointer events redirected until UngrabPointer |
+| 27 | UngrabPointer             | ✓ | clears active grab |
 | 28 | GrabButton                | ∅ | |
 | 29 | UngrabButton              | ∅ | |
 | 30 | ChangeActivePointerGrab   | ✗ | |
