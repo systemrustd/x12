@@ -167,6 +167,7 @@ pub struct ChangeWindowAttributesRequest {
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigureWindowRequest {
     pub window: ResourceId,
+    pub value_mask: u16,
     pub x: Option<i16>,
     pub y: Option<i16>,
     pub width: Option<u16>,
@@ -720,10 +721,11 @@ pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttri
 
 pub fn configure_window_request(body: &[u8]) -> Option<ConfigureWindowRequest> {
     let window = ResourceId(read_u32_le(body.get(0..4)?));
-    let value_mask = read_u16_le(body.get(4..6)?) as u32;
-    let values = value_list(value_mask, body.get(8..)?);
+    let value_mask = read_u16_le(body.get(4..6)?);
+    let values = value_list(u32::from(value_mask), body.get(8..)?);
     Some(ConfigureWindowRequest {
         window,
+        value_mask,
         x: values.value(0).map(|value| value as i16),
         y: values.value(1).map(|value| value as i16),
         width: values.value(2).map(|value| value as u16),
@@ -1144,6 +1146,44 @@ pub fn encode_configure_notify_event(
     write_u16(order, out, geometry.border_width);
     out.push(u8::from(override_redirect));
     out.extend_from_slice(&[0; 5]);
+}
+
+pub fn encode_map_request_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    parent: ResourceId,
+    window: ResourceId,
+) {
+    out.push(20); // MapRequest
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, parent.0);
+    write_u32(order, out, window.0);
+    out.extend_from_slice(&[0; 20]);
+}
+
+pub fn encode_configure_request_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    parent: ResourceId,
+    window: ResourceId,
+    request: &ConfigureWindowRequest,
+) {
+    out.push(23); // ConfigureRequest
+    out.push(0); // stack-mode (not forwarded)
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, parent.0);
+    write_u32(order, out, window.0);
+    write_u32(order, out, 0); // sibling
+    write_i16(order, out, request.x.unwrap_or(0));
+    write_i16(order, out, request.y.unwrap_or(0));
+    write_u16(order, out, request.width.unwrap_or(0));
+    write_u16(order, out, request.height.unwrap_or(0));
+    write_u16(order, out, request.border_width.unwrap_or(0));
+    write_u16(order, out, request.value_mask);
+    out.extend_from_slice(&[0; 4]);
 }
 
 fn arc_request_data(body: &[u8]) -> Option<(u32, &[u8])> {

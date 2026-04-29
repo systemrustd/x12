@@ -1114,63 +1114,87 @@ fn handle_request(
         }
         8 => {
             if let Some(window) = x11::map_window_id(body) {
-                let (map_info, host_xid) = {
-                    let mut s = lock_server(server)?;
-                    s.resources.map_window(window);
-                    let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
-                    let map_info = s
-                        .resources
-                        .window(window)
-                        .map(|w| (w.parent, w.override_redirect, w.width, w.height));
-                    (map_info, host_xid)
-                };
-                if let Some(xid) = host_xid
-                    && let Some(host) = host
-                    && let Ok(mut h) = host.lock()
-                {
-                    let _ = h.map_subwindow(xid);
-                }
-                let wants_focus = {
+                // Check for SubstructureRedirect before mapping.
+                let pre = {
                     let s = lock_server(server)?;
-                    let mask = s
-                        .clients
-                        .get(&client_id.0)
-                        .and_then(|c| c.event_masks.get(&window).copied())
-                        .unwrap_or(0);
-                    let viewable = s
-                        .resources
-                        .window(window)
-                        .is_some_and(|w| w.map_state == MapState::Viewable);
-                    viewable && (mask & 0x3) != 0
+                    let win = s.resources.window(window);
+                    win.map(|w| (w.parent, w.override_redirect))
                 };
-                if wants_focus {
-                    debug!("focus key window 0x{:x}", window.0);
-                    set_focused_window(focused_window, server, window)?;
-                }
-                if let Some((_parent, override_redirect, width, height)) = map_info {
-                    crate::server::emit_window_event(
-                        server,
-                        window,
-                        0x0002_0000,
-                        |buf, seq, order| {
-                            x11::encode_map_notify_event(
-                                buf,
-                                seq,
-                                order,
+                if let Some((parent, override_redirect)) = pre {
+                    let redirect_targets = if !override_redirect {
+                        let s = lock_server(server)?;
+                        // SubstructureRedirectMask = 1 << 20
+                        s.subscribers(parent, 0x0010_0000)
+                    } else {
+                        Vec::new()
+                    };
+                    if !redirect_targets.is_empty() {
+                        // A WM holds SubstructureRedirect on the parent: send MapRequest instead.
+                        fanout_event(&redirect_targets, |buf, seq, order| {
+                            x11::encode_map_request_event(buf, seq, order, parent, window);
+                        });
+                    } else {
+                        let (map_info, host_xid) = {
+                            let mut s = lock_server(server)?;
+                            s.resources.map_window(window);
+                            let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
+                            let map_info = s
+                                .resources
+                                .window(window)
+                                .map(|w| (w.parent, w.override_redirect, w.width, w.height));
+                            (map_info, host_xid)
+                        };
+                        if let Some(xid) = host_xid
+                            && let Some(host) = host
+                            && let Ok(mut h) = host.lock()
+                        {
+                            let _ = h.map_subwindow(xid);
+                        }
+                        let wants_focus = {
+                            let s = lock_server(server)?;
+                            let mask = s
+                                .clients
+                                .get(&client_id.0)
+                                .and_then(|c| c.event_masks.get(&window).copied())
+                                .unwrap_or(0);
+                            let viewable = s
+                                .resources
+                                .window(window)
+                                .is_some_and(|w| w.map_state == MapState::Viewable);
+                            viewable && (mask & 0x3) != 0
+                        };
+                        if wants_focus {
+                            debug!("focus key window 0x{:x}", window.0);
+                            set_focused_window(focused_window, server, window)?;
+                        }
+                        if let Some((_parent, override_redir, width, height)) = map_info {
+                            crate::server::emit_window_event(
+                                server,
                                 window,
-                                window,
-                                override_redirect,
+                                0x0002_0000,
+                                |buf, seq, order| {
+                                    x11::encode_map_notify_event(
+                                        buf,
+                                        seq,
+                                        order,
+                                        window,
+                                        window,
+                                        override_redir,
+                                    );
+                                },
                             );
-                        },
-                    );
-                    crate::server::emit_window_event(
-                        server,
-                        window,
-                        0x0000_8000,
-                        |buf, seq, order| {
-                            x11::encode_expose_event(buf, seq, order, window, width, height);
-                        },
-                    );
+                            crate::server::emit_window_event(
+                                server,
+                                window,
+                                0x0000_8000,
+                                |buf, seq, order| {
+                                    x11::encode_expose_event(
+                                        buf, seq, order, window, width, height,
+                                    );
+                                },
+                            );
+                        }
+                    }
                 }
             }
             log_void(client_id, sequence, "MapWindow")
@@ -1313,46 +1337,74 @@ fn handle_request(
         }
         12 => {
             if let Some(request) = x11::configure_window_request(body) {
-                let (configure, host_xid) = {
-                    let mut s = lock_server(server)?;
-                    let configure = s
-                        .resources
-                        .configure_window(request)
-                        .map(|w| (w.id, window_geometry(w), w.override_redirect));
-                    let host_xid = configure
-                        .as_ref()
-                        .and_then(|(id, _, _)| s.resources.window(*id).and_then(|w| w.host_xid));
-                    (configure, host_xid)
+                // Check for SubstructureRedirect on the window's parent.
+                let pre = {
+                    let s = lock_server(server)?;
+                    s.resources
+                        .window(request.window)
+                        .map(|w| (w.parent, w.override_redirect))
                 };
-                if let Some(xid) = host_xid
-                    && let Some(host) = host
-                    && let Ok(mut h) = host.lock()
-                {
-                    let _ = h.configure_subwindow(
-                        xid,
-                        request.x,
-                        request.y,
-                        request.width,
-                        request.height,
-                    );
-                }
-                if let Some((window_id, geometry, override_redirect)) = configure {
-                    crate::server::emit_window_event(
-                        server,
-                        window_id,
-                        0x0002_0000,
-                        |buf, seq, order| {
-                            x11::encode_configure_notify_event(
-                                buf,
-                                seq,
-                                order,
-                                window_id,
-                                window_id,
-                                geometry,
-                                override_redirect,
-                            );
-                        },
-                    );
+                let redirect_targets = if let Some((parent, false)) = pre {
+                    let s = lock_server(server)?;
+                    s.subscribers(parent, 0x0010_0000)
+                } else {
+                    Vec::new()
+                };
+                if !redirect_targets.is_empty() {
+                    // WM holds SubstructureRedirect: forward as ConfigureRequest.
+                    let parent = pre.map(|(p, _)| p).unwrap_or(ROOT_WINDOW);
+                    fanout_event(&redirect_targets, |buf, seq, order| {
+                        x11::encode_configure_request_event(
+                            buf,
+                            seq,
+                            order,
+                            parent,
+                            request.window,
+                            &request,
+                        );
+                    });
+                } else {
+                    let (configure, host_xid) = {
+                        let mut s = lock_server(server)?;
+                        let configure = s
+                            .resources
+                            .configure_window(request)
+                            .map(|w| (w.id, window_geometry(w), w.override_redirect));
+                        let host_xid = configure.as_ref().and_then(|(id, _, _)| {
+                            s.resources.window(*id).and_then(|w| w.host_xid)
+                        });
+                        (configure, host_xid)
+                    };
+                    if let Some(xid) = host_xid
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.configure_subwindow(
+                            xid,
+                            request.x,
+                            request.y,
+                            request.width,
+                            request.height,
+                        );
+                    }
+                    if let Some((window_id, geometry, override_redirect)) = configure {
+                        crate::server::emit_window_event(
+                            server,
+                            window_id,
+                            0x0002_0000,
+                            |buf, seq, order| {
+                                x11::encode_configure_notify_event(
+                                    buf,
+                                    seq,
+                                    order,
+                                    window_id,
+                                    window_id,
+                                    geometry,
+                                    override_redirect,
+                                );
+                            },
+                        );
+                    }
                 }
             }
             log_void(client_id, sequence, "ConfigureWindow")

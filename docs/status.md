@@ -161,6 +161,16 @@ In rough priority order:
       - `RRGetScreenInfo` (legacy RANDR 1.0) if a client probes it.
       - Extension-specific error codes (`BadRROutput`, `BadRRCrtc`) instead of `BadValue`.
 
+- [ ] **SubstructureRedirect / MapRequest / ConfigureRequest.** When a WM
+      registers `SubstructureRedirectMask` (0x100000) on the root window,
+      `MapWindow` for unmapped top-level windows must send `MapRequest`
+      (event type 20) to the WM instead of mapping directly; similarly
+      `ConfigureWindow` must send `ConfigureRequest` (event type 23).
+      The WM then decides whether to honour the request (by calling
+      `MapWindow` / `ConfigureWindow` itself) and how to frame the window.
+      Required for fvwm3 (and any reparenting WM) to draw borders and
+      titlebars. `override-redirect` windows bypass redirection.
+
 Other Phase 2 work not started yet.
 
 ## Phase 3 — Toolkit compatibility
