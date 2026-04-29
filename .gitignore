@@ -1,6 +1,10 @@
 # Build
 target/
 
+# Runtime logs (reference traces live under docs/assets/)
+*.log
+!docs/assets/*.log
+
 # Worktrees
 .worktrees/
 
