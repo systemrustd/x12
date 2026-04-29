@@ -67,7 +67,8 @@ In rough priority order:
       `HostInputPump` + `xid_map` fanout. `xeyes` now tracks cursor
       via real `MotionNotify` events.
 - [ ] **`CopyArea` and `PutImage`.** Both are stubs; xterm uses them for
-      scrolling and some text paths.
+      scrolling and some text paths. Spec:
+      [`2026-04-29-copyarea-putimage-design.md`](superpowers/specs/2026-04-29-copyarea-putimage-design.md).
 
 ### Known follow-ups
 
