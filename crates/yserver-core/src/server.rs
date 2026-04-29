@@ -329,11 +329,6 @@ pub fn pointer_event_fanout(
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
         }
-        if matches!(event.kind, PointerEventKind::ButtonRelease)
-            && let Ok(mut g) = state.lock()
-        {
-            g.pointer_grab = None;
-        }
         return;
     }
 
