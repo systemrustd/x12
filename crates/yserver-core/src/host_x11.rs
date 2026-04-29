@@ -378,10 +378,9 @@ impl HostX11 {
             return Ok(());
         };
         let opcode = r.opcode;
-        // body_tail: num_glyphs(4) + glyph_ids + glyph_infos + glyph_data
-        let payload_len = 4 + body_tail.len();
-        let padded_payload = padded_len(payload_len);
-        let length_units = 2 + (padded_payload / 4) as u16;
+        // body_tail (already padded on the wire): num_glyphs(4) + glyph_ids + glyph_infos + glyph_data
+        let padded_tail = padded_len(body_tail.len());
+        let length_units = 2 + (padded_tail / 4) as u16;
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(opcode);
@@ -389,7 +388,7 @@ impl HostX11 {
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_gs);
         out.extend_from_slice(body_tail);
-        out.resize(8 + padded_payload, 0);
+        out.resize(8 + padded_tail, 0);
         self.stream.write_all(&out)?;
         self.stream.flush()
     }
