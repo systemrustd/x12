@@ -9,7 +9,9 @@ use std::{
     time::Instant,
 };
 
-use yserver_protocol::x11::{self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
+use yserver_protocol::x11::{
+    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
+};
 
 use crate::{randr::RandrState, resources::ResourceTable};
 
@@ -157,6 +159,10 @@ pub struct ServerState {
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
     pub randr: RandrState,
+    /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
+    pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
+    /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
+    pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
     /// Selection ownership: maps selection atom → owning window (ResourceId).
     pub selections: HashMap<AtomId, ResourceId>,
     /// Active pointer grab: (grab owner, grab window). When set, all pointer
@@ -176,6 +182,22 @@ pub struct ServerState {
     pub key_grabs: Vec<KeyGrab>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
+    /// XFIXES regions owned by clients.
+    pub xfixes_regions: HashMap<u32, XFixesRegion>,
+    /// XFIXES selection event masks: (client, window, selection atom) -> mask.
+    pub xfixes_selection_masks: HashMap<(u32, ResourceId, AtomId), u32>,
+    /// XFIXES cursor event masks: (client, window) -> mask.
+    pub xfixes_cursor_masks: HashMap<(u32, ResourceId), u32>,
+    /// SHAPE state per window. Missing entries mean the default window rectangle.
+    pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
+    /// SHAPE select-input state: (client, window) -> enabled.
+    pub shape_select_masks: HashMap<(u32, ResourceId), bool>,
+    pub sync_counters: HashMap<u32, SyncCounter>,
+    pub sync_alarms: HashMap<u32, SyncAlarm>,
+    pub damage_objects: HashMap<u32, DamageObject>,
+    pub composite_redirects: HashMap<(ResourceId, bool), u8>,
+    pub present_event_selections: HashMap<u32, PresentEventSelection>,
+    pub present_msc: HashMap<ResourceId, u64>,
 }
 
 impl ServerState {
@@ -188,6 +210,8 @@ impl ServerState {
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
             randr: RandrState::nested(0, 800, 600),
+            randr_select_masks: HashMap::new(),
+            xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
             pointer_grab: None,
             active_pointer_grab: None,
@@ -196,6 +220,17 @@ impl ServerState {
             frozen_pointer_event: None,
             key_grabs: Vec::new(),
             active_keyboard_grab: None,
+            xfixes_regions: HashMap::new(),
+            xfixes_selection_masks: HashMap::new(),
+            xfixes_cursor_masks: HashMap::new(),
+            shape_windows: HashMap::new(),
+            shape_select_masks: HashMap::new(),
+            sync_counters: HashMap::new(),
+            sync_alarms: HashMap::new(),
+            damage_objects: HashMap::new(),
+            composite_redirects: HashMap::new(),
+            present_event_selections: HashMap::new(),
+            present_msc: HashMap::new(),
         }
     }
 
@@ -212,6 +247,84 @@ impl ServerState {
 impl Default for ServerState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct XFixesRegion {
+    pub owner: ClientId,
+    pub rects: Vec<xfixes::RegionRect>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShapeWindowState {
+    pub bounding: Option<Vec<xfixes::RegionRect>>,
+    pub clip: Option<Vec<xfixes::RegionRect>>,
+    pub input: Option<Vec<xfixes::RegionRect>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncCounter {
+    pub owner: ClientId,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncAlarm {
+    pub owner: ClientId,
+    pub counter: u32,
+    pub wait_value: i64,
+    pub delta: i64,
+    pub events: bool,
+    pub state: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DamageObject {
+    pub owner: ClientId,
+    pub drawable: ResourceId,
+    pub level: u8,
+    pub rects: Vec<xfixes::RegionRect>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentEventSelection {
+    pub owner: ClientId,
+    pub window: ResourceId,
+    pub event_mask: u32,
+}
+
+impl Default for SyncAlarm {
+    fn default() -> Self {
+        Self {
+            owner: ClientId(0),
+            counter: 0,
+            wait_value: 0,
+            delta: 0,
+            events: false,
+            state: 0,
+        }
+    }
+}
+
+impl ShapeWindowState {
+    pub fn rects_mut(&mut self, kind: u8) -> Option<&mut Option<Vec<xfixes::RegionRect>>> {
+        match kind {
+            shape::KIND_BOUNDING => Some(&mut self.bounding),
+            shape::KIND_CLIP => Some(&mut self.clip),
+            shape::KIND_INPUT => Some(&mut self.input),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn rects(&self, kind: u8) -> Option<&Vec<xfixes::RegionRect>> {
+        match kind {
+            shape::KIND_BOUNDING => self.bounding.as_ref(),
+            shape::KIND_CLIP => self.clip.as_ref(),
+            shape::KIND_INPUT => self.input.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -423,6 +536,26 @@ pub fn fanout_raw_event(targets: &[EventTarget], event: &[u8; 32]) {
     }
 }
 
+#[must_use]
+pub(crate) fn xi2_mask_for_client(
+    client: &ClientHandle,
+    target: ResourceId,
+    fallback: ResourceId,
+    device_candidates: &[u16],
+) -> u32 {
+    for window in [target, fallback] {
+        for deviceid in device_candidates {
+            if let Some(mask) = client.xi2_masks.get(&(window, *deviceid)) {
+                return *mask;
+            }
+        }
+        if fallback == target {
+            break;
+        }
+    }
+    0
+}
+
 pub fn emit_window_event(
     state: &Mutex<ServerState>,
     window: ResourceId,
@@ -443,6 +576,38 @@ pub fn pointer_event_fanout(
     event: crate::host_x11::HostPointerEvent,
 ) {
     use crate::host_x11::PointerEventKind;
+
+    // Translate root_x/root_y from host-screen coordinates into ynest-root
+    // coordinates. The host pump reports root_x/y relative to the host server's
+    // root window, but our nested clients see the ynest container as their
+    // root, so values must be relative to that. For events on a registered
+    // top-level subwindow we have host event_x/y (relative to that subwindow)
+    // and the top-level's known position in nested-root, so the translation is
+    // straightforward. Without this translation, clients placing popups or
+    // tooltips at root_x/root_y end up off-screen by the container's host
+    // offset.
+    let event = if let Some(top_level_id) = xid_map
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&event.host_xid).copied())
+    {
+        let translated = state.lock().ok().and_then(|g| {
+            g.resources
+                .window(top_level_id)
+                .map(|w| (w.x + event.event_x, w.y + event.event_y))
+        });
+        if let Some((rx, ry)) = translated {
+            crate::host_x11::HostPointerEvent {
+                root_x: rx,
+                root_y: ry,
+                ..event
+            }
+        } else {
+            event
+        }
+    } else {
+        event
+    };
 
     // Active pointer grab: redirect all button/motion events to grab owner.
     let grab_state = match state.lock() {
@@ -583,7 +748,22 @@ pub fn pointer_event_fanout(
     let mask_bit: u32 = match event.kind {
         PointerEventKind::ButtonPress => 0x0000_0004,
         PointerEventKind::ButtonRelease => 0x0000_0008,
-        PointerEventKind::MotionNotify => 0x0000_0040,
+        PointerEventKind::MotionNotify => {
+            // PointerMotion (0x40), plus ButtonMotion (0x2000) and the
+            // matching ButtonNMotion bit for each currently held button.
+            // event.state bits 8..=12 are Button1..Button5.
+            let mut bits: u32 = 0x0000_0040;
+            let buttons_held = (event.state >> 8) & 0x1f;
+            if buttons_held != 0 {
+                bits |= 0x0000_2000;
+                for n in 0..5 {
+                    if buttons_held & (1 << n) != 0 {
+                        bits |= 0x0000_0100 << n;
+                    }
+                }
+            }
+            bits
+        }
         PointerEventKind::EnterNotify => 0x0000_0010,
         PointerEventKind::LeaveNotify => 0x0000_0020,
     };
@@ -610,16 +790,7 @@ pub fn pointer_event_fanout(
             let mut xi2_targets = Vec::new();
             if xi2_evtype != 0 {
                 for c in g.clients.values() {
-                    let mask = c
-                        .xi2_masks
-                        .get(&(target, 2)) // Master Pointer
-                        .or_else(|| c.xi2_masks.get(&(target, 1))) // XIAllMasterDevices
-                        .or_else(|| c.xi2_masks.get(&(target, 0))) // XIAllDevices
-                        .or_else(|| c.xi2_masks.get(&(top_level_id, 2)))
-                        .or_else(|| c.xi2_masks.get(&(top_level_id, 1)))
-                        .or_else(|| c.xi2_masks.get(&(top_level_id, 0)))
-                        .copied()
-                        .unwrap_or(0);
+                    let mask = xi2_mask_for_client(c, target, top_level_id, &[2, 1, 0]);
                     if mask & (1 << xi2_evtype) != 0 {
                         xi2_targets.push(ServerState::event_target_for_client(c));
                     }
@@ -913,6 +1084,50 @@ mod tests {
     }
 
     #[test]
+    fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
+        for deviceid in [2u16, 1, 0] {
+            let client = ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 4)]),
+            };
+
+            assert_eq!(
+                xi2_mask_for_client(&client, ResourceId(0x100), ResourceId(0x100), &[2, 1, 0]),
+                1 << 4
+            );
+        }
+    }
+
+    #[test]
+    fn xi2_keyboard_mask_matches_exact_and_wildcard_devices() {
+        for deviceid in [3u16, 1, 0] {
+            let client = ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 2)]),
+            };
+
+            assert_eq!(
+                xi2_mask_for_client(&client, ResourceId(0x100), ResourceId(0x100), &[3, 1, 0]),
+                1 << 2
+            );
+        }
+    }
+
+    #[test]
     fn subscribers_omits_disconnected_client() {
         let mut state = ServerState::new();
         state.clients.insert(
@@ -1188,6 +1403,136 @@ mod tests {
             s.subscribers(ResourceId(0x0010_0002), 0x0000_0040).len(),
             1,
             "only client B selected MotionNotify"
+        );
+    }
+
+    #[test]
+    fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
+        use std::{
+            collections::HashMap as StdHashMap,
+            io::{ErrorKind, Read},
+            sync::Mutex as StdMutex,
+        };
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        // Client A: subscribes to ButtonMotion (0x2000) only. Mirrors
+        // wmaker's frame mask: it expects motion while a button is held.
+        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        // Client B: no motion mask at all — must not receive anything.
+        let (b_writer_local, mut b_reader_remote) = UnixStream::pair().expect("socketpair");
+
+        a_reader_remote.set_nonblocking(true).unwrap();
+        b_reader_remote.set_nonblocking(true).unwrap();
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            // Top-level window so pointer_target_at returns the same id.
+            s.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(0x0010_0002),
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    background_pixel: None,
+                    event_mask: None,
+                    override_redirect: None,
+                },
+            );
+            let _ = s.resources.map_window(ResourceId(0x0010_0002));
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_2000)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+            s.clients.insert(
+                2,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(b_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0020_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+        }
+
+        let mut map = StdHashMap::new();
+        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
+        let xid_map = Arc::new(StdMutex::new(map));
+
+        // Motion with button 1 held (state bit 8 == 0x100).
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::MotionNotify,
+                host_xid: 0xCAFE,
+                detail: 0,
+                time: 0,
+                root_x: 5,
+                root_y: 5,
+                event_x: 5,
+                event_y: 5,
+                state: 0x0100,
+            },
+        );
+
+        let mut buf = [0u8; 32];
+        let a_read = a_reader_remote.read(&mut buf);
+        assert!(
+            matches!(a_read, Ok(32)),
+            "client with ButtonMotion mask should receive 32-byte MotionNotify when a button is held; got {a_read:?}",
+        );
+        assert_eq!(buf[0], 6, "event type should be MotionNotify");
+
+        let b_read = b_reader_remote.read(&mut buf);
+        assert!(
+            matches!(b_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "client with no motion mask must not receive motion; got {b_read:?}",
+        );
+
+        // Motion without any button held: ButtonMotion subscriber must NOT receive.
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::MotionNotify,
+                host_xid: 0xCAFE,
+                detail: 0,
+                time: 0,
+                root_x: 5,
+                root_y: 5,
+                event_x: 5,
+                event_y: 5,
+                state: 0,
+            },
+        );
+        let a_read2 = a_reader_remote.read(&mut buf);
+        assert!(
+            matches!(a_read2, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "ButtonMotion-only subscriber must NOT receive motion when no button is held; got {a_read2:?}",
         );
     }
 

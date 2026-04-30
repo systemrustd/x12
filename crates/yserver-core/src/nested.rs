@@ -14,16 +14,20 @@ use std::{
 use log::{debug, error, info, warn};
 use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
-    randr as x11randr,
+    composite as x11composite, damage as x11damage, present as x11present, randr as x11randr,
+    shape as x11shape, sync as x11sync, xfixes as x11xfixes,
 };
 
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
     resources::{
-        ARGB_VISUAL, GlyphSetState, MapState, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL,
-        ROOT_WINDOW, ReparentWindowError, Window,
+        ARGB_VISUAL, GlyphSetState, HostDrawableTarget, MapState, PictureState, Pixmap,
+        ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ReparentWindowError, Window,
     },
-    server::{ClientHandle, EventTarget, ServerState, fanout_event, fanout_raw_event},
+    server::{
+        ClientHandle, DamageObject, EventTarget, PresentEventSelection, ServerState, SyncAlarm,
+        SyncCounter, XFixesRegion, fanout_event, fanout_raw_event,
+    },
 };
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
@@ -47,6 +51,151 @@ const XKB_MAJOR_OPCODE: u8 = 136;
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_FIRST_EVENT: u8 = 90;
 const XI2_FIRST_ERROR: u8 = 153;
+
+const XFIXES_MAJOR_OPCODE: u8 = 140;
+const XFIXES_FIRST_EVENT: u8 = 91;
+const XFIXES_FIRST_ERROR: u8 = 154;
+
+const SHAPE_MAJOR_OPCODE: u8 = 141;
+const SHAPE_FIRST_EVENT: u8 = 92;
+const SHAPE_FIRST_ERROR: u8 = 155;
+
+const SYNC_MAJOR_OPCODE: u8 = 142;
+const SYNC_FIRST_EVENT: u8 = 93;
+const SYNC_FIRST_ERROR: u8 = 156;
+
+const DAMAGE_MAJOR_OPCODE: u8 = 143;
+const DAMAGE_FIRST_EVENT: u8 = 94;
+const DAMAGE_FIRST_ERROR: u8 = 157;
+
+const COMPOSITE_MAJOR_OPCODE: u8 = 144;
+const COMPOSITE_FIRST_EVENT: u8 = 0;
+const COMPOSITE_FIRST_ERROR: u8 = 158;
+
+const PRESENT_MAJOR_OPCODE: u8 = 145;
+const PRESENT_FIRST_EVENT: u8 = 95;
+const PRESENT_FIRST_ERROR: u8 = 159;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtensionAvailability {
+    Always,
+    HostRender,
+    HostXkb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnsupportedMinorPolicy {
+    HandledInline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExtensionMetadata {
+    name: &'static str,
+    major_opcode: u8,
+    first_event: u8,
+    first_error: u8,
+    availability: ExtensionAvailability,
+    unsupported_minor_policy: UnsupportedMinorPolicy,
+}
+
+const EXTENSIONS: &[ExtensionMetadata] = &[
+    ExtensionMetadata {
+        name: "RANDR",
+        major_opcode: RANDR_MAJOR_OPCODE,
+        first_event: RANDR_FIRST_EVENT,
+        first_error: RANDR_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "RENDER",
+        major_opcode: RENDER_MAJOR_OPCODE,
+        first_event: RENDER_FIRST_EVENT,
+        first_error: RENDER_FIRST_ERROR,
+        availability: ExtensionAvailability::HostRender,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "Generic Event Extension",
+        major_opcode: GE_MAJOR_OPCODE,
+        first_event: 0,
+        first_error: 0,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "BIG-REQUESTS",
+        major_opcode: BIG_REQUESTS_MAJOR_OPCODE,
+        first_event: BIG_REQUESTS_FIRST_EVENT,
+        first_error: BIG_REQUESTS_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XKEYBOARD",
+        major_opcode: XKB_MAJOR_OPCODE,
+        first_event: 0,
+        first_error: 0,
+        availability: ExtensionAvailability::HostXkb,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XInputExtension",
+        major_opcode: XI2_MAJOR_OPCODE,
+        first_event: XI2_FIRST_EVENT,
+        first_error: XI2_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XFIXES",
+        major_opcode: XFIXES_MAJOR_OPCODE,
+        first_event: XFIXES_FIRST_EVENT,
+        first_error: XFIXES_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "SHAPE",
+        major_opcode: SHAPE_MAJOR_OPCODE,
+        first_event: SHAPE_FIRST_EVENT,
+        first_error: SHAPE_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "SYNC",
+        major_opcode: SYNC_MAJOR_OPCODE,
+        first_event: SYNC_FIRST_EVENT,
+        first_error: SYNC_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "DAMAGE",
+        major_opcode: DAMAGE_MAJOR_OPCODE,
+        first_event: DAMAGE_FIRST_EVENT,
+        first_error: DAMAGE_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "Composite",
+        major_opcode: COMPOSITE_MAJOR_OPCODE,
+        first_event: COMPOSITE_FIRST_EVENT,
+        first_error: COMPOSITE_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "Present",
+        major_opcode: PRESENT_MAJOR_OPCODE,
+        first_event: PRESENT_FIRST_EVENT,
+        first_error: PRESENT_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+];
 
 struct OwnedGetPropertyReply {
     format: u8,
@@ -122,6 +271,11 @@ pub fn run(display: u16) -> io::Result<()> {
                             Ok(HostEvent::Expose(ev)) => {
                                 expose_event_fanout(&server_for_thread, &xid_map, ev);
                             }
+                            Ok(HostEvent::Configure(ev)) => {
+                                if ev.host_xid == window_id {
+                                    handle_host_container_resize(&server_for_thread, ev);
+                                }
+                            }
                             Ok(HostEvent::Closed) => {
                                 info!("host pump: window closed, exiting");
                                 std::process::exit(0);
@@ -174,6 +328,42 @@ fn lock_server(server: &Mutex<ServerState>) -> io::Result<std::sync::MutexGuard<
     server
         .lock()
         .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "server state poisoned"))
+}
+
+fn extension_metadata(name: &str) -> Option<&'static ExtensionMetadata> {
+    EXTENSIONS.iter().find(|ext| ext.name == name)
+}
+
+fn extension_is_available(ext: &ExtensionMetadata, host: Option<&Arc<Mutex<HostX11>>>) -> bool {
+    match ext.availability {
+        ExtensionAvailability::Always => true,
+        ExtensionAvailability::HostRender => host
+            .and_then(|h| h.lock().ok())
+            .is_some_and(|h| h.render_opcode().is_some()),
+        ExtensionAvailability::HostXkb => host
+            .and_then(|h| h.lock().ok())
+            .is_some_and(|h| h.xkb_opcode().is_some()),
+    }
+}
+
+fn extension_query_reply(name: &str, host: Option<&Arc<Mutex<HostX11>>>) -> Option<(u8, u8, u8)> {
+    let ext = extension_metadata(name)?;
+    if !extension_is_available(ext, host) {
+        return None;
+    }
+    if ext.availability == ExtensionAvailability::HostXkb {
+        let (_, first_event, first_error) = host?.lock().ok()?.xkb_info()?;
+        return Some((ext.major_opcode, first_event, first_error));
+    }
+    Some((ext.major_opcode, ext.first_event, ext.first_error))
+}
+
+fn advertised_extension_names(host: Option<&Arc<Mutex<HostX11>>>) -> Vec<&'static str> {
+    EXTENSIONS
+        .iter()
+        .filter(|ext| extension_is_available(ext, host))
+        .map(|ext| ext.name)
+        .collect()
 }
 
 fn emit_x11_error(
@@ -416,14 +606,41 @@ fn handle_client(
         s.drop_window_subscriptions(&all_destroyed);
         let removed = s.resources.remove_non_window_resources_owned_by(client_id);
         s.clients.remove(&client_id.0);
+        let dead_windows: std::collections::HashSet<ResourceId> =
+            all_destroyed.iter().copied().collect();
+        s.xfixes_regions
+            .retain(|_, region| region.owner != client_id);
+        s.xfixes_selection_masks
+            .retain(|(owner, _, _), _| *owner != client_id.0);
+        s.xfixes_cursor_masks
+            .retain(|(owner, _), _| *owner != client_id.0);
+        s.shape_windows
+            .retain(|window, _| !dead_windows.contains(window));
+        s.shape_select_masks
+            .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
+        s.sync_counters
+            .retain(|_, counter| counter.owner != client_id);
+        s.sync_alarms.retain(|_, alarm| alarm.owner != client_id);
+        s.damage_objects.retain(|_, damage| {
+            damage.owner != client_id && !dead_windows.contains(&damage.drawable)
+        });
+        s.composite_redirects
+            .retain(|(window, _), _| !dead_windows.contains(window));
+        s.present_event_selections.retain(|_, selection| {
+            selection.owner != client_id && !dead_windows.contains(&selection.window)
+        });
+        s.present_msc
+            .retain(|window, _| !dead_windows.contains(window));
+        s.randr_select_masks
+            .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
+        s.xkb_select_event_masks
+            .retain(|(owner, _), _| *owner != client_id.0);
         s.button_grabs.retain(|g| g.owner != client_id);
         if s.pointer_grab.is_some_and(|(owner, _)| owner == client_id) {
             s.pointer_grab = None;
             s.pointer_grab_is_passive = false;
             s.frozen_pointer_event = None;
         }
-        let dead_windows: std::collections::HashSet<ResourceId> =
-            all_destroyed.iter().copied().collect();
         s.selections
             .retain(|_, owner_window| !dead_windows.contains(owner_window));
         (removed, pending)
@@ -476,7 +693,12 @@ fn spawn_window_close_watcher(window_id: u32) {
         debug!("window-close watcher ready");
         loop {
             match watcher.read_event() {
-                Ok(HostEvent::Key(_) | HostEvent::Pointer(_) | HostEvent::Expose(_)) => {}
+                Ok(
+                    HostEvent::Key(_)
+                    | HostEvent::Pointer(_)
+                    | HostEvent::Expose(_)
+                    | HostEvent::Configure(_),
+                ) => {}
                 Ok(HostEvent::Closed) => {
                     info!("host window closed, exiting");
                     std::process::exit(0);
@@ -576,7 +798,9 @@ fn spawn_keyboard_forwarder(
             let event = loop {
                 match keyboard.read_event() {
                     Ok(HostEvent::Key(event)) => break event,
-                    Ok(HostEvent::Pointer(_) | HostEvent::Expose(_)) => continue,
+                    Ok(HostEvent::Pointer(_) | HostEvent::Expose(_) | HostEvent::Configure(_)) => {
+                        continue;
+                    }
                     Ok(HostEvent::Closed) => {
                         info!("host window closed, exiting");
                         std::process::exit(0);
@@ -659,13 +883,12 @@ fn spawn_keyboard_forwarder(
                     .clients
                     .values()
                     .filter(|client| {
-                        let mask = client
-                            .xi2_masks
-                            .get(&(event_window, 3))
-                            .or_else(|| client.xi2_masks.get(&(event_window, 1)))
-                            .or_else(|| client.xi2_masks.get(&(event_window, 0)))
-                            .copied()
-                            .unwrap_or(0);
+                        let mask = crate::server::xi2_mask_for_client(
+                            client,
+                            event_window,
+                            event_window,
+                            &[3, 1, 0],
+                        );
                         mask & (1 << xi2_evtype) != 0
                     })
                     .map(|client| crate::server::EventTarget {
@@ -721,6 +944,149 @@ fn expose_event_fanout(
             buf, seq, order, window, ev.x, ev.y, ev.width, ev.height, ev.count,
         );
     });
+    // Root-level exposes describe areas of the container that were uncovered
+    // by a moved top-level. The other top-levels in the area still have their
+    // own host subwindows and receive their own host exposes; descendants of
+    // those top-levels are reached via that path. Walking root's descendants
+    // here would double-deliver and produce flickering chrome.
+    if window == ROOT_WINDOW {
+        return;
+    }
+    // For top-level exposes, synthesize Expose for mapped sub-windows that
+    // overlap the area. Sub-windows have no host counterpart (only top-levels
+    // do), so without this wmaker's frame chrome (titlebar, resize handle) is
+    // never told to repaint after a sibling top-level is dragged across it.
+    let exposed = match server.lock() {
+        Ok(s) => s.resources.descendants_in_exposed_area(
+            window,
+            ev.x as i16,
+            ev.y as i16,
+            ev.width,
+            ev.height,
+        ),
+        Err(_) => return,
+    };
+    for rect in exposed {
+        crate::server::emit_window_event(server, rect.window, 0x0000_8000, |buf, seq, order| {
+            x11::encode_expose_event(
+                buf,
+                seq,
+                order,
+                rect.window,
+                rect.x as u16,
+                rect.y as u16,
+                rect.width,
+                rect.height,
+                0,
+            );
+        });
+    }
+}
+
+fn handle_host_container_resize(
+    server: &Arc<Mutex<ServerState>>,
+    ev: crate::host_x11::HostConfigureEvent,
+) {
+    #[allow(clippy::type_complexity)]
+    let update = {
+        let mut s = match server.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if ev.width == 0
+            || ev.height == 0
+            || (s.randr.screen_width == ev.width && s.randr.screen_height == ev.height)
+        {
+            return;
+        }
+
+        let timestamp = s.timestamp_now();
+        s.randr.resize(timestamp, ev.width, ev.height);
+        if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
+            root.width = ev.width;
+            root.height = ev.height;
+        }
+
+        let width_mm = u16::try_from(s.randr.width_mm).unwrap_or(u16::MAX);
+        let height_mm = u16::try_from(s.randr.height_mm).unwrap_or(u16::MAX);
+        let targets = s
+            .randr_select_masks
+            .iter()
+            .filter_map(|((owner, window), mask)| {
+                s.client_target(ClientId(*owner))
+                    .map(|target| (target, *window, *mask))
+            })
+            .collect::<Vec<_>>();
+
+        Some((timestamp, ev.width, ev.height, width_mm, height_mm, targets))
+    };
+
+    let Some((timestamp, width, height, width_mm, height_mm, targets)) = update else {
+        return;
+    };
+
+    debug!(
+        "host container resized to {}x{} at {}, emitting RANDR updates",
+        width, height, timestamp
+    );
+    for (target, request_window, mask) in targets {
+        let sequence = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
+            let event = x11randr::encode_screen_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::ScreenChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    root: ROOT_WINDOW.0,
+                    request_window: request_window.0,
+                    width,
+                    height,
+                    width_mm,
+                    height_mm,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
+            let event = x11randr::encode_crtc_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::CrtcChangeNotify {
+                    timestamp,
+                    request_window: request_window.0,
+                    crtc: crate::randr::CRTC_ID,
+                    mode: crate::randr::MODE_ID,
+                    x: ev.x,
+                    y: ev.y,
+                    width,
+                    height,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+            let event = x11randr::encode_output_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::OutputChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    request_window: request_window.0,
+                    output: crate::randr::OUTPUT_ID,
+                    crtc: crate::randr::CRTC_ID,
+                    mode: crate::randr::MODE_ID,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+    }
 }
 
 /// Walk every mapped descendant of `root` and send Expose to those that
@@ -902,6 +1268,14 @@ fn handle_render_request(
                 ARGB_VISUAL,
             )
         }
+        // QueryPictIndexValues (minor=2)
+        2 => {
+            debug!(
+                "client {} #{} RENDER::QueryPictIndexValues",
+                client_id.0, sequence.0
+            );
+            x11::write_render_query_pict_index_values_reply(&mut *lock_writer()?, sequence)
+        }
         // CreatePicture (minor=4)
         4 => {
             let Some(req) = x11::render_create_picture_request(body) else {
@@ -973,8 +1347,7 @@ fn handle_render_request(
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
 
-            let safe_to_forward =
-                change_picture_safe_to_forward(value_mask, &body[8..]);
+            let safe_to_forward = change_picture_safe_to_forward(value_mask, &body[8..]);
 
             debug!(
                 "client {} #{} RENDER::ChangePicture pic=0x{:x} mask=0x{:x} forward={}",
@@ -1157,12 +1530,20 @@ fn handle_render_request(
             }
             Ok(())
         }
-        // ReferenceGlyphSet (minor=18) — stub
+        // ReferenceGlyphSet (minor=18)
         18 => {
+            let Some((new_glyphset, existing)) = x11::render_reference_glyphset_request(body)
+            else {
+                return Ok(());
+            };
             debug!(
-                "client {} #{} RENDER::ReferenceGlyphSet (stub)",
-                client_id.0, sequence.0
+                "client {} #{} RENDER::ReferenceGlyphSet new=0x{:x} existing=0x{:x}",
+                client_id.0, sequence.0, new_glyphset.0, existing.0
             );
+            let mut s = lock_server(server)?;
+            let _ = s
+                .resources
+                .reference_glyphset(client_id, new_glyphset, existing);
             Ok(())
         }
         // FreeGlyphSet (minor=19)
@@ -1201,12 +1582,25 @@ fn handle_render_request(
             }
             Ok(())
         }
-        // FreeGlyphs (minor=22) — stub
+        // FreeGlyphs (minor=22)
         22 => {
+            let Some((gs_id, glyph_ids)) = x11::render_free_glyphs_request(body) else {
+                return Ok(());
+            };
             debug!(
-                "client {} #{} RENDER::FreeGlyphs (stub)",
-                client_id.0, sequence.0
+                "client {} #{} RENDER::FreeGlyphs gs=0x{:x} glyphs={}",
+                client_id.0,
+                sequence.0,
+                gs_id.0,
+                glyph_ids.len() / 4
             );
+            let host_gs = {
+                let s = lock_server(server)?;
+                s.resources.glyphset(gs_id).map(|g| g.host_glyphset_xid)
+            };
+            if let (Some(host_gs), Some(mut h)) = (host_gs, lock_host()) {
+                let _ = h.render_free_glyphs(host_gs, &glyph_ids);
+            }
             Ok(())
         }
         // CompositeGlyphs8/16/32 (minor=23/24/25)
@@ -1352,6 +1746,14 @@ fn handle_render_request(
             }
             Ok(())
         }
+        // QueryFilters (minor=29)
+        29 => {
+            debug!(
+                "client {} #{} RENDER::QueryFilters",
+                client_id.0, sequence.0
+            );
+            x11::write_render_query_filters_reply(&mut *lock_writer()?, sequence)
+        }
         // SetPictureFilter (minor=30): picture(4) + nbytes(2) + pad(2) + name + values
         30 => {
             if body.len() < 8 {
@@ -1432,8 +1834,25 @@ fn handle_render_request(
             }
             Ok(())
         }
-        // CreateRadialGradient (minor=31): picture(4) + inner_center(8) + outer_center(8) + radii(8) + num_stops(4) + data
+        // CreateAnimCursor (minor=31): no-op for now. The request is void, and
+        // existing cursor paths use core CreateCursor or RENDER::CreateCursor.
         31 => {
+            debug!(
+                "client {} #{} RENDER::CreateAnimCursor (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        // AddTraps (minor=32): intentionally not implemented yet.
+        32 => {
+            debug!(
+                "client {} #{} RENDER::AddTraps (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        // CreateRadialGradient (minor=35): picture(4) + inner_center(8) + outer_center(8) + radii(8) + num_stops(4) + data
+        35 => {
             if body.len() < 32 {
                 return Ok(());
             }
@@ -1459,6 +1878,16 @@ fn handle_render_request(
                     },
                 );
             }
+            Ok(())
+        }
+        // CreateConicalGradient (minor=36): known RENDER request, not used by
+        // current validation targets. Keep explicit so it is not confused with
+        // CreateRadialGradient.
+        36 => {
+            debug!(
+                "client {} #{} RENDER::CreateConicalGradient (stub)",
+                client_id.0, sequence.0
+            );
             Ok(())
         }
         _ => {
@@ -1724,12 +2153,50 @@ fn handle_randr_request(
             lock_writer()?.write_all(&buf)
         }
         x11randr::RR_SELECT_INPUT => {
+            if let Some(req) = x11randr::parse_select_input(body) {
+                let mut s = lock_server(server)?;
+                if req.enable == 0 {
+                    s.randr_select_masks
+                        .remove(&(client_id.0, ResourceId(req.window)));
+                } else {
+                    s.randr_select_masks
+                        .insert((client_id.0, ResourceId(req.window)), req.enable);
+                }
+            }
+            debug!("client {} #{} RANDR::SelectInput", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11randr::RR_GET_SCREEN_INFO => {
+            // Legacy RANDR 1.0/1.1 query. Old clients (e16) call this and
+            // block waiting for the reply, so a missing handler hangs the
+            // session at startup. Reply with the single synthetic
+            // mode + 60Hz.
             debug!(
-                "client {} #{} RANDR::SelectInput (accepted, not stored)",
+                "client {} #{} RANDR::GetScreenInfo",
                 client_id.0, sequence.0
             );
-            // TODO: store event masks when RRScreenChangeNotify is implemented
-            Ok(())
+            let (timestamp, config_timestamp, width, height, mwidth, mheight) = {
+                let s = lock_server(server)?;
+                (
+                    s.randr.timestamp,
+                    s.randr.config_timestamp,
+                    s.randr.screen_width,
+                    s.randr.screen_height,
+                    u16::try_from(s.randr.width_mm).unwrap_or(u16::MAX),
+                    u16::try_from(s.randr.height_mm).unwrap_or(u16::MAX),
+                )
+            };
+            let buf = x11randr::encode_get_screen_info_reply(
+                sequence,
+                ROOT_WINDOW.0,
+                timestamp,
+                config_timestamp,
+                width,
+                height,
+                mwidth,
+                mheight,
+            );
+            lock_writer()?.write_all(&buf)
         }
         x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
             debug!(
@@ -1748,6 +2215,1255 @@ fn handle_randr_request(
             debug!(
                 "client {} #{} RANDR::unknown minor={}",
                 client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn normalize_region_rects(mut rects: Vec<x11xfixes::RegionRect>) -> Vec<x11xfixes::RegionRect> {
+    const MAX_RECTS: usize = 4096;
+    rects.retain(|rect| !rect.is_empty());
+    rects.truncate(MAX_RECTS);
+    rects
+}
+
+fn region_extents(rects: &[x11xfixes::RegionRect]) -> x11xfixes::RegionRect {
+    if rects.is_empty() {
+        return x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    let mut x1 = i32::from(rects[0].x);
+    let mut y1 = i32::from(rects[0].y);
+    let mut x2 = i32::from(rects[0].x) + i32::from(rects[0].width);
+    let mut y2 = i32::from(rects[0].y) + i32::from(rects[0].height);
+    for rect in &rects[1..] {
+        x1 = x1.min(i32::from(rect.x));
+        y1 = y1.min(i32::from(rect.y));
+        x2 = x2.max(i32::from(rect.x) + i32::from(rect.width));
+        y2 = y2.max(i32::from(rect.y) + i32::from(rect.height));
+    }
+    x11xfixes::RegionRect {
+        x: x1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        y: y1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        width: (x2 - x1).clamp(0, i32::from(u16::MAX)) as u16,
+        height: (y2 - y1).clamp(0, i32::from(u16::MAX)) as u16,
+    }
+}
+
+fn intersect_rect(
+    a: x11xfixes::RegionRect,
+    b: x11xfixes::RegionRect,
+) -> Option<x11xfixes::RegionRect> {
+    let x1 = i32::from(a.x).max(i32::from(b.x));
+    let y1 = i32::from(a.y).max(i32::from(b.y));
+    let x2 = (i32::from(a.x) + i32::from(a.width)).min(i32::from(b.x) + i32::from(b.width));
+    let y2 = (i32::from(a.y) + i32::from(a.height)).min(i32::from(b.y) + i32::from(b.height));
+    if x2 <= x1 || y2 <= y1 {
+        return None;
+    }
+    Some(x11xfixes::RegionRect {
+        x: x1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        y: y1.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        width: (x2 - x1).clamp(0, i32::from(u16::MAX)) as u16,
+        height: (y2 - y1).clamp(0, i32::from(u16::MAX)) as u16,
+    })
+}
+
+fn intersect_regions(
+    a: &[x11xfixes::RegionRect],
+    b: &[x11xfixes::RegionRect],
+) -> Vec<x11xfixes::RegionRect> {
+    let mut out = Vec::new();
+    for ar in a {
+        for br in b {
+            if let Some(rect) = intersect_rect(*ar, *br) {
+                out.push(rect);
+            }
+        }
+    }
+    normalize_region_rects(out)
+}
+
+fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
+    for rect in rects {
+        rect.x = rect.x.saturating_add(dx);
+        rect.y = rect.y.saturating_add(dy);
+    }
+}
+
+fn handle_xfixes_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11xfixes::QUERY_VERSION => {
+            debug!(
+                "client {} #{} XFIXES::QueryVersion -> {}.{}",
+                client_id.0,
+                sequence.0,
+                x11xfixes::MAJOR_VERSION,
+                x11xfixes::MINOR_VERSION
+            );
+            let reply = x11xfixes::encode_query_version_reply(
+                sequence,
+                x11xfixes::MAJOR_VERSION,
+                x11xfixes::MINOR_VERSION,
+            );
+            lock_writer()?.write_all(&reply)
+        }
+        x11xfixes::SELECT_SELECTION_INPUT => {
+            if let Some(req) = x11xfixes::parse_select_selection_input(body) {
+                let mut s = lock_server(server)?;
+                let key = (client_id.0, ResourceId(req.window), AtomId(req.selection));
+                if req.event_mask == 0 {
+                    s.xfixes_selection_masks.remove(&key);
+                } else {
+                    s.xfixes_selection_masks.insert(key, req.event_mask);
+                }
+            }
+            debug!(
+                "client {} #{} XFIXES::SelectSelectionInput",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::SELECT_CURSOR_INPUT => {
+            if let Some(req) = x11xfixes::parse_select_cursor_input(body) {
+                let mut s = lock_server(server)?;
+                let key = (client_id.0, ResourceId(req.window));
+                if req.event_mask == 0 {
+                    s.xfixes_cursor_masks.remove(&key);
+                } else {
+                    s.xfixes_cursor_masks.insert(key, req.event_mask);
+                }
+            }
+            debug!(
+                "client {} #{} XFIXES::SelectCursorInput",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::GET_CURSOR_IMAGE => {
+            debug!(
+                "client {} #{} XFIXES::GetCursorImage",
+                client_id.0, sequence.0
+            );
+            let reply = x11xfixes::encode_get_cursor_image_empty_reply(sequence);
+            lock_writer()?.write_all(&reply)
+        }
+        x11xfixes::CREATE_REGION => {
+            if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
+                let mut s = lock_server(server)?;
+                s.xfixes_regions.insert(
+                    region,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(rects),
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::CreateRegion",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::CREATE_REGION_FROM_BITMAP | x11xfixes::CREATE_REGION_FROM_GC => {
+            if let Some((region, _source)) = x11xfixes::parse_u32_pair(body) {
+                let mut s = lock_server(server)?;
+                s.xfixes_regions.insert(
+                    region,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects: Vec::new(),
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::CreateRegionFromSource",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::CREATE_REGION_FROM_WINDOW => {
+            if let Some((region, window)) = x11xfixes::parse_u32_pair(body) {
+                let rects = {
+                    let s = lock_server(server)?;
+                    s.resources
+                        .window(ResourceId(window))
+                        .map(|w| {
+                            vec![x11xfixes::RegionRect {
+                                x: 0,
+                                y: 0,
+                                width: w.width,
+                                height: w.height,
+                            }]
+                        })
+                        .unwrap_or_default()
+                };
+                let mut s = lock_server(server)?;
+                s.xfixes_regions.insert(
+                    region,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects,
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::CreateRegionFromWindow",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::DESTROY_REGION => {
+            if let Some((region, _)) = x11xfixes::parse_u32_pair(body) {
+                lock_server(server)?.xfixes_regions.remove(&region);
+            } else if body.len() >= 4 {
+                let region = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                lock_server(server)?.xfixes_regions.remove(&region);
+            }
+            debug!(
+                "client {} #{} XFIXES::DestroyRegion",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::SET_REGION => {
+            if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
+                let mut s = lock_server(server)?;
+                s.xfixes_regions
+                    .entry(region)
+                    .and_modify(|r| r.rects = normalize_region_rects(rects.clone()))
+                    .or_insert_with(|| XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(rects),
+                    });
+            }
+            debug!("client {} #{} XFIXES::SetRegion", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11xfixes::COPY_REGION => {
+            if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                let rects = lock_server(server)?
+                    .xfixes_regions
+                    .get(&source)
+                    .map(|r| r.rects.clone())
+                    .unwrap_or_default();
+                lock_server(server)?.xfixes_regions.insert(
+                    dest,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects,
+                    },
+                );
+            }
+            debug!("client {} #{} XFIXES::CopyRegion", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11xfixes::UNION_REGION | x11xfixes::INTERSECT_REGION | x11xfixes::SUBTRACT_REGION => {
+            if let Some((source1, source2, dest)) = x11xfixes::parse_u32_triplet(body) {
+                let (a, b) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.xfixes_regions
+                            .get(&source1)
+                            .map(|r| r.rects.clone())
+                            .unwrap_or_default(),
+                        s.xfixes_regions
+                            .get(&source2)
+                            .map(|r| r.rects.clone())
+                            .unwrap_or_default(),
+                    )
+                };
+                let rects = match minor {
+                    x11xfixes::UNION_REGION => {
+                        normalize_region_rects(a.into_iter().chain(b).collect())
+                    }
+                    x11xfixes::INTERSECT_REGION => intersect_regions(&a, &b),
+                    // Conservative approximation: subtracting an overlapping region
+                    // may over-clear, but never invents damaged/visible area.
+                    x11xfixes::SUBTRACT_REGION => {
+                        if intersect_regions(&a, &b).is_empty() {
+                            a
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                lock_server(server)?.xfixes_regions.insert(
+                    dest,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects,
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::RegionAlgebra minor={}",
+                client_id.0, sequence.0, minor
+            );
+            Ok(())
+        }
+        x11xfixes::INVERT_REGION => {
+            if let Some((_source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
+                lock_server(server)?.xfixes_regions.insert(
+                    dest,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(vec![bounds]),
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::InvertRegion",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::TRANSLATE_REGION => {
+            if let Some((region, dx, dy)) = x11xfixes::parse_translate_region(body)
+                && let Some(region) = lock_server(server)?.xfixes_regions.get_mut(&region)
+            {
+                translate_region(&mut region.rects, dx, dy);
+            }
+            debug!(
+                "client {} #{} XFIXES::TranslateRegion",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::REGION_EXTENTS => {
+            if let Some((source, dest)) = x11xfixes::parse_u32_pair(body) {
+                let rect = {
+                    let s = lock_server(server)?;
+                    s.xfixes_regions
+                        .get(&source)
+                        .map(|r| region_extents(&r.rects))
+                        .unwrap_or(x11xfixes::RegionRect {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        })
+                };
+                lock_server(server)?.xfixes_regions.insert(
+                    dest,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(vec![rect]),
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} XFIXES::RegionExtents",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11xfixes::FETCH_REGION => {
+            let region = body
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            let (extents, rects) = {
+                let s = lock_server(server)?;
+                let rects = s
+                    .xfixes_regions
+                    .get(&region)
+                    .map(|r| r.rects.clone())
+                    .unwrap_or_default();
+                (region_extents(&rects), rects)
+            };
+            debug!("client {} #{} XFIXES::FetchRegion", client_id.0, sequence.0);
+            let reply = x11xfixes::encode_fetch_region_reply(sequence, extents, &rects);
+            lock_writer()?.write_all(&reply)
+        }
+        x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
+            debug!(
+                "client {} #{} XFIXES::{}Cursor (stub)",
+                client_id.0,
+                sequence.0,
+                if minor == x11xfixes::HIDE_CURSOR {
+                    "Hide"
+                } else {
+                    "Show"
+                }
+            );
+            Ok(())
+        }
+        other => {
+            debug!(
+                "client {} #{} XFIXES::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn offset_rects(
+    mut rects: Vec<x11xfixes::RegionRect>,
+    dx: i16,
+    dy: i16,
+) -> Vec<x11xfixes::RegionRect> {
+    translate_region(&mut rects, dx, dy);
+    normalize_region_rects(rects)
+}
+
+fn default_shape_rect(server: &ServerState, window: ResourceId) -> x11xfixes::RegionRect {
+    server.resources.window(window).map_or(
+        x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        |w| x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: w.width,
+            height: w.height,
+        },
+    )
+}
+
+fn shape_rects_for(
+    server: &ServerState,
+    window: ResourceId,
+    kind: u8,
+) -> Vec<x11xfixes::RegionRect> {
+    server
+        .shape_windows
+        .get(&window)
+        .and_then(|state| state.rects(kind).cloned())
+        .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window)]))
+}
+
+fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: u8) -> bool {
+    server
+        .shape_windows
+        .get(&window)
+        .and_then(|state| state.rects(kind))
+        .is_some()
+}
+
+fn apply_shape_op(
+    current: Vec<x11xfixes::RegionRect>,
+    source: Vec<x11xfixes::RegionRect>,
+    op: u8,
+) -> Vec<x11xfixes::RegionRect> {
+    match op {
+        x11shape::OP_SET => normalize_region_rects(source),
+        x11shape::OP_UNION => normalize_region_rects(current.into_iter().chain(source).collect()),
+        x11shape::OP_INTERSECT => intersect_regions(&current, &source),
+        x11shape::OP_SUBTRACT => {
+            if intersect_regions(&current, &source).is_empty() {
+                current
+            } else {
+                Vec::new()
+            }
+        }
+        x11shape::OP_INVERT => normalize_region_rects(source),
+        _ => current,
+    }
+}
+
+fn set_shape_rects(
+    server: &mut ServerState,
+    window: ResourceId,
+    kind: u8,
+    rects: Vec<x11xfixes::RegionRect>,
+) {
+    let state = server.shape_windows.entry(window).or_default();
+    if let Some(slot) = state.rects_mut(kind) {
+        *slot = Some(normalize_region_rects(rects));
+    }
+}
+
+fn handle_shape_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11shape::QUERY_VERSION => {
+            debug!("client {} #{} SHAPE::QueryVersion", client_id.0, sequence.0);
+            let reply = x11shape::encode_query_version_reply(sequence);
+            lock_writer()?.write_all(&reply)
+        }
+        x11shape::RECTANGLES => {
+            if let Some((req, rects)) = x11shape::parse_rectangles_request(body) {
+                let window = ResourceId(req.dest);
+                let source = offset_rects(rects, req.x_off, req.y_off);
+                let mut s = lock_server(server)?;
+                let current = shape_rects_for(&s, window, req.dest_kind);
+                let rects = apply_shape_op(current, source, req.op);
+                set_shape_rects(&mut s, window, req.dest_kind, rects);
+            }
+            debug!("client {} #{} SHAPE::Rectangles", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11shape::MASK => {
+            if let Some(req) = x11shape::parse_mask_request(body) {
+                let window = ResourceId(req.dest);
+                let source = if req.src == 0 {
+                    Vec::new()
+                } else {
+                    let s = lock_server(server)?;
+                    vec![default_shape_rect(&s, window)]
+                };
+                let source = offset_rects(source, req.x_off, req.y_off);
+                let mut s = lock_server(server)?;
+                let current = shape_rects_for(&s, window, req.dest_kind);
+                let rects = apply_shape_op(current, source, req.op);
+                set_shape_rects(&mut s, window, req.dest_kind, rects);
+            }
+            debug!("client {} #{} SHAPE::Mask", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11shape::COMBINE => {
+            if let Some(req) = x11shape::parse_combine_request(body) {
+                let dest = ResourceId(req.dest);
+                let src = ResourceId(req.src);
+                let source = {
+                    let s = lock_server(server)?;
+                    offset_rects(shape_rects_for(&s, src, req.src_kind), req.x_off, req.y_off)
+                };
+                let mut s = lock_server(server)?;
+                let current = shape_rects_for(&s, dest, req.dest_kind);
+                let rects = apply_shape_op(current, source, req.op);
+                set_shape_rects(&mut s, dest, req.dest_kind, rects);
+            }
+            debug!("client {} #{} SHAPE::Combine", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11shape::OFFSET => {
+            if let Some(req) = x11shape::parse_offset_request(body) {
+                let mut s = lock_server(server)?;
+                if let Some(state) = s.shape_windows.get_mut(&ResourceId(req.dest))
+                    && let Some(slot) = state.rects_mut(req.dest_kind)
+                    && let Some(rects) = slot.as_mut()
+                {
+                    translate_region(rects, req.x_off, req.y_off);
+                }
+            }
+            debug!("client {} #{} SHAPE::Offset", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11shape::QUERY_EXTENTS => {
+            let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            let (bounding_shaped, clip_shaped, bounding, clip) = {
+                let s = lock_server(server)?;
+                let bounding_rects = shape_rects_for(&s, window, x11shape::KIND_BOUNDING);
+                let clip_rects = shape_rects_for(&s, window, x11shape::KIND_CLIP);
+                (
+                    shape_kind_is_set(&s, window, x11shape::KIND_BOUNDING),
+                    shape_kind_is_set(&s, window, x11shape::KIND_CLIP),
+                    region_extents(&bounding_rects),
+                    region_extents(&clip_rects),
+                )
+            };
+            debug!("client {} #{} SHAPE::QueryExtents", client_id.0, sequence.0);
+            let reply = x11shape::encode_query_extents_reply(
+                sequence,
+                bounding_shaped,
+                clip_shaped,
+                bounding,
+                clip,
+            );
+            lock_writer()?.write_all(&reply)
+        }
+        x11shape::SELECT_INPUT => {
+            if let Some(req) = x11shape::parse_select_input_request(body) {
+                let mut s = lock_server(server)?;
+                let key = (client_id.0, ResourceId(req.window));
+                if req.enable {
+                    s.shape_select_masks.insert(key, true);
+                } else {
+                    s.shape_select_masks.remove(&key);
+                }
+            }
+            debug!("client {} #{} SHAPE::SelectInput", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11shape::INPUT_SELECTED => {
+            let window = ResourceId(x11shape::parse_window(body).unwrap_or(ROOT_WINDOW.0));
+            let enabled = {
+                let s = lock_server(server)?;
+                s.shape_select_masks
+                    .get(&(client_id.0, window))
+                    .copied()
+                    .unwrap_or(false)
+            };
+            debug!(
+                "client {} #{} SHAPE::InputSelected",
+                client_id.0, sequence.0
+            );
+            let reply = x11shape::encode_input_selected_reply(sequence, enabled);
+            lock_writer()?.write_all(&reply)
+        }
+        x11shape::GET_RECTANGLES => {
+            let (window, kind) = x11shape::parse_get_rectangles_request(body)
+                .map(|(w, k)| (ResourceId(w), k))
+                .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
+            let rects = {
+                let s = lock_server(server)?;
+                shape_rects_for(&s, window, kind)
+            };
+            debug!(
+                "client {} #{} SHAPE::GetRectangles",
+                client_id.0, sequence.0
+            );
+            let reply = x11shape::encode_get_rectangles_reply(sequence, 0, &rects);
+            lock_writer()?.write_all(&reply)
+        }
+        other => {
+            debug!(
+                "client {} #{} SHAPE::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_sync_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11sync::INITIALIZE => {
+            let (client_major, client_minor) =
+                x11sync::parse_initialize(body).unwrap_or((x11sync::MAJOR_VERSION, 0));
+            let major = x11sync::MAJOR_VERSION.min(client_major);
+            let minor_ver = if major < x11sync::MAJOR_VERSION {
+                client_minor
+            } else {
+                x11sync::MINOR_VERSION
+            };
+            debug!(
+                "client {} #{} SYNC::Initialize -> {}.{}",
+                client_id.0, sequence.0, major, minor_ver
+            );
+            let reply = x11sync::encode_initialize_reply(sequence, major, minor_ver);
+            lock_writer()?.write_all(&reply)
+        }
+        x11sync::LIST_SYSTEM_COUNTERS => {
+            debug!(
+                "client {} #{} SYNC::ListSystemCounters -> empty",
+                client_id.0, sequence.0
+            );
+            let reply = x11sync::encode_list_system_counters_empty_reply(sequence);
+            lock_writer()?.write_all(&reply)
+        }
+        x11sync::CREATE_COUNTER => {
+            if let Some((counter, value)) = x11sync::parse_counter_value(body) {
+                lock_server(server)?.sync_counters.insert(
+                    counter,
+                    SyncCounter {
+                        owner: client_id,
+                        value,
+                    },
+                );
+            }
+            debug!("client {} #{} SYNC::CreateCounter", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::SET_COUNTER => {
+            if let Some((counter, value)) = x11sync::parse_counter_value(body)
+                && let Some(counter) = lock_server(server)?.sync_counters.get_mut(&counter)
+            {
+                counter.value = value;
+            }
+            debug!("client {} #{} SYNC::SetCounter", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::CHANGE_COUNTER => {
+            if let Some((counter, delta)) = x11sync::parse_counter_value(body)
+                && let Some(counter) = lock_server(server)?.sync_counters.get_mut(&counter)
+            {
+                counter.value = counter.value.saturating_add(delta);
+            }
+            debug!("client {} #{} SYNC::ChangeCounter", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::QUERY_COUNTER => {
+            let counter = x11sync::parse_resource(body).unwrap_or(0);
+            let value = lock_server(server)?
+                .sync_counters
+                .get(&counter)
+                .map_or(0, |counter| counter.value);
+            debug!("client {} #{} SYNC::QueryCounter", client_id.0, sequence.0);
+            let reply = x11sync::encode_query_counter_reply(sequence, value);
+            lock_writer()?.write_all(&reply)
+        }
+        x11sync::DESTROY_COUNTER => {
+            if let Some(counter) = x11sync::parse_resource(body) {
+                lock_server(server)?.sync_counters.remove(&counter);
+            }
+            debug!(
+                "client {} #{} SYNC::DestroyCounter",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11sync::AWAIT => {
+            debug!(
+                "client {} #{} SYNC::Await (non-blocking stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11sync::CREATE_ALARM => {
+            if let Some((alarm, _mask)) = x11sync::parse_alarm_with_mask(body) {
+                lock_server(server)?.sync_alarms.insert(
+                    alarm,
+                    SyncAlarm {
+                        owner: client_id,
+                        ..SyncAlarm::default()
+                    },
+                );
+            }
+            debug!("client {} #{} SYNC::CreateAlarm", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::CHANGE_ALARM => {
+            if let Some((alarm, _mask)) = x11sync::parse_alarm_with_mask(body)
+                && let Some(alarm) = lock_server(server)?.sync_alarms.get_mut(&alarm)
+            {
+                alarm.state = 0;
+            }
+            debug!("client {} #{} SYNC::ChangeAlarm", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::QUERY_ALARM => {
+            let alarm_id = x11sync::parse_resource(body).unwrap_or(0);
+            let alarm = lock_server(server)?
+                .sync_alarms
+                .get(&alarm_id)
+                .cloned()
+                .unwrap_or_default();
+            debug!("client {} #{} SYNC::QueryAlarm", client_id.0, sequence.0);
+            let reply = x11sync::encode_query_alarm_reply(
+                sequence,
+                alarm.counter,
+                alarm.wait_value,
+                alarm.delta,
+                alarm.events,
+                alarm.state,
+            );
+            lock_writer()?.write_all(&reply)
+        }
+        x11sync::DESTROY_ALARM => {
+            if let Some(alarm) = x11sync::parse_resource(body) {
+                lock_server(server)?.sync_alarms.remove(&alarm);
+            }
+            debug!("client {} #{} SYNC::DestroyAlarm", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11sync::SET_PRIORITY => {
+            debug!(
+                "client {} #{} SYNC::SetPriority (stub)",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11sync::GET_PRIORITY => {
+            debug!(
+                "client {} #{} SYNC::GetPriority -> 0",
+                client_id.0, sequence.0
+            );
+            let reply = x11sync::encode_get_priority_reply(sequence, 0);
+            lock_writer()?.write_all(&reply)
+        }
+        other => {
+            debug!(
+                "client {} #{} SYNC::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn drawable_full_rect(server: &ServerState, drawable: ResourceId) -> x11xfixes::RegionRect {
+    if let Some(window) = server.resources.window(drawable) {
+        return x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: window.width,
+            height: window.height,
+        };
+    }
+    server.resources.pixmap(drawable).map_or(
+        x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        |pixmap| x11xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: pixmap.width,
+            height: pixmap.height,
+        },
+    )
+}
+
+fn handle_damage_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11damage::QUERY_VERSION => {
+            let (client_major, client_minor) = x11damage::parse_query_version(body)
+                .unwrap_or((x11damage::MAJOR_VERSION, x11damage::MINOR_VERSION));
+            let major = x11damage::MAJOR_VERSION.min(client_major);
+            let minor_ver = if major < x11damage::MAJOR_VERSION {
+                client_minor
+            } else {
+                x11damage::MINOR_VERSION.min(client_minor)
+            };
+            debug!(
+                "client {} #{} DAMAGE::QueryVersion -> {}.{}",
+                client_id.0, sequence.0, major, minor_ver
+            );
+            let reply = x11damage::encode_query_version_reply(sequence, major, minor_ver);
+            lock_writer()?.write_all(&reply)
+        }
+        x11damage::CREATE => {
+            if let Some((damage, drawable, level)) = x11damage::parse_create(body) {
+                lock_server(server)?.damage_objects.insert(
+                    damage,
+                    DamageObject {
+                        owner: client_id,
+                        drawable: ResourceId(drawable),
+                        level,
+                        rects: Vec::new(),
+                    },
+                );
+            }
+            debug!("client {} #{} DAMAGE::Create", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11damage::DESTROY => {
+            if let Some(damage) = x11damage::parse_resource(body) {
+                lock_server(server)?.damage_objects.remove(&damage);
+            }
+            debug!("client {} #{} DAMAGE::Destroy", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11damage::ADD => {
+            if let Some((drawable, region)) = x11damage::parse_add(body) {
+                let mut s = lock_server(server)?;
+                let rects = if region == 0 {
+                    vec![drawable_full_rect(&s, ResourceId(drawable))]
+                } else {
+                    s.xfixes_regions
+                        .get(&region)
+                        .map(|region| region.rects.clone())
+                        .unwrap_or_default()
+                };
+                for damage in s.damage_objects.values_mut() {
+                    if damage.drawable == ResourceId(drawable) {
+                        damage.rects.extend(rects.clone());
+                        damage.rects = normalize_region_rects(std::mem::take(&mut damage.rects));
+                    }
+                }
+            }
+            debug!("client {} #{} DAMAGE::Add", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11damage::SUBTRACT => {
+            if let Some((damage_id, repair, parts)) = x11damage::parse_subtract(body) {
+                let mut s = lock_server(server)?;
+                let rects = s
+                    .damage_objects
+                    .get(&damage_id)
+                    .map(|damage| damage.rects.clone())
+                    .unwrap_or_default();
+                if repair != 0 {
+                    s.xfixes_regions.insert(
+                        repair,
+                        XFixesRegion {
+                            owner: client_id,
+                            rects: rects.clone(),
+                        },
+                    );
+                }
+                if parts != 0 {
+                    s.xfixes_regions.insert(
+                        parts,
+                        XFixesRegion {
+                            owner: client_id,
+                            rects: Vec::new(),
+                        },
+                    );
+                }
+                if let Some(damage) = s.damage_objects.get_mut(&damage_id) {
+                    damage.rects.clear();
+                }
+            }
+            debug!("client {} #{} DAMAGE::Subtract", client_id.0, sequence.0);
+            Ok(())
+        }
+        other => {
+            debug!(
+                "client {} #{} DAMAGE::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_composite_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11composite::QUERY_VERSION => {
+            let _ = x11composite::parse_query_version(body);
+            let major = x11composite::MAJOR_VERSION;
+            let minor_ver = x11composite::MINOR_VERSION;
+            debug!(
+                "client {} #{} COMPOSITE::QueryVersion -> {}.{}",
+                client_id.0, sequence.0, major, minor_ver
+            );
+            let reply = x11composite::encode_query_version_reply(sequence, major, minor_ver);
+            lock_writer()?.write_all(&reply)
+        }
+        x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
+            if let Some((window, update)) = x11composite::parse_window_update(body) {
+                let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
+                lock_server(server)?
+                    .composite_redirects
+                    .insert((ResourceId(window), subwindows), update);
+            }
+            debug!("client {} #{} COMPOSITE::Redirect", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
+            if let Some((window, _update)) = x11composite::parse_window_update(body) {
+                let subwindows = minor == x11composite::UNREDIRECT_SUBWINDOWS;
+                lock_server(server)?
+                    .composite_redirects
+                    .remove(&(ResourceId(window), subwindows));
+            }
+            debug!(
+                "client {} #{} COMPOSITE::Unredirect",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
+            if let Some((region, window)) = x11composite::parse_u32_pair(body) {
+                let rects = {
+                    let s = lock_server(server)?;
+                    vec![drawable_full_rect(&s, ResourceId(window))]
+                };
+                lock_server(server)?.xfixes_regions.insert(
+                    region,
+                    XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(rects),
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} COMPOSITE::CreateRegionFromBorderClip",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11composite::NAME_WINDOW_PIXMAP => {
+            let window = x11composite::parse_u32_pair(body).map_or(0, |(window, _pixmap)| window);
+            debug!(
+                "client {} #{} COMPOSITE::NameWindowPixmap -> BadMatch",
+                client_id.0, sequence.0
+            );
+            emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_MATCH,
+                window,
+                COMPOSITE_MAJOR_OPCODE,
+            )
+        }
+        x11composite::GET_OVERLAY_WINDOW => {
+            let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
+            debug!(
+                "client {} #{} COMPOSITE::GetOverlayWindow",
+                client_id.0, sequence.0
+            );
+            // For the nested compatibility subset, the root window is a stable,
+            // viewable server window and is sufficient for capability probes.
+            let overlay = ROOT_WINDOW.0;
+            let reply = x11composite::encode_get_overlay_window_reply(sequence, overlay);
+            lock_writer()?.write_all(&reply)
+        }
+        x11composite::RELEASE_OVERLAY_WINDOW => {
+            debug!(
+                "client {} #{} COMPOSITE::ReleaseOverlayWindow",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        other => {
+            debug!(
+                "client {} #{} COMPOSITE::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_present_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11present::QUERY_VERSION => {
+            let _ = x11present::parse_query_version(body);
+            debug!(
+                "client {} #{} PRESENT::QueryVersion -> {}.{}",
+                client_id.0,
+                sequence.0,
+                x11present::MAJOR_VERSION,
+                x11present::MINOR_VERSION
+            );
+            let reply = x11present::encode_query_version_reply(
+                sequence,
+                x11present::MAJOR_VERSION,
+                x11present::MINOR_VERSION,
+            );
+            lock_writer()?.write_all(&reply)
+        }
+        x11present::QUERY_CAPABILITIES => {
+            let _target = x11present::parse_query_capabilities(body).unwrap_or(0);
+            debug!(
+                "client {} #{} PRESENT::QueryCapabilities -> none",
+                client_id.0, sequence.0
+            );
+            let reply =
+                x11present::encode_query_capabilities_reply(sequence, x11present::CAPABILITY_NONE);
+            lock_writer()?.write_all(&reply)
+        }
+        x11present::SELECT_INPUT => {
+            if let Some(req) = x11present::parse_select_input(body) {
+                lock_server(server)?.present_event_selections.insert(
+                    req.eid,
+                    PresentEventSelection {
+                        owner: client_id,
+                        window: ResourceId(req.window),
+                        event_mask: req.event_mask,
+                    },
+                );
+            }
+            debug!(
+                "client {} #{} PRESENT::SelectInput",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+        x11present::PIXMAP => {
+            let Some(req) = x11present::parse_pixmap(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            };
+
+            if req.wait_fence != 0 || req.idle_fence != 0 {
+                let bad = if req.wait_fence != 0 {
+                    req.wait_fence
+                } else {
+                    req.idle_fence
+                };
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_IMPLEMENTATION,
+                    bad,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+
+            let (window_exists, pixmap_exists, src, dst) = {
+                let s = lock_server(server)?;
+                (
+                    s.resources.window(ResourceId(req.window)).is_some(),
+                    s.resources.pixmap(ResourceId(req.pixmap)).is_some(),
+                    s.resources.host_drawable_target(ResourceId(req.pixmap)),
+                    s.resources.host_drawable_target(ResourceId(req.window)),
+                )
+            };
+            if !window_exists {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    req.window,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            if !pixmap_exists {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.pixmap,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+
+            if let (
+                Some(HostDrawableTarget::Pixmap {
+                    host_xid,
+                    width,
+                    height,
+                    depth: src_depth,
+                    ..
+                }),
+                Some(dst),
+            ) = (src, dst)
+            {
+                if src_depth != dst.depth() {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        req.pixmap,
+                        PRESENT_MAJOR_OPCODE,
+                    );
+                }
+                if let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.copy_area(
+                        host_xid,
+                        dst.host_xid(),
+                        req.x_off,
+                        req.y_off,
+                        dst.x_offset(),
+                        dst.y_offset(),
+                        width,
+                        height,
+                    )?;
+                }
+            }
+
+            lock_server(server)?
+                .present_msc
+                .entry(ResourceId(req.window))
+                .and_modify(|msc| *msc = msc.saturating_add(1))
+                .or_insert(1);
+            debug!(
+                "client {} #{} PRESENT::Pixmap serial={} notifies={}",
+                client_id.0,
+                sequence.0,
+                req.serial,
+                req.notifies.len()
+            );
+            Ok(())
+        }
+        x11present::NOTIFY_MSC => {
+            if let Some(req) = x11present::parse_notify_msc(body) {
+                lock_server(server)?
+                    .present_msc
+                    .entry(ResourceId(req.window))
+                    .and_modify(|msc| *msc = (*msc).max(req.target_msc).saturating_add(1))
+                    .or_insert(req.target_msc.saturating_add(1));
+            }
+            debug!("client {} #{} PRESENT::NotifyMSC", client_id.0, sequence.0);
+            Ok(())
+        }
+        x11present::PIXMAP_SYNCED => emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_IMPLEMENTATION,
+            0,
+            PRESENT_MAJOR_OPCODE,
+        ),
+        _ => {
+            debug!(
+                "client {} #{} PRESENT unsupported minor {} ({} bytes)",
+                client_id.0,
+                sequence.0,
+                minor,
+                body.len()
             );
             Ok(())
         }
@@ -1775,10 +3491,14 @@ fn handle_request(
         1 => {
             if let Some(request) = x11::create_window_request(header.data, body) {
                 debug!(
-                    "client {} create window 0x{:x} parent=0x{:x} mask=0x{:x}",
+                    "client {} create window 0x{:x} parent=0x{:x} pos=({},{}) size={}x{} mask=0x{:x}",
                     client_id.0,
                     request.window.0,
                     request.parent.0,
+                    request.x,
+                    request.y,
+                    request.width,
+                    request.height,
                     request.event_mask.unwrap_or(0)
                 );
                 let new_id = request.window.0;
@@ -1915,11 +3635,30 @@ fn handle_request(
                         None
                     }
                 };
-                if target_window == ROOT_WINDOW && request.background_pixmap.is_some() {
-                    if let Some(host) = host
+                if target_window == ROOT_WINDOW {
+                    debug!(
+                        "client {} CWA(root) bg_pixmap={:?} bg_pixel={:?} root_bg_host_xid={:?}",
+                        client_id.0,
+                        request.background_pixmap,
+                        request.background_pixel,
+                        root_bg_host_xid,
+                    );
+                }
+                if target_window == ROOT_WINDOW
+                    && let Some(host) = host
+                {
+                    // Mirror the root background onto the host container so
+                    // the host auto-clears regions uncovered by nested
+                    // top-level moves. bg_pixmap takes precedence over
+                    // bg_pixel when both are set in the same request.
+                    if request.background_pixmap.is_some()
                         && let Ok(mut h) = host.lock()
                     {
                         let _ = h.set_container_background_pixmap(root_bg_host_xid.unwrap_or(0));
+                    } else if let Some(pixel) = request.background_pixel
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.set_container_background_pixel(pixel);
                     }
                 }
                 if viewable && want_focus_check & 0x3 != 0 {
@@ -4484,46 +6223,12 @@ fn handle_request(
         96 => log_void(client_id, sequence, "RecolorCursor"),
         98 => {
             let name = x11::query_extension_name(body);
-            let (present, major_opcode, first_event, first_error) = match name.as_str() {
-                "RANDR" => (
-                    true,
-                    RANDR_MAJOR_OPCODE,
-                    RANDR_FIRST_EVENT,
-                    RANDR_FIRST_ERROR,
-                ),
-                "RENDER" => {
-                    let has_render = host
-                        .and_then(|h| h.lock().ok())
-                        .is_some_and(|h| h.render_opcode().is_some());
-                    if has_render {
-                        (
-                            true,
-                            RENDER_MAJOR_OPCODE,
-                            RENDER_FIRST_EVENT,
-                            RENDER_FIRST_ERROR,
-                        )
-                    } else {
-                        (false, 0, 0, 0)
-                    }
-                }
-                "Generic Event Extension" => (true, GE_MAJOR_OPCODE, 0, 0),
-                "BIG-REQUESTS" => (
-                    true,
-                    BIG_REQUESTS_MAJOR_OPCODE,
-                    BIG_REQUESTS_FIRST_EVENT,
-                    BIG_REQUESTS_FIRST_ERROR,
-                ),
-                "XKEYBOARD" => {
-                    let host_info = host.and_then(|h| h.lock().ok()).and_then(|h| h.xkb_info());
-                    if let Some((_, first_event, first_error)) = host_info {
-                        (true, XKB_MAJOR_OPCODE, first_event, first_error)
-                    } else {
-                        (false, 0, 0, 0)
-                    }
-                }
-                "XInputExtension" => (true, XI2_MAJOR_OPCODE, XI2_FIRST_EVENT, XI2_FIRST_ERROR),
-                _ => (false, 0, 0, 0),
-            };
+            let (present, major_opcode, first_event, first_error) =
+                extension_query_reply(&name, host)
+                    .map(|(major_opcode, first_event, first_error)| {
+                        (true, major_opcode, first_event, first_error)
+                    })
+                    .unwrap_or((false, 0, 0, 0));
             debug!(
                 "client {} #{} QueryExtension {:?} -> {}",
                 client_id.0,
@@ -4542,22 +6247,7 @@ fn handle_request(
         }
         99 => {
             log_reply(client_id, sequence, "ListExtensions");
-            let mut names = vec!["RANDR", "Generic Event Extension"];
-            if host
-                .and_then(|h| h.lock().ok())
-                .is_some_and(|h| h.render_opcode().is_some())
-            {
-                names.push("RENDER");
-            }
-            names.push("BIG-REQUESTS");
-            if host
-                .and_then(|h| h.lock().ok())
-                .is_some_and(|h| h.xkb_opcode().is_some())
-            {
-                names.push("XKEYBOARD");
-            }
-            names.push("XInputExtension");
-
+            let names = advertised_extension_names(host);
             x11::write_list_extensions_reply(&mut *lock_writer()?, sequence, &names)
         }
         100 => {
@@ -4657,6 +6347,55 @@ fn handle_request(
             header.data, // RENDER minor opcode
             body,
         ),
+        XFIXES_MAJOR_OPCODE => handle_xfixes_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // XFIXES minor opcode
+            body,
+        ),
+        SHAPE_MAJOR_OPCODE => handle_shape_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // SHAPE minor opcode
+            body,
+        ),
+        SYNC_MAJOR_OPCODE => handle_sync_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // SYNC minor opcode
+            body,
+        ),
+        DAMAGE_MAJOR_OPCODE => handle_damage_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // DAMAGE minor opcode
+            body,
+        ),
+        COMPOSITE_MAJOR_OPCODE => handle_composite_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // COMPOSITE minor opcode
+            body,
+        ),
+        PRESENT_MAJOR_OPCODE => handle_present_request(
+            client_id,
+            server,
+            host,
+            writer,
+            sequence,
+            header.data, // PRESENT minor opcode
+            body,
+        ),
         GE_MAJOR_OPCODE => {
             // Generic Event Extension: only request is GEQueryVersion (minor=0)
             if header.data == 0 {
@@ -4693,6 +6432,19 @@ fn handle_request(
                 "client {} #{} XkbProxy minor={}",
                 client_id.0, sequence.0, minor
             );
+            if minor == 1 && body.len() >= 12 {
+                let device_spec = u16::from_le_bytes([body[0], body[1]]);
+                let clear = u16::from_le_bytes([body[4], body[5]]);
+                let select_all = u16::from_le_bytes([body[6], body[7]]);
+                let selected = select_all & !clear;
+                let mut s = lock_server(server)?;
+                if selected == 0 {
+                    s.xkb_select_event_masks.remove(&(client_id.0, device_spec));
+                } else {
+                    s.xkb_select_event_masks
+                        .insert((client_id.0, device_spec), selected);
+                }
+            }
             let reply = host
                 .and_then(|h| h.lock().ok())
                 .and_then(|mut h| h.xkb_proxy(minor, body).ok())
@@ -5103,27 +6855,27 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
 #[cfg(test)]
 mod tests {
     use super::{
-        BIG_REQUESTS_MAJOR_OPCODE, RANDR_FIRST_ERROR, RANDR_FIRST_EVENT, RANDR_MAJOR_OPCODE,
-        RENDER_FIRST_ERROR, RENDER_FIRST_EVENT, RENDER_MAJOR_OPCODE, XI2_FIRST_ERROR,
-        XI2_FIRST_EVENT, XI2_MAJOR_OPCODE, XKB_MAJOR_OPCODE, zpixmap_expected_len,
+        EXTENSIONS, UnsupportedMinorPolicy, advertised_extension_names, extension_metadata,
+        zpixmap_expected_len,
     };
 
     #[test]
-    fn advertised_extension_bases_are_unique() {
-        let major_opcodes = vec![
-            RANDR_MAJOR_OPCODE,
-            RENDER_MAJOR_OPCODE,
-            BIG_REQUESTS_MAJOR_OPCODE,
-            XKB_MAJOR_OPCODE,
-            XI2_MAJOR_OPCODE,
-        ];
+    fn extension_registry_major_opcodes_are_unique() {
+        let major_opcodes = EXTENSIONS
+            .iter()
+            .map(|ext| ext.major_opcode)
+            .collect::<Vec<_>>();
         let mut sorted = major_opcodes.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), major_opcodes.len());
+    }
 
-        let non_zero_event_bases = [RANDR_FIRST_EVENT, RENDER_FIRST_EVENT, XI2_FIRST_EVENT]
+    #[test]
+    fn extension_registry_non_zero_bases_are_unique() {
+        let non_zero_event_bases = EXTENSIONS
             .into_iter()
+            .map(|ext| ext.first_event)
             .filter(|base| *base != 0)
             .collect::<Vec<_>>();
         let mut sorted = non_zero_event_bases.clone();
@@ -5131,14 +6883,41 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), non_zero_event_bases.len());
 
-        let non_zero_error_bases = [RANDR_FIRST_ERROR, RENDER_FIRST_ERROR, XI2_FIRST_ERROR]
+        let non_zero_error_bases = EXTENSIONS
             .into_iter()
+            .map(|ext| ext.first_error)
             .filter(|base| *base != 0)
             .collect::<Vec<_>>();
         let mut sorted = non_zero_error_bases.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), non_zero_error_bases.len());
+    }
+
+    #[test]
+    fn phase3_2_extensions_are_not_advertised_until_implemented() {
+        let names = advertised_extension_names(None);
+        assert!(names.contains(&"RANDR"));
+        assert!(names.contains(&"BIG-REQUESTS"));
+        assert!(names.contains(&"Generic Event Extension"));
+        assert!(names.contains(&"XInputExtension"));
+        assert!(names.contains(&"XFIXES"));
+        assert!(names.contains(&"SHAPE"));
+        assert!(names.contains(&"SYNC"));
+        assert!(names.contains(&"DAMAGE"));
+        assert!(names.contains(&"Composite"));
+        assert!(names.contains(&"Present"));
+    }
+
+    #[test]
+    fn phase3_2_extensions_use_inline_handlers() {
+        for name in ["XFIXES", "SHAPE", "SYNC", "DAMAGE", "Composite", "Present"] {
+            let ext = extension_metadata(name).expect("extension metadata");
+            assert_eq!(
+                ext.unsupported_minor_policy,
+                UnsupportedMinorPolicy::HandledInline
+            );
+        }
     }
 
     #[test]
@@ -5397,7 +7176,7 @@ mod tests {
             let buttons_len_field = 2usize;
             let pad = 2usize;
             let modifier_info = 16usize; // base(4)+latched(4)+locked(4)+effective(4)
-            let group_info = 4usize;     // base(1)+latched(1)+locked(1)+effective(1)
+            let group_info = 4usize; // base(1)+latched(1)+locked(1)+effective(1)
             let extra = buttons_len_field + pad + modifier_info + group_info;
             assert_eq!(extra, 24, "extra payload must be 24 bytes");
             assert_eq!(extra % 4, 0, "must be 4-byte aligned");
@@ -5434,6 +7213,327 @@ mod tests {
             let adj_y = i16::from_le_bytes([body[6], body[7]]).wrapping_add(y_off);
             assert_eq!(adj_x, -5);
             assert_eq!(adj_y, 30);
+        }
+    }
+
+    mod xfixes_ops {
+        use super::super::{
+            intersect_regions, normalize_region_rects, region_extents, translate_region,
+        };
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        fn r(x: i16, y: i16, w: u16, h: u16) -> RegionRect {
+            RegionRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            }
+        }
+
+        #[test]
+        fn normalize_removes_empty_rects() {
+            let input = vec![r(0, 0, 0, 5), r(1, 2, 3, 4), r(5, 5, 1, 0)];
+            assert_eq!(normalize_region_rects(input), vec![r(1, 2, 3, 4)]);
+        }
+
+        #[test]
+        fn normalize_truncates_at_cap() {
+            let rects: Vec<RegionRect> = (0..4097).map(|i| r(i as i16, 0, 1, 1)).collect();
+            assert_eq!(normalize_region_rects(rects).len(), 4096);
+        }
+
+        #[test]
+        fn region_extents_empty_returns_zero() {
+            assert_eq!(region_extents(&[]), r(0, 0, 0, 0));
+        }
+
+        #[test]
+        fn region_extents_single_passthrough() {
+            let rect = r(3, 4, 10, 20);
+            assert_eq!(region_extents(&[rect]), rect);
+        }
+
+        #[test]
+        fn region_extents_bounding_box() {
+            let rects = vec![r(0, 0, 10, 10), r(5, 5, 10, 10)];
+            assert_eq!(region_extents(&rects), r(0, 0, 15, 15));
+        }
+
+        #[test]
+        fn intersect_overlapping() {
+            let a = vec![r(0, 0, 10, 10)];
+            let b = vec![r(5, 5, 10, 10)];
+            assert_eq!(intersect_regions(&a, &b), vec![r(5, 5, 5, 5)]);
+        }
+
+        #[test]
+        fn intersect_non_overlapping_is_empty() {
+            let a = vec![r(0, 0, 5, 5)];
+            let b = vec![r(10, 10, 5, 5)];
+            assert!(intersect_regions(&a, &b).is_empty());
+        }
+
+        #[test]
+        fn intersect_with_empty_region_is_empty() {
+            let empty: Vec<RegionRect> = vec![];
+            let nonempty = vec![r(0, 0, 10, 10)];
+            assert!(intersect_regions(&empty, &nonempty).is_empty());
+            assert!(intersect_regions(&nonempty, &empty).is_empty());
+        }
+
+        #[test]
+        fn translate_shifts_coords() {
+            let mut rects = vec![r(10, 20, 5, 5)];
+            translate_region(&mut rects, 3, -5);
+            assert_eq!(rects[0], r(13, 15, 5, 5));
+        }
+
+        #[test]
+        fn translate_saturates_at_bounds() {
+            let mut rects = vec![r(i16::MAX, i16::MIN, 1, 1)];
+            translate_region(&mut rects, 100, -100);
+            assert_eq!(rects[0].x, i16::MAX);
+            assert_eq!(rects[0].y, i16::MIN);
+        }
+    }
+
+    mod xfixes_requests {
+        use std::{
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex},
+        };
+
+        use super::super::handle_xfixes_request;
+        use crate::server::ServerState;
+        use yserver_protocol::x11::{
+            AtomId, ClientId, ResourceId, SequenceNumber, xfixes as x11xfixes,
+        };
+
+        fn make_writer() -> Arc<Mutex<UnixStream>> {
+            let (w, _r) = UnixStream::pair().unwrap();
+            Arc::new(Mutex::new(w))
+        }
+
+        fn make_server() -> Arc<Mutex<ServerState>> {
+            Arc::new(Mutex::new(ServerState::new()))
+        }
+
+        fn create_region_body(xid: u32, x: i16, y: i16, w: u16, h: u16) -> Vec<u8> {
+            let mut body = vec![0u8; 12];
+            body[0..4].copy_from_slice(&xid.to_le_bytes());
+            body[4..6].copy_from_slice(&x.to_le_bytes());
+            body[6..8].copy_from_slice(&y.to_le_bytes());
+            body[8..10].copy_from_slice(&w.to_le_bytes());
+            body[10..12].copy_from_slice(&h.to_le_bytes());
+            body
+        }
+
+        #[test]
+        fn hide_show_cursor_return_ok_no_reply() {
+            let writer = make_writer();
+            let server = make_server();
+            for minor in [x11xfixes::HIDE_CURSOR, x11xfixes::SHOW_CURSOR] {
+                assert!(
+                    handle_xfixes_request(
+                        ClientId(1),
+                        &server,
+                        &writer,
+                        SequenceNumber(1),
+                        minor,
+                        &[0u8; 4]
+                    )
+                    .is_ok()
+                );
+            }
+        }
+
+        #[test]
+        fn selection_mask_stored_and_cleared() {
+            let writer = make_writer();
+            let server = make_server();
+            let mut body = [0u8; 12];
+            body[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+            body[4..8].copy_from_slice(&1u32.to_le_bytes());
+            body[8..12].copy_from_slice(&7u32.to_le_bytes());
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(1),
+                x11xfixes::SELECT_SELECTION_INPUT,
+                &body,
+            )
+            .unwrap();
+            {
+                let s = server.lock().unwrap();
+                let key = (1u32, ResourceId(0x100), AtomId(1));
+                assert_eq!(s.xfixes_selection_masks.get(&key), Some(&7u32));
+            }
+            body[8..12].copy_from_slice(&0u32.to_le_bytes());
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(2),
+                x11xfixes::SELECT_SELECTION_INPUT,
+                &body,
+            )
+            .unwrap();
+            {
+                let s = server.lock().unwrap();
+                let key = (1u32, ResourceId(0x100), AtomId(1));
+                assert!(s.xfixes_selection_masks.get(&key).is_none());
+            }
+        }
+
+        #[test]
+        fn cursor_mask_stored_and_cleared() {
+            let writer = make_writer();
+            let server = make_server();
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&0x200u32.to_le_bytes());
+            body[4..8].copy_from_slice(&3u32.to_le_bytes());
+            handle_xfixes_request(
+                ClientId(2),
+                &server,
+                &writer,
+                SequenceNumber(1),
+                x11xfixes::SELECT_CURSOR_INPUT,
+                &body,
+            )
+            .unwrap();
+            {
+                let s = server.lock().unwrap();
+                assert_eq!(
+                    s.xfixes_cursor_masks.get(&(2u32, ResourceId(0x200))),
+                    Some(&3u32)
+                );
+            }
+            body[4..8].copy_from_slice(&0u32.to_le_bytes());
+            handle_xfixes_request(
+                ClientId(2),
+                &server,
+                &writer,
+                SequenceNumber(2),
+                x11xfixes::SELECT_CURSOR_INPUT,
+                &body,
+            )
+            .unwrap();
+            {
+                let s = server.lock().unwrap();
+                assert!(
+                    s.xfixes_cursor_masks
+                        .get(&(2u32, ResourceId(0x200)))
+                        .is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn region_create_and_destroy() {
+            let writer = make_writer();
+            let server = make_server();
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(1),
+                x11xfixes::CREATE_REGION,
+                &create_region_body(0x300, 0, 0, 10, 10),
+            )
+            .unwrap();
+            assert!(server.lock().unwrap().xfixes_regions.contains_key(&0x300));
+            let mut body2 = [0u8; 4];
+            body2[0..4].copy_from_slice(&0x300u32.to_le_bytes());
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(2),
+                x11xfixes::DESTROY_REGION,
+                &body2,
+            )
+            .unwrap();
+            assert!(!server.lock().unwrap().xfixes_regions.contains_key(&0x300));
+        }
+
+        #[test]
+        fn region_duplicate_xid_overwrites() {
+            let writer = make_writer();
+            let server = make_server();
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(1),
+                x11xfixes::CREATE_REGION,
+                &create_region_body(0x400, 1, 0, 5, 5),
+            )
+            .unwrap();
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(2),
+                x11xfixes::CREATE_REGION,
+                &create_region_body(0x400, 9, 0, 5, 5),
+            )
+            .unwrap();
+            let s = server.lock().unwrap();
+            assert_eq!(s.xfixes_regions.get(&0x400).unwrap().rects[0].x, 9);
+        }
+
+        #[test]
+        fn destroy_unknown_region_is_silent() {
+            let writer = make_writer();
+            let server = make_server();
+            let mut body = [0u8; 4];
+            body[0..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+            assert!(
+                handle_xfixes_request(
+                    ClientId(1),
+                    &server,
+                    &writer,
+                    SequenceNumber(1),
+                    x11xfixes::DESTROY_REGION,
+                    &body,
+                )
+                .is_ok()
+            );
+            assert!(server.lock().unwrap().xfixes_regions.is_empty());
+        }
+
+        #[test]
+        fn region_client_disconnect_cleanup() {
+            let writer = make_writer();
+            let server = make_server();
+            handle_xfixes_request(
+                ClientId(1),
+                &server,
+                &writer,
+                SequenceNumber(1),
+                x11xfixes::CREATE_REGION,
+                &create_region_body(0x500, 0, 0, 5, 5),
+            )
+            .unwrap();
+            handle_xfixes_request(
+                ClientId(2),
+                &server,
+                &writer,
+                SequenceNumber(2),
+                x11xfixes::CREATE_REGION,
+                &create_region_body(0x501, 0, 0, 5, 5),
+            )
+            .unwrap();
+            server
+                .lock()
+                .unwrap()
+                .xfixes_regions
+                .retain(|_, r| r.owner != ClientId(1));
+            let s = server.lock().unwrap();
+            assert!(!s.xfixes_regions.contains_key(&0x500));
+            assert!(s.xfixes_regions.contains_key(&0x501));
         }
     }
 }

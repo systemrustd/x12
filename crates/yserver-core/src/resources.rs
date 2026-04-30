@@ -81,6 +81,15 @@ impl HostDrawableTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExposedRect {
+    pub window: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReparentResult {
     pub window: ResourceId,
     pub old_parent: ResourceId,
@@ -121,6 +130,7 @@ pub struct ResourceTable {
     cursors: HashMap<u32, Cursor>,
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,
+    host_glyphset_refcounts: HashMap<u32, usize>,
 }
 
 impl ResourceTable {
@@ -160,6 +170,7 @@ impl ResourceTable {
             cursors: HashMap::new(),
             pictures: HashMap::new(),
             glyphsets: HashMap::new(),
+            host_glyphset_refcounts: HashMap::new(),
         }
     }
 
@@ -435,6 +446,88 @@ impl ResourceTable {
 
     pub fn parent_of(&self, id: ResourceId) -> Option<ResourceId> {
         self.windows.get(&id.0).map(|w| w.parent)
+    }
+
+    /// Walk mapped descendants of `top_level` and return the intersection
+    /// rectangles (in each descendant's local coordinates) that overlap an
+    /// expose region given in top-level coordinates. Used to synthesize
+    /// `Expose` events for sub-windows when only the top-level subwindow has a
+    /// host counterpart — without this, dragging a window across another
+    /// leaves child sub-windows (titlebars, content panes) unrepainted because
+    /// the host server never knows they exist.
+    #[must_use]
+    pub fn descendants_in_exposed_area(
+        &self,
+        top_level: ResourceId,
+        ex: i16,
+        ey: i16,
+        ew: u16,
+        eh: u16,
+    ) -> Vec<ExposedRect> {
+        let mut out = Vec::new();
+        let er = i32::from(ex) + i32::from(ew);
+        let eb = i32::from(ey) + i32::from(eh);
+        self.descendants_in_exposed_area_inner(
+            top_level,
+            0,
+            0,
+            i32::from(ex),
+            i32::from(ey),
+            er,
+            eb,
+            &mut out,
+        );
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn descendants_in_exposed_area_inner(
+        &self,
+        parent_id: ResourceId,
+        parent_x: i32,
+        parent_y: i32,
+        ex: i32,
+        ey: i32,
+        er: i32,
+        eb: i32,
+        out: &mut Vec<ExposedRect>,
+    ) {
+        let Some(parent) = self.windows.get(&parent_id.0) else {
+            return;
+        };
+        for child_id in &parent.children {
+            let Some(child) = self.windows.get(&child_id.0) else {
+                continue;
+            };
+            if child.map_state == MapState::Unmapped {
+                continue;
+            }
+            let cx = parent_x + i32::from(child.x);
+            let cy = parent_y + i32::from(child.y);
+            let cr = cx + i32::from(child.width);
+            let cb = cy + i32::from(child.height);
+            let ix = ex.max(cx);
+            let iy = ey.max(cy);
+            let ir = er.min(cr);
+            let ib = eb.min(cb);
+            if ir <= ix || ib <= iy {
+                continue;
+            }
+            let local_x = i16::try_from(ix - cx).unwrap_or(0);
+            let local_y = i16::try_from(iy - cy).unwrap_or(0);
+            let local_w = u16::try_from(ir - ix).unwrap_or(0);
+            let local_h = u16::try_from(ib - iy).unwrap_or(0);
+            if local_w > 0 && local_h > 0 {
+                out.push(ExposedRect {
+                    window: *child_id,
+                    x: local_x,
+                    y: local_y,
+                    width: local_w,
+                    height: local_h,
+                });
+            }
+            self.descendants_in_exposed_area_inner(*child_id, cx, cy, ex, ey, er, eb, out);
+        }
     }
 
     pub fn pointer_target_at(
@@ -744,15 +837,59 @@ impl ResourceTable {
     }
 
     pub fn create_glyphset(&mut self, id: ResourceId, state: GlyphSetState) {
+        if let Some(old) = self.glyphsets.remove(&id.0) {
+            let _ = self.release_host_glyphset_ref(old.host_glyphset_xid);
+        }
+        *self
+            .host_glyphset_refcounts
+            .entry(state.host_glyphset_xid)
+            .or_insert(0) += 1;
         self.glyphsets.insert(id.0, state);
     }
 
     pub fn free_glyphset(&mut self, id: ResourceId) -> Option<GlyphSetState> {
-        self.glyphsets.remove(&id.0)
+        let state = self.glyphsets.remove(&id.0)?;
+        if self.release_host_glyphset_ref(state.host_glyphset_xid) {
+            Some(state)
+        } else {
+            None
+        }
     }
 
     pub fn glyphset(&self, id: ResourceId) -> Option<&GlyphSetState> {
         self.glyphsets.get(&id.0)
+    }
+
+    pub fn reference_glyphset(
+        &mut self,
+        client: ClientId,
+        new_id: ResourceId,
+        existing_id: ResourceId,
+    ) -> bool {
+        let Some(existing) = self.glyphsets.get(&existing_id.0) else {
+            return false;
+        };
+        self.create_glyphset(
+            new_id,
+            GlyphSetState {
+                client,
+                host_glyphset_xid: existing.host_glyphset_xid,
+            },
+        );
+        true
+    }
+
+    fn release_host_glyphset_ref(&mut self, host_xid: u32) -> bool {
+        let Some(count) = self.host_glyphset_refcounts.get_mut(&host_xid) else {
+            return true;
+        };
+        if *count > 1 {
+            *count -= 1;
+            false
+        } else {
+            self.host_glyphset_refcounts.remove(&host_xid);
+            true
+        }
     }
 
     pub fn install_font(
@@ -883,14 +1020,16 @@ impl ResourceTable {
             }
         });
         let mut freed_glyphsets = Vec::new();
-        self.glyphsets.retain(|_, g| {
-            if g.client == client {
-                freed_glyphsets.push(g.host_glyphset_xid);
-                false
-            } else {
-                true
+        let removed_glyphsets = self
+            .glyphsets
+            .extract_if(|_, g| g.client == client)
+            .map(|(_, g)| g.host_glyphset_xid)
+            .collect::<Vec<_>>();
+        for host_xid in removed_glyphsets {
+            if self.release_host_glyphset_ref(host_xid) {
+                freed_glyphsets.push(host_xid);
             }
-        });
+        }
         ClientRemovedResources {
             closed_fonts,
             freed_pixmaps,
@@ -1171,6 +1310,53 @@ mod tests {
             Just(InitialState::Unviewable),
             Just(InitialState::Unmapped),
         ]
+    }
+
+    #[test]
+    fn reference_glyphset_alias_frees_host_only_after_last_alias() {
+        let mut table = ResourceTable::new();
+        table.create_glyphset(
+            ResourceId(0x200),
+            GlyphSetState {
+                client: ClientId(1),
+                host_glyphset_xid: 0xabc,
+            },
+        );
+
+        assert!(table.reference_glyphset(ClientId(1), ResourceId(0x201), ResourceId(0x200)));
+        assert_eq!(
+            table
+                .glyphset(ResourceId(0x201))
+                .map(|g| g.host_glyphset_xid),
+            Some(0xabc)
+        );
+
+        assert!(table.free_glyphset(ResourceId(0x200)).is_none());
+        assert_eq!(
+            table
+                .free_glyphset(ResourceId(0x201))
+                .map(|g| g.host_glyphset_xid),
+            Some(0xabc)
+        );
+    }
+
+    #[test]
+    fn remove_client_frees_shared_glyphset_once() {
+        let mut table = ResourceTable::new();
+        table.create_glyphset(
+            ResourceId(0x200),
+            GlyphSetState {
+                client: ClientId(1),
+                host_glyphset_xid: 0xabc,
+            },
+        );
+        assert!(table.reference_glyphset(ClientId(1), ResourceId(0x201), ResourceId(0x200)));
+
+        let removed = table.remove_non_window_resources_owned_by(ClientId(1));
+
+        assert_eq!(removed.freed_glyphsets, vec![0xabc]);
+        assert!(table.glyphset(ResourceId(0x200)).is_none());
+        assert!(table.glyphset(ResourceId(0x201)).is_none());
     }
 
     #[test]

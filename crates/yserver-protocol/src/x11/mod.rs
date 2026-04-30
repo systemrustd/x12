@@ -12,7 +12,13 @@ use keysyms::keysyms_for_keycode;
 mod wire;
 pub use wire::*;
 
+pub mod composite;
+pub mod damage;
+pub mod present;
 pub mod randr;
+pub mod shape;
+pub mod sync;
+pub mod xfixes;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientByteOrder {
@@ -2726,6 +2732,39 @@ mod tests {
         }
     }
 
+    mod render_reply_tests {
+        use super::*;
+
+        #[test]
+        fn query_pict_index_values_empty_reply_shape() {
+            let mut out = Vec::new();
+            write_render_query_pict_index_values_reply(&mut out, SequenceNumber(0x1234)).unwrap();
+
+            assert_eq!(out.len(), 32);
+            assert_eq!(out[0], 1);
+            assert_eq!(out[1], 0);
+            assert_eq!(&out[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&out[4..8], &0u32.to_le_bytes());
+            assert_eq!(&out[8..12], &0u32.to_le_bytes());
+            assert!(out[12..].iter().all(|b| *b == 0));
+        }
+
+        #[test]
+        fn query_filters_empty_reply_shape() {
+            let mut out = Vec::new();
+            write_render_query_filters_reply(&mut out, SequenceNumber(0x1234)).unwrap();
+
+            assert_eq!(out.len(), 32);
+            assert_eq!(out[0], 1);
+            assert_eq!(out[1], 0);
+            assert_eq!(&out[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&out[4..8], &0u32.to_le_bytes());
+            assert_eq!(&out[8..12], &0u32.to_le_bytes());
+            assert_eq!(&out[12..16], &0u32.to_le_bytes());
+            assert!(out[16..].iter().all(|b| *b == 0));
+        }
+    }
+
     mod get_property_tests {
         use super::*;
         use proptest::prelude::*;
@@ -3667,6 +3706,15 @@ pub fn render_create_glyphset_request(body: &[u8]) -> Option<(ResourceId, u32)> 
     Some((gs, fmt))
 }
 
+pub fn render_reference_glyphset_request(body: &[u8]) -> Option<(ResourceId, ResourceId)> {
+    if body.len() < 8 {
+        return None;
+    }
+    let new_glyphset = ResourceId(read_u32_le(body.get(0..4)?));
+    let existing = ResourceId(read_u32_le(body.get(4..8)?));
+    Some((new_glyphset, existing))
+}
+
 pub fn render_add_glyphs_request(body: &[u8]) -> Option<(ResourceId, Vec<u8>)> {
     if body.len() < 8 {
         return None;
@@ -3674,6 +3722,15 @@ pub fn render_add_glyphs_request(body: &[u8]) -> Option<(ResourceId, Vec<u8>)> {
     let gs = ResourceId(read_u32_le(body.get(0..4)?));
     let tail = body.get(4..).unwrap_or(&[]).to_vec();
     Some((gs, tail))
+}
+
+pub fn render_free_glyphs_request(body: &[u8]) -> Option<(ResourceId, Vec<u8>)> {
+    if body.len() < 4 {
+        return None;
+    }
+    let gs = ResourceId(read_u32_le(body.get(0..4)?));
+    let glyph_ids = body.get(4..).unwrap_or(&[]).to_vec();
+    Some((gs, glyph_ids))
 }
 
 pub fn render_composite_glyphs_request(body: &[u8]) -> Option<RenderCompositeGlyphsRequest> {
@@ -3869,6 +3926,33 @@ pub fn write_render_query_pict_formats_reply(
     writer.write_all(&out)
 }
 
+pub fn write_render_query_pict_index_values_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_values
+    out.extend_from_slice(&[0u8; 20]); // pad to 32 bytes
+    debug_assert_eq!(out.len(), 32);
+    writer.write_all(&out)
+}
+
+pub fn write_render_query_filters_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_filters
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_aliases
+    out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
+    debug_assert_eq!(out.len(), 32);
+    writer.write_all(&out)
+}
+
 pub fn write_render_query_version_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
@@ -3895,4 +3979,5 @@ pub mod error {
     pub const BAD_GC: u8 = 13;
     pub const BAD_ID_CHOICE: u8 = 14;
     pub const BAD_LENGTH: u8 = 16;
+    pub const BAD_IMPLEMENTATION: u8 = 17;
 }

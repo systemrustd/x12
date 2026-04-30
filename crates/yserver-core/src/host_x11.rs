@@ -612,6 +612,25 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn render_free_glyphs(&mut self, host_gs: u32, glyph_ids: &[u8]) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        let padded_ids = padded_len(glyph_ids.len());
+        let length_units = 2 + (padded_ids / 4) as u16;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(22); // FreeGlyphs
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_gs);
+        out.extend_from_slice(glyph_ids);
+        out.resize(8 + padded_ids, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_composite_glyphs(
         &mut self,
@@ -721,7 +740,7 @@ impl HostX11 {
     }
 
     pub fn render_create_radial_gradient(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
-        self.render_forward_picture_op(31, host_pic, body)
+        self.render_forward_picture_op(35, host_pic, body)
     }
 
     pub fn render_change_picture(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
@@ -901,33 +920,7 @@ impl HostX11 {
         self.stream.write_all(&out)?;
         self.stream.flush()?;
 
-        // Minor opcodes that yield replies in XKB 1.0.
-        // Source: X11/extensions/XKBproto.h and XKB protocol spec.
-        // 21 = XkbPerClientFlags: Xlib calls _XReply() for this.
-        let has_reply = matches!(
-            minor,
-            0 | 3
-                | 4
-                | 5
-                | 6
-                | 8
-                | 10
-                | 12
-                | 14
-                | 16
-                | 17
-                | 18
-                | 20
-                | 21
-                | 22
-                | 24
-                | 26
-                | 28
-                | 30
-                | 33
-                | 101
-        );
-        if !has_reply {
+        if !xkb_minor_has_reply(minor) {
             return Ok(None);
         }
 
@@ -1153,6 +1146,37 @@ impl HostX11 {
         clear.push(61); // ClearArea
         clear.push(0); // exposures = false
         write_u16(&mut clear, 4); // length 4 = 16 bytes
+        write_u32(&mut clear, self.window_id);
+        write_i16(&mut clear, 0);
+        write_i16(&mut clear, 0);
+        write_u16(&mut clear, 0);
+        write_u16(&mut clear, 0);
+        self.stream.write_all(&clear)?;
+        self.stream.flush()
+    }
+
+    pub fn set_container_background_pixel(&mut self, pixel: u32) -> io::Result<()> {
+        // ChangeWindowAttributes with value-mask CWBackPixel = 0x00000002.
+        // Setting bg-pixel makes the host auto-clear the container with a
+        // solid color whenever a region is exposed (e.g. a top-level
+        // subwindow is moved across it). Without this, drags leave trails of
+        // stale window content on the desktop.
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(16);
+        out.push(2);
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, 0x0000_0002); // CWBackPixel
+        write_u32(&mut out, pixel);
+        self.stream.write_all(&out)?;
+
+        // ClearArea so the new color is visible immediately.
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut clear = Vec::with_capacity(16);
+        clear.push(61);
+        clear.push(0);
+        write_u16(&mut clear, 4);
         write_u32(&mut clear, self.window_id);
         write_i16(&mut clear, 0);
         write_i16(&mut clear, 0);
@@ -1883,6 +1907,35 @@ impl HostX11 {
     }
 }
 
+#[must_use]
+pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
+    // Reply-producing XKB requests. Source: X11/extensions/XKB.h,
+    // XKBproto.h, and Xlib call sites that enter _XReply().
+    matches!(
+        minor,
+        0 | 3
+            | 4
+            | 5
+            | 6
+            | 8
+            | 10
+            | 12
+            | 14
+            | 16
+            | 17
+            | 18
+            | 20
+            | 21
+            | 22
+            | 24
+            | 26
+            | 28
+            | 30
+            | 33
+            | 101
+    )
+}
+
 fn connect_to_host() -> io::Result<UnixStream> {
     let display = env::var("DISPLAY").map_err(|_| {
         io::Error::new(
@@ -1906,9 +1959,16 @@ impl HostInputPump {
         select_keyboard_events(&mut stream, window_id)?;
         stream.flush()?;
         let read_stream = stream.try_clone()?;
+        // Map the host container window to ynest's ROOT_WINDOW so Expose
+        // events on the container (raised by the host when subwindows uncover
+        // the desktop area) are delivered as Expose on ROOT_WINDOW. Without
+        // this entry expose_event_fanout drops the event and the desktop
+        // background is never repainted after a window drag.
+        let mut xid_map = HashMap::new();
+        xid_map.insert(window_id, crate::resources::ROOT_WINDOW);
         let handle = HostInputPumpHandle {
             write_stream: Arc::new(Mutex::new(stream)),
-            xid_map: Arc::new(Mutex::new(HashMap::new())),
+            xid_map: Arc::new(Mutex::new(xid_map)),
         };
         Ok(Self {
             read_stream,
@@ -1976,13 +2036,31 @@ impl HostInputPump {
                     }));
                 }
                 12 => {
+                    let host_xid = read_u32(&event[4..8]);
+                    let x = read_u16(&event[8..10]);
+                    let y = read_u16(&event[10..12]);
+                    let width = read_u16(&event[12..14]);
+                    let height = read_u16(&event[14..16]);
+                    let count = read_u16(&event[16..18]);
+                    log::trace!(
+                        "host pump: Expose host_xid=0x{host_xid:x} x={x} y={y} w={width} h={height} count={count}",
+                    );
                     return Ok(HostEvent::Expose(HostExposeEvent {
-                        host_xid: read_u32(&event[4..8]),
-                        x: read_u16(&event[8..10]),
-                        y: read_u16(&event[10..12]),
-                        width: read_u16(&event[12..14]),
-                        height: read_u16(&event[14..16]),
-                        count: read_u16(&event[16..18]),
+                        host_xid,
+                        x,
+                        y,
+                        width,
+                        height,
+                        count,
+                    }));
+                }
+                22 => {
+                    return Ok(HostEvent::Configure(HostConfigureEvent {
+                        host_xid: read_u32(&event[8..12]),
+                        x: read_i16(&event[16..18]),
+                        y: read_i16(&event[18..20]),
+                        width: read_u16(&event[20..22]),
+                        height: read_u16(&event[22..24]),
                     }));
                 }
                 17 => return Ok(HostEvent::Closed),
@@ -2020,7 +2098,13 @@ impl HostInputPumpHandle {
             .lock()
             .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "host pump stream poisoned"))?;
         stream.write_all(&out)?;
-        stream.flush()
+        stream.flush()?;
+        log::debug!(
+            "host pump: register_top_level nested=0x{:x} host=0x{:x}",
+            nested_id.0,
+            host_xid
+        );
+        Ok(())
     }
 
     pub fn unregister_top_level(&self, host_xid: u32) {
@@ -2040,6 +2124,7 @@ pub enum HostEvent {
     Key(HostKeyEvent),
     Pointer(HostPointerEvent),
     Expose(HostExposeEvent),
+    Configure(HostConfigureEvent),
     Closed,
 }
 
@@ -2051,6 +2136,15 @@ pub struct HostExposeEvent {
     pub width: u16,
     pub height: u16,
     pub count: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostConfigureEvent {
+    pub host_xid: u32,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2085,6 +2179,27 @@ pub struct HostKeyEvent {
     pub event_x: i16,
     pub event_y: i16,
     pub state: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xkb_minor_has_reply;
+
+    #[test]
+    fn xkb_reply_minor_audit_includes_known_blocking_requests() {
+        for minor in [0, 4, 8, 10, 14, 17, 20, 21, 24, 101] {
+            assert!(
+                xkb_minor_has_reply(minor),
+                "minor {minor} must wait for reply"
+            );
+        }
+    }
+
+    #[test]
+    fn xkb_void_minor_audit_keeps_select_events_fire_and_forget() {
+        assert!(!xkb_minor_has_reply(1)); // SelectEvents
+        assert!(!xkb_minor_has_reply(2)); // Bell
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2265,8 +2380,10 @@ fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result
     write_u16(&mut out, 4);
     write_u32(&mut out, window_id);
     write_u32(&mut out, 1 << 11);
-    // KeyPress | KeyRelease | StructureNotify
-    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17));
+    // KeyPress | KeyRelease | StructureNotify | Exposure.
+    // Exposure is needed so the desktop area is repainted after another
+    // top-level subwindow is dragged across it.
+    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17) | (1 << 15));
     stream.write_all(&out)
 }
 

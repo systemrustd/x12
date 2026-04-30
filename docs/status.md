@@ -159,7 +159,6 @@ In rough priority order:
       Follow-ups:
       - Host-window resize propagation → update `RandrState` dimensions.
       - `RRScreenChangeNotify` delivery to clients that called `RRSelectInput`.
-      - `RRGetScreenInfo` (legacy RANDR 1.0) if a client probes it.
       - Extension-specific error codes (`BadRROutput`, `BadRRCrtc`) instead of `BadValue`.
 
 - [x] **SubstructureRedirect / MapRequest / ConfigureRequest.** When a WM
@@ -250,9 +249,9 @@ In rough priority order:
       disconnect (closest non-dying ancestor + coord preservation +
       remap-if-unmapped), `GrabButton` sync replay through pump-thread
       channel, RANDR `RRSelectInput` mask storage and host-resize
-      `RRScreenChangeNotify` delivery, RANDR 1.0 `RRGetScreenInfo`,
-      `SendEvent` parent propagation, `UnmapNotify.from_configure` for
-      shrunk children, manual Openbox/Fluxbox validation runs.
+      `RRScreenChangeNotify` delivery, `SendEvent` parent propagation,
+      `UnmapNotify.from_configure` for shrunk children, manual
+      Openbox/Fluxbox validation runs.
 
 ### Known follow-ups
 
@@ -285,7 +284,7 @@ Goal: run a simple GTK3 application interactively under `ynest`.
     Wrong size caused xcb assertion `extra_reply_data_left`.
 - [x] RENDER `SetPictureClipRectangles` (minor=6): forward to host with
   window-offset adjustment so clip aligns with `Composite`'s dst translation.
-- [x] RENDER `CreateRadialGradient` (minor=31): create host picture like LinearGradient.
+- [x] RENDER `CreateRadialGradient` (minor=35): create host picture like LinearGradient.
 - [x] RENDER `ChangePicture` (minor=5): forward when no non-None XID attributes.
   - Critical: `CPClipMask=None` (mask=0x40, value=0) clears the clip after
     clipped glyph rendering. Without forwarding this, stale clips persisted
@@ -300,11 +299,164 @@ Goal: run a simple GTK3 application interactively under `ynest`.
 - Sidebar labels, content text, and widget rendering all visible.
 - `cargo test --workspace`: all tests pass (114 in yserver-core).
 
-## Phase 3.2 — Advanced Interoperability (pending)
+## Phase 3.2 — Advanced Interoperability (in progress)
 
 Goal: extensions and behavior needed for Qt, SDL, GLFW, Electron.
 Implement enough RENDER, SHAPE, DAMAGE, COMPOSITE, SYNC,
 and PRESENT for real applications.
+
+Design:
+[`2026-04-30-phase3-2-advanced-interoperability-design.md`](superpowers/specs/2026-04-30-phase3-2-advanced-interoperability-design.md).
+
+Implementation plan:
+[`2026-04-30-phase3-2-advanced-interoperability.md`](superpowers/plans/2026-04-30-phase3-2-advanced-interoperability.md).
+
+Landed so far:
+- RENDER blocking reply gaps: `QueryPictIndexValues` and `QueryFilters`
+  return exact 32-byte empty replies.
+- RENDER glyphset gaps: `ReferenceGlyphSet` aliases existing host glyphsets
+  with local refcounts; `FreeGlyphs` translates the glyphset and forwards to
+  the host without destroying the glyphset.
+- RANDR modern query coverage confirmed: `RRGetScreenResourcesCurrent`,
+  `RRGetMonitors`, and empty `RRGetOutputProperty` replies have wire-shape
+  tests. `RRSelectInput` masks are stored, and host container ConfigureNotify
+  updates root geometry/RANDR state while emitting `RRScreenChangeNotify`,
+  CRTC-change, and output-change events to subscribers.
+- Extension metadata is centralized for `QueryExtension`, `ListExtensions`,
+  and dispatch constants.
+- XFIXES is now advertised as version 2.0. Implemented paths include
+  `QueryVersion`, `SelectSelectionInput`, `SelectCursorInput`,
+  `GetCursorImage` with a valid empty cursor image reply, local region
+  lifecycle/algebra/fetch, and no-op `HideCursor`/`ShowCursor`. Selection and
+  cursor event masks are stored, but XFIXES events are not emitted yet.
+- SHAPE is now advertised as version 1.1. Implemented paths include
+  `QueryVersion`, `Rectangles`, `Mask`, `Combine`, `Offset`, `QueryExtents`,
+  `SelectInput`, `InputSelected`, and `GetRectangles` backed by local
+  per-window bounding/clip/input rectangle lists. Host SHAPE forwarding and
+  input-shape-aware pointer hit testing are deferred.
+- SYNC is now advertised as version 3.0. Implemented paths include
+  `Initialize`, empty `ListSystemCounters`, local counter
+  create/set/change/query/destroy, local alarm create/change/query/destroy,
+  `GetPriority`, `SetPriority` no-op, and non-blocking `Await`. AlarmNotify
+  events and fence requests are deferred.
+- DAMAGE is now advertised as version 1.1. Implemented paths include
+  `QueryVersion`, damage object create/destroy, explicit `DamageAdd`, and
+  `Subtract` with optional XFIXES repair/parts region integration. Automatic
+  damage accumulation from drawing paths and DamageNotify events are deferred.
+- Composite is now advertised as version 0.4. Implemented paths include
+  `QueryVersion`, redirect/unredirect bookkeeping, border-clip region creation,
+  `GetOverlayWindow`, `ReleaseOverlayWindow`, and guarded `NameWindowPixmap`
+  returning `BadMatch`. Real named window pixmaps are deferred.
+- Present is now advertised as version 1.0. Implemented paths include
+  `QueryVersion`, `QueryCapabilities` with no optional capabilities,
+  `SelectInput` bookkeeping, no-sync `PresentPixmap` pixmap-to-window copy
+  when host-backed, non-blocking `NotifyMSC`, and `BadImplementation` for
+  non-zero fence requests. Present events and real fence synchronization are
+  deferred.
+- XKB proxy reply handling was audited against the known reply-producing
+  minors, including `GetDeviceInfo` and `SetDebuggingFlags`; void requests
+  remain fire-and-forget. `XkbSelectEvents` masks are retained locally for
+  future state-notify synthesis.
+- XI2 exact-device and wildcard mask matching is covered for keyboard and
+  pointer delivery. Scroll valuator packets remain deferred; current wheel
+  support still uses core button 4/5 plus XI2 button events.
+- Window Maker validation pass (commit `3d3e9da`):
+  - `MotionNotify` delivery now matches `ButtonMotion` (0x2000) and the
+    per-button `ButtonNMotion` bits (0x100..0x1000) when their button is
+    held in `event.state`, in addition to `PointerMotion` (0x40). wmaker
+    drives drag tracking through `ButtonMotion`, so without this it
+    received zero motion during a drag.
+  - Pointer events carry `root_x`/`root_y` in nested-root coordinates
+    (translated from the host pump's host-screen values via the top-
+    level's known nested position), so popups land at the click site
+    instead of being offset by the host container's screen origin.
+  - Host pump selects `Exposure` on the container window and maps the
+    container `host_xid` to `ROOT_WINDOW`, so Expose events on the
+    desktop area reach `expose_event_fanout`. `ChangeWindowAttributes`
+    on root forwards `background_pixel` (in addition to
+    `background_pixmap`) to the host container so the host auto-clears
+    uncovered desktop regions during drags.
+  - `expose_event_fanout` walks mapped descendants of an exposed
+    top-level and synthesizes `Expose` events for each that overlaps
+    the area, in the descendant's local coords. Without this,
+    nested-only sub-windows (wmaker's titlebar, resize handle, app
+    content panes) never repaint after another top-level moves across
+    them. Skipped when the exposed window is `ROOT_WINDOW` since
+    top-levels of root have their own host counterparts.
+  - **Validated:** wmaker comes up; clicking opens popups under the
+    cursor; dragging xterm/xclock frames moves them and the desktop
+    repaints with the configured `bg_pixel`. Some artifacts remain
+    when frames are dragged off-screen or fully behind another
+    top-level (host doesn't preserve those pixels and we don't yet
+    use backing-store).
+- RANDR 1.0 `RRGetScreenInfo` (minor 5) now replies with the single
+  synthetic mode and a 60Hz refresh list. Old clients (e16) probe this
+  at startup and block waiting for the reply, so a missing handler
+  hung the session before the first window appeared. Encoder lives in
+  `yserver_protocol::x11::randr::encode_get_screen_info_reply`.
+  **Validated:** Enlightenment e16 starts and a window can be dragged.
+
+## Phase 3.3 — Window manager validation follow-ups (not started)
+
+Goal: clean up rendering artifacts and missing chrome that surfaced
+while validating wmaker and e16. None are blockers — the WMs come up
+and apps are usable — but each one is a visible glitch under real WM
+sessions.
+
+- **Forward SHAPE to host for top-levels.** Currently `SHAPE::Rectangles`,
+  `SHAPE::Mask`, `SHAPE::Combine`, and `SHAPE::Offset` only update the
+  per-window state stored in `ServerState::shape_windows`. The host
+  treats every top-level subwindow as a full rectangle, so themed
+  frames that depend on shaped chrome (e16 issues ~1900 `SHAPE::Mask`
+  calls per session) render with extra/missing pixels. Plan: detect
+  the SHAPE extension on the host connection during `HostX11`
+  initialization, cache its major opcode, and on every shape mutation
+  targeting a window with a `host_xid` forward `ShapeRectangles` to
+  the host with the resolved rect list. Sub-windows without a
+  `host_xid` keep their local-only behavior (the parent's host shape
+  already clips them). Localized to `host_x11.rs` (a new SHAPE
+  forwarder) and the SHAPE branches in `nested.rs::handle_shape_request`.
+
+- **Preserve pixels for fully occluded / off-screen drags.** The host
+  doesn't preserve subwindow pixels that are scrolled off-screen or
+  fully behind a sibling top-level, and we don't enable backing-store
+  on host subwindows. Dragging a frame off-screen and back, or fully
+  behind another top-level and back out, leaves stale content on the
+  uncovered area until the client redraws. Two options: (a) request
+  `BackingStore=Always` on each top-level subwindow at create time,
+  trading host memory for correctness, or (b) emit a synthetic
+  `ConfigureNotify` + full-window Expose to the affected client when
+  we detect the configure that re-exposes the area. Option (a) is
+  simpler and what most nested servers do.
+
+- **XFIXES `ChangeCursorByName` (minor 23).** e16 calls this 7+ times
+  during cursor theming and we currently log it as `XFIXES::unknown`.
+  No reply is expected, so it doesn't block, but the cursor never
+  changes. Plan: parse the request (cursor xid + name string), look
+  up or create a host cursor by name via the host connection, and
+  apply via `ChangeCursor` on the affected windows. Pairs naturally
+  with the existing XFIXES cursor implementation.
+
+- **Sub-window Expose covering cross-border / behind-sibling drags.**
+  Our `descendants_in_exposed_area` walker (Phase 3.2) handles the
+  common case where a top-level moves and its sibling sub-windows
+  need repaint, but it relies on the host generating Expose for the
+  uncovered region. When the host can't (because the area was
+  off-screen or fully behind a stacked top-level), no Expose is
+  generated. The same fix as the backing-store item above resolves
+  this — either backing-store or a synthetic full-window Expose on
+  the configure boundary.
+
+- **Verify e16 RENDER coverage.** e16 sends 5400+ `RENDER::CreatePicture`
+  / `FreePicture` and 4400+ `RENDER::Composite` calls per session.
+  Spot-check that all of these succeed against the host (no silent
+  drops on opcodes we have but parse incorrectly), since the visible
+  artifacts may also include subtly mis-encoded glyphs or composites
+  for e16's themed buttons.
+
+- **Validation runs:** Openbox, Fluxbox (called out under Phase 2 as
+  deferred), then back to wmaker/e16 once SHAPE forwarding lands to
+  confirm the chrome artifacts go away.
 
 ## Phase 4 — Accelerated clients
 
@@ -547,24 +699,29 @@ between client and host ID spaces.
 |-------|-----------------------|--------|-------|
 |   0   | QueryVersion          | ↩ | proxied — replies with host's version |
 |   1   | QueryPictFormats      | ↩ | replies with 4 synthetic formats (A1, A8, RGB24, ARGB32) |
-|   2   | QueryPictIndexValues  | ✗ | |
+|   2   | QueryPictIndexValues  | ↩ | exact empty reply |
 |   4   | CreatePicture         | ✓ | format ID translated; coord offset stored on `PictureState` |
 |   5   | ChangePicture         | ∅ | clip mask / repeat not applied to host picture |
 |   6   | SetPictureClipRectangles | ✗ | |
 |   7   | FreePicture           | ✓ | |
 |   8   | Composite             | ✓ | dst_xy patched with dst picture's x/y offset; mask=0 forwards as host xid 0 |
 |  17   | CreateGlyphSet        | ✓ | format ID translated to host equivalent |
-|  18   | ReferenceGlyphSet     | ∅ | |
+|  18   | ReferenceGlyphSet     | ✓ | aliases existing host glyphset with refcount |
 |  19   | FreeGlyphSet          | ✓ | |
 |  20   | AddGlyphs             | ✓ | body padding/length corrected against Xephyr trace |
-|  22   | FreeGlyphs            | ∅ | |
+|  22   | FreeGlyphs            | ✓ | glyphset XID translated; request forwarded to host |
 |  23   | CompositeGlyphs8      | ✓ | first glyphcmd's deltax/deltay patched with picture offset |
 |  24   | CompositeGlyphs16     | ✓ | same patching as 8 |
 |  25   | CompositeGlyphs32     | ✓ | same patching as 8 |
 |  26   | FillRectangles        | ✓ | rectangle coords offset by picture's x/y offset |
 |  27   | CreateCursor          | ✓ | from picture; cursor XID allocated locally |
+|  29   | QueryFilters          | ↩ | exact empty filter/alias reply |
+|  31   | CreateAnimCursor      | ∅ | accepted no-op |
+|  32   | AddTraps              | ∅ | accepted no-op |
 |  33   | CreateSolidFill       | ✓ | |
-|  35   | AddTraps              | ✗ | |
+|  34   | CreateLinearGradient  | ✓ | |
+|  35   | CreateRadialGradient  | ✓ | |
+|  36   | CreateConicalGradient | ∅ | accepted no-op |
 
 Notes:
 - Wire encoding parity with the host was verified against

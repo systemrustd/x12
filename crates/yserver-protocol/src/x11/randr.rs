@@ -27,6 +27,18 @@ pub const RR_GET_OUTPUT_PRIMARY: u8 = 31;
 pub const RR_GET_PROVIDERS: u8 = 32;
 pub const RR_GET_MONITORS: u8 = 42;
 
+pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
+pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
+pub const NOTIFY_MASK_OUTPUT_CHANGE: u16 = 1 << 2;
+
+pub const EVENT_SCREEN_CHANGE_NOTIFY: u8 = 0;
+pub const EVENT_NOTIFY: u8 = 1;
+pub const NOTIFY_CRTC_CHANGE: u8 = 0;
+pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
+pub const ROTATION_ROTATE_0: u16 = 1;
+pub const SUBPIXEL_UNKNOWN: u16 = 0;
+pub const CONNECTION_CONNECTED: u8 = 0;
+
 // ── Local wire helpers (mirrors of wire.rs helpers, private to this module) ──
 
 fn read_u32_le(bytes: &[u8]) -> u32 {
@@ -184,6 +196,56 @@ pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u
     out.extend_from_slice(&minor.to_le_bytes());
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
+    out
+}
+
+/// Encodes a `GetScreenInfo` reply for the single synthetic mode.
+///
+/// Layout (RANDR 1.1+): 32-byte header followed by one `ScreenSize` (8 bytes)
+/// and one `RefreshRates` list (`nRates` u16 + `nRates` * 2 bytes, padded to 4
+/// bytes). `nInfo = nSizes + nRefreshLists` so libXrandr can iterate the
+/// trailing refresh-list section.
+#[must_use]
+pub fn encode_get_screen_info_reply(
+    sequence: SequenceNumber,
+    root: u32,
+    timestamp: u32,
+    config_timestamp: u32,
+    width: u16,
+    height: u16,
+    mwidth: u16,
+    mheight: u16,
+) -> Vec<u8> {
+    let n_sizes: u16 = 1;
+    let n_rates: u16 = 1;
+    let n_info: u16 = n_sizes * 2; // one refresh list per size
+    let refresh_record_padded = pad4(2 + 2 * usize::from(n_rates));
+    let extra = usize::from(n_sizes) * 8 + usize::from(n_sizes) * refresh_record_padded;
+    #[allow(clippy::cast_possible_truncation)]
+    let length = (extra / 4) as u32;
+    let rotations: u8 = 1; // RR_Rotate_0 only
+
+    let mut out = fixed_reply(sequence, rotations, length);
+    out.extend_from_slice(&root.to_le_bytes());
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(&config_timestamp.to_le_bytes());
+    out.extend_from_slice(&n_sizes.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // sizeID = 0 (current)
+    out.extend_from_slice(&1u16.to_le_bytes()); // rotation = RR_Rotate_0
+    out.extend_from_slice(&60u16.to_le_bytes()); // current rate = 60 Hz
+    out.extend_from_slice(&n_info.to_le_bytes());
+    out.extend_from_slice(&[0u8; 2]);
+    debug_assert_eq!(out.len(), 32);
+
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&mwidth.to_le_bytes());
+    out.extend_from_slice(&mheight.to_le_bytes());
+
+    out.extend_from_slice(&n_rates.to_le_bytes());
+    out.extend_from_slice(&60u16.to_le_bytes());
+    pad_vec4(&mut out);
+
     out
 }
 
@@ -594,6 +656,107 @@ pub fn encode_get_crtc_gamma_reply(sequence: SequenceNumber, size: u16) -> Vec<u
     out
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScreenChangeNotify {
+    pub timestamp: u32,
+    pub config_timestamp: u32,
+    pub root: u32,
+    pub request_window: u32,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u16,
+    pub height_mm: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrtcChangeNotify {
+    pub timestamp: u32,
+    pub request_window: u32,
+    pub crtc: u32,
+    pub mode: u32,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputChangeNotify {
+    pub timestamp: u32,
+    pub config_timestamp: u32,
+    pub request_window: u32,
+    pub output: u32,
+    pub crtc: u32,
+    pub mode: u32,
+}
+
+#[must_use]
+pub fn encode_screen_change_notify_event(
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: ScreenChangeNotify,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = first_event + EVENT_SCREEN_CHANGE_NOTIFY;
+    out[1] = ROTATION_ROTATE_0 as u8;
+    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
+    out[8..12].copy_from_slice(&event.config_timestamp.to_le_bytes());
+    out[12..16].copy_from_slice(&event.root.to_le_bytes());
+    out[16..20].copy_from_slice(&event.request_window.to_le_bytes());
+    out[20..22].copy_from_slice(&0u16.to_le_bytes());
+    out[22..24].copy_from_slice(&SUBPIXEL_UNKNOWN.to_le_bytes());
+    out[24..26].copy_from_slice(&event.width.to_le_bytes());
+    out[26..28].copy_from_slice(&event.height.to_le_bytes());
+    out[28..30].copy_from_slice(&event.width_mm.to_le_bytes());
+    out[30..32].copy_from_slice(&event.height_mm.to_le_bytes());
+    out
+}
+
+#[must_use]
+pub fn encode_crtc_change_notify_event(
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: CrtcChangeNotify,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = first_event + EVENT_NOTIFY;
+    out[1] = NOTIFY_CRTC_CHANGE;
+    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
+    out[8..12].copy_from_slice(&event.request_window.to_le_bytes());
+    out[12..16].copy_from_slice(&event.crtc.to_le_bytes());
+    out[16..20].copy_from_slice(&event.mode.to_le_bytes());
+    out[20..22].copy_from_slice(&ROTATION_ROTATE_0.to_le_bytes());
+    out[24..26].copy_from_slice(&event.x.to_le_bytes());
+    out[26..28].copy_from_slice(&event.y.to_le_bytes());
+    out[28..30].copy_from_slice(&event.width.to_le_bytes());
+    out[30..32].copy_from_slice(&event.height.to_le_bytes());
+    out
+}
+
+#[must_use]
+pub fn encode_output_change_notify_event(
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: OutputChangeNotify,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = first_event + EVENT_NOTIFY;
+    out[1] = NOTIFY_OUTPUT_CHANGE;
+    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
+    out[8..12].copy_from_slice(&event.config_timestamp.to_le_bytes());
+    out[12..16].copy_from_slice(&event.request_window.to_le_bytes());
+    out[16..20].copy_from_slice(&event.output.to_le_bytes());
+    out[20..24].copy_from_slice(&event.crtc.to_le_bytes());
+    out[24..28].copy_from_slice(&event.mode.to_le_bytes());
+    out[28..30].copy_from_slice(&ROTATION_ROTATE_0.to_le_bytes());
+    out[30] = CONNECTION_CONNECTED;
+    out[31] = SUBPIXEL_UNKNOWN as u8;
+    out
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -751,5 +914,124 @@ mod tests {
         assert_eq!(&buf[40..44], &3u32.to_le_bytes());
         // name at byte 44
         assert_eq!(&buf[44..51], b"ynest-0");
+    }
+
+    #[test]
+    fn encode_get_output_property_empty_reply_shape() {
+        let buf = encode_get_output_property_reply(SequenceNumber(9));
+
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1], 0); // format = 0
+        assert_eq!(&buf[2..4], &9u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &0u32.to_le_bytes());
+        assert!(buf[8..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn encode_get_monitors_single_monitor_shape() {
+        let outputs = [0x20u32];
+        let buf = encode_get_monitors_reply(
+            SequenceNumber(10),
+            123,
+            &[MonitorInfo {
+                name: 0,
+                primary: true,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                width_mm: 211,
+                height_mm: 158,
+                outputs: &outputs,
+            }],
+        );
+
+        assert_eq!(buf.len(), 60);
+        assert_eq!(buf[0], 1);
+        assert_eq!(&buf[2..4], &10u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &7u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &123u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &1u32.to_le_bytes()); // nMonitors
+        assert_eq!(&buf[16..20], &1u32.to_le_bytes()); // nOutputs
+        assert_eq!(buf[36], 1); // primary
+        assert_eq!(&buf[40..42], &0i16.to_le_bytes());
+        assert_eq!(&buf[44..46], &800u16.to_le_bytes());
+        assert_eq!(&buf[56..60], &0x20u32.to_le_bytes());
+    }
+
+    #[test]
+    fn screen_change_notify_event_shape() {
+        let event = encode_screen_change_notify_event(
+            89,
+            SequenceNumber(11),
+            ScreenChangeNotify {
+                timestamp: 100,
+                config_timestamp: 101,
+                root: 0x100,
+                request_window: 0x101,
+                width: 1024,
+                height: 768,
+                width_mm: 271,
+                height_mm: 203,
+            },
+        );
+
+        assert_eq!(event.len(), 32);
+        assert_eq!(event[0], 89);
+        assert_eq!(event[1], 1);
+        assert_eq!(&event[2..4], &11u16.to_le_bytes());
+        assert_eq!(&event[4..8], &100u32.to_le_bytes());
+        assert_eq!(&event[12..16], &0x100u32.to_le_bytes());
+        assert_eq!(&event[24..26], &1024u16.to_le_bytes());
+        assert_eq!(&event[30..32], &203u16.to_le_bytes());
+    }
+
+    #[test]
+    fn crtc_change_notify_event_shape() {
+        let event = encode_crtc_change_notify_event(
+            89,
+            SequenceNumber(12),
+            CrtcChangeNotify {
+                timestamp: 200,
+                request_window: 0x100,
+                crtc: 2,
+                mode: 3,
+                x: 4,
+                y: 5,
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        assert_eq!(event[0], 90);
+        assert_eq!(event[1], 0);
+        assert_eq!(&event[4..8], &200u32.to_le_bytes());
+        assert_eq!(&event[12..16], &2u32.to_le_bytes());
+        assert_eq!(&event[20..22], &1u16.to_le_bytes());
+        assert_eq!(&event[28..30], &1280u16.to_le_bytes());
+    }
+
+    #[test]
+    fn output_change_notify_event_shape() {
+        let event = encode_output_change_notify_event(
+            89,
+            SequenceNumber(13),
+            OutputChangeNotify {
+                timestamp: 300,
+                config_timestamp: 301,
+                request_window: 0x100,
+                output: 1,
+                crtc: 2,
+                mode: 3,
+            },
+        );
+
+        assert_eq!(event[0], 90);
+        assert_eq!(event[1], 1);
+        assert_eq!(&event[8..12], &301u32.to_le_bytes());
+        assert_eq!(&event[16..20], &1u32.to_le_bytes());
+        assert_eq!(event[30], CONNECTION_CONNECTED);
+        assert_eq!(event[31], 0);
     }
 }

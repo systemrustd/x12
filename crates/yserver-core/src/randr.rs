@@ -48,6 +48,10 @@ impl RandrState {
         )
     }
 
+    pub fn resize(&mut self, timestamp: u32, width: u16, height: u16) {
+        *self = Self::nested(timestamp, width, height);
+    }
+
     /// Build a `ScreenResources` reply describing the single synthetic output/CRTC/mode.
     #[must_use]
     pub fn screen_resources_current(&self) -> proto::ScreenResources {
