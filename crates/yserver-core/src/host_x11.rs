@@ -920,6 +920,41 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    /// Set the host container window's background pixmap so the host
+    /// server auto-fills regions uncovered when nested top-levels move,
+    /// without us needing to plumb Expose events through the nested root.
+    /// Pass `None` (or 0) for `None` (no bg pixmap → window stays its
+    /// previous content).
+    pub fn set_container_background_pixmap(&mut self, host_pixmap_xid: u32) -> io::Result<()> {
+        // ChangeWindowAttributes (opcode 2): window(4) value-mask(4) values(4*n)
+        // value-mask CWBackPixmap = 0x00000001
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(16);
+        out.push(2);
+        out.push(0);
+        write_u16(&mut out, 4); // length 4 = 16 bytes
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, 0x0000_0001); // CWBackPixmap
+        write_u32(&mut out, host_pixmap_xid);
+        self.stream.write_all(&out)?;
+
+        // Force the host to repaint immediately so the new bg shows up
+        // even if nothing has triggered an Expose yet. ClearArea(window,
+        // 0,0,0,0, false) clears the entire window.
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut clear = Vec::with_capacity(16);
+        clear.push(61); // ClearArea
+        clear.push(0); // exposures = false
+        write_u16(&mut clear, 4); // length 4 = 16 bytes
+        write_u32(&mut clear, self.window_id);
+        write_i16(&mut clear, 0);
+        write_i16(&mut clear, 0);
+        write_u16(&mut clear, 0);
+        write_u16(&mut clear, 0);
+        self.stream.write_all(&clear)?;
+        self.stream.flush()
+    }
+
     pub fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();

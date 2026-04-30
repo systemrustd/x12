@@ -1557,7 +1557,7 @@ fn handle_request(
                 let cursor_id = request.cursor;
                 let want_focus_check;
                 let viewable;
-                {
+                let root_bg_host_xid = {
                     let mut s = lock_server(server)?;
                     if let Some(event_mask) = request.event_mask {
                         let entry = s.clients.get_mut(&client_id.0).expect("client registered");
@@ -1584,6 +1584,23 @@ fn handle_request(
                         .resources
                         .window(target_window)
                         .is_some_and(|w| w.map_state == MapState::Viewable);
+
+                    // Mirror root's bg-pixmap onto the host container so the
+                    // host server auto-fills regions uncovered by nested
+                    // top-level moves. Skip if the request didn't touch
+                    // background_pixmap or didn't target root.
+                    if target_window == ROOT_WINDOW && request.background_pixmap.is_some() {
+                        s.resources.window_background_pixmap_host_xid(ROOT_WINDOW)
+                    } else {
+                        None
+                    }
+                };
+                if target_window == ROOT_WINDOW && request.background_pixmap.is_some() {
+                    if let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.set_container_background_pixmap(root_bg_host_xid.unwrap_or(0));
+                    }
                 }
                 if viewable && want_focus_check & 0x3 != 0 {
                     set_focused_window(focused_window, server, target_window)?;
