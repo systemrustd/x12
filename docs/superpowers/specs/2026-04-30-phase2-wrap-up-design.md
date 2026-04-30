@@ -59,12 +59,29 @@ owner instead.
    owner until `UngrabKeyboard`.
 4. **`UngrabKeyboard` (32)** — clear the active keyboard grab.
 5. **Routing in the keyboard forwarder** — before falling through to
-   the focus path, look up `(keycode, state)` in the `KeyGrab` table
-   anchored at the focused window's ancestor chain (X11 semantics:
-   any grab on an ancestor of the focused window qualifies). If a
-   grab matches, deliver `KeyPress`/`KeyRelease` to the grab owner with
-   `event` set to the grab window. If an active keyboard grab exists,
-   it overrides everything.
+   the focus path, look up `(keycode, state)` in the `KeyGrab` table.
+   X11 semantics for "grab applies":
+   - grab-window is an ancestor of (or equal to) the focused window, or
+   - grab-window is a descendant of the focused window *and* contains
+     the pointer.
+
+   Phase 2 implements the first case only (ancestor / equal). The
+   descendant-containing-pointer path is deferred unless validation
+   shows a real WM uses it; reparenting WMs put their grabs on root,
+   which the ancestor walk already covers.
+
+   On a matching `KeyPress`, the spec says the passive grab activates
+   into a temporary *active* keyboard grab held by the same client on
+   the same grab window until the matching `KeyRelease`. We model
+   this: when the passive lookup hits, install an
+   `ActiveKeyboardGrab { source: PassiveKey { keycode } }` so all
+   subsequent key events (including modifier sequences pressed during
+   the chord) route to the same owner; the next `KeyRelease` of that
+   keycode tears the active grab down. While *any* active keyboard
+   grab is held, passive grabs from other clients do not fire.
+
+   Deliver `KeyPress`/`KeyRelease` to the grab owner with `event` set
+   to the grab window.
 6. **`GetKeyboardMapping` (101)** — replace the hard-coded
    `keysyms.rs` table with a host proxy: `XGetKeyboardMapping` from the
    host server, cache the result, return the requested slice. Falls
@@ -89,16 +106,36 @@ root before destroying them.
 
 9. **`ChangeSaveSet` (6)** — store, per client, a
    `HashSet<ResourceId>` of foreign windows the client wants to keep
-   alive. `mode=Insert/Delete`. On client disconnect, before resource
-   cleanup, reparent each save-set window back to the root and then
-   remap it. Honor save-set on `DestroyWindow` of a parent: do not
-   destroy save-set children, reparent them to root instead.
-10. **`CirculateWindow` (13)** — if the parent has a substructure
-    redirect subscriber, emit `CirculateRequest` (event 27) to it and
-    do not change stacking. Otherwise reorder children (Top/Bottom)
+   alive (`mode=Insert/Delete`).
+
+   Per the X11 spec, on client resource destruction, for each
+   save-set window that is *inferior* to a window created by the
+   dying client:
+   - reparent it to the closest ancestor that was *not* created by
+     the dying client (typically root for a single-WM session, but
+     not always — preserve this rule);
+   - preserve its absolute root-relative position across the
+     reparent (compute `(new_x, new_y)` from old absolute coords
+     minus new parent's absolute origin);
+   - if the save-set window is currently unmapped, map it.
+
+   Honor save-set on `DestroyWindow` of a parent: do not destroy
+   save-set children — reparent them per the same rules and then
+   destroy the empty parent.
+10. **`CirculateWindow` (13)** — the request's `window` argument is
+    the *container* whose children are being restacked. If the
+    container has a substructure-redirect subscriber, emit
+    `CirculateRequest` (event 27) to it with
+    `parent = container, window = child` and do not change
+    stacking. Otherwise reorder the container's children (Top/Bottom)
     and emit `CirculateNotify` (event 26) to subscribers of
-    StructureNotify on the window and SubstructureNotify on the
-    parent.
+    StructureNotify on the moved child and SubstructureNotify on the
+    container.
+
+    Phase-2 stacking is naive: rotate the back child to the front
+    (RaiseLowest, dir=0) or front child to the back (LowerHighest,
+    dir=1). True obscuring detection is a Phase 4+ compositor
+    concern; Openbox/Fluxbox don't depend on it.
 11. **`CirculateNotify` / `CirculateRequest` events** — encoders in
     `protocol/x11`; emit hooks in `nested.rs`.
 12. **`DestroySubwindows` (5)** — recurse the existing destroy path
@@ -118,10 +155,12 @@ called from the disconnect path.
 
 ### D. Pointer/grab follow-ups
 
-14. **`ChangeActivePointerGrab` (30)** — update the active pointer
-    grab's `event_mask` / `cursor` / `time` if there is one. No-op
-    otherwise (no error, X11 spec allows the silent no-op when the
-    grab id matches no active grab).
+14. **`ChangeActivePointerGrab` (30)** — update the *active* pointer
+    grab's `event_mask` / `cursor` / `time` if there is one. The spec
+    is explicit: this request does **not** affect passive button
+    grabs. State must therefore live on the active-pointer-grab
+    record, not on the `button_grabs` table. No-op when no active
+    grab is held.
 15. **`GrabButton` sync replay (known follow-up)** — replace the
     deferred-replay TODO. Move the replay path to a small command
     queue (`mpsc::Sender<ReplayCmd>`) consumed by the
@@ -234,6 +273,44 @@ End-to-end the validation gates are the WM runs listed under
 *Validation targets*. We don't have a harness for running a WM in
 CI; manual validation under an existing `ynest` session is the bar,
 same as previous Phase 2 items.
+
+## Codex review notes (2026-04-30)
+
+Submitted spec + plan to codex for review; key corrections folded
+back here:
+
+- MappingNotify byte layout: `request` is at byte 4, not byte 1.
+  Plan encoder updated accordingly.
+- `CirculateWindow`'s argument is the parent/container, not the
+  child. Redirect check and event field assignment updated above.
+- Passive key grabs activate into a temporary active keyboard grab
+  on press, lasting until the matching release.
+- Save-set restore reparents to closest non-dying ancestor,
+  preserves absolute coordinates, and maps if unmapped.
+- `ChangeActivePointerGrab` mutates the active grab record, not the
+  `button_grabs` table.
+- `CopyPlane` body length is 28 bytes after the request header.
+- `GetModifierMapping` reply width is `8 * keycodes_per_modifier`,
+  not a fixed 64 bytes.
+
+The reviewer noted that for **Openbox/Fluxbox specifically**, our
+deferral list is fine: XKB / BIG-REQUESTS / MIT-SHM / XFIXES /
+SHAPE / XInput2 / DAMAGE / COMPOSITE / SYNC / PRESENT can stay
+absent so long as `QueryExtension` answers cleanly. SYNC is
+optional for `_NET_WM_SYNC_REQUEST` resize handshake; Openbox
+should not block on it. i3 and awesome remain Phase 3 because
+they have hard XKB dependencies.
+
+Also flagged but not in immediate scope:
+
+- `SetModifierMapping` could be promoted from no-op to a real
+  reject ("Failed" status). Leaving as no-op is acceptable until a
+  real client trips on it.
+- `QueryKeymap`, `GetKeyboardControl`, `Bell` are already stubbed
+  in the current implementation.
+- `KillClient` is not needed for WM startup; deferred.
+- Colormap install/uninstall is irrelevant on a true-color nested
+  setup.
 
 ## Open issues (deliberate)
 

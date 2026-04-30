@@ -14,11 +14,11 @@
 
 ## Conventions used in this plan
 
-- "Failing test" steps go in the same `mod tests {}` block at the end of the file being modified (existing pattern in `protocol/x11/mod.rs` and `resources.rs`). For wire encoders, the test is a hex/byte-array roundtrip; for state machines, an exercise of the public method.
-- Run `cargo test -p yserver-protocol` or `cargo test -p yserver-core` to scope tests, or `cargo test` for the full set.
-- Pre-commit gate (per `~/.claude/CLAUDE.md` Rust section): `cargo +nightly fmt`, `cargo clippy -- -W clippy::pedantic`, `cargo test`. The repo's CLAUDE.md says clippy without pedantic is fine here, but pedantic doesn't hurt — run pedantic and only address easy hits, do not chase pedantic lints in unrelated code.
-- Commit messages follow the existing style (`feat:`, `fix:`, `docs:`).
-- All commits must use the trailer `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`.
+- "Failing test" steps go in the same `mod tests {}` block at the end of the file being modified (existing pattern in `protocol/x11/mod.rs` and `resources.rs`). For wire encoders, the test is a byte-array roundtrip; for state machines, an exercise of the public method.
+- Run `cargo test -p yserver-protocol -- <filter>` (single filter only — cargo doesn't take multiple positional filters; combine with substring matches if needed) or `cargo test` for the full set.
+- Pre-commit gate (per `AGENTS.md`): `cargo +nightly fmt`, `cargo clippy` (no `-W clippy::pedantic`; the repo opts out), `cargo test`. Fix all warnings.
+- Commit messages follow the existing style (`feat:`, `fix:`, `docs:`). No trailers — match the existing project history.
+- For test fakes that need a `UnixStream`, use `UnixStream::pair()` to obtain two real connected ends; never construct a stream with `unsafe { std::mem::zeroed() }`. Where a public field demands a writer for a struct-init test, factor the test through a small writer trait or an `Arc<Mutex<dyn Write + Send>>`.
 
 ---
 
@@ -184,7 +184,6 @@ Per-server passive key grab table with AnyKey (keycode=0) and
 AnyModifier (modifiers=0x8000) wildcards; lookup walks the
 focused window's ancestor chain plus root.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -345,7 +344,6 @@ feat: implement GrabKey / UngrabKey (op 33 / 34)
 Stores passive key grabs in ServerState.key_grabs; UngrabKey supports
 AnyKey/AnyModifier wildcards. Parsers covered by unit tests.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -353,34 +351,56 @@ EOF
 ### Task A3: GrabKeyboard / UngrabKeyboard
 
 **Files:**
-- Modify: `crates/yserver-core/src/server.rs` (add `keyboard_grab: Option<(ClientId, ResourceId)>`)
+- Modify: `crates/yserver-core/src/server.rs` (add `ActiveKeyboardGrab`, `ActiveKeyboardGrabSource`, `active_keyboard_grab` field)
 - Modify: `crates/yserver-core/src/nested.rs` (replace stubs at opcodes 31, 32)
 
-- [ ] **Step 1: Write a unit test for the active grab field**
+This task introduces the struct that Task A4 fills in further. We
+keep it minimal here: just the explicit-grab path.
 
-In `server.rs` tests mod:
+- [ ] **Step 1: Add the structs and field**
+
+In `server.rs` near `KeyGrab`:
 
 ```rust
-#[test]
-fn keyboard_grab_set_and_clear() {
-    use crate::resources::{ClientId, ResourceId};
-    let mut s = ServerState::new();
-    assert!(s.keyboard_grab.is_none());
-    s.keyboard_grab = Some((ClientId(7), ResourceId(0xff)));
-    assert_eq!(s.keyboard_grab.unwrap().0, ClientId(7));
-    s.keyboard_grab = None;
-    assert!(s.keyboard_grab.is_none());
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveKeyboardGrabSource {
+    Explicit,                  // from GrabKeyboard
+    PassiveKey { keycode: u8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveKeyboardGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    pub source: ActiveKeyboardGrabSource,
 }
 ```
 
-- [ ] **Step 2: Run, fail, add field, run, pass**
+Add `pub active_keyboard_grab: Option<ActiveKeyboardGrab>` to
+`ServerState`, init to `None`.
 
-Run: `cargo test -p yserver-core keyboard_grab`
-Expected: compile error first; after adding `pub keyboard_grab: Option<(ClientId, ResourceId)>` (init to `None`), passes.
+- [ ] **Step 2: Unit test**
+
+```rust
+#[test]
+fn active_keyboard_grab_set_and_clear() {
+    use crate::resources::{ClientId, ResourceId};
+    let mut s = ServerState::new();
+    assert!(s.active_keyboard_grab.is_none());
+    s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+        owner: ClientId(7),
+        grab_window: ResourceId(0xff),
+        source: ActiveKeyboardGrabSource::Explicit,
+    });
+    assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
+    s.active_keyboard_grab = None;
+    assert!(s.active_keyboard_grab.is_none());
+}
+```
+
+Run: `cargo test -p yserver-core active_keyboard_grab` — passes.
 
 - [ ] **Step 3: Wire opcodes 31 / 32**
-
-Replace the two stubs:
 
 ```rust
 31 => {
@@ -390,15 +410,19 @@ Replace the two stubs:
         let grab_window = ResourceId(u32::from_le_bytes(
             [body[0], body[1], body[2], body[3]]));
         let mut s = lock_server(server)?;
-        s.keyboard_grab = Some((client_id, grab_window));
+        s.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+            owner: client_id,
+            grab_window,
+            source: crate::server::ActiveKeyboardGrabSource::Explicit,
+        });
     }
     log_reply(client_id, sequence, "GrabKeyboard");
     x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
 }
 32 => {
     let mut s = lock_server(server)?;
-    if let Some((owner, _)) = s.keyboard_grab && owner == client_id {
-        s.keyboard_grab = None;
+    if let Some(g) = s.active_keyboard_grab && g.owner == client_id {
+        s.active_keyboard_grab = None;
     }
     log_void(client_id, sequence, "UngrabKeyboard")
 }
@@ -419,7 +443,6 @@ feat: implement GrabKeyboard / UngrabKeyboard (op 31 / 32)
 Active keyboard grab tracked on ServerState; routing change in
 spawn_keyboard_forwarder follows in next commit.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -497,29 +520,108 @@ Expected: fail with "decide_key_target not found", then pass after pasting in th
 
 - [ ] **Step 3: Use the helper in `spawn_keyboard_forwarder`**
 
-In the existing forwarder loop, replace the `if focus == ROOT_WINDOW { continue; }` block plus the `write_key_event(... event: focus ...)` call with:
+In the existing forwarder loop, replace the `if focus == ROOT_WINDOW { continue; }` block plus the `write_key_event(... event: focus ...)` call.
+
+The X11 spec says a passive `GrabKey` match on a `KeyPress` activates a *temporary active keyboard grab* held by the same owner on the same grab window, lasting until the matching `KeyRelease`. While any active keyboard grab is held, passive grabs from other clients do not fire. The lookup therefore needs to track three states:
+
+1. An active keyboard grab is held → route to its owner.
+2. No active grab; this is a `KeyPress`; passive lookup matches → install an active grab tagged `PassiveKey { keycode }` and route to the new owner.
+3. Otherwise → route to focus.
+
+Update `decide_key_target` to take the press/release flag and a mutable hook for installing the active grab:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum KeyTarget {
+    Focus(ResourceId),
+    Grab { client_id: ClientId, grab_window: ResourceId },
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ActiveKeyboardGrabSource {
+    Explicit,                  // GrabKeyboard
+    PassiveKey { keycode: u8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveKeyboardGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    pub source: ActiveKeyboardGrabSource,
+}
+
+pub(crate) fn route_key_event(
+    state: &mut ServerState,
+    focus: ResourceId,
+    keycode: u8,
+    state_mask: u16,
+    pressed: bool,
+) -> KeyTarget {
+    // 1. Active keyboard grab pre-empts everything.
+    if let Some(g) = state.active_keyboard_grab {
+        // Auto-release a passive-induced active grab when its key releases.
+        if !pressed {
+            if let ActiveKeyboardGrabSource::PassiveKey { keycode: kc } = g.source {
+                if kc == keycode {
+                    state.active_keyboard_grab = None;
+                }
+            }
+        }
+        return KeyTarget::Grab { client_id: g.owner, grab_window: g.grab_window };
+    }
+    // 2. Passive grab match on press → activate.
+    if pressed {
+        if let Some(grab) = state.find_key_grab(focus, keycode, state_mask) {
+            let owner = grab.owner;
+            let win = grab.grab_window;
+            state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner,
+                grab_window: win,
+                source: ActiveKeyboardGrabSource::PassiveKey { keycode },
+            });
+            return KeyTarget::Grab { client_id: owner, grab_window: win };
+        }
+    }
+    // 3. Focus delivery (drop on root).
+    if focus == ROOT_WINDOW { return KeyTarget::Drop; }
+    KeyTarget::Focus(focus)
+}
+```
+
+Replace `keyboard_grab: Option<(ClientId, ResourceId)>` from Task A3
+with `active_keyboard_grab: Option<ActiveKeyboardGrab>` and add the
+`Explicit` source from `GrabKeyboard`. (Update the A3 diff and the
+unit test to use the new struct; the test from A3 becomes:
+
+```rust
+s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+    owner: ClientId(7),
+    grab_window: ResourceId(0xff),
+    source: ActiveKeyboardGrabSource::Explicit,
+});
+```
+
+before this task is committed.)
+
+Then in the forwarder loop:
 
 ```rust
 let (event_window, target_writer) = {
-    let s = match server.lock() { Ok(s) => s, Err(_) => continue };
-    let target = decide_key_target(&s, focus, event.keycode, event.state);
+    let mut s = match server.lock() { Ok(s) => s, Err(_) => continue };
+    let target = route_key_event(&mut s, focus, event.keycode, event.state, event.pressed);
     match target {
         KeyTarget::Drop => continue,
         KeyTarget::Focus(w) => (w, writer.clone()),
         KeyTarget::Grab { client_id: cid, grab_window } => {
-            // Look up the grab owner's writer.
             match s.client_target(cid) {
                 Some(t) => (grab_window, t.writer.clone()),
-                None => continue, // owner gone
+                None => continue,
             }
         }
     }
 };
-let mut writer = match target_writer.lock() { Ok(w) => w, Err(_) => return };
-// ... existing write_key_event call but with event_window in `event:`
 ```
-
-(The exact mechanics: today the function holds a single `Arc<Mutex<UnixStream>>` for the focused client. When a grab fires, we deliver to the *grab owner* — which may be a different client. So we need to re-acquire the writer through `state.client_target(cid)`. Adjust function signature: pass `Arc<Mutex<ServerState>>` into `spawn_keyboard_forwarder` if it isn't already there.)
 
 - [ ] **Step 4: Build and run tests**
 
@@ -548,7 +650,6 @@ Active keyboard grab pre-empts focus delivery; passive GrabKey on the
 focused window or any ancestor delivers to the grab owner with the
 event window set to the grab window.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -695,7 +796,6 @@ feat: proxy GetKeyboardMapping (op 101) to host
 Replaces the hard-coded keysyms.rs stub with the host's real keymap.
 Falls back to the local table when the host call fails.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -709,19 +809,34 @@ EOF
 
 Steps follow the same TDD shape as Task A5: encoder unit test in `protocol`, host proxy method, dispatcher rewrite, full test, commit.
 
-- [ ] **Step 1: Encoder test**
+The reply width is `8 * keycodes_per_modifier` bytes. Don't hardcode
+64 — host Xlib may report a different `max_keypermod`.
+
+- [ ] **Step 1: Encoder test (parameterised)**
 
 ```rust
 #[test]
-fn modifier_mapping_reply_layout() {
-    let kc: [u8; 64] = std::array::from_fn(|i| i as u8 + 8);
+fn modifier_mapping_reply_layout_kpm_2() {
+    let kpm = 2u8;
+    let kc: Vec<u8> = (0..(8 * kpm) as u8).map(|i| i + 8).collect();
     let mut buf = Vec::new();
-    write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), 8, &kc).unwrap();
+    write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc).unwrap();
     assert_eq!(buf[0], 1);     // reply
-    assert_eq!(buf[1], 8);     // keycodes-per-modifier
+    assert_eq!(buf[1], kpm);
     let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    assert_eq!(length, 16);    // 64 bytes / 4
-    assert_eq!(buf[32..96], kc[..]);
+    assert_eq!(length, (8 * kpm as u32) / 4);
+    assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
+}
+
+#[test]
+fn modifier_mapping_reply_layout_kpm_4() {
+    let kpm = 4u8;
+    let kc: Vec<u8> = (0..(8 * kpm) as u8).map(|i| i + 8).collect();
+    let mut buf = Vec::new();
+    write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc).unwrap();
+    let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    assert_eq!(length, (8 * kpm as u32) / 4);
+    assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
 }
 ```
 
@@ -734,10 +849,13 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
     keycodes_per_modifier: u8,
     keycodes: &[u8],
 ) -> io::Result<()> {
-    let length_words = u32::try_from(keycodes.len() / 4).unwrap_or(0);
+    debug_assert_eq!(keycodes.len(), 8 * keycodes_per_modifier as usize,
+        "GetModifierMapping payload must be exactly 8 * keycodes_per_modifier");
+    let total = 8 * u32::from(keycodes_per_modifier);
+    let length_words = total / 4;
     let mut reply = fixed_reply(sequence, keycodes_per_modifier, length_words);
     reply.extend_from_slice(keycodes);
-    while reply.len() % 4 != 0 { reply.push(0); }
+    // total is always a multiple of 4 (8 * kpm); no extra padding needed.
     writer.write_all(&reply)
 }
 ```
@@ -770,7 +888,6 @@ Commit message:
 ```
 feat: proxy GetModifierMapping (op 119) to host
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task A7: ChangeKeyboardMapping + MappingNotify
@@ -788,13 +905,19 @@ fn mapping_notify_event_layout() {
     write_mapping_notify_event(&mut buf, SequenceNumber(0), /*request=*/1, 8, 248).unwrap();
     assert_eq!(buf.len(), 32);
     assert_eq!(buf[0], 34);     // MappingNotify
-    assert_eq!(buf[1], 1);      // request: Keyboard
-    assert_eq!(buf[4], 8);      // first_keycode
-    assert_eq!(buf[5], 248);    // count
+    // buf[1] is unused
+    assert_eq!(buf[4], 1);      // request: Keyboard
+    assert_eq!(buf[5], 8);      // first_keycode
+    assert_eq!(buf[6], 248);    // count
 }
 ```
 
 - [ ] **Step 2: Implement encoder + dispatcher**
+
+Per the X11 spec, MappingNotify body layout (bytes 4..32 after the
+2-byte sequence at 2..4) starts with `request` at byte 4,
+`first-keycode` at byte 5, `count` at byte 6, then 25 unused bytes.
+Byte 1 is unused.
 
 ```rust
 pub fn write_mapping_notify_event(
@@ -806,10 +929,11 @@ pub fn write_mapping_notify_event(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = 34;
-    buf[1] = request;
+    // buf[1] unused
     buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    buf[4] = first_keycode;
-    buf[5] = count;
+    buf[4] = request;
+    buf[5] = first_keycode;
+    buf[6] = count;
     writer.write_all(&buf)
 }
 ```
@@ -842,7 +966,6 @@ feat: implement ChangeKeyboardMapping (op 100) + MappingNotify
 Treats the request as a no-op (host owns the keymap) but emits
 MappingNotify(Keyboard) to all clients so they refresh.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -854,17 +977,39 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 **Files:**
 - Modify: `crates/yserver-core/src/server.rs` — `ClientHandle.save_set: HashSet<ResourceId>`
 
-- [ ] **Step 1: Test**
+- [ ] **Step 1: Add the field**
+
+In `server.rs`, add to `ClientHandle`:
+
+```rust
+pub save_set: HashSet<ResourceId>,
+```
+
+Initialise it (`HashSet::new()`) in every place `ClientHandle { ... }`
+is constructed. Search `ClientHandle {` — there are 1–2 sites in
+`nested.rs`.
+
+- [ ] **Step 2: Test via real `UnixStream::pair()`**
+
+Constructing a `ClientHandle` for a unit test needs a real
+`UnixStream`. Use `UnixStream::pair()`:
 
 ```rust
 #[test]
 fn save_set_insert_and_remove() {
     use crate::resources::ResourceId;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex, atomic::AtomicU16};
+
+    let (a, _b) = UnixStream::pair().unwrap();
     let mut handle = ClientHandle {
-        writer: Arc::new(Mutex::new(/* requires test stream — skip in unit, just struct-init */
-            unsafe { std::mem::zeroed() })),
-        // ... use a fresh helper or refactor: see below
-        ..ClientHandle::test_default()
+        writer: Arc::new(Mutex::new(a)),
+        byte_order: ClientByteOrder::Little,
+        last_sequence: Arc::new(AtomicU16::new(0)),
+        resource_id_base: 0,
+        resource_id_mask: 0,
+        event_masks: Default::default(),
+        save_set: Default::default(),
     };
     handle.save_set.insert(ResourceId(0x10));
     handle.save_set.insert(ResourceId(0x20));
@@ -874,26 +1019,14 @@ fn save_set_insert_and_remove() {
 }
 ```
 
-The `unsafe zeroed` is a cheat for unit testing — the cleaner pattern is a `ClientHandle::test_default()` method behind `#[cfg(test)]`. Add it.
-
-- [ ] **Step 2: Implement**
-
-Add field to `ClientHandle`:
-
-```rust
-pub save_set: HashSet<ResourceId>,
-```
-
-Initialise in every place where `ClientHandle` is constructed (search `ClientHandle {` — there should be 1–2 sites in `nested.rs`).
-
-Add `#[cfg(test)] impl ClientHandle { fn test_default() -> Self { ... } }`.
+(`_b` is held by the test to keep the pair alive; dropping it would
+close the writer end.)
 
 - [ ] **Step 3: Test, commit**
 
 ```
 feat: add save_set field to ClientHandle
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task B2: ChangeSaveSet opcode
@@ -921,40 +1054,117 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 }
 ```
 
-- [ ] **Step 2: Restore on disconnect**
+- [ ] **Step 2: Add `restore_save_set_for_client` on `ResourceTable`**
 
-In the client disconnect path (search for the `clients.remove` call — likely in `handle_client` cleanup), before resource cleanup:
+Per X11 spec semantics: for each save-set window inferior to a window
+created by the dying client, reparent it to the **closest ancestor
+that was not created by the dying client**, preserving its
+*absolute root-relative position*; if it is unmapped, also map it.
+
+In `resources.rs`:
 
 ```rust
-let to_restore: Vec<ResourceId> = match server.lock() {
-    Ok(s) => s.clients.get(&client_id.0).map(|c| c.save_set.iter().copied().collect()).unwrap_or_default(),
+/// Returns the list of (save-set window, new_parent, new_x, new_y, needs_remap)
+/// that the caller should apply. Pure — does not mutate self.
+pub fn plan_save_set_restore(
+    &self,
+    dying_client: ClientId,
+    save_set: &HashSet<ResourceId>,
+) -> Vec<(ResourceId, ResourceId, i16, i16, bool)> {
+    let mut out = Vec::new();
+    for &w in save_set {
+        // Skip if the window itself is gone or not inferior to a
+        // dying-client-created window.
+        let Some(win) = self.window(w) else { continue };
+        let abs = self.window_absolute_position(w);
+        // Walk up from current parent to find first ancestor whose
+        // creator is NOT dying_client.
+        let mut anc = win.parent;
+        while anc != ROOT_WINDOW {
+            let Some(ancw) = self.window(anc) else { break };
+            if ancw.created_by != dying_client { break; }
+            anc = ancw.parent;
+        }
+        if anc == win.parent { continue; }   // already a safe ancestor
+        let new_parent_abs = self.window_absolute_position(anc);
+        #[allow(clippy::cast_possible_truncation)]
+        let nx = (abs.0 - new_parent_abs.0) as i16;
+        #[allow(clippy::cast_possible_truncation)]
+        let ny = (abs.1 - new_parent_abs.1) as i16;
+        let needs_remap = !win.mapped;
+        out.push((w, anc, nx, ny, needs_remap));
+    }
+    out
+}
+```
+
+This requires `Window.created_by: ClientId` (add the field; populate
+it at `create_window` time — search `ResourceTable::create_window`).
+If `created_by` doesn't already exist, add it as a small TDD step
+*before* this one.
+
+- [ ] **Step 3: Wire restore into the disconnect path**
+
+Search for the `clients.remove` call (likely in `handle_client`
+cleanup or a `drop_client` helper). Before resource cleanup:
+
+```rust
+let plan = match server.lock() {
+    Ok(s) => {
+        let save_set = s.clients.get(&client_id.0)
+            .map(|c| c.save_set.clone())
+            .unwrap_or_default();
+        s.resources.plan_save_set_restore(client_id, &save_set)
+    }
     Err(_) => Vec::new(),
 };
-for w in to_restore {
-    // Reparent w to root if it still exists
+for (w, new_parent, nx, ny, needs_remap) in plan {
     if let Ok(mut s) = server.lock() {
-        if s.resources.window(w).is_some() {
-            // ResourceTable::reparent moves the window; coordinate-translation
-            // can be 0,0 for a save-set restore (matches Xorg behaviour).
-            let _ = s.resources.reparent_window(w, ROOT_WINDOW, 0, 0);
+        let _ = s.resources.reparent_window(w, new_parent, nx, ny);
+        if needs_remap {
+            let _ = s.resources.map_window(w);
         }
     }
 }
 ```
 
-- [ ] **Step 3: Test the disconnect restore via a unit test on `ResourceTable`**
+- [ ] **Step 4: Test `plan_save_set_restore` on `ResourceTable`**
 
-(There is no easy way to drive disconnect synthetically without a real client thread. Defer the integration test; the unit test exercises `ResourceTable::reparent_window` survival, which already exists.)
+```rust
+#[test]
+fn save_set_reparents_to_first_non_dying_ancestor_and_remaps() {
+    let mut t = ResourceTable::new();
+    let wm = ClientId(1);
+    let app = ClientId(2);
+    let frame = ResourceId(0x100);
+    let child = ResourceId(0x200);
+    t.create_window_for(wm, frame, ROOT_WINDOW, 100, 200, 400, 300, 24).unwrap();
+    t.create_window_for(app, child, frame, 5, 7, 100, 50, 24).unwrap();
+    // child is unmapped; frame is mapped.
+    t.map_window(frame).unwrap();
 
-- [ ] **Step 4: Commit**
+    let mut ss = HashSet::new();
+    ss.insert(child);
+    let plan = t.plan_save_set_restore(/*dying=*/wm, &ss);
+    assert_eq!(plan.len(), 1);
+    let (w, parent, nx, ny, needs_remap) = plan[0];
+    assert_eq!(w, child);
+    assert_eq!(parent, ROOT_WINDOW);
+    // child absolute is 100+5, 200+7 = (105, 207); root is at (0,0).
+    assert_eq!((nx, ny), (105, 207));
+    assert!(needs_remap);
+}
+```
+
+- [ ] **Step 5: Commit**
 
 ```
-feat: implement ChangeSaveSet (op 6)
+feat: implement ChangeSaveSet (op 6) with spec-correct restore
 
 Tracks per-client save-set; on client disconnect, save-set windows
-are reparented back to root before resource cleanup.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+are reparented to the closest ancestor not owned by the dying
+client, preserving root-relative position, and remapped if they
+were unmapped.
 ```
 
 ### Task B3: CirculateNotify / CirculateRequest event encoders
@@ -1030,7 +1240,6 @@ pub fn write_circulate_request_event(
 ```
 feat: add CirculateNotify / CirculateRequest event encoders
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task B4: CirculateWindow opcode 13
@@ -1040,34 +1249,50 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 
 - [ ] **Step 1: Wire dispatch**
 
+The request's `window` argument is the **container** whose children are
+being restacked — it is not itself the moved window. Substructure
+redirect is checked on the container; the resulting `CirculateRequest`
+event reports `parent = container`, `window = the chosen child`.
+
 ```rust
 13 => {
-    // CirculateWindow body: window(4); header.data = direction (0=RaiseLowest, 1=LowerHighest)
+    // CirculateWindow body: container(4); header.data = direction (0=RaiseLowest, 1=LowerHighest)
     if body.len() >= 4 {
-        let win = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        let container = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let direction = header.data;
-        let parent = lock_server(server)?
-            .resources.window(win).map(|w| w.parent);
-        if let Some(parent) = parent {
-            // Substructure redirect on the parent?
+
+        // Pick the child that would actually be restacked (back for Raise, front for Lower).
+        let chosen_child = {
+            let s = lock_server(server)?;
+            let kids = s.resources.children(container);
+            match (direction, kids.first(), kids.last()) {
+                (0, _, Some(&back)) => Some(back),
+                (1, Some(&front), _) => Some(front),
+                _ => None,
+            }
+        };
+
+        if let Some(child) = chosen_child {
+            // Substructure redirect on the container (NOT its parent).
             let redirect_target = lock_server(server)?
-                .subscribers(parent, 0x0010_0000) // SubstructureRedirectMask
+                .subscribers(container, 0x0010_0000) // SubstructureRedirectMask
                 .into_iter().next();
             if let Some(target) = redirect_target {
                 let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
                 let mut buf = Vec::with_capacity(32);
-                let _ = x11::write_circulate_request_event(&mut buf, seq, parent, win, direction);
+                let _ = x11::write_circulate_request_event(
+                    &mut buf, seq, /*parent=*/container, /*window=*/child, direction);
                 if let Ok(mut w) = target.writer.lock() { let _ = w.write_all(&buf); }
             } else {
                 // No redirect — actually circulate.
-                let _ = lock_server(server)?.resources.circulate_window(win, direction);
-                // Notify subscribers.
-                let on_window = lock_server(server)?.subscribers(win, 0x0002_0000);     // StructureNotify
-                let on_parent = lock_server(server)?.subscribers(parent, 0x0008_0000);  // SubstructureNotify
-                for t in on_window.into_iter().chain(on_parent.into_iter()) {
+                let _ = lock_server(server)?.resources.circulate_window(container, direction);
+                let on_child = lock_server(server)?.subscribers(child, 0x0002_0000);        // StructureNotify on the moved child
+                let on_container = lock_server(server)?.subscribers(container, 0x0008_0000); // SubstructureNotify on the container
+                for t in on_child.into_iter().chain(on_container.into_iter()) {
                     let seq = SequenceNumber(t.last_sequence.load(Ordering::Relaxed));
                     let mut buf = Vec::with_capacity(32);
-                    let _ = x11::write_circulate_notify_event(&mut buf, seq, win, win, direction);
+                    let _ = x11::write_circulate_notify_event(
+                        &mut buf, seq, /*event_window=*/child, /*window=*/child, direction);
                     if let Ok(mut w) = t.writer.lock() { let _ = w.write_all(&buf); }
                 }
             }
@@ -1119,7 +1344,6 @@ children and emits CirculateNotify. Phase-2 stacking is naive
 (end-of-list rotation); proper obscuring detection comes with the
 compositor.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task B5: DestroySubwindows opcode 5
@@ -1149,7 +1373,6 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 feat: implement DestroySubwindows (op 5)
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1196,8 +1419,10 @@ In `nested.rs`, model after the existing `62 => { ... CopyArea ... }` arm:
 
 ```rust
 63 => {
-    // Layout same as CopyArea + trailing plane(4)
-    if body.len() >= 24 {
+    // CopyPlane body (after the 4-byte request header): src(4) dst(4) gc(4)
+    //   src_x(2) src_y(2) dst_x(2) dst_y(2) width(2) height(2) plane(4)
+    // Total 28 bytes.
+    if body.len() >= 28 {
         let src = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let gc = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
@@ -1220,7 +1445,6 @@ In `nested.rs`, model after the existing `62 => { ... CopyArea ... }` arm:
 ```
 feat: implement CopyPlane (op 63)
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1232,23 +1456,53 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 **Files:**
 - Modify: `crates/yserver-core/src/nested.rs`
 
-- [ ] **Step 1: Wire dispatch**
+Per the X11 spec, `ChangeActivePointerGrab` updates the *active*
+pointer grab and explicitly does not affect passive button grabs.
+The fields live on a new `ActivePointerGrab` record, not on
+`button_grabs`.
+
+- [ ] **Step 1: Promote `pointer_grab` to a struct**
+
+In `server.rs`, replace `pointer_grab: Option<(ClientId, ResourceId)>`
+with:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub struct ActivePointerGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    pub event_mask: u16,
+    pub cursor: ResourceId,    // 0 = inherit
+    pub time: u32,
+}
+
+pub active_pointer_grab: Option<ActivePointerGrab>,
+```
+
+Migrate every existing `pointer_grab = Some((...))` site (search the
+crate) to construct `ActivePointerGrab { ... }`. Migrate
+`pointer_grab.and_then(...)` reads similarly. The existing
+`pointer_grab_is_passive` flag stays — it tracks whether the active
+grab was activated *by* a passive button grab (different concept
+from a passive button grab itself).
+
+- [ ] **Step 2: Wire dispatch**
 
 ```rust
 30 => {
     // body: cursor(4) time(4) event_mask(2) pad(2)
     if body.len() >= 12 {
         let cursor = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        let time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let event_mask = u16::from_le_bytes([body[8], body[9]]);
         let mut s = lock_server(server)?;
-        if let Some((owner, _)) = s.pointer_grab && owner == client_id {
-            // Update host cursor on the grab window if we have a host xid.
-            // For now, just record; full cursor swap requires another host call.
-            for grab in s.button_grabs.iter_mut() {
-                if grab.owner == client_id {
-                    grab.event_mask = event_mask;
-                    let _ = cursor; // cursor swap deferred
-                }
+        if let Some(g) = s.active_pointer_grab.as_mut() {
+            if g.owner == client_id {
+                g.event_mask = event_mask;
+                g.cursor = cursor;
+                g.time = time;
+                // Host cursor swap is deferred — would require XChangeActivePointerGrab
+                // forwarding. The grab record is sufficient for our event-mask gating.
             }
         }
     }
@@ -1256,15 +1510,14 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 3: Commit**
 
 ```
 feat: implement ChangeActivePointerGrab (op 30)
 
-Updates the active pointer grab's event_mask; cursor swap is deferred
-until we have a use case beyond fvwm3.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Promotes pointer_grab to ActivePointerGrab record; updates
+event_mask/cursor/time on the active grab. Per spec, this request
+does not affect passive button grabs.
 ```
 
 ### Task D2: GrabButton sync replay channel
@@ -1311,7 +1564,6 @@ Replaces the deferred TODO in AllowEvents(ReplayPointer) with a
 crossbeam-style command channel consumed by the pointer pump
 thread, which already holds xid_map.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1347,7 +1599,6 @@ Add field, `subscribe(...)`, `subscriber_mask(...)`.
 ```
 feat: store RRSelectInput masks in RandrState
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task E2: Host resize watcher and RRScreenChangeNotify
@@ -1446,7 +1697,6 @@ Watcher thread sees XConfigureNotify on the host container and
 updates RandrState dimensions, then fans out RRScreenChangeNotify
 to clients that selected RRScreenChangeNotifyMask.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task E3: RRGetScreenInfo (RANDR 1.0)
@@ -1466,7 +1716,6 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 feat: implement RRGetScreenInfo (RANDR minor=5) for 1.0 clients
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1490,7 +1739,6 @@ fix: free host bg-pixmap XIDs on DestroyWindow
 
 Closes the leak noted in status.md known follow-ups.
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task F2: SendEvent propagation up the parent chain
@@ -1511,7 +1759,6 @@ Add `fn target_for_send_event(state, dst, event_type, propagate) -> Option<Event
 ```
 fix: propagate SendEvent up parent chain when no direct subscriber
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ### Task F3: UnmapNotify.from_configure on shrunk children
@@ -1545,7 +1792,6 @@ fn child_clipped_out_after_parent_shrink() {
 ```
 fix: emit UnmapNotify(from_configure=true) for clipped-out children
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1603,7 +1849,6 @@ Same shape as G1 with `fluxbox` instead of `openbox`. If Fluxbox demands BIG-REQ
 ```
 docs: mark Phase 2 wrap-up items complete
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
 
 ---
@@ -1612,6 +1857,17 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 
 - Spec coverage: every numbered item in the spec maps to a Group A–F task.
 - No placeholders: every code step contains the actual code.
-- Type consistency: `KeyGrab`, `KeyTarget`, `ReplayCmd`, `RandrState::subscribers` types referenced in dispatcher arms match their definitions.
+- Type consistency: `KeyGrab`, `ActiveKeyboardGrab`, `ActiveKeyboardGrabSource`, `ActivePointerGrab`, `KeyTarget`, `ReplayCmd`, `RandrState::subscribers` types referenced in dispatcher arms match their definitions.
 - Each task ends with a commit.
 - Tests precede implementation in every TDD-relevant task; pure plumbing tasks (e.g. dispatcher arms with no return value) rely on the encoder unit tests and validation in G1/G2.
+
+## Revision history
+
+- 2026-04-30 — codex review folded in: MappingNotify offsets,
+  CirculateWindow container semantics, passive-key activates active
+  grab, ChangeActivePointerGrab targets the active grab record,
+  save-set restore preserves coords + remaps + walks ancestor chain,
+  CopyPlane body length 28 bytes, GetModifierMapping size
+  parameterised. Also: dropped `clippy::pedantic`, dropped
+  Co-Authored-By trailers, replaced `unsafe { mem::zeroed() }`
+  test pattern with `UnixStream::pair()`.
