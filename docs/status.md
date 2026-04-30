@@ -466,6 +466,31 @@ sessions.
   no RANDR awareness don't reflow when the host window is resized
   today.
 
+- **Apps disappear after host resize (fvwm).** Resizing the ynest
+  container triggers the desktop bg to be re-tiled across the full
+  new area but the visible app windows go blank, with only tiny
+  fragments of their decorations remaining. Setting `bit-gravity =
+  NorthWest` on the container and `bit-gravity = NorthWest +
+  backing-store = Always` on every top-level subwindow did not
+  resolve it, which suggests the cause is not pixel preservation
+  through the host resize. Suspects: fvwm responding to
+  `RRScreenChangeNotify` by drawing the bg pattern into the root
+  with a clip that includes child windows, a host compositor pass
+  that fails to redraw subwindow content, or a missing synthetic
+  expose/configure that prevents apps from re-rendering. Repro:
+  resize the ynest window with fvwm running and xclock/xterm
+  visible — they vanish without ConfigureWindow events from any
+  client.
+
+- **fvwm segfault when the host window is closed.** Closing the
+  ynest container triggers the host pump to exit, the listening
+  socket to drop, and fvwm to crash. Real X servers also drop
+  connections on exit, so fvwm should handle this; we may be
+  cutting the I/O without flushing pending events or emitting a
+  clean disconnect signal. Verify: capture fvwm's stderr and run
+  it under gdb to identify the segfault, then check whether ynest
+  flushes per-client writers on host_pump exit.
+
 - **Validation runs:** Openbox, Fluxbox (called out under Phase 2 as
   deferred), then back to wmaker/e16 once SHAPE forwarding lands to
   confirm the chrome artifacts go away.
