@@ -109,6 +109,46 @@ pub struct PassiveButtonGrab {
     pub pointer_mode: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct KeyGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    /// 0 == AnyKey
+    pub keycode: u8,
+    /// 0x8000 == AnyModifier; otherwise the literal modifier-state mask
+    pub modifiers: u16,
+    pub owner_events: bool,
+    /// 0 = Synchronous, 1 = Asynchronous
+    pub pointer_mode: u8,
+    /// 0 = Synchronous, 1 = Asynchronous
+    pub keyboard_mode: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveKeyboardGrabSource {
+    /// from GrabKeyboard
+    Explicit,
+    /// activated by a passive GrabKey on the matching keycode press
+    PassiveKey { keycode: u8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveKeyboardGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    pub source: ActiveKeyboardGrabSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActivePointerGrab {
+    pub owner: ClientId,
+    pub grab_window: ResourceId,
+    pub event_mask: u16,
+    /// 0 = inherit
+    pub cursor: ResourceId,
+    pub time: u32,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -122,12 +162,20 @@ pub struct ServerState {
     /// Active pointer grab: (grab owner, grab window). When set, all pointer
     /// events are redirected to the grab owner regardless of where the cursor is.
     pub pointer_grab: Option<(ClientId, ResourceId)>,
+    /// Active pointer grab record (full state including event_mask/cursor/time).
+    /// When set, mirrors `pointer_grab` and supersedes it for spec-correct
+    /// `ChangeActivePointerGrab` semantics.
+    pub active_pointer_grab: Option<ActivePointerGrab>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// True when `pointer_grab` was activated by a passive button grab.
     pub pointer_grab_is_passive: bool,
     /// Frozen pointer event held by a sync passive grab.
     pub frozen_pointer_event: Option<crate::host_x11::HostPointerEvent>,
+    /// Registered passive key grabs.
+    pub key_grabs: Vec<KeyGrab>,
+    /// Active keyboard grab (explicit or passive-induced).
+    pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
 }
 
 impl ServerState {
@@ -142,9 +190,12 @@ impl ServerState {
             randr: RandrState::nested(0, 800, 600),
             selections: HashMap::new(),
             pointer_grab: None,
+            active_pointer_grab: None,
             button_grabs: Vec::new(),
             pointer_grab_is_passive: false,
             frozen_pointer_event: None,
+            key_grabs: Vec::new(),
+            active_keyboard_grab: None,
         }
     }
 
@@ -275,6 +326,63 @@ impl ServerState {
             depth += 1;
             if depth > 256 {
                 break;
+            }
+        }
+        None
+    }
+
+    /// X11 passive `GrabKey` lookup.
+    ///
+    /// Phase-2 subset: matches grabs whose `grab_window` is the focused
+    /// window, an ancestor of it, or root. The descendant-containing-pointer
+    /// case is deferred until a real client needs it.
+    #[must_use]
+    pub fn find_key_grab(
+        &self,
+        window: ResourceId,
+        keycode: u8,
+        state_mask: u16,
+    ) -> Option<&KeyGrab> {
+        let mut current = window;
+        let mut depth = 0usize;
+        let mut tried_root = false;
+        loop {
+            for grab in &self.key_grabs {
+                if grab.grab_window != current {
+                    continue;
+                }
+                let key_match = grab.keycode == 0 || grab.keycode == keycode;
+                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                if key_match && mod_match {
+                    return Some(grab);
+                }
+            }
+            if current == crate::resources::ROOT_WINDOW {
+                tried_root = true;
+                break;
+            }
+            let Some(w) = self.resources.window(current) else {
+                break;
+            };
+            if w.parent == current {
+                break;
+            }
+            current = w.parent;
+            depth += 1;
+            if depth > 256 {
+                break;
+            }
+        }
+        if !tried_root && current != crate::resources::ROOT_WINDOW {
+            for grab in &self.key_grabs {
+                if grab.grab_window != crate::resources::ROOT_WINDOW {
+                    continue;
+                }
+                let key_match = grab.keycode == 0 || grab.keycode == keycode;
+                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                if key_match && mod_match {
+                    return Some(grab);
+                }
             }
         }
         None
@@ -1002,5 +1110,74 @@ mod tests {
         );
 
         assert!(state.lock().unwrap().clients.contains_key(&1));
+    }
+
+    #[test]
+    fn key_grab_lookup_exact_match() {
+        let mut s = ServerState::new();
+        let win = ResourceId(0x42);
+        let owner = ClientId(1);
+        s.key_grabs.push(KeyGrab {
+            owner,
+            grab_window: win,
+            keycode: 24,
+            modifiers: 0x0040,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 1,
+        });
+        let hit = s.find_key_grab(win, 24, 0x0040);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().owner, owner);
+    }
+
+    #[test]
+    fn key_grab_lookup_any_modifier_wildcard() {
+        let mut s = ServerState::new();
+        let win = ResourceId(0x42);
+        s.key_grabs.push(KeyGrab {
+            owner: ClientId(1),
+            grab_window: win,
+            keycode: 24,
+            modifiers: 0x8000,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 1,
+        });
+        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
+        assert!(s.find_key_grab(win, 24, 0x0000).is_some());
+        assert!(s.find_key_grab(win, 25, 0x0040).is_none());
+    }
+
+    #[test]
+    fn key_grab_lookup_any_keycode_wildcard() {
+        let mut s = ServerState::new();
+        let win = ResourceId(0x42);
+        s.key_grabs.push(KeyGrab {
+            owner: ClientId(1),
+            grab_window: win,
+            keycode: 0,
+            modifiers: 0x0040,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 1,
+        });
+        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
+        assert!(s.find_key_grab(win, 99, 0x0040).is_some());
+        assert!(s.find_key_grab(win, 24, 0x0000).is_none());
+    }
+
+    #[test]
+    fn active_keyboard_grab_set_and_clear() {
+        let mut s = ServerState::new();
+        assert!(s.active_keyboard_grab.is_none());
+        s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+            owner: ClientId(7),
+            grab_window: ResourceId(0xff),
+            source: ActiveKeyboardGrabSource::Explicit,
+        });
+        assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
+        s.active_keyboard_grab = None;
+        assert!(s.active_keyboard_grab.is_none());
     }
 }
