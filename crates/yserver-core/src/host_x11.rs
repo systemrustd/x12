@@ -149,6 +149,90 @@ impl HostX11 {
         }
     }
 
+    /// Send `GetKeyboardMapping` (op 101) to the host and return
+    /// `(keysyms_per_keycode, keysyms_flat)` where the keysyms slice has
+    /// `count * keysyms_per_keycode` u32 values.
+    pub fn get_keyboard_mapping(
+        &mut self,
+        first_keycode: u8,
+        count: u8,
+    ) -> io::Result<(u8, Vec<u32>)> {
+        let target = self.sequence;
+        let mut out = [0u8; 8];
+        out[0] = 101;
+        out[2] = 2; // length in 4-byte units
+        out[3] = 0;
+        out[4] = first_keycode;
+        out[5] = count;
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence != target {
+                continue;
+            }
+            if resp.bytes[0] == 0 {
+                return Err(io::Error::other(format!(
+                    "host GetKeyboardMapping failed (error {})",
+                    resp.bytes[1]
+                )));
+            }
+            let kpc = resp.bytes[1];
+            // Body bytes start at offset 32 in the response.
+            let n = usize::from(count) * usize::from(kpc);
+            if resp.bytes.len() < 32 + n * 4 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "GetKeyboardMapping reply truncated",
+                ));
+            }
+            let mut keysyms = Vec::with_capacity(n);
+            for i in 0..n {
+                let base = 32 + i * 4;
+                keysyms.push(u32::from_le_bytes([
+                    resp.bytes[base],
+                    resp.bytes[base + 1],
+                    resp.bytes[base + 2],
+                    resp.bytes[base + 3],
+                ]));
+            }
+            return Ok((kpc, keysyms));
+        }
+    }
+
+    /// Send `GetModifierMapping` (op 119) to the host and return
+    /// `(keycodes_per_modifier, keycodes)` where keycodes has
+    /// `8 * keycodes_per_modifier` bytes.
+    pub fn get_modifier_mapping(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        let target = self.sequence;
+        let out = [119u8, 0, 1, 0];
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence != target {
+                continue;
+            }
+            if resp.bytes[0] == 0 {
+                return Err(io::Error::other(format!(
+                    "host GetModifierMapping failed (error {})",
+                    resp.bytes[1]
+                )));
+            }
+            let kpm = resp.bytes[1];
+            let n = 8 * usize::from(kpm);
+            if resp.bytes.len() < 32 + n {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "GetModifierMapping reply truncated",
+                ));
+            }
+            return Ok((kpm, resp.bytes[32..32 + n].to_vec()));
+        }
+    }
+
     pub fn close_font(&mut self, host_xid: u32) -> io::Result<()> {
         let mut out = Vec::new();
         out.push(46);

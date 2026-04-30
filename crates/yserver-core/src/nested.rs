@@ -3908,17 +3908,51 @@ fn handle_request(
             log_reply(client_id, sequence, "ListExtensions");
             x11::write_list_extensions_reply(&mut *lock_writer()?, sequence)
         }
+        100 => {
+            // ChangeKeyboardMapping: keycode_count in header.data;
+            //   body: first_keycode(1) keysyms_per_keycode(1) pad(2) keysyms(...)
+            let first_keycode = body.first().copied().unwrap_or(8);
+            let count = header.data;
+            let targets: Vec<_> = match server.lock() {
+                Ok(s) => s
+                    .clients
+                    .values()
+                    .map(|c| crate::server::EventTarget {
+                        writer: c.writer.clone(),
+                        byte_order: c.byte_order,
+                        last_sequence: c.last_sequence.clone(),
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            crate::server::fanout_event(&targets, |buf, seq, _order| {
+                let _ = x11::write_mapping_notify_event(buf, seq, 1, first_keycode, count);
+            });
+            log_void(client_id, sequence, "ChangeKeyboardMapping")
+        }
         101 => {
             log_reply(client_id, sequence, "GetKeyboardMapping");
-            let first_keycode = body.first().copied().unwrap_or(0);
+            let first_keycode = body.first().copied().unwrap_or(8);
             let keycode_count = body.get(1).copied().unwrap_or(0);
-            x11::write_get_keyboard_mapping_reply(
-                &mut *lock_writer()?,
-                sequence,
-                first_keycode,
-                keycode_count,
-                4,
-            )
+            let proxied = host
+                .and_then(|h| h.lock().ok())
+                .and_then(|mut h| h.get_keyboard_mapping(first_keycode, keycode_count).ok());
+            if let Some((kpc, keysyms)) = proxied {
+                x11::write_get_keyboard_mapping_reply_from_keysyms(
+                    &mut *lock_writer()?,
+                    sequence,
+                    kpc,
+                    &keysyms,
+                )
+            } else {
+                x11::write_get_keyboard_mapping_reply(
+                    &mut *lock_writer()?,
+                    sequence,
+                    first_keycode,
+                    keycode_count,
+                    4,
+                )
+            }
         }
         103 => log_void(client_id, sequence, "Bell"),
         104 => log_void(client_id, sequence, "ChangeKeyboardControl"),
@@ -3939,7 +3973,19 @@ fn handle_request(
         118 => log_void(client_id, sequence, "SetModifierMapping"),
         119 => {
             log_reply(client_id, sequence, "GetModifierMapping");
-            x11::write_get_modifier_mapping_reply(&mut *lock_writer()?, sequence)
+            let proxied = host
+                .and_then(|h| h.lock().ok())
+                .and_then(|mut h| h.get_modifier_mapping().ok());
+            if let Some((kpm, keycodes)) = proxied {
+                x11::write_get_modifier_mapping_reply_with_keycodes(
+                    &mut *lock_writer()?,
+                    sequence,
+                    kpm,
+                    &keycodes,
+                )
+            } else {
+                x11::write_get_modifier_mapping_reply(&mut *lock_writer()?, sequence)
+            }
         }
         127 => log_void(client_id, sequence, "NoOperation"),
         RANDR_MAJOR_OPCODE => handle_randr_request(
