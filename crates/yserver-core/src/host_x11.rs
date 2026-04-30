@@ -1082,6 +1082,38 @@ impl HostX11 {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn copy_plane(
+        &mut self,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+        plane: u32,
+    ) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(63); // CopyPlane opcode
+        out.push(0);
+        write_u16(&mut out, 8); // length: 8 units = 32 bytes
+        write_u32(&mut out, src_host_xid);
+        write_u32(&mut out, dst_host_xid);
+        write_u32(&mut out, self.gc_id);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+        write_i16(&mut out, dst_x);
+        write_i16(&mut out, dst_y);
+        write_u16(&mut out, width);
+        write_u16(&mut out, height);
+        write_u32(&mut out, plane);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     /// Send GetImage to the host and return the raw reply bytes (32-byte header
     /// + image data).  Returns None on host error or if the region is invalid.
     pub fn get_image(

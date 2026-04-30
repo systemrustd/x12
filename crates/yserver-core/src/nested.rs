@@ -2726,12 +2726,25 @@ fn handle_request(
             log_void(client_id, sequence, "SendEvent")
         }
         26 => {
-            if body.len() >= 4 {
+            // GrabPointer body: owner_events(header.data) grab_window(4) event_mask(2)
+            //   pointer_mode(1) keyboard_mode(1) confine_to(4) cursor(4) time(4)
+            if body.len() >= 20 {
                 let grab_window =
                     ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let event_mask = u16::from_le_bytes([body[4], body[5]]);
+                let cursor =
+                    ResourceId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
+                let time = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
                 let mut s = lock_server(server)?;
                 s.pointer_grab = Some((client_id, grab_window));
                 s.pointer_grab_is_passive = false;
+                s.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+                    owner: client_id,
+                    grab_window,
+                    event_mask,
+                    cursor,
+                    time,
+                });
             }
             log_reply(client_id, sequence, "GrabPointer");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
@@ -2740,6 +2753,7 @@ fn handle_request(
             let mut s = lock_server(server)?;
             s.pointer_grab = None;
             s.pointer_grab_is_passive = false;
+            s.active_pointer_grab = None;
             s.frozen_pointer_event = None;
             drop(s);
             log_void(client_id, sequence, "UngrabPointer")
@@ -2789,6 +2803,23 @@ fn handle_request(
                 });
             }
             log_void(client_id, sequence, "UngrabButton")
+        }
+        30 => {
+            // ChangeActivePointerGrab body: cursor(4) time(4) event_mask(2) pad(2)
+            if body.len() >= 12 {
+                let cursor = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let event_mask = u16::from_le_bytes([body[8], body[9]]);
+                let mut s = lock_server(server)?;
+                if let Some(g) = s.active_pointer_grab.as_mut()
+                    && g.owner == client_id
+                {
+                    g.event_mask = event_mask;
+                    g.cursor = cursor;
+                    g.time = time;
+                }
+            }
+            log_void(client_id, sequence, "ChangeActivePointerGrab")
         }
         31 => {
             // GrabKeyboard body: owner_events(header.data) grab_window(4)
@@ -3337,6 +3368,53 @@ fn handle_request(
                 }
             }
             log_void(client_id, sequence, "CopyArea")
+        }
+        63 => {
+            // CopyPlane: src(4) dst(4) gc(4) sx(2) sy(2) dx(2) dy(2) w(2) h(2) plane(4) = 28 bytes
+            if body.len() >= 28 {
+                let src = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let dst = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let gc = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+                let sx = i16::from_le_bytes([body[12], body[13]]);
+                let sy = i16::from_le_bytes([body[14], body[15]]);
+                let dx = i16::from_le_bytes([body[16], body[17]]);
+                let dy = i16::from_le_bytes([body[18], body[19]]);
+                let w = u16::from_le_bytes([body[20], body[21]]);
+                let h = u16::from_le_bytes([body[22], body[23]]);
+                let plane = u32::from_le_bytes([body[24], body[25], body[26], body[27]]);
+                if w != 0 && h != 0 {
+                    let (gc_exists, clip, src_target, dst_target) = {
+                        let s = lock_server(server)?;
+                        (
+                            s.resources.gc(gc).is_some(),
+                            s.resources.gc_clip_rectangles(gc),
+                            s.resources.host_drawable_target(src),
+                            s.resources.host_drawable_target(dst),
+                        )
+                    };
+                    if !gc_exists {
+                        return emit_x11_error(writer, sequence, x11::error::BAD_GC, gc.0, 63);
+                    }
+                    if let (Some(srct), Some(dstt)) = (src_target, dst_target)
+                        && let Some(host_arc) = host
+                        && let Ok(mut hh) = host_arc.lock()
+                    {
+                        hh.set_clip_rectangles(clip, dstt.x_offset(), dstt.y_offset())?;
+                        hh.copy_plane(
+                            srct.host_xid(),
+                            dstt.host_xid(),
+                            translate_i16(sx, srct.x_offset()),
+                            translate_i16(sy, srct.y_offset()),
+                            translate_i16(dx, dstt.x_offset()),
+                            translate_i16(dy, dstt.y_offset()),
+                            w,
+                            h,
+                            plane,
+                        )?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "CopyPlane")
         }
         64 => {
             if body.len() >= 8 {
