@@ -1574,10 +1574,11 @@ fn handle_request(
         }
         4 => {
             if let Some(window) = x11::free_resource_id(body) {
-                let pending = {
+                let (pending, bg_pixmap_xids) = {
                     let mut s = lock_server(server)?;
                     let mut order = Vec::new();
                     collect_destroy_order(&s.resources, window, &mut order);
+                    let bg = s.resources.collect_bg_pixmap_host_xids(window);
                     let mut pending: Vec<PendingDestroy> = Vec::new();
                     for w in &order {
                         let (parent, was_mapped, host_xid) =
@@ -1603,8 +1604,16 @@ fn handle_request(
                     }
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
-                    pending
+                    (pending, bg)
                 };
+                if !bg_pixmap_xids.is_empty()
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    for xid in &bg_pixmap_xids {
+                        let _ = h.free_pixmap(*xid);
+                    }
+                }
                 for pending in pending {
                     if let Some(xid) = pending.host_xid {
                         if let Some(host) = host

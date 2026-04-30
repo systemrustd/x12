@@ -209,6 +209,26 @@ impl ResourceTable {
         destroyed
     }
 
+    /// Walk the about-to-be-destroyed window subtree and collect every
+    /// retained bg-pixmap host XID. Caller frees them on the host.
+    pub fn collect_bg_pixmap_host_xids(&self, root: ResourceId) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.collect_bg_pixmap_host_xids_inner(root, &mut out);
+        out
+    }
+
+    fn collect_bg_pixmap_host_xids_inner(&self, id: ResourceId, out: &mut Vec<u32>) {
+        let Some(window) = self.windows.get(&id.0) else {
+            return;
+        };
+        if let Some(xid) = window.background_pixmap_host_xid {
+            out.push(xid);
+        }
+        for child in &window.children {
+            self.collect_bg_pixmap_host_xids_inner(*child, out);
+        }
+    }
+
     fn destroy_window_inner(&mut self, id: ResourceId, destroyed: &mut Vec<ResourceId>) {
         let Some(window) = self.windows.remove(&id.0) else {
             return;
