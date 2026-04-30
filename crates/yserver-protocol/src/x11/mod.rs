@@ -1162,18 +1162,21 @@ pub fn encode_expose_event(
     sequence: SequenceNumber,
     order: ClientByteOrder,
     window: ResourceId,
+    x: u16,
+    y: u16,
     width: u16,
     height: u16,
+    count: u16,
 ) {
     out.push(12); // Expose
     out.push(0);
     write_u16(order, out, sequence.0);
     write_u32(order, out, window.0);
-    write_u16(order, out, 0);
-    write_u16(order, out, 0);
+    write_u16(order, out, x);
+    write_u16(order, out, y);
     write_u16(order, out, width);
     write_u16(order, out, height);
-    write_u16(order, out, 0); // count
+    write_u16(order, out, count);
     out.extend_from_slice(&[0; 14]);
 }
 

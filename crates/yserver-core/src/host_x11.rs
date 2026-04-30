@@ -1768,6 +1768,16 @@ impl HostInputPump {
                         state: read_u16(&event[28..30]),
                     }));
                 }
+                12 => {
+                    return Ok(HostEvent::Expose(HostExposeEvent {
+                        host_xid: read_u32(&event[4..8]),
+                        x: read_u16(&event[8..10]),
+                        y: read_u16(&event[10..12]),
+                        width: read_u16(&event[12..14]),
+                        height: read_u16(&event[14..16]),
+                        count: read_u16(&event[16..18]),
+                    }));
+                }
                 17 => return Ok(HostEvent::Closed),
                 _ => {}
             }
@@ -1779,7 +1789,8 @@ const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
     | 0x0000_0008 // ButtonRelease
     | 0x0000_0010 // EnterWindow
     | 0x0000_0020 // LeaveWindow
-    | 0x0000_0040; // PointerMotion
+    | 0x0000_0040 // PointerMotion
+    | 0x0000_8000; // Exposure
 
 impl HostInputPumpHandle {
     pub fn register_top_level(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
@@ -1821,7 +1832,18 @@ impl HostInputPumpHandle {
 pub enum HostEvent {
     Key(HostKeyEvent),
     Pointer(HostPointerEvent),
+    Expose(HostExposeEvent),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostExposeEvent {
+    pub host_xid: u32,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub count: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

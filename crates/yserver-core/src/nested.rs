@@ -107,6 +107,9 @@ pub fn run(display: u16) -> io::Result<()> {
                                     event,
                                 );
                             }
+                            Ok(HostEvent::Expose(ev)) => {
+                                expose_event_fanout(&server_for_thread, &xid_map, ev);
+                            }
                             Ok(HostEvent::Closed) => {
                                 info!("host pump: window closed, exiting");
                                 std::process::exit(0);
@@ -453,7 +456,7 @@ fn spawn_window_close_watcher(window_id: u32) {
         debug!("window-close watcher ready");
         loop {
             match watcher.read_event() {
-                Ok(HostEvent::Key(_) | HostEvent::Pointer(_)) => {}
+                Ok(HostEvent::Key(_) | HostEvent::Pointer(_) | HostEvent::Expose(_)) => {}
                 Ok(HostEvent::Closed) => {
                     info!("host window closed, exiting");
                     std::process::exit(0);
@@ -553,7 +556,7 @@ fn spawn_keyboard_forwarder(
             let event = loop {
                 match keyboard.read_event() {
                     Ok(HostEvent::Key(event)) => break event,
-                    Ok(HostEvent::Pointer(_)) => continue,
+                    Ok(HostEvent::Pointer(_) | HostEvent::Expose(_)) => continue,
                     Ok(HostEvent::Closed) => {
                         info!("host window closed, exiting");
                         std::process::exit(0);
@@ -632,6 +635,25 @@ fn spawn_keyboard_forwarder(
     });
 }
 
+/// Forward a host Expose event to nested clients that selected ExposureMask.
+/// Called from the host input-pump thread when the host uncovers a subwindow.
+fn expose_event_fanout(
+    server: &Arc<Mutex<ServerState>>,
+    xid_map: &crate::host_x11::HostXidMap,
+    ev: crate::host_x11::HostExposeEvent,
+) {
+    let nested_id = match xid_map.lock() {
+        Ok(map) => map.get(&ev.host_xid).copied(),
+        Err(_) => None,
+    };
+    let Some(window) = nested_id else { return };
+    crate::server::emit_window_event(server, window, 0x0000_8000, |buf, seq, order| {
+        x11::encode_expose_event(
+            buf, seq, order, window, ev.x, ev.y, ev.width, ev.height, ev.count,
+        );
+    });
+}
+
 /// Walk every mapped descendant of `root` and send Expose to those that
 /// selected ExposureMask.  Used after a top-level window becomes viewable so
 /// that deeply-nested widgets (e.g. Xt ClockWidget) redraw immediately.
@@ -651,7 +673,7 @@ fn emit_expose_subtree(server: &Arc<Mutex<ServerState>>, root: ResourceId) {
         };
         if let Some((w, h)) = extents {
             crate::server::emit_window_event(server, child, 0x0000_8000, |buf, seq, order| {
-                x11::encode_expose_event(buf, seq, order, child, w, h);
+                x11::encode_expose_event(buf, seq, order, child, 0, 0, w, h, 0);
             });
             emit_expose_subtree(server, child);
         }
@@ -1963,7 +1985,7 @@ fn handle_request(
                                 0x0000_8000,
                                 |buf, seq, order| {
                                     x11::encode_expose_event(
-                                        buf, seq, order, window, width, height,
+                                        buf, seq, order, window, 0, 0, width, height, 0,
                                     );
                                 },
                             );
@@ -2042,7 +2064,9 @@ fn handle_request(
                             child,
                             0x0000_8000,
                             |buf, seq, order| {
-                                x11::encode_expose_event(buf, seq, order, child, width, height);
+                                x11::encode_expose_event(
+                                    buf, seq, order, child, 0, 0, width, height, 0,
+                                );
                             },
                         );
                     }
@@ -2231,8 +2255,11 @@ fn handle_request(
                                         seq,
                                         order,
                                         window_id,
+                                        0,
+                                        0,
                                         geometry.width,
                                         geometry.height,
+                                        0,
                                     );
                                 },
                             );
