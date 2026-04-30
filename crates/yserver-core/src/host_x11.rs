@@ -983,9 +983,17 @@ impl HostX11 {
         // 1. CreateWindow request — parent is the container (self.window_id).
         let cw_seq = self.sequence;
         let mut out = Vec::new();
+        // Top-level subwindow attributes:
+        // - bit-gravity = NorthWest (1<<4): preserve pixels on a resize.
+        // - backing-store = Always (1<<6, value 2): the host preserves the
+        //   subwindow's pixel content even when occluded or its parent is
+        //   resized in ways that would otherwise discard it. Without this
+        //   the host can drop pixels when the container is resized and
+        //   apps appear blank until the next Expose-driven redraw.
+        let value_mask: u32 = (1 << 4) | (1 << 6);
         out.push(1); // CreateWindow opcode
         out.push(0); // depth = CopyFromParent
-        write_u16(&mut out, 8); // length: 8 units * 4 = 32 bytes
+        write_u16(&mut out, 10); // length: 8 fixed + 2 values = 10 units
         write_u32(&mut out, host_xid);
         write_u32(&mut out, self.window_id); // parent = container
         write_i16(&mut out, x);
@@ -997,7 +1005,9 @@ impl HostX11 {
         write_u16(&mut out, 0); // border_width
         write_u16(&mut out, 0); // class = CopyFromParent
         write_u32(&mut out, 0); // visual = CopyFromParent
-        write_u32(&mut out, 0); // value-mask = 0
+        write_u32(&mut out, value_mask);
+        write_u32(&mut out, 1); // bit-gravity = NorthWest
+        write_u32(&mut out, 2); // backing-store = Always
         self.stream.write_all(&out)?;
         self.sequence = self.sequence.wrapping_add(1);
 
@@ -2354,10 +2364,18 @@ fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
 }
 
 fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> io::Result<()> {
+    // Value-mask: bg-pixel (bit 1) | bit-gravity (bit 4) | event-mask (bit 11).
+    // bit-gravity = NorthWest (1) so a host-side resize preserves the NW pixels.
+    // Without this the gravity defaults to Forget and the host server is free
+    // to clear the entire container on resize, which paints over every visible
+    // subwindow and leaves the desktop blank until the apps redraw.
+    let value_mask: u32 = (1 << 1) | (1 << 4) | (1 << 11);
+    // length = 3 fixed words + 1 word per value bit (3 values). 3 + 3 = 6
+    // fixed; add 4-word CreateWindow header → 10 total length units.
     let mut out = Vec::new();
     out.push(1);
     out.push(setup.root_depth);
-    write_u16(&mut out, 10);
+    write_u16(&mut out, 11);
     write_u32(&mut out, window_id);
     write_u32(&mut out, setup.root);
     write_i16(&mut out, 80);
@@ -2367,9 +2385,10 @@ fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> 
     write_u16(&mut out, 0);
     write_u16(&mut out, 1);
     write_u32(&mut out, setup.root_visual);
-    write_u32(&mut out, (1 << 1) | (1 << 11));
-    write_u32(&mut out, setup.white_pixel);
-    write_u32(&mut out, 0x0000_8000 | 0x0002_0000);
+    write_u32(&mut out, value_mask);
+    write_u32(&mut out, setup.white_pixel); // bg-pixel
+    write_u32(&mut out, 1); // bit-gravity = NorthWest
+    write_u32(&mut out, 0x0000_8000 | 0x0002_0000); // event-mask
     stream.write_all(&out)
 }
 
