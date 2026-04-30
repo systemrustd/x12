@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     os::unix::net::UnixStream,
     sync::{
@@ -223,6 +223,9 @@ pub struct ClientHandle {
     pub resource_id_base: u32,
     pub resource_id_mask: u32,
     pub event_masks: HashMap<ResourceId, u32>,
+    /// Foreign windows the client wants kept alive after disconnect
+    /// (X11 ChangeSaveSet semantics).
+    pub save_set: HashSet<ResourceId>,
 }
 
 /// Snapshot of a client's writer for cross-client event fanout.
@@ -782,6 +785,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
+                save_set: HashSet::new(),
             },
         );
         state.clients.insert(
@@ -793,6 +797,7 @@ mod tests {
                 resource_id_base: 0x0020_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]),
+                save_set: HashSet::new(),
             },
         );
         // PropertyChange = 0x0040_0000
@@ -812,6 +817,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x200), 0xFFFF_FFFF)]),
+                save_set: HashSet::new(),
             },
         );
         let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -830,6 +836,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
+                save_set: HashSet::new(),
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -849,6 +856,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0b1010)]),
+                save_set: HashSet::new(),
             },
         );
         state.clients.insert(
@@ -860,6 +868,7 @@ mod tests {
                 resource_id_base: 0x0020_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0b0100)]),
+                save_set: HashSet::new(),
             },
         );
 
@@ -894,6 +903,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::new(),
+                save_set: HashSet::new(),
             },
         );
 
@@ -925,6 +935,7 @@ mod tests {
                 resource_id_base: 0x0010_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0002_0000)]), // StructureNotify
+                save_set: HashSet::new(),
             },
         );
         state.clients.insert(
@@ -936,6 +947,7 @@ mod tests {
                 resource_id_base: 0x0020_0000,
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]), // KeyPress
+                save_set: HashSet::new(),
             },
         );
 
@@ -974,6 +986,7 @@ mod tests {
                     (ResourceId(0x100), 0x0040_0000),
                     (ResourceId(0x200), 0x0040_0000),
                 ]),
+                save_set: HashSet::new(),
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -1008,6 +1021,7 @@ mod tests {
                     resource_id_base: 0x0010_0000,
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]), // ButtonPress
+                    save_set: HashSet::new(),
                 },
             );
             s.clients.insert(
@@ -1019,6 +1033,7 @@ mod tests {
                     resource_id_base: 0x0020_0000,
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0040)]), // PointerMotion
+                    save_set: HashSet::new(),
                 },
             );
             s.clients.insert(
@@ -1030,6 +1045,7 @@ mod tests {
                     resource_id_base: 0x0030_0000,
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
                 },
             );
         }
@@ -1087,6 +1103,7 @@ mod tests {
                     resource_id_base: 0x0010_0000,
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]),
+                    save_set: HashSet::new(),
                 },
             );
         }

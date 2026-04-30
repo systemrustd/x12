@@ -312,6 +312,7 @@ fn handle_client(
                 resource_id_base,
                 resource_id_mask,
                 event_masks: HashMap::new(),
+                save_set: std::collections::HashSet::new(),
             },
         );
     }
@@ -1619,6 +1620,84 @@ fn handle_request(
                 }
             }
             log_void(client_id, sequence, "DestroyWindow")
+        }
+        5 => {
+            // DestroySubwindows: window(4) — destroy each child of the parent.
+            if body.len() >= 4 {
+                let parent = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let kids: Vec<ResourceId> = lock_server(server)?
+                    .resources
+                    .children(parent)
+                    .iter()
+                    .copied()
+                    .collect();
+                for k in kids {
+                    let pending = {
+                        let mut s = lock_server(server)?;
+                        let mut order = Vec::new();
+                        collect_destroy_order(&s.resources, k, &mut order);
+                        let mut pending: Vec<PendingDestroy> = Vec::new();
+                        for w in &order {
+                            let (kparent, was_mapped, host_xid) =
+                                s.resources
+                                    .window(*w)
+                                    .map_or((ROOT_WINDOW, false, None), |win| {
+                                        (
+                                            win.parent,
+                                            win.map_state != MapState::Unmapped,
+                                            win.host_xid,
+                                        )
+                                    });
+                            let on_window = s.subscribers(*w, 0x0002_0000);
+                            let on_parent = s.subscribers(kparent, 0x0008_0000);
+                            pending.push(PendingDestroy {
+                                window: *w,
+                                parent: kparent,
+                                was_mapped,
+                                host_xid,
+                                on_window,
+                                on_parent,
+                            });
+                        }
+                        let _ = s.resources.destroy_window(k);
+                        s.drop_window_subscriptions(&order);
+                        pending
+                    };
+                    for entry in pending {
+                        if let Some(xid) = entry.host_xid {
+                            if let Some(host) = host
+                                && let Ok(mut h) = host.lock()
+                            {
+                                let _ = h.destroy_subwindow(xid);
+                            }
+                            if let Some(input_handle) = input_handle {
+                                input_handle.unregister_top_level(xid);
+                            }
+                        }
+                        fanout_destroy_sequence(&entry);
+                    }
+                }
+            }
+            log_void(client_id, sequence, "DestroySubwindows")
+        }
+        6 => {
+            // ChangeSaveSet: window(4); header.data = mode (0=Insert, 1=Delete)
+            if body.len() >= 4 {
+                let win = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let mut s = lock_server(server)?;
+                if let Some(c) = s.clients.get_mut(&client_id.0) {
+                    match header.data {
+                        0 => {
+                            c.save_set.insert(win);
+                        }
+                        1 => {
+                            c.save_set.remove(&win);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            log_void(client_id, sequence, "ChangeSaveSet")
         }
         7 => {
             if let Some(request) = x11::reparent_window_request(body) {
