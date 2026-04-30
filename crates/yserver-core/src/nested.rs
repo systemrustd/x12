@@ -1634,12 +1634,8 @@ fn handle_request(
             // DestroySubwindows: window(4) — destroy each child of the parent.
             if body.len() >= 4 {
                 let parent = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-                let kids: Vec<ResourceId> = lock_server(server)?
-                    .resources
-                    .children(parent)
-                    .iter()
-                    .copied()
-                    .collect();
+                let kids: Vec<ResourceId> =
+                    lock_server(server)?.resources.children(parent).to_vec();
                 for k in kids {
                     let pending = {
                         let mut s = lock_server(server)?;
@@ -2209,7 +2205,7 @@ fn handle_request(
                             .circulate_window(container, direction);
                         let on_child = lock_server(server)?.subscribers(child, 0x0002_0000);
                         let on_container = lock_server(server)?.subscribers(container, 0x0008_0000);
-                        for t in on_child.into_iter().chain(on_container.into_iter()) {
+                        for t in on_child.into_iter().chain(on_container) {
                             let seq = SequenceNumber(t.last_sequence.load(Ordering::Relaxed));
                             let mut buf = Vec::with_capacity(32);
                             let _ = x11::write_circulate_notify_event(

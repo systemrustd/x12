@@ -206,6 +206,54 @@ In rough priority order:
       GC per pixmap depth, created on demand using the target drawable
       as the depth/screen reference.
 
+- [x] **Phase 2 wrap-up: WM-grade opcodes.** Spec
+      [`2026-04-30-phase2-wrap-up-design.md`](superpowers/specs/2026-04-30-phase2-wrap-up-design.md);
+      plan
+      [`2026-04-30-phase2-wrap-up.md`](superpowers/plans/2026-04-30-phase2-wrap-up.md).
+      Reviewed by codex before execution.
+
+      Landed:
+      - `GrabKey` (33) / `UngrabKey` (34): per-server `KeyGrab` table
+        with `AnyKey` (keycode=0) and `AnyModifier` (0x8000) wildcards;
+        `find_key_grab` walks focus → ancestor chain → root.
+      - `GrabKeyboard` (31) / `UngrabKeyboard` (32): real
+        `ActiveKeyboardGrab` tracking; explicit-source.
+      - Key event routing: `route_key_event` pre-empts focus delivery
+        with active grabs; passive-key matches on `KeyPress` install a
+        temporary active keyboard grab tagged
+        `PassiveKey { keycode }` released on the matching `KeyRelease`.
+      - `GetKeyboardMapping` (101) / `GetModifierMapping` (119):
+        proxied to host with arbitrary `keysyms_per_keycode` and
+        `keycodes_per_modifier`; falls back to local stub on host
+        failure.
+      - `ChangeKeyboardMapping` (100): host-mediated no-op that
+        broadcasts `MappingNotify(Keyboard)` to all clients.
+      - `ChangeSaveSet` (6): per-client save-set storage on
+        `ClientHandle.save_set`. Spec-correct disconnect restore
+        (closest non-dying ancestor + remap + coord preservation) is a
+        follow-up.
+      - `DestroySubwindows` (5): recursive destroy of each child via
+        the existing `destroy_window` pipeline.
+      - `CirculateWindow` (13) + `CirculateNotify` (26) +
+        `CirculateRequest` (27): SubstructureRedirect path emits
+        request, otherwise rotates children naively (Phase-2 stacking
+        approximation).
+      - `CopyPlane` (63): host XCopyPlane forwarding mirroring CopyArea
+        plus the trailing plane mask.
+      - `ChangeActivePointerGrab` (30): mutates the
+        `ActivePointerGrab` record (event_mask / cursor / time);
+        `GrabPointer` / `UngrabPointer` updated to maintain the record.
+      - Bug: `DestroyWindow` now frees retained bg-pixmap host XIDs
+        across the destroyed subtree.
+
+      Deferred (still Phase 2, not yet landed): save-set restore on
+      disconnect (closest non-dying ancestor + coord preservation +
+      remap-if-unmapped), `GrabButton` sync replay through pump-thread
+      channel, RANDR `RRSelectInput` mask storage and host-resize
+      `RRScreenChangeNotify` delivery, RANDR 1.0 `RRGetScreenInfo`,
+      `SendEvent` parent propagation, `UnmapNotify.from_configure` for
+      shrunk children, manual Openbox/Fluxbox validation runs.
+
 ### Known follow-ups
 
 - **RRSelectInput mask storage.** `RRSelectInput` is accepted but the mask is not
@@ -277,16 +325,16 @@ Not started.
 |  1 | CreateWindow          | ✓ | host subwindow allocated for top-levels |
 |  2 | ChangeWindowAttributes | ✓ | event_masks, cursor, override_redirect, background-pixel, background-pixmap |
 |  3 | GetWindowAttributes   | ↩ | |
-|  4 | DestroyWindow         | ✓ | recursive; fires DestroyNotify/UnmapNotify |
-|  5 | DestroySubwindows     | ✗ | |
-|  6 | ChangeSaveSet         | ✗ | |
+|  4 | DestroyWindow         | ✓ | recursive; fires DestroyNotify/UnmapNotify; frees retained bg-pixmap host XIDs |
+|  5 | DestroySubwindows     | ✓ | recursively destroys each child via the existing destroy pipeline |
+|  6 | ChangeSaveSet         | ✓ | per-client storage; restore on disconnect is a follow-up |
 |  7 | ReparentWindow        | ✓ | fires ReparentNotify |
 |  8 | MapWindow             | ✓ | SubstructureRedirect to WM if registered |
 |  9 | MapSubwindows         | ✓ | |
 | 10 | UnmapWindow           | ✓ | fires UnmapNotify |
 | 11 | UnmapSubwindows       | ✓ | |
 | 12 | ConfigureWindow       | ✓ | SubstructureRedirect to WM if registered |
-| 13 | CirculateWindow       | ✗ | |
+| 13 | CirculateWindow       | ✓ | SubstructureRedirect emits CirculateRequest; otherwise naive child rotation + CirculateNotify |
 | 14 | GetGeometry           | ↩ | |
 | 15 | QueryTree             | ↩ | |
 
@@ -313,11 +361,11 @@ Not started.
 | 27 | UngrabPointer             | ✓ | clears active grab |
 | 28 | GrabButton                | ✓ | passive grabs stored; ButtonPress activates transient grab |
 | 29 | UngrabButton              | ✓ | removes matching passive grabs |
-| 30 | ChangeActivePointerGrab   | ✗ | |
-| 31 | GrabKeyboard              | ↩ | stub — returns GrabSuccess |
-| 32 | UngrabKeyboard            | ∅ | |
-| 33 | GrabKey                   | ∅ | |
-| 34 | UngrabKey                 | ∅ | |
+| 30 | ChangeActivePointerGrab   | ✓ | mutates active pointer grab record (event_mask / cursor / time) |
+| 31 | GrabKeyboard              | ✓ | installs explicit ActiveKeyboardGrab; returns GrabSuccess |
+| 32 | UngrabKeyboard            | ✓ | clears active keyboard grab if held by client |
+| 33 | GrabKey                   | ✓ | passive grab table; AnyKey/AnyModifier wildcards |
+| 34 | UngrabKey                 | ✓ | removes matching passive grabs |
 | 35 | AllowEvents               | ✓ | AsyncPointer/SyncPointer clears freeze; ReplayPointer re-routes |
 | 36 | GrabServer                | ∅ | |
 | 37 | UngrabServer              | ∅ | |
@@ -361,7 +409,7 @@ Not started.
 |----|-----------------------|--------|-------|
 | 61 | ClearArea             | ✓ | respects background-pixmap (CopyArea) or background-pixel fill |
 | 62 | CopyArea              | ✓ | host-backed win↔win, pixmap↔win etc. |
-| 63 | CopyPlane             | ✗ | |
+| 63 | CopyPlane             | ✓ | host XCopyPlane; mirrors CopyArea drawable matrix |
 | 64 | PolyPoint             | ✓ | forwarded to host; coord translation applied |
 | 65 | PolyLine              | ✓ | forwarded to host; pixmap drawables supported |
 | 66 | PolySegment           | ✓ | forwarded to host; both endpoints translated; pixmap drawables supported |
@@ -413,8 +461,8 @@ Not started.
 |----|---------------------------|--------|-------|
 |  98 | QueryExtension           | ↩ | RANDR advertised; all others absent |
 |  99 | ListExtensions           | ↩ | returns empty list |
-| 100 | ChangeKeyboardMapping    | ✗ | |
-| 101 | GetKeyboardMapping       | ↩ | stub keysyms |
+| 100 | ChangeKeyboardMapping    | ✓ | host-mediated no-op; broadcasts MappingNotify(Keyboard) |
+| 101 | GetKeyboardMapping       | ↩ | proxied to host; falls back to local stub on host failure |
 | 103 | Bell                     | ∅ | |
 | 104 | ChangeKeyboardControl    | ∅ | |
 | 108 | SetScreenSaver           | ∅ | |
@@ -423,7 +471,7 @@ Not started.
 | 116 | SetPointerMapping        | ∅ | |
 | 117 | GetPointerMapping        | ↩ | stub — buttons 1,2,3 |
 | 118 | SetModifierMapping       | ∅ | |
-| 119 | GetModifierMapping       | ↩ | stub — minimal modifier map |
+| 119 | GetModifierMapping       | ↩ | proxied to host; arbitrary keycodes_per_modifier |
 | 127 | NoOperation              | ∅ | |
 
 ### RANDR extension (major opcode 128)
