@@ -349,6 +349,30 @@ impl ResourceTable {
             .map_or(&[], |window| window.children.as_slice())
     }
 
+    /// Phase-2 naive CirculateWindow: rotate the back child to the front
+    /// (`direction = 0`, RaiseLowest) or the front child to the back
+    /// (`direction = 1`, LowerHighest). Returns the moved child if any.
+    /// Real obscuring detection is a Phase 4+ compositor concern.
+    pub fn circulate_window(&mut self, container: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids = &mut self.windows.get_mut(&container.0)?.children;
+        if kids.len() < 2 {
+            return None;
+        }
+        match direction {
+            0 => {
+                let last = kids.pop().expect("len>=2");
+                kids.insert(0, last);
+                Some(last)
+            }
+            1 => {
+                let first = kids.remove(0);
+                kids.push(first);
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
     pub fn mapped_children_bottom_to_top(&self, parent: ResourceId) -> Option<Vec<ResourceId>> {
         let parent = self.windows.get(&parent.0)?;
         Some(
@@ -1641,5 +1665,39 @@ mod tests {
             prop_assert_eq!(target.x_offset, expected_x);
             prop_assert_eq!(target.y_offset, expected_y);
         }
+    }
+
+    #[test]
+    fn circulate_window_raises_lowest_to_top() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x400, ROOT_WINDOW.0, 0, 0);
+        let moved = t.circulate_window(ROOT_WINDOW, 0).unwrap();
+        assert_eq!(moved, ResourceId(0x400));
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+        );
+    }
+
+    #[test]
+    fn circulate_window_lowers_highest_to_bottom() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        let moved = t.circulate_window(ROOT_WINDOW, 1).unwrap();
+        assert_eq!(moved, ResourceId(0x200));
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x200)]
+        );
+    }
+
+    #[test]
+    fn circulate_window_noop_with_lt_two_children() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        assert!(t.circulate_window(ROOT_WINDOW, 0).is_none());
     }
 }

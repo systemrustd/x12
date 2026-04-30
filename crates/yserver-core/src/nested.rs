@@ -2164,6 +2164,57 @@ fn handle_request(
             }
             log_void(client_id, sequence, "ConfigureWindow")
         }
+        13 => {
+            // CirculateWindow body: container(4); header.data = direction
+            // (0=RaiseLowest, 1=LowerHighest). The argument is the container.
+            if body.len() >= 4 {
+                let container =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let direction = header.data;
+                let chosen_child = {
+                    let s = lock_server(server)?;
+                    let kids = s.resources.children(container);
+                    match (direction, kids.first(), kids.last()) {
+                        (0, _, Some(&back)) => Some(back),
+                        (1, Some(&front), _) => Some(front),
+                        _ => None,
+                    }
+                };
+                if let Some(child) = chosen_child {
+                    let redirect_target = lock_server(server)?
+                        .subscribers(container, 0x0010_0000)
+                        .into_iter()
+                        .next();
+                    if let Some(target) = redirect_target {
+                        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+                        let mut buf = Vec::with_capacity(32);
+                        let _ = x11::write_circulate_request_event(
+                            &mut buf, seq, container, child, direction,
+                        );
+                        if let Ok(mut w) = target.writer.lock() {
+                            let _ = w.write_all(&buf);
+                        }
+                    } else {
+                        let _ = lock_server(server)?
+                            .resources
+                            .circulate_window(container, direction);
+                        let on_child = lock_server(server)?.subscribers(child, 0x0002_0000);
+                        let on_container = lock_server(server)?.subscribers(container, 0x0008_0000);
+                        for t in on_child.into_iter().chain(on_container.into_iter()) {
+                            let seq = SequenceNumber(t.last_sequence.load(Ordering::Relaxed));
+                            let mut buf = Vec::with_capacity(32);
+                            let _ = x11::write_circulate_notify_event(
+                                &mut buf, seq, child, child, direction,
+                            );
+                            if let Ok(mut w) = t.writer.lock() {
+                                let _ = w.write_all(&buf);
+                            }
+                        }
+                    }
+                }
+            }
+            log_void(client_id, sequence, "CirculateWindow")
+        }
         14 => {
             log_reply(client_id, sequence, "GetGeometry");
             let geometry = {
