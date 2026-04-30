@@ -2199,6 +2199,134 @@ pub fn encode_selection_clear_event(
     out.extend_from_slice(&buf);
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GrabKeyRequest {
+    pub owner_events: bool,
+    pub grab_window: u32,
+    pub modifiers: u16,
+    pub keycode: u8,
+    pub pointer_mode: u8,
+    pub keyboard_mode: u8,
+}
+
+#[must_use]
+pub fn parse_grab_key(body: &[u8], owner_events: bool) -> Option<GrabKeyRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(GrabKeyRequest {
+        owner_events,
+        grab_window: u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+        modifiers: u16::from_le_bytes([body[4], body[5]]),
+        keycode: body[6],
+        pointer_mode: body[7],
+        keyboard_mode: body[8],
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UngrabKeyRequest {
+    pub keycode: u8,
+    pub grab_window: u32,
+    pub modifiers: u16,
+}
+
+#[must_use]
+pub fn parse_ungrab_key(body: &[u8], keycode_in_header_data: u8) -> Option<UngrabKeyRequest> {
+    if body.len() < 6 {
+        return None;
+    }
+    Some(UngrabKeyRequest {
+        keycode: keycode_in_header_data,
+        grab_window: u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+        modifiers: u16::from_le_bytes([body[4], body[5]]),
+    })
+}
+
+pub fn write_mapping_notify_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = 34;
+    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    buf[4] = request;
+    buf[5] = first_keycode;
+    buf[6] = count;
+    writer.write_all(&buf)
+}
+
+pub fn write_circulate_notify_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    event_window: ResourceId,
+    window: ResourceId,
+    place: u8,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = 26;
+    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    buf[4..8].copy_from_slice(&event_window.0.to_le_bytes());
+    buf[8..12].copy_from_slice(&window.0.to_le_bytes());
+    buf[16] = place;
+    writer.write_all(&buf)
+}
+
+pub fn write_circulate_request_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    parent: ResourceId,
+    window: ResourceId,
+    place: u8,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = 27;
+    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    buf[4..8].copy_from_slice(&parent.0.to_le_bytes());
+    buf[8..12].copy_from_slice(&window.0.to_le_bytes());
+    buf[16] = place;
+    writer.write_all(&buf)
+}
+
+pub fn write_get_keyboard_mapping_reply_from_keysyms(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    keysyms_per_keycode: u8,
+    keysyms: &[u32],
+) -> io::Result<()> {
+    let length_words = u32::try_from(keysyms.len()).unwrap_or(0);
+    let mut reply = fixed_reply(sequence, keysyms_per_keycode, length_words);
+    reply.extend_from_slice(&[0u8; 24]);
+    reply.truncate(32);
+    for k in keysyms {
+        reply.extend_from_slice(&k.to_le_bytes());
+    }
+    writer.write_all(&reply)
+}
+
+pub fn write_get_modifier_mapping_reply_with_keycodes(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    keycodes_per_modifier: u8,
+    keycodes: &[u8],
+) -> io::Result<()> {
+    debug_assert_eq!(
+        keycodes.len(),
+        8 * keycodes_per_modifier as usize,
+        "GetModifierMapping payload must be exactly 8 * keycodes_per_modifier"
+    );
+    let total = 8 * u32::from(keycodes_per_modifier);
+    let length_words = total / 4;
+    let mut reply = fixed_reply(sequence, keycodes_per_modifier, length_words);
+    reply.extend_from_slice(&[0u8; 24]);
+    reply.truncate(32);
+    reply.extend_from_slice(keycodes);
+    writer.write_all(&reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3019,6 +3147,127 @@ mod tests {
         fn short_body_returns_none() {
             let body = [0u8; 19]; // 1 byte short of required 20 bytes
             assert!(put_image_request(2, &body).is_none());
+        }
+    }
+
+    mod phase2_keyboard_tests {
+        use super::*;
+
+        #[test]
+        fn parse_grab_key_request_basic() {
+            let body = [
+                0x12, 0x34, 0x00, 0x00, // grab_window 0x3412
+                0x40, 0x00, // modifiers 0x0040
+                24,   // keycode 24
+                1,    // pointer_mode async
+                1,    // keyboard_mode async
+                0, 0, 0, // pad
+            ];
+            let parsed = parse_grab_key(&body, false).unwrap();
+            assert_eq!(parsed.grab_window, 0x3412);
+            assert_eq!(parsed.modifiers, 0x0040);
+            assert_eq!(parsed.keycode, 24);
+            assert_eq!(parsed.pointer_mode, 1);
+            assert_eq!(parsed.keyboard_mode, 1);
+            assert!(!parsed.owner_events);
+        }
+
+        #[test]
+        fn parse_ungrab_key_request_basic() {
+            let body = [0x12, 0x34, 0x00, 0x00, 0x40, 0x00, 0, 0];
+            let parsed = parse_ungrab_key(&body, 24).unwrap();
+            assert_eq!(parsed.grab_window, 0x3412);
+            assert_eq!(parsed.keycode, 24);
+            assert_eq!(parsed.modifiers, 0x0040);
+        }
+
+        #[test]
+        fn mapping_notify_event_layout() {
+            let mut buf = Vec::new();
+            write_mapping_notify_event(&mut buf, SequenceNumber(0), 1, 8, 248).unwrap();
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 34);
+            assert_eq!(buf[4], 1);
+            assert_eq!(buf[5], 8);
+            assert_eq!(buf[6], 248);
+        }
+
+        #[test]
+        fn circulate_notify_event_layout() {
+            let mut buf = Vec::new();
+            write_circulate_notify_event(
+                &mut buf,
+                SequenceNumber(0),
+                ResourceId(0x100),
+                ResourceId(0x200),
+                0,
+            )
+            .unwrap();
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 26);
+            assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 0x100);
+            assert_eq!(
+                u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+                0x200
+            );
+            assert_eq!(buf[16], 0);
+        }
+
+        #[test]
+        fn circulate_request_event_layout() {
+            let mut buf = Vec::new();
+            write_circulate_request_event(
+                &mut buf,
+                SequenceNumber(0),
+                ResourceId(0x100),
+                ResourceId(0x200),
+                1,
+            )
+            .unwrap();
+            assert_eq!(buf[0], 27);
+            assert_eq!(buf[16], 1);
+        }
+
+        #[test]
+        fn keyboard_mapping_reply_from_keysyms_layout() {
+            let keysyms: &[u32] = &[0x71, 0x51, 0, 0, 0x77, 0x57, 0, 0];
+            let mut buf = Vec::new();
+            write_get_keyboard_mapping_reply_from_keysyms(&mut buf, SequenceNumber(7), 4, keysyms)
+                .unwrap();
+            assert_eq!(buf[0], 1);
+            assert_eq!(buf[1], 4);
+            assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 8);
+            assert_eq!(buf.len(), 32 + 8 * 4);
+            assert_eq!(
+                u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
+                0x71
+            );
+        }
+
+        #[test]
+        fn modifier_mapping_reply_layout_kpm_2() {
+            let kpm = 2u8;
+            let kc: Vec<u8> = (0..(8 * kpm)).map(|i| i + 8).collect();
+            let mut buf = Vec::new();
+            write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc)
+                .unwrap();
+            assert_eq!(buf[0], 1);
+            assert_eq!(buf[1], kpm);
+            let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            assert_eq!(length, (8 * u32::from(kpm)) / 4);
+            assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
+        }
+
+        #[test]
+        fn modifier_mapping_reply_layout_kpm_4() {
+            let kpm = 4u8;
+            let kc: Vec<u8> = (0..(8 * kpm)).map(|i| i + 8).collect();
+            let mut buf = Vec::new();
+            write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc)
+                .unwrap();
+            let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            assert_eq!(length, (8 * u32::from(kpm)) / 4);
+            assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
         }
     }
 }

@@ -2610,12 +2610,69 @@ fn handle_request(
             log_void(client_id, sequence, "UngrabButton")
         }
         31 => {
+            // GrabKeyboard body: owner_events(header.data) grab_window(4)
+            //   time(4) pointer_mode(1) keyboard_mode(1) pad(2)
+            if body.len() >= 12 {
+                let grab_window =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let mut s = lock_server(server)?;
+                s.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+                    owner: client_id,
+                    grab_window,
+                    source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                });
+            }
             log_reply(client_id, sequence, "GrabKeyboard");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
         }
-        32 => log_void(client_id, sequence, "UngrabKeyboard"),
-        33 => log_void(client_id, sequence, "GrabKey"),
-        34 => log_void(client_id, sequence, "UngrabKey"),
+        32 => {
+            let mut s = lock_server(server)?;
+            if let Some(g) = s.active_keyboard_grab
+                && g.owner == client_id
+            {
+                s.active_keyboard_grab = None;
+            }
+            log_void(client_id, sequence, "UngrabKeyboard")
+        }
+        33 => {
+            if let Some(req) = x11::parse_grab_key(body, header.data != 0) {
+                let mut s = lock_server(server)?;
+                let grab_window = ResourceId(req.grab_window);
+                s.key_grabs.retain(|g| {
+                    !(g.owner == client_id
+                        && g.grab_window == grab_window
+                        && g.keycode == req.keycode
+                        && g.modifiers == req.modifiers)
+                });
+                s.key_grabs.push(crate::server::KeyGrab {
+                    owner: client_id,
+                    grab_window,
+                    keycode: req.keycode,
+                    modifiers: req.modifiers,
+                    owner_events: req.owner_events,
+                    pointer_mode: req.pointer_mode,
+                    keyboard_mode: req.keyboard_mode,
+                });
+                debug!(
+                    "client {} GrabKey window=0x{:x} keycode={} modifiers=0x{:x}",
+                    client_id.0, req.grab_window, req.keycode, req.modifiers
+                );
+            }
+            log_void(client_id, sequence, "GrabKey")
+        }
+        34 => {
+            if let Some(req) = x11::parse_ungrab_key(body, header.data) {
+                let mut s = lock_server(server)?;
+                let grab_window = ResourceId(req.grab_window);
+                s.key_grabs.retain(|g| {
+                    !(g.owner == client_id
+                        && g.grab_window == grab_window
+                        && (g.keycode == req.keycode || req.keycode == 0)
+                        && (g.modifiers == req.modifiers || req.modifiers == 0x8000))
+                });
+            }
+            log_void(client_id, sequence, "UngrabKey")
+        }
         36 => log_void(client_id, sequence, "GrabServer"),
         37 => log_void(client_id, sequence, "UngrabServer"),
         38 => {
