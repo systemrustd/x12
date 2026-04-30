@@ -20,6 +20,12 @@ struct HostRenderInfo {
     fmt_argb32: u32,
 }
 
+struct HostXkbInfo {
+    opcode: u8,
+    first_event: u8,
+    first_error: u8,
+}
+
 pub struct HostX11 {
     stream: UnixStream,
     window_id: u32,
@@ -30,6 +36,7 @@ pub struct HostX11 {
     sequence: u16,
     next_xid: u32,
     render: Option<HostRenderInfo>,
+    xkb: Option<HostXkbInfo>,
     // Responses read during create_subwindow drain loops that belong to future
     // requests (sequence > geom_seq at time of read). Without this buffer,
     // the drain loop for window N discards the GetGeometry reply for window N+k,
@@ -93,10 +100,12 @@ impl HostX11 {
             sequence: 5,
             next_xid: setup.resource_id_base + 3,
             render: None,
+            xkb: None,
             reply_buffer: Vec::new(),
             depth_gcs: HashMap::new(),
         };
         this.render = this.init_render().ok();
+        this.xkb = this.init_xkb().ok();
         Ok(this)
     }
 
@@ -293,6 +302,16 @@ impl HostX11 {
         self.render.as_ref().map(|r| r.opcode)
     }
 
+    pub fn xkb_opcode(&self) -> Option<u8> {
+        self.xkb.as_ref().map(|r| r.opcode)
+    }
+
+    pub fn xkb_info(&self) -> Option<(u8, u8, u8)> {
+        self.xkb
+            .as_ref()
+            .map(|r| (r.opcode, r.first_event, r.first_error))
+    }
+
     pub fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
         let r = self.render.as_ref()?;
         match ynest_fmt {
@@ -370,6 +389,67 @@ impl HostX11 {
                 return Ok(info);
             }
         }
+    }
+
+    fn init_xkb(&mut self) -> io::Result<HostXkbInfo> {
+        let ext_name = b"XKEYBOARD";
+        let padded = padded_len(ext_name.len());
+        let length_units = 2 + (padded / 4) as u16;
+        let ext_seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(98u8);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u16(&mut out, ext_name.len() as u16);
+        write_u16(&mut out, 0);
+        out.extend_from_slice(ext_name);
+        out.resize(8 + padded, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        let (opcode, first_event, first_error);
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == ext_seq {
+                if resp.bytes[8] == 0 {
+                    return Err(io::Error::other("host XKEYBOARD extension not present"));
+                }
+                opcode = resp.bytes[9];
+                first_event = resp.bytes[10];
+                first_error = resp.bytes[11];
+                break;
+            }
+        }
+
+        // We also need to send UseExtension to the host for XKB to be fully functional.
+        let use_seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(opcode);
+        out.push(0); // UseExtension
+        write_u16(&mut out, 2);
+        write_u16(&mut out, 1); // want major 1
+        write_u16(&mut out, 0); // want minor 0
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == use_seq {
+                // byte 8 is supported (bool)
+                if resp.bytes[8] == 0 {
+                    return Err(io::Error::other("host XKB UseExtension failed"));
+                }
+                break;
+            }
+        }
+
+        Ok(HostXkbInfo {
+            opcode,
+            first_event,
+            first_error,
+        })
     }
 
     pub fn render_create_picture(
@@ -592,6 +672,70 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    /// Forward a RENDER request whose first body word is a picture XID.
+    /// `minor` is the RENDER sub-opcode; `body` is everything after the 4-byte
+    /// request header.  The first 4 bytes of `body` are replaced with
+    /// `host_pic` before forwarding.
+    fn render_forward_picture_op(
+        &mut self,
+        minor: u8,
+        host_pic: u32,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        let total = 4 + body.len();
+        let length_units =
+            u16::try_from(total / 4).map_err(|_| io::Error::other("RENDER request too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(total);
+        out.push(opcode);
+        out.push(minor);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_pic); // overwrite client picture XID
+        if body.len() > 4 {
+            out.extend_from_slice(&body[4..]);
+        }
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    /// RENDER::SetPictureTransform (minor=28): forward transform matrix to host.
+    pub fn render_set_picture_transform(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
+        self.render_forward_picture_op(28, host_pic, body)
+    }
+
+    /// RENDER::SetPictureFilter (minor=30): forward filter name + values to host.
+    pub fn render_set_picture_filter(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
+        self.render_forward_picture_op(30, host_pic, body)
+    }
+
+    /// RENDER::CreateLinearGradient (minor=34): create gradient picture on host.
+    /// `host_pic` is a fresh XID already allocated by the caller.
+    /// `body` is the client body after the picture XID field (p1 x/y, p2 x/y,
+    /// num_stops, offsets[], colors[]).
+    pub fn render_create_linear_gradient(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
+        self.render_forward_picture_op(34, host_pic, body)
+    }
+
+    pub fn render_create_radial_gradient(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
+        self.render_forward_picture_op(31, host_pic, body)
+    }
+
+    pub fn render_change_picture(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
+        self.render_forward_picture_op(5, host_pic, body)
+    }
+
+    pub fn render_set_picture_clip_rectangles(
+        &mut self,
+        host_pic: u32,
+        body: &[u8],
+    ) -> io::Result<()> {
+        self.render_forward_picture_op(6, host_pic, body)
+    }
+
     pub fn render_create_solid_fill(&mut self, host_pic: u32, color: [u8; 8]) -> io::Result<()> {
         let Some(r) = self.render.as_ref() else {
             return Ok(());
@@ -734,6 +878,69 @@ impl HostX11 {
                 let minor = read_u32(&resp.bytes[12..16]);
                 return Ok((major, minor));
             }
+        }
+    }
+
+    pub fn xkb_proxy(&mut self, minor: u8, body: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let Some(xkb) = self.xkb.as_ref() else {
+            return Err(io::Error::other("XKB not available on host"));
+        };
+        let target = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+
+        // Standard X11 request: major(1) minor(1) length(2)
+        let total_len = body.len() + 4;
+        let length_units = u16::try_from(total_len / 4)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "XKB request too large"))?;
+
+        let mut out = Vec::with_capacity(total_len);
+        out.push(xkb.opcode);
+        out.push(minor);
+        write_u16(&mut out, length_units);
+        out.extend_from_slice(body);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        // Minor opcodes that yield replies in XKB 1.0.
+        // Source: X11/extensions/XKBproto.h and XKB protocol spec.
+        // 21 = XkbPerClientFlags: Xlib calls _XReply() for this.
+        let has_reply = matches!(
+            minor,
+            0 | 3
+                | 4
+                | 5
+                | 6
+                | 8
+                | 10
+                | 12
+                | 14
+                | 16
+                | 17
+                | 18
+                | 20
+                | 21
+                | 22
+                | 24
+                | 26
+                | 28
+                | 30
+                | 33
+                | 101
+        );
+        if !has_reply {
+            return Ok(None);
+        }
+
+        if let Some(pos) = self.reply_buffer.iter().position(|r| r.sequence == target) {
+            return Ok(Some(self.reply_buffer.remove(pos).bytes));
+        }
+
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == target {
+                return Ok(Some(resp.bytes));
+            }
+            self.reply_buffer.push(resp);
         }
     }
 

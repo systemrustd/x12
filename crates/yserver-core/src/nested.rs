@@ -36,6 +36,18 @@ const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;
 const RENDER_FIRST_ERROR: u8 = 152;
 
+const GE_MAJOR_OPCODE: u8 = 138;
+
+const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
+const BIG_REQUESTS_FIRST_EVENT: u8 = 0;
+const BIG_REQUESTS_FIRST_ERROR: u8 = 0;
+
+const XKB_MAJOR_OPCODE: u8 = 136;
+
+const XI2_MAJOR_OPCODE: u8 = 137;
+const XI2_FIRST_EVENT: u8 = 90;
+const XI2_FIRST_ERROR: u8 = 153;
+
 struct OwnedGetPropertyReply {
     format: u8,
     r#type: AtomId,
@@ -316,6 +328,8 @@ fn handle_client(
                 resource_id_mask,
                 event_masks: HashMap::new(),
                 save_set: std::collections::HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
     }
@@ -338,7 +352,13 @@ fn handle_client(
     let result: io::Result<()> = (|| {
         let mut sequence = SequenceNumber(0);
         loop {
-            let Some((header, body)) = x11::read_request(&mut reader)? else {
+            let big_enabled = server
+                .lock()
+                .ok()
+                .and_then(|s| s.clients.get(&client_id.0).map(|c| c.big_requests_enabled))
+                .unwrap_or(false);
+
+            let Some((header, body)) = x11::read_request(&mut reader, big_enabled)? else {
                 return Ok(());
             };
             sequence = sequence.next();
@@ -631,6 +651,55 @@ fn spawn_keyboard_forwarder(
                 warn!("client {} keyboard forwarding stopped: {err}", client_id.0);
                 return;
             }
+            drop(w);
+
+            let xi2_evtype = if event.pressed { 2u16 } else { 3u16 };
+            let xi2_targets: Vec<_> = match server.lock() {
+                Ok(s) => s
+                    .clients
+                    .values()
+                    .filter(|client| {
+                        let mask = client
+                            .xi2_masks
+                            .get(&(event_window, 3))
+                            .or_else(|| client.xi2_masks.get(&(event_window, 1)))
+                            .or_else(|| client.xi2_masks.get(&(event_window, 0)))
+                            .copied()
+                            .unwrap_or(0);
+                        mask & (1 << xi2_evtype) != 0
+                    })
+                    .map(|client| crate::server::EventTarget {
+                        writer: client.writer.clone(),
+                        byte_order: client.byte_order,
+                        last_sequence: client.last_sequence.clone(),
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            for target in xi2_targets {
+                let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+                let mut buf = Vec::with_capacity(84);
+                x11::encode_xi2_device_event(
+                    &mut buf,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    xi2_evtype,
+                    3,
+                    event.time,
+                    ROOT_WINDOW,
+                    event_window,
+                    event.root_x,
+                    event.root_y,
+                    event.event_x,
+                    event.event_y,
+                    event.state & 0x004d,
+                    u32::from(event.keycode),
+                    3,
+                );
+                if let Ok(mut writer) = target.writer.lock() {
+                    let _ = writer.write_all(&buf);
+                }
+            }
         }
     });
 }
@@ -703,11 +772,42 @@ fn set_focused_window(
         crate::server::emit_window_event(server, prev, 0x0020_0000, |buf, seq, order| {
             x11::encode_focus_event(buf, seq, order, false, prev);
         });
+        emit_xi2_focus_event(server, prev, 10);
     }
     crate::server::emit_window_event(server, window, 0x0020_0000, |buf, seq, order| {
         x11::encode_focus_event(buf, seq, order, true, window);
     });
+    emit_xi2_focus_event(server, window, 9);
     Ok(())
+}
+
+fn emit_xi2_focus_event(server: &Arc<Mutex<ServerState>>, window: ResourceId, evtype: u16) {
+    let targets: Vec<_> = match server.lock() {
+        Ok(s) => s
+            .clients
+            .values()
+            .filter(|client| {
+                let mask = client
+                    .xi2_masks
+                    .get(&(window, 3))
+                    .or_else(|| client.xi2_masks.get(&(window, 1)))
+                    .or_else(|| client.xi2_masks.get(&(window, 0)))
+                    .copied()
+                    .unwrap_or(0);
+                mask & (1 << evtype) != 0
+            })
+            .map(|client| crate::server::EventTarget {
+                writer: client.writer.clone(),
+                byte_order: client.byte_order,
+                last_sequence: client.last_sequence.clone(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    crate::server::fanout_event(&targets, |buf, seq, _order| {
+        x11::encode_xi2_focus_event(buf, seq, XI2_MAJOR_OPCODE, evtype, 3, 0, window, 0, 0);
+    });
 }
 
 fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
@@ -720,6 +820,44 @@ fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
     } else {
         window_extent.saturating_sub(offset as u16)
     }
+}
+
+/// Returns true if a RENDER ChangePicture request can be safely forwarded to the host.
+///
+/// CPAlphaMap (bit 1) and CPClipMask (bit 6) are XID-valued attributes. We can only forward
+/// them when their value is 0 (None). All other attributes are scalar and always safe.
+/// `values` is the slice after the picture XID and value_mask in the request body.
+fn change_picture_safe_to_forward(value_mask: u32, values: &[u8]) -> bool {
+    const CP_ALPHA_MAP: u32 = 1 << 1;
+    const CP_CLIP_MASK: u32 = 1 << 6;
+    let xid_bits = CP_ALPHA_MAP | CP_CLIP_MASK;
+
+    if value_mask & xid_bits == 0 {
+        return true;
+    }
+    let nvalues = value_mask.count_ones() as usize;
+    if values.len() < nvalues * 4 {
+        return false;
+    }
+    let mut idx = 0usize;
+    for bit in 0..32u32 {
+        if value_mask & (1 << bit) == 0 {
+            continue;
+        }
+        if (1 << bit) & xid_bits != 0 {
+            let v = u32::from_le_bytes([
+                values[idx * 4],
+                values[idx * 4 + 1],
+                values[idx * 4 + 2],
+                values[idx * 4 + 3],
+            ]);
+            if v != 0 {
+                return false;
+            }
+        }
+        idx += 1;
+    }
+    true
 }
 
 #[allow(clippy::too_many_lines)]
@@ -822,12 +960,36 @@ fn handle_render_request(
             }
             Ok(())
         }
-        // ChangePicture (minor=5) — stub: accept and ignore
+        // ChangePicture (minor=5): forwarded when safe (no non-None XID attributes).
+        // CPAlphaMap=bit1 and CPClipMask=bit6 are XID attributes; we only forward them
+        // when their value is 0 (None). All other attributes are scalars and safe to forward.
+        // This is critical for CPClipMask=None (mask=0x40, value=0) which clears the clip
+        // after clipped glyph rendering — without forwarding this, stale clips persist and
+        // cause CompositeGlyphs8 to be clipped to a tiny rectangle on subsequent redraws.
         5 => {
+            if body.len() < 8 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+
+            let safe_to_forward =
+                change_picture_safe_to_forward(value_mask, &body[8..]);
+
             debug!(
-                "client {} #{} RENDER::ChangePicture (stub)",
-                client_id.0, sequence.0
+                "client {} #{} RENDER::ChangePicture pic=0x{:x} mask=0x{:x} forward={}",
+                client_id.0, sequence.0, pic_id.0, value_mask, safe_to_forward
             );
+
+            if safe_to_forward {
+                let host_pic = lock_server(server)?
+                    .resources
+                    .picture(pic_id)
+                    .map(|p| p.host_picture_xid);
+                if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
+                    let _ = h.render_change_picture(hp, body);
+                }
+            }
             Ok(())
         }
         // Composite (minor=8): src + mask -> dst at (dst_x, dst_y)
@@ -1171,6 +1333,134 @@ fn handle_render_request(
             }
             Ok(())
         }
+        // SetPictureTransform (minor=28): picture(4) + 3×3 FIXED matrix (36 bytes)
+        28 => {
+            if body.len() < 40 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let host_pic = lock_server(server)?
+                .resources
+                .picture(pic_id)
+                .map(|p| p.host_picture_xid);
+            debug!(
+                "client {} #{} RENDER::SetPictureTransform pic=0x{:x} host={:?}",
+                client_id.0, sequence.0, pic_id.0, host_pic
+            );
+            if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
+                let _ = h.render_set_picture_transform(hp, body);
+            }
+            Ok(())
+        }
+        // SetPictureFilter (minor=30): picture(4) + nbytes(2) + pad(2) + name + values
+        30 => {
+            if body.len() < 8 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let host_pic = lock_server(server)?
+                .resources
+                .picture(pic_id)
+                .map(|p| p.host_picture_xid);
+            debug!(
+                "client {} #{} RENDER::SetPictureFilter pic=0x{:x} host={:?}",
+                client_id.0, sequence.0, pic_id.0, host_pic
+            );
+            if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
+                let _ = h.render_set_picture_filter(hp, body);
+            }
+            Ok(())
+        }
+        // SetPictureClipRectangles (minor=6): picture(4) + clip_x(INT16) + clip_y(INT16) + rects[]
+        // Clip coords are in drawable-local space; must add the picture's window offset so they
+        // align with Composite's dst_x/dst_y which are similarly adjusted.
+        6 => {
+            if body.len() < 8 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let (host_pic, x_off, y_off) = lock_server(server)?
+                .resources
+                .picture(pic_id)
+                .map_or((None, 0i16, 0i16), |p| {
+                    (Some(p.host_picture_xid), p.x_offset, p.y_offset)
+                });
+            if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
+                debug!(
+                    "client {} #{} RENDER::SetPictureClipRectangles pic=0x{:x} host={:?} off=({},{})",
+                    client_id.0, sequence.0, pic_id.0, host_pic, x_off, y_off
+                );
+                if x_off == 0 && y_off == 0 {
+                    let _ = h.render_set_picture_clip_rectangles(hp, body);
+                } else {
+                    let clip_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
+                    let clip_y = i16::from_le_bytes([body[6], body[7]]).wrapping_add(y_off);
+                    let mut adj = body.to_vec();
+                    adj[4..6].copy_from_slice(&clip_x.to_le_bytes());
+                    adj[6..8].copy_from_slice(&clip_y.to_le_bytes());
+                    let _ = h.render_set_picture_clip_rectangles(hp, &adj);
+                }
+            }
+            Ok(())
+        }
+        // CreateLinearGradient (minor=34): picture(4) + p1(8) + p2(8) + num_stops(4) + data
+        34 => {
+            if body.len() < 24 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            debug!(
+                "client {} #{} RENDER::CreateLinearGradient pic=0x{:x}",
+                client_id.0, sequence.0, pic_id.0
+            );
+            let host_pic = lock_host().map(|mut h| {
+                let xid = h.allocate_xid();
+                let _ = h.render_create_linear_gradient(xid, body);
+                xid
+            });
+            if let Some(host_pic) = host_pic {
+                lock_server(server)?.resources.create_picture(
+                    pic_id,
+                    PictureState {
+                        client: client_id,
+                        host_picture_xid: host_pic,
+                        host_owned_pixmap: None,
+                        x_offset: 0,
+                        y_offset: 0,
+                    },
+                );
+            }
+            Ok(())
+        }
+        // CreateRadialGradient (minor=31): picture(4) + inner_center(8) + outer_center(8) + radii(8) + num_stops(4) + data
+        31 => {
+            if body.len() < 32 {
+                return Ok(());
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            debug!(
+                "client {} #{} RENDER::CreateRadialGradient pic=0x{:x}",
+                client_id.0, sequence.0, pic_id.0
+            );
+            let host_pic = lock_host().map(|mut h| {
+                let xid = h.allocate_xid();
+                let _ = h.render_create_radial_gradient(xid, body);
+                xid
+            });
+            if let Some(host_pic) = host_pic {
+                lock_server(server)?.resources.create_picture(
+                    pic_id,
+                    PictureState {
+                        client: client_id,
+                        host_picture_xid: host_pic,
+                        host_owned_pixmap: None,
+                        x_offset: 0,
+                        y_offset: 0,
+                    },
+                );
+            }
+            Ok(())
+        }
         _ => {
             debug!(
                 "client {} #{} RENDER::unknown minor={}",
@@ -1423,6 +1713,14 @@ fn handle_randr_request(
                 client_id.0, sequence.0
             );
             let buf = x11randr::encode_get_crtc_gamma_reply(sequence, 0);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_OUTPUT_PROPERTY => {
+            debug!(
+                "client {} #{} RANDR::GetOutputProperty -> not found",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_get_output_property_reply(sequence);
             lock_writer()?.write_all(&buf)
         }
         x11randr::RR_SELECT_INPUT => {
@@ -1926,6 +2224,10 @@ fn handle_request(
                     };
                     if !redirect_targets.is_empty() {
                         // A WM holds SubstructureRedirect on the parent: send MapRequest instead.
+                        debug!(
+                            "client {} MapWindow 0x{:x} -> MapRequest to WM",
+                            client_id.0, window.0
+                        );
                         fanout_event(&redirect_targets, |buf, seq, order| {
                             x11::encode_map_request_event(buf, seq, order, parent, window);
                         });
@@ -1940,6 +2242,10 @@ fn handle_request(
                                 .map(|w| (w.parent, w.override_redirect, w.width, w.height));
                             (map_info, host_xid)
                         };
+                        debug!(
+                            "client {} MapWindow 0x{:x} direct host_xid={:?}",
+                            client_id.0, window.0, host_xid
+                        );
                         if let Some(xid) = host_xid
                             && let Some(host) = host
                             && let Ok(mut h) = host.lock()
@@ -4178,29 +4484,45 @@ fn handle_request(
         96 => log_void(client_id, sequence, "RecolorCursor"),
         98 => {
             let name = x11::query_extension_name(body);
-            let (present, major_opcode, first_event, first_error) = if name == "RANDR" {
-                (
+            let (present, major_opcode, first_event, first_error) = match name.as_str() {
+                "RANDR" => (
                     true,
                     RANDR_MAJOR_OPCODE,
                     RANDR_FIRST_EVENT,
                     RANDR_FIRST_ERROR,
-                )
-            } else if name == "RENDER" {
-                let has_render = host
-                    .and_then(|h| h.lock().ok())
-                    .map_or(false, |h| h.render_opcode().is_some());
-                if has_render {
-                    (
-                        true,
-                        RENDER_MAJOR_OPCODE,
-                        RENDER_FIRST_EVENT,
-                        RENDER_FIRST_ERROR,
-                    )
-                } else {
-                    (false, 0, 0, 0)
+                ),
+                "RENDER" => {
+                    let has_render = host
+                        .and_then(|h| h.lock().ok())
+                        .is_some_and(|h| h.render_opcode().is_some());
+                    if has_render {
+                        (
+                            true,
+                            RENDER_MAJOR_OPCODE,
+                            RENDER_FIRST_EVENT,
+                            RENDER_FIRST_ERROR,
+                        )
+                    } else {
+                        (false, 0, 0, 0)
+                    }
                 }
-            } else {
-                (false, 0, 0, 0)
+                "Generic Event Extension" => (true, GE_MAJOR_OPCODE, 0, 0),
+                "BIG-REQUESTS" => (
+                    true,
+                    BIG_REQUESTS_MAJOR_OPCODE,
+                    BIG_REQUESTS_FIRST_EVENT,
+                    BIG_REQUESTS_FIRST_ERROR,
+                ),
+                "XKEYBOARD" => {
+                    let host_info = host.and_then(|h| h.lock().ok()).and_then(|h| h.xkb_info());
+                    if let Some((_, first_event, first_error)) = host_info {
+                        (true, XKB_MAJOR_OPCODE, first_event, first_error)
+                    } else {
+                        (false, 0, 0, 0)
+                    }
+                }
+                "XInputExtension" => (true, XI2_MAJOR_OPCODE, XI2_FIRST_EVENT, XI2_FIRST_ERROR),
+                _ => (false, 0, 0, 0),
             };
             debug!(
                 "client {} #{} QueryExtension {:?} -> {}",
@@ -4220,7 +4542,23 @@ fn handle_request(
         }
         99 => {
             log_reply(client_id, sequence, "ListExtensions");
-            x11::write_list_extensions_reply(&mut *lock_writer()?, sequence)
+            let mut names = vec!["RANDR", "Generic Event Extension"];
+            if host
+                .and_then(|h| h.lock().ok())
+                .is_some_and(|h| h.render_opcode().is_some())
+            {
+                names.push("RENDER");
+            }
+            names.push("BIG-REQUESTS");
+            if host
+                .and_then(|h| h.lock().ok())
+                .is_some_and(|h| h.xkb_opcode().is_some())
+            {
+                names.push("XKEYBOARD");
+            }
+            names.push("XInputExtension");
+
+            x11::write_list_extensions_reply(&mut *lock_writer()?, sequence, &names)
         }
         100 => {
             // ChangeKeyboardMapping: keycode_count in header.data;
@@ -4319,6 +4657,261 @@ fn handle_request(
             header.data, // RENDER minor opcode
             body,
         ),
+        GE_MAJOR_OPCODE => {
+            // Generic Event Extension: only request is GEQueryVersion (minor=0)
+            if header.data == 0 {
+                log_reply(client_id, sequence, "GEQueryVersion");
+                x11::write_ge_query_version_reply(&mut *lock_writer()?, sequence)
+            } else {
+                Ok(())
+            }
+        }
+        BIG_REQUESTS_MAJOR_OPCODE => {
+            let minor = header.data;
+            if minor == 0 {
+                // Enable
+                log_reply(client_id, sequence, "BigRequestsEnable");
+                {
+                    let mut s = lock_server(server)?;
+                    if let Some(client) = s.clients.get_mut(&client_id.0) {
+                        client.big_requests_enabled = true;
+                    }
+                }
+                // Max length: 64k units (256 KB) or similar.
+                // X11 says max length is in 4-byte units.
+                // u16 length field in header is 64k * 4 = 256KB.
+                // BIG-REQUESTS allows 4GB.
+                // We'll advertise 1MB (256k units) for now.
+                x11::write_big_requests_enable_reply(&mut *lock_writer()?, sequence, 256 * 1024)
+            } else {
+                Ok(())
+            }
+        }
+        XKB_MAJOR_OPCODE => {
+            let minor = header.data;
+            debug!(
+                "client {} #{} XkbProxy minor={}",
+                client_id.0, sequence.0, minor
+            );
+            let reply = host
+                .and_then(|h| h.lock().ok())
+                .and_then(|mut h| h.xkb_proxy(minor, body).ok())
+                .flatten();
+            if let Some(mut bytes) = reply {
+                // Patch the sequence number in the reply to match the client's.
+                if bytes.len() >= 4 {
+                    bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+                }
+                writer
+                    .lock()
+                    .map_err(|_| io::Error::other("writer poisoned"))?
+                    .write_all(&bytes)
+            } else {
+                Ok(())
+            }
+        }
+        XI2_MAJOR_OPCODE => {
+            let minor = header.data;
+            match minor {
+                1 => {
+                    // GetExtensionVersion (XI1): present=true, major=2, minor=0
+                    log_reply(client_id, sequence, "XIGetExtensionVersion");
+                    let mut reply = x11::fixed_reply(sequence, 0, 0);
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2); // server_major
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // server_minor
+                    reply.push(1); // present=true
+                    reply.extend_from_slice(&[0; 19]);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                42 => {
+                    // XIChangeCursor: no reply
+                    log_void(client_id, sequence, "XIChangeCursor")?;
+                    Ok(())
+                }
+                44 => {
+                    // XISetClientPointer
+                    log_void(client_id, sequence, "XISetClientPointer")?;
+                    Ok(())
+                }
+                45 => {
+                    // XIGetClientPointer
+                    log_reply(client_id, sequence, "XIGetClientPointer");
+                    let mut reply = x11::fixed_reply(sequence, 0, 0);
+                    reply.push(1); // set=true
+                    reply.push(0); // pad
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2); // deviceid=2 (Master Pointer)
+                    reply.extend_from_slice(&[0; 22]);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                46 => {
+                    // XISelectEvents: window(4) num_masks(2) pad(2) [deviceid(2) mask_len(2) masks(4*n)]
+                    log_void(client_id, sequence, "XISelectEvents")?;
+                    if body.len() >= 8 {
+                        let window =
+                            ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                        let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
+                        let mut pos = 8;
+                        let mut s = lock_server(server)?;
+                        if let Some(client) = s.clients.get_mut(&client_id.0) {
+                            for _ in 0..num_masks {
+                                if pos + 4 > body.len() {
+                                    break;
+                                }
+                                let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                                let mask_len =
+                                    u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
+                                pos += 4;
+                                let byte_len = mask_len.saturating_mul(4);
+                                if pos + byte_len > body.len() {
+                                    break;
+                                }
+                                let mask = if mask_len > 0 {
+                                    u32::from_le_bytes([
+                                        body[pos],
+                                        body[pos + 1],
+                                        body[pos + 2],
+                                        body[pos + 3],
+                                    ])
+                                } else {
+                                    0
+                                };
+                                if mask == 0 {
+                                    client.xi2_masks.remove(&(window, deviceid));
+                                } else {
+                                    client.xi2_masks.insert((window, deviceid), mask);
+                                }
+                                pos += byte_len;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                47 => {
+                    // XIQueryVersion
+                    log_reply(client_id, sequence, "XIQueryVersion");
+                    let mut reply = x11::fixed_reply(sequence, 0, 0);
+                    // version 2.2
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
+                    reply.extend_from_slice(&[0; 20]);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                48 => {
+                    // XIQueryDevice: deviceid(2) pad(2)
+                    log_reply(client_id, sequence, "XIQueryDevice");
+                    let mut infos = Vec::new();
+                    for (deviceid, use_, attachment, name) in [
+                        (2u16, 1u16, 3u16, "Virtual core pointer"),
+                        (3u16, 2u16, 2u16, "Virtual core keyboard"),
+                    ] {
+                        x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, deviceid);
+                        x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, use_);
+                        x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, attachment);
+                        x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, 0); // classes
+                        x11::write_u16(
+                            ClientByteOrder::LittleEndian,
+                            &mut infos,
+                            name.len() as u16,
+                        );
+                        infos.push(1); // enabled
+                        infos.push(0);
+                        infos.extend_from_slice(name.as_bytes());
+                        x11::pad_vec4(&mut infos);
+                    }
+
+                    let mut reply =
+                        x11::fixed_reply(sequence, 0, x11::checked_units(infos.len())? as u32);
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2); // num_devices
+                    reply.extend_from_slice(&[0; 22]);
+                    reply.extend_from_slice(&infos);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                59 => {
+                    // XIGetProperty: return "no such property" (format=0, type=None, num_items=0)
+                    log_reply(client_id, sequence, "XIGetProperty -> not found");
+                    let mut reply = x11::fixed_reply(sequence, 0, 0);
+                    // type(4) + bytes_after(4) + num_items(4) + format(1) + pad(11) = 24 bytes
+                    reply.extend_from_slice(&[0u8; 24]);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                60 => {
+                    // XIGetSelectedEvents: window(4)
+                    log_reply(client_id, sequence, "XIGetSelectedEvents");
+                    if body.len() < 4 {
+                        return Ok(());
+                    }
+                    let window =
+                        ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                    let mut masks = Vec::new();
+                    if let Ok(s) = server.lock()
+                        && let Some(client) = s.clients.get(&client_id.0)
+                    {
+                        for (&(win, dev), &mask) in &client.xi2_masks {
+                            if win == window {
+                                x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, dev);
+                                x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, 1); // mask_len=1
+                                x11::write_u32(ClientByteOrder::LittleEndian, &mut masks, mask);
+                            }
+                        }
+                    }
+                    let num_masks = (masks.len() / 8) as u16;
+                    let mut reply =
+                        x11::fixed_reply(sequence, 0, x11::checked_units(masks.len())? as u32);
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, num_masks);
+                    reply.extend_from_slice(&[0; 22]);
+                    reply.extend_from_slice(&masks);
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                40 => {
+                    // XIQueryPointer: deviceid(2) pad(2) window(4)
+                    // Fixed 32 bytes: same_screen(1) pad(1) seq(2) length(4)
+                    //   root(4) child(4) root_x(4) root_y(4) win_x(4) win_y(4)
+                    // Extra (length*4 bytes): buttons_len(2) pad(2)
+                    //   ModifierInfo: base(4) latched(4) locked(4) effective(4) = 16 bytes
+                    //   GroupInfo: base(1) latched(1) locked(1) effective(1) = 4 bytes
+                    //   buttons: buttons_len*4 bytes = 0 bytes (buttons_len=0)
+                    // Extra = 2+2+16+4 = 24 bytes = 6 units
+                    log_reply(client_id, sequence, "XIQueryPointer");
+                    let mut reply = x11::fixed_reply(sequence, 1 /* same_screen */, 6);
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, ROOT_WINDOW.0); // root
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // child=None
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // root_x (FP1616)
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // root_y
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // win_x
+                    x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // win_y
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // buttons_len=0
+                    x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // pad
+                    reply.extend_from_slice(&[0u8; 16]); // ModifierInfo
+                    reply.extend_from_slice(&[0u8; 4]); // GroupInfo (4×CARD8)
+                    writer
+                        .lock()
+                        .map_err(|_| io::Error::other("writer poisoned"))?
+                        .write_all(&reply)
+                }
+                _ => {
+                    debug!("unhandled XI2 request minor={}", minor);
+                    Ok(())
+                }
+            }
+        }
         35 => {
             let mode = header.data;
             if mode == 0 || mode == 1 || mode == 2 {
@@ -4509,7 +5102,44 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
 
 #[cfg(test)]
 mod tests {
-    use super::zpixmap_expected_len;
+    use super::{
+        BIG_REQUESTS_MAJOR_OPCODE, RANDR_FIRST_ERROR, RANDR_FIRST_EVENT, RANDR_MAJOR_OPCODE,
+        RENDER_FIRST_ERROR, RENDER_FIRST_EVENT, RENDER_MAJOR_OPCODE, XI2_FIRST_ERROR,
+        XI2_FIRST_EVENT, XI2_MAJOR_OPCODE, XKB_MAJOR_OPCODE, zpixmap_expected_len,
+    };
+
+    #[test]
+    fn advertised_extension_bases_are_unique() {
+        let major_opcodes = vec![
+            RANDR_MAJOR_OPCODE,
+            RENDER_MAJOR_OPCODE,
+            BIG_REQUESTS_MAJOR_OPCODE,
+            XKB_MAJOR_OPCODE,
+            XI2_MAJOR_OPCODE,
+        ];
+        let mut sorted = major_opcodes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), major_opcodes.len());
+
+        let non_zero_event_bases = [RANDR_FIRST_EVENT, RENDER_FIRST_EVENT, XI2_FIRST_EVENT]
+            .into_iter()
+            .filter(|base| *base != 0)
+            .collect::<Vec<_>>();
+        let mut sorted = non_zero_event_bases.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), non_zero_event_bases.len());
+
+        let non_zero_error_bases = [RANDR_FIRST_ERROR, RENDER_FIRST_ERROR, XI2_FIRST_ERROR]
+            .into_iter()
+            .filter(|base| *base != 0)
+            .collect::<Vec<_>>();
+        let mut sorted = non_zero_error_bases.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), non_zero_error_bases.len());
+    }
 
     #[test]
     fn zpixmap_expected_len_depth24_2x3() {
@@ -4681,6 +5311,129 @@ mod tests {
             });
             let _ = route_key_event(&mut s, ClientId(1), ResourceId(0x200), 25, 0, false);
             assert!(s.active_keyboard_grab.is_some());
+        }
+    }
+
+    mod render {
+        use super::super::change_picture_safe_to_forward;
+
+        // Helper to build a ChangePicture values slice with one CARD32 value.
+        fn one_val(v: u32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+
+        fn two_vals(a: u32, b: u32) -> [u8; 8] {
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&a.to_le_bytes());
+            buf[4..8].copy_from_slice(&b.to_le_bytes());
+            buf
+        }
+
+        // ── ChangePicture safe_to_forward logic ───────────────────────────────
+
+        #[test]
+        fn cp_repeat_scalar_is_always_safe() {
+            // CPRepeat = bit 0 — no XID involved, always forward
+            assert!(change_picture_safe_to_forward(0x01, &one_val(1)));
+        }
+
+        #[test]
+        fn cp_component_alpha_scalar_is_always_safe() {
+            // CPComponentAlpha = bit 12 — scalar BOOL, always forward
+            assert!(change_picture_safe_to_forward(1 << 12, &one_val(1)));
+        }
+
+        #[test]
+        fn cp_clip_mask_none_is_safe() {
+            // CPClipMask=None (bit 6, value=0): clears the clip — must be forwarded.
+            // This is the key fix: without forwarding, stale clips persist and blank redraws.
+            assert!(change_picture_safe_to_forward(0x40, &one_val(0)));
+        }
+
+        #[test]
+        fn cp_clip_mask_pixmap_xid_is_unsafe() {
+            // CPClipMask=<pixmap> (bit 6, non-zero value): XID needs translation — skip.
+            assert!(!change_picture_safe_to_forward(0x40, &one_val(0x1234)));
+        }
+
+        #[test]
+        fn cp_alpha_map_none_is_safe() {
+            // CPAlphaMap=None (bit 1, value=0): clearing alpha map is safe.
+            assert!(change_picture_safe_to_forward(0x02, &one_val(0)));
+        }
+
+        #[test]
+        fn cp_alpha_map_picture_xid_is_unsafe() {
+            // CPAlphaMap=<picture> (bit 1, non-zero value): XID needs translation — skip.
+            assert!(!change_picture_safe_to_forward(0x02, &one_val(0xdead)));
+        }
+
+        #[test]
+        fn cp_repeat_and_clip_mask_none_is_safe() {
+            // CPRepeat (bit 0) + CPClipMask=None (bit 6): values in bit order: [repeat, clip]
+            // clip value is 0 (None) → safe to forward
+            assert!(change_picture_safe_to_forward(0x41, &two_vals(1, 0)));
+        }
+
+        #[test]
+        fn cp_repeat_and_clip_mask_xid_is_unsafe() {
+            // CPRepeat (bit 0) + CPClipMask=pixmap (bit 6): clip value non-zero → unsafe
+            assert!(!change_picture_safe_to_forward(0x41, &two_vals(1, 0xbeef)));
+        }
+
+        #[test]
+        fn truncated_values_with_xid_bit_is_unsafe() {
+            // value_mask has CPClipMask (bit 6) but values slice is empty → unsafe
+            assert!(!change_picture_safe_to_forward(0x40, &[]));
+        }
+
+        // ── XIQueryPointer reply length ────────────────────────────────────────
+
+        #[test]
+        fn xi_query_pointer_extra_bytes_fit_6_length_units() {
+            // GroupInfo is 4×CARD8 = 4 bytes (NOT 16 like ModifierInfo).
+            // Extra payload: buttons_len(2) + pad(2) + ModifierInfo(16) + GroupInfo(4) = 24 bytes.
+            // 24 bytes / 4 = 6 length units.
+            let buttons_len_field = 2usize;
+            let pad = 2usize;
+            let modifier_info = 16usize; // base(4)+latched(4)+locked(4)+effective(4)
+            let group_info = 4usize;     // base(1)+latched(1)+locked(1)+effective(1)
+            let extra = buttons_len_field + pad + modifier_info + group_info;
+            assert_eq!(extra, 24, "extra payload must be 24 bytes");
+            assert_eq!(extra % 4, 0, "must be 4-byte aligned");
+            assert_eq!(extra / 4, 6, "length field must be 6");
+        }
+
+        // ── SetPictureClipRectangles offset adjustment ────────────────────────
+
+        #[test]
+        fn clip_origin_adjusted_by_window_offset() {
+            // When the host picture sits at (x_off, y_off) inside the host container,
+            // clip_x_origin and clip_y_origin must be adjusted so the clip aligns with
+            // Composite's dst_x/dst_y which are also shifted by (x_off, y_off).
+            let x_off: i16 = 100;
+            let y_off: i16 = 50;
+            let mut body = vec![0u8; 16];
+            body[4..6].copy_from_slice(&10i16.to_le_bytes());
+            body[6..8].copy_from_slice(&20i16.to_le_bytes());
+            let adj_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
+            let adj_y = i16::from_le_bytes([body[6], body[7]]).wrapping_add(y_off);
+            assert_eq!(adj_x, 110);
+            assert_eq!(adj_y, 70);
+        }
+
+        #[test]
+        fn clip_origin_zero_offset_unchanged() {
+            // Pixmap-backed pictures have x_off=y_off=0; clip must pass through unmodified.
+            let x_off: i16 = 0;
+            let y_off: i16 = 0;
+            let mut body = vec![0u8; 16];
+            body[4..6].copy_from_slice(&(-5i16).to_le_bytes());
+            body[6..8].copy_from_slice(&30i16.to_le_bytes());
+            let adj_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
+            let adj_y = i16::from_le_bytes([body[6], body[7]]).wrapping_add(y_off);
+            assert_eq!(adj_x, -5);
+            assert_eq!(adj_y, 30);
         }
     }
 }

@@ -15,6 +15,7 @@ pub const RR_GET_SCREEN_SIZE_RANGE: u8 = 6;
 pub const RR_GET_SCREEN_RESOURCES: u8 = 8;
 pub const RR_GET_OUTPUT_INFO: u8 = 9;
 pub const RR_LIST_OUTPUT_PROPERTIES: u8 = 10;
+pub const RR_GET_OUTPUT_PROPERTY: u8 = 15;
 pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
 pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
@@ -463,6 +464,15 @@ pub fn encode_get_crtc_transform_reply(sequence: SequenceNumber) -> Vec<u8> {
 pub fn encode_list_output_properties_reply(sequence: SequenceNumber) -> Vec<u8> {
     let mut out = fixed_reply(sequence, 0, 0);
     out.extend_from_slice(&[0u8; 24]); // nAtoms=0 + pad
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
+/// Encodes a `GetOutputProperty` reply indicating the property does not exist (format=0,
+/// type=None, bytes_after=0, num_items=0, no data).
+pub fn encode_get_output_property_reply(sequence: SequenceNumber) -> Vec<u8> {
+    let mut out = fixed_reply(sequence, 0 /* format=0 */, 0);
+    out.extend_from_slice(&[0u8; 24]); // type=None(4) + bytes_after=0(4) + num_items=0(4) + pad(12)
     debug_assert_eq!(out.len(), 32);
     out
 }

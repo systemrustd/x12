@@ -268,13 +268,43 @@ In rough priority order:
   does not propagate up the window tree (event_mask=0 with PointerWindow/InputFocus
   destinations).
 
-## Phase 3 — Toolkit compatibility
+## Phase 3.1 — Toolkit Compatibility (GTK3) ✓ COMPLETE
 
-Goal: extensions and behavior needed for GTK, Qt, SDL, GLFW, Electron.
-Implement enough XKB, XInput2, RENDER, SHAPE, DAMAGE, COMPOSITE, SYNC,
+Goal: run a simple GTK3 application interactively under `ynest`.
+
+- [x] Implement BIG-REQUESTS (required by modern toolkits).
+- [x] Implement XKB proxying to host (GTK3 requires XKB QueryExtension).
+  - Fixed: `XkbPerClientFlags` (minor=21) has a reply — Xlib blocks in `_XReply()`
+    until it arrives; omitting it caused gtk3-demo to hang at startup.
+- [x] Basic XInput2 support (`XIQueryVersion`, `XIGetClientPointer`,
+  `XISelectEvents`, `XIQueryDevice`, `XIGetSelectedEvents`, `XIChangeCursor`).
+- [x] XI2 keyboard, pointer, crossing, and focus events delivered as GenericEvent
+  type 35 to selected clients.
+- [x] `XIQueryPointer` (XI2 minor=40): stub reply with correct wire format.
+  - `GroupInfo` is 4×CARD8 = 4 bytes; length field = 6 (24 extra bytes).
+    Wrong size caused xcb assertion `extra_reply_data_left`.
+- [x] RENDER `SetPictureClipRectangles` (minor=6): forward to host with
+  window-offset adjustment so clip aligns with `Composite`'s dst translation.
+- [x] RENDER `CreateRadialGradient` (minor=31): create host picture like LinearGradient.
+- [x] RENDER `ChangePicture` (minor=5): forward when no non-None XID attributes.
+  - Critical: `CPClipMask=None` (mask=0x40, value=0) clears the clip after
+    clipped glyph rendering. Without forwarding this, stale clips persisted
+    and caused all sidebar labels to disappear on the next redraw.
+- [x] RENDER `SetPictureTransform` (minor=28), `SetPictureFilter` (minor=30),
+  `CreateLinearGradient` (minor=34): forwarded to host.
+
+**Validation Result — gtk3-demo running under ynest + fvwm3:**
+- gtk3-demo main window appears with fvwm3 decorations.
+- Clicking sidebar items navigates to the correct content pane.
+- Clicking "Run" opens child dialogs (fvwm3 handles stacking).
+- Sidebar labels, content text, and widget rendering all visible.
+- `cargo test --workspace`: all tests pass (114 in yserver-core).
+
+## Phase 3.2 — Advanced Interoperability (pending)
+
+Goal: extensions and behavior needed for Qt, SDL, GLFW, Electron.
+Implement enough RENDER, SHAPE, DAMAGE, COMPOSITE, SYNC,
 and PRESENT for real applications.
-
-Not started.
 
 ## Phase 4 — Accelerated clients
 
@@ -459,8 +489,8 @@ Not started.
 
 | Op | Name                      | Status | Notes |
 |----|---------------------------|--------|-------|
-|  98 | QueryExtension           | ↩ | RANDR advertised; all others absent |
-|  99 | ListExtensions           | ↩ | returns empty list |
+|  98 | QueryExtension           | ✓ | RANDR, RENDER, BIG-REQUESTS, XKEYBOARD, XInputExtension |
+|  99 | ListExtensions           | ✓ | returns list of supported extensions |
 | 100 | ChangeKeyboardMapping    | ✓ | host-mediated no-op; broadcasts MappingNotify(Keyboard) |
 | 101 | GetKeyboardMapping       | ↩ | proxied to host; falls back to local stub on host failure |
 | 103 | Bell                     | ∅ | |
@@ -473,6 +503,33 @@ Not started.
 | 118 | SetModifierMapping       | ∅ | |
 | 119 | GetModifierMapping       | ↩ | proxied to host; arbitrary keycodes_per_modifier |
 | 127 | NoOperation              | ∅ | |
+
+### BIG-REQUESTS extension (major opcode 135)
+
+| Minor | Name                  | Status | Notes |
+|-------|-----------------------|--------|-------|
+|   0   | Enable                | ✓ | enables 32-bit length support; max 1MB advertised |
+
+### XKEYBOARD extension (major opcode 136)
+
+| Minor | Name                  | Status | Notes |
+|-------|-----------------------|--------|-------|
+|   *   | (any)                 | ✓ | proxied to host after opcode substitution |
+
+### XInput2 extension (major opcode 137)
+
+| Minor | Name                  | Status | Notes |
+|-------|-----------------------|--------|-------|
+|  44   | XISetClientPointer    | ∅ | accepted no-op |
+|  45   | XIGetClientPointer    | ↩ | returns virtual core pointer |
+|  46   | XISelectEvents        | ✓ | mask storage in ClientHandle |
+|  47   | XIQueryVersion        | ↩ | replies with version 2.2 |
+|  48   | XIQueryDevice         | ↩ | returns virtual core pointer and keyboard |
+|  60   | XIGetSelectedEvents   | ↩ | returns stored masks for the calling client |
+|   *   | (other)               | ∅ | stubs / ignored |
+
+Supported XI2 events: `KeyPress`, `KeyRelease`, `ButtonPress`,
+`ButtonRelease`, `Motion`, `Enter`, `Leave`, `FocusIn`, and `FocusOut`.
 
 ### RANDR extension (major opcode 128)
 

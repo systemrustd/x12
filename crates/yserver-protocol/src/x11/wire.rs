@@ -21,45 +21,45 @@ pub(super) fn read_i16_le(bytes: &[u8]) -> i16 {
     i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
-pub(super) fn write_u16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u16) {
+pub fn write_u16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u16) {
     match byte_order {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
         ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
     }
 }
 
-pub(super) fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
+pub fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
     match byte_order {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
         ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
     }
 }
 
-pub(super) fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {
+pub fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {
     match byte_order {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
         ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
     }
 }
 
-pub(super) fn byte_order_value(byte_order: ClientByteOrder) -> u8 {
+pub fn byte_order_value(byte_order: ClientByteOrder) -> u8 {
     match byte_order {
         ClientByteOrder::LittleEndian => 0,
         ClientByteOrder::BigEndian => 1,
     }
 }
 
-pub(super) fn pad4(len: usize) -> usize {
+pub fn pad4(len: usize) -> usize {
     (len + 3) & !3
 }
 
-pub(super) fn pad_vec4(out: &mut Vec<u8>) {
+pub fn pad_vec4(out: &mut Vec<u8>) {
     while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
 
-pub(super) fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
+pub fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
     let mut reply = Vec::with_capacity(32);
     reply.push(1);
     reply.push(data);
@@ -68,7 +68,7 @@ pub(super) fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Ve
     reply
 }
 
-pub(super) fn checked_units(byte_len: usize) -> io::Result<u16> {
+pub fn checked_units(byte_len: usize) -> io::Result<u16> {
     if !byte_len.is_multiple_of(4) {
         return Err(io::Error::new(
             ErrorKind::InvalidData,

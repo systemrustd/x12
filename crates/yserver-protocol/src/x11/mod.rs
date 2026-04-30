@@ -10,7 +10,7 @@ mod keysyms;
 use keysyms::keysyms_for_keycode;
 
 mod wire;
-use wire::*;
+pub use wire::*;
 
 pub mod randr;
 
@@ -95,7 +95,7 @@ pub struct Screen {
 pub struct RequestHeader {
     pub opcode: u8,
     pub data: u8,
-    pub length_units: u16,
+    pub length_units: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -690,7 +690,10 @@ fn write_screen(out: &mut Vec<u8>, screen: Screen) {
     write_u32(ClientByteOrder::LittleEndian, out, 0xff00_0000); // alpha mask
 }
 
-pub fn read_request(reader: &mut impl Read) -> io::Result<Option<(RequestHeader, Vec<u8>)>> {
+pub fn read_request(
+    reader: &mut impl Read,
+    big_requests_enabled: bool,
+) -> io::Result<Option<(RequestHeader, Vec<u8>)>> {
     let mut header = [0; 4];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
@@ -705,28 +708,37 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<Option<(RequestHeader,
         Err(err) => return Err(err),
     }
 
+    let mut length_units = u32::from(u16::from_le_bytes([header[2], header[3]]));
+    let body_len;
+
+    if length_units == 0 && big_requests_enabled {
+        let mut big_len = [0; 4];
+        reader.read_exact(&mut big_len)?;
+        length_units = u32::from_le_bytes(big_len);
+        if length_units < 2 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid BIG-REQUESTS length {}", length_units),
+            ));
+        }
+        body_len = (length_units as usize * 4) - 8;
+    } else {
+        if length_units < 1 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid request length {}", length_units),
+            ));
+        }
+        body_len = (length_units as usize * 4) - 4;
+    }
+
     let request = RequestHeader {
         opcode: header[0],
         data: header[1],
-        length_units: u16::from_le_bytes([header[2], header[3]]),
+        length_units,
     };
 
-    if request.length_units == 0 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "BIG-REQUESTS length form is not supported yet",
-        ));
-    }
-
-    let request_len = usize::from(request.length_units) * 4;
-    if request_len < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid request length {}", request.length_units),
-        ));
-    }
-
-    let mut body = vec![0; request_len - 4];
+    let mut body = vec![0; body_len];
     reader.read_exact(&mut body)?;
     Ok(Some((request, body)))
 }
@@ -1494,6 +1506,190 @@ pub fn write_list_properties_reply(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi2_device_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    root: ResourceId,
+    event: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    state: u16,
+    detail: u32,
+    sourceid: u16,
+) {
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, out, 13);
+
+    write_u16(ClientByteOrder::LittleEndian, out, evtype);
+    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
+    write_u32(ClientByteOrder::LittleEndian, out, time);
+    write_u32(ClientByteOrder::LittleEndian, out, detail);
+    write_u32(ClientByteOrder::LittleEndian, out, root.0);
+    write_u32(ClientByteOrder::LittleEndian, out, event.0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // child
+
+    // Coordinates are FP16.16
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(root_x) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(root_y) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(event_x) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(event_y) << 16) as u32,
+    );
+
+    write_u16(ClientByteOrder::LittleEndian, out, 1); // buttons_len
+    write_u16(ClientByteOrder::LittleEndian, out, 0); // valuators_len
+    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
+    write_u16(ClientByteOrder::LittleEndian, out, 0); // pad
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // flags
+
+    // mods: base, latched, locked, effective
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, u32::from(state));
+
+    out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
+
+    if evtype == 4 || evtype == 5 {
+        let bit = if detail > 0 && detail <= 32 {
+            1 << (detail - 1)
+        } else {
+            0
+        };
+        write_u32(ClientByteOrder::LittleEndian, out, bit);
+    } else {
+        write_u32(ClientByteOrder::LittleEndian, out, 0);
+    }
+
+    debug_assert_eq!(out.len(), 84);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi2_crossing_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    root: ResourceId,
+    event: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    state: u16,
+    mode: u8,
+    detail: u8,
+    sourceid: u16,
+) {
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, out, 11);
+
+    write_u16(ClientByteOrder::LittleEndian, out, evtype);
+    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
+    write_u32(ClientByteOrder::LittleEndian, out, time);
+    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
+    out.push(mode);
+    out.push(detail);
+    write_u32(ClientByteOrder::LittleEndian, out, root.0);
+    write_u32(ClientByteOrder::LittleEndian, out, event.0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // child
+
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(root_x) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(root_y) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(event_x) << 16) as u32,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        out,
+        (i32::from(event_y) << 16) as u32,
+    );
+
+    out.push(1); // same_screen
+    out.push(u8::from(matches!(evtype, 9 | 10))); // focus
+    write_u16(ClientByteOrder::LittleEndian, out, 1); // buttons_len
+
+    // mods: base, latched, locked, effective
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, u32::from(state));
+
+    out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // button mask
+
+    debug_assert_eq!(out.len(), 76);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi2_focus_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    event: ResourceId,
+    mode: u8,
+    detail: u8,
+) {
+    encode_xi2_crossing_event(
+        out,
+        sequence,
+        major_opcode,
+        evtype,
+        deviceid,
+        time,
+        ResourceId(0x100),
+        event,
+        0,
+        0,
+        0,
+        0,
+        0,
+        mode,
+        detail,
+        deviceid,
+    );
+}
+
 pub fn write_get_selection_owner_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
@@ -1735,12 +1931,53 @@ pub fn write_query_extension_reply(
     writer.write_all(&reply)
 }
 
-pub fn write_list_extensions_reply(
+pub fn write_ge_query_version_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
+    // GEQueryVersion reply: major=1, minor=0, rest padding
     let mut reply = fixed_reply(sequence, 0, 0);
+    reply.extend_from_slice(&[1, 0]); // major_version = 1
+    reply.extend_from_slice(&[0, 0]); // minor_version = 0
+    reply.extend_from_slice(&[0; 20]);
+    writer.write_all(&reply)
+}
+
+pub fn write_big_requests_enable_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    max_request_length: u32,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, 0, 0);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        max_request_length,
+    );
+    reply.extend_from_slice(&[0; 20]);
+    writer.write_all(&reply)
+}
+
+pub fn write_list_extensions_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    names: &[&str],
+) -> io::Result<()> {
+    let mut names_raw = Vec::new();
+    for name in names {
+        let bytes = name.as_bytes();
+        names_raw.push(bytes.len() as u8);
+        names_raw.extend_from_slice(bytes);
+    }
+    pad_vec4(&mut names_raw);
+
+    let mut reply = fixed_reply(
+        sequence,
+        names.len() as u8,
+        checked_units(names_raw.len())? as u32,
+    );
     reply.extend_from_slice(&[0; 24]);
+    reply.extend_from_slice(&names_raw);
     writer.write_all(&reply)
 }
 
@@ -2333,6 +2570,83 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_request_rejects_zero_length_without_big_requests() {
+        let mut input = std::io::Cursor::new([1, 2, 0, 0]);
+        let err = read_request(&mut input, false).expect_err("zero length must be invalid");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_request_accepts_big_requests_extended_length() {
+        let mut input = std::io::Cursor::new([
+            1, 2, 0, 0, // normal header with extended length marker
+            3, 0, 0, 0, // 12-byte total request: header + big length + 4 body bytes
+            0xaa, 0xbb, 0xcc, 0xdd,
+        ]);
+        let (header, body) = read_request(&mut input, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+
+        assert_eq!(header.opcode, 1);
+        assert_eq!(header.data, 2);
+        assert_eq!(header.length_units, 3);
+        assert_eq!(body, [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn xi2_device_event_has_expected_wire_size() {
+        let mut out = Vec::new();
+        encode_xi2_device_event(
+            &mut out,
+            SequenceNumber(7),
+            137,
+            4,
+            2,
+            123,
+            ResourceId(0x100),
+            ResourceId(0x200),
+            1,
+            2,
+            3,
+            4,
+            5,
+            1,
+            2,
+        );
+
+        assert_eq!(out.len(), 84);
+        assert_eq!(&out[0..4], &[35, 137, 7, 0]);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 13);
+    }
+
+    #[test]
+    fn xi2_crossing_event_has_expected_wire_size() {
+        let mut out = Vec::new();
+        encode_xi2_crossing_event(
+            &mut out,
+            SequenceNumber(8),
+            137,
+            7,
+            2,
+            123,
+            ResourceId(0x100),
+            ResourceId(0x200),
+            1,
+            2,
+            3,
+            4,
+            5,
+            0,
+            0,
+            2,
+        );
+
+        assert_eq!(out.len(), 76);
+        assert_eq!(&out[0..4], &[35, 137, 8, 0]);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 11);
+    }
 
     mod change_property_tests {
         use super::*;

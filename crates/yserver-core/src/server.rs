@@ -226,6 +226,9 @@ pub struct ClientHandle {
     /// Foreign windows the client wants kept alive after disconnect
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
+    pub big_requests_enabled: bool,
+    /// XI2 event masks: (window_id, device_id) -> mask
+    pub xi2_masks: HashMap<(ResourceId, u16), u32>,
 }
 
 /// Snapshot of a client's writer for cross-client event fanout.
@@ -584,21 +587,51 @@ pub fn pointer_event_fanout(
         PointerEventKind::EnterNotify => 0x0000_0010,
         PointerEventKind::LeaveNotify => 0x0000_0020,
     };
-    let (nested_id, event_x, event_y, targets) = match state.lock() {
+    let xi2_evtype: u16 = match event.kind {
+        PointerEventKind::ButtonPress => 4,
+        PointerEventKind::ButtonRelease => 5,
+        PointerEventKind::MotionNotify => 6,
+        PointerEventKind::EnterNotify => 7,
+        PointerEventKind::LeaveNotify => 8,
+    };
+
+    let (nested_id, event_x, event_y, core_targets, xi2_targets) = match state.lock() {
         Ok(g) => {
             let (target, event_x, event_y) = g
                 .resources
                 .pointer_target_at(top_level_id, event.event_x, event.event_y)
                 .unwrap_or((top_level_id, event.event_x, event.event_y));
-            let mut targets = g.subscribers(target, mask_bit);
-            if targets.is_empty() && target != top_level_id {
-                targets = g.subscribers(top_level_id, mask_bit);
+
+            let mut core_targets = g.subscribers(target, mask_bit);
+            if core_targets.is_empty() && target != top_level_id {
+                core_targets = g.subscribers(top_level_id, mask_bit);
             }
-            (target, event_x, event_y, targets)
+
+            let mut xi2_targets = Vec::new();
+            if xi2_evtype != 0 {
+                for c in g.clients.values() {
+                    let mask = c
+                        .xi2_masks
+                        .get(&(target, 2)) // Master Pointer
+                        .or_else(|| c.xi2_masks.get(&(target, 1))) // XIAllMasterDevices
+                        .or_else(|| c.xi2_masks.get(&(target, 0))) // XIAllDevices
+                        .or_else(|| c.xi2_masks.get(&(top_level_id, 2)))
+                        .or_else(|| c.xi2_masks.get(&(top_level_id, 1)))
+                        .or_else(|| c.xi2_masks.get(&(top_level_id, 0)))
+                        .copied()
+                        .unwrap_or(0);
+                    if mask & (1 << xi2_evtype) != 0 {
+                        xi2_targets.push(ServerState::event_target_for_client(c));
+                    }
+                }
+            }
+
+            (target, event_x, event_y, core_targets, xi2_targets)
         }
         Err(_) => return,
     };
-    for target in targets {
+
+    for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
         let mut buf = Vec::with_capacity(32);
         match event.kind {
@@ -680,6 +713,55 @@ pub fn pointer_event_fanout(
                     state: event.state,
                 },
             ),
+        }
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(&buf);
+        }
+    }
+
+    for target in xi2_targets {
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(84);
+        if matches!(
+            event.kind,
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+        ) {
+            x11::encode_xi2_crossing_event(
+                &mut buf,
+                seq,
+                137,
+                xi2_evtype,
+                2,
+                event.time,
+                crate::resources::ROOT_WINDOW,
+                nested_id,
+                event.root_x,
+                event.root_y,
+                event_x,
+                event_y,
+                event.state,
+                0,
+                0,
+                2,
+            );
+        } else {
+            x11::encode_xi2_device_event(
+                &mut buf,
+                seq,
+                137, // XI2 major opcode
+                xi2_evtype,
+                2, // deviceid: Master Pointer
+                event.time,
+                crate::resources::ROOT_WINDOW,
+                nested_id,
+                event.root_x,
+                event.root_y,
+                event_x,
+                event_y,
+                event.state,
+                u32::from(event.detail),
+                2,
+            );
         }
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
@@ -786,6 +868,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         state.clients.insert(
@@ -798,6 +882,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         // PropertyChange = 0x0040_0000
@@ -818,6 +904,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x200), 0xFFFF_FFFF)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -837,6 +925,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -857,6 +947,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0b1010)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         state.clients.insert(
@@ -869,6 +961,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0b0100)]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
 
@@ -904,6 +998,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::new(),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
 
@@ -936,6 +1032,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0002_0000)]), // StructureNotify
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         state.clients.insert(
@@ -948,6 +1046,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]), // KeyPress
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
 
@@ -987,6 +1087,8 @@ mod tests {
                     (ResourceId(0x200), 0x0040_0000),
                 ]),
                 save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -1022,6 +1124,8 @@ mod tests {
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]), // ButtonPress
                     save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
                 },
             );
             s.clients.insert(
@@ -1034,6 +1138,8 @@ mod tests {
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0040)]), // PointerMotion
                     save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
                 },
             );
             s.clients.insert(
@@ -1046,6 +1152,8 @@ mod tests {
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::new(),
                     save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
                 },
             );
         }
@@ -1104,6 +1212,8 @@ mod tests {
                     resource_id_mask: 0x000F_FFFF,
                     event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]),
                     save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
                 },
             );
         }
