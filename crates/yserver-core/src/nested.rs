@@ -324,6 +324,7 @@ fn handle_client(
                 writer.clone(),
                 focused_window.clone(),
                 last_sequence.clone(),
+                Arc::clone(&server),
             ),
             Err(err) => warn!("client {} keyboard forwarding disabled: {err}", client_id.0),
         }
@@ -465,12 +466,86 @@ fn spawn_window_close_watcher(window_id: u32) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeyTarget {
+    Focus(ResourceId),
+    Grab {
+        client_id: ClientId,
+        grab_window: ResourceId,
+        writer: WriterTag,
+    },
+    Drop,
+}
+
+/// `WriterTag::Self_` means use the focused-client writer (same `client_id`
+/// as the forwarder); `WriterTag::Other(id)` means look up the grab owner's
+/// writer through `ServerState::client_target`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WriterTag {
+    Self_,
+    Other(ClientId),
+}
+
+fn route_key_event(
+    state: &mut ServerState,
+    self_client: ClientId,
+    focus: ResourceId,
+    keycode: u8,
+    state_mask: u16,
+    pressed: bool,
+) -> KeyTarget {
+    use crate::server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource};
+
+    if let Some(g) = state.active_keyboard_grab {
+        if !pressed
+            && let ActiveKeyboardGrabSource::PassiveKey { keycode: kc } = g.source
+            && kc == keycode
+        {
+            state.active_keyboard_grab = None;
+        }
+        let writer = if g.owner == self_client {
+            WriterTag::Self_
+        } else {
+            WriterTag::Other(g.owner)
+        };
+        return KeyTarget::Grab {
+            client_id: g.owner,
+            grab_window: g.grab_window,
+            writer,
+        };
+    }
+    if pressed && let Some(grab) = state.find_key_grab(focus, keycode, state_mask) {
+        let owner = grab.owner;
+        let win = grab.grab_window;
+        state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+            owner,
+            grab_window: win,
+            source: ActiveKeyboardGrabSource::PassiveKey { keycode },
+        });
+        let writer = if owner == self_client {
+            WriterTag::Self_
+        } else {
+            WriterTag::Other(owner)
+        };
+        return KeyTarget::Grab {
+            client_id: owner,
+            grab_window: win,
+            writer,
+        };
+    }
+    if focus == ROOT_WINDOW {
+        return KeyTarget::Drop;
+    }
+    KeyTarget::Focus(focus)
+}
+
 fn spawn_keyboard_forwarder(
     client_id: ClientId,
     mut keyboard: HostInputPump,
     writer: Arc<Mutex<UnixStream>>,
     focused_window: Arc<Mutex<ResourceId>>,
     last_sequence: Arc<AtomicU16>,
+    server: Arc<Mutex<ServerState>>,
 ) {
     thread::spawn(move || {
         loop {
@@ -492,29 +567,56 @@ fn spawn_keyboard_forwarder(
                 .lock()
                 .map(|focus| *focus)
                 .unwrap_or(ROOT_WINDOW);
-            if focus == ROOT_WINDOW {
-                continue;
-            }
+
+            let (event_window, target_writer, target_seq) = {
+                let mut s = match server.lock() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let target = route_key_event(
+                    &mut s,
+                    client_id,
+                    focus,
+                    event.keycode,
+                    event.state,
+                    event.pressed,
+                );
+                match target {
+                    KeyTarget::Drop => continue,
+                    KeyTarget::Focus(w) => (w, writer.clone(), last_sequence.clone()),
+                    KeyTarget::Grab {
+                        grab_window,
+                        writer: tag,
+                        ..
+                    } => match tag {
+                        WriterTag::Self_ => (grab_window, writer.clone(), last_sequence.clone()),
+                        WriterTag::Other(cid) => match s.client_target(cid) {
+                            Some(t) => (grab_window, t.writer.clone(), t.last_sequence.clone()),
+                            None => continue,
+                        },
+                    },
+                }
+            };
 
             debug!(
                 "client {} key {} {} -> 0x{:x}",
                 client_id.0,
                 if event.pressed { "press" } else { "release" },
                 event.keycode,
-                focus.0
+                event_window.0
             );
-            let Some(mut writer) = writer.lock().ok() else {
+            let Some(mut w) = target_writer.lock().ok() else {
                 return;
             };
             if let Err(err) = x11::write_key_event(
-                &mut *writer,
+                &mut *w,
                 x11::KeyEvent {
                     pressed: event.pressed,
                     keycode: event.keycode,
-                    sequence: SequenceNumber(last_sequence.load(Ordering::Relaxed)),
+                    sequence: SequenceNumber(target_seq.load(Ordering::Relaxed)),
                     time: event.time,
                     root: ROOT_WINDOW,
-                    event: focus,
+                    event: event_window,
                     root_x: event.root_x,
                     root_y: event.root_y,
                     event_x: event.event_x,
@@ -4092,5 +4194,133 @@ mod tests {
     #[test]
     fn zpixmap_expected_len_zero_width_returns_zero() {
         assert_eq!(zpixmap_expected_len(0, 3, 24), Some(0));
+    }
+
+    mod key_routing {
+        use super::super::{KeyTarget, WriterTag, route_key_event};
+        use crate::{
+            resources::ROOT_WINDOW,
+            server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ServerState},
+        };
+        use yserver_protocol::x11::{ClientId, ResourceId};
+
+        #[test]
+        fn focus_when_no_grab() {
+            let mut s = ServerState::new();
+            let focus = ResourceId(0x200);
+            let t = route_key_event(&mut s, ClientId(1), focus, 24, 0, true);
+            assert_eq!(t, KeyTarget::Focus(focus));
+        }
+
+        #[test]
+        fn drop_when_focus_is_root() {
+            let mut s = ServerState::new();
+            let t = route_key_event(&mut s, ClientId(1), ROOT_WINDOW, 24, 0, true);
+            assert_eq!(t, KeyTarget::Drop);
+        }
+
+        #[test]
+        fn active_grab_pre_empts() {
+            let mut s = ServerState::new();
+            s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner: ClientId(3),
+                grab_window: ResourceId(0x200),
+                source: ActiveKeyboardGrabSource::Explicit,
+            });
+            let t = route_key_event(&mut s, ClientId(1), ResourceId(0x200), 24, 0, true);
+            assert_eq!(
+                t,
+                KeyTarget::Grab {
+                    client_id: ClientId(3),
+                    grab_window: ResourceId(0x200),
+                    writer: WriterTag::Other(ClientId(3)),
+                }
+            );
+        }
+
+        #[test]
+        fn passive_grab_on_root_fires_for_descendant_focus() {
+            let mut s = ServerState::new();
+            // Set up a focus window whose ancestor walk reaches root.
+            let req = yserver_protocol::x11::CreateWindowRequest {
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                depth: 24,
+                visual: ResourceId(0),
+                class: 0,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            };
+            s.resources.create_window(ClientId(1), req);
+
+            s.key_grabs.push(KeyGrab {
+                owner: ClientId(2),
+                grab_window: ROOT_WINDOW,
+                keycode: 24,
+                modifiers: 0x0040,
+                owner_events: false,
+                pointer_mode: 1,
+                keyboard_mode: 1,
+            });
+
+            let t = route_key_event(
+                &mut s,
+                /*self_client=*/ ClientId(1),
+                /*focus=*/ ResourceId(0x200),
+                /*keycode=*/ 24,
+                /*state_mask=*/ 0x0040,
+                /*pressed=*/ true,
+            );
+            assert_eq!(
+                t,
+                KeyTarget::Grab {
+                    client_id: ClientId(2),
+                    grab_window: ROOT_WINDOW,
+                    writer: WriterTag::Other(ClientId(2)),
+                }
+            );
+            // Press should have installed an active passive-key grab.
+            assert!(matches!(
+                s.active_keyboard_grab.unwrap().source,
+                ActiveKeyboardGrabSource::PassiveKey { keycode: 24 }
+            ));
+        }
+
+        #[test]
+        fn passive_release_clears_active_grab() {
+            let mut s = ServerState::new();
+            s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner: ClientId(2),
+                grab_window: ROOT_WINDOW,
+                source: ActiveKeyboardGrabSource::PassiveKey { keycode: 24 },
+            });
+            let _ = route_key_event(
+                &mut s,
+                ClientId(1),
+                ResourceId(0x200),
+                24,
+                0,
+                /*pressed=*/ false,
+            );
+            assert!(s.active_keyboard_grab.is_none());
+        }
+
+        #[test]
+        fn passive_release_of_other_keycode_keeps_grab() {
+            let mut s = ServerState::new();
+            s.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner: ClientId(2),
+                grab_window: ROOT_WINDOW,
+                source: ActiveKeyboardGrabSource::PassiveKey { keycode: 24 },
+            });
+            let _ = route_key_event(&mut s, ClientId(1), ResourceId(0x200), 25, 0, false);
+            assert!(s.active_keyboard_grab.is_some());
+        }
     }
 }
