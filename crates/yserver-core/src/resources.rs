@@ -299,23 +299,64 @@ impl ResourceTable {
     }
 
     pub fn configure_window(&mut self, request: ConfigureWindowRequest) -> Option<&Window> {
-        let window = self.windows.get_mut(&request.window.0)?;
-        if let Some(x) = request.x {
-            window.x = x;
+        {
+            let window = self.windows.get_mut(&request.window.0)?;
+            if let Some(x) = request.x {
+                window.x = x;
+            }
+            if let Some(y) = request.y {
+                window.y = y;
+            }
+            if let Some(width) = request.width {
+                window.width = width;
+            }
+            if let Some(height) = request.height {
+                window.height = height;
+            }
+            if let Some(border_width) = request.border_width {
+                window.border_width = border_width;
+            }
         }
-        if let Some(y) = request.y {
-            window.y = y;
+        self.restack_window(request.window, request.sibling, request.stack_mode);
+        self.windows.get(&request.window.0)
+    }
+
+    fn restack_window(
+        &mut self,
+        window_id: ResourceId,
+        sibling: Option<ResourceId>,
+        stack_mode: Option<u8>,
+    ) {
+        let Some(stack_mode) = stack_mode else {
+            return;
+        };
+        let Some(parent_id) = self.windows.get(&window_id.0).map(|window| window.parent) else {
+            return;
+        };
+        let Some(parent) = self.windows.get_mut(&parent_id.0) else {
+            return;
+        };
+        let Some(index) = parent.children.iter().position(|child| *child == window_id) else {
+            return;
+        };
+        let window = parent.children.remove(index);
+        let sibling_index =
+            sibling.and_then(|sibling| parent.children.iter().position(|child| *child == sibling));
+        match stack_mode {
+            0 => {
+                let insert_at = sibling_index.map_or(parent.children.len(), |index| index + 1);
+                parent.children.insert(insert_at, window);
+            }
+            1 => {
+                let insert_at = sibling_index.unwrap_or(0);
+                parent.children.insert(insert_at, window);
+            }
+            2 | 4 => parent.children.push(window),
+            3 => parent.children.insert(0, window),
+            _ => parent
+                .children
+                .insert(index.min(parent.children.len()), window),
         }
-        if let Some(width) = request.width {
-            window.width = width;
-        }
-        if let Some(height) = request.height {
-            window.height = height;
-        }
-        if let Some(border_width) = request.border_width {
-            window.border_width = border_width;
-        }
-        Some(window)
     }
 
     #[must_use]
@@ -716,6 +757,7 @@ impl ResourceTable {
     }
 
     pub fn create_gc(&mut self, owner: ClientId, request: CreateGcRequest) {
+        let _unsupported_clip_mask = request.clip_mask;
         self.gcs.insert(
             request.gc.0,
             Gc {
@@ -753,6 +795,9 @@ impl ResourceTable {
         }
         if let Some(font) = request.font {
             gc.font = Some(font);
+        }
+        if request.clip_mask.is_some() {
+            gc.clip_rectangles = None;
         }
     }
 
@@ -1905,5 +1950,69 @@ mod tests {
         let mut t = ResourceTable::new();
         make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
         assert!(t.circulate_window(ROOT_WINDOW, 0).is_none());
+    }
+
+    #[test]
+    fn configure_window_stack_mode_above_raises_child() {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x400, ROOT_WINDOW.0, 0, 0);
+
+        let configured = t.configure_window(ConfigureWindowRequest {
+            window: ResourceId(0x200),
+            value_mask: 1 << 6,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0),
+        });
+
+        assert!(configured.is_some());
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+    }
+
+    #[test]
+    fn change_gc_clip_mask_none_clears_clip_rectangles() {
+        let mut t = ResourceTable::new();
+        t.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x500),
+                drawable: ROOT_WINDOW,
+                foreground: None,
+                background: None,
+                line_width: None,
+                font: None,
+                clip_mask: None,
+            },
+        );
+        t.set_clip_rectangles(SetClipRectanglesRequest {
+            gc: ResourceId(0x500),
+            clip: ClipRectangles {
+                ordering: 0,
+                x_origin: 0,
+                y_origin: 0,
+                rectangles: vec![0, 0, 0, 0, 10, 0, 10, 0],
+            },
+        });
+        assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_some());
+
+        t.change_gc(GcChange {
+            gc: ResourceId(0x500),
+            foreground: None,
+            background: None,
+            line_width: None,
+            font: None,
+            clip_mask: Some(None),
+        });
+
+        assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_none());
     }
 }

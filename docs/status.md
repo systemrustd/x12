@@ -198,6 +198,17 @@ In rough priority order:
       the visible viewport. top_level_host_target falls through to
       root with zero offset.
 
+- [ ] **e16 popup menu compatibility.** Root/container pointer events
+      are selected in ynest, `QueryPointer` reports nested
+      root-relative coordinates, and `ConfigureWindow` now preserves
+      and forwards `CWSibling`/`CWStackMode` for host-backed
+      top-levels. Current investigation is focused on e16's reparented
+      menu subtree, SHAPE requests, and child-window redraw/clipping
+      semantics; core GC `GCClipMask=None` now clears stored clip
+      rectangles. SHAPE `Mask(source=None)` now clears the stored client
+      shape instead of recording an empty region, and non-None mask
+      bookkeeping uses the source pixmap dimensions.
+
 - [x] **Per-depth host GCs.** The default host GC is bound to a depth-24
       drawable, so PutImage onto non-depth-24 pixmaps (e.g. FvwmButtons'
       depth-8 alpha masks for icon compositing) BadMatched on the host
@@ -476,32 +487,91 @@ host container at default 800×600):
   container is blank — no client chrome draws. Filed as Phase 3.4.
 - **Fluxbox:** Not installed in the validation environment.
 
+## Phase 3.4 — Bugfixing the Phase 3.3 follow-ups (in progress)
+
+### Landed
+
+- [x] **e16 startup regression — fixed.** Root cause: atom IDs leak
+      from the host into our protocol stream via host-proxied replies
+      (most notably the `FONTPROP` atoms inside `ListFontsWithInfo`).
+      Clients then call `XGetAtomName` on those atoms. Previously we
+      synthesized a successful reply with the placeholder name
+      `"UNKNOWN"` for any atom we hadn't seen, which fooled clients
+      into believing the atom existed under that name. e16 hit this
+      via FONT properties returned from `ListFontsWithInfo`, then
+      silently exited later when atom didn't behave as expected.
+      Fix: forward `GetAtomName` for atoms not in our local table to
+      the host (`host_x11::get_atom_name`) and proxy the host's name
+      back. If the host doesn't know either, return `BadAtom` —
+      spec-correct. e16 now starts and renders apps under `ynest`.
+
+- [x] **e16 popup-menu groundwork (cherry-pick of `origin/e16-popup-tests`).**
+      Forward `CWSibling` / `CWStackMode` to host `ConfigureWindow`
+      for host-backed top-levels so e16's popup raises land in the
+      right stacking order. Local `ResourceTable::configure_window`
+      now restacks the parent's children list per the request.
+      `SHAPE::Mask(source = None)` clears the stored shape (back to
+      the default unshaped rectangle) instead of recording an empty
+      region, so e16's menu reparenting no longer leaves popups
+      invisibly clipped. Non-`None` `SHAPE::Mask` source uses the
+      source pixmap's geometry. Core GC `GCClipMask = None` clears
+      stored clip rectangles in `ResourceTable`. Map / Reparent /
+      ConfigureWindow / SHAPE handlers now log enough detail to
+      drive the next iteration. e16's "Enlightenment Message Dialog"
+      now renders text and buttons through `ynest`.
+
 ### Phase 3.4 follow-ups
 
-- **wmaker appicon contents missing.** The 64×64 dock-icon frames
-  draw their 3D border (background pixmap → ClearArea path works)
-  but the inner icon graphic and the app-name label are absent.
-  Pre-existing — present on Phase-3.2 builds before SHAPE
-  forwarding landed. Repro: `ynest 99` + `wmaker` + `xterm` +
-  `xclock`; bottom-left appicons appear as empty grey squares.
-  Suspect: WindowMaker's icon-paint path renders into a child
-  sub-window of the appicon that has no host backing, so the
-  CompositeGlyphs/CopyArea ops never reach the host surface.
+- **wmaker duplicate-Expose on top-level Map (fixed).** ynest's
+  `MapWindow` handler emitted an `Expose(window)` even when the
+  window has a `host_xid` — the host server then fired its own
+  Expose for the same subwindow via the host pump, so wmaker saw
+  every appicon get two consecutive Exposes and reacted by
+  re-creating its appicon background pixmap on each one (3 CWAs
+  on a single appicon vs 1 on Xephyr). Fixed: gate the manual
+  Expose-emit in MapWindow on `host_xid.is_none()` so we only
+  synthesize when the host doesn't.
+- **wmaker appicon icon graphic still missing.** Confirmed via
+  x11trace + 48×48 / 64×64 PutImage byte dumps: wmaker correctly
+  PutImages a 48×48 d24 icon graphic into its `WM_HINTS`
+  icon_pixmap, but the 64×64 appicon-bg pixmap that gets attached
+  to the appicon window contains only the tile bg + 3D border —
+  no `CopyArea` from icon-pixmap to bg-pixmap appears in the
+  trace. Same flow on Xephyr+MIT-SHM (no CopyArea after the
+  shm-CopyArea). The icon composition step is in wmaker's
+  client-side `wraster` and only lands in the pixmap on the
+  MIT-SHM path. Without MIT-SHM (which we don't yet implement),
+  wmaker doesn't composite the icon onto the bg, so appicons stay
+  empty. Implementing MIT-SHM is the path forward.
 - **wmaker title-bar close button missing.** Same shape: title-bar
   itself draws but the close-button glyph in its corner is absent.
   Same suspected root cause — sub-window-of-titlebar drawing not
   reaching the host. Pre-existing.
-- **e16 startup regression.** e16 exits with code 1 after the
-  initial XKB/AllocColor/Composite/ListFonts probe sequence,
-  before any window appears. Last-observed atom-name probe
-  (`GetAtomName 117 -> "UNKNOWN"`) and `unsupported opcode 88`
-  (FreeColors) are likely diagnostic noise rather than the cause.
-  Bisect against the most recent known-working build needed.
-- **openbox renders blank container.** Openbox starts under ynest
-  with apps connecting (xterm, xclock client setups complete) but
-  no pixels reach the screen. No unsupported opcodes logged.
-  Repro: `ynest 99` + `openbox` + `xterm` + `xclock`, screenshot
-  the host container.
+- **e16 popup/dialog "wireframe" rendering — environmental, not
+  ynest.** Phase 3.4 follow-up: the e16 dialog visible after the
+  popup cherry-pick draws as ~17 nested rectangles per dialog
+  frame because e16's draw stream contains *only* outlines —
+  26 `PolyRectangle`, 64 `PolySegment`, 76 `PolyText8`, 109
+  `ChangeGC`, **zero** `PolyFillRectangle`/`CopyArea`/`PutImage`.
+  e16's normal chrome is drawn from theme tile pixmaps composed
+  via `CopyArea`; here e16 can't load its theme (because the
+  real `/home/jos` is read-only in this sandbox and e16 falls
+  back to a no-theme dialog) so the fills are absent and the
+  3D-stepped widget borders look like wireframe trails. Real e16
+  popups in a writable HOME would render as proper filled chrome.
+  Re-test once the validation env has writable user state.
+- **openbox WM chrome not drawn.** With the atom fix, openbox
+  starts and apps render correctly (`xeyes` is fully visible
+  inside the openbox frame). What's still missing is the openbox
+  *frame chrome itself* — the title bar, label text, and border
+  are not drawn, so the frame appears as a black/empty
+  rectangle around the client. Repro: `ynest 99` + `openbox` +
+  `xeyes` (or `xclock`), screenshot the container; you'll see the
+  client content but no visible WM decorations. Suspect: openbox
+  draws frame decorations into child sub-windows of the frame
+  (label, button windows visible in the trace as 1×1 children of
+  `0x100139`), and that drawing path doesn't reach the host —
+  same family of bug as the wmaker chrome issues.
 - **fvwm3 segfaults on host container resize.** `xdotool
   windowsize 0x400000 1024 768` while fvwm3 is running reliably
   segfaults fvwm3 immediately after the new core

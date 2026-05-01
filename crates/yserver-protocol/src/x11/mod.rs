@@ -181,6 +181,8 @@ pub struct ConfigureWindowRequest {
     pub width: Option<u16>,
     pub height: Option<u16>,
     pub border_width: Option<u16>,
+    pub sibling: Option<ResourceId>,
+    pub stack_mode: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +210,7 @@ pub struct CreateGcRequest {
     pub background: Option<u32>,
     pub line_width: Option<u16>,
     pub font: Option<ResourceId>,
+    pub clip_mask: Option<Option<ResourceId>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +220,7 @@ pub struct GcChange {
     pub background: Option<u32>,
     pub line_width: Option<u16>,
     pub font: Option<ResourceId>,
+    pub clip_mask: Option<Option<ResourceId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -819,6 +823,8 @@ pub fn configure_window_request(body: &[u8]) -> Option<ConfigureWindowRequest> {
         width: values.value(2).map(|value| value as u16),
         height: values.value(3).map(|value| value as u16),
         border_width: values.value(4).map(|value| value as u16),
+        sibling: values.value(5).map(ResourceId),
+        stack_mode: values.value(6).map(|value| value as u8),
     })
 }
 
@@ -929,6 +935,9 @@ pub fn create_gc_request(body: &[u8]) -> Option<CreateGcRequest> {
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
         font: values.value(14).map(ResourceId),
+        clip_mask: values
+            .value(19)
+            .map(|value| (value != 0).then_some(ResourceId(value))),
     })
 }
 
@@ -941,6 +950,9 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
         font: values.value(14).map(ResourceId),
+        clip_mask: values
+            .value(19)
+            .map(|value| (value != 0).then_some(ResourceId(value))),
     })
 }
 
@@ -1263,11 +1275,11 @@ pub fn encode_configure_request_event(
     request: &ConfigureWindowRequest,
 ) {
     out.push(23); // ConfigureRequest
-    out.push(0); // stack-mode (not forwarded)
+    out.push(request.stack_mode.unwrap_or(0));
     write_u16(order, out, sequence.0);
     write_u32(order, out, parent.0);
     write_u32(order, out, window.0);
-    write_u32(order, out, 0); // sibling
+    write_u32(order, out, request.sibling.unwrap_or(ResourceId(0)).0);
     write_i16(order, out, request.x.unwrap_or(0));
     write_i16(order, out, request.y.unwrap_or(0));
     write_u16(order, out, request.width.unwrap_or(0));

@@ -19,7 +19,7 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
+    host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostSubwindowConfig, HostX11},
     resources::{
         ARGB_VISUAL, GlyphSetState, HostDrawableTarget, MapState, PictureState, Pixmap,
         ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ReparentWindowError, Window,
@@ -2326,6 +2326,55 @@ fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
     }
 }
 
+/// Handle `GetAtomName` (opcode 17). Atom IDs in our protocol stream can come
+/// from host-proxied replies (notably the `FONTPROP` atoms inside
+/// `ListFontsWithInfo`), so a client can legitimately ask us about an atom
+/// we never interned ourselves. Fall back to the host before returning
+/// `BadAtom`, otherwise e16 sees an atom in a font property reply, calls
+/// `XGetAtomName` on it, gets `BadAtom`, and exits.
+///
+/// The `host_lookup` closure is the test seam — production callers pass a
+/// closure that forwards to `host_x11::get_atom_name` over the host stream.
+fn handle_get_atom_name_with_host_lookup<F>(
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    atom: AtomId,
+    host_lookup: F,
+) -> io::Result<()>
+where
+    F: FnOnce(u32) -> Option<String>,
+{
+    let local = {
+        let s = lock_server(server)?;
+        s.atoms.name(atom).map(str::to_owned)
+    };
+    let name = local.or_else(|| host_lookup(atom.0));
+    match name {
+        Some(name) => {
+            let mut w = writer.lock().map_err(|_| {
+                io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned")
+            })?;
+            x11::write_get_atom_name_reply(&mut *w, sequence, &name)
+        }
+        None => emit_x11_error(writer, sequence, x11::error::BAD_ATOM, atom.0, 17),
+    }
+}
+
+fn handle_get_atom_name(
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    atom: AtomId,
+) -> io::Result<()> {
+    handle_get_atom_name_with_host_lookup(server, writer, sequence, atom, |atom_id| {
+        let host = host?;
+        let mut h = host.lock().ok()?;
+        h.get_atom_name(atom_id).ok().flatten()
+    })
+}
+
 fn handle_xfixes_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
@@ -2716,6 +2765,21 @@ fn shape_rects_for(
         .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window)]))
 }
 
+fn shape_mask_source_rects(server: &ServerState, source: ResourceId) -> Vec<x11xfixes::RegionRect> {
+    server
+        .resources
+        .pixmap(source)
+        .map(|pixmap| {
+            normalize_region_rects(vec![x11xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: pixmap.width,
+                height: pixmap.height,
+            }])
+        })
+        .unwrap_or_default()
+}
+
 fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: u8) -> bool {
     server
         .shape_windows
@@ -2794,6 +2858,23 @@ fn mirror_shape_to_host(
     }
 }
 
+/// Reset the stored region for a single shape kind. Triggered by
+/// `SHAPE::Mask` with `source = None`, which must clear the kind back to its
+/// default (the unshaped window rectangle) rather than recording an empty
+/// region. Used by e16 menu reparenting.
+fn clear_shape_rects(server: &mut ServerState, window: ResourceId, kind: u8) {
+    let Some(state) = server.shape_windows.get_mut(&window) else {
+        return;
+    };
+    let Some(slot) = state.rects_mut(kind) else {
+        return;
+    };
+    *slot = None;
+    if state.bounding.is_none() && state.clip.is_none() && state.input.is_none() {
+        server.shape_windows.remove(&window);
+    }
+}
+
 fn handle_shape_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
@@ -2823,12 +2904,22 @@ fn handle_shape_request(
                 let mut s = lock_server(server)?;
                 let current = shape_rects_for(&s, window, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
+                debug!(
+                    "client {} #{} SHAPE::Rectangles dest=0x{:x} kind={} op={} rects={} extents={:?}",
+                    client_id.0,
+                    sequence.0,
+                    window.0,
+                    req.dest_kind,
+                    req.op,
+                    rects.len(),
+                    region_extents(&rects)
+                );
                 set_shape_rects(&mut s, window, req.dest_kind, rects);
                 Some((window, req.dest_kind))
             } else {
+                debug!("client {} #{} SHAPE::Rectangles", client_id.0, sequence.0);
                 None
             };
-            debug!("client {} #{} SHAPE::Rectangles", client_id.0, sequence.0);
             if let Some((window, kind)) = mirror_target {
                 mirror_shape_to_host(server, host, window, kind);
             }
@@ -2837,22 +2928,48 @@ fn handle_shape_request(
         x11shape::MASK => {
             let mirror_target = if let Some(req) = x11shape::parse_mask_request(body) {
                 let window = ResourceId(req.dest);
-                let source = if req.src == 0 {
-                    Vec::new()
-                } else {
+                if req.src == 0 {
+                    let mut s = lock_server(server)?;
+                    clear_shape_rects(&mut s, window, req.dest_kind);
+                    let rects = shape_rects_for(&s, window, req.dest_kind);
+                    debug!(
+                        "client {} #{} SHAPE::Mask dest=0x{:x} kind={} op={} src=None clear extents={:?}",
+                        client_id.0,
+                        sequence.0,
+                        window.0,
+                        req.dest_kind,
+                        req.op,
+                        region_extents(&rects)
+                    );
+                    drop(s);
+                    mirror_shape_to_host(server, host, window, req.dest_kind);
+                    return Ok(());
+                }
+                let source = {
                     let s = lock_server(server)?;
-                    vec![default_shape_rect(&s, window)]
+                    shape_mask_source_rects(&s, ResourceId(req.src))
                 };
                 let source = offset_rects(source, req.x_off, req.y_off);
                 let mut s = lock_server(server)?;
                 let current = shape_rects_for(&s, window, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
+                debug!(
+                    "client {} #{} SHAPE::Mask dest=0x{:x} kind={} op={} src=0x{:x} rects={} extents={:?}",
+                    client_id.0,
+                    sequence.0,
+                    window.0,
+                    req.dest_kind,
+                    req.op,
+                    req.src,
+                    rects.len(),
+                    region_extents(&rects)
+                );
                 set_shape_rects(&mut s, window, req.dest_kind, rects);
                 Some((window, req.dest_kind))
             } else {
+                debug!("client {} #{} SHAPE::Mask", client_id.0, sequence.0);
                 None
             };
-            debug!("client {} #{} SHAPE::Mask", client_id.0, sequence.0);
             if let Some((window, kind)) = mirror_target {
                 mirror_shape_to_host(server, host, window, kind);
             }
@@ -2869,12 +2986,24 @@ fn handle_shape_request(
                 let mut s = lock_server(server)?;
                 let current = shape_rects_for(&s, dest, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
+                debug!(
+                    "client {} #{} SHAPE::Combine dest=0x{:x} kind={} op={} src=0x{:x} src_kind={} rects={} extents={:?}",
+                    client_id.0,
+                    sequence.0,
+                    dest.0,
+                    req.dest_kind,
+                    req.op,
+                    req.src,
+                    req.src_kind,
+                    rects.len(),
+                    region_extents(&rects)
+                );
                 set_shape_rects(&mut s, dest, req.dest_kind, rects);
                 Some((dest, req.dest_kind))
             } else {
+                debug!("client {} #{} SHAPE::Combine", client_id.0, sequence.0);
                 None
             };
-            debug!("client {} #{} SHAPE::Combine", client_id.0, sequence.0);
             if let Some((window, kind)) = mirror_target {
                 mirror_shape_to_host(server, host, window, kind);
             }
@@ -3992,6 +4121,17 @@ fn handle_request(
                         return emit_x11_error(writer, sequence, code, bad_value, 7);
                     }
                 };
+                debug!(
+                    "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?}",
+                    client_id.0,
+                    sequence.0,
+                    result.window.0,
+                    result.old_parent.0,
+                    result.new_parent.0,
+                    result.x,
+                    result.y,
+                    result.host_xid
+                );
                 if let Some(xid) = result.host_xid {
                     if result.new_parent == ROOT_WINDOW {
                         // Window moved back to root: reposition its host subwindow.
@@ -4000,10 +4140,11 @@ fn handle_request(
                         {
                             let _ = h.configure_subwindow(
                                 xid,
-                                Some(result.x),
-                                Some(result.y),
-                                None,
-                                None,
+                                HostSubwindowConfig {
+                                    x: Some(result.x),
+                                    y: Some(result.y),
+                                    ..HostSubwindowConfig::default()
+                                },
                             );
                         }
                     } else if result.old_parent == ROOT_WINDOW {
@@ -4101,16 +4242,30 @@ fn handle_request(
                             let mut s = lock_server(server)?;
                             let _ = s.resources.map_window(window);
                             let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
-                            let map_info = s
-                                .resources
-                                .window(window)
-                                .map(|w| (w.parent, w.override_redirect, w.width, w.height));
+                            let map_info = s.resources.window(window).map(|w| {
+                                (w.parent, w.override_redirect, w.x, w.y, w.width, w.height)
+                            });
                             (map_info, host_xid)
                         };
-                        debug!(
-                            "client {} MapWindow 0x{:x} direct host_xid={:?}",
-                            client_id.0, window.0, host_xid
-                        );
+                        if let Some((parent, override_redir, x, y, width, height)) = map_info {
+                            debug!(
+                                "client {} MapWindow 0x{:x} direct parent=0x{:x} pos=({},{}) size={}x{} override={} host_xid={:?}",
+                                client_id.0,
+                                window.0,
+                                parent.0,
+                                x,
+                                y,
+                                width,
+                                height,
+                                override_redir,
+                                host_xid
+                            );
+                        } else {
+                            debug!(
+                                "client {} MapWindow 0x{:x} direct host_xid={:?}",
+                                client_id.0, window.0, host_xid
+                            );
+                        }
                         if let Some(xid) = host_xid
                             && let Some(host) = host
                             && let Ok(mut h) = host.lock()
@@ -4134,7 +4289,7 @@ fn handle_request(
                             debug!("focus key window 0x{:x}", window.0);
                             set_focused_window(focused_window, server, window)?;
                         }
-                        if let Some((_parent, override_redir, width, height)) = map_info {
+                        if let Some((_parent, override_redir, _x, _y, width, height)) = map_info {
                             crate::server::emit_window_event(
                                 server,
                                 window,
@@ -4150,21 +4305,28 @@ fn handle_request(
                                     );
                                 },
                             );
-                            crate::server::emit_window_event(
-                                server,
-                                window,
-                                0x0000_8000,
-                                |buf, seq, order| {
-                                    x11::encode_expose_event(
-                                        buf, seq, order, window, 0, 0, width, height, 0,
-                                    );
-                                },
-                            );
+                            // Synthesize Expose only when the window has no host
+                            // backing. Top-levels with a `host_xid` get their
+                            // Expose from the host pump (the host server
+                            // generates one when their host subwindow is
+                            // mapped), so emitting one here too produces a
+                            // duplicate that wmaker reacts to by re-creating
+                            // its appicon bg pixmap.
+                            if host_xid.is_none() {
+                                crate::server::emit_window_event(
+                                    server,
+                                    window,
+                                    0x0000_8000,
+                                    |buf, seq, order| {
+                                        x11::encode_expose_event(
+                                            buf, seq, order, window, 0, 0, width, height, 0,
+                                        );
+                                    },
+                                );
+                            }
                             // Descendants that were already mapped (e.g. Xt widget children)
                             // are now viewable; send them Expose so they redraw immediately.
-                            if host_xid.is_some() {
-                                emit_expose_subtree(server, window);
-                            }
+                            emit_expose_subtree(server, window);
                         }
                     }
                 }
@@ -4368,12 +4530,16 @@ fn handle_request(
                         );
                     });
                 } else {
-                    let (configure, host_xid, old_size) = {
+                    let (configure, host_xid, sibling_host_xid, old_size, parent) = {
                         let mut s = lock_server(server)?;
                         let old_size = s
                             .resources
                             .window(request.window)
                             .map(|w| (w.width, w.height));
+                        let sibling_host_xid = request
+                            .sibling
+                            .and_then(|sibling| s.resources.window(sibling))
+                            .and_then(|w| w.host_xid);
                         let configure = s
                             .resources
                             .configure_window(request)
@@ -4381,18 +4547,41 @@ fn handle_request(
                         let host_xid = configure.as_ref().and_then(|(id, _, _)| {
                             s.resources.window(*id).and_then(|w| w.host_xid)
                         });
-                        (configure, host_xid, old_size)
+                        let parent = configure
+                            .as_ref()
+                            .and_then(|(id, _, _)| s.resources.window(*id).map(|w| w.parent));
+                        (configure, host_xid, sibling_host_xid, old_size, parent)
                     };
+                    debug!(
+                        "client {} #{} ConfigureWindow 0x{:x} parent={:?} mask=0x{:x} x={:?} y={:?} w={:?} h={:?} sibling={:?}/host={:?} stack={:?} host_xid={:?}",
+                        client_id.0,
+                        sequence.0,
+                        request.window.0,
+                        parent.map(|p| format!("0x{:x}", p.0)),
+                        request.value_mask,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                        request.sibling.map(|s| format!("0x{:x}", s.0)),
+                        sibling_host_xid,
+                        request.stack_mode,
+                        host_xid
+                    );
                     if let Some(xid) = host_xid
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
                         let _ = h.configure_subwindow(
                             xid,
-                            request.x,
-                            request.y,
-                            request.width,
-                            request.height,
+                            HostSubwindowConfig {
+                                x: request.x,
+                                y: request.y,
+                                width: request.width,
+                                height: request.height,
+                                sibling: sibling_host_xid,
+                                stack_mode: request.stack_mode,
+                            },
                         );
                     }
                     if let Some((window_id, geometry, override_redirect)) = configure {
@@ -4543,15 +4732,11 @@ fn handle_request(
         }
         17 => {
             let atom = x11::request_atom(body);
-            let name = {
-                let s = lock_server(server)?;
-                s.atoms.name(atom).unwrap_or("UNKNOWN").to_owned()
-            };
             debug!(
-                "client {} #{} GetAtomName {} -> {:?}",
-                client_id.0, sequence.0, atom.0, name
+                "client {} #{} GetAtomName {}",
+                client_id.0, sequence.0, atom.0,
             );
-            x11::write_get_atom_name_reply(&mut *lock_writer()?, sequence, &name)
+            handle_get_atom_name(server, host, writer, sequence, atom)
         }
         18 => {
             let Some(req) = x11::change_property_request(header.data, body) else {
@@ -5224,8 +5409,8 @@ fn handle_request(
                 x11::QueryPointerReply {
                     root: ROOT_WINDOW,
                     child: ROOT_WINDOW,
-                    root_x: pointer.root_x,
-                    root_y: pointer.root_y,
+                    root_x: pointer.win_x,
+                    root_y: pointer.win_y,
                     win_x: pointer.win_x,
                     win_y: pointer.win_y,
                     mask: pointer.mask,
@@ -7346,9 +7531,13 @@ mod tests {
 
     mod xfixes_ops {
         use super::super::{
-            intersect_regions, normalize_region_rects, region_extents, translate_region,
+            clear_shape_rects, intersect_regions, normalize_region_rects, region_extents,
+            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, translate_region,
         };
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use crate::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::{
+            ClientId, CreatePixmapRequest, ResourceId, shape, xfixes::RegionRect,
+        };
 
         fn r(x: i16, y: i16, w: u16, h: u16) -> RegionRect {
             RegionRect {
@@ -7423,6 +7612,43 @@ mod tests {
             translate_region(&mut rects, 100, -100);
             assert_eq!(rects[0].x, i16::MAX);
             assert_eq!(rects[0].y, i16::MIN);
+        }
+
+        #[test]
+        fn shape_mask_source_uses_pixmap_geometry() {
+            let mut server = ServerState::new();
+            let pixmap = ResourceId(0x200);
+            server.resources.create_pixmap(
+                ClientId(1),
+                CreatePixmapRequest {
+                    depth: 1,
+                    pixmap,
+                    drawable: ROOT_WINDOW,
+                    width: 17,
+                    height: 23,
+                },
+            );
+
+            assert_eq!(
+                shape_mask_source_rects(&server, pixmap),
+                vec![r(0, 0, 17, 23)]
+            );
+        }
+
+        #[test]
+        fn clear_shape_rects_reverts_to_default_region() {
+            let mut server = ServerState::new();
+            let window = ROOT_WINDOW;
+            server.shape_windows.entry(window).or_default().bounding = Some(vec![r(1, 2, 3, 4)]);
+
+            assert!(shape_kind_is_set(&server, window, shape::KIND_BOUNDING));
+            clear_shape_rects(&mut server, window, shape::KIND_BOUNDING);
+
+            assert!(!shape_kind_is_set(&server, window, shape::KIND_BOUNDING));
+            assert_eq!(
+                shape_rects_for(&server, window, shape::KIND_BOUNDING),
+                vec![r(0, 0, 800, 600)]
+            );
         }
     }
 
@@ -7988,6 +8214,109 @@ mod tests {
             let height = u16::from_le_bytes(buf[22..24].try_into().unwrap());
             assert_eq!(width, 1024);
             assert_eq!(height, 768);
+        }
+    }
+
+    mod atom_name {
+        //! `GetAtomName` (opcode 17) — atom IDs in our protocol stream can
+        //! come from host-proxied replies (most notably the FONTPROP atoms
+        //! in `ListFontsWithInfo`), so a client may legitimately ask us for
+        //! the name of an atom we never interned ourselves. Falling back to
+        //! the host keeps atom IDs consistent across our layer; without it
+        //! e16 sees a `BadAtom` and exits during startup.
+        use std::{
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex},
+        };
+
+        use super::super::handle_get_atom_name_with_host_lookup;
+        use crate::server::ServerState;
+        use yserver_protocol::x11::{AtomId, SequenceNumber};
+
+        fn pair() -> (Arc<Mutex<UnixStream>>, UnixStream) {
+            let (w, r) = UnixStream::pair().unwrap();
+            (Arc::new(Mutex::new(w)), r)
+        }
+
+        #[test]
+        fn predefined_atom_returns_reply_without_host_lookup() {
+            // Predefined atom 1 = PRIMARY. Local-only path; host lookup must
+            // not be invoked.
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer, mut reader) = pair();
+            let host_called = std::cell::Cell::new(false);
+            handle_get_atom_name_with_host_lookup(
+                &server,
+                &writer,
+                SequenceNumber(1),
+                AtomId(1),
+                |_atom| {
+                    host_called.set(true);
+                    Some("not used".into())
+                },
+            )
+            .unwrap();
+            assert!(!host_called.get(), "predefined atom should not hit host");
+            let mut header = [0u8; 32];
+            reader.read_exact(&mut header).expect("reply header");
+            assert_eq!(header[0], 1, "expected reply, got error");
+        }
+
+        #[test]
+        fn unknown_atom_falls_through_to_host_lookup() {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer, mut reader) = pair();
+            handle_get_atom_name_with_host_lookup(
+                &server,
+                &writer,
+                SequenceNumber(7),
+                AtomId(117),
+                |atom| {
+                    assert_eq!(atom, 117);
+                    Some("Button Wheel Up".into())
+                },
+            )
+            .unwrap();
+
+            // Drain the 32-byte fixed reply header.
+            let mut header = [0u8; 32];
+            reader.read_exact(&mut header).expect("reply header");
+            assert_eq!(header[0], 1, "expected successful reply");
+            let name_len = u16::from_le_bytes([header[8], header[9]]) as usize;
+            assert_eq!(name_len, "Button Wheel Up".len());
+            // Drain the padded name body.
+            let padded = (name_len + 3) & !3;
+            let mut body = vec![0u8; padded];
+            reader.read_exact(&mut body).expect("reply body");
+            assert_eq!(&body[..name_len], b"Button Wheel Up");
+        }
+
+        #[test]
+        fn unknown_atom_with_no_host_fallback_emits_bad_atom() {
+            // No host (or host has no answer either). Spec-correct response
+            // is BadAtom — the previous "UNKNOWN" placeholder reply was
+            // wrong and would fool clients into believing the atom exists.
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer, mut reader) = pair();
+            handle_get_atom_name_with_host_lookup(
+                &server,
+                &writer,
+                SequenceNumber(9),
+                AtomId(117),
+                |_| None,
+            )
+            .unwrap();
+            let mut buf = [0u8; 32];
+            reader.read_exact(&mut buf).expect("error reply block");
+            assert_eq!(buf[0], 0, "expected error response");
+            assert_eq!(buf[1], 5, "BadAtom = 5");
+            assert_eq!(
+                u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                117,
+                "bad value = the offending atom",
+            );
+            assert_eq!(buf[10], 17, "major opcode for GetAtomName");
         }
     }
 }

@@ -1039,8 +1039,6 @@ impl HostX11 {
 
         Ok(PointerPosition {
             same_screen: reply[1] != 0,
-            root_x: read_i16(&reply[16..18]),
-            root_y: read_i16(&reply[18..20]),
             win_x: read_i16(&reply[20..22]),
             win_y: read_i16(&reply[22..24]),
             mask: read_u16(&reply[24..26]),
@@ -1162,28 +1160,33 @@ impl HostX11 {
     pub fn configure_subwindow(
         &mut self,
         host_xid: u32,
-        x: Option<i16>,
-        y: Option<i16>,
-        width: Option<u16>,
-        height: Option<u16>,
+        config: HostSubwindowConfig,
     ) -> io::Result<()> {
         let mut value_mask: u16 = 0;
         let mut values: Vec<u8> = Vec::new();
-        if let Some(x) = x {
+        if let Some(x) = config.x {
             value_mask |= 1 << 0;
             write_u32(&mut values, x as i32 as u32);
         }
-        if let Some(y) = y {
+        if let Some(y) = config.y {
             value_mask |= 1 << 1;
             write_u32(&mut values, y as i32 as u32);
         }
-        if let Some(width) = width {
+        if let Some(width) = config.width {
             value_mask |= 1 << 2;
             write_u32(&mut values, u32::from(width.max(1)));
         }
-        if let Some(height) = height {
+        if let Some(height) = config.height {
             value_mask |= 1 << 3;
             write_u32(&mut values, u32::from(height.max(1)));
+        }
+        if let Some(sibling) = config.sibling {
+            value_mask |= 1 << 5;
+            write_u32(&mut values, sibling);
+        }
+        if let Some(stack_mode) = config.stack_mode {
+            value_mask |= 1 << 6;
+            write_u32(&mut values, u32::from(stack_mode));
         }
         if value_mask == 0 {
             return Ok(());
@@ -1309,6 +1312,46 @@ impl HostX11 {
         write_i16(&mut out, dst_y);
         self.stream.write_all(&out)?;
         self.stream.flush()
+    }
+
+    /// Forward `GetAtomName(atom)` to the host and return its name, or
+    /// `Ok(None)` if the host doesn't know the atom (returns `BadAtom`).
+    /// Used to resolve atoms that leak in via host-proxied replies — most
+    /// notably the `FONTPROP` atoms in `ListFontsWithInfo` payloads.
+    pub fn get_atom_name(&mut self, atom: u32) -> io::Result<Option<String>> {
+        let target = self.sequence;
+        let mut out = Vec::new();
+        out.push(17u8); // GetAtomName
+        out.push(0);
+        write_u16(&mut out, 2); // length: 2 units = 8 bytes
+        write_u32(&mut out, atom);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence != target {
+                self.reply_buffer.push(resp);
+                continue;
+            }
+            if resp.bytes[0] == 0 {
+                // BadAtom (or other) error — host doesn't know this atom.
+                return Ok(None);
+            }
+            let name_len = u16::from_le_bytes([resp.bytes[8], resp.bytes[9]]) as usize;
+            let name_start = 32usize;
+            let end = name_start.checked_add(name_len).ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "GetAtomName name length overflow")
+            })?;
+            if resp.bytes.len() < end {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "GetAtomName reply truncated",
+                ));
+            }
+            let name = String::from_utf8_lossy(&resp.bytes[name_start..end]).into_owned();
+            return Ok(Some(name));
+        }
     }
 
     pub fn create_pixmap(
@@ -2471,11 +2514,19 @@ mod tests {
 #[derive(Clone, Copy, Debug)]
 pub struct PointerPosition {
     pub same_screen: bool,
-    pub root_x: i16,
-    pub root_y: i16,
     pub win_x: i16,
     pub win_y: i16,
     pub mask: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostSubwindowConfig {
+    pub x: Option<i16>,
+    pub y: Option<i16>,
+    pub width: Option<u16>,
+    pub height: Option<u16>,
+    pub sibling: Option<u32>,
+    pub stack_mode: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2655,10 +2706,13 @@ fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result
     write_u16(&mut out, 4);
     write_u32(&mut out, window_id);
     write_u32(&mut out, 1 << 11);
-    // KeyPress | KeyRelease | StructureNotify | Exposure.
-    // Exposure is needed so the desktop area is repainted after another
-    // top-level subwindow is dragged across it.
-    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17) | (1 << 15));
+    // KeyPress | KeyRelease | StructureNotify plus pointer/exposure events.
+    // Pointer events on the host container are root-window events in ynest;
+    // top-level subwindows register their own pointer masks separately.
+    write_u32(
+        &mut out,
+        (1 << 0) | (1 << 1) | (1 << 17) | POINTER_EVENT_MASK,
+    );
     stream.write_all(&out)
 }
 
