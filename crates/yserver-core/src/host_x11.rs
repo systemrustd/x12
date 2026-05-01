@@ -37,6 +37,12 @@ pub struct HostX11 {
     next_xid: u32,
     render: Option<HostRenderInfo>,
     xkb: Option<HostXkbInfo>,
+    /// Major opcode of the host's SHAPE extension, cached on init. `None`
+    /// means the host doesn't advertise SHAPE — forwarders become no-ops.
+    shape_opcode: Option<u8>,
+    /// Major opcode of the host's XFIXES extension. Used so far only by
+    /// `ChangeCursorByName`; other XFIXES requests are still served locally.
+    xfixes_opcode: Option<u8>,
     // Responses read during create_subwindow drain loops that belong to future
     // requests (sequence > geom_seq at time of read). Without this buffer,
     // the drain loop for window N discards the GetGeometry reply for window N+k,
@@ -101,11 +107,21 @@ impl HostX11 {
             next_xid: setup.resource_id_base + 3,
             render: None,
             xkb: None,
+            shape_opcode: None,
+            xfixes_opcode: None,
             reply_buffer: Vec::new(),
             depth_gcs: HashMap::new(),
         };
         this.render = this.init_render().ok();
         this.xkb = this.init_xkb().ok();
+        this.shape_opcode = this.query_extension_opcode(b"SHAPE").ok().flatten();
+        if this.shape_opcode.is_none() {
+            log::info!("host SHAPE extension absent — top-level shape forwarding disabled");
+        }
+        this.xfixes_opcode = this.query_extension_opcode(b"XFIXES").ok().flatten();
+        if this.xfixes_opcode.is_none() {
+            log::info!("host XFIXES extension absent — cursor-by-name forwarding disabled");
+        }
         Ok(this)
     }
 
@@ -452,6 +468,77 @@ impl HostX11 {
         })
     }
 
+    /// Issue `QueryExtension(name)` on the host stream and return the major
+    /// opcode if the extension is present. Used for capability probes that
+    /// don't need the first-event/first-error fields (`init_render` and
+    /// `init_xkb` cache those for their own bookkeeping).
+    fn query_extension_opcode(&mut self, name: &[u8]) -> io::Result<Option<u8>> {
+        let padded = padded_len(name.len());
+        let length_units = 2 + (padded / 4) as u16;
+        let ext_seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(98u8); // QueryExtension
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u16(&mut out, name.len() as u16);
+        write_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out.resize(8 + padded, 0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == ext_seq {
+                if resp.bytes[8] == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(resp.bytes[9]));
+            }
+            self.reply_buffer.push(resp);
+        }
+    }
+
+    /// Mirror the resolved bounding/clip rectangles for a top-level subwindow
+    /// to the host's SHAPE extension. The local `ServerState::shape_windows`
+    /// remains the source of truth for protocol-visible queries (`QueryExtents`,
+    /// `GetRectangles`, `InputSelected`); this call exists so the host actually
+    /// renders themed WM frames with the right silhouette.
+    ///
+    /// `kind` follows the SHAPE protocol enum: 0 = Bounding, 1 = Clip.
+    /// No-op when the host doesn't advertise SHAPE.
+    pub fn set_shape_rectangles(
+        &mut self,
+        host_xid: u32,
+        kind: u8,
+        rects: &[yserver_protocol::x11::xfixes::RegionRect],
+    ) -> io::Result<()> {
+        let Some(bytes) = build_shape_rectangles(self.shape_opcode, host_xid, kind, rects) else {
+            return Ok(());
+        };
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()
+    }
+
+    /// Forward XFIXES `ChangeCursorByName` (minor 23) to the host. The host
+    /// resolves the cursor name against its own theme, so we pass through
+    /// `name_bytes` verbatim. No-op when the host doesn't advertise XFIXES.
+    pub fn xfixes_change_cursor_by_name(
+        &mut self,
+        host_cursor_xid: u32,
+        name_bytes: &[u8],
+    ) -> io::Result<()> {
+        let Some(bytes) =
+            build_xfixes_change_cursor_by_name(self.xfixes_opcode, host_cursor_xid, name_bytes)
+        else {
+            return Ok(());
+        };
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()
+    }
+
     pub fn render_create_picture(
         &mut self,
         host_pic: u32,
@@ -650,26 +737,14 @@ impl HostX11 {
             return Ok(());
         };
         let opcode = r.opcode;
-        // Patch coordinates: add (x_off, y_off) to the first non-255 element's delta
+        let id_size = match minor {
+            23 => 1, // CompositeGlyphs8
+            24 => 2, // CompositeGlyphs16
+            25 => 4, // CompositeGlyphs32
+            _ => 1,  // shouldn't happen, fall back to 8-bit stride
+        };
         let mut patched = items.to_vec();
-        if x_off != 0 || y_off != 0 {
-            let mut pos = 0;
-            while pos + 8 <= patched.len() {
-                let count = patched[pos];
-                if count == 255 {
-                    pos += 8;
-                    continue;
-                }
-                // patch delta_x at pos+4..pos+6, delta_y at pos+6..pos+8
-                let dx =
-                    i16::from_le_bytes([patched[pos + 4], patched[pos + 5]]).wrapping_add(x_off);
-                let dy =
-                    i16::from_le_bytes([patched[pos + 6], patched[pos + 7]]).wrapping_add(y_off);
-                patched[pos + 4..pos + 6].copy_from_slice(&dx.to_le_bytes());
-                patched[pos + 6..pos + 8].copy_from_slice(&dy.to_le_bytes());
-                break;
-            }
-        }
+        patch_glyph_command_offsets(&mut patched, x_off, y_off, id_size);
         let padded_items = padded_len(patched.len());
         let length_units = 7 + (padded_items / 4) as u16;
         self.sequence = self.sequence.wrapping_add(1);
@@ -2193,7 +2268,8 @@ pub struct HostKeyEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::xkb_minor_has_reply;
+    use super::{build_shape_rectangles, xkb_minor_has_reply};
+    use yserver_protocol::x11::xfixes::RegionRect;
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {
@@ -2209,6 +2285,186 @@ mod tests {
     fn xkb_void_minor_audit_keeps_select_events_fire_and_forget() {
         assert!(!xkb_minor_has_reply(1)); // SelectEvents
         assert!(!xkb_minor_has_reply(2)); // Bell
+    }
+
+    #[test]
+    fn shape_rectangles_no_host_opcode_returns_none() {
+        // No host SHAPE opcode → caller should send nothing.
+        assert!(build_shape_rectangles(None, 0xdead_beef, 0, &[]).is_none());
+    }
+
+    #[test]
+    fn change_cursor_by_name_no_host_opcode_returns_none() {
+        // No host XFIXES opcode → caller should send nothing and not crash.
+        assert!(super::build_xfixes_change_cursor_by_name(None, 0x10, b"left_ptr").is_none());
+    }
+
+    #[test]
+    fn change_cursor_by_name_wire_shape_unpadded_name() {
+        // 8-byte name "left_ptr" → no padding needed.
+        let bytes =
+            super::build_xfixes_change_cursor_by_name(Some(140), 0xdead_beef, b"left_ptr").unwrap();
+        // header(4) + cursor(4) + nbytes(2)+pad(2) + name(8) = 20 bytes = 5 units
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes[0], 140, "major = XFIXES");
+        assert_eq!(bytes[1], 23, "minor = ChangeCursorByName");
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 5);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            0xdead_beef,
+        );
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 8);
+        assert_eq!(&bytes[12..20], b"left_ptr");
+    }
+
+    #[test]
+    fn change_cursor_by_name_wire_shape_pads_name_to_4() {
+        // 5-byte name → 3 padding bytes appended.
+        let bytes = super::build_xfixes_change_cursor_by_name(Some(140), 0x1, b"hand1").unwrap();
+        // 12 (header) + padded_len(5) = 12 + 8 = 20 bytes = 5 units
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 5);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 5);
+        assert_eq!(&bytes[12..17], b"hand1");
+        assert_eq!(&bytes[17..20], &[0, 0, 0]);
+    }
+
+    fn glyphcmd(count: u8, dx: i16, dy: i16) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0] = count;
+        buf[4..6].copy_from_slice(&dx.to_le_bytes());
+        buf[6..8].copy_from_slice(&dy.to_le_bytes());
+        buf
+    }
+
+    fn read_dx(items: &[u8], pos: usize) -> i16 {
+        i16::from_le_bytes([items[pos + 4], items[pos + 5]])
+    }
+
+    fn read_dy(items: &[u8], pos: usize) -> i16 {
+        i16::from_le_bytes([items[pos + 6], items[pos + 7]])
+    }
+
+    #[test]
+    fn glyph_offset_patches_every_non_255_command() {
+        // Two real glyph runs (count=1, count=2) separated by a 255 sentinel
+        // marking a glyphset switch. Every non-sentinel command's delta must
+        // be shifted by (x_off, y_off) so multi-run composites line up at the
+        // host's destination origin.
+        let mut items = Vec::new();
+        items.extend_from_slice(&glyphcmd(1, 10, 20)); // run 1
+        items.extend_from_slice(&glyphcmd(255, 0, 0)); // glyphset switch
+        items.extend_from_slice(&[0u8; 4]); // 8-byte alignment for the 255 cmd
+        items.extend_from_slice(&glyphcmd(2, 30, 40)); // run 2
+
+        super::patch_glyph_command_offsets(&mut items, 5, -3, 1);
+
+        assert_eq!(read_dx(&items, 0), 15);
+        assert_eq!(read_dy(&items, 0), 17);
+        // 255 sentinel cmd untouched (its delta bytes are still 0).
+        assert_eq!(read_dx(&items, 8), 0);
+        assert_eq!(read_dy(&items, 8), 0);
+        // Second run patched too.
+        assert_eq!(read_dx(&items, 20), 35);
+        assert_eq!(read_dy(&items, 20), 37);
+    }
+
+    #[test]
+    fn glyph_offset_zero_offset_is_identity() {
+        let mut items = Vec::new();
+        items.extend_from_slice(&glyphcmd(1, 10, 20));
+        items.extend_from_slice(&glyphcmd(2, 30, 40));
+        let original = items.clone();
+        super::patch_glyph_command_offsets(&mut items, 0, 0, 1);
+        assert_eq!(items, original);
+    }
+
+    #[test]
+    fn glyph_offset_handles_16bit_glyph_id_stride() {
+        // Two CompositeGlyphs16 runs back to back: header(8) + count*2 padded
+        // to 4. count=3 → 6 bytes payload → padded 8 bytes → next header at
+        // pos+16.
+        let mut items = Vec::new();
+        items.extend_from_slice(&glyphcmd(3, 10, 20));
+        items.extend_from_slice(&[0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc, 0, 0]); // 3 ids + pad
+        items.extend_from_slice(&glyphcmd(2, 30, 40));
+        items.extend_from_slice(&[0xdd, 0xdd, 0xee, 0xee]); // 2 ids, no pad needed
+
+        super::patch_glyph_command_offsets(&mut items, 1, 2, 2);
+
+        assert_eq!(read_dx(&items, 0), 11);
+        assert_eq!(read_dy(&items, 0), 22);
+        assert_eq!(read_dx(&items, 16), 31);
+        assert_eq!(read_dy(&items, 16), 42);
+    }
+
+    #[test]
+    fn shape_rectangles_empty_list_clears_shape() {
+        // Empty rect list with op=Set is the canonical "no shape" — header only,
+        // no rectangle bodies.
+        let bytes = build_shape_rectangles(Some(141), 0xdead_beef, 0, &[]).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 141, "major opcode");
+        assert_eq!(bytes[1], 1, "minor = RECTANGLES");
+        assert_eq!(
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+            4,
+            "length = 4 units"
+        );
+        assert_eq!(bytes[4], 0, "op = Set");
+        assert_eq!(bytes[5], 0, "kind = Bounding");
+        assert_eq!(bytes[6], 0, "ordering = Unsorted");
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0xdead_beef,
+            "dest = host xid",
+        );
+        // x_off, y_off are zero for top-level forwarding.
+        assert_eq!(i16::from_le_bytes([bytes[12], bytes[13]]), 0);
+        assert_eq!(i16::from_le_bytes([bytes[14], bytes[15]]), 0);
+    }
+
+    #[test]
+    fn shape_rectangles_clip_kind_mapping() {
+        // KIND_CLIP is 1; ensure it makes it onto the wire as-is.
+        let bytes = build_shape_rectangles(Some(141), 0x1, 1, &[]).unwrap();
+        assert_eq!(bytes[5], 1, "kind = Clip");
+    }
+
+    #[test]
+    fn shape_rectangles_multi_rect_payload_unchanged() {
+        // Top-level shape coords are already in the host subwindow's local
+        // coords (subwindow position itself is the offset). Forwarder must
+        // not translate per-rect — assert the rectangle bytes are forwarded
+        // verbatim.
+        let rects = [
+            RegionRect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            },
+            RegionRect {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40,
+            },
+        ];
+        let bytes = build_shape_rectangles(Some(141), 0xabad_cafe, 0, &rects).unwrap();
+        // header(16) + 2 rects * 8 bytes = 32 bytes = 8 units
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 8);
+
+        assert_eq!(i16::from_le_bytes([bytes[16], bytes[17]]), 1);
+        assert_eq!(i16::from_le_bytes([bytes[18], bytes[19]]), 2);
+        assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 3);
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 4);
+
+        assert_eq!(i16::from_le_bytes([bytes[24], bytes[25]]), 10);
+        assert_eq!(i16::from_le_bytes([bytes[26], bytes[27]]), 20);
+        assert_eq!(u16::from_le_bytes([bytes[28], bytes[29]]), 30);
+        assert_eq!(u16::from_le_bytes([bytes[30], bytes[31]]), 40);
     }
 }
 
@@ -2504,6 +2760,93 @@ fn pad4(out: &mut Vec<u8>) {
     while !out.len().is_multiple_of(4) {
         out.push(0);
     }
+}
+
+/// Add `(x_off, y_off)` to every non-sentinel glyph command's delta in a
+/// `CompositeGlyphs{8,16,32}` payload. Previously this only patched the first
+/// command's delta and stopped, which mispositioned multi-run composites
+/// — anything containing a 255 sentinel that switches glyphsets between runs.
+///
+/// `id_size` is 1 for `CompositeGlyphs8` (minor 23), 2 for the 16-bit variant
+/// (minor 24), 4 for the 32-bit variant (minor 25). The glyph-id payload that
+/// follows each non-sentinel header is `count * id_size` bytes, padded to a
+/// 4-byte boundary; the next header begins immediately after that.
+fn patch_glyph_command_offsets(items: &mut [u8], x_off: i16, y_off: i16, id_size: usize) {
+    if x_off == 0 && y_off == 0 {
+        return;
+    }
+    debug_assert!(matches!(id_size, 1 | 2 | 4));
+    let mut pos = 0;
+    while pos + 8 <= items.len() {
+        let count = items[pos];
+        if count == 255 {
+            // Glyphset-switch sentinel: 8 bytes total (count, pad×3, glyphset
+            // XID), no payload follows.
+            pos += 8;
+            continue;
+        }
+        let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]).wrapping_add(x_off);
+        let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]).wrapping_add(y_off);
+        items[pos + 4..pos + 6].copy_from_slice(&dx.to_le_bytes());
+        items[pos + 6..pos + 8].copy_from_slice(&dy.to_le_bytes());
+        let payload_bytes = usize::from(count) * id_size;
+        let padded = (payload_bytes + 3) & !3;
+        pos += 8 + padded;
+    }
+}
+
+/// Build the wire bytes for XFIXES `ChangeCursorByName` (minor 23). Returns
+/// `None` when the host XFIXES extension is unavailable.
+fn build_xfixes_change_cursor_by_name(
+    host_xfixes_opcode: Option<u8>,
+    host_cursor_xid: u32,
+    name_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let opcode = host_xfixes_opcode?;
+    let nbytes = u16::try_from(name_bytes.len()).ok()?;
+    let padded_name = padded_len(name_bytes.len());
+    let length_units = u16::try_from(3 + padded_name / 4).ok()?;
+    let mut out = Vec::with_capacity(12 + padded_name);
+    out.push(opcode);
+    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
+    write_u16(&mut out, length_units);
+    write_u32(&mut out, host_cursor_xid);
+    write_u16(&mut out, nbytes);
+    write_u16(&mut out, 0); // pad
+    out.extend_from_slice(name_bytes);
+    out.resize(12 + padded_name, 0);
+    Some(out)
+}
+
+/// Build the wire bytes for SHAPE `Rectangles(op=Set, ordering=Unsorted)`
+/// targeting `host_xid`. Returns `None` when the host SHAPE extension is
+/// unavailable so the caller doesn't waste a stream write.
+fn build_shape_rectangles(
+    host_shape_opcode: Option<u8>,
+    host_xid: u32,
+    kind: u8,
+    rects: &[yserver_protocol::x11::xfixes::RegionRect],
+) -> Option<Vec<u8>> {
+    let opcode = host_shape_opcode?;
+    let length_units = u16::try_from(4 + rects.len() * 2).ok()?;
+    let mut out = Vec::with_capacity(16 + rects.len() * 8);
+    out.push(opcode);
+    out.push(yserver_protocol::x11::shape::RECTANGLES);
+    write_u16(&mut out, length_units);
+    out.push(yserver_protocol::x11::shape::OP_SET);
+    out.push(kind);
+    out.push(0); // ordering = Unsorted
+    out.push(0); // pad
+    write_u32(&mut out, host_xid);
+    write_i16(&mut out, 0); // x_off (top-level coords already match)
+    write_i16(&mut out, 0); // y_off
+    for rect in rects {
+        write_i16(&mut out, rect.x);
+        write_i16(&mut out, rect.y);
+        write_u16(&mut out, rect.width);
+        write_u16(&mut out, rect.height);
+    }
+    Some(out)
 }
 
 fn write_open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {

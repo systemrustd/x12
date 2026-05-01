@@ -396,104 +396,136 @@ Landed so far:
   `yserver_protocol::x11::randr::encode_get_screen_info_reply`.
   **Validated:** Enlightenment e16 starts and a window can be dragged.
 
-## Phase 3.3 — Window manager validation follow-ups (not started)
+## Phase 3.3 — Window manager validation follow-ups (in progress)
 
 Goal: clean up rendering artifacts and missing chrome that surfaced
-while validating wmaker and e16. None are blockers — the WMs come up
-and apps are usable — but each one is a visible glitch under real WM
+while validating wmaker and e16. None were blockers — the WMs came up
+and apps were usable — but each one was a visible glitch under real WM
 sessions.
 
-- **Forward SHAPE to host for top-levels.** Currently `SHAPE::Rectangles`,
-  `SHAPE::Mask`, `SHAPE::Combine`, and `SHAPE::Offset` only update the
-  per-window state stored in `ServerState::shape_windows`. The host
-  treats every top-level subwindow as a full rectangle, so themed
-  frames that depend on shaped chrome (e16 issues ~1900 `SHAPE::Mask`
-  calls per session) render with extra/missing pixels. Plan: detect
-  the SHAPE extension on the host connection during `HostX11`
-  initialization, cache its major opcode, and on every shape mutation
-  targeting a window with a `host_xid` forward `ShapeRectangles` to
-  the host with the resolved rect list. Sub-windows without a
-  `host_xid` keep their local-only behavior (the parent's host shape
-  already clips them). Localized to `host_x11.rs` (a new SHAPE
-  forwarder) and the SHAPE branches in `nested.rs::handle_shape_request`.
+Design:
+[`2026-04-30-phase3-3-wm-validation-followups-design.md`](superpowers/specs/2026-04-30-phase3-3-wm-validation-followups-design.md).
+Plan:
+[`2026-04-30-phase3-3-wm-validation-followups.md`](superpowers/plans/2026-04-30-phase3-3-wm-validation-followups.md).
 
-- **Preserve pixels for fully occluded / off-screen drags.** The host
-  doesn't preserve subwindow pixels that are scrolled off-screen or
-  fully behind a sibling top-level, and we don't enable backing-store
-  on host subwindows. Dragging a frame off-screen and back, or fully
-  behind another top-level and back out, leaves stale content on the
-  uncovered area until the client redraws. Two options: (a) request
-  `BackingStore=Always` on each top-level subwindow at create time,
-  trading host memory for correctness, or (b) emit a synthetic
-  `ConfigureNotify` + full-window Expose to the affected client when
-  we detect the configure that re-exposes the area. Option (a) is
-  simpler and what most nested servers do.
+### Landed
 
-- **XFIXES `ChangeCursorByName` (minor 23).** e16 calls this 7+ times
-  during cursor theming and we currently log it as `XFIXES::unknown`.
-  No reply is expected, so it doesn't block, but the cursor never
-  changes. Plan: parse the request (cursor xid + name string), look
-  up or create a host cursor by name via the host connection, and
-  apply via `ChangeCursor` on the affected windows. Pairs naturally
-  with the existing XFIXES cursor implementation.
+- [x] **Forward SHAPE to host for top-levels.** `HostX11` now probes
+      the host's SHAPE extension during init and caches its major
+      opcode. After every `Rectangles`/`Mask`/`Combine`/`Offset`
+      mutation that targets a top-level with a `host_xid`,
+      `handle_shape_request` mirrors the resolved bounding/clip rect
+      list to the host as a single `ShapeRectangles(op=Set,
+      ordering=Unsorted)`. Local `shape_windows` remains the source
+      of truth for `QueryExtents`/`GetRectangles`/`InputSelected`.
+      Sub-windows without host backing keep local-only behavior; the
+      parent's host shape already clips them.
 
-- **Sub-window Expose covering cross-border / behind-sibling drags.**
-  Our `descendants_in_exposed_area` walker (Phase 3.2) handles the
-  common case where a top-level moves and its sibling sub-windows
-  need repaint, but it relies on the host generating Expose for the
-  uncovered region. When the host can't (because the area was
-  off-screen or fully behind a stacked top-level), no Expose is
-  generated. The same fix as the backing-store item above resolves
-  this — either backing-store or a synthetic full-window Expose on
-  the configure boundary.
+- [x] **XFIXES `ChangeCursorByName` (minor 23).** Forward to the host
+      so it can resolve the cursor name against its own theme. We
+      cache the host XFIXES major opcode at init and translate the
+      nested cursor XID to the host XID via `cursor_host_xid` before
+      forwarding. e16 stops logging `XFIXES::unknown minor=23`.
 
-- **Verify e16 RENDER coverage.** e16 sends 5400+ `RENDER::CreatePicture`
-  / `FreePicture` and 4400+ `RENDER::Composite` calls per session.
-  Spot-check that all of these succeed against the host (no silent
-  drops on opcodes we have but parse incorrectly), since the visible
-  artifacts may also include subtly mis-encoded glyphs or composites
-  for e16's themed buttons.
+- [x] **Multi-glyph `CompositeGlyphs` delta patching.**
+      `render_composite_glyphs` previously patched only the first
+      non-sentinel glyph command's delta and stopped, so multi-run
+      composites that switch glyphsets via the 255 sentinel landed
+      later runs at the wrong destination origin. The patch loop now
+      walks every glyph command, advancing past each non-sentinel
+      header plus its `count * id_size` payload (id_size = 1 / 2 / 4
+      for `CompositeGlyphs8`/`16`/`32`).
 
-- **Root window resize plumbing.** `handle_host_container_resize`
-  already updates `RandrState`, the nested `ROOT_WINDOW` dimensions,
-  and emits `RRScreenChangeNotify` / CRTC- and output-change events
-  to subscribers with `RRSelectInput` masks. Missing pieces:
-  `ConfigureNotify` on `ROOT_WINDOW` to clients with
-  `StructureNotify` on root (panels and "fill the screen" clients
-  rely on this), re-mapping of the container's `bg_pixel` to the new
-  bounds (host should auto-handle this but verify), and exposing the
-  new size to clients that re-query via `GetGeometry`. Clients with
-  no RANDR awareness don't reflow when the host window is resized
-  today.
+- [x] **Root window resize plumbing — core `ConfigureNotify`.**
+      `handle_host_container_resize` already updated `RandrState`
+      and root geometry and fanned out `RRScreenChangeNotify` plus
+      CRTC/output events. It now also emits a core `ConfigureNotify`
+      on `ROOT_WINDOW` to clients selecting `StructureNotifyMask`
+      *before* the RANDR fanout, so panels and "fill the screen"
+      apps without RANDR awareness reflow correctly. Tests assert
+      `RandrState` + `ROOT_WINDOW` geometry + the
+      `StructureNotify`-only client path. A small probe lives at
+      [`docs/root-resize-probe.py`](root-resize-probe.py) for
+      manual validation.
 
-- **Apps disappear after host resize (fvwm).** Resizing the ynest
-  container triggers the desktop bg to be re-tiled across the full
-  new area but the visible app windows go blank, with only tiny
-  fragments of their decorations remaining. Setting `bit-gravity =
-  NorthWest` on the container and `bit-gravity = NorthWest +
-  backing-store = Always` on every top-level subwindow did not
-  resolve it, which suggests the cause is not pixel preservation
-  through the host resize. Suspects: fvwm responding to
-  `RRScreenChangeNotify` by drawing the bg pattern into the root
-  with a clip that includes child windows, a host compositor pass
-  that fails to redraw subwindow content, or a missing synthetic
-  expose/configure that prevents apps from re-rendering. Repro:
-  resize the ynest window with fvwm running and xclock/xterm
-  visible — they vanish without ConfigureWindow events from any
-  client.
+- [x] **RENDER opcode-table reconciliation.** `ChangePicture` is
+      no longer marked `∅` (it forwards scalar attributes and
+      explicit-None XID attributes); `SetPictureClipRectangles` is
+      `✓` (forwarded with picture x/y offset translation).
 
-- **fvwm segfault when the host window is closed.** Closing the
-  ynest container triggers the host pump to exit, the listening
-  socket to drop, and fvwm to crash. Real X servers also drop
-  connections on exit, so fvwm should handle this; we may be
-  cutting the I/O without flushing pending events or emitting a
-  clean disconnect signal. Verify: capture fvwm's stderr and run
-  it under gdb to identify the segfault, then check whether ynest
-  flushes per-client writers on host_pump exit.
+### Validation outcomes
 
-- **Validation runs:** Openbox, Fluxbox (called out under Phase 2 as
-  deferred), then back to wmaker/e16 once SHAPE forwarding lands to
-  confirm the chrome artifacts go away.
+Smoke pass under each WM (release ynest on `:99` + xterm + xclock,
+host container at default 800×600):
+
+- **wmaker:** WM starts; xterm and xclock render; window chrome
+  draws. Drag/restack works (Phase 3.2 backing-store covers the
+  drag-redraw scenarios from the design's items #2/#4 — no
+  artifacts under the validation set, so synthetic Expose was not
+  needed in this phase). Two pre-existing rendering gaps remain
+  (filed below as Phase 3.4).
+- **e16:** Regressed since the last documented startup pass —
+  exits with status 1 during initial setup, before any window is
+  mapped. Pre-Phase-3.3 build also exits the same way, so the
+  regression predates this phase. Filed as Phase 3.4.
+- **fvwm3:** Starts and renders. The host-container-resize path
+  (host xdotool windowsize) reliably crashes fvwm3 itself with a
+  segfault — reproducible without ynest changes. Likely an fvwm3
+  bug; deferred.
+- **openbox:** WM starts and clients connect, but the rendered
+  container is blank — no client chrome draws. Filed as Phase 3.4.
+- **Fluxbox:** Not installed in the validation environment.
+
+### Phase 3.4 follow-ups
+
+- **wmaker appicon contents missing.** The 64×64 dock-icon frames
+  draw their 3D border (background pixmap → ClearArea path works)
+  but the inner icon graphic and the app-name label are absent.
+  Pre-existing — present on Phase-3.2 builds before SHAPE
+  forwarding landed. Repro: `ynest 99` + `wmaker` + `xterm` +
+  `xclock`; bottom-left appicons appear as empty grey squares.
+  Suspect: WindowMaker's icon-paint path renders into a child
+  sub-window of the appicon that has no host backing, so the
+  CompositeGlyphs/CopyArea ops never reach the host surface.
+- **wmaker title-bar close button missing.** Same shape: title-bar
+  itself draws but the close-button glyph in its corner is absent.
+  Same suspected root cause — sub-window-of-titlebar drawing not
+  reaching the host. Pre-existing.
+- **e16 startup regression.** e16 exits with code 1 after the
+  initial XKB/AllocColor/Composite/ListFonts probe sequence,
+  before any window appears. Last-observed atom-name probe
+  (`GetAtomName 117 -> "UNKNOWN"`) and `unsupported opcode 88`
+  (FreeColors) are likely diagnostic noise rather than the cause.
+  Bisect against the most recent known-working build needed.
+- **openbox renders blank container.** Openbox starts under ynest
+  with apps connecting (xterm, xclock client setups complete) but
+  no pixels reach the screen. No unsupported opcodes logged.
+  Repro: `ynest 99` + `openbox` + `xterm` + `xclock`, screenshot
+  the host container.
+- **fvwm3 segfaults on host container resize.** `xdotool
+  windowsize 0x400000 1024 768` while fvwm3 is running reliably
+  segfaults fvwm3 immediately after the new core
+  `ConfigureNotify(root)` is emitted. Reproduces with no clients
+  attached. Likely an fvwm3 bug (real Xorg also emits root
+  ConfigureNotify on screen resize via xrandr). Deferred per the
+  design's "swap and document" rule until a target client
+  misbehaves under another order. Re-test after a fvwm3 update.
+- **Apps disappear after host resize (fvwm).** Original Phase 3.2
+  observation; not addressed in 3.3. Now superseded by the
+  segfault above for fvwm3 specifically.
+- **fvwm segfault when host window is closed.** Original Phase 3.2
+  observation; not addressed in 3.3.
+- **Sub-window Expose for fully off-screen / behind-sibling drags
+  (synthetic Expose / Phase B).** Backing-store mitigation from
+  commit `93b988a` covers the smoke pass; not exercised heavily
+  enough to need synthetic Expose in 3.3. Defer until a real
+  validation scenario demonstrates a backing-store gap.
+- **e16 RENDER coverage audit.** Audit instrumentation deferred —
+  e16 doesn't reach a stable rendering state under ynest right
+  now, so a 60-second e16 audit run isn't actionable. Re-open
+  after the e16 startup regression is fixed.
+- **Input-shape hit testing in the pointer pump.** Already
+  deferred from Phase 3.2; still deferred.
 
 ## Phase 4 — Accelerated clients
 
@@ -738,8 +770,8 @@ between client and host ID spaces.
 |   1   | QueryPictFormats      | ↩ | replies with 4 synthetic formats (A1, A8, RGB24, ARGB32) |
 |   2   | QueryPictIndexValues  | ↩ | exact empty reply |
 |   4   | CreatePicture         | ✓ | format ID translated; coord offset stored on `PictureState` |
-|   5   | ChangePicture         | ∅ | clip mask / repeat not applied to host picture |
-|   6   | SetPictureClipRectangles | ✗ | |
+|   5   | ChangePicture         | ✓ | scalar attributes + None XID attributes forwarded; non-None CPClipMask/CPAlphaMap dropped (XID translation not yet wired) |
+|   6   | SetPictureClipRectangles | ✓ | forwarded with picture x/y offset translation |
 |   7   | FreePicture           | ✓ | |
 |   8   | Composite             | ✓ | dst_xy patched with dst picture's x/y offset; mask=0 forwards as host xid 0 |
 |  17   | CreateGlyphSet        | ✓ | format ID translated to host equivalent |
@@ -747,9 +779,9 @@ between client and host ID spaces.
 |  19   | FreeGlyphSet          | ✓ | |
 |  20   | AddGlyphs             | ✓ | body padding/length corrected against Xephyr trace |
 |  22   | FreeGlyphs            | ✓ | glyphset XID translated; request forwarded to host |
-|  23   | CompositeGlyphs8      | ✓ | first glyphcmd's deltax/deltay patched with picture offset |
-|  24   | CompositeGlyphs16     | ✓ | same patching as 8 |
-|  25   | CompositeGlyphs32     | ✓ | same patching as 8 |
+|  23   | CompositeGlyphs8      | ✓ | every non-sentinel glyphcmd's delta patched with picture offset (multi-run safe) |
+|  24   | CompositeGlyphs16     | ✓ | same patching as 8 (16-bit glyph-id stride) |
+|  25   | CompositeGlyphs32     | ✓ | same patching as 8 (32-bit glyph-id stride) |
 |  26   | FillRectangles        | ✓ | rectangle coords offset by picture's x/y offset |
 |  27   | CreateCursor          | ✓ | from picture; cursor XID allocated locally |
 |  29   | QueryFilters          | ↩ | exact empty filter/alias reply |
@@ -773,9 +805,10 @@ Notes:
 
 ### Known follow-ups (RENDER)
 
-- ChangePicture is a no-op stub; clip-mask and repeat values aren't
-  forwarded. fvwm3 doesn't seem to need them, but proper Xft clipping
-  would require this.
+- ChangePicture forwards scalar attributes and explicit-None XID
+  attributes (CPClipMask=None, CPAlphaMap=None) but drops non-None
+  CPClipMask/CPAlphaMap because XID translation isn't wired yet —
+  proper pixmap-clip / alpha-map mapping would require it.
 - DestroyWindow should release any retained bg-pixmap host XIDs
   (`Window.background_pixmap_host_xid`); currently they leak on
   window destroy.

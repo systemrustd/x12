@@ -18,6 +18,7 @@ pub const INVERT_REGION: u8 = 16;
 pub const TRANSLATE_REGION: u8 = 17;
 pub const REGION_EXTENTS: u8 = 18;
 pub const FETCH_REGION: u8 = 19;
+pub const CHANGE_CURSOR_BY_NAME: u8 = 23;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
 
@@ -153,6 +154,21 @@ pub fn parse_invert_region(body: &[u8]) -> Option<(u32, RegionRect, u32)> {
     ))
 }
 
+/// Parse XFIXES `ChangeCursorByName` (minor 23). Returns the cursor XID and
+/// the raw name bytes (no UTF-8 validation, no theme lookup — the caller
+/// forwards the exact bytes to the host).
+#[must_use]
+pub fn parse_change_cursor_by_name(body: &[u8]) -> Option<(u32, &[u8])> {
+    if body.len() < 8 {
+        return None;
+    }
+    let cursor = read_u32_le(body);
+    let nbytes = read_u16_le(&body[4..6]) as usize;
+    // bytes 6..8 are padding.
+    let name = body.get(8..8 + nbytes)?;
+    Some((cursor, name))
+}
+
 #[must_use]
 pub fn parse_rectangles(mut bytes: &[u8]) -> Vec<RegionRect> {
     let mut rects = Vec::new();
@@ -245,6 +261,56 @@ mod tests {
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
         assert_eq!(u16::from_le_bytes(reply[12..14].try_into().unwrap()), 0);
         assert_eq!(u16::from_le_bytes(reply[14..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn change_cursor_by_name_parses_unpadded_name() {
+        // body: cursor(4) | nbytes(2) | pad(2) | name(nbytes) padded to 4
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xdead_beef_u32.to_le_bytes());
+        let name = b"left_ptr"; // 8 bytes — already 4-byte aligned, no pad
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(name);
+
+        let (cursor, parsed_name) = parse_change_cursor_by_name(&body).unwrap();
+        assert_eq!(cursor, 0xdead_beef);
+        assert_eq!(parsed_name, name);
+    }
+
+    #[test]
+    fn change_cursor_by_name_handles_4_byte_padding() {
+        // 6-byte name → 2 padding bytes follow.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        let name = b"hand1\0".strip_suffix(b"\0").unwrap(); // 5 bytes
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(name);
+        body.push(0); // pad to 4-byte alignment
+        body.push(0); // pad to 4-byte alignment
+        body.push(0); // pad to 4-byte alignment
+
+        let (cursor, parsed_name) = parse_change_cursor_by_name(&body).unwrap();
+        assert_eq!(cursor, 1);
+        assert_eq!(parsed_name, name, "padding bytes must not leak into name");
+    }
+
+    #[test]
+    fn change_cursor_by_name_rejects_truncated_input() {
+        // Body claims 100 name bytes but provides 4.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&100_u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(b"oops");
+        assert!(parse_change_cursor_by_name(&body).is_none());
+    }
+
+    #[test]
+    fn change_cursor_by_name_rejects_short_header() {
+        // Less than 8 bytes — header itself doesn't fit.
+        assert!(parse_change_cursor_by_name(&[1, 2, 3, 4]).is_none());
     }
 
     #[test]

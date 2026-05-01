@@ -1029,6 +1029,36 @@ fn handle_host_container_resize(
         "host container resized to {}x{} at {}, emitting RANDR updates",
         width, height, timestamp
     );
+
+    // Spec-correct: emit a core ConfigureNotify on root *before* the RANDR
+    // fanout so non-RANDR-aware clients (panels, "fill the screen" apps)
+    // reflow at the same point in the event stream that RANDR-aware toolkits
+    // see screen-change. Subscribers selected via StructureNotifyMask on root.
+    crate::server::emit_window_event(
+        server,
+        ROOT_WINDOW,
+        0x0002_0000, // StructureNotifyMask
+        |buf, seq, order| {
+            x11::encode_configure_notify_event(
+                buf,
+                seq,
+                order,
+                ROOT_WINDOW,
+                ROOT_WINDOW,
+                x11::Geometry {
+                    root: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    border_width: 0,
+                    depth: 24,
+                },
+                false,
+            );
+        },
+    );
+
     for (target, request_window, mask) in targets {
         let sequence = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
         if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
@@ -2299,6 +2329,7 @@ fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
 fn handle_xfixes_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
     writer: &Arc<Mutex<UnixStream>>,
     sequence: SequenceNumber,
     minor: u8,
@@ -2595,6 +2626,35 @@ fn handle_xfixes_request(
             let reply = x11xfixes::encode_fetch_region_reply(sequence, extents, &rects);
             lock_writer()?.write_all(&reply)
         }
+        x11xfixes::CHANGE_CURSOR_BY_NAME => {
+            // Forward to the host so it can resolve the name against its own
+            // cursor theme. e16 hits this path 7+ times during cursor theming;
+            // without forwarding, the cursor never changes when hovering chrome.
+            if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_change_cursor_by_name(body) {
+                let host_cursor = lock_server(server)?
+                    .resources
+                    .cursor_host_xid(ResourceId(cursor_xid));
+                if let (Some(host), Some(host_cursor)) = (host, host_cursor) {
+                    if let Ok(mut h) = host.lock()
+                        && let Err(err) = h.xfixes_change_cursor_by_name(host_cursor, name_bytes)
+                    {
+                        debug!(
+                            "host XFIXES::ChangeCursorByName failed for cursor 0x{cursor_xid:x}: {err}"
+                        );
+                    }
+                } else {
+                    debug!(
+                        "client {} #{} XFIXES::ChangeCursorByName cursor=0x{:x} dropped (no host mapping)",
+                        client_id.0, sequence.0, cursor_xid
+                    );
+                }
+            }
+            debug!(
+                "client {} #{} XFIXES::ChangeCursorByName",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
             debug!(
                 "client {} #{} XFIXES::{}Cursor (stub)",
@@ -2697,9 +2757,47 @@ fn set_shape_rects(
     }
 }
 
+/// Resolve `window`'s host XID and current per-kind rect list, then forward
+/// the resolved list to the host's SHAPE extension. No-op when the window has
+/// no host backing (sub-windows below top-levels keep their local-only
+/// behavior — the parent's host shape already clips them).
+fn mirror_shape_to_host(
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    window: ResourceId,
+    kind: u8,
+) {
+    let Some(host) = host else { return };
+    if kind != x11shape::KIND_BOUNDING && kind != x11shape::KIND_CLIP {
+        return;
+    }
+    let (host_xid, rects) = {
+        let s = match server.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let Some(w) = s.resources.window(window) else {
+            return;
+        };
+        let Some(host_xid) = w.host_xid else {
+            return;
+        };
+        (host_xid, shape_rects_for(&s, window, kind))
+    };
+    if let Ok(mut h) = host.lock()
+        && let Err(err) = h.set_shape_rectangles(host_xid, kind, &rects)
+    {
+        debug!(
+            "host SHAPE mirror failed for window 0x{:x} kind={kind}: {err}",
+            window.0
+        );
+    }
+}
+
 fn handle_shape_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
     writer: &Arc<Mutex<UnixStream>>,
     sequence: SequenceNumber,
     minor: u8,
@@ -2718,19 +2816,26 @@ fn handle_shape_request(
             lock_writer()?.write_all(&reply)
         }
         x11shape::RECTANGLES => {
-            if let Some((req, rects)) = x11shape::parse_rectangles_request(body) {
+            let mirror_target = if let Some((req, rects)) = x11shape::parse_rectangles_request(body)
+            {
                 let window = ResourceId(req.dest);
                 let source = offset_rects(rects, req.x_off, req.y_off);
                 let mut s = lock_server(server)?;
                 let current = shape_rects_for(&s, window, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
                 set_shape_rects(&mut s, window, req.dest_kind, rects);
-            }
+                Some((window, req.dest_kind))
+            } else {
+                None
+            };
             debug!("client {} #{} SHAPE::Rectangles", client_id.0, sequence.0);
+            if let Some((window, kind)) = mirror_target {
+                mirror_shape_to_host(server, host, window, kind);
+            }
             Ok(())
         }
         x11shape::MASK => {
-            if let Some(req) = x11shape::parse_mask_request(body) {
+            let mirror_target = if let Some(req) = x11shape::parse_mask_request(body) {
                 let window = ResourceId(req.dest);
                 let source = if req.src == 0 {
                     Vec::new()
@@ -2743,12 +2848,18 @@ fn handle_shape_request(
                 let current = shape_rects_for(&s, window, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
                 set_shape_rects(&mut s, window, req.dest_kind, rects);
-            }
+                Some((window, req.dest_kind))
+            } else {
+                None
+            };
             debug!("client {} #{} SHAPE::Mask", client_id.0, sequence.0);
+            if let Some((window, kind)) = mirror_target {
+                mirror_shape_to_host(server, host, window, kind);
+            }
             Ok(())
         }
         x11shape::COMBINE => {
-            if let Some(req) = x11shape::parse_combine_request(body) {
+            let mirror_target = if let Some(req) = x11shape::parse_combine_request(body) {
                 let dest = ResourceId(req.dest);
                 let src = ResourceId(req.src);
                 let source = {
@@ -2759,21 +2870,36 @@ fn handle_shape_request(
                 let current = shape_rects_for(&s, dest, req.dest_kind);
                 let rects = apply_shape_op(current, source, req.op);
                 set_shape_rects(&mut s, dest, req.dest_kind, rects);
-            }
+                Some((dest, req.dest_kind))
+            } else {
+                None
+            };
             debug!("client {} #{} SHAPE::Combine", client_id.0, sequence.0);
+            if let Some((window, kind)) = mirror_target {
+                mirror_shape_to_host(server, host, window, kind);
+            }
             Ok(())
         }
         x11shape::OFFSET => {
-            if let Some(req) = x11shape::parse_offset_request(body) {
+            let mirror_target = if let Some(req) = x11shape::parse_offset_request(body) {
+                let dest = ResourceId(req.dest);
                 let mut s = lock_server(server)?;
-                if let Some(state) = s.shape_windows.get_mut(&ResourceId(req.dest))
+                let mut translated = false;
+                if let Some(state) = s.shape_windows.get_mut(&dest)
                     && let Some(slot) = state.rects_mut(req.dest_kind)
                     && let Some(rects) = slot.as_mut()
                 {
                     translate_region(rects, req.x_off, req.y_off);
+                    translated = true;
                 }
-            }
+                translated.then_some((dest, req.dest_kind))
+            } else {
+                None
+            };
             debug!("client {} #{} SHAPE::Offset", client_id.0, sequence.0);
+            if let Some((window, kind)) = mirror_target {
+                mirror_shape_to_host(server, host, window, kind);
+            }
             Ok(())
         }
         x11shape::QUERY_EXTENTS => {
@@ -6350,6 +6476,7 @@ fn handle_request(
         XFIXES_MAJOR_OPCODE => handle_xfixes_request(
             client_id,
             server,
+            host,
             writer,
             sequence,
             header.data, // XFIXES minor opcode
@@ -6358,6 +6485,7 @@ fn handle_request(
         SHAPE_MAJOR_OPCODE => handle_shape_request(
             client_id,
             server,
+            host,
             writer,
             sequence,
             header.data, // SHAPE minor opcode
@@ -7338,6 +7466,7 @@ mod tests {
                     handle_xfixes_request(
                         ClientId(1),
                         &server,
+                        None,
                         &writer,
                         SequenceNumber(1),
                         minor,
@@ -7359,6 +7488,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(1),
                 x11xfixes::SELECT_SELECTION_INPUT,
@@ -7374,6 +7504,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(2),
                 x11xfixes::SELECT_SELECTION_INPUT,
@@ -7397,6 +7528,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(2),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(1),
                 x11xfixes::SELECT_CURSOR_INPUT,
@@ -7414,6 +7546,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(2),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(2),
                 x11xfixes::SELECT_CURSOR_INPUT,
@@ -7437,6 +7570,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(1),
                 x11xfixes::CREATE_REGION,
@@ -7449,6 +7583,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(2),
                 x11xfixes::DESTROY_REGION,
@@ -7465,6 +7600,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(1),
                 x11xfixes::CREATE_REGION,
@@ -7474,6 +7610,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(2),
                 x11xfixes::CREATE_REGION,
@@ -7494,6 +7631,7 @@ mod tests {
                 handle_xfixes_request(
                     ClientId(1),
                     &server,
+                    None,
                     &writer,
                     SequenceNumber(1),
                     x11xfixes::DESTROY_REGION,
@@ -7511,6 +7649,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(1),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(1),
                 x11xfixes::CREATE_REGION,
@@ -7520,6 +7659,7 @@ mod tests {
             handle_xfixes_request(
                 ClientId(2),
                 &server,
+                None,
                 &writer,
                 SequenceNumber(2),
                 x11xfixes::CREATE_REGION,
@@ -7534,6 +7674,320 @@ mod tests {
             let s = server.lock().unwrap();
             assert!(!s.xfixes_regions.contains_key(&0x500));
             assert!(s.xfixes_regions.contains_key(&0x501));
+        }
+    }
+
+    mod shape_requests {
+        //! Integration tests for `handle_shape_request`'s resolved-rect path.
+        //!
+        //! The host-mirror leg is intentionally exercised with `host = None`:
+        //! we already byte-test `build_shape_rectangles` over in
+        //! `host_x11::tests::shape_rectangles_*`. What we want to lock down
+        //! here is that `shape_windows` ends up holding the right resolved
+        //! rectangle list after each handler invocation, since that is what
+        //! `mirror_shape_to_host` would pass on to the host.
+        use std::{
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex},
+        };
+
+        use super::super::{handle_shape_request, shape_rects_for};
+        use crate::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::{
+            ClientId, CreateWindowRequest, ResourceId, SequenceNumber, shape as x11shape,
+            xfixes::RegionRect,
+        };
+
+        fn make_writer() -> Arc<Mutex<UnixStream>> {
+            let (w, _r) = UnixStream::pair().unwrap();
+            Arc::new(Mutex::new(w))
+        }
+
+        fn make_server_with_window(
+            window: ResourceId,
+            host_xid: Option<u32>,
+        ) -> Arc<Mutex<ServerState>> {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let mut s = server.lock().unwrap();
+            let req = CreateWindowRequest {
+                window,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                depth: 24,
+                visual: ResourceId(0),
+                class: 0,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            };
+            s.resources.create_window(ClientId(1), req);
+            if let Some(host_xid) = host_xid
+                && let Some(w) = s.resources.window_mut(window)
+            {
+                w.host_xid = Some(host_xid);
+            }
+            drop(s);
+            server
+        }
+
+        fn rectangles_body(dest: u32, rects: &[RegionRect]) -> Vec<u8> {
+            let mut body = Vec::with_capacity(12 + rects.len() * 8);
+            body.push(x11shape::OP_SET);
+            body.push(x11shape::KIND_BOUNDING);
+            body.push(0); // ordering = Unsorted
+            body.push(0); // pad
+            body.extend_from_slice(&dest.to_le_bytes());
+            body.extend_from_slice(&0i16.to_le_bytes()); // x_off
+            body.extend_from_slice(&0i16.to_le_bytes()); // y_off
+            for rect in rects {
+                body.extend_from_slice(&rect.x.to_le_bytes());
+                body.extend_from_slice(&rect.y.to_le_bytes());
+                body.extend_from_slice(&rect.width.to_le_bytes());
+                body.extend_from_slice(&rect.height.to_le_bytes());
+            }
+            body
+        }
+
+        fn combine_body(
+            op: u8,
+            dest_kind: u8,
+            src_kind: u8,
+            dest: u32,
+            x_off: i16,
+            y_off: i16,
+            src: u32,
+        ) -> Vec<u8> {
+            let mut body = Vec::with_capacity(16);
+            body.push(op);
+            body.push(dest_kind);
+            body.push(src_kind);
+            body.push(0); // pad
+            body.extend_from_slice(&dest.to_le_bytes());
+            body.extend_from_slice(&x_off.to_le_bytes());
+            body.extend_from_slice(&y_off.to_le_bytes());
+            body.extend_from_slice(&src.to_le_bytes());
+            body
+        }
+
+        #[test]
+        fn rectangles_set_records_resolved_bounding_list() {
+            let dest = ResourceId(0x300);
+            let server = make_server_with_window(dest, Some(0xdead_beef));
+            let writer = make_writer();
+            let rects = vec![RegionRect {
+                x: 5,
+                y: 6,
+                width: 30,
+                height: 40,
+            }];
+            let body = rectangles_body(dest.0, &rects);
+            handle_shape_request(
+                ClientId(1),
+                &server,
+                None, // host mirror is no-op here; we test local resolved state
+                &writer,
+                SequenceNumber(1),
+                x11shape::RECTANGLES,
+                &body,
+            )
+            .unwrap();
+            let s = server.lock().unwrap();
+            assert_eq!(shape_rects_for(&s, dest, x11shape::KIND_BOUNDING), rects);
+        }
+
+        #[test]
+        fn combine_with_local_only_source_merges_into_dest() {
+            // Simulates a WM titlebar mask combined into a frame: the source
+            // window has no host_xid, so a per-opcode mirror would silently
+            // drop. Resolved-rect mirroring instead snapshots the merged
+            // destination list — this test asserts that snapshot is correct.
+            let dest = ResourceId(0x301);
+            let src = ResourceId(0x302);
+            let server = make_server_with_window(dest, Some(0xdead_beef));
+
+            // Give source its own bounding state (local-only, no host_xid).
+            let mut s = server.lock().unwrap();
+            let req = CreateWindowRequest {
+                window: src,
+                parent: dest,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 10,
+                border_width: 0,
+                depth: 24,
+                visual: ResourceId(0),
+                class: 0,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            };
+            s.resources.create_window(ClientId(1), req);
+            drop(s);
+
+            let writer = make_writer();
+            let src_rect = RegionRect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 10,
+            };
+            handle_shape_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(1),
+                x11shape::RECTANGLES,
+                &rectangles_body(src.0, &[src_rect]),
+            )
+            .unwrap();
+
+            // Seed dest with a rect, then COMBINE union from src.
+            let dest_rect = RegionRect {
+                x: 0,
+                y: 20,
+                width: 100,
+                height: 60,
+            };
+            handle_shape_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(2),
+                x11shape::RECTANGLES,
+                &rectangles_body(dest.0, &[dest_rect]),
+            )
+            .unwrap();
+            handle_shape_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(3),
+                x11shape::COMBINE,
+                &combine_body(
+                    x11shape::OP_UNION,
+                    x11shape::KIND_BOUNDING,
+                    x11shape::KIND_BOUNDING,
+                    dest.0,
+                    0,
+                    0,
+                    src.0,
+                ),
+            )
+            .unwrap();
+
+            let s = server.lock().unwrap();
+            let merged = shape_rects_for(&s, dest, x11shape::KIND_BOUNDING);
+            // Both rects are disjoint, so normalize_region_rects keeps both.
+            assert_eq!(merged.len(), 2);
+            assert!(merged.contains(&dest_rect));
+            assert!(merged.contains(&src_rect));
+        }
+    }
+
+    mod root_resize {
+        //! `handle_host_container_resize` post-conditions, including
+        //! `ConfigureNotify` delivery to clients that selected
+        //! `StructureNotify` on root *without* `RRSelectInput`.
+        use std::{
+            collections::{HashMap, HashSet},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+
+        use super::super::handle_host_container_resize;
+        use crate::{
+            host_x11::HostConfigureEvent,
+            resources::ROOT_WINDOW,
+            server::{ClientHandle, ServerState},
+        };
+        use yserver_protocol::x11::ClientByteOrder;
+
+        const STRUCTURE_NOTIFY_MASK: u32 = 0x0002_0000;
+
+        fn server_with_root_listener() -> (Arc<Mutex<ServerState>>, UnixStream) {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer_local, reader_remote) = UnixStream::pair().expect("socketpair");
+            let mut s = server.lock().unwrap();
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(ROOT_WINDOW, STRUCTURE_NOTIFY_MASK)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+            drop(s);
+            (server, reader_remote)
+        }
+
+        #[test]
+        fn resize_updates_state_and_root_geometry() {
+            let (server, _reader) = server_with_root_listener();
+            handle_host_container_resize(
+                &server,
+                HostConfigureEvent {
+                    host_xid: 0xdead_beef,
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 768,
+                },
+            );
+            let s = server.lock().unwrap();
+            assert_eq!(s.randr.screen_width, 1024);
+            assert_eq!(s.randr.screen_height, 768);
+            let root = s.resources.window(ROOT_WINDOW).expect("root window");
+            assert_eq!(root.width, 1024);
+            assert_eq!(root.height, 768);
+        }
+
+        #[test]
+        fn structure_notify_listener_gets_configure_notify() {
+            let (server, mut reader) = server_with_root_listener();
+
+            handle_host_container_resize(
+                &server,
+                HostConfigureEvent {
+                    host_xid: 0xdead_beef,
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 768,
+                },
+            );
+
+            // Drain everything currently buffered. The first 32 bytes must be a
+            // ConfigureNotify (event type 22) on root with the new dimensions.
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let mut buf = [0u8; 32];
+            reader.read_exact(&mut buf).expect("event byte block");
+            assert_eq!(buf[0], 22, "event type 22 = ConfigureNotify");
+            // Bytes 4..8 = event_window, 8..12 = window. Both must be ROOT_WINDOW.
+            let event_window = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            let window = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            assert_eq!(event_window, ROOT_WINDOW.0);
+            assert_eq!(window, ROOT_WINDOW.0);
+            // Width @ bytes 20..22, height @ bytes 22..24 (after above_sibling
+            // u32 + x i16 + y i16).
+            let width = u16::from_le_bytes(buf[20..22].try_into().unwrap());
+            let height = u16::from_le_bytes(buf[22..24].try_into().unwrap());
+            assert_eq!(width, 1024);
+            assert_eq!(height, 768);
         }
     }
 }
