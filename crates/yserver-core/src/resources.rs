@@ -335,30 +335,191 @@ impl ResourceTable {
         let Some(parent_id) = self.windows.get(&window_id.0).map(|window| window.parent) else {
             return;
         };
+        let Some(action) = self.resolve_restack_action(window_id, parent_id, sibling, stack_mode)
+        else {
+            return;
+        };
         let Some(parent) = self.windows.get_mut(&parent_id.0) else {
             return;
         };
         let Some(index) = parent.children.iter().position(|child| *child == window_id) else {
             return;
         };
-        let window = parent.children.remove(index);
-        let sibling_index =
-            sibling.and_then(|sibling| parent.children.iter().position(|child| *child == sibling));
-        match stack_mode {
-            0 => {
-                let insert_at = sibling_index.map_or(parent.children.len(), |index| index + 1);
+        match action {
+            RestackAction::NoOp => {}
+            RestackAction::Top => {
+                let window = parent.children.remove(index);
+                parent.children.push(window);
+            }
+            RestackAction::Bottom => {
+                let window = parent.children.remove(index);
+                parent.children.insert(0, window);
+            }
+            RestackAction::AboveSibling(sibling_id) => {
+                let window = parent.children.remove(index);
+                let sibling_index = parent
+                    .children
+                    .iter()
+                    .position(|child| *child == sibling_id);
+                let insert_at = sibling_index.map_or(parent.children.len(), |i| i + 1);
                 parent.children.insert(insert_at, window);
             }
-            1 => {
+            RestackAction::BelowSibling(sibling_id) => {
+                let window = parent.children.remove(index);
+                let sibling_index = parent
+                    .children
+                    .iter()
+                    .position(|child| *child == sibling_id);
                 let insert_at = sibling_index.unwrap_or(0);
                 parent.children.insert(insert_at, window);
             }
-            2 | 4 => parent.children.push(window),
-            3 => parent.children.insert(0, window),
-            _ => parent
-                .children
-                .insert(index.min(parent.children.len()), window),
         }
+    }
+
+    /// Resolve a `ConfigureWindow` stack-mode + optional sibling to the
+    /// concrete restack action per the X11 protocol. `None` means the
+    /// request is malformed (window not in parent's child list, sibling
+    /// not actually a sibling, unknown stack mode) and should be skipped.
+    ///
+    /// X11 stack-mode codes: 0=Above, 1=Below, 2=TopIf, 3=BottomIf,
+    /// 4=Opposite. TopIf/BottomIf/Opposite are *conditional* on the
+    /// current occlusion state; Above/Below are unconditional.
+    fn resolve_restack_action(
+        &self,
+        window_id: ResourceId,
+        parent_id: ResourceId,
+        sibling: Option<ResourceId>,
+        stack_mode: u8,
+    ) -> Option<RestackAction> {
+        let parent = self.windows.get(&parent_id.0)?;
+        let window_index = parent.children.iter().position(|c| *c == window_id)?;
+        if let Some(sibling_id) = sibling
+            && !parent.children.contains(&sibling_id)
+        {
+            return None;
+        }
+
+        Some(match stack_mode {
+            0 => match sibling {
+                Some(sib) => RestackAction::AboveSibling(sib),
+                None => RestackAction::Top,
+            },
+            1 => match sibling {
+                Some(sib) => RestackAction::BelowSibling(sib),
+                None => RestackAction::Bottom,
+            },
+            2 => {
+                if self.any_sibling_occludes_window(parent_id, window_index, sibling) {
+                    RestackAction::Top
+                } else {
+                    RestackAction::NoOp
+                }
+            }
+            3 => {
+                if self.window_occludes_any_sibling(parent_id, window_index, sibling) {
+                    RestackAction::Bottom
+                } else {
+                    RestackAction::NoOp
+                }
+            }
+            4 => {
+                if self.any_sibling_occludes_window(parent_id, window_index, sibling) {
+                    RestackAction::Top
+                } else if self.window_occludes_any_sibling(parent_id, window_index, sibling) {
+                    RestackAction::Bottom
+                } else {
+                    RestackAction::NoOp
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// True iff some sibling currently stacked above `window` (at
+    /// `window_index` in the parent's child list) overlaps it. Both
+    /// windows must be mapped per X11's occlusion definition. With
+    /// `sibling = Some(_)`, only that sibling is considered.
+    fn any_sibling_occludes_window(
+        &self,
+        parent_id: ResourceId,
+        window_index: usize,
+        sibling: Option<ResourceId>,
+    ) -> bool {
+        let Some(parent) = self.windows.get(&parent_id.0) else {
+            return false;
+        };
+        let Some(window_id) = parent.children.get(window_index) else {
+            return false;
+        };
+        let Some(window) = self.windows.get(&window_id.0) else {
+            return false;
+        };
+        if window.map_state == MapState::Unmapped {
+            return false;
+        }
+        for (i, other_id) in parent.children.iter().enumerate() {
+            if i <= window_index {
+                continue;
+            }
+            if let Some(sib) = sibling
+                && *other_id != sib
+            {
+                continue;
+            }
+            let Some(other) = self.windows.get(&other_id.0) else {
+                continue;
+            };
+            if other.map_state == MapState::Unmapped {
+                continue;
+            }
+            if window_rects_overlap(window, other) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True iff `window` (at `window_index` in the parent's child list)
+    /// currently occludes some sibling stacked below it. With `sibling =
+    /// Some(_)`, only that sibling is considered.
+    fn window_occludes_any_sibling(
+        &self,
+        parent_id: ResourceId,
+        window_index: usize,
+        sibling: Option<ResourceId>,
+    ) -> bool {
+        let Some(parent) = self.windows.get(&parent_id.0) else {
+            return false;
+        };
+        let Some(window_id) = parent.children.get(window_index) else {
+            return false;
+        };
+        let Some(window) = self.windows.get(&window_id.0) else {
+            return false;
+        };
+        if window.map_state == MapState::Unmapped {
+            return false;
+        }
+        for (i, other_id) in parent.children.iter().enumerate() {
+            if i >= window_index {
+                continue;
+            }
+            if let Some(sib) = sibling
+                && *other_id != sib
+            {
+                continue;
+            }
+            let Some(other) = self.windows.get(&other_id.0) else {
+                continue;
+            };
+            if other.map_state == MapState::Unmapped {
+                continue;
+            }
+            if window_rects_overlap(window, other) {
+                return true;
+            }
+        }
+        false
     }
 
     #[must_use]
@@ -1229,6 +1390,39 @@ pub struct NamedCompositePixmap {
     pub height: u16,
 }
 
+/// The concrete restack a `ConfigureWindow` request resolves to after
+/// applying X11's stack-mode + occlusion semantics. Built by
+/// [`ResourceTable::resolve_restack_action`] from the immutable child
+/// list, then applied by [`ResourceTable::restack_window`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestackAction {
+    NoOp,
+    Top,
+    Bottom,
+    AboveSibling(ResourceId),
+    BelowSibling(ResourceId),
+}
+
+/// True iff the bounding rectangles of `a` and `b` (including border)
+/// have a non-empty intersection. Used by occlusion checks for
+/// `TopIf` / `BottomIf` / `Opposite` stack modes.
+fn window_rects_overlap(a: &Window, b: &Window) -> bool {
+    let (ax0, ay0, ax1, ay1) = window_bounding_box(a);
+    let (bx0, by0, bx1, by1) = window_bounding_box(b);
+    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+}
+
+/// X11 bounding box of a window: the outer rectangle including border.
+/// Returns (left, top, right, bottom) in parent coords.
+fn window_bounding_box(w: &Window) -> (i32, i32, i32, i32) {
+    let bw = i32::from(w.border_width);
+    let x0 = i32::from(w.x);
+    let y0 = i32::from(w.y);
+    let x1 = x0 + i32::from(w.width) + 2 * bw;
+    let y1 = y0 + i32::from(w.height) + 2 * bw;
+    (x0, y0, x1, y1)
+}
+
 #[derive(Clone, Debug)]
 pub struct Window {
     pub id: ResourceId,
@@ -2065,6 +2259,322 @@ mod tests {
         assert_eq!(
             t.children(ROOT_WINDOW),
             &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+    }
+
+    /// Build a request that only sets sibling + stack_mode. Geometry
+    /// fields are `None` so existing position/size is preserved.
+    fn restack_request(
+        window: u32,
+        sibling: Option<u32>,
+        stack_mode: u8,
+    ) -> ConfigureWindowRequest {
+        ConfigureWindowRequest {
+            window: ResourceId(window),
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: sibling.map(ResourceId),
+            stack_mode: Some(stack_mode),
+        }
+    }
+
+    /// Children A=0x200, B=0x300, C=0x400 under root, all 50×50, mapped.
+    /// `a_x` / `b_x` / `c_x` set the x position of each — y is always 0.
+    fn three_mapped_children(a_x: i16, b_x: i16, c_x: i16) -> ResourceTable {
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, a_x, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, b_x, 0);
+        make_child(&mut t, 0x400, ROOT_WINDOW.0, c_x, 0);
+        let _ = t.map_window(ROOT_WINDOW);
+        let _ = t.map_window(ResourceId(0x200));
+        let _ = t.map_window(ResourceId(0x300));
+        let _ = t.map_window(ResourceId(0x400));
+        t
+    }
+
+    #[test]
+    fn stack_mode_above_with_sibling_places_just_above() {
+        // A B C ; place A above B → B A C
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x300), 0))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x200), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn stack_mode_below_with_sibling_places_just_below() {
+        // A B C ; place C below B → A C B
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x400, Some(0x300), 1))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x400), ResourceId(0x300)]
+        );
+    }
+
+    #[test]
+    fn stack_mode_below_no_sibling_lowers_to_bottom() {
+        // A B C ; lower C → C A B
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x400, None, 1))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+        );
+    }
+
+    #[test]
+    fn top_if_with_overlapping_higher_sibling_raises_to_top() {
+        // A B C all overlapping at (0,0); TopIf on A with sibling=C → C is
+        // above A and overlaps → A goes to top.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x400), 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+    }
+
+    #[test]
+    fn top_if_with_lower_sibling_is_noop() {
+        // A B C ; TopIf on C with sibling=A → A is below C, cannot occlude
+        // → no-op.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x400, Some(0x200), 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn top_if_with_higher_sibling_no_overlap_is_noop() {
+        // A at x=0, B at x=200, C at x=400 — no geometric overlap.
+        let mut t = three_mapped_children(0, 200, 400);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x400), 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn top_if_no_sibling_raises_when_any_higher_overlaps() {
+        // A at x=0, B at x=200 (no overlap with A), C at x=20 (overlaps A
+        // and is above A) → TopIf on A with no sibling → top.
+        let mut t = three_mapped_children(0, 200, 20);
+        assert!(
+            t.configure_window(restack_request(0x200, None, 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+    }
+
+    #[test]
+    fn bottom_if_with_lower_overlapping_sibling_lowers_to_bottom() {
+        // A B C all overlapping; BottomIf on C with sibling=A → C is above
+        // A and overlaps → C lowers to bottom.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x400, Some(0x200), 3))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+        );
+    }
+
+    #[test]
+    fn bottom_if_with_higher_sibling_is_noop() {
+        // A B C ; BottomIf on A with sibling=C → A cannot occlude C
+        // (A is below C) → no-op.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x400), 3))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn bottom_if_no_sibling_no_overlap_is_noop() {
+        let mut t = three_mapped_children(0, 200, 400);
+        assert!(
+            t.configure_window(restack_request(0x400, None, 3))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn opposite_with_higher_overlapping_sibling_goes_to_top() {
+        // A B C ; Opposite on A with sibling=C → C above + overlaps → top.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x400), 4))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+    }
+
+    #[test]
+    fn opposite_with_lower_overlapping_sibling_goes_to_bottom() {
+        // A B C ; Opposite on C with sibling=A → A is below + overlaps
+        // (window-occludes-sibling holds) → bottom.
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x400, Some(0x200), 4))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+        );
+    }
+
+    #[test]
+    fn opposite_no_overlap_is_noop() {
+        let mut t = three_mapped_children(0, 200, 400);
+        assert!(
+            t.configure_window(restack_request(0x300, None, 4))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn occlusion_ignores_unmapped_siblings() {
+        // A B C all overlapping; unmap C; TopIf on A with no sibling.
+        // C is unmapped so cannot occlude; B is above A and overlaps →
+        // A still raises to top. Order after restack: [B, C, A].
+        let mut t = three_mapped_children(0, 0, 0);
+        let _ = t.unmap_window(ResourceId(0x400));
+        assert!(
+            t.configure_window(restack_request(0x200, None, 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
+        );
+
+        // Same shape but with B unmapped too: no mapped occluder remains
+        // → no-op.
+        let mut t = three_mapped_children(0, 0, 0);
+        let _ = t.unmap_window(ResourceId(0x300));
+        let _ = t.unmap_window(ResourceId(0x400));
+        assert!(
+            t.configure_window(restack_request(0x200, None, 2))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
+        );
+    }
+
+    #[test]
+    fn pointer_hit_test_follows_top_if_restack() {
+        // A B at (0,0) overlapping; B is on top so pointer at (10,10) hits
+        // B. After TopIf on A → A on top → pointer hits A.
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        let _ = t.map_window(ROOT_WINDOW);
+        let _ = t.map_window(ResourceId(0x200));
+        let _ = t.map_window(ResourceId(0x300));
+
+        assert_eq!(
+            t.pointer_target_at(ROOT_WINDOW, 10, 10).map(|h| h.0),
+            Some(ResourceId(0x300))
+        );
+
+        assert!(
+            t.configure_window(restack_request(0x200, None, 2))
+                .is_some()
+        );
+
+        assert_eq!(
+            t.pointer_target_at(ROOT_WINDOW, 10, 10).map(|h| h.0),
+            Some(ResourceId(0x200))
+        );
+    }
+
+    #[test]
+    fn pointer_hit_test_follows_bottom_if_restack() {
+        // A B at (0,0) overlapping; B is on top → pointer hits B.
+        // BottomIf on B (no sibling) → B occludes A → bottom → pointer hits A.
+        let mut t = ResourceTable::new();
+        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
+        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
+        let _ = t.map_window(ROOT_WINDOW);
+        let _ = t.map_window(ResourceId(0x200));
+        let _ = t.map_window(ResourceId(0x300));
+
+        assert!(
+            t.configure_window(restack_request(0x300, None, 3))
+                .is_some()
+        );
+
+        assert_eq!(
+            t.pointer_target_at(ROOT_WINDOW, 10, 10).map(|h| h.0),
+            Some(ResourceId(0x200))
+        );
+    }
+
+    #[test]
+    fn restack_with_sibling_not_in_parent_is_noop() {
+        // 0x999 is not a child of root → request must be a no-op (in a
+        // real server it would raise BadMatch; the resolver's contract is
+        // to leave the local state untouched).
+        let mut t = three_mapped_children(0, 0, 0);
+        assert!(
+            t.configure_window(restack_request(0x200, Some(0x999), 0))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
         );
     }
 
