@@ -768,6 +768,24 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
       having the kb pump select only `KeyPress | KeyRelease |
       StructureNotify` — pointer events stay on the main pump's
       connection where they belong.
+- [x] **Step 6 — cleanup: drop the offset-translation machinery.**
+      With every InputOutput window owning its own host xid (Step 2)
+      and host-driven Expose (Step 3+4b), drawing handlers no longer
+      need to translate (x, y) by an accumulated parent offset. Deleted:
+      `top_level_host_target` + `TopLevelTarget` (the walk-up helper),
+      the `(x_offset, y_offset)` fields on `HostDrawableTarget::Window`
+      and `PictureState`, the `(x_off, y_off)` parameters on
+      `apply_gc_clip` / `host_x11::set_clip_rectangles` /
+      `host_x11::set_clip_pixmap`, the offset-translation helpers
+      (`translate_i16`, `translate_i16_pair`, `translated_records`,
+      `translated_points`, `translated_segments`, `translated_text_body`,
+      `read_i16_from`, `write_i16_to`), and the
+      `Window.uses_synthetic_expose` flag with its accompanying
+      synthetic-Expose path on MapWindow (host pump is the sole Expose
+      source now). All ~30 drawing call sites updated to pass raw
+      coordinates / slices through to the host. Drawing on InputOnly
+      drawables (which never had a host xid) still drops silently as
+      before. Phase 3.7 (per-client GC) is unblocked.
 - [x] **Step 5 — NameWindowPixmap retention across DestroyWindow.**
       Per the COMPOSITE spec, named pixmaps outlive the source
       window's destroy and remain valid until the client calls
@@ -827,11 +845,6 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
   fence doesn't fully close.
 - **Settings sub-window doesn't open** after selecting the
   popup item. Likely the same race on a different code path.
-- **Step 6 — cleanup.** Delete `top_level_host_target` and
-  the `(x_off, y_off)` second-return on `host_drawable_target`;
-  delete the `(x_off, y_off)` parameters on `apply_gc_clip`;
-  remove the `uses_synthetic_expose` flag (always false now
-  for InputOutput windows). Pure deletions.
 - **Cross-connection sync fence is a Phase-3.7 design smell.**
   The pump and main connections race in several places; the
   per-CreateWindow fence is a duct-tape fix. Folding pump and

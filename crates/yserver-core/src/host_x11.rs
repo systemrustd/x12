@@ -1714,17 +1714,12 @@ impl HostX11 {
         self.stream.flush()
     }
 
-    pub fn set_clip_rectangles(
-        &mut self,
-        clip: Option<ClipRectangles>,
-        x_offset: i16,
-        y_offset: i16,
-    ) -> io::Result<()> {
+    pub fn set_clip_rectangles(&mut self, clip: Option<ClipRectangles>) -> io::Result<()> {
         let new_state = match clip {
             Some(clip) => HostClipState::Rectangles(HostClipRectangles {
                 ordering: clip.ordering,
-                x_origin: clip.x_origin.wrapping_add(x_offset),
-                y_origin: clip.y_origin.wrapping_add(y_offset),
+                x_origin: clip.x_origin,
+                y_origin: clip.y_origin,
                 rectangles: clip.rectangles,
             }),
             None => HostClipState::None,
@@ -1745,13 +1740,11 @@ impl HostX11 {
         host_pixmap: u32,
         clip_x_origin: i16,
         clip_y_origin: i16,
-        x_offset: i16,
-        y_offset: i16,
     ) -> io::Result<()> {
         self.set_host_clip(HostClipState::Pixmap {
             host_pixmap,
-            x_origin: clip_x_origin.wrapping_add(x_offset),
-            y_origin: clip_y_origin.wrapping_add(y_offset),
+            x_origin: clip_x_origin,
+            y_origin: clip_y_origin,
         })
     }
 

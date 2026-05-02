@@ -62,21 +62,10 @@ pub struct Colormap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TopLevelTarget {
-    pub top_level: ResourceId,
-    pub host_xid: u32,
-    pub x_offset: i16,
-    pub y_offset: i16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostDrawableTarget {
     Window {
         nested: ResourceId,
-        top_level: ResourceId,
         host_xid: u32,
-        x_offset: i16,
-        y_offset: i16,
         depth: u8,
     },
     Pixmap {
@@ -92,20 +81,6 @@ impl HostDrawableTarget {
     pub fn host_xid(self) -> u32 {
         match self {
             Self::Window { host_xid, .. } | Self::Pixmap { host_xid, .. } => host_xid,
-        }
-    }
-
-    pub fn x_offset(self) -> i16 {
-        match self {
-            Self::Window { x_offset, .. } => x_offset,
-            Self::Pixmap { .. } => 0,
-        }
-    }
-
-    pub fn y_offset(self) -> i16 {
-        match self {
-            Self::Window { y_offset, .. } => y_offset,
-            Self::Pixmap { .. } => 0,
         }
     }
 
@@ -147,8 +122,6 @@ pub struct PictureState {
     pub client: ClientId,
     pub host_picture_xid: u32,
     pub host_owned_pixmap: Option<u32>,
-    pub x_offset: i16,
-    pub y_offset: i16,
 }
 
 #[derive(Debug)]
@@ -199,10 +172,6 @@ impl ResourceTable {
                 properties: HashMap::new(),
                 host_xid: None,
                 composite_named_pixmaps: Vec::new(),
-                // Root receives no Expose at all from the host pump or
-                // from the synthetic emitter — the container is wired
-                // separately and root drawing routes there directly.
-                uses_synthetic_expose: false,
             },
         );
 
@@ -356,7 +325,6 @@ impl ResourceTable {
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
-            uses_synthetic_expose: true,
         };
 
         self.windows
@@ -697,42 +665,6 @@ impl ResourceTable {
         was_mapped
     }
 
-    #[must_use]
-    pub fn top_level_host_target(&self, id: ResourceId) -> Option<TopLevelTarget> {
-        let start = self.windows.get(&id.0)?;
-        // Phase 3.6 Steps 3+4 (combined): every InputOutput window has
-        // its own host_xid (Step 2 invariant) and the host tree mirrors
-        // the local tree (Step 4 ReparentWindow + Configure forwarding).
-        // Drawing on a sub-window targets the sub-window's host xid
-        // directly — no coordinate translation; host clipping handles
-        // sibling occlusion. The walk-up fallback only kicks in for
-        // windows that don't have a host xid (InputOnly, or pre-
-        // HostX11 init).
-        if let Some(host_xid) = start.host_xid {
-            return Some(TopLevelTarget {
-                top_level: id,
-                host_xid,
-                x_offset: 0,
-                y_offset: 0,
-            });
-        }
-        let mut current = start;
-        let mut x_offset: i16 = 0;
-        let mut y_offset: i16 = 0;
-        while current.parent != ROOT_WINDOW && current.id != ROOT_WINDOW {
-            x_offset = x_offset.wrapping_add(current.x);
-            y_offset = y_offset.wrapping_add(current.y);
-            current = self.windows.get(&current.parent.0)?;
-        }
-        let host_xid = current.host_xid?;
-        Some(TopLevelTarget {
-            top_level: current.id,
-            host_xid,
-            x_offset,
-            y_offset,
-        })
-    }
-
     pub fn window(&self, id: ResourceId) -> Option<&Window> {
         self.windows.get(&id.0)
     }
@@ -1060,14 +992,19 @@ impl ResourceTable {
 
     #[must_use]
     pub fn host_drawable_target(&self, id: ResourceId) -> Option<HostDrawableTarget> {
+        // Phase 3.6 Step 6: every InputOutput window has its own host_xid
+        // (Step 2 invariant) and the host tree mirrors the local tree
+        // (Step 4 reparent + configure forwarding), so drawing on a
+        // sub-window targets that sub-window's host xid directly with no
+        // coordinate translation. Windows without their own host_xid
+        // (InputOnly, transient pre-init state) yield None — the caller
+        // drops the draw silently, same as before (drawing on InputOnly
+        // is undefined / spec-error territory).
         if let Some(window) = self.windows.get(&id.0) {
-            let target = self.top_level_host_target(id)?;
+            let host_xid = window.host_xid?;
             return Some(HostDrawableTarget::Window {
                 nested: id,
-                top_level: target.top_level,
-                host_xid: target.host_xid,
-                x_offset: target.x_offset,
-                y_offset: target.y_offset,
+                host_xid,
                 depth: window.depth,
             });
         }
@@ -1617,12 +1554,6 @@ pub struct Window {
     /// Per-window list of `Composite::NameWindowPixmap` aliases. All are
     /// invalidated together on resize per the COMPOSITE spec.
     pub composite_named_pixmaps: Vec<NamedCompositePixmap>,
-    /// Whether the local Expose pump synthesises Expose for this
-    /// window. `true` for sub-windows during Phase 3.6 Step 2 (their
-    /// host child window stays dormant), `false` for top-levels (the
-    /// host server delivers real Expose). Step 4 will flip this to
-    /// `false` for sub-windows once host ExposureMask routing lands.
-    pub uses_synthetic_expose: bool,
 }
 
 impl Window {
@@ -1650,7 +1581,6 @@ impl Window {
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
-            uses_synthetic_expose: true,
         }
     }
 }
@@ -1931,99 +1861,6 @@ mod tests {
     }
 
     #[test]
-    fn top_level_host_target_for_top_level_returns_self() {
-        let mut table = ResourceTable::new();
-        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
-        let target = table.top_level_host_target(ResourceId(0x0010_0002));
-        assert_eq!(
-            target,
-            Some(TopLevelTarget {
-                top_level: ResourceId(0x0010_0002),
-                host_xid: 0xAA,
-                x_offset: 0,
-                y_offset: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn top_level_host_target_for_child_accumulates_offset() {
-        let mut table = ResourceTable::new();
-        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
-        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
-        let target = table.top_level_host_target(ResourceId(0x0010_0003));
-        assert_eq!(
-            target,
-            Some(TopLevelTarget {
-                top_level: ResourceId(0x0010_0002),
-                host_xid: 0xAA,
-                x_offset: 10,
-                y_offset: 20,
-            })
-        );
-    }
-
-    #[test]
-    fn top_level_host_target_for_grandchild_sums_offsets() {
-        let mut table = ResourceTable::new();
-        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
-        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
-        make_child(&mut table, 0x0010_0004, 0x0010_0003, 5, 5);
-        let target = table.top_level_host_target(ResourceId(0x0010_0004));
-        assert_eq!(
-            target,
-            Some(TopLevelTarget {
-                top_level: ResourceId(0x0010_0002),
-                host_xid: 0xAA,
-                x_offset: 15,
-                y_offset: 25,
-            })
-        );
-    }
-
-    #[test]
-    fn top_level_host_target_returns_none_for_root_when_unset() {
-        let table = ResourceTable::new();
-        assert_eq!(table.top_level_host_target(ROOT_WINDOW), None);
-    }
-
-    #[test]
-    fn top_level_host_target_for_root_uses_wired_host_xid() {
-        // When the nested core wires up root.host_xid to the host container,
-        // root drawing must route to that container with zero offset.
-        let mut table = ResourceTable::new();
-        if let Some(root) = table.window_mut(ROOT_WINDOW) {
-            root.host_xid = Some(0xdead_beef);
-        }
-        assert_eq!(
-            table.top_level_host_target(ROOT_WINDOW),
-            Some(TopLevelTarget {
-                top_level: ROOT_WINDOW,
-                host_xid: 0xdead_beef,
-                x_offset: 0,
-                y_offset: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn top_level_host_target_returns_none_when_top_level_has_no_host_xid() {
-        let mut table = ResourceTable::new();
-        make_window(&mut table, 0x0010_0002); // no host_xid set
-        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
-        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0002)), None);
-        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0003)), None);
-    }
-
-    #[test]
-    fn top_level_host_target_returns_none_for_orphaned_window() {
-        let mut table = ResourceTable::new();
-        // Build a child whose parent is a non-existent window (chain breaks).
-        make_child(&mut table, 0x0010_0003, 0x9999_9999, 10, 20);
-        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0003)), None);
-    }
-
-    #[test]
     fn host_drawable_target_top_level_window_with_host_xid() {
         let mut table = ResourceTable::new();
         make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
@@ -2032,31 +1869,43 @@ mod tests {
             target,
             Some(HostDrawableTarget::Window {
                 nested: ResourceId(0x0010_0002),
-                top_level: ResourceId(0x0010_0002),
                 host_xid: 0xAA,
-                x_offset: 0,
-                y_offset: 0,
                 depth: 24,
             })
         );
     }
 
     #[test]
-    fn host_drawable_target_child_window_with_accumulated_offsets() {
+    fn host_drawable_target_child_window_targets_own_host_xid() {
+        // Phase 3.6 Step 6: every InputOutput window has its own host_xid;
+        // a child without host_xid set yields None (drop) rather than
+        // walking up to the parent.
         let mut table = ResourceTable::new();
         make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xBB);
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        if let Some(child) = table.window_mut(ResourceId(0x0010_0003)) {
+            child.host_xid = Some(0xCC);
+        }
         let target = table.host_drawable_target(ResourceId(0x0010_0003));
         assert_eq!(
             target,
             Some(HostDrawableTarget::Window {
                 nested: ResourceId(0x0010_0003),
-                top_level: ResourceId(0x0010_0002),
-                host_xid: 0xBB,
-                x_offset: 10,
-                y_offset: 20,
+                host_xid: 0xCC,
                 depth: 24,
             })
+        );
+    }
+
+    #[test]
+    fn host_drawable_target_window_without_host_xid_returns_none() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xBB);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        // child has no host_xid; drawing on it drops silently.
+        assert_eq!(
+            table.host_drawable_target(ResourceId(0x0010_0003)),
+            None
         );
     }
 
@@ -2336,44 +2185,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn top_level_host_target_offset_proptest(
-            n in 1usize..=8,
-            offsets in proptest::collection::vec((any::<i16>(), any::<i16>()), 1..=8),
-        ) {
-            let depth = n.min(offsets.len());
-            let mut table = ResourceTable::new();
-            let top_level_id: u32 = 0x0010_0000;
-            let host_xid: u32 = 0xCAFE;
-            make_top_level_with_host_xid(&mut table, top_level_id, host_xid);
-
-            let mut parent = top_level_id;
-            let mut expected_x: i16 = 0;
-            let mut expected_y: i16 = 0;
-            let mut leaf = top_level_id;
-            for (i, (x, y)) in offsets.iter().take(depth).enumerate() {
-                let id: u32 = 0x0010_0001 + u32::try_from(i).unwrap();
-                make_child(&mut table, id, parent, *x, *y);
-                // The child contributes its own (x, y) to the offset only on the
-                // way *up* — the helper walks from leaf to top-level and skips the
-                // top-level's own (x, y), matching the spec.
-                expected_x = expected_x.wrapping_add(*x);
-                expected_y = expected_y.wrapping_add(*y);
-                leaf = id;
-                parent = id;
-            }
-            // The helper accumulates only ancestor offsets up to (but not
-            // including) the top-level. So the leaf's own (x, y) is included
-            // only if there is at least one intermediate ancestor between it
-            // and the top-level — i.e., depth >= 2. For depth == 1, the leaf
-            // is a direct child of the top-level and its (x, y) is the
-            // accumulated offset.
-            let target = table.top_level_host_target(ResourceId(leaf)).unwrap();
-            prop_assert_eq!(target.top_level, ResourceId(top_level_id));
-            prop_assert_eq!(target.host_xid, host_xid);
-            prop_assert_eq!(target.x_offset, expected_x);
-            prop_assert_eq!(target.y_offset, expected_y);
-        }
     }
 
     #[test]
@@ -2853,35 +2664,6 @@ mod tests {
         let child = t.window(ResourceId(0x300)).expect("child created");
         assert_eq!(child.visual, ARGB_VISUAL);
         assert_eq!(child.depth, 32);
-    }
-
-    #[test]
-    fn newly_created_window_uses_synthetic_expose_by_default() {
-        let mut t = ResourceTable::new();
-        t.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 0,
-                window: ResourceId(0x200),
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 50,
-                height: 50,
-                border_width: 0,
-                class: 1,
-                visual: ResourceId(0),
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
-            },
-        );
-        // Root window is wired directly to the host container — no
-        // synthetic Expose needed. Newly-created windows default to
-        // synthetic until the dispatch layer flips the flag for
-        // top-levels (Step 2) or sub-windows (Step 4).
-        assert!(!t.window(ROOT_WINDOW).unwrap().uses_synthetic_expose);
-        assert!(t.window(ResourceId(0x200)).unwrap().uses_synthetic_expose);
     }
 
     #[test]
