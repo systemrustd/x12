@@ -894,8 +894,8 @@ fn spawn_keyboard_forwarder(
                         std::process::exit(0);
                     }
                     Err(err) => {
-                        info!("host connection lost ({err}), exiting");
-                        std::process::exit(0);
+                        info!("client {} kb pump connection lost ({err})", client_id.0);
+                        return;
                     }
                 }
             };

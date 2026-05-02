@@ -3192,13 +3192,20 @@ fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result
     write_u16(&mut out, 4);
     write_u32(&mut out, window_id);
     write_u32(&mut out, 1 << 11);
-    // KeyPress | KeyRelease | StructureNotify plus pointer/exposure events.
-    // Pointer events on the host container are root-window events in ynest;
-    // top-level subwindows register their own pointer masks separately.
-    write_u32(
-        &mut out,
-        (1 << 0) | (1 << 1) | (1 << 17) | POINTER_EVENT_MASK,
-    );
+    // KeyPress | KeyRelease | StructureNotify only.
+    //
+    // Per X11 spec ButtonPress is *exclusive* — only one client at a
+    // time per window. The main `HostInputPump` (created in
+    // `nested::run`) already selects POINTER_EVENT_MASK (which
+    // includes ButtonPress) on the container; if the per-client kb
+    // pump tries to also select ButtonPress here the host returns
+    // BadAccess for the entire ChangeWindowAttributes request,
+    // leaving the kb pump connection with no mask at all on
+    // container — the pump then silently receives nothing including
+    // KeyPress. Selecting only KeyPress / KeyRelease /
+    // StructureNotify avoids the conflict; pointer events arrive on
+    // the main pump's connection where they belong.
+    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17));
     stream.write_all(&out)
 }
 
