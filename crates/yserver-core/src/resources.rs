@@ -24,6 +24,42 @@ pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
 pub const ARGB_VISUAL: ResourceId = ResourceId(0x103);
+pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
+
+/// X11 visual class codes (subset we care about). The setup reply
+/// advertises these per-visual; clients pass a visual ID into
+/// `CreateWindow`, `CreateColormap`, and RENDER `CreatePicture`.
+pub const VISUAL_CLASS_TRUE_COLOR: u8 = 4;
+
+/// A visual exposed to clients via the setup reply. We currently
+/// expose a fixed pair (root TrueColor at 24-bit, ARGB TrueColor at
+/// 32-bit). The `host_visual_xid` field is filled in once we've
+/// probed the host server's setup; it stays `None` until then so
+/// that early CreateWindow forwarding can be detected and skipped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Visual {
+    pub id: ResourceId,
+    pub class: u8,
+    pub depth: u8,
+    pub bits_per_rgb: u8,
+    pub colormap_entries: u16,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub alpha_mask: u32,
+    pub host_visual_xid: Option<u32>,
+}
+
+/// A colormap. We currently expose one per visual (root colormap +
+/// ARGB colormap). The `host_colormap_xid` is allocated on the host
+/// once during `HostX11` init and pushed in via
+/// [`ResourceTable::set_colormap_host_xid`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Colormap {
+    pub id: ResourceId,
+    pub visual: ResourceId,
+    pub host_colormap_xid: Option<u32>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TopLevelTarget {
@@ -131,6 +167,8 @@ pub struct ResourceTable {
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,
     host_glyphset_refcounts: HashMap<u32, usize>,
+    visuals: HashMap<u32, Visual>,
+    colormaps: HashMap<u32, Colormap>,
 }
 
 impl ResourceTable {
@@ -163,6 +201,60 @@ impl ResourceTable {
             },
         );
 
+        // Seed the visual + colormap tables with the same pair the setup
+        // reply advertises. `host_visual_xid` / `host_colormap_xid` stay
+        // `None` until `HostX11` init pushes the probed values in via
+        // [`set_visual_host_xid`] / [`set_colormap_host_xid`].
+        let mut visuals = HashMap::new();
+        visuals.insert(
+            ROOT_VISUAL.0,
+            Visual {
+                id: ROOT_VISUAL,
+                class: VISUAL_CLASS_TRUE_COLOR,
+                depth: 24,
+                bits_per_rgb: 8,
+                colormap_entries: 256,
+                red_mask: 0x00ff_0000,
+                green_mask: 0x0000_ff00,
+                blue_mask: 0x0000_00ff,
+                alpha_mask: 0,
+                host_visual_xid: None,
+            },
+        );
+        visuals.insert(
+            ARGB_VISUAL.0,
+            Visual {
+                id: ARGB_VISUAL,
+                class: VISUAL_CLASS_TRUE_COLOR,
+                depth: 32,
+                bits_per_rgb: 8,
+                colormap_entries: 256,
+                red_mask: 0x00ff_0000,
+                green_mask: 0x0000_ff00,
+                blue_mask: 0x0000_00ff,
+                alpha_mask: 0xff00_0000,
+                host_visual_xid: None,
+            },
+        );
+
+        let mut colormaps = HashMap::new();
+        colormaps.insert(
+            ROOT_COLORMAP.0,
+            Colormap {
+                id: ROOT_COLORMAP,
+                visual: ROOT_VISUAL,
+                host_colormap_xid: None,
+            },
+        );
+        colormaps.insert(
+            ARGB_COLORMAP.0,
+            Colormap {
+                id: ARGB_COLORMAP,
+                visual: ARGB_VISUAL,
+                host_colormap_xid: None,
+            },
+        );
+
         Self {
             windows,
             pixmaps: HashMap::new(),
@@ -172,10 +264,70 @@ impl ResourceTable {
             pictures: HashMap::new(),
             glyphsets: HashMap::new(),
             host_glyphset_refcounts: HashMap::new(),
+            visuals,
+            colormaps,
         }
     }
 
+    pub fn visual(&self, id: ResourceId) -> Option<&Visual> {
+        self.visuals.get(&id.0)
+    }
+
+    pub fn visuals_iter(&self) -> impl Iterator<Item = &Visual> {
+        self.visuals.values()
+    }
+
+    pub fn is_known_visual(&self, id: ResourceId) -> bool {
+        self.visuals.contains_key(&id.0)
+    }
+
+    pub fn set_visual_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
+        match self.visuals.get_mut(&id.0) {
+            Some(v) => {
+                v.host_visual_xid = Some(host_xid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn colormap(&self, id: ResourceId) -> Option<&Colormap> {
+        self.colormaps.get(&id.0)
+    }
+
+    pub fn set_colormap_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
+        match self.colormaps.get_mut(&id.0) {
+            Some(c) => {
+                c.host_colormap_xid = Some(host_xid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// First colormap entry whose `visual` matches; we currently keep
+    /// one colormap per visual so this is unambiguous.
+    pub fn colormap_for_visual(&self, visual: ResourceId) -> Option<&Colormap> {
+        self.colormaps.values().find(|c| c.visual == visual)
+    }
+
     pub fn create_window(&mut self, owner: ClientId, request: CreateWindowRequest) {
+        // CopyFromParent on visual / depth must inherit from the parent's
+        // visual and depth, not from the root. ARGB-parent + CopyFromParent
+        // child must produce an ARGB child; otherwise the child's host
+        // CreateWindow would forward depth=24 against an ARGB parent and
+        // produce a host BadMatch.
+        let parent = self.windows.get(&request.parent.0);
+        let resolved_depth = if request.depth == 0 {
+            parent.map_or(24, |p| p.depth)
+        } else {
+            request.depth
+        };
+        let resolved_visual = if request.visual.0 == 0 {
+            parent.map_or(ROOT_VISUAL, |p| p.visual)
+        } else {
+            request.visual
+        };
         let window = Window {
             id: request.window,
             parent: request.parent,
@@ -185,16 +337,8 @@ impl ResourceTable {
             width: request.width,
             height: request.height,
             border_width: request.border_width,
-            depth: if request.depth == 0 {
-                self.windows.get(&request.parent.0).map_or(24, |p| p.depth)
-            } else {
-                request.depth
-            },
-            visual: if request.visual.0 == 0 {
-                ROOT_VISUAL
-            } else {
-                request.visual
-            },
+            depth: resolved_depth,
+            visual: resolved_visual,
             class: WindowClass::from_protocol(request.class),
             map_state: MapState::Unmapped,
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
@@ -2576,6 +2720,135 @@ mod tests {
             t.children(ROOT_WINDOW),
             &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
         );
+    }
+
+    #[test]
+    fn visual_table_seeded_with_root_and_argb() {
+        let t = ResourceTable::new();
+        let root = t.visual(ROOT_VISUAL).expect("root visual seeded");
+        assert_eq!(root.depth, 24);
+        assert_eq!(root.alpha_mask, 0);
+        assert_eq!(root.host_visual_xid, None);
+        let argb = t.visual(ARGB_VISUAL).expect("argb visual seeded");
+        assert_eq!(argb.depth, 32);
+        assert_eq!(argb.alpha_mask, 0xff00_0000);
+        assert_eq!(argb.host_visual_xid, None);
+    }
+
+    #[test]
+    fn colormap_for_visual_returns_matching_entry() {
+        let t = ResourceTable::new();
+        assert_eq!(
+            t.colormap_for_visual(ROOT_VISUAL).map(|c| c.id),
+            Some(ROOT_COLORMAP)
+        );
+        assert_eq!(
+            t.colormap_for_visual(ARGB_VISUAL).map(|c| c.id),
+            Some(ARGB_COLORMAP)
+        );
+    }
+
+    #[test]
+    fn set_visual_host_xid_persists() {
+        let mut t = ResourceTable::new();
+        assert!(t.set_visual_host_xid(ARGB_VISUAL, 0x4711));
+        assert_eq!(
+            t.visual(ARGB_VISUAL).and_then(|v| v.host_visual_xid),
+            Some(0x4711)
+        );
+        assert!(!t.set_visual_host_xid(ResourceId(0xdead), 0x42));
+    }
+
+    #[test]
+    fn set_colormap_host_xid_persists() {
+        let mut t = ResourceTable::new();
+        assert!(t.set_colormap_host_xid(ARGB_COLORMAP, 0x9999));
+        assert_eq!(
+            t.colormap(ARGB_COLORMAP).and_then(|c| c.host_colormap_xid),
+            Some(0x9999)
+        );
+    }
+
+    #[test]
+    fn is_known_visual_distinguishes_table_entries() {
+        let t = ResourceTable::new();
+        assert!(t.is_known_visual(ROOT_VISUAL));
+        assert!(t.is_known_visual(ARGB_VISUAL));
+        // 0 is the wire encoding for CopyFromParent — not in the table; the
+        // CreateWindow handler validates separately and never queries this.
+        assert!(!t.is_known_visual(ResourceId(0)));
+        assert!(!t.is_known_visual(ResourceId(0xdead_beef)));
+    }
+
+    #[test]
+    fn copy_from_parent_visual_inherits_argb_parent() {
+        let mut t = ResourceTable::new();
+        // Create an ARGB top-level then a CopyFromParent child of it.
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ARGB_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x300),
+                parent: ResourceId(0x200),
+                x: 0,
+                y: 0,
+                width: 25,
+                height: 25,
+                border_width: 0,
+                class: 1,
+                visual: ResourceId(0), // CopyFromParent
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let child = t.window(ResourceId(0x300)).expect("child created");
+        assert_eq!(child.visual, ARGB_VISUAL);
+        assert_eq!(child.depth, 32);
+    }
+
+    #[test]
+    fn copy_from_parent_visual_inherits_root_visual_for_root_child() {
+        let mut t = ResourceTable::new();
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ResourceId(0),
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let w = t.window(ResourceId(0x200)).expect("created");
+        assert_eq!(w.visual, ROOT_VISUAL);
+        assert_eq!(w.depth, 24);
     }
 
     #[test]

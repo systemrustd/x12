@@ -19,7 +19,10 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostSubwindowConfig, HostX11},
+    host_x11::{
+        HostEvent, HostInputPump, HostInputPumpHandle, HostSubwindowConfig, HostSubwindowVisual,
+        HostX11,
+    },
     resources::{
         ARGB_VISUAL, GcClipState, GlyphSetState, HostDrawableTarget, MapState,
         NamedCompositePixmap, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW,
@@ -265,6 +268,24 @@ pub fn run(display: u16) -> io::Result<()> {
         root.host_xid = Some(host_window_id);
     }
 
+    // Push host visual / colormap xids into the resource table so that
+    // CreateWindow forwarding can translate our visual ids to host ones.
+    if let Some(host_arc) = host.as_ref()
+        && let Ok(host) = host_arc.lock()
+        && let Ok(mut s) = server.lock()
+    {
+        s.resources
+            .set_visual_host_xid(crate::resources::ROOT_VISUAL, host.root_visual_xid());
+        if let Some(host_colormap) = host.argb_colormap_xid() {
+            s.resources
+                .set_colormap_host_xid(crate::resources::ARGB_COLORMAP, host_colormap);
+        }
+        if let Some(host_argb_visual) = host.argb_visual_xid() {
+            s.resources
+                .set_visual_host_xid(crate::resources::ARGB_VISUAL, host_argb_visual);
+        }
+    }
+
     let input_pump_handle: Option<HostInputPumpHandle> = match host_window_id {
         Some(window_id) => match HostInputPump::open_from_env(window_id) {
             Ok(mut pump) => {
@@ -391,6 +412,45 @@ fn emit_x11_error(
         .lock()
         .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
     x11::write_error(&mut *w, sequence, code, bad_value, 0, major_opcode)
+}
+
+/// Pick the host CreateWindow visual / depth / colormap for a freshly
+/// created top-level by inspecting the local Window's resolved visual.
+/// `ROOT_VISUAL` matches the host container's visual so we use
+/// `CopyFromParent` (no colormap value needed). `ARGB_VISUAL` requires
+/// explicit visual + colormap host xids — when those aren't available
+/// (host advertises no depth-32 TrueColor visual) we fall back to
+/// `CopyFromParent` so the window still appears, just at depth 24.
+fn resolve_host_subwindow_visual(
+    server: &Mutex<ServerState>,
+    window: ResourceId,
+) -> HostSubwindowVisual {
+    let Ok(s) = server.lock() else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    let Some(window) = s.resources.window(window) else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    if window.visual == crate::resources::ROOT_VISUAL {
+        return HostSubwindowVisual::CopyFromParent;
+    }
+    let Some(visual) = s.resources.visual(window.visual) else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    let Some(visual_xid) = visual.host_visual_xid else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    let Some(colormap) = s.resources.colormap_for_visual(window.visual) else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    let Some(colormap_xid) = colormap.host_colormap_xid else {
+        return HostSubwindowVisual::CopyFromParent;
+    };
+    HostSubwindowVisual::Explicit {
+        depth: visual.depth,
+        visual_xid,
+        colormap_xid,
+    }
 }
 
 fn collect_destroy_order(
@@ -4894,6 +4954,23 @@ fn handle_request(
                 if validation_failed {
                     return emit_x11_error(writer, sequence, x11::error::BAD_ID_CHOICE, new_id, 1);
                 }
+                // Visual validation. CopyFromParent (visual=0) is always
+                // legal — the resolver inherits parent.visual. An explicit
+                // visual must be in our local table; otherwise reject
+                // locally with BadMatch and never reach the host.
+                let visual_known = {
+                    let s = lock_server(server)?;
+                    request.visual.0 == 0 || s.resources.is_known_visual(request.visual)
+                };
+                if !visual_known {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        request.visual.0,
+                        1,
+                    );
+                }
                 {
                     let mut s = lock_server(server)?;
                     s.resources.create_window(client_id, request);
@@ -4909,11 +4986,17 @@ fn handle_request(
                 if parent == ROOT_WINDOW
                     && let Some(host) = host
                 {
+                    let host_visual = resolve_host_subwindow_visual(server, window_id);
                     let allocated_xid: Option<u32> = host.lock().ok().and_then(|mut h| {
                         let xid = h.allocate_xid();
-                        if let Err(err) =
-                            h.create_subwindow(xid, geometry.0, geometry.1, geometry.2, geometry.3)
-                        {
+                        if let Err(err) = h.create_subwindow(
+                            xid,
+                            geometry.0,
+                            geometry.1,
+                            geometry.2,
+                            geometry.3,
+                            host_visual,
+                        ) {
                             warn!(
                                 "client {} create_subwindow for 0x{:x} failed: {err}",
                                 client_id.0, new_id

@@ -49,6 +49,18 @@ pub struct HostX11 {
     /// `None` means the host doesn't advertise COMPOSITE — clients then
     /// receive `BadAlloc` for `NameWindowPixmap`.
     composite_opcode: Option<u8>,
+    /// Host XID of the host root visual. Pushed into `ResourceTable` so
+    /// that core CreateWindow forwarding for our `ROOT_VISUAL` resolves
+    /// to a real host visual.
+    root_visual_xid: u32,
+    /// Host XID of an ARGB (32-bit TrueColor) visual on the host, if
+    /// one was advertised at setup. `None` means we can't honour
+    /// `ARGB_VISUAL` for top-level CreateWindow on this host.
+    argb_visual_xid: Option<u32>,
+    /// Host XID of a colormap allocated for `argb_visual_xid` during
+    /// init. Required by `CreateWindow` whenever the child visual is
+    /// not `CopyFromParent`.
+    argb_colormap_xid: Option<u32>,
     // Responses read during create_subwindow drain loops that belong to future
     // requests (sequence > geom_seq at time of read). Without this buffer,
     // the drain loop for window N discards the GetGeometry reply for window N+k,
@@ -85,6 +97,38 @@ enum HostClipState {
         x_origin: i16,
         y_origin: i16,
     },
+}
+
+/// Visual / depth / colormap selector for [`HostX11::create_subwindow`].
+/// `CopyFromParent` is the historical path — depth=0, visual=0, no
+/// colormap value — used when the requested child visual matches the
+/// host container's visual. `Explicit` carries the host xids needed to
+/// honour ARGB top-levels: the host requires both a real visual id and
+/// a colormap whose visual matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostSubwindowVisual {
+    CopyFromParent,
+    Explicit {
+        depth: u8,
+        visual_xid: u32,
+        colormap_xid: u32,
+    },
+}
+
+impl HostSubwindowVisual {
+    fn depth(self) -> u8 {
+        match self {
+            Self::CopyFromParent => 0,
+            Self::Explicit { depth, .. } => depth,
+        }
+    }
+
+    fn visual_xid(self) -> u32 {
+        match self {
+            Self::CopyFromParent => 0,
+            Self::Explicit { visual_xid, .. } => visual_xid,
+        }
+    }
 }
 
 pub type HostXidMap = Arc<Mutex<HashMap<u32, ResourceId>>>;
@@ -136,6 +180,9 @@ impl HostX11 {
             composite_opcode: None,
             reply_buffer: Vec::new(),
             depth_gcs: HashMap::new(),
+            root_visual_xid: setup.root_visual,
+            argb_visual_xid: setup.argb_visual,
+            argb_colormap_xid: None,
         };
         this.render = this.init_render().ok();
         this.xkb = this.init_xkb().ok();
@@ -151,7 +198,57 @@ impl HostX11 {
         if this.composite_opcode.is_none() {
             log::info!("host COMPOSITE extension absent — NameWindowPixmap will return BadAlloc");
         }
+        if let Some(argb_visual) = this.argb_visual_xid {
+            match this.create_argb_colormap(setup.root, argb_visual) {
+                Ok(xid) => this.argb_colormap_xid = Some(xid),
+                Err(err) => {
+                    log::warn!(
+                        "could not allocate host ARGB colormap (visual=0x{argb_visual:x}): {err}; \
+                         ARGB CreateWindow will fall back to CopyFromParent"
+                    );
+                }
+            }
+        } else {
+            log::info!("host advertises no depth-32 TrueColor visual — ARGB CreateWindow disabled");
+        }
         Ok(this)
+    }
+
+    /// Host XIDs the upper layer pushes into the visual / colormap
+    /// tables in `ResourceTable`. `argb_*` are `None` when the host
+    /// has no depth-32 TrueColor visual.
+    pub fn root_visual_xid(&self) -> u32 {
+        self.root_visual_xid
+    }
+
+    pub fn argb_visual_xid(&self) -> Option<u32> {
+        self.argb_visual_xid
+    }
+
+    pub fn argb_colormap_xid(&self) -> Option<u32> {
+        self.argb_colormap_xid
+    }
+
+    /// Allocate a host colormap for our ARGB visual via `XCreateColormap(
+    /// alloc=None, mid, root, visual)`. Sent fire-and-forget — host errors
+    /// (visual not depth-32, etc.) become async and are absorbed silently;
+    /// the resulting xid is still returned but if the host failed, later
+    /// CreateWindow attempts using it will surface a host BadColor / BadValue
+    /// (also absorbed). This is acceptable here — the alternative is a
+    /// blocking sync round-trip during HostX11 init.
+    fn create_argb_colormap(&mut self, host_root: u32, argb_visual: u32) -> io::Result<u32> {
+        let cmap_id = self.allocate_xid();
+        let mut out = Vec::with_capacity(16);
+        out.push(78); // CreateColormap opcode
+        out.push(0); // alloc = None
+        write_u16(&mut out, 4); // length = 4 words
+        write_u32(&mut out, cmap_id);
+        write_u32(&mut out, host_root);
+        write_u32(&mut out, argb_visual);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        Ok(cmap_id)
     }
 
     /// Major opcode of the host's COMPOSITE extension, or `None` if the
@@ -1113,6 +1210,7 @@ impl HostX11 {
         y: i16,
         width: u16,
         height: u16,
+        visual: HostSubwindowVisual,
     ) -> io::Result<()> {
         // 1. CreateWindow request — parent is the container (self.window_id).
         let cw_seq = self.sequence;
@@ -1124,10 +1222,14 @@ impl HostX11 {
         //   resized in ways that would otherwise discard it. Without this
         //   the host can drop pixels when the container is resized and
         //   apps appear blank until the next Expose-driven redraw.
-        let value_mask: u32 = (1 << 4) | (1 << 6);
+        // - colormap (1<<13): only set when visual differs from the
+        //   container's; the host requires a colormap whose visual matches.
+        let needs_colormap = matches!(visual, HostSubwindowVisual::Explicit { .. });
+        let value_mask: u32 = (1 << 4) | (1 << 6) | if needs_colormap { 1 << 13 } else { 0 };
+        let value_count: u16 = 2 + u16::from(needs_colormap);
         out.push(1); // CreateWindow opcode
-        out.push(0); // depth = CopyFromParent
-        write_u16(&mut out, 10); // length: 8 fixed + 2 values = 10 units
+        out.push(visual.depth());
+        write_u16(&mut out, 8 + value_count); // length: 8 fixed + value words
         write_u32(&mut out, host_xid);
         write_u32(&mut out, self.window_id); // parent = container
         write_i16(&mut out, x);
@@ -1138,10 +1240,13 @@ impl HostX11 {
         write_u16(&mut out, safe_height);
         write_u16(&mut out, 0); // border_width
         write_u16(&mut out, 0); // class = CopyFromParent
-        write_u32(&mut out, 0); // visual = CopyFromParent
+        write_u32(&mut out, visual.visual_xid());
         write_u32(&mut out, value_mask);
         write_u32(&mut out, 1); // bit-gravity = NorthWest
         write_u32(&mut out, 2); // backing-store = Always
+        if let HostSubwindowVisual::Explicit { colormap_xid, .. } = visual {
+            write_u32(&mut out, colormap_xid);
+        }
         self.stream.write_all(&out)?;
         self.sequence = self.sequence.wrapping_add(1);
 
@@ -2439,8 +2544,73 @@ pub struct HostKeyEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shape_rectangles, xkb_minor_has_reply};
+    use super::{build_shape_rectangles, scan_for_argb_visual, xkb_minor_has_reply};
     use yserver_protocol::x11::xfixes::RegionRect;
+
+    /// `(visual_id, class, red_mask, green_mask, blue_mask)`.
+    type VisualRec = (u32, u8, u32, u32, u32);
+    type DepthRec<'a> = (u8, &'a [VisualRec]);
+
+    /// Build a single-screen depth list with the given (depth, visuals)
+    /// records. Returns the byte buffer + the offset at which the depth
+    /// list starts (matches the layout `read_setup_reply` hands to
+    /// `scan_for_argb_visual`).
+    fn build_depth_list(records: &[DepthRec<'_>]) -> (Vec<u8>, usize) {
+        let mut body = Vec::new();
+        let depth_offset = 0;
+        for (depth, visuals) in records {
+            body.push(*depth);
+            body.push(0); // pad
+            body.extend_from_slice(&(visuals.len() as u16).to_le_bytes());
+            body.extend_from_slice(&[0; 4]); // pad
+            for (vid, class, red, green, blue) in *visuals {
+                body.extend_from_slice(&vid.to_le_bytes());
+                body.push(*class);
+                body.push(8); // bits_per_rgb
+                body.extend_from_slice(&256u16.to_le_bytes()); // colormap_entries
+                body.extend_from_slice(&red.to_le_bytes());
+                body.extend_from_slice(&green.to_le_bytes());
+                body.extend_from_slice(&blue.to_le_bytes());
+                body.extend_from_slice(&[0; 4]); // pad
+            }
+        }
+        (body, depth_offset)
+    }
+
+    #[test]
+    fn scan_for_argb_visual_picks_depth_32_truecolor_with_8bit_rgb() {
+        let (body, off) = build_depth_list(&[
+            (24, &[(0x21, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)]),
+            (32, &[(0x42, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)]),
+        ]);
+        assert_eq!(scan_for_argb_visual(&body, off, 2), Some(0x42));
+    }
+
+    #[test]
+    fn scan_for_argb_visual_skips_non_true_color_at_depth_32() {
+        let (body, off) =
+            build_depth_list(&[(32, &[(0x42, 5, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)])]);
+        assert_eq!(scan_for_argb_visual(&body, off, 1), None);
+    }
+
+    #[test]
+    fn scan_for_argb_visual_returns_none_when_no_depth_32() {
+        let (body, off) =
+            build_depth_list(&[(24, &[(0x21, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)])]);
+        assert_eq!(scan_for_argb_visual(&body, off, 1), None);
+    }
+
+    #[test]
+    fn scan_for_argb_visual_returns_none_on_truncated_body() {
+        // Header claims a depth-32 visual but the body cuts off early.
+        let mut body = Vec::new();
+        body.push(32);
+        body.push(0);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body.extend_from_slice(&[0; 12]); // less than the 24-byte VisualType
+        assert_eq!(scan_for_argb_visual(&body, 0, 1), None);
+    }
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {
@@ -2713,6 +2883,12 @@ struct HostSetup {
     root_depth: u8,
     white_pixel: u32,
     black_pixel: u32,
+    /// First TrueColor visual at depth 32 with a non-zero alpha mask, if
+    /// the host advertises one. Used to forward CreateWindow with our
+    /// `ARGB_VISUAL` so the host produces an ARGB drawable instead of a
+    /// 24-bit one. `None` = host has no ARGB visual; we fall back to
+    /// CopyFromParent in that case.
+    argb_visual: Option<u32>,
 }
 
 fn parse_display_number(display: &str) -> io::Result<u16> {
@@ -2788,6 +2964,9 @@ fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
     }
 
     let screen = &body[screen_offset..];
+    let allowed_depths_len = screen[39] as usize;
+    let argb_visual = scan_for_argb_visual(&body, screen_offset + 40, allowed_depths_len);
+
     Ok(HostSetup {
         resource_id_base,
         root: read_u32(&screen[0..4]),
@@ -2795,7 +2974,49 @@ fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
         root_depth: screen[38],
         white_pixel: read_u32(&screen[8..12]),
         black_pixel: read_u32(&screen[12..16]),
+        argb_visual,
     })
+}
+
+/// Walk the screen's depth-list looking for a depth-32 TrueColor visual
+/// with a non-zero alpha mask. Each depth record is `depth(1) pad(1)
+/// visuals_len(2) pad(4)` followed by `visuals_len * 24` bytes of
+/// VisualType records (visual_id(4) class(1) bits_per_rgb(1)
+/// colormap_entries(2) red(4) green(4) blue(4) pad(4)).
+///
+/// Returns `None` if the host has no such visual or the body is too
+/// short to parse cleanly. `pad(4)` after the per-depth header is part
+/// of the X11 protocol layout — see Protocol Reference, Setup section.
+fn scan_for_argb_visual(body: &[u8], mut off: usize, depth_count: usize) -> Option<u32> {
+    for _ in 0..depth_count {
+        if body.len() < off + 8 {
+            return None;
+        }
+        let depth = body[off];
+        let visuals_len = read_u16(&body[off + 2..off + 4]) as usize;
+        off += 8;
+        for _ in 0..visuals_len {
+            if body.len() < off + 24 {
+                return None;
+            }
+            let visual_id = read_u32(&body[off..off + 4]);
+            let class = body[off + 4];
+            let red_mask = read_u32(&body[off + 8..off + 12]);
+            let green_mask = read_u32(&body[off + 12..off + 16]);
+            let blue_mask = read_u32(&body[off + 16..off + 20]);
+            // Approximate "alpha mask present": for a 32-bit TrueColor
+            // visual the host does not actually expose the alpha mask in
+            // the setup reply (X11 only exposes R/G/B). We infer ARGB by
+            // depth=32 + class=TrueColor + the standard 8-bit RGB layout.
+            let standard_argb_layout =
+                red_mask == 0x00ff_0000 && green_mask == 0x0000_ff00 && blue_mask == 0x0000_00ff;
+            if depth == 32 && class == 4 && standard_argb_layout {
+                return Some(visual_id);
+            }
+            off += 24;
+        }
+    }
+    None
 }
 
 fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> io::Result<()> {
