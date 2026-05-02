@@ -5007,20 +5007,26 @@ fn handle_request(
                             .insert(window_id, mask);
                     }
                 }
-                // Allocate a host xid for every InputOutput window
-                // (Phase 3.6 Step 2). Top-levels are mapped + registered
-                // with the input pump; sub-window host children stay
-                // dormant — created with event_mask=0 + bit-gravity NW
-                // and never mapped — so their bg pixel doesn't paint
-                // over the top-level's content. Drawing for sub-windows
-                // still routes via `top_level_host_target` until Step 3.
-                let class_is_input_output = {
+                // Allocate a host xid for every non-InputOnly window
+                // (Phase 3.6 Step 2). The plan's invariant is
+                // "host_xid always Some for class != InputOnly", which
+                // includes `CopyFromParent` (the common class clients
+                // pass; our resource table preserves the protocol
+                // value, but logically it inherits the parent's class
+                // — InputOutput, for our top-levels). Top-levels are
+                // mapped + registered with the input pump; sub-window
+                // host children stay dormant — created with
+                // event_mask=0 + bit-gravity NW and never mapped — so
+                // their bg pixel doesn't paint over the top-level's
+                // content. Drawing for sub-windows still routes via
+                // `top_level_host_target` until Step 3.
+                let needs_host_xid = {
                     let s = lock_server(server)?;
                     s.resources
                         .window(window_id)
-                        .is_some_and(|w| w.class == crate::resources::WindowClass::InputOutput)
+                        .is_some_and(|w| w.class != crate::resources::WindowClass::InputOnly)
                 };
-                if class_is_input_output && let Some(host) = host {
+                if needs_host_xid && let Some(host) = host {
                     let host_visual = resolve_host_subwindow_visual(server, window_id);
                     let host_parent_xid = if parent == ROOT_WINDOW {
                         host.lock().ok().map(|h| h.window_id())
