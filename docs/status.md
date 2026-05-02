@@ -820,47 +820,129 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
 - e16 startup: significantly more chrome renders than the Phase
   3.4 environmental baseline — top bar, two pagers, minimap.
 - e16 popup *sometimes* opens, *sometimes* selects items (was
-  100% broken before Phase 3.6).
+  100% broken before Phase 3.6). **Phase 3.7 below resolves
+  these.**
 
-### Phase 3.6 follow-ups
+## Phase 3.7 — Event-flow + popup rendering fixes (in progress)
 
-- **Rendering quality under e16 popups / chrome.** Theme
-  gradients missing, popup background black instead of themed
-  gradient, root background pattern missing, colours generally
-  wrong. e16 paints gradients via many small `CopyArea` calls
-  from theme pixmaps; pixmap creation + MIT-SHM `PutImage` to
-  it + the `CopyArea` forwarding all reach the host correctly,
-  but the resulting pixels don't show. Likely candidates:
-  shared host GC state interference with per-window drawables,
-  CopyArea result being overdrawn by something on the
-  sub-window, or the destination's host-side clipping is wrong.
-  Diagnostic plan: capture an x11trace dump of e16 startup
-  under ynest vs under Xephyr (same theme), compare host-side
-  request streams side-by-side, identify the divergence.
-- **Intermittent popup mapping.** e16 sometimes opens a popup
-  whose host child is `IsUnMapped` even though the local
-  Window is `Viewable`. After interaction (e.g. switching
-  desktops), it works. Race in the CreateWindow / Reparent /
-  MapWindow flow that the per-CreateWindow `sync_main_connection`
-  fence doesn't fully close. New finding (2026-05-02): popups
-  only show on the *second* desktop — if I switch back to the
-  first one popups don't work, on the second they do. The
-  desktop-switch round-trip seems to land the host into the
-  state that subsequent map operations need; the first desktop
-  never reaches that state on its own. Suggests the missing
-  setup is desktop-scoped or driven by a host-side event the
-  desktop switch produces.
-- **Settings sub-window doesn't open** after selecting the
-  popup item. Likely the same race on a different code path.
-- **Cross-connection sync fence is a Phase-3.7 design smell.**
-  The pump and main connections race in several places; the
-  per-CreateWindow fence is a duct-tape fix. Folding pump and
-  main into one connection (or properly serialising via a
-  message queue) is the structural fix. Phase 3.7+ work.
-- **Per-client GC mirroring** (originally Phase 3.7). The
-  shared host GC creates whole categories of subtle bugs;
-  per-client GC removes them. Now visibly motivated by the
-  e16 rendering-quality issues above.
+Goal: turn the partial e16 popup behaviour from Phase 3.6 into a
+working popup → menu-item click flow. Six interlocking bugs surfaced
+during e16 validation; commit `51afa21` lands them as a single squashed
+change. Each was independently observable as part of the broken-popup
+symptom but the dependency graph required the whole set.
+
+### Landed (commit `51afa21`, 2026-05-02)
+
+- [x] **Container POINTER_EVENT_MASK regression.** Phase-3.6 commit
+      `1f43914` fixed the per-client kb pump's BadAccess by removing
+      `POINTER_EVENT_MASK` from `select_keyboard_events`, but the
+      same function was used by the main pump's
+      `HostInputPump::open_from_env`. The container stopped receiving
+      pointer events. Clicks on the desktop area where no top-level
+      child intervenes (e16's first desktop = root with "Root-bg"
+      cover) silently dropped on the host. Restore via dedicated
+      `select_pointer_events_on_container` called only from the main
+      pump.
+- [x] **ButtonPress propagation stopped at top_level_id.**
+      `pointer_event_fanout` walked `target → top_level_id` only,
+      never reached root. e16's `Root-bg` full-screen child of root
+      has only `EnterWindow` mask; per X11 spec the click must
+      propagate to root where the WM listens. Add
+      `ServerState::pointer_propagation_target` walking the parent
+      chain to root with coord translation; honour from
+      `ButtonPress` / `ButtonRelease` / `MotionNotify` dispatch.
+      +4 unit tests.
+- [x] **Missing CreateNotify / parent-side MapNotify /
+      ConfigureNotify fanout.** Three handlers in `nested.rs` only
+      fired StructureNotify on the window itself, not
+      SubstructureNotify on the parent (`CreateNotify` never fired
+      at all). e16's popup state machine couldn't proceed because
+      it never got `MapNotify` for its own popups despite selecting
+      `SubstructureNotify` on root. Add `encode_create_notify_event`;
+      emit `CreateNotify` on `CreateWindow` and `SubstructureNotify`
+      on parent from `MapWindow` / `MapSubwindows` / `ConfigureWindow`.
+- [x] **Popup body rendered solid black.** e16 paints popup chrome
+      via GCs with `fill-style=Tiled` and `tile=theme_pixmap`, then
+      `PolyFillRectangle` onto a destination pixmap which is later
+      `CopyArea`-sliced into per-menu-item bg-pixmaps. ynest's
+      `CreateGcRequest` only parsed foreground/background/line_width/
+      font/clip_mask — `fill_style` and `tile` were silently dropped.
+      Parse `fill_style` + `tile` + `stipple` + `tile_x_origin` +
+      `tile_y_origin`; resolve via new
+      `ResourceTable::gc_fill_state` into a `GcFillState` enum; add
+      `HostX11::set_gc_fill_tiled` / `set_gc_fill_solid`; wire
+      `apply_gc_fill_state` into `PolyFillRectangle` /
+      `PolyFillArc` / `FillPoly` with a reset to Solid after each
+      draw so unrelated draws on the shared host GC don't inherit
+      the tile.
+- [x] **`SHAPE` `OP_SUBTRACT` collapsed regions.** `apply_shape_op`
+      for `OP_SUBTRACT` returned either the unchanged current region
+      or empty `Vec`, never doing actual region subtraction. Add
+      `subtract_rect` (per-rect 4-strip split around the
+      intersection) and `subtract_regions` (iterate source). +4 unit
+      tests. The current e16 popup uses Set + Intersect so this
+      doesn't visibly change those popups, but any client doing
+      Set + Subtract for region arithmetic was being silently
+      corrupted.
+- [x] **Click on widgets in WM-managed windows didn't activate.**
+      Two interlocked input bugs:
+      - Grab path encoded `event_x`/`event_y` as raw `root_x`/
+        `root_y` instead of grab-window-relative. Per X11 spec,
+        when a pointer grab is active the event-window is the
+        grab_window and `event_x`/`y` are relative to it; the grab
+        owner uses these coords to locate the child widget that was
+        clicked. Resolve via
+        `ResourceTable::window_absolute_position`.
+      - `ReparentWindow` handler unregistered the host_xid → nested
+        mapping when a window left root, but didn't switch the host
+        event-mask back to the sub-window default (`ExposureMask`).
+        The host kept `POINTER_EVENT_MASK` selected on the now-sub-
+        window so events still arrived on its host_xid; the empty
+        `xid_map` entry then made `pointer_event_fanout` drop them
+        silently. Result: clicks on every reparented child of root
+        (e16 popup items, openbox/fvwm pager workspace cells,
+        dialog OK buttons inside frames) were discarded. Switch
+        `unregister_top_level` → `register_subwindow` which both
+        updates the map AND CWAs the host mask back to
+        `ExposureMask`, so events bubble up to the new top-level
+        ancestor and route correctly.
+
+**Validated** under e16 + ynest:99 + DISPLAY=:0 host clicks:
+right-click on first desktop opens the popup menu (was 100% broken
+on master), popup body renders with theme gradient + submenu
+indicators (was 100% black), and clicking "Settings" opens the
+Enlightenment Settings dialog (was 100% silent).
+
+### Phase 3.7 follow-ups
+
+- **Rounded corners cosmetic.** ynest's e16 popup outer shape is
+  Set + Intersect (rectangular bounding) — the rounded look comes
+  from the bg-pixmap content, with small black pixels at the very
+  corners visible because the popup outer's bg isn't auto-filled
+  there (default bg = None). Xephyr e16 sometimes uses a 14-rect
+  staircase Set for rounded corners; both ynest and Xephyr show
+  the same e16 binary running but the popup shape differs by run.
+  Investigate why (e16 might inspect render extension caps or
+  popup-size thresholds), and consider `ParentRelative` bg
+  forwarding so the popup outer inherits its parent's bg colour
+  instead of leaving uninitialised pixels.
+- **Intermittent popup mapping.** Largely subsumed by the Phase 3.7
+  fixes above (the "first desktop never works" was the
+  POINTER_EVENT_MASK regression). The "second desktop works" was
+  pure top-level subscription via Phase 3.6's `register_top_level`,
+  bypassing the broken first-desk path. Re-evaluate after smoke
+  testing under fvwm3 / wmaker.
+- **Cross-connection sync fence is a design smell.** The pump and
+  main connections race in several places; the per-CreateWindow
+  fence is a duct-tape fix. Folding pump and main into one
+  connection (or properly serialising via a message queue) is the
+  structural fix.
+- **Per-client GC mirroring** (originally Phase 3.7 plan, task
+  #26). The shared host GC creates subtle bugs; per-client GC
+  removes them. The Phase 3.7 fill-style fix proved this — adding
+  state to the shared GC required careful reset-to-Solid after
+  each draw to avoid leaking tile state between clients. A real
+  per-client GC is cleaner.
 
 ## Phase 4 — Accelerated clients
 
