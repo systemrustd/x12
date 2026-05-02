@@ -4549,8 +4549,11 @@ fn handle_composite_request(
             let pixmap = ResourceId(pixmap_raw);
 
             // Snapshot what we need from the server: host xid, geometry,
-            // depth, and whether *some* client redirected this window
-            // (or its parent via SUBWINDOWS).
+            // depth, redirection state, and whether this is a sub-window
+            // (parent != root). The sub-window block lets Phase 3.6 Step 2
+            // ship before Step 5 wires up host-pixmap retention across
+            // sub-window DestroyWindow; once Step 5 lands the
+            // `is_sub_window` reject below goes away.
             let snapshot = {
                 let s = lock_server(server)?;
                 s.resources.window(window).map(|w| {
@@ -4565,10 +4568,12 @@ fn handle_composite_request(
                         w.height,
                         w.depth,
                         parent_redirected || self_redirected,
+                        w.parent != ROOT_WINDOW,
                     )
                 })
             };
-            let Some((host_xid, w_width, w_height, w_depth, redirected)) = snapshot else {
+            let Some((host_xid, w_width, w_height, w_depth, redirected, is_sub_window)) = snapshot
+            else {
                 return emit_x11_error(
                     writer,
                     sequence,
@@ -4588,6 +4593,26 @@ fn handle_composite_request(
                     writer,
                     sequence,
                     x11::error::BAD_MATCH,
+                    window_raw,
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            }
+
+            // Phase 3.6 Step 2 block: refuse NameWindowPixmap on
+            // mirrored sub-windows until Step 5 wires up host-pixmap
+            // retention across sub-window DestroyWindow. Without that
+            // retention the host pixmap an aliased sub-window points
+            // at would be freed prematurely on destroy. Top-levels are
+            // unaffected — they were already mirrored pre-Step-2.
+            if is_sub_window {
+                debug!(
+                    "client {} #{} COMPOSITE::NameWindowPixmap -> BadValue (sub-window mirroring; lifted in Step 5)",
+                    client_id.0, sequence.0
+                );
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_VALUE,
                     window_raw,
                     COMPOSITE_MAJOR_OPCODE,
                 );
@@ -4982,28 +5007,48 @@ fn handle_request(
                             .insert(window_id, mask);
                     }
                 }
-                // Top-level only: allocate host xid + create host subwindow + register.
-                if parent == ROOT_WINDOW
-                    && let Some(host) = host
-                {
+                // Allocate a host xid for every InputOutput window
+                // (Phase 3.6 Step 2). Top-levels are mapped + registered
+                // with the input pump; sub-window host children stay
+                // dormant — created with event_mask=0 + bit-gravity NW
+                // and never mapped — so their bg pixel doesn't paint
+                // over the top-level's content. Drawing for sub-windows
+                // still routes via `top_level_host_target` until Step 3.
+                let class_is_input_output = {
+                    let s = lock_server(server)?;
+                    s.resources
+                        .window(window_id)
+                        .is_some_and(|w| w.class == crate::resources::WindowClass::InputOutput)
+                };
+                if class_is_input_output && let Some(host) = host {
                     let host_visual = resolve_host_subwindow_visual(server, window_id);
-                    let allocated_xid: Option<u32> = host.lock().ok().and_then(|mut h| {
-                        let xid = h.allocate_xid();
-                        if let Err(err) = h.create_subwindow(
-                            xid,
-                            geometry.0,
-                            geometry.1,
-                            geometry.2,
-                            geometry.3,
-                            host_visual,
-                        ) {
-                            warn!(
-                                "client {} create_subwindow for 0x{:x} failed: {err}",
-                                client_id.0, new_id
-                            );
-                            return None;
-                        }
-                        Some(xid)
+                    let host_parent_xid = if parent == ROOT_WINDOW {
+                        host.lock().ok().map(|h| h.window_id())
+                    } else {
+                        let s = lock_server(server)?;
+                        s.resources.window(parent).and_then(|w| w.host_xid)
+                    };
+                    let allocated_xid: Option<u32> = host_parent_xid.and_then(|host_parent| {
+                        host.lock().ok().and_then(|mut h| {
+                            let xid = h.allocate_xid();
+                            if let Err(err) = h.create_subwindow(
+                                host_parent,
+                                xid,
+                                geometry.0,
+                                geometry.1,
+                                geometry.2,
+                                geometry.3,
+                                request.border_width,
+                                host_visual,
+                            ) {
+                                warn!(
+                                    "client {} create_subwindow for 0x{:x} failed: {err}",
+                                    client_id.0, new_id
+                                );
+                                return None;
+                            }
+                            Some(xid)
+                        })
                     });
 
                     if let Some(host_xid) = allocated_xid {
@@ -5011,9 +5056,22 @@ fn handle_request(
                             let mut s = lock_server(server)?;
                             if let Some(w) = s.resources.window_mut(window_id) {
                                 w.host_xid = Some(host_xid);
+                                if parent == ROOT_WINDOW {
+                                    // Top-level: host pump delivers
+                                    // Expose (ExposureMask selected via
+                                    // `register_top_level`), so the
+                                    // synthetic emitter must stay
+                                    // silent.
+                                    w.uses_synthetic_expose = false;
+                                }
+                                // Sub-windows keep
+                                // `uses_synthetic_expose = true` (the
+                                // default) — Step 4 flips it once host
+                                // ExposureMask routing lands.
                             }
                         }
-                        if let Some(input_handle) = input_handle
+                        if parent == ROOT_WINDOW
+                            && let Some(input_handle) = input_handle
                             && let Err(err) = input_handle.register_top_level(window_id, host_xid)
                         {
                             warn!(
@@ -5221,13 +5279,20 @@ fn handle_request(
                 }
                 for pending in pending {
                     if let Some(xid) = pending.host_xid {
+                        // Unregister the host_xid → ResourceId mapping
+                        // *before* sending host destroy. A late
+                        // host-pump event with this xid arriving after
+                        // the local Window is gone would otherwise
+                        // misroute to a destroyed ResourceId; with the
+                        // mapping cleared first, lookup misses and the
+                        // event drops silently.
+                        if let Some(input_handle) = input_handle {
+                            input_handle.unregister_top_level(xid);
+                        }
                         if let Some(host) = host
                             && let Ok(mut h) = host.lock()
                         {
                             let _ = h.destroy_subwindow(xid);
-                        }
-                        if let Some(input_handle) = input_handle {
-                            input_handle.unregister_top_level(xid);
                         }
                     }
                     fanout_destroy_sequence(&pending);
@@ -5470,18 +5535,20 @@ fn handle_request(
                             x11::encode_map_request_event(buf, seq, order, parent, window);
                         });
                     } else {
-                        let (map_info, host_xid) = {
+                        let (map_info, host_xid, uses_synthetic_expose) = {
                             let mut s = lock_server(server)?;
                             let _ = s.resources.map_window(window);
-                            let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
-                            let map_info = s.resources.window(window).map(|w| {
+                            let w = s.resources.window(window);
+                            let host_xid = w.and_then(|w| w.host_xid);
+                            let synthetic = w.is_none_or(|w| w.uses_synthetic_expose);
+                            let map_info = w.map(|w| {
                                 (w.parent, w.override_redirect, w.x, w.y, w.width, w.height)
                             });
-                            (map_info, host_xid)
+                            (map_info, host_xid, synthetic)
                         };
                         if let Some((parent, override_redir, x, y, width, height)) = map_info {
                             debug!(
-                                "client {} MapWindow 0x{:x} direct parent=0x{:x} pos=({},{}) size={}x{} override={} host_xid={:?}",
+                                "client {} MapWindow 0x{:x} direct parent=0x{:x} pos=({},{}) size={}x{} override={} host_xid={:?} synthetic_expose={}",
                                 client_id.0,
                                 window.0,
                                 parent.0,
@@ -5490,7 +5557,8 @@ fn handle_request(
                                 width,
                                 height,
                                 override_redir,
-                                host_xid
+                                host_xid,
+                                uses_synthetic_expose
                             );
                         } else {
                             debug!(
@@ -5498,7 +5566,13 @@ fn handle_request(
                                 client_id.0, window.0, host_xid
                             );
                         }
+                        // Map the host child only when it's a non-dormant
+                        // window — i.e. a top-level the host server is
+                        // driving. Dormant sub-windows (Phase 3.6 Step 2)
+                        // keep their host child unmapped so its bg pixel
+                        // doesn't paint over the top-level's content.
                         if let Some(xid) = host_xid
+                            && !uses_synthetic_expose
                             && let Some(host) = host
                             && let Ok(mut h) = host.lock()
                         {
@@ -5537,14 +5611,16 @@ fn handle_request(
                                     );
                                 },
                             );
-                            // Synthesize Expose only when the window has no host
-                            // backing. Top-levels with a `host_xid` get their
-                            // Expose from the host pump (the host server
-                            // generates one when their host subwindow is
-                            // mapped), so emitting one here too produces a
-                            // duplicate that wmaker reacts to by re-creating
-                            // its appicon bg pixmap.
-                            if host_xid.is_none() {
+                            // Synthesize Expose for windows we don't yet
+                            // get host Expose for — that's everything with
+                            // `uses_synthetic_expose = true`. Top-levels
+                            // (synthetic = false) get their Expose from
+                            // the host pump; sub-windows during Step 2
+                            // are dormant on the host so the synthetic
+                            // path stays the only Expose source. Step 4
+                            // flips the flag for sub-windows once we
+                            // start routing host Expose for them.
+                            if uses_synthetic_expose {
                                 crate::server::emit_window_event(
                                     server,
                                     window,
@@ -5572,18 +5648,24 @@ fn handle_request(
                     s.resources.children(parent).to_vec()
                 };
                 for child in children {
-                    let (extents, host_xid, was_unmapped, override_redirect) = {
+                    let (extents, host_xid, was_unmapped, override_redirect, synthetic) = {
                         let mut s = lock_server(server)?;
                         let was_unmapped = s.resources.map_window(child);
-                        let host_xid = s.resources.window(child).and_then(|w| w.host_xid);
-                        let extents = s.resources.window(child).map(|w| (w.width, w.height));
-                        let override_redirect = s
-                            .resources
-                            .window(child)
-                            .is_some_and(|w| w.override_redirect);
-                        (extents, host_xid, was_unmapped, override_redirect)
+                        let w = s.resources.window(child);
+                        let host_xid = w.and_then(|w| w.host_xid);
+                        let extents = w.map(|w| (w.width, w.height));
+                        let override_redirect = w.is_some_and(|w| w.override_redirect);
+                        let synthetic = w.is_none_or(|w| w.uses_synthetic_expose);
+                        (
+                            extents,
+                            host_xid,
+                            was_unmapped,
+                            override_redirect,
+                            synthetic,
+                        )
                     };
                     if let Some(xid) = host_xid
+                        && !synthetic
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
@@ -5641,9 +5723,11 @@ fn handle_request(
         }
         10 => {
             if let Some(window) = x11::map_window_id(body) {
-                let (snapshot, host_xid) = {
+                let (snapshot, host_xid, synthetic) = {
                     let mut s = lock_server(server)?;
-                    let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
+                    let w = s.resources.window(window);
+                    let host_xid = w.and_then(|w| w.host_xid);
+                    let synthetic = w.is_none_or(|w| w.uses_synthetic_expose);
                     let was_mapped = s.resources.unmap_window(window);
                     let snapshot = if was_mapped {
                         let parent = s.resources.window(window).map_or(ROOT_WINDOW, |w| w.parent);
@@ -5653,9 +5737,10 @@ fn handle_request(
                     } else {
                         None
                     };
-                    (snapshot, host_xid)
+                    (snapshot, host_xid, synthetic)
                 };
                 if let Some(xid) = host_xid
+                    && !synthetic
                     && let Some(host) = host
                     && let Ok(mut h) = host.lock()
                 {
@@ -5677,6 +5762,7 @@ fn handle_request(
                 struct PendingUnmap {
                     child: ResourceId,
                     host_xid: Option<u32>,
+                    synthetic: bool,
                     on_child: Vec<EventTarget>,
                     on_parent: Vec<EventTarget>,
                 }
@@ -5693,11 +5779,14 @@ fn handle_request(
                     };
                     let mut pending = Vec::new();
                     for child in children {
-                        let host_xid = s.resources.window(child).and_then(|w| w.host_xid);
+                        let w = s.resources.window(child);
+                        let host_xid = w.and_then(|w| w.host_xid);
+                        let synthetic = w.is_none_or(|w| w.uses_synthetic_expose);
                         if s.resources.unmap_window(child) {
                             pending.push(PendingUnmap {
                                 child,
                                 host_xid,
+                                synthetic,
                                 on_child: s.subscribers(child, 0x0002_0000),
                                 on_parent: s.subscribers(parent, 0x0008_0000),
                             });
@@ -5707,6 +5796,7 @@ fn handle_request(
                 };
                 for item in pending {
                     if let Some(xid) = item.host_xid
+                        && !item.synthetic
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
@@ -9894,6 +9984,58 @@ mod tests {
             .unwrap();
             let buf = read_error(&mut reader_remote);
             assert_eq!(buf[1], x11error::BAD_MATCH);
+        }
+
+        #[test]
+        fn name_window_pixmap_on_mirrored_sub_window_returns_bad_value() {
+            // Phase 3.6 Step 2 block: even with the parent redirected via
+            // SUBWINDOWS, calling NameWindowPixmap on a sub-window must
+            // reject locally with BadValue (lifted in Step 5 once host
+            // pixmap retention across sub-window destroy is wired up).
+            let top_level = ResourceId(0x10_0500);
+            let sub_window = ResourceId(0x10_0501);
+            let server = make_server_with_window(top_level, Some(0xdead_beef));
+            {
+                let mut s = server.lock().unwrap();
+                s.resources.create_window(
+                    ClientId(1),
+                    CreateWindowRequest {
+                        window: sub_window,
+                        parent: top_level,
+                        x: 0,
+                        y: 0,
+                        width: 50,
+                        height: 50,
+                        border_width: 0,
+                        depth: 24,
+                        visual: ResourceId(0),
+                        class: 0,
+                        background_pixel: None,
+                        event_mask: None,
+                        override_redirect: None,
+                    },
+                );
+                if let Some(w) = s.resources.window_mut(sub_window) {
+                    w.host_xid = Some(0xface_face);
+                }
+                // Redirect sub-windows of the top-level so the
+                // BadMatch-not-redirected guard doesn't fire.
+                s.composite_redirects.insert((top_level, true), 0);
+            }
+            let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            handle_composite_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(1),
+                x11composite::NAME_WINDOW_PIXMAP,
+                &name_window_pixmap_body(sub_window.0, 0x10_0701),
+            )
+            .unwrap();
+            let buf = read_error(&mut reader_remote);
+            assert_eq!(buf[1], x11error::BAD_VALUE);
         }
 
         #[test]

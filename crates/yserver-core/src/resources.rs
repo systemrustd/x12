@@ -192,12 +192,17 @@ impl ResourceTable {
                 background_pixel: 0x00ff_ffff,
                 background_pixmap: None,
                 background_pixmap_host_xid: None,
+                border_pixmap_host_xid: None,
                 override_redirect: false,
                 cursor: None,
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
                 host_xid: None,
                 composite_named_pixmaps: Vec::new(),
+                // Root receives no Expose at all from the host pump or
+                // from the synthetic emitter — the container is wired
+                // separately and root drawing routes there directly.
+                uses_synthetic_expose: false,
             },
         );
 
@@ -344,12 +349,14 @@ impl ResourceTable {
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
             background_pixmap: None,
             background_pixmap_host_xid: None,
+            border_pixmap_host_xid: None,
             override_redirect: request.override_redirect.unwrap_or(false),
             cursor: None,
             owner,
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
+            uses_synthetic_expose: true,
         };
 
         self.windows
@@ -1587,6 +1594,9 @@ pub struct Window {
     /// it survives FreePixmap (X11 servers retain bg pixmaps independent
     /// of client refs).
     pub background_pixmap_host_xid: Option<u32>,
+    /// Host XID of the border pixmap (if any). Parallel to
+    /// `background_pixmap_host_xid`, retained for the same reason.
+    pub border_pixmap_host_xid: Option<u32>,
     pub override_redirect: bool,
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
@@ -1595,6 +1605,12 @@ pub struct Window {
     /// Per-window list of `Composite::NameWindowPixmap` aliases. All are
     /// invalidated together on resize per the COMPOSITE spec.
     pub composite_named_pixmaps: Vec<NamedCompositePixmap>,
+    /// Whether the local Expose pump synthesises Expose for this
+    /// window. `true` for sub-windows during Phase 3.6 Step 2 (their
+    /// host child window stays dormant), `false` for top-levels (the
+    /// host server delivers real Expose). Step 4 will flip this to
+    /// `false` for sub-windows once host ExposureMask routing lands.
+    pub uses_synthetic_expose: bool,
 }
 
 impl Window {
@@ -1615,12 +1631,14 @@ impl Window {
             background_pixel: 0x00ff_ffff,
             background_pixmap: None,
             background_pixmap_host_xid: None,
+            border_pixmap_host_xid: None,
             override_redirect: false,
             cursor: None,
             owner: SERVER_OWNER,
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
+            uses_synthetic_expose: true,
         }
     }
 }
@@ -2823,6 +2841,62 @@ mod tests {
         let child = t.window(ResourceId(0x300)).expect("child created");
         assert_eq!(child.visual, ARGB_VISUAL);
         assert_eq!(child.depth, 32);
+    }
+
+    #[test]
+    fn newly_created_window_uses_synthetic_expose_by_default() {
+        let mut t = ResourceTable::new();
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ResourceId(0),
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        // Root window is wired directly to the host container — no
+        // synthetic Expose needed. Newly-created windows default to
+        // synthetic until the dispatch layer flips the flag for
+        // top-levels (Step 2) or sub-windows (Step 4).
+        assert!(!t.window(ROOT_WINDOW).unwrap().uses_synthetic_expose);
+        assert!(t.window(ResourceId(0x200)).unwrap().uses_synthetic_expose);
+    }
+
+    #[test]
+    fn newly_created_window_has_no_border_pixmap_host_xid() {
+        let mut t = ResourceTable::new();
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 1,
+                class: 1,
+                visual: ResourceId(0),
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        assert_eq!(
+            t.window(ResourceId(0x200)).unwrap().border_pixmap_host_xid,
+            None
+        );
     }
 
     #[test]

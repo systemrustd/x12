@@ -1203,19 +1203,30 @@ impl HostX11 {
         })
     }
 
+    /// Forward `XCreateWindow(host_parent, host_xid, x, y, width, height,
+    /// border_width, ...)` fire-and-forget. No reply is awaited — host
+    /// errors (BadAlloc / BadMatch / BadValue) become async and are
+    /// absorbed silently by `read_response` drain loops elsewhere. The
+    /// caller is responsible for pre-validating visual / depth / parent
+    /// locally so we don't dangle a host xid that the host never
+    /// allocated.
+    ///
+    /// `event_mask = 0` always — pointer/exposure events are selected
+    /// later via `HostInputPumpHandle::register_top_level` (top-levels
+    /// only during Phase 3.6 Step 2; sub-window mirroring stays dormant).
     pub fn create_subwindow(
         &mut self,
+        host_parent: u32,
         host_xid: u32,
         x: i16,
         y: i16,
         width: u16,
         height: u16,
+        border_width: u16,
         visual: HostSubwindowVisual,
     ) -> io::Result<()> {
-        // 1. CreateWindow request — parent is the container (self.window_id).
-        let cw_seq = self.sequence;
         let mut out = Vec::new();
-        // Top-level subwindow attributes:
+        // Subwindow attributes:
         // - bit-gravity = NorthWest (1<<4): preserve pixels on a resize.
         // - backing-store = Always (1<<6, value 2): the host preserves the
         //   subwindow's pixel content even when occluded or its parent is
@@ -1231,14 +1242,14 @@ impl HostX11 {
         out.push(visual.depth());
         write_u16(&mut out, 8 + value_count); // length: 8 fixed + value words
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.window_id); // parent = container
+        write_u32(&mut out, host_parent);
         write_i16(&mut out, x);
         write_i16(&mut out, y);
         let safe_width = width.max(1);
         let safe_height = height.max(1);
         write_u16(&mut out, safe_width);
         write_u16(&mut out, safe_height);
-        write_u16(&mut out, 0); // border_width
+        write_u16(&mut out, border_width);
         write_u16(&mut out, 0); // class = CopyFromParent
         write_u32(&mut out, visual.visual_xid());
         write_u32(&mut out, value_mask);
@@ -1248,60 +1259,14 @@ impl HostX11 {
             write_u32(&mut out, colormap_xid);
         }
         self.stream.write_all(&out)?;
-        self.sequence = self.sequence.wrapping_add(1);
-
-        // 2. GetInputFocus round-trip — always returns a reply, ensuring
-        //    CreateWindow has been committed by the host before we return.
-        //    (GetGeometry can fail with BadDrawable if CreateWindow failed,
-        //    and the error response is identical in layout to a real answer.)
-        let sync_seq = self.sequence;
-        let mut sync = Vec::new();
-        sync.push(43); // GetInputFocus opcode
-        sync.push(0);
-        write_u16(&mut sync, 1);
-        self.stream.write_all(&sync)?;
-        self.sequence = self.sequence.wrapping_add(1);
         self.stream.flush()?;
-
+        self.sequence = self.sequence.wrapping_add(1);
         log::debug!(
-            "create_subwindow: host_xid=0x{:x} cw_seq={} sync_seq={} buf_len={}",
+            "create_subwindow: host_xid=0x{:x} parent=0x{:x} pos=({x},{y}) size={width}x{height} bw={border_width}",
             host_xid,
-            cw_seq,
-            sync_seq,
-            self.reply_buffer.len()
+            host_parent,
         );
-
-        // Drain replies/errors until we see the GetInputFocus reply at sync_seq.
-        // Check buffered responses first — a previous call's drain loop may have
-        // read past sync_seq and saved the reply here.
-        if let Some(pos) = self
-            .reply_buffer
-            .iter()
-            .position(|r| r.sequence == sync_seq)
-        {
-            log::debug!("create_subwindow: found in buffer at pos={}", pos);
-            self.reply_buffer.remove(pos);
-            return Ok(());
-        }
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            let detail = if resp.bytes[0] == 0 {
-                format!("err_code={}", resp.bytes[1])
-            } else {
-                String::new()
-            };
-            log::debug!(
-                "create_subwindow: stream resp type={} seq={} {} (want {})",
-                resp.bytes[0],
-                resp.sequence,
-                detail,
-                sync_seq
-            );
-            if resp.sequence == sync_seq {
-                return Ok(());
-            }
-            self.reply_buffer.push(resp);
-        }
+        Ok(())
     }
 
     pub fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
