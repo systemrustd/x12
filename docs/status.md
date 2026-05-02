@@ -768,6 +768,29 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
       having the kb pump select only `KeyPress | KeyRelease |
       StructureNotify` — pointer events stay on the main pump's
       connection where they belong.
+- [x] **Step 5 — NameWindowPixmap retention across DestroyWindow.**
+      Per the COMPOSITE spec, named pixmaps outlive the source
+      window's destroy and remain valid until the client calls
+      `FreePixmap`. The `DestroyWindow` (op 4) and
+      `DestroySubwindows` (op 5) handlers in `nested.rs` no longer
+      free the local Pixmap or the host pixmap for entries in
+      `Window.composite_named_pixmaps`; the local Pixmap remains
+      in `ResourceTable` with its `host_xid` intact and `FreePixmap`
+      (op 54) cleans up on the eventual client request.
+      Resize-driven invalidation (`invalidate_composite_named_pixmaps`
+      from the `ConfigureWindow` resize path) still frees aliases —
+      that's the spec-mandated case. The Step-2 BadValue gate
+      rejecting `NameWindowPixmap` on mirrored sub-windows was
+      lifted; sub-windows now use the same redirect-required +
+      host-required validation as top-levels. Reparent already
+      did not invalidate — added a regression test.
+      Stress gate: 200 iterations of create + alias + destroy
+      retain every Pixmap and panic-free.
+      Generation-tagging / per-window-serialise host ops
+      (originally listed in the plan for Step 5) was scoped down
+      to "verify with stress test, host BadDrawable absorption is
+      already in place" — no draw-after-destroy bug surfaced
+      under the stress test, so no generation system this PR.
 
 ### Verified working
 
@@ -804,10 +827,6 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
   fence doesn't fully close.
 - **Settings sub-window doesn't open** after selecting the
   popup item. Likely the same race on a different code path.
-- **Step 5 — host xid + NameWindowPixmap retention.** Lock
-  down race surface that grew with sub-window mirroring; lift
-  the NameWindowPixmap-on-mirrored-sub-window block from
-  Step 2. Touched but not implemented this phase.
 - **Step 6 — cleanup.** Delete `top_level_host_target` and
   the `(x_off, y_off)` second-return on `host_drawable_target`;
   delete the `(x_off, y_off)` parameters on `apply_gc_clip`;

@@ -4549,11 +4549,7 @@ fn handle_composite_request(
             let pixmap = ResourceId(pixmap_raw);
 
             // Snapshot what we need from the server: host xid, geometry,
-            // depth, redirection state, and whether this is a sub-window
-            // (parent != root). The sub-window block lets Phase 3.6 Step 2
-            // ship before Step 5 wires up host-pixmap retention across
-            // sub-window DestroyWindow; once Step 5 lands the
-            // `is_sub_window` reject below goes away.
+            // depth, redirection state.
             let snapshot = {
                 let s = lock_server(server)?;
                 s.resources.window(window).map(|w| {
@@ -4568,12 +4564,10 @@ fn handle_composite_request(
                         w.height,
                         w.depth,
                         parent_redirected || self_redirected,
-                        w.parent != ROOT_WINDOW,
                     )
                 })
             };
-            let Some((host_xid, w_width, w_height, w_depth, redirected, is_sub_window)) = snapshot
-            else {
+            let Some((host_xid, w_width, w_height, w_depth, redirected)) = snapshot else {
                 return emit_x11_error(
                     writer,
                     sequence,
@@ -4593,26 +4587,6 @@ fn handle_composite_request(
                     writer,
                     sequence,
                     x11::error::BAD_MATCH,
-                    window_raw,
-                    COMPOSITE_MAJOR_OPCODE,
-                );
-            }
-
-            // Phase 3.6 Step 2 block: refuse NameWindowPixmap on
-            // mirrored sub-windows until Step 5 wires up host-pixmap
-            // retention across sub-window DestroyWindow. Without that
-            // retention the host pixmap an aliased sub-window points
-            // at would be freed prematurely on destroy. Top-levels are
-            // unaffected — they were already mirrored pre-Step-2.
-            if is_sub_window {
-                debug!(
-                    "client {} #{} COMPOSITE::NameWindowPixmap -> BadValue (sub-window mirroring; lifted in Step 5)",
-                    client_id.0, sequence.0
-                );
-                return emit_x11_error(
-                    writer,
-                    sequence,
-                    x11::error::BAD_VALUE,
                     window_raw,
                     COMPOSITE_MAJOR_OPCODE,
                 );
@@ -5282,17 +5256,13 @@ fn handle_request(
         }
         4 => {
             if let Some(window) = x11::free_resource_id(body) {
-                let (pending, bg_pixmap_xids, composite_aliases) = {
+                let (pending, bg_pixmap_xids) = {
                     let mut s = lock_server(server)?;
                     let mut order = Vec::new();
                     collect_destroy_order(&s.resources, window, &mut order);
                     let bg = s.resources.collect_bg_pixmap_host_xids(window);
-                    let mut composite_aliases: Vec<NamedCompositePixmap> = Vec::new();
                     let mut pending: Vec<PendingDestroy> = Vec::new();
                     for w in &order {
-                        if let Some(win) = s.resources.window_mut(*w) {
-                            composite_aliases.append(&mut win.composite_named_pixmaps);
-                        }
                         let (parent, was_mapped, host_xid) =
                             s.resources
                                 .window(*w)
@@ -5314,12 +5284,19 @@ fn handle_request(
                             on_parent,
                         });
                     }
-                    for a in &composite_aliases {
-                        let _ = s.resources.free_pixmap(a.client_pixmap);
-                    }
+                    // Phase 3.6 Step 5: COMPOSITE NameWindowPixmap aliases
+                    // (Window.composite_named_pixmaps) are intentionally NOT
+                    // freed here. Per the COMPOSITE spec, named pixmaps
+                    // outlive DestroyWindow until the client calls
+                    // FreePixmap. The Window struct is dropped by
+                    // destroy_window below — the per-window alias list goes
+                    // with it, but the local Pixmap resources remain in
+                    // s.resources with their host_xid intact, and FreePixmap
+                    // (op 54) cleans the host pixmap on the eventual client
+                    // request.
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
-                    (pending, bg, composite_aliases)
+                    (pending, bg)
                 };
                 if !bg_pixmap_xids.is_empty()
                     && let Some(host) = host
@@ -5327,14 +5304,6 @@ fn handle_request(
                 {
                     for xid in &bg_pixmap_xids {
                         let _ = h.free_pixmap(*xid);
-                    }
-                }
-                if !composite_aliases.is_empty()
-                    && let Some(host) = host
-                    && let Ok(mut h) = host.lock()
-                {
-                    for a in &composite_aliases {
-                        let _ = h.free_pixmap(a.host_pixmap);
                     }
                 }
                 for pending in pending {
@@ -5367,16 +5336,12 @@ fn handle_request(
                 let kids: Vec<ResourceId> =
                     lock_server(server)?.resources.children(parent).to_vec();
                 for k in kids {
-                    let (pending, composite_aliases) = {
+                    let pending = {
                         let mut s = lock_server(server)?;
                         let mut order = Vec::new();
                         collect_destroy_order(&s.resources, k, &mut order);
-                        let mut composite_aliases: Vec<NamedCompositePixmap> = Vec::new();
                         let mut pending: Vec<PendingDestroy> = Vec::new();
                         for w in &order {
-                            if let Some(win) = s.resources.window_mut(*w) {
-                                composite_aliases.append(&mut win.composite_named_pixmaps);
-                            }
                             let (kparent, was_mapped, host_xid) =
                                 s.resources
                                     .window(*w)
@@ -5398,21 +5363,13 @@ fn handle_request(
                                 on_parent,
                             });
                         }
-                        for a in &composite_aliases {
-                            let _ = s.resources.free_pixmap(a.client_pixmap);
-                        }
+                        // Phase 3.6 Step 5: see DestroyWindow above —
+                        // composite_named_pixmaps are retained until client
+                        // FreePixmap.
                         let _ = s.resources.destroy_window(k);
                         s.drop_window_subscriptions(&order);
-                        (pending, composite_aliases)
+                        pending
                     };
-                    if !composite_aliases.is_empty()
-                        && let Some(host) = host
-                        && let Ok(mut h) = host.lock()
-                    {
-                        for a in &composite_aliases {
-                            let _ = h.free_pixmap(a.host_pixmap);
-                        }
-                    }
                     for entry in pending {
                         if let Some(xid) = entry.host_xid {
                             if let Some(host) = host
@@ -10072,11 +10029,12 @@ mod tests {
         }
 
         #[test]
-        fn name_window_pixmap_on_mirrored_sub_window_returns_bad_value() {
-            // Phase 3.6 Step 2 block: even with the parent redirected via
-            // SUBWINDOWS, calling NameWindowPixmap on a sub-window must
-            // reject locally with BadValue (lifted in Step 5 once host
-            // pixmap retention across sub-window destroy is wired up).
+        fn name_window_pixmap_on_mirrored_sub_window_without_host_returns_bad_alloc() {
+            // Phase 3.6 Step 5: the sub-window-specific BadValue block is
+            // lifted. With no host backing available, the request now falls
+            // through to the standard BadAlloc path (host required to
+            // satisfy NameWindowPixmap), same as a top-level. Pre-Step-5
+            // this test asserted BadValue on the sub-window.
             let top_level = ResourceId(0x10_0500);
             let sub_window = ResourceId(0x10_0501);
             let server = make_server_with_window(top_level, Some(0xdead_beef));
@@ -10103,8 +10061,6 @@ mod tests {
                 if let Some(w) = s.resources.window_mut(sub_window) {
                     w.host_xid = Some(0xface_face);
                 }
-                // Redirect sub-windows of the top-level so the
-                // BadMatch-not-redirected guard doesn't fire.
                 s.composite_redirects.insert((top_level, true), 0);
             }
             let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
@@ -10120,7 +10076,7 @@ mod tests {
             )
             .unwrap();
             let buf = read_error(&mut reader_remote);
-            assert_eq!(buf[1], x11error::BAD_VALUE);
+            assert_eq!(buf[1], x11error::BAD_ALLOC);
         }
 
         #[test]
@@ -10204,6 +10160,251 @@ mod tests {
                     .is_empty(),
                 "window's alias list cleared",
             );
+        }
+
+        #[test]
+        fn destroy_window_retains_composite_named_pixmaps() {
+            // Phase 3.6 Step 5: NameWindowPixmap aliases survive
+            // DestroyWindow until the client calls FreePixmap. The local
+            // Pixmap resource (and, in real flow, its host pixmap) must
+            // outlive the source window.
+            use super::super::handle_request;
+            use crate::resources::NamedCompositePixmap;
+            use yserver_protocol::x11::RequestHeader;
+            let window = ResourceId(0x10_0500);
+            let server = make_server_with_window(window, Some(0xdead_beef));
+            let pixmap = ResourceId(0x10_0601);
+            {
+                let mut s = server.lock().unwrap();
+                s.resources.create_pixmap(
+                    ClientId(1),
+                    yserver_protocol::x11::CreatePixmapRequest {
+                        pixmap,
+                        drawable: window,
+                        width: 100,
+                        height: 100,
+                        depth: 24,
+                    },
+                );
+                let _ = s.resources.set_pixmap_host_xid(pixmap, 0xa);
+                let w = s.resources.window_mut(window).unwrap();
+                w.composite_named_pixmaps.push(NamedCompositePixmap {
+                    client_pixmap: pixmap,
+                    host_pixmap: 0xa,
+                    width: 100,
+                    height: 100,
+                });
+            }
+            let (writer_local, _reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            let focused_window = Arc::new(Mutex::new(ROOT_WINDOW));
+            let mut body = Vec::with_capacity(4);
+            body.extend_from_slice(&window.0.to_le_bytes());
+            handle_request(
+                ClientId(1),
+                &server,
+                None,
+                None,
+                &writer,
+                &focused_window,
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 4, // DestroyWindow
+                    data: 0,
+                    length_units: 2,
+                },
+                &body,
+                None,
+            )
+            .unwrap();
+            let s = server.lock().unwrap();
+            assert!(
+                s.resources.window(window).is_none(),
+                "window destroyed",
+            );
+            let p = s
+                .resources
+                .pixmap(pixmap)
+                .expect("composite-named pixmap retained after DestroyWindow");
+            assert_eq!(p.host_xid, Some(0xa), "host_xid retained for FreePixmap");
+        }
+
+        #[test]
+        fn reparent_window_does_not_invalidate_named_pixmaps() {
+            // COMPOSITE spec: reparent does NOT invalidate named pixmaps.
+            // Only resize / unredirect do. Regression guard so a future
+            // reparent edit doesn't accidentally drain the alias list.
+            use crate::resources::NamedCompositePixmap;
+            use yserver_protocol::x11::ReparentWindowRequest;
+            let parent_a = ResourceId(0x10_0400);
+            let parent_b = ResourceId(0x10_0401);
+            let window = ResourceId(0x10_0500);
+            let server = make_server_with_window(parent_a, Some(0xaaaa));
+            {
+                let mut s = server.lock().unwrap();
+                s.resources.create_window(
+                    ClientId(1),
+                    yserver_protocol::x11::CreateWindowRequest {
+                        window: parent_b,
+                        parent: ROOT_WINDOW,
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                        border_width: 0,
+                        depth: 24,
+                        visual: ResourceId(0),
+                        class: 0,
+                        background_pixel: None,
+                        event_mask: None,
+                        override_redirect: None,
+                    },
+                );
+                s.resources.create_window(
+                    ClientId(1),
+                    yserver_protocol::x11::CreateWindowRequest {
+                        window,
+                        parent: parent_a,
+                        x: 0,
+                        y: 0,
+                        width: 50,
+                        height: 50,
+                        border_width: 0,
+                        depth: 24,
+                        visual: ResourceId(0),
+                        class: 0,
+                        background_pixel: None,
+                        event_mask: None,
+                        override_redirect: None,
+                    },
+                );
+                let w = s.resources.window_mut(window).unwrap();
+                w.host_xid = Some(0xbbbb);
+                w.composite_named_pixmaps.push(NamedCompositePixmap {
+                    client_pixmap: ResourceId(0x10_0601),
+                    host_pixmap: 0xc,
+                    width: 50,
+                    height: 50,
+                });
+            }
+            let result = {
+                let mut s = server.lock().unwrap();
+                s.resources
+                    .reparent_window(ReparentWindowRequest {
+                        window,
+                        parent: parent_b,
+                        x: 5,
+                        y: 7,
+                    })
+                    .expect("reparent ok")
+            };
+            assert_eq!(result.new_parent, parent_b);
+            let s = server.lock().unwrap();
+            let aliases = &s.resources.window(window).unwrap().composite_named_pixmaps;
+            assert_eq!(
+                aliases.len(),
+                1,
+                "named-pixmap aliases retained across reparent"
+            );
+            assert_eq!(aliases[0].host_pixmap, 0xc);
+        }
+
+        #[test]
+        fn rapid_destroy_with_named_pixmaps_retains_all_no_panic() {
+            // Phase 3.6 Step 5 stress gate: rapid CreateWindow +
+            // NameWindowPixmap + DestroyWindow doesn't panic and every
+            // aliased Pixmap is retained for the eventual FreePixmap. With
+            // no host the host-side race surface is out of reach in a unit
+            // test — what we cover here is resource-table integrity under
+            // load, which is where the new retention path lives.
+            use super::super::handle_request;
+            use crate::resources::NamedCompositePixmap;
+            use yserver_protocol::x11::RequestHeader;
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer_local, _reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            let focused_window = Arc::new(Mutex::new(ROOT_WINDOW));
+            let n: u32 = 200;
+            for i in 0..n {
+                let window = ResourceId(0x0010_0000 | i);
+                let pixmap = ResourceId(0x0020_0000 | i);
+                {
+                    let mut s = server.lock().unwrap();
+                    s.resources.create_window(
+                        ClientId(1),
+                        CreateWindowRequest {
+                            window,
+                            parent: ROOT_WINDOW,
+                            x: 0,
+                            y: 0,
+                            width: 100,
+                            height: 100,
+                            border_width: 0,
+                            depth: 24,
+                            visual: ResourceId(0),
+                            class: 0,
+                            background_pixel: None,
+                            event_mask: None,
+                            override_redirect: None,
+                        },
+                    );
+                    if let Some(w) = s.resources.window_mut(window) {
+                        w.host_xid = Some(0xff00_0000 | i);
+                    }
+                    s.resources.create_pixmap(
+                        ClientId(1),
+                        yserver_protocol::x11::CreatePixmapRequest {
+                            pixmap,
+                            drawable: window,
+                            width: 100,
+                            height: 100,
+                            depth: 24,
+                        },
+                    );
+                    let _ = s.resources.set_pixmap_host_xid(pixmap, 0xee00_0000 | i);
+                    let w = s.resources.window_mut(window).unwrap();
+                    w.composite_named_pixmaps.push(NamedCompositePixmap {
+                        client_pixmap: pixmap,
+                        host_pixmap: 0xee00_0000 | i,
+                        width: 100,
+                        height: 100,
+                    });
+                }
+                let mut body = Vec::with_capacity(4);
+                body.extend_from_slice(&window.0.to_le_bytes());
+                handle_request(
+                    ClientId(1),
+                    &server,
+                    None,
+                    None,
+                    &writer,
+                    &focused_window,
+                    SequenceNumber(i as u16),
+                    RequestHeader {
+                        opcode: 4,
+                        data: 0,
+                        length_units: 2,
+                    },
+                    &body,
+                    None,
+                )
+                .unwrap();
+            }
+            let s = server.lock().unwrap();
+            for i in 0..n {
+                let window = ResourceId(0x0010_0000 | i);
+                let pixmap = ResourceId(0x0020_0000 | i);
+                assert!(
+                    s.resources.window(window).is_none(),
+                    "window 0x{:x} destroyed",
+                    window.0
+                );
+                let p = s
+                    .resources
+                    .pixmap(pixmap)
+                    .unwrap_or_else(|| panic!("pixmap 0x{:x} retained", pixmap.0));
+                assert_eq!(p.host_xid, Some(0xee00_0000 | i));
+            }
         }
 
         #[test]
