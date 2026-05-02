@@ -842,7 +842,14 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
   Window is `Viewable`. After interaction (e.g. switching
   desktops), it works. Race in the CreateWindow / Reparent /
   MapWindow flow that the per-CreateWindow `sync_main_connection`
-  fence doesn't fully close.
+  fence doesn't fully close. New finding (2026-05-02): popups
+  only show on the *second* desktop — if I switch back to the
+  first one popups don't work, on the second they do. The
+  desktop-switch round-trip seems to land the host into the
+  state that subsequent map operations need; the first desktop
+  never reaches that state on its own. Suggests the missing
+  setup is desktop-scoped or driven by a host-side event the
+  desktop switch produces.
 - **Settings sub-window doesn't open** after selecting the
   popup item. Likely the same race on a different code path.
 - **Cross-connection sync fence is a Phase-3.7 design smell.**
