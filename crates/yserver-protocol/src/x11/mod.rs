@@ -14,6 +14,7 @@ pub use wire::*;
 
 pub mod composite;
 pub mod damage;
+pub mod mit_shm;
 pub mod present;
 pub mod randr;
 pub mod shape;
@@ -221,6 +222,8 @@ pub struct GcChange {
     pub line_width: Option<u16>,
     pub font: Option<ResourceId>,
     pub clip_mask: Option<Option<ResourceId>>,
+    pub clip_x_origin: Option<i16>,
+    pub clip_y_origin: Option<i16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -950,6 +953,8 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
         font: values.value(14).map(ResourceId),
+        clip_x_origin: values.value(17).map(|v| v as i16),
+        clip_y_origin: values.value(18).map(|v| v as i16),
         clip_mask: values
             .value(19)
             .map(|value| (value != 0).then_some(ResourceId(value))),
@@ -3987,6 +3992,7 @@ pub mod error {
     pub const BAD_ATOM: u8 = 5;
     pub const BAD_MATCH: u8 = 8;
     pub const BAD_DRAWABLE: u8 = 9;
+    pub const BAD_ACCESS: u8 = 10;
     pub const BAD_ALLOC: u8 = 11;
     pub const BAD_GC: u8 = 13;
     pub const BAD_ID_CHOICE: u8 = 14;

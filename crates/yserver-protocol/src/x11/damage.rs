@@ -71,6 +71,61 @@ pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u
     out
 }
 
+/// Damage report level a client requested when creating the damage object.
+/// Spec values: 0 = RawRectangles, 1 = DeltaRectangles, 2 = BoundingBox,
+/// 3 = NonEmpty.
+pub mod report_level {
+    pub const RAW_RECTANGLES: u8 = 0;
+    pub const DELTA_RECTANGLES: u8 = 1;
+    pub const BOUNDING_BOX: u8 = 2;
+    pub const NON_EMPTY: u8 = 3;
+}
+
+/// Bit 7 of the `level` byte signals that more `DamageNotify` events follow
+/// inside the same Subtract cycle. Last event in a cycle has it cleared.
+pub const MORE_FLAG: u8 = 0x80;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rectangle {
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Encode a `DamageNotify` event (event type = `first_event + 0`). The
+/// `level` byte's high bit must already include the `MORE_FLAG` if more
+/// events follow this one in the current Subtract cycle.
+#[must_use]
+#[allow(clippy::too_many_arguments)] // wire encoder — fields are part of the protocol
+pub fn encode_damage_notify_event(
+    first_event: u8,
+    sequence: SequenceNumber,
+    level: u8,
+    drawable: u32,
+    damage: u32,
+    timestamp: u32,
+    area: Rectangle,
+    geometry: Rectangle,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = first_event;
+    out[1] = level;
+    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    out[4..8].copy_from_slice(&drawable.to_le_bytes());
+    out[8..12].copy_from_slice(&damage.to_le_bytes());
+    out[12..16].copy_from_slice(&timestamp.to_le_bytes());
+    out[16..18].copy_from_slice(&area.x.to_le_bytes());
+    out[18..20].copy_from_slice(&area.y.to_le_bytes());
+    out[20..22].copy_from_slice(&area.width.to_le_bytes());
+    out[22..24].copy_from_slice(&area.height.to_le_bytes());
+    out[24..26].copy_from_slice(&geometry.x.to_le_bytes());
+    out[26..28].copy_from_slice(&geometry.y.to_le_bytes());
+    out[28..30].copy_from_slice(&geometry.width.to_le_bytes());
+    out[30..32].copy_from_slice(&geometry.height.to_le_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +138,81 @@ mod tests {
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn damage_notify_event_wire_layout() {
+        let area = Rectangle {
+            x: 5,
+            y: 6,
+            width: 7,
+            height: 8,
+        };
+        let geometry = Rectangle {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
+        let evt = encode_damage_notify_event(
+            94,
+            SequenceNumber(0xabcd),
+            report_level::NON_EMPTY,
+            0xdead_beef,
+            0xcafe_babe,
+            0x12345678,
+            area,
+            geometry,
+        );
+        assert_eq!(evt[0], 94, "type = first_event");
+        assert_eq!(evt[1], report_level::NON_EMPTY);
+        assert_eq!(u16::from_le_bytes([evt[2], evt[3]]), 0xabcd);
+        assert_eq!(
+            u32::from_le_bytes(evt[4..8].try_into().unwrap()),
+            0xdead_beef
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[8..12].try_into().unwrap()),
+            0xcafe_babe
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[12..16].try_into().unwrap()),
+            0x12345678
+        );
+        assert_eq!(i16::from_le_bytes([evt[16], evt[17]]), 5);
+        assert_eq!(u16::from_le_bytes([evt[20], evt[21]]), 7);
+        assert_eq!(u16::from_le_bytes([evt[28], evt[29]]), 100);
+    }
+
+    #[test]
+    fn damage_notify_more_flag_distinguishes_intermediate_from_final() {
+        let r = Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let intermediate = encode_damage_notify_event(
+            94,
+            SequenceNumber(1),
+            report_level::DELTA_RECTANGLES | MORE_FLAG,
+            0,
+            0,
+            0,
+            r,
+            r,
+        );
+        let last = encode_damage_notify_event(
+            94,
+            SequenceNumber(1),
+            report_level::DELTA_RECTANGLES,
+            0,
+            0,
+            0,
+            r,
+            r,
+        );
+        assert_eq!(intermediate[1] & MORE_FLAG, MORE_FLAG);
+        assert_eq!(last[1] & MORE_FLAG, 0);
     }
 }

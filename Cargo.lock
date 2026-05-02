@@ -774,6 +774,7 @@ dependencies = [
 name = "yserver-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "log",
  "proptest",
  "yserver-protocol",

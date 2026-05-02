@@ -21,13 +21,15 @@ use yserver_protocol::x11::{
 use crate::{
     host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostSubwindowConfig, HostX11},
     resources::{
-        ARGB_VISUAL, GlyphSetState, HostDrawableTarget, MapState, PictureState, Pixmap,
-        ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ReparentWindowError, Window,
+        ARGB_VISUAL, GcClipState, GlyphSetState, HostDrawableTarget, MapState,
+        NamedCompositePixmap, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW,
+        ReparentWindowError, Window,
     },
     server::{
         ClientHandle, DamageObject, EventTarget, PresentEventSelection, ServerState, SyncAlarm,
         SyncCounter, XFixesRegion, fanout_event, fanout_raw_event,
     },
+    unix_fd::FdReader,
 };
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
@@ -75,6 +77,10 @@ const COMPOSITE_FIRST_ERROR: u8 = 158;
 const PRESENT_MAJOR_OPCODE: u8 = 145;
 const PRESENT_FIRST_EVENT: u8 = 95;
 const PRESENT_FIRST_ERROR: u8 = 159;
+
+const MIT_SHM_MAJOR_OPCODE: u8 = 130;
+const MIT_SHM_FIRST_EVENT: u8 = 96;
+const MIT_SHM_FIRST_ERROR: u8 = 160;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExtensionAvailability {
@@ -192,6 +198,14 @@ const EXTENSIONS: &[ExtensionMetadata] = &[
         major_opcode: PRESENT_MAJOR_OPCODE,
         first_event: PRESENT_FIRST_EVENT,
         first_error: PRESENT_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "MIT-SHM",
+        major_opcode: MIT_SHM_MAJOR_OPCODE,
+        first_event: MIT_SHM_FIRST_EVENT,
+        first_error: MIT_SHM_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
@@ -501,7 +515,7 @@ fn handle_client(
         },
     )?;
 
-    let mut reader = stream.try_clone()?;
+    let mut reader = FdReader::new(stream.try_clone()?);
     let writer = Arc::new(Mutex::new(stream));
     let focused_window = Arc::new(Mutex::new(ROOT_WINDOW));
     let last_sequence = Arc::new(AtomicU16::new(0));
@@ -553,6 +567,16 @@ fn handle_client(
             };
             sequence = sequence.next();
             last_sequence.store(sequence.0, Ordering::Relaxed);
+            // MIT-SHM AttachFd carries its file descriptor in the cmsg of
+            // the same message that delivered the request body. Pop it now
+            // so handle_request can attach it to the segment table.
+            let attached_fd = if header.opcode == MIT_SHM_MAJOR_OPCODE
+                && header.data == x11::mit_shm::ATTACH_FD
+            {
+                reader.pop_fd()
+            } else {
+                None
+            };
             handle_request(
                 client_id,
                 &server,
@@ -563,6 +587,7 @@ fn handle_client(
                 sequence,
                 header,
                 &body,
+                attached_fd,
             )?;
         }
     })();
@@ -631,6 +656,9 @@ fn handle_client(
         });
         s.present_msc
             .retain(|window, _| !dead_windows.contains(window));
+        // MIT-SHM segments: drop any owned by this client. The Drop impl on
+        // MitShmSegment unmaps and closes the FD.
+        s.mit_shm_segments.retain(|_, seg| seg.owner != client_id);
         s.randr_select_masks
             .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
         s.xkb_select_event_masks
@@ -1218,42 +1246,69 @@ fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
     }
 }
 
-/// Returns true if a RENDER ChangePicture request can be safely forwarded to the host.
+/// The two ChangePicture attribute kinds whose value is an XID and therefore
+/// needs translation between client and host atom spaces before we can
+/// forward the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangePictureAttr {
+    /// CPAlphaMap (bit 1) — value is a `Picture` XID.
+    AlphaMap,
+    /// CPClipMask (bit 6) — value is a `Pixmap` XID (or 0 for None).
+    ClipMask,
+}
+
+/// Translate any XID-valued attributes in a `ChangePicture` `values` slice.
 ///
-/// CPAlphaMap (bit 1) and CPClipMask (bit 6) are XID-valued attributes. We can only forward
-/// them when their value is 0 (None). All other attributes are scalar and always safe.
-/// `values` is the slice after the picture XID and value_mask in the request body.
-fn change_picture_safe_to_forward(value_mask: u32, values: &[u8]) -> bool {
+/// Walks the encoded values in attribute-bit order; for each attribute whose
+/// value is a non-zero XID (`CPAlphaMap` and `CPClipMask`), invokes
+/// `translate(attr, value)` to obtain the host XID. Returns a fresh `Vec<u8>`
+/// with the host XIDs substituted, or `None` if any translator returns
+/// `None` (caller drops the request) or the input is shorter than
+/// `value_mask` requires.
+///
+/// Scalar attributes and explicit `None` (zero) XID values are passed
+/// through unchanged.
+fn change_picture_translate_xids<F>(
+    value_mask: u32,
+    values: &[u8],
+    mut translate: F,
+) -> Option<Vec<u8>>
+where
+    F: FnMut(ChangePictureAttr, u32) -> Option<u32>,
+{
     const CP_ALPHA_MAP: u32 = 1 << 1;
     const CP_CLIP_MASK: u32 = 1 << 6;
-    let xid_bits = CP_ALPHA_MAP | CP_CLIP_MASK;
 
-    if value_mask & xid_bits == 0 {
-        return true;
-    }
     let nvalues = value_mask.count_ones() as usize;
     if values.len() < nvalues * 4 {
-        return false;
+        return None;
     }
+    let mut out = values[..nvalues * 4].to_vec();
     let mut idx = 0usize;
     for bit in 0..32u32 {
         if value_mask & (1 << bit) == 0 {
             continue;
         }
-        if (1 << bit) & xid_bits != 0 {
+        let attr = match 1 << bit {
+            CP_ALPHA_MAP => Some(ChangePictureAttr::AlphaMap),
+            CP_CLIP_MASK => Some(ChangePictureAttr::ClipMask),
+            _ => None,
+        };
+        if let Some(attr) = attr {
             let v = u32::from_le_bytes([
-                values[idx * 4],
-                values[idx * 4 + 1],
-                values[idx * 4 + 2],
-                values[idx * 4 + 3],
+                out[idx * 4],
+                out[idx * 4 + 1],
+                out[idx * 4 + 2],
+                out[idx * 4 + 3],
             ]);
             if v != 0 {
-                return false;
+                let host = translate(attr, v)?;
+                out[idx * 4..idx * 4 + 4].copy_from_slice(&host.to_le_bytes());
             }
         }
         idx += 1;
     }
-    true
+    Some(out)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1364,12 +1419,14 @@ fn handle_render_request(
             }
             Ok(())
         }
-        // ChangePicture (minor=5): forwarded when safe (no non-None XID attributes).
-        // CPAlphaMap=bit1 and CPClipMask=bit6 are XID attributes; we only forward them
-        // when their value is 0 (None). All other attributes are scalars and safe to forward.
-        // This is critical for CPClipMask=None (mask=0x40, value=0) which clears the clip
-        // after clipped glyph rendering — without forwarding this, stale clips persist and
-        // cause CompositeGlyphs8 to be clipped to a tiny rectangle on subsequent redraws.
+        // ChangePicture (minor=5): translate XID attributes (CPAlphaMap,
+        // CPClipMask) from client to host atom space, then forward.
+        // CPClipMask=None (mask=0x40, value=0) is critical — without
+        // forwarding, stale clips persist and cause CompositeGlyphs8 to
+        // be clipped to a tiny rectangle on subsequent redraws. CPClipMask
+        // = pixmap and CPAlphaMap = picture used to be dropped because we
+        // hadn't wired XID translation; modern Xft text rendering and
+        // shadow-text effects exercise these.
         5 => {
             if body.len() < 8 {
                 return Ok(());
@@ -1377,21 +1434,48 @@ fn handle_render_request(
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
 
-            let safe_to_forward = change_picture_safe_to_forward(value_mask, &body[8..]);
+            // Snapshot host XIDs for any pixmaps / pictures the values
+            // reference. We do this up-front under a single server lock so
+            // the translator closure stays cheap and synchronous.
+            let translated = {
+                let s = lock_server(server)?;
+                change_picture_translate_xids(value_mask, &body[8..], |attr, xid| {
+                    let resource = ResourceId(xid);
+                    match attr {
+                        ChangePictureAttr::ClipMask => {
+                            s.resources.pixmap(resource).and_then(|p| p.host_xid)
+                        }
+                        ChangePictureAttr::AlphaMap => {
+                            s.resources.picture(resource).map(|p| p.host_picture_xid)
+                        }
+                    }
+                })
+            };
+
+            let Some(translated_values) = translated else {
+                debug!(
+                    "client {} #{} RENDER::ChangePicture pic=0x{:x} mask=0x{:x} dropped (XID translation failed)",
+                    client_id.0, sequence.0, pic_id.0, value_mask,
+                );
+                return Ok(());
+            };
+
+            // Reassemble the body with the patched values slice.
+            let mut patched = Vec::with_capacity(8 + translated_values.len());
+            patched.extend_from_slice(&body[..8]);
+            patched.extend_from_slice(&translated_values);
 
             debug!(
-                "client {} #{} RENDER::ChangePicture pic=0x{:x} mask=0x{:x} forward={}",
-                client_id.0, sequence.0, pic_id.0, value_mask, safe_to_forward
+                "client {} #{} RENDER::ChangePicture pic=0x{:x} mask=0x{:x} forwarded",
+                client_id.0, sequence.0, pic_id.0, value_mask
             );
 
-            if safe_to_forward {
-                let host_pic = lock_server(server)?
-                    .resources
-                    .picture(pic_id)
-                    .map(|p| p.host_picture_xid);
-                if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
-                    let _ = h.render_change_picture(hp, body);
-                }
+            let host_pic = lock_server(server)?
+                .resources
+                .picture(pic_id)
+                .map(|p| p.host_picture_xid);
+            if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
+                let _ = h.render_change_picture(hp, &patched);
             }
             Ok(())
         }
@@ -2375,6 +2459,719 @@ fn handle_get_atom_name(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_mit_shm_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+    attached_fd: Option<std::os::fd::RawFd>,
+) -> io::Result<()> {
+    use yserver_protocol::x11::mit_shm as shm;
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+    debug!(
+        "client {} #{} MIT-SHM dispatch minor={minor} body_len={}",
+        client_id.0,
+        sequence.0,
+        body.len()
+    );
+
+    match minor {
+        shm::QUERY_VERSION => {
+            // We do not implement live shared pixmaps (Option A in the design).
+            // Tell clients explicitly so toolkits fall back to MIT-SHM PutImage
+            // for repeated uploads instead of relying on shared-pixmap liveness.
+            debug!(
+                "client {} #{} MIT-SHM::QueryVersion -> {}.{} shared_pixmaps=false",
+                client_id.0,
+                sequence.0,
+                shm::MAJOR_VERSION,
+                shm::MINOR_VERSION
+            );
+            let reply = shm::encode_query_version_reply(sequence, false);
+            lock_writer()?.write_all(&reply)
+        }
+        shm::ATTACH => {
+            let Some(req) = shm::parse_attach(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            match crate::server::MitShmSegment::from_shmid(client_id, req.shmid, req.read_only) {
+                Ok(segment) => {
+                    let mut s = lock_server(server)?;
+                    s.mit_shm_segments.insert(req.shmseg, segment);
+                    debug!(
+                        "client {} #{} MIT-SHM::Attach shmseg=0x{:x} shmid=0x{:x} read_only={}",
+                        client_id.0, sequence.0, req.shmseg, req.shmid, req.read_only
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} MIT-SHM::Attach failed: {err}",
+                        client_id.0, sequence.0
+                    );
+                    emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.shmseg,
+                        MIT_SHM_MAJOR_OPCODE,
+                    )
+                }
+            }
+        }
+        shm::ATTACH_FD => {
+            let Some(req) = shm::parse_attach_fd(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            let Some(fd) = attached_fd else {
+                debug!(
+                    "client {} #{} MIT-SHM::AttachFd shmseg=0x{:x} arrived without an FD",
+                    client_id.0, sequence.0, req.shmseg
+                );
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.shmseg,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            match crate::server::MitShmSegment::from_fd(client_id, fd, req.read_only) {
+                Ok(segment) => {
+                    let mut s = lock_server(server)?;
+                    s.mit_shm_segments.insert(req.shmseg, segment);
+                    debug!(
+                        "client {} #{} MIT-SHM::AttachFd shmseg=0x{:x} read_only={}",
+                        client_id.0, sequence.0, req.shmseg, req.read_only
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} MIT-SHM::AttachFd failed: {err}",
+                        client_id.0, sequence.0
+                    );
+                    emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.shmseg,
+                        MIT_SHM_MAJOR_OPCODE,
+                    )
+                }
+            }
+        }
+        shm::DETACH => {
+            if let Some(shmseg) = shm::parse_detach(body) {
+                lock_server(server)?.mit_shm_segments.remove(&shmseg);
+                debug!(
+                    "client {} #{} MIT-SHM::Detach shmseg=0x{:x}",
+                    client_id.0, sequence.0, shmseg
+                );
+            }
+            Ok(())
+        }
+        shm::CREATE_PIXMAP => {
+            let Some(req) = shm::parse_create_pixmap(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            handle_mit_shm_create_pixmap(client_id, server, host, writer, sequence, req)
+        }
+        shm::PUT_IMAGE => {
+            let Some(req) = shm::parse_put_image(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            handle_mit_shm_put_image(client_id, server, host, writer, sequence, req)
+        }
+        shm::GET_IMAGE => {
+            let Some(req) = shm::parse_get_image(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            handle_mit_shm_get_image(client_id, server, host, writer, sequence, req)
+        }
+        shm::CREATE_SEGMENT => {
+            let Some(req) = shm::parse_create_segment(body) else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    MIT_SHM_MAJOR_OPCODE,
+                );
+            };
+            handle_mit_shm_create_segment(client_id, server, writer, sequence, req)
+        }
+        other => {
+            debug!(
+                "client {} #{} MIT-SHM::unknown minor={other}",
+                client_id.0, sequence.0
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Handle `MIT-SHM::CreateSegment` (minor 7). The server allocates a
+/// memfd of `size` bytes and sends the descriptor back to the client
+/// via `SCM_RIGHTS` in the reply. The client then mmaps it directly,
+/// just as if it had called `AttachFd` after `memfd_create`.
+fn handle_mit_shm_create_segment(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    req: yserver_protocol::x11::mit_shm::CreateSegmentRequest,
+) -> io::Result<()> {
+    if req.size == 0 {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    // memfd_create with MFD_CLOEXEC for our own copy; the dup we send
+    // via SCM_RIGHTS is delivered without CLOEXEC so the client gets a
+    // normal fd it can mmap.
+    let fd = unsafe { libc::memfd_create(c"yserver-shm".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        debug!(
+            "client {} #{} MIT-SHM::CreateSegment memfd_create failed",
+            client_id.0, sequence.0
+        );
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_ALLOC,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    // Truncate to the requested size so mmap on either end has backing.
+    if unsafe { libc::ftruncate(fd, libc::off_t::from(req.size as i32)) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        debug!(
+            "client {} #{} MIT-SHM::CreateSegment ftruncate({}) failed: {err}",
+            client_id.0, sequence.0, req.size
+        );
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_ALLOC,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    // Dup so we have one fd for our own MitShmSegment (which mmaps it
+    // and closes on Drop) and a separate fd to send to the client.
+    let fd_for_client = unsafe { libc::dup(fd) };
+    if fd_for_client < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        debug!(
+            "client {} #{} MIT-SHM::CreateSegment dup failed: {err}",
+            client_id.0, sequence.0
+        );
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_ALLOC,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    let segment = match crate::server::MitShmSegment::from_fd(client_id, fd, req.read_only) {
+        Ok(s) => s,
+        Err(err) => {
+            unsafe { libc::close(fd_for_client) };
+            // `from_fd` already closed its `fd` on failure.
+            debug!(
+                "client {} #{} MIT-SHM::CreateSegment mmap failed: {err}",
+                client_id.0, sequence.0
+            );
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_ALLOC,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+    };
+    {
+        let mut s = lock_server(server)?;
+        s.mit_shm_segments.insert(req.shmseg, segment);
+    }
+    // Send the reply along with `fd_for_client` via SCM_RIGHTS. The
+    // kernel duplicates the fd into the client's table; we then close
+    // our copy.
+    let reply = yserver_protocol::x11::mit_shm::encode_create_segment_reply(sequence);
+    let send_res = {
+        let mut w = writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
+        crate::unix_fd::send_with_fd(&mut w, &reply, fd_for_client)
+    };
+    unsafe { libc::close(fd_for_client) };
+    debug!(
+        "client {} #{} MIT-SHM::CreateSegment shmseg=0x{:x} size={} read_only={}",
+        client_id.0, sequence.0, req.shmseg, req.size, req.read_only
+    );
+    send_res
+}
+
+fn handle_mit_shm_create_pixmap(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    req: yserver_protocol::x11::mit_shm::CreatePixmapRequest,
+) -> io::Result<()> {
+    debug!(
+        "client {} #{} MIT-SHM::CreatePixmap pid=0x{:x} drawable=0x{:x} {}x{} d{} shmseg=0x{:x}+{}",
+        client_id.0,
+        sequence.0,
+        req.pid,
+        req.drawable,
+        req.width,
+        req.height,
+        req.depth,
+        req.shmseg,
+        req.offset,
+    );
+    // Validate ownership of the new pixmap XID.
+    let (validation_failed, drawable_exists) = {
+        let s = lock_server(server)?;
+        let handle = s.clients.get(&client_id.0).expect("client registered");
+        let owned = crate::server::IdAllocator::validate_owned(
+            req.pid,
+            handle.resource_id_base,
+            handle.resource_id_mask,
+        );
+        let in_use = s.resources.any_resource_exists(ResourceId(req.pid));
+        let drawable_exists = s.resources.window(ResourceId(req.drawable)).is_some()
+            || s.resources.pixmap(ResourceId(req.drawable)).is_some();
+        (!owned || in_use, drawable_exists)
+    };
+    if validation_failed {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_ID_CHOICE,
+            req.pid,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    if !drawable_exists {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_DRAWABLE,
+            req.drawable,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    if !supported_pixmap_depth(req.depth) {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(req.depth),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    let Some(expected_len) = zpixmap_expected_len(req.width, req.height, req.depth) else {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    };
+
+    // Snapshot the segment bytes now (Option A — `shared_pixmaps=false`),
+    // create a regular host pixmap, PutImage the bytes into it, then register
+    // the local Pixmap pointing at the host xid. From here on it behaves like
+    // any other CreatePixmap.
+    let host_xid = if let Some(host) = host
+        && let Ok(mut host) = host.lock()
+    {
+        let xid = host.allocate_xid();
+        match host.create_pixmap(xid, req.depth, req.width, req.height) {
+            Ok(()) => Some(xid),
+            Err(err) => {
+                warn!(
+                    "client {} MIT-SHM::CreatePixmap host CreatePixmap failed: {err}",
+                    client_id.0
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Lift the bytes from the segment.
+    let snapshot: Vec<u8> = {
+        let s = lock_server(server)?;
+        let Some(segment) = s.mit_shm_segments.get(&req.shmseg) else {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        let bytes = segment.as_slice();
+        let start = req.offset as usize;
+        let end = start.saturating_add(expected_len);
+        if end > bytes.len() {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.offset,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+        bytes[start..end].to_vec()
+    };
+
+    if let (Some(host), Some(host_xid)) = (host, host_xid)
+        && let Ok(mut host) = host.lock()
+    {
+        // No client GC for MIT-SHM CreatePixmap snapshot — clear any
+        // leftover clip-mask before the synthetic put_image.
+        let _ = host.clear_clip_rectangles();
+        if let Err(err) =
+            host.put_image(host_xid, req.depth, req.width, req.height, 0, 0, &snapshot)
+        {
+            warn!(
+                "client {} MIT-SHM::CreatePixmap put_image failed: {err}",
+                client_id.0
+            );
+        }
+    }
+
+    // Register local pixmap aliasing the host xid. Reuse the regular
+    // CreatePixmap path's local bookkeeping.
+    {
+        let mut s = lock_server(server)?;
+        s.resources.create_pixmap(
+            client_id,
+            x11::CreatePixmapRequest {
+                depth: req.depth,
+                pixmap: ResourceId(req.pid),
+                drawable: ResourceId(req.drawable),
+                width: req.width,
+                height: req.height,
+            },
+        );
+        if let Some(xid) = host_xid {
+            let updated = s.resources.set_pixmap_host_xid(ResourceId(req.pid), xid);
+            debug_assert!(updated, "pixmap was just inserted above");
+        }
+    }
+    debug!(
+        "client {} #{} MIT-SHM::CreatePixmap pid=0x{:x} {}x{} d{} shmseg=0x{:x}+{} host_xid={:?}",
+        client_id.0,
+        sequence.0,
+        req.pid,
+        req.width,
+        req.height,
+        req.depth,
+        req.shmseg,
+        req.offset,
+        host_xid
+    );
+    Ok(())
+}
+
+fn handle_mit_shm_put_image(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    req: yserver_protocol::x11::mit_shm::PutImageRequest,
+) -> io::Result<()> {
+    debug!(
+        "client {} #{} MIT-SHM::PutImage entry drawable=0x{:x} shmseg=0x{:x} offset={} {}x{} d{} fmt={}",
+        client_id.0,
+        sequence.0,
+        req.drawable,
+        req.shmseg,
+        req.offset,
+        req.src_width,
+        req.src_height,
+        req.depth,
+        req.format,
+    );
+    let target = {
+        let s = lock_server(server)?;
+        s.resources.host_drawable_target(ResourceId(req.drawable))
+    };
+    let Some(target) = target else {
+        debug!(
+            "client {} #{} MIT-SHM::PutImage drawable=0x{:x} no host backing",
+            client_id.0, sequence.0, req.drawable
+        );
+        return Ok(());
+    };
+    let Some(stride_bytes) = zpixmap_expected_len(req.src_width, req.src_height, req.depth) else {
+        debug!(
+            "client {} #{} MIT-SHM::PutImage drawable=0x{:x} unsupported geometry/depth: {}x{} d{}",
+            client_id.0, sequence.0, req.drawable, req.src_width, req.src_height, req.depth
+        );
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.shmseg,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    };
+
+    // Pull the requested rectangle out of the segment.
+    let snapshot: Vec<u8> = {
+        let s = lock_server(server)?;
+        let Some(segment) = s.mit_shm_segments.get(&req.shmseg) else {
+            debug!(
+                "client {} #{} MIT-SHM::PutImage shmseg=0x{:x} not attached",
+                client_id.0, sequence.0, req.shmseg
+            );
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        let bytes = segment.as_slice();
+        let start = req.offset as usize;
+        let end = start.saturating_add(stride_bytes);
+        if end > bytes.len() {
+            debug!(
+                "client {} #{} MIT-SHM::PutImage offset+stride out of range: {}+{} > {}",
+                client_id.0,
+                sequence.0,
+                start,
+                stride_bytes,
+                bytes.len()
+            );
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.offset,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+        bytes[start..end].to_vec()
+    };
+
+    if let Some(host) = host
+        && let Ok(mut host) = host.lock()
+    {
+        // MIT-SHM PutImage doesn't carry a client GC; reset host clip so
+        // a clip-mask left over from an unrelated draw (e.g. wmaker
+        // close-button symbol) doesn't restrict the image upload.
+        host.clear_clip_rectangles()?;
+        host.put_image(
+            target.host_xid(),
+            req.depth,
+            req.src_width,
+            req.src_height,
+            translate_i16(req.dst_x, target.x_offset()),
+            translate_i16(req.dst_y, target.y_offset()),
+            &snapshot,
+        )?;
+    }
+    accumulate_damage(
+        server,
+        ResourceId(req.drawable),
+        req.dst_x,
+        req.dst_y,
+        req.src_width,
+        req.src_height,
+    );
+    debug!(
+        "client {} #{} MIT-SHM::PutImage drawable=0x{:x} {}x{} d{}",
+        client_id.0, sequence.0, req.drawable, req.src_width, req.src_height, req.depth
+    );
+    Ok(())
+}
+
+fn handle_mit_shm_get_image(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    req: yserver_protocol::x11::mit_shm::GetImageRequest,
+) -> io::Result<()> {
+    use yserver_protocol::x11::mit_shm as shm;
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+    // Validate write access to the segment.
+    {
+        let s = lock_server(server)?;
+        let Some(segment) = s.mit_shm_segments.get(&req.shmseg) else {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        if segment.read_only {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_ACCESS,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+    }
+    // Pull the bytes from the host.
+    let host_bytes = if let Some(host) = host
+        && let Ok(mut host) = host.lock()
+    {
+        let target = {
+            let s = lock_server(server)?;
+            s.resources.host_drawable_target(ResourceId(req.drawable))
+        };
+        let Some(target) = target else {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_DRAWABLE,
+                req.drawable,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        host.get_image(
+            target.host_xid(),
+            req.format,
+            req.x.saturating_add(target.x_offset()),
+            req.y.saturating_add(target.y_offset()),
+            req.width,
+            req.height,
+            req.plane_mask,
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let Some(host_reply_bytes) = host_bytes else {
+        return emit_x11_error(
+            writer,
+            sequence,
+            x11::error::BAD_DRAWABLE,
+            req.drawable,
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    };
+    // Host reply layout: 32-byte fixed header + pixel data. Strip the header.
+    let pixel_data: Vec<u8> = host_reply_bytes.get(32..).unwrap_or(&[]).to_vec();
+    // Write into the segment.
+    {
+        let mut s = lock_server(server)?;
+        let Some(segment) = s.mit_shm_segments.get_mut(&req.shmseg) else {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        let Some(buf) = segment.as_mut_slice() else {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_ACCESS,
+                req.shmseg,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        };
+        let start = req.offset as usize;
+        let end = start.saturating_add(pixel_data.len());
+        if end > buf.len() {
+            return emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                req.offset,
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
+        buf[start..end].copy_from_slice(&pixel_data);
+    }
+    // Reply with the visual + size.
+    let depth = host_reply_bytes.first().copied().unwrap_or(24);
+    let visual = ROOT_VISUAL.0;
+    #[allow(clippy::cast_possible_truncation)]
+    let size = pixel_data.len() as u32;
+    let reply = shm::encode_get_image_reply(sequence, depth, visual, size);
+    lock_writer()?.write_all(&reply)?;
+    debug!(
+        "client {} #{} MIT-SHM::GetImage drawable=0x{:x} -> {} bytes",
+        client_id.0, sequence.0, req.drawable, size
+    );
+    Ok(())
+}
+
 fn handle_xfixes_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
@@ -3277,6 +4074,197 @@ fn handle_sync_request(
     }
 }
 
+/// Mark `(x, y, w, h)` of `drawable` as damaged. For every `DamageObject`
+/// attached to that drawable (level ≥ 1) emits a `DamageNotify` to the
+/// owning client at most once per Subtract cycle, then unions the rect
+/// into the damage region.
+///
+/// Per the Phase 3.5 design, level 0 (RawRectangles, fire-per-op) is
+/// deferred; we fire at most one event per cycle for levels 1, 2, and 3.
+/// Subtract resets the per-object `pending_notify_fired` flag.
+pub fn accumulate_damage(
+    server: &Arc<Mutex<ServerState>>,
+    drawable: ResourceId,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    // Snapshot per-target writers + identity tuples so we can fanout outside
+    // the server lock.
+    struct Notification {
+        writer: Arc<Mutex<UnixStream>>,
+        last_sequence: Arc<std::sync::atomic::AtomicU16>,
+        damage_id: u32,
+        level: u8,
+        drawable: u32,
+        geometry: yserver_protocol::x11::damage::Rectangle,
+    }
+    let (timestamp, notifications): (u32, Vec<Notification>) = match server.lock() {
+        Ok(mut s) => {
+            let timestamp = s.timestamp_now();
+            let geom_full = drawable_full_rect(&s, drawable);
+            let geom_rect = yserver_protocol::x11::damage::Rectangle {
+                x: 0,
+                y: 0,
+                width: geom_full.width,
+                height: geom_full.height,
+            };
+            let mut out = Vec::new();
+            // Walk damage_objects: snapshot client writer for those that
+            // need to fire and weren't already fired this cycle.
+            let damage_ids: Vec<u32> = s
+                .damage_objects
+                .iter()
+                .filter(|(_, dmg)| dmg.drawable == drawable)
+                .map(|(id, _)| *id)
+                .collect();
+            for damage_id in damage_ids {
+                let (level, fired, owner) = {
+                    let dmg = s.damage_objects.get(&damage_id).expect("just enumerated");
+                    (dmg.level, dmg.pending_notify_fired, dmg.owner)
+                };
+                // OR the rect into the region. (Stored unconditionally so
+                // GetRectangles / Subtract observe accurate state.)
+                let rect = yserver_protocol::x11::xfixes::RegionRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                if let Some(d) = s.damage_objects.get_mut(&damage_id) {
+                    d.rects.push(rect);
+                }
+                if !fired && let Some(client) = s.clients.get(&owner.0) {
+                    out.push(Notification {
+                        writer: client.writer.clone(),
+                        last_sequence: client.last_sequence.clone(),
+                        damage_id,
+                        level,
+                        drawable: drawable.0,
+                        geometry: geom_rect,
+                    });
+                    if let Some(d) = s.damage_objects.get_mut(&damage_id) {
+                        d.pending_notify_fired = true;
+                    }
+                }
+            }
+            (timestamp, out)
+        }
+        Err(_) => return,
+    };
+
+    for n in notifications {
+        let seq = yserver_protocol::x11::SequenceNumber(
+            n.last_sequence.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let area = yserver_protocol::x11::damage::Rectangle {
+            x,
+            y,
+            width,
+            height,
+        };
+        let evt = yserver_protocol::x11::damage::encode_damage_notify_event(
+            DAMAGE_FIRST_EVENT,
+            seq,
+            n.level,
+            n.drawable,
+            n.damage_id,
+            timestamp,
+            area,
+            n.geometry,
+        );
+        if let Ok(mut w) = n.writer.lock() {
+            let _ = w.write_all(&evt);
+        }
+    }
+}
+
+/// Apply the GC's effective clip-state to the host shared GC before
+/// issuing a draw. Translates the clip's origin into top-level
+/// coordinates by `(x_offset, y_offset)`. Replaces the previous
+/// `set_clip_rectangles(clip, ...)` call so we also honour
+/// `ChangeGC(clip_mask=Pixmap)` (used by wmaker for window-decoration
+/// symbols) — without this, depth-1 clip-mask draws fill the entire
+/// rect with the foreground color and the X/dot symbols vanish.
+fn apply_gc_clip(
+    host: &mut HostX11,
+    state: &GcClipState,
+    x_offset: i16,
+    y_offset: i16,
+) -> io::Result<()> {
+    match state {
+        GcClipState::Rectangles(c) => host.set_clip_rectangles(Some(c.clone()), x_offset, y_offset),
+        GcClipState::Pixmap {
+            host_pixmap,
+            clip_x_origin,
+            clip_y_origin,
+        } => host.set_clip_pixmap(
+            *host_pixmap,
+            *clip_x_origin,
+            *clip_y_origin,
+            x_offset,
+            y_offset,
+        ),
+        GcClipState::None => host.clear_clip_rectangles(),
+    }
+}
+
+/// Free every `Composite::NameWindowPixmap` alias on `window`, clearing
+/// the bookkeeping list and `FreePixmap`'ing each host alias. Per the
+/// COMPOSITE spec, a resize or destroy invalidates *all* previously
+/// named pixmaps on the window simultaneously.
+pub fn invalidate_composite_named_pixmaps(
+    server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
+    window: ResourceId,
+) {
+    let aliases: Vec<NamedCompositePixmap> = match server.lock() {
+        Ok(mut s) => match s.resources.window_mut(window) {
+            Some(w) => std::mem::take(&mut w.composite_named_pixmaps),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if aliases.is_empty() {
+        return;
+    }
+    // Drop the local Pixmap resources so subsequent client refs return
+    // BadPixmap, matching real X11 behaviour after the alias dies.
+    if let Ok(mut s) = server.lock() {
+        for a in &aliases {
+            let _ = s.resources.free_pixmap(a.client_pixmap);
+        }
+    }
+    // Free host pixmaps. Errors are best-effort — if the host died
+    // we'll lose the alias on next reconnect anyway.
+    if let Some(host_arc) = host
+        && let Ok(mut h) = host_arc.lock()
+    {
+        for a in &aliases {
+            let _ = h.free_pixmap(a.host_pixmap);
+        }
+    }
+}
+
+/// Convenience for drawing ops where computing an exact bounding box is
+/// fiddly (`PolyLine`, `PolyArc`, `FillPoly`, text rendering, …). We
+/// damage the whole drawable rather than guess at bounds. Conservative
+/// but correct: damage consumers may repaint slightly more, never less.
+pub fn accumulate_damage_full(server: &Arc<Mutex<ServerState>>, drawable: ResourceId) {
+    let (width, height) = match server.lock() {
+        Ok(s) => {
+            let r = drawable_full_rect(&s, drawable);
+            (r.width, r.height)
+        }
+        Err(_) => return,
+    };
+    accumulate_damage(server, drawable, 0, 0, width, height);
+}
+
 fn drawable_full_rect(server: &ServerState, drawable: ResourceId) -> x11xfixes::RegionRect {
     if let Some(window) = server.resources.window(drawable) {
         return x11xfixes::RegionRect {
@@ -3342,6 +4330,7 @@ fn handle_damage_request(
                         drawable: ResourceId(drawable),
                         level,
                         rects: Vec::new(),
+                        pending_notify_fired: false,
                     },
                 );
             }
@@ -3404,6 +4393,9 @@ fn handle_damage_request(
                 }
                 if let Some(damage) = s.damage_objects.get_mut(&damage_id) {
                     damage.rects.clear();
+                    // Subtract closes the current cycle; the next damaging op
+                    // is allowed to fire DamageNotify again.
+                    damage.pending_notify_fired = false;
                 }
             }
             debug!("client {} #{} DAMAGE::Subtract", client_id.0, sequence.0);
@@ -3422,6 +4414,7 @@ fn handle_damage_request(
 fn handle_composite_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
+    host: Option<&Arc<Mutex<HostX11>>>,
     writer: &Arc<Mutex<UnixStream>>,
     sequence: SequenceNumber,
     minor: u8,
@@ -3489,18 +4482,143 @@ fn handle_composite_request(
             Ok(())
         }
         x11composite::NAME_WINDOW_PIXMAP => {
-            let window = x11composite::parse_u32_pair(body).map_or(0, |(window, _pixmap)| window);
+            let Some((window_raw, pixmap_raw)) = x11composite::parse_u32_pair(body) else {
+                return Ok(());
+            };
+            let window = ResourceId(window_raw);
+            let pixmap = ResourceId(pixmap_raw);
+
+            // Snapshot what we need from the server: host xid, geometry,
+            // depth, and whether *some* client redirected this window
+            // (or its parent via SUBWINDOWS).
+            let snapshot = {
+                let s = lock_server(server)?;
+                s.resources.window(window).map(|w| {
+                    let parent_redirected = s
+                        .composite_redirects
+                        .keys()
+                        .any(|(rwid, sub)| *sub && *rwid == w.parent);
+                    let self_redirected = s.composite_redirects.contains_key(&(window, false));
+                    (
+                        w.host_xid,
+                        w.width,
+                        w.height,
+                        w.depth,
+                        parent_redirected || self_redirected,
+                    )
+                })
+            };
+            let Some((host_xid, w_width, w_height, w_depth, redirected)) = snapshot else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window_raw,
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            };
+
+            // Spec: NameWindowPixmap is only valid on a redirected window.
+            if !redirected {
+                debug!(
+                    "client {} #{} COMPOSITE::NameWindowPixmap -> BadMatch (window not redirected)",
+                    client_id.0, sequence.0
+                );
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    window_raw,
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            }
+
+            // Without a host or without host COMPOSITE, no backing store
+            // exists to alias. Per design, return BadAlloc rather than
+            // fake the pixmap (a window-as-pixmap alias breaks downstream
+            // pixmap-only requests).
+            let Some(host_arc) = host else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    pixmap_raw,
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            };
+            let Some(host_window_xid) = host_xid else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    pixmap_raw,
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            };
+
+            let host_pixmap_xid = {
+                let Ok(mut h) = host_arc.lock() else {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        pixmap_raw,
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
+                };
+                if h.composite_opcode().is_none() {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        pixmap_raw,
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
+                }
+                let host_pixmap_xid = h.allocate_xid();
+                if h.name_window_pixmap(host_window_xid, host_pixmap_xid)
+                    .is_err()
+                {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        pixmap_raw,
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
+                }
+                host_pixmap_xid
+            };
+
+            // Register the local Pixmap resource and link it to the host
+            // alias. Future CopyArea/etc. on this xid will use host_xid.
+            {
+                let mut s = lock_server(server)?;
+                s.resources.create_pixmap(
+                    client_id,
+                    x11::CreatePixmapRequest {
+                        pixmap,
+                        drawable: window,
+                        width: w_width,
+                        height: w_height,
+                        depth: w_depth,
+                    },
+                );
+                let _ = s.resources.set_pixmap_host_xid(pixmap, host_pixmap_xid);
+                if let Some(w) = s.resources.window_mut(window) {
+                    w.composite_named_pixmaps.push(NamedCompositePixmap {
+                        client_pixmap: pixmap,
+                        host_pixmap: host_pixmap_xid,
+                        width: w_width,
+                        height: w_height,
+                    });
+                }
+            }
             debug!(
-                "client {} #{} COMPOSITE::NameWindowPixmap -> BadMatch",
-                client_id.0, sequence.0
+                "client {} #{} COMPOSITE::NameWindowPixmap window=0x{:x} pixmap=0x{:x} (host pixmap=0x{:x})",
+                client_id.0, sequence.0, window_raw, pixmap_raw, host_pixmap_xid
             );
-            emit_x11_error(
-                writer,
-                sequence,
-                x11::error::BAD_MATCH,
-                window,
-                COMPOSITE_MAJOR_OPCODE,
-            )
+            Ok(())
         }
         x11composite::GET_OVERLAY_WINDOW => {
             let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
@@ -3736,6 +4854,7 @@ fn handle_request(
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
+    attached_fd: Option<std::os::fd::RawFd>,
 ) -> io::Result<()> {
     let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
         writer
@@ -3962,13 +5081,17 @@ fn handle_request(
         }
         4 => {
             if let Some(window) = x11::free_resource_id(body) {
-                let (pending, bg_pixmap_xids) = {
+                let (pending, bg_pixmap_xids, composite_aliases) = {
                     let mut s = lock_server(server)?;
                     let mut order = Vec::new();
                     collect_destroy_order(&s.resources, window, &mut order);
                     let bg = s.resources.collect_bg_pixmap_host_xids(window);
+                    let mut composite_aliases: Vec<NamedCompositePixmap> = Vec::new();
                     let mut pending: Vec<PendingDestroy> = Vec::new();
                     for w in &order {
+                        if let Some(win) = s.resources.window_mut(*w) {
+                            composite_aliases.append(&mut win.composite_named_pixmaps);
+                        }
                         let (parent, was_mapped, host_xid) =
                             s.resources
                                 .window(*w)
@@ -3990,9 +5113,12 @@ fn handle_request(
                             on_parent,
                         });
                     }
+                    for a in &composite_aliases {
+                        let _ = s.resources.free_pixmap(a.client_pixmap);
+                    }
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
-                    (pending, bg)
+                    (pending, bg, composite_aliases)
                 };
                 if !bg_pixmap_xids.is_empty()
                     && let Some(host) = host
@@ -4000,6 +5126,14 @@ fn handle_request(
                 {
                     for xid in &bg_pixmap_xids {
                         let _ = h.free_pixmap(*xid);
+                    }
+                }
+                if !composite_aliases.is_empty()
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    for a in &composite_aliases {
+                        let _ = h.free_pixmap(a.host_pixmap);
                     }
                 }
                 for pending in pending {
@@ -4025,12 +5159,16 @@ fn handle_request(
                 let kids: Vec<ResourceId> =
                     lock_server(server)?.resources.children(parent).to_vec();
                 for k in kids {
-                    let pending = {
+                    let (pending, composite_aliases) = {
                         let mut s = lock_server(server)?;
                         let mut order = Vec::new();
                         collect_destroy_order(&s.resources, k, &mut order);
+                        let mut composite_aliases: Vec<NamedCompositePixmap> = Vec::new();
                         let mut pending: Vec<PendingDestroy> = Vec::new();
                         for w in &order {
+                            if let Some(win) = s.resources.window_mut(*w) {
+                                composite_aliases.append(&mut win.composite_named_pixmaps);
+                            }
                             let (kparent, was_mapped, host_xid) =
                                 s.resources
                                     .window(*w)
@@ -4052,10 +5190,21 @@ fn handle_request(
                                 on_parent,
                             });
                         }
+                        for a in &composite_aliases {
+                            let _ = s.resources.free_pixmap(a.client_pixmap);
+                        }
                         let _ = s.resources.destroy_window(k);
                         s.drop_window_subscriptions(&order);
-                        pending
+                        (pending, composite_aliases)
                     };
+                    if !composite_aliases.is_empty()
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        for a in &composite_aliases {
+                            let _ = h.free_pixmap(a.host_pixmap);
+                        }
+                    }
                     for entry in pending {
                         if let Some(xid) = entry.host_xid {
                             if let Some(host) = host
@@ -4601,9 +5750,16 @@ fn handle_request(
                                 );
                             },
                         );
-                        let grew = old_size.map_or(false, |(ow, oh)| {
-                            geometry.width > ow || geometry.height > oh
-                        });
+                        // COMPOSITE: a resize invalidates every alias on this
+                        // window in one shot. The compositor must re-issue
+                        // NameWindowPixmap after the resize.
+                        let resized = old_size
+                            .is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
+                        if resized {
+                            invalidate_composite_named_pixmaps(server, host, window_id);
+                        }
+                        let grew = old_size
+                            .is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
                         if grew {
                             crate::server::emit_window_event(
                                 server,
@@ -5808,6 +6964,16 @@ fn handle_request(
                             )?;
                         }
                     }
+                    if width != 0 && height != 0 {
+                        accumulate_damage(
+                            server,
+                            request.window,
+                            request.x,
+                            request.y,
+                            width,
+                            height,
+                        );
+                    }
                 }
             }
             log_void(client_id, sequence, "ClearArea")
@@ -5826,7 +6992,7 @@ fn handle_request(
                             || s.resources.pixmap(request.src).is_some(),
                         s.resources.window(request.dst).is_some()
                             || s.resources.pixmap(request.dst).is_some(),
-                        s.resources.gc_clip_rectangles(request.gc),
+                        s.resources.gc_clip_state(request.gc),
                         s.resources.host_drawable_target(request.src),
                         s.resources.host_drawable_target(request.dst),
                     )
@@ -5853,31 +7019,42 @@ fn handle_request(
                     );
                 }
                 // src/dst exist but have no host backing yet — silently drop
-                if let (Some(src), Some(dst)) = (src, dst) {
-                    if src.depth() != dst.depth() {
-                        return emit_x11_error(
-                            writer,
-                            sequence,
-                            x11::error::BAD_MATCH,
-                            request.dst.0,
-                            62,
-                        );
-                    }
-                    if let Some(host) = host
-                        && let Ok(mut host) = host.lock()
-                    {
-                        host.set_clip_rectangles(clip, dst.x_offset(), dst.y_offset())?;
-                        host.copy_area(
-                            src.host_xid(),
-                            dst.host_xid(),
-                            translate_i16(request.src_x, src.x_offset()),
-                            translate_i16(request.src_y, src.y_offset()),
-                            translate_i16(request.dst_x, dst.x_offset()),
-                            translate_i16(request.dst_y, dst.y_offset()),
+                match (src.as_ref(), dst.as_ref()) {
+                    (Some(src), Some(dst)) => {
+                        if src.depth() != dst.depth() {
+                            return emit_x11_error(
+                                writer,
+                                sequence,
+                                x11::error::BAD_MATCH,
+                                request.dst.0,
+                                62,
+                            );
+                        }
+                        if let Some(host) = host
+                            && let Ok(mut host) = host.lock()
+                        {
+                            apply_gc_clip(&mut host, &clip, dst.x_offset(), dst.y_offset())?;
+                            host.copy_area(
+                                src.host_xid(),
+                                dst.host_xid(),
+                                translate_i16(request.src_x, src.x_offset()),
+                                translate_i16(request.src_y, src.y_offset()),
+                                translate_i16(request.dst_x, dst.x_offset()),
+                                translate_i16(request.dst_y, dst.y_offset()),
+                                request.width,
+                                request.height,
+                            )?;
+                        }
+                        accumulate_damage(
+                            server,
+                            request.dst,
+                            request.dst_x,
+                            request.dst_y,
                             request.width,
                             request.height,
-                        )?;
+                        );
                     }
+                    _ => {}
                 }
             }
             log_void(client_id, sequence, "CopyArea")
@@ -5900,7 +7077,7 @@ fn handle_request(
                         let s = lock_server(server)?;
                         (
                             s.resources.gc(gc).is_some(),
-                            s.resources.gc_clip_rectangles(gc),
+                            s.resources.gc_clip_state(gc),
                             s.resources.host_drawable_target(src),
                             s.resources.host_drawable_target(dst),
                         )
@@ -5912,7 +7089,7 @@ fn handle_request(
                         && let Some(host_arc) = host
                         && let Ok(mut hh) = host_arc.lock()
                     {
-                        hh.set_clip_rectangles(clip, dstt.x_offset(), dstt.y_offset())?;
+                        apply_gc_clip(&mut hh, &clip, dstt.x_offset(), dstt.y_offset())?;
                         hh.copy_plane(
                             srct.host_xid(),
                             dstt.host_xid(),
@@ -5925,6 +7102,7 @@ fn handle_request(
                             plane,
                         )?;
                     }
+                    accumulate_damage(server, dst, dx, dy, w, h);
                 }
             }
             log_void(client_id, sequence, "CopyPlane")
@@ -5938,7 +7116,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -5946,7 +7124,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated = translated_points(
                         points,
                         header.data,
@@ -5955,6 +7133,7 @@ fn handle_request(
                     );
                     host.poly_point(target.host_xid(), foreground, header.data, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyPoint")
         }
@@ -5966,7 +7145,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -5974,7 +7153,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated = translated_points(
                         points,
                         header.data,
@@ -5983,6 +7162,7 @@ fn handle_request(
                     );
                     host.poly_line(target.host_xid(), foreground, header.data, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyLine")
         }
@@ -5994,7 +7174,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6002,11 +7182,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_segments(segments, target.x_offset(), target.y_offset());
                     host.poly_segment(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolySegment")
         }
@@ -6018,7 +7199,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6026,11 +7207,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_records(rectangles, 8, target.x_offset(), target.y_offset());
                     host.poly_rectangle(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyRectangle")
         }
@@ -6042,7 +7224,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6050,11 +7232,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_records(arcs, 12, target.x_offset(), target.y_offset());
                     host.poly_arc(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyArc")
         }
@@ -6068,7 +7251,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6076,11 +7259,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_points(points, coord_mode, target.x_offset(), target.y_offset());
                     host.fill_poly(target.host_xid(), foreground, coord_mode, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "FillPoly")
         }
@@ -6092,7 +7276,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6100,11 +7284,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_records(rectangles, 8, target.x_offset(), target.y_offset());
                     host.poly_fill_rectangle(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyFillRectangle")
         }
@@ -6116,7 +7301,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6124,11 +7309,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_records(arcs, 12, target.x_offset(), target.y_offset());
                     host.poly_fill_arc(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyFillArc")
         }
@@ -6144,7 +7330,7 @@ fn handle_request(
                         s.resources.gc(request.gc).is_some(),
                         s.resources.window(request.drawable).is_some()
                             || s.resources.pixmap(request.drawable).is_some(),
-                        s.resources.gc_clip_rectangles(request.gc),
+                        s.resources.gc_clip_state(request.gc),
                         s.resources.host_drawable_target(request.drawable),
                     )
                 };
@@ -6190,7 +7376,7 @@ fn handle_request(
                     if let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
-                        host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                        apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                         host.put_image(
                             target.host_xid(),
                             request.depth,
@@ -6201,6 +7387,14 @@ fn handle_request(
                             &request.data[..expected_len],
                         )?;
                     }
+                    accumulate_damage(
+                        server,
+                        request.drawable,
+                        request.dst_x,
+                        request.dst_y,
+                        request.width,
+                        request.height,
+                    );
                 }
             }
             log_void(client_id, sequence, "PutImage")
@@ -6282,7 +7476,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6290,11 +7484,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.poly_text8(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyText8")
         }
@@ -6305,7 +7500,7 @@ fn handle_request(
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
-                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.gc_clip_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -6313,11 +7508,12 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.poly_text16(target.host_xid(), foreground, &translated)?;
                 }
+                accumulate_damage_full(server, drawable);
             }
             log_void(client_id, sequence, "PolyText16")
         }
@@ -6331,7 +7527,7 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(gc),
                         s.resources.gc_background(gc),
-                        s.resources.gc_clip_rectangles(gc),
+                        s.resources.gc_clip_state(gc),
                         s.resources.host_drawable_target(ResourceId(drawable)),
                     )
                 };
@@ -6339,7 +7535,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.image_text8(
@@ -6350,6 +7546,7 @@ fn handle_request(
                         &translated,
                     )?;
                 }
+                accumulate_damage_full(server, ResourceId(drawable));
             }
             log_void(client_id, sequence, "ImageText8")
         }
@@ -6363,7 +7560,7 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(gc),
                         s.resources.gc_background(gc),
-                        s.resources.gc_clip_rectangles(gc),
+                        s.resources.gc_clip_state(gc),
                         s.resources.host_drawable_target(ResourceId(drawable)),
                     )
                 };
@@ -6371,7 +7568,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    apply_gc_clip(&mut host, &clip, target.x_offset(), target.y_offset())?;
                     let translated =
                         translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.image_text16(
@@ -6382,6 +7579,7 @@ fn handle_request(
                         &translated,
                     )?;
                 }
+                accumulate_damage_full(server, ResourceId(drawable));
             }
             log_void(client_id, sequence, "ImageText16")
         }
@@ -6695,6 +7893,7 @@ fn handle_request(
         COMPOSITE_MAJOR_OPCODE => handle_composite_request(
             client_id,
             server,
+            host,
             writer,
             sequence,
             header.data, // COMPOSITE minor opcode
@@ -6708,6 +7907,16 @@ fn handle_request(
             sequence,
             header.data, // PRESENT minor opcode
             body,
+        ),
+        MIT_SHM_MAJOR_OPCODE => handle_mit_shm_request(
+            client_id,
+            server,
+            host,
+            writer,
+            sequence,
+            header.data, // MIT-SHM minor opcode
+            body,
+            attached_fd,
         ),
         GE_MAJOR_OPCODE => {
             // Generic Event Extension: only request is GEQueryVersion (minor=0)
@@ -7042,6 +8251,11 @@ fn zpixmap_expected_len(width: u16, height: u16, depth: u8) -> Option<usize> {
         }
         8 => usize::from(width).div_ceil(4).checked_mul(4)?,
         4 => usize::from(width).div_ceil(8).checked_mul(4)?,
+        // 1 bit per pixel: width bits per row, padded to 32-bit boundary.
+        // wmaker (libwraster) uses depth-1 ZPixmap masks via MIT-SHM
+        // when compositing app icons — without this they fail with
+        // BadValue and the icon never renders.
+        1 => usize::from(width).div_ceil(32).checked_mul(4)?,
         _ => return None,
     };
     stride_bytes.checked_mul(usize::from(height))
@@ -7268,9 +8482,24 @@ mod tests {
     }
 
     #[test]
+    fn zpixmap_expected_len_depth1_24x24() {
+        // wmaker uploads 24x24 d1 alpha masks via MIT-SHM. 24 bits per
+        // row → padded to 32 bits = 4 bytes/row × 24 rows = 96 bytes.
+        assert_eq!(zpixmap_expected_len(24, 24, 1), Some(96));
+    }
+
+    #[test]
+    fn zpixmap_expected_len_depth1_padding() {
+        // 33 bits per row → padded to 64 bits = 8 bytes/row × 2 = 16
+        assert_eq!(zpixmap_expected_len(33, 2, 1), Some(16));
+    }
+
+    #[test]
     fn zpixmap_expected_len_unsupported_depth_returns_none() {
+        // 16- and 15-bit ZPixmap aren't on a real path for ynest yet.
+        // (Depth 1 is supported — see depth1 tests above.)
         assert_eq!(zpixmap_expected_len(2, 3, 16), None);
-        assert_eq!(zpixmap_expected_len(2, 3, 1), None);
+        assert_eq!(zpixmap_expected_len(2, 3, 15), None);
     }
 
     #[test]
@@ -7407,7 +8636,7 @@ mod tests {
     }
 
     mod render {
-        use super::super::change_picture_safe_to_forward;
+        use super::super::change_picture_translate_xids;
 
         // Helper to build a ChangePicture values slice with one CARD32 value.
         fn one_val(v: u32) -> [u8; 4] {
@@ -7421,62 +8650,97 @@ mod tests {
             buf
         }
 
-        // ── ChangePicture safe_to_forward logic ───────────────────────────────
+        // ── ChangePicture XID translation ──────────────────────────────────
 
         #[test]
-        fn cp_repeat_scalar_is_always_safe() {
-            // CPRepeat = bit 0 — no XID involved, always forward
-            assert!(change_picture_safe_to_forward(0x01, &one_val(1)));
+        fn translate_xids_passes_scalar_attrs_through() {
+            // CPRepeat (bit 0) only — translator must never be invoked.
+            let mut translator_called = false;
+            let out = change_picture_translate_xids(0x01, &one_val(7), |_, _| {
+                translator_called = true;
+                Some(0)
+            });
+            assert_eq!(out, Some(one_val(7).to_vec()));
+            assert!(!translator_called);
         }
 
         #[test]
-        fn cp_component_alpha_scalar_is_always_safe() {
-            // CPComponentAlpha = bit 12 — scalar BOOL, always forward
-            assert!(change_picture_safe_to_forward(1 << 12, &one_val(1)));
+        fn translate_xids_leaves_none_value_unchanged() {
+            // CPClipMask=None (value=0) — no translation needed, just forward as-is.
+            let out = change_picture_translate_xids(0x40, &one_val(0), |_, _| {
+                panic!("translator should not be called for None XID")
+            });
+            assert_eq!(out, Some(one_val(0).to_vec()));
         }
 
         #[test]
-        fn cp_clip_mask_none_is_safe() {
-            // CPClipMask=None (bit 6, value=0): clears the clip — must be forwarded.
-            // This is the key fix: without forwarding, stale clips persist and blank redraws.
-            assert!(change_picture_safe_to_forward(0x40, &one_val(0)));
+        fn translate_xids_swaps_clip_mask_pixmap_to_host() {
+            // CPClipMask = client pixmap 0x1234; translator returns host 0x4242.
+            // The patched values slice should carry 0x4242 in the same slot.
+            let out = change_picture_translate_xids(0x40, &one_val(0x1234), |attr, v| {
+                assert!(matches!(attr, super::super::ChangePictureAttr::ClipMask));
+                assert_eq!(v, 0x1234);
+                Some(0x4242)
+            });
+            assert_eq!(out, Some(one_val(0x4242).to_vec()));
         }
 
         #[test]
-        fn cp_clip_mask_pixmap_xid_is_unsafe() {
-            // CPClipMask=<pixmap> (bit 6, non-zero value): XID needs translation — skip.
-            assert!(!change_picture_safe_to_forward(0x40, &one_val(0x1234)));
+        fn translate_xids_swaps_alpha_map_picture_to_host() {
+            let out = change_picture_translate_xids(0x02, &one_val(0xdead), |attr, _| {
+                assert!(matches!(attr, super::super::ChangePictureAttr::AlphaMap));
+                Some(0xbeef)
+            });
+            assert_eq!(out, Some(one_val(0xbeef).to_vec()));
         }
 
         #[test]
-        fn cp_alpha_map_none_is_safe() {
-            // CPAlphaMap=None (bit 1, value=0): clearing alpha map is safe.
-            assert!(change_picture_safe_to_forward(0x02, &one_val(0)));
+        fn translate_xids_drops_when_translator_returns_none() {
+            // Unknown XID → drop the request rather than forwarding a stale value.
+            let out = change_picture_translate_xids(0x40, &one_val(0x9999), |_, _| None::<u32>);
+            assert_eq!(out, None);
         }
 
         #[test]
-        fn cp_alpha_map_picture_xid_is_unsafe() {
-            // CPAlphaMap=<picture> (bit 1, non-zero value): XID needs translation — skip.
-            assert!(!change_picture_safe_to_forward(0x02, &one_val(0xdead)));
+        fn translate_xids_handles_repeat_plus_clip_mask_pixmap() {
+            // CPRepeat (bit 0) + CPClipMask (bit 6): values in bit order are
+            // [repeat, clip]. Translation must hit only the clip slot.
+            let out = change_picture_translate_xids(0x41, &two_vals(1, 0x1234), |attr, _| {
+                if matches!(attr, super::super::ChangePictureAttr::ClipMask) {
+                    Some(0xbeef)
+                } else {
+                    panic!("only ClipMask should hit translator")
+                }
+            });
+            assert_eq!(out, Some(two_vals(1, 0xbeef).to_vec()));
         }
 
         #[test]
-        fn cp_repeat_and_clip_mask_none_is_safe() {
-            // CPRepeat (bit 0) + CPClipMask=None (bit 6): values in bit order: [repeat, clip]
-            // clip value is 0 (None) → safe to forward
-            assert!(change_picture_safe_to_forward(0x41, &two_vals(1, 0)));
+        fn translate_xids_handles_alpha_map_and_clip_mask_together() {
+            // CPAlphaMap (bit 1) + CPClipMask (bit 6): values in bit order:
+            // [alpha_map, clip_mask]. Both XIDs should be translated.
+            let out = change_picture_translate_xids(
+                (1 << 1) | (1 << 6),
+                &two_vals(0xa1, 0xc1),
+                |attr, v| match attr {
+                    super::super::ChangePictureAttr::AlphaMap => {
+                        assert_eq!(v, 0xa1);
+                        Some(0xa2)
+                    }
+                    super::super::ChangePictureAttr::ClipMask => {
+                        assert_eq!(v, 0xc1);
+                        Some(0xc2)
+                    }
+                },
+            );
+            assert_eq!(out, Some(two_vals(0xa2, 0xc2).to_vec()));
         }
 
         #[test]
-        fn cp_repeat_and_clip_mask_xid_is_unsafe() {
-            // CPRepeat (bit 0) + CPClipMask=pixmap (bit 6): clip value non-zero → unsafe
-            assert!(!change_picture_safe_to_forward(0x41, &two_vals(1, 0xbeef)));
-        }
-
-        #[test]
-        fn truncated_values_with_xid_bit_is_unsafe() {
-            // value_mask has CPClipMask (bit 6) but values slice is empty → unsafe
-            assert!(!change_picture_safe_to_forward(0x40, &[]));
+        fn translate_xids_returns_none_on_short_values_with_xid_bit() {
+            // value_mask has CPClipMask (bit 6) but values slice is empty.
+            let out = change_picture_translate_xids(0x40, &[], |_, _| Some(0));
+            assert_eq!(out, None);
         }
 
         // ── XIQueryPointer reply length ────────────────────────────────────────
@@ -8317,6 +9581,338 @@ mod tests {
                 "bad value = the offending atom",
             );
             assert_eq!(buf[10], 17, "major opcode for GetAtomName");
+        }
+    }
+
+    mod damage {
+        //! Auto-accumulation: when a draw op modifies a drawable that has
+        //! one or more `DamageObject`s attached, the server must fire
+        //! `DamageNotify` events to the owning clients per the level
+        //! contract. Phase 3.5 implements levels 2 (BoundingBox) and 3
+        //! (NonEmpty) as "at most one event per Subtract cycle"; level 1
+        //! (DeltaRectangles) is included via the same path for now (one
+        //! event when region transitions empty → non-empty), and level 0
+        //! (RawRectangles) is deferred.
+        use std::{
+            collections::{HashMap, HashSet},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+
+        use super::super::accumulate_damage;
+        use crate::server::{ClientHandle, DamageObject, ServerState};
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, ResourceId};
+
+        const DAMAGE_FIRST_EVENT: u8 = 94;
+
+        fn server_with_client_owning_damage(
+            damage_id: u32,
+            drawable: ResourceId,
+            level: u8,
+        ) -> (Arc<Mutex<ServerState>>, UnixStream) {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer_local, reader_remote) = UnixStream::pair().expect("socketpair");
+            let mut s = server.lock().unwrap();
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+            s.damage_objects.insert(
+                damage_id,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable,
+                    level,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                },
+            );
+            drop(s);
+            (server, reader_remote)
+        }
+
+        #[test]
+        fn first_draw_on_a_damaged_drawable_fires_damage_notify() {
+            let drawable = ResourceId(0x10_0200);
+            let (server, mut reader) = server_with_client_owning_damage(0x10_0301, drawable, 3);
+            accumulate_damage(&server, drawable, 0, 0, 32, 32);
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let mut buf = [0u8; 32];
+            reader.read_exact(&mut buf).expect("DamageNotify event");
+            assert_eq!(buf[0], DAMAGE_FIRST_EVENT, "type = first_event");
+            assert_eq!(buf[1] & 0x7F, 3, "level = NonEmpty (3)");
+            // drawable @ bytes 4..8
+            let dwbl = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            assert_eq!(dwbl, drawable.0);
+            // damage @ bytes 8..12
+            let dmg = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            assert_eq!(dmg, 0x10_0301);
+            // area.width @ bytes 20..22
+            assert_eq!(u16::from_le_bytes([buf[20], buf[21]]), 32);
+        }
+
+        #[test]
+        fn second_draw_in_same_cycle_does_not_fire_for_non_empty_level() {
+            let drawable = ResourceId(0x10_0200);
+            let (server, mut reader) = server_with_client_owning_damage(0x10_0301, drawable, 3);
+            accumulate_damage(&server, drawable, 0, 0, 32, 32);
+            accumulate_damage(&server, drawable, 0, 0, 64, 64);
+            reader.set_nonblocking(true).expect("non-blocking");
+            // Drain any first event first.
+            let mut buf = [0u8; 32];
+            reader.read_exact(&mut buf).expect("first event");
+            // Second event must not be present.
+            let mut more = [0u8; 32];
+            assert!(
+                reader.read_exact(&mut more).is_err(),
+                "no second event in same cycle"
+            );
+        }
+
+        #[test]
+        fn accumulate_does_nothing_when_drawable_does_not_match_any_damage() {
+            let damaged = ResourceId(0x10_0200);
+            let (server, mut reader) = server_with_client_owning_damage(0x10_0301, damaged, 3);
+            // Draw on a different drawable — no event should fire.
+            accumulate_damage(&server, ResourceId(0x10_0999), 0, 0, 32, 32);
+            reader.set_nonblocking(true).expect("non-blocking");
+            let mut buf = [0u8; 32];
+            assert!(
+                reader.read_exact(&mut buf).is_err(),
+                "no event for unrelated drawable",
+            );
+        }
+
+        /// After the client issues `DamageSubtract`, the cycle ends and the
+        /// next damaging op must fire `DamageNotify` again.
+        #[test]
+        fn subtract_reopens_the_cycle_for_next_damage_notify() {
+            let drawable = ResourceId(0x10_0200);
+            let damage_id = 0x10_0301;
+            let (server, mut reader) = server_with_client_owning_damage(damage_id, drawable, 3);
+            accumulate_damage(&server, drawable, 0, 0, 32, 32);
+
+            // Simulate Subtract: clear region + reset pending_notify_fired.
+            // We poke the field directly here rather than going through the
+            // wire decoder; the production code path is one line in
+            // handle_damage_request.
+            {
+                let mut s = server.lock().unwrap();
+                let dmg = s.damage_objects.get_mut(&damage_id).unwrap();
+                dmg.rects.clear();
+                dmg.pending_notify_fired = false;
+            }
+            accumulate_damage(&server, drawable, 0, 0, 64, 64);
+
+            reader.set_nonblocking(true).expect("non-blocking");
+            let mut first = [0u8; 32];
+            reader.read_exact(&mut first).expect("first event");
+            let mut second = [0u8; 32];
+            reader
+                .read_exact(&mut second)
+                .expect("second event after subtract");
+            assert_eq!(u16::from_le_bytes([second[20], second[21]]), 64);
+        }
+    }
+
+    mod composite {
+        //! NameWindowPixmap path. With a real host these would forward
+        //! `Composite::NameWindowPixmap`; in unit tests we exercise the
+        //! preconditions that don't need a host (BadMatch when not
+        //! redirected, BadAlloc when no host backing). Success-path
+        //! integration is covered by the picom manual smoke described in
+        //! the Phase 3.5 design.
+        use std::{
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex},
+        };
+
+        use super::super::handle_composite_request;
+        use crate::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::{
+            ClientId, CreateWindowRequest, ResourceId, SequenceNumber, composite as x11composite,
+            error as x11error,
+        };
+
+        fn make_server_with_window(
+            window: ResourceId,
+            host_xid: Option<u32>,
+        ) -> Arc<Mutex<ServerState>> {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let mut s = server.lock().unwrap();
+            s.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    window,
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    depth: 24,
+                    visual: ResourceId(0),
+                    class: 0,
+                    background_pixel: None,
+                    event_mask: None,
+                    override_redirect: None,
+                },
+            );
+            if let Some(xid) = host_xid
+                && let Some(w) = s.resources.window_mut(window)
+            {
+                w.host_xid = Some(xid);
+            }
+            drop(s);
+            server
+        }
+
+        fn name_window_pixmap_body(window: u32, pixmap: u32) -> Vec<u8> {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&window.to_le_bytes());
+            body.extend_from_slice(&pixmap.to_le_bytes());
+            body
+        }
+
+        fn read_error(reader: &mut UnixStream) -> [u8; 32] {
+            let mut buf = [0u8; 32];
+            reader.read_exact(&mut buf).expect("error reply");
+            assert_eq!(buf[0], 0, "expected error response, got opcode {}", buf[0]);
+            buf
+        }
+
+        #[test]
+        fn name_window_pixmap_on_unredirected_window_returns_bad_match() {
+            let window = ResourceId(0x10_0500);
+            let server = make_server_with_window(window, Some(0xdead_beef));
+            let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            handle_composite_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(1),
+                x11composite::NAME_WINDOW_PIXMAP,
+                &name_window_pixmap_body(window.0, 0x10_0501),
+            )
+            .unwrap();
+            let buf = read_error(&mut reader_remote);
+            assert_eq!(buf[1], x11error::BAD_MATCH);
+        }
+
+        #[test]
+        fn name_window_pixmap_with_no_host_returns_bad_alloc() {
+            let window = ResourceId(0x10_0500);
+            let server = make_server_with_window(window, Some(0xdead_beef));
+            // Mark redirected so we get past the BadMatch check.
+            {
+                let mut s = server.lock().unwrap();
+                s.composite_redirects.insert((window, false), 0);
+            }
+            let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            handle_composite_request(
+                ClientId(1),
+                &server,
+                None, // no host -> cannot satisfy NameWindowPixmap
+                &writer,
+                SequenceNumber(1),
+                x11composite::NAME_WINDOW_PIXMAP,
+                &name_window_pixmap_body(window.0, 0x10_0501),
+            )
+            .unwrap();
+            let buf = read_error(&mut reader_remote);
+            assert_eq!(buf[1], x11error::BAD_ALLOC);
+        }
+
+        #[test]
+        fn invalidate_drops_local_pixmaps_and_clears_window_list() {
+            use super::super::invalidate_composite_named_pixmaps;
+            use crate::resources::NamedCompositePixmap;
+            let window = ResourceId(0x10_0500);
+            let server = make_server_with_window(window, Some(0xdead_beef));
+            let p1 = ResourceId(0x10_0601);
+            let p2 = ResourceId(0x10_0602);
+            {
+                let mut s = server.lock().unwrap();
+                s.resources.create_pixmap(
+                    ClientId(1),
+                    yserver_protocol::x11::CreatePixmapRequest {
+                        pixmap: p1,
+                        drawable: window,
+                        width: 100,
+                        height: 100,
+                        depth: 24,
+                    },
+                );
+                s.resources.create_pixmap(
+                    ClientId(1),
+                    yserver_protocol::x11::CreatePixmapRequest {
+                        pixmap: p2,
+                        drawable: window,
+                        width: 100,
+                        height: 100,
+                        depth: 24,
+                    },
+                );
+                let w = s.resources.window_mut(window).unwrap();
+                w.composite_named_pixmaps.push(NamedCompositePixmap {
+                    client_pixmap: p1,
+                    host_pixmap: 0xa,
+                    width: 100,
+                    height: 100,
+                });
+                w.composite_named_pixmaps.push(NamedCompositePixmap {
+                    client_pixmap: p2,
+                    host_pixmap: 0xb,
+                    width: 100,
+                    height: 100,
+                });
+            }
+            invalidate_composite_named_pixmaps(&server, None, window);
+            let s = server.lock().unwrap();
+            assert!(s.resources.pixmap(p1).is_none(), "p1 freed locally");
+            assert!(s.resources.pixmap(p2).is_none(), "p2 freed locally");
+            assert!(
+                s.resources
+                    .window(window)
+                    .unwrap()
+                    .composite_named_pixmaps
+                    .is_empty(),
+                "window's alias list cleared",
+            );
+        }
+
+        #[test]
+        fn name_window_pixmap_on_unknown_window_returns_bad_window() {
+            let server = Arc::new(Mutex::new(ServerState::new()));
+            let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(writer_local));
+            handle_composite_request(
+                ClientId(1),
+                &server,
+                None,
+                &writer,
+                SequenceNumber(1),
+                x11composite::NAME_WINDOW_PIXMAP,
+                &name_window_pixmap_body(0x9999_9999, 0x10_0501),
+            )
+            .unwrap();
+            let buf = read_error(&mut reader_remote);
+            assert_eq!(buf[1], x11error::BAD_WINDOW);
         }
     }
 }

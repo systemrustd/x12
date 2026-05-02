@@ -198,6 +198,8 @@ pub struct ServerState {
     pub composite_redirects: HashMap<(ResourceId, bool), u8>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     pub present_msc: HashMap<ResourceId, u64>,
+    /// MIT-SHM segments — keyed by client-supplied `shmseg` ID.
+    pub mit_shm_segments: HashMap<u32, MitShmSegment>,
 }
 
 impl ServerState {
@@ -231,6 +233,7 @@ impl ServerState {
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
             present_msc: HashMap::new(),
+            mit_shm_segments: HashMap::new(),
         }
     }
 
@@ -285,6 +288,11 @@ pub struct DamageObject {
     pub drawable: ResourceId,
     pub level: u8,
     pub rects: Vec<xfixes::RegionRect>,
+    /// True when we've already emitted a `DamageNotify` for this Subtract
+    /// cycle. The "cycle" begins after `DamageSubtract` clears the
+    /// accumulated region. Levels 2 (BoundingBox) and 3 (NonEmpty) emit at
+    /// most one event per cycle; resetting this flag is the cycle boundary.
+    pub pending_notify_fired: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,6 +300,157 @@ pub struct PresentEventSelection {
     pub owner: ClientId,
     pub window: ResourceId,
     pub event_mask: u32,
+}
+
+/// A shared memory segment attached via MIT-SHM. Owns the lifetime of both
+/// the file descriptor and the kernel mapping; the `Drop` impl `munmap`s
+/// and closes the fd in the right order.
+#[derive(Debug)]
+pub struct MitShmSegment {
+    pub owner: ClientId,
+    /// Length of the memory mapping, in bytes.
+    pub size: usize,
+    /// Whether the client requested a read-only attach. We honour this on
+    /// `GetImage` (which writes back into the segment) by failing those
+    /// requests with `BadAccess`.
+    pub read_only: bool,
+    /// Pointer to the start of the mapping. Always non-null while this
+    /// `MitShmSegment` is alive.
+    addr: *mut libc::c_void,
+    /// Backing source — either an FD we close on Drop, or a SysV shmat
+    /// mapping we shmdt on Drop.
+    backing: MitShmBacking,
+}
+
+#[derive(Debug)]
+enum MitShmBacking {
+    /// `AttachFd`: file descriptor that backs `addr` via `mmap`.
+    Fd(libc::c_int),
+    /// Legacy `Attach`: SysV mapping. `addr` was returned by `shmat(2)`.
+    Sysv,
+}
+
+// Safe to send across threads: the underlying memory is independent of any
+// thread-local state, and we serialize access via `&mut ServerState`.
+unsafe impl Send for MitShmSegment {}
+unsafe impl Sync for MitShmSegment {}
+
+impl MitShmSegment {
+    /// Map an attached file descriptor. Caller must have verified the FD
+    /// references a regular file or memfd; we `fstat` to learn the size.
+    ///
+    /// On success, takes ownership of `fd` and will close it on `Drop`.
+    pub fn from_fd(owner: ClientId, fd: libc::c_int, read_only: bool) -> std::io::Result<Self> {
+        // Stat to get size.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstat(fd, &mut stat) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        if stat.st_size <= 0 {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "MIT-SHM AttachFd: zero-length segment",
+            ));
+        }
+        let size = stat.st_size as usize;
+        let prot = if read_only {
+            libc::PROT_READ
+        } else {
+            libc::PROT_READ | libc::PROT_WRITE
+        };
+        let addr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, libc::MAP_SHARED, fd, 0) };
+        if addr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        Ok(Self {
+            owner,
+            size,
+            read_only,
+            addr,
+            backing: MitShmBacking::Fd(fd),
+        })
+    }
+
+    /// Attach a SysV shared-memory segment created by the client via
+    /// `shmget(2)`. Returns an error when the kernel rejects `shmat` (most
+    /// commonly because the client and server live in different IPC
+    /// namespaces).
+    pub fn from_shmid(owner: ClientId, shmid: u32, read_only: bool) -> std::io::Result<Self> {
+        let flags = if read_only { libc::SHM_RDONLY } else { 0 };
+        // SAFETY: shmat is fine to call with arbitrary user-provided shmid;
+        // it returns (void*)-1 on failure.
+        let addr = unsafe { libc::shmat(shmid as libc::c_int, std::ptr::null(), flags) };
+        if addr == (-1_isize as *mut libc::c_void) {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Query the segment size via shmctl(IPC_STAT).
+        let mut info: libc::shmid_ds = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::shmctl(shmid as libc::c_int, libc::IPC_STAT, &raw mut info) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::shmdt(addr) };
+            return Err(err);
+        }
+        let size = info.shm_segsz as usize;
+        if size == 0 {
+            unsafe { libc::shmdt(addr) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "MIT-SHM Attach: zero-length segment",
+            ));
+        }
+        Ok(Self {
+            owner,
+            size,
+            read_only,
+            addr,
+            backing: MitShmBacking::Sysv,
+        })
+    }
+
+    /// View into the mapped memory. Lifetime is tied to `&self`, so callers
+    /// may only borrow within their own request handler.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `addr` is non-null and valid for `size` bytes for the
+        // lifetime of `self` (until Drop). Memory is shared across processes
+        // but X server semantics expect us to read the snapshot from our
+        // perspective synchronously inside a request handler.
+        unsafe { std::slice::from_raw_parts(self.addr.cast::<u8>(), self.size) }
+    }
+
+    /// Mutable view into the mapped memory. Returns `None` for read-only
+    /// segments — caller should reply `BadAccess`.
+    pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        if self.read_only {
+            return None;
+        }
+        // SAFETY: same as `as_slice`, plus the segment was mapped with
+        // `PROT_WRITE` because `read_only == false`.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.addr.cast::<u8>(), self.size) })
+    }
+}
+
+impl Drop for MitShmSegment {
+    fn drop(&mut self) {
+        unsafe {
+            match self.backing {
+                MitShmBacking::Fd(fd) => {
+                    libc::munmap(self.addr, self.size);
+                    libc::close(fd);
+                }
+                MitShmBacking::Sysv => {
+                    libc::shmdt(self.addr);
+                }
+            }
+        }
+    }
 }
 
 impl Default for SyncAlarm {

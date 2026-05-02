@@ -17,3 +17,4 @@ yserver-core = { path = "crates/yserver-core" }
 yserver-protocol = { path = "crates/yserver-protocol" }
 log = "0.4"
 env_logger = "0.11"
+libc = "0.2"

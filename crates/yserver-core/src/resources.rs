@@ -159,6 +159,7 @@ impl ResourceTable {
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
                 host_xid: None,
+                composite_named_pixmaps: Vec::new(),
             },
         );
 
@@ -204,6 +205,7 @@ impl ResourceTable {
             owner,
             properties: HashMap::new(),
             host_xid: None,
+            composite_named_pixmaps: Vec::new(),
         };
 
         self.windows
@@ -757,7 +759,10 @@ impl ResourceTable {
     }
 
     pub fn create_gc(&mut self, owner: ClientId, request: CreateGcRequest) {
-        let _unsupported_clip_mask = request.clip_mask;
+        let clip_pixmap = match request.clip_mask {
+            Some(Some(pixmap)) => Some(pixmap),
+            _ => None,
+        };
         self.gcs.insert(
             request.gc.0,
             Gc {
@@ -768,6 +773,9 @@ impl ResourceTable {
                 line_width: request.line_width.unwrap_or(0),
                 font: request.font,
                 clip_rectangles: None,
+                clip_pixmap,
+                clip_x_origin: 0,
+                clip_y_origin: 0,
                 owner,
             },
         );
@@ -782,6 +790,9 @@ impl ResourceTable {
             line_width: 0,
             font: None,
             clip_rectangles: None,
+            clip_pixmap: None,
+            clip_x_origin: 0,
+            clip_y_origin: 0,
             owner: SERVER_OWNER,
         });
         if let Some(foreground) = request.foreground {
@@ -796,8 +807,17 @@ impl ResourceTable {
         if let Some(font) = request.font {
             gc.font = Some(font);
         }
-        if request.clip_mask.is_some() {
+        if let Some(x) = request.clip_x_origin {
+            gc.clip_x_origin = x;
+        }
+        if let Some(y) = request.clip_y_origin {
+            gc.clip_y_origin = y;
+        }
+        // CPClipMask: Some(None) = clear, Some(Some(p)) = pixmap. Setting
+        // a clip-mask supersedes any prior `SetClipRectangles` per spec.
+        if let Some(mask) = request.clip_mask {
             gc.clip_rectangles = None;
+            gc.clip_pixmap = mask;
         }
     }
 
@@ -810,8 +830,13 @@ impl ResourceTable {
             line_width: 0,
             font: None,
             clip_rectangles: None,
+            clip_pixmap: None,
+            clip_x_origin: 0,
+            clip_y_origin: 0,
             owner: SERVER_OWNER,
         });
+        // SetClipRectangles supersedes any prior clip-mask pixmap.
+        gc.clip_pixmap = None;
         gc.clip_rectangles = Some(request.clip);
     }
 
@@ -867,6 +892,32 @@ impl ResourceTable {
 
     pub fn gc_clip_rectangles(&self, id: ResourceId) -> Option<ClipRectangles> {
         self.gc(id).and_then(|gc| gc.clip_rectangles.clone())
+    }
+
+    /// Return the GC's effective clip-state, resolved against the host:
+    /// either a list of rectangles, a host-pixmap clip-mask (with
+    /// origin), or `None` (no clipping). Returns `None` for an unknown
+    /// GC, or when the GC names a `clip_pixmap` whose host-side backing
+    /// is missing — both equivalent to "draw unclipped" rather than
+    /// erroring out the request.
+    pub fn gc_clip_state(&self, id: ResourceId) -> GcClipState {
+        let Some(gc) = self.gc(id) else {
+            return GcClipState::None;
+        };
+        if let Some(rects) = gc.clip_rectangles.clone() {
+            return GcClipState::Rectangles(rects);
+        }
+        if let Some(pixmap_id) = gc.clip_pixmap
+            && let Some(pixmap) = self.pixmaps.get(&pixmap_id.0)
+            && let Some(host_pixmap) = pixmap.host_xid
+        {
+            return GcClipState::Pixmap {
+                host_pixmap,
+                clip_x_origin: gc.clip_x_origin,
+                clip_y_origin: gc.clip_y_origin,
+            };
+        }
+        GcClipState::None
     }
 
     pub fn create_picture(&mut self, id: ResourceId, state: PictureState) {
@@ -1151,6 +1202,33 @@ impl ResourceTable {
     }
 }
 
+/// Effective clip-state of a GC at the moment a draw op runs. Either
+/// the GC has a `SetClipRectangles` list, a `ChangeGC(clip_mask=Pixmap)`
+/// host-mask, or no clip at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GcClipState {
+    None,
+    Rectangles(ClipRectangles),
+    Pixmap {
+        host_pixmap: u32,
+        clip_x_origin: i16,
+        clip_y_origin: i16,
+    },
+}
+
+/// One client-issued `Composite::NameWindowPixmap` alias on a window. The
+/// COMPOSITE spec allows a client to call `NameWindowPixmap` repeatedly;
+/// each call returns a distinct `Pixmap` resource pointing at the
+/// window's redirected backing store. All aliases on a window are
+/// invalidated together by a resize and freed on destroy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamedCompositePixmap {
+    pub client_pixmap: ResourceId,
+    pub host_pixmap: u32,
+    pub width: u16,
+    pub height: u16,
+}
+
 #[derive(Clone, Debug)]
 pub struct Window {
     pub id: ResourceId,
@@ -1176,6 +1254,9 @@ pub struct Window {
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
     pub host_xid: Option<u32>,
+    /// Per-window list of `Composite::NameWindowPixmap` aliases. All are
+    /// invalidated together on resize per the COMPOSITE spec.
+    pub composite_named_pixmaps: Vec<NamedCompositePixmap>,
 }
 
 impl Window {
@@ -1201,6 +1282,7 @@ impl Window {
             owner: SERVER_OWNER,
             properties: HashMap::new(),
             host_xid: None,
+            composite_named_pixmaps: Vec::new(),
         }
     }
 }
@@ -1270,6 +1352,14 @@ pub struct Gc {
     pub line_width: u16,
     pub font: Option<ResourceId>,
     pub clip_rectangles: Option<ClipRectangles>,
+    /// Pixmap-based clip-mask, set via `ChangeGC` with `CPClipMask`. When
+    /// `Some`, draws through the GC are clipped to the 1-bits of the
+    /// referenced depth-1 pixmap shifted by `(clip_x_origin,
+    /// clip_y_origin)`. wmaker uses this for window-decoration symbols
+    /// (close-button "X", miniaturize dot).
+    pub clip_pixmap: Option<ResourceId>,
+    pub clip_x_origin: i16,
+    pub clip_y_origin: i16,
     pub owner: ClientId,
 }
 
@@ -2011,6 +2101,8 @@ mod tests {
             line_width: None,
             font: None,
             clip_mask: Some(None),
+            clip_x_origin: None,
+            clip_y_origin: None,
         });
 
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_none());
