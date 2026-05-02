@@ -47,6 +47,10 @@ yserver-headless-shutdown seconds="3":
 ynest display="99":
     cargo run --bin ynest -- {{display}}
 
+# Release-build ynest with a chosen container geometry.
+ynest-release display="99" geometry="1920x1080":
+    cargo run --release --bin ynest -- {{display}} --geometry {{geometry}}
+
 # Smoke-test virtme harness: bring up Xorg + xterm in a QEMU window.
 harness-check:
     vng -r {{KERNEL}} --disable-microvm --rw \
