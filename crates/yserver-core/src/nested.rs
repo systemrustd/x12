@@ -5185,6 +5185,44 @@ fn handle_request(
                 if viewable && want_focus_check & 0x3 != 0 {
                     set_focused_window(focused_window, server, target_window)?;
                 }
+                // Phase 3.6 Step 4a: forward bg-pixel / bg-pixmap
+                // updates to the host child of any non-root window
+                // that has one. Without this, a client that sets bg
+                // via CreateWindow then later changes via
+                // ChangeWindowAttributes ends up with a stale host bg
+                // (the host auto-clears with the original colour).
+                if target_window != ROOT_WINDOW
+                    && (request.background_pixel.is_some() || request.background_pixmap.is_some())
+                    && let Some(host) = host
+                {
+                    let (host_xid, bg_pixel, bg_pixmap_host_xid) = {
+                        let s = lock_server(server)?;
+                        let w = s.resources.window(target_window);
+                        let xid = w.and_then(|w| w.host_xid);
+                        let pix = w.map(|w| w.background_pixel);
+                        let pmh = w.and_then(|w| w.background_pixmap_host_xid);
+                        (xid, pix, pmh)
+                    };
+                    if let Some(host_xid) = host_xid {
+                        // bg-pixmap takes precedence over bg-pixel; mirror
+                        // X11 CreateWindow value-list semantics. Use bit 0
+                        // (bg-pixmap) when the request set it (even
+                        // explicit `None` / 0 = no auto-clear); else use
+                        // bit 1 (bg-pixel).
+                        let mut value_mask: u32 = 0;
+                        let mut values: Vec<u32> = Vec::with_capacity(1);
+                        if request.background_pixmap.is_some() {
+                            value_mask |= 1 << 0;
+                            values.push(bg_pixmap_host_xid.unwrap_or(0));
+                        } else if request.background_pixel.is_some() {
+                            value_mask |= 1 << 1;
+                            values.push(bg_pixel.unwrap_or(0));
+                        }
+                        if let Ok(mut h) = host.lock() {
+                            let _ = h.change_subwindow_attributes(host_xid, value_mask, &values);
+                        }
+                    }
+                }
                 if let Some(cid) = cursor_id {
                     let (host_window_xid, cursor_host_xid) = {
                         let s = lock_server(server)?;
@@ -5435,32 +5473,53 @@ fn handle_request(
                     result.y,
                     result.host_xid
                 );
-                if let Some(xid) = result.host_xid {
-                    if result.new_parent == ROOT_WINDOW {
-                        // Window moved back to root: reposition its host subwindow.
-                        if let Some(host) = host
-                            && let Ok(mut h) = host.lock()
-                        {
-                            let _ = h.configure_subwindow(
-                                xid,
-                                HostSubwindowConfig {
-                                    x: Some(result.x),
-                                    y: Some(result.y),
-                                    ..HostSubwindowConfig::default()
-                                },
-                            );
-                        }
-                    } else if result.old_parent == ROOT_WINDOW {
-                        // Window moved away from root: its host subwindow is stale.
-                        // top_level_host_target will route drawing through the new top-level.
-                        if let Some(host) = host
-                            && let Ok(mut h) = host.lock()
-                        {
-                            let _ = h.destroy_subwindow(xid);
-                        }
-                        if let Some(input_handle) = input_handle {
-                            input_handle.unregister_top_level(xid);
-                        }
+                // Phase 3.6 Step 4a: forward XReparentWindow to host so
+                // its tree mirrors the local logical tree. Pre-Step-2
+                // code destroyed the host subwindow when a top-level
+                // moved away from root and recreated nothing — the
+                // walk-up `top_level_host_target` covered drawing for
+                // the now-orphaned local Window. With per-window host
+                // xids (Step 2), the host child must follow the local
+                // reparent for sub-window draws (Step 3) to land in
+                // the right host-tree position.
+                if let Some(xid) = result.host_xid
+                    && let Some(host) = host
+                {
+                    let new_host_parent = if result.new_parent == ROOT_WINDOW {
+                        host.lock().ok().map(|h| h.window_id())
+                    } else {
+                        let s = lock_server(server)?;
+                        s.resources
+                            .window(result.new_parent)
+                            .and_then(|w| w.host_xid)
+                    };
+                    if let Some(host_parent) = new_host_parent
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.reparent_subwindow(xid, host_parent, result.x, result.y);
+                    }
+                    // If the window stops being a top-level (left root),
+                    // unregister its host_xid → ResourceId mapping so
+                    // pointer/expose events on the host pump no longer
+                    // misroute. The host subwindow itself stays alive
+                    // under its new parent.
+                    if result.old_parent == ROOT_WINDOW
+                        && result.new_parent != ROOT_WINDOW
+                        && let Some(input_handle) = input_handle
+                    {
+                        input_handle.unregister_top_level(xid);
+                    }
+                    // If the window becomes a top-level (moved to root),
+                    // re-register so pointer events can find it again.
+                    if result.old_parent != ROOT_WINDOW
+                        && result.new_parent == ROOT_WINDOW
+                        && let Some(input_handle) = input_handle
+                        && let Err(err) = input_handle.register_top_level(result.window, xid)
+                    {
+                        warn!(
+                            "client {} register_top_level for 0x{:x} on reparent failed: {err}",
+                            client_id.0, result.window.0
+                        );
                     }
                 }
                 fanout_event(&on_window, |buf, seq, order| {
@@ -5907,6 +5966,7 @@ fn handle_request(
                                 y: request.y,
                                 width: request.width,
                                 height: request.height,
+                                border_width: request.border_width,
                                 sibling: sibling_host_xid,
                                 stack_mode: request.stack_mode,
                             },

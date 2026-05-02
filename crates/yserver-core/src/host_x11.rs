@@ -1311,6 +1311,10 @@ impl HostX11 {
             value_mask |= 1 << 3;
             write_u32(&mut values, u32::from(height.max(1)));
         }
+        if let Some(border_width) = config.border_width {
+            value_mask |= 1 << 4;
+            write_u32(&mut values, u32::from(border_width));
+        }
         if let Some(sibling) = config.sibling {
             value_mask |= 1 << 5;
             write_u32(&mut values, sibling);
@@ -1337,6 +1341,66 @@ impl HostX11 {
         out.extend_from_slice(&values);
         self.stream.write_all(&out)?;
         self.stream.flush()
+    }
+
+    /// Forward `XReparentWindow(host_xid, host_parent, x, y)` to the
+    /// host so the host tree stays in sync with the local logical tree.
+    /// Used by nested.rs's ReparentWindow handler whenever a window
+    /// moves between local parents and at least one of those parents
+    /// has a real host-mirrored child window. Fire-and-forget.
+    pub fn reparent_subwindow(
+        &mut self,
+        host_xid: u32,
+        host_parent: u32,
+        x: i16,
+        y: i16,
+    ) -> io::Result<()> {
+        // Wire layout: opcode(1) pad(1) length(2 = 4) window(4) parent(4)
+        //              x(2) y(2)
+        let mut out = Vec::with_capacity(16);
+        out.push(7); // ReparentWindow
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, host_parent);
+        write_i16(&mut out, x);
+        write_i16(&mut out, y);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Forward a `ChangeWindowAttributes` value-list to the host child
+    /// of a sub-window so attribute updates after CreateWindow (bg
+    /// pixel changes, cursor, etc.) take effect on the host. Caller
+    /// builds the `(value_mask, values)` pair following X11
+    /// CreateWindow semantics. Fire-and-forget; host BadValue /
+    /// BadMatch is absorbed silently.
+    pub fn change_subwindow_attributes(
+        &mut self,
+        host_xid: u32,
+        value_mask: u32,
+        values: &[u32],
+    ) -> io::Result<()> {
+        if value_mask == 0 || values.is_empty() {
+            return Ok(());
+        }
+        let length_units = 3 + u16::try_from(values.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many CWA values"))?;
+        let mut out = Vec::with_capacity(usize::from(length_units) * 4);
+        out.push(2); // ChangeWindowAttributes opcode
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, value_mask);
+        for v in values {
+            write_u32(&mut out, *v);
+        }
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.sequence = self.sequence.wrapping_add(1);
+        Ok(())
     }
 
     /// Set the host container window's background pixmap so the host
@@ -2788,6 +2852,7 @@ pub struct HostSubwindowConfig {
     pub y: Option<i16>,
     pub width: Option<u16>,
     pub height: Option<u16>,
+    pub border_width: Option<u16>,
     pub sibling: Option<u32>,
     pub stack_mode: Option<u8>,
 }
