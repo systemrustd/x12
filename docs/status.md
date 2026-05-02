@@ -682,6 +682,147 @@ and a host `PutImage` chunking fix for >256 KB images. Design doc:
   `PutImage` instead of sharing memory with the host. Revisit if
   large-image upload latency becomes a bottleneck.
 
+## Phase 3.6 — Sub-window mirroring (Xnest model) (in progress)
+
+Goal: mirror every InputOutput client window to a host X window
+parented under the client-side parent's host xid (Xnest's
+`Window.c` model), replacing the prior "top-levels host-backed,
+sub-windows virtual + draws translated by `(x_offset, y_offset)`"
+hack. Closes the long-tail of correctness gaps that the offset-
+hack created: sibling clipping is fictional, sub-window stacking
+ordered, `CopyArea` from a partially-occluded source returns
+wrong pixels, per-sub-window cursors don't work, every drawing
+handler carries the offset translation, etc.
+
+Plan: `docs/superpowers/plans/2026-05-02-phase3-6-plan.md`.
+Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
+
+### Landed
+
+- [x] **Step 1a — `restack_window` stack-mode semantics.**
+      Pre-existing bug surfaced by codex review on the plan:
+      `TopIf` / `BottomIf` / `Opposite` were treated as unconditional
+      raise / lower / push-to-top. Fixed via a `RestackAction`
+      resolver applying X11's spec-correct conditional occlusion
+      checks (mapped + bbox overlap + correct stack position).
+      +17 unit tests covering all 5 modes × {sibling, no-sibling}.
+- [x] **Step 1b — minimal visual table + CreateWindow visual /
+      colormap rule.** Added `Visual` and `Colormap` resource types,
+      seeded with root TrueColor and ARGB TrueColor visuals; ARGB
+      visual probed from host setup reply, ARGB colormap allocated
+      on host at init. CreateWindow forwarding picks `CopyFromParent`
+      when child visual matches parent and `CWColormap`+explicit
+      visual otherwise. Unknown visual on `CreateWindow` rejected
+      locally with `BadMatch` (no host roundtrip). CopyFromParent
+      fixed to inherit `parent.visual`/`parent.depth` rather than
+      always `ROOT_VISUAL` / 24.
+- [x] **Step 2 — every InputOutput window gets a host xid (dormant).**
+      `Window.host_xid` is now always Some for class != InputOnly.
+      Sub-windows get host children created with `event_mask = 0`,
+      bg-pixel forwarded; `border_pixmap_host_xid` field added,
+      `uses_synthetic_expose` flag added. The post-CreateWindow
+      `GetInputFocus` sync removed (re-introduced as a fence in
+      Step 3+4b once we found the cross-connection race). Bug
+      fixed in followup commit: the gate guarding host-xid
+      allocation was `class == InputOutput`, missing the
+      `CopyFromParent` class that wmaker/xterm/GTK pass at
+      CreateWindow time; switched to `class != InputOnly` per the
+      plan's invariant.
+- [x] **Step 4a — host XReparentWindow + sub-window CWA bg +
+      Configure border_width.** Forwarding infrastructure that
+      Step 3 needed: ReparentWindow forwarded so the host tree
+      mirrors local under WM frames, `ChangeWindowAttributes`
+      forwards bg-pixmap / bg-pixel to sub-window host children,
+      `ConfigureWindow` carries `border_width` alongside x/y/w/h.
+- [x] **Step 3 + 4b combined — per-window drawing + host-driven
+      Expose.** The plan's split between Step 3 (drawing rewire) and
+      Step 4b (Expose source switch + map + stacking) couldn't be
+      landed independently — the X11 model requires the drawing
+      route, host-side mapping, and Expose source to flip together.
+      `top_level_host_target` shortcuts to the start window's
+      host_xid + zero offsets when one exists. Sub-window host
+      children are mapped on host, registered with the input pump
+      via a new `register_subwindow` (ExposureMask only — input
+      bubbles up to the container per X11 propagation rules,
+      Xnest `Window.c:91`). `uses_synthetic_expose` flips to
+      `false` for every host-mirrored window after registration.
+      Cross-connection sync fence (`sync_main_connection`) added
+      after host CreateWindow so the pump's
+      ChangeWindowAttributes(ExposureMask) can't race the main
+      connection's CreateWindow under heavy WM activity. A leftover
+      Phase-2 line in `resources::reparent_window` that cleared
+      `host_xid` on reparent-away-from-root removed — that single
+      line was defeating the per-window drawing route under any WM
+      that reparents (i.e. all of them).
+- [x] **Per-client keyboard pump fix.** Latent bug pre-dating
+      Phase 3.6 that became user-visible only once interactive
+      testing was the norm post-mirroring: X11 ButtonPress is
+      exclusive (one client per window). The main `HostInputPump`
+      already selected `POINTER_EVENT_MASK` (which includes
+      ButtonPress) on the container; each per-client keyboard
+      pump's `select_keyboard_events` tried to also include
+      `POINTER_EVENT_MASK`, the host returned `BadAccess` for
+      the entire `ChangeWindowAttributes`, the kb pump
+      connection ended up with no mask at all, and keyboard
+      input silently never arrived at any client. Fixed by
+      having the kb pump select only `KeyPress | KeyRelease |
+      StructureNotify` — pointer events stay on the main pump's
+      connection where they belong.
+
+### Verified working
+
+- xterm under wmaker: chrome + content area + shell prompt + typing.
+- xterm without WM: full prompt rendered (was working pre-PR).
+- xterm under fvwm3: chrome renders.
+- xeyes / xclock: rendering unchanged.
+- wmaker chrome: clip + dock + appicons + xterm titlebar.
+- e16 startup: significantly more chrome renders than the Phase
+  3.4 environmental baseline — top bar, two pagers, minimap.
+- e16 popup *sometimes* opens, *sometimes* selects items (was
+  100% broken before Phase 3.6).
+
+### Phase 3.6 follow-ups
+
+- **Rendering quality under e16 popups / chrome.** Theme
+  gradients missing, popup background black instead of themed
+  gradient, root background pattern missing, colours generally
+  wrong. e16 paints gradients via many small `CopyArea` calls
+  from theme pixmaps; pixmap creation + MIT-SHM `PutImage` to
+  it + the `CopyArea` forwarding all reach the host correctly,
+  but the resulting pixels don't show. Likely candidates:
+  shared host GC state interference with per-window drawables,
+  CopyArea result being overdrawn by something on the
+  sub-window, or the destination's host-side clipping is wrong.
+  Diagnostic plan: capture an x11trace dump of e16 startup
+  under ynest vs under Xephyr (same theme), compare host-side
+  request streams side-by-side, identify the divergence.
+- **Intermittent popup mapping.** e16 sometimes opens a popup
+  whose host child is `IsUnMapped` even though the local
+  Window is `Viewable`. After interaction (e.g. switching
+  desktops), it works. Race in the CreateWindow / Reparent /
+  MapWindow flow that the per-CreateWindow `sync_main_connection`
+  fence doesn't fully close.
+- **Settings sub-window doesn't open** after selecting the
+  popup item. Likely the same race on a different code path.
+- **Step 5 — host xid + NameWindowPixmap retention.** Lock
+  down race surface that grew with sub-window mirroring; lift
+  the NameWindowPixmap-on-mirrored-sub-window block from
+  Step 2. Touched but not implemented this phase.
+- **Step 6 — cleanup.** Delete `top_level_host_target` and
+  the `(x_off, y_off)` second-return on `host_drawable_target`;
+  delete the `(x_off, y_off)` parameters on `apply_gc_clip`;
+  remove the `uses_synthetic_expose` flag (always false now
+  for InputOutput windows). Pure deletions.
+- **Cross-connection sync fence is a Phase-3.7 design smell.**
+  The pump and main connections race in several places; the
+  per-CreateWindow fence is a duct-tape fix. Folding pump and
+  main into one connection (or properly serialising via a
+  message queue) is the structural fix. Phase 3.7+ work.
+- **Per-client GC mirroring** (originally Phase 3.7). The
+  shared host GC creates whole categories of subtle bugs;
+  per-client GC removes them. Now visibly motivated by the
+  e16 rendering-quality issues above.
+
 ## Phase 4 — Accelerated clients
 
 Goal: modern GLX/EGL/Vulkan direct-rendering paths and host buffer
