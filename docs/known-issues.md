@@ -63,21 +63,36 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
-- [ ] **xeyes doesn't track cursor.** Likely regression. status.md
-      line 75 documents "xeyes now tracks cursor via real
-      `MotionNotify` events" as Phase 1 working behavior. No longer
-      true on current master. Suspect: Phase 6.3 changed event
-      routing fundamentally (host pump dissolved into the merged
-      connection's dispatcher → crossbeam channel → `HostPumpEventSink`
-      → `pointer_event_fanout`); somewhere in that chain `MotionNotify`
-      delivery to non-focused / pointer-grab-less clients was dropped.
-      Bisect candidates: `9bfa688` (dispatcher introduction),
-      `6ed3d8a` (Big Flip — pump dissolution + xid_map move).
-      Reproduce: `just ynest-wmaker-xterm`, then `DISPLAY=:99 xeyes`
-      and move the mouse over the host container. Check whether
-      ynest's dispatcher classifies event type 6 (`MotionNotify`)
-      and whether the sink fans it out to clients selecting
-      `PointerMotion` or `ButtonMotion` masks.
+- [ ] **XInput2 GenericEvents (event type 35) silently dropped by the
+      dispatcher.** Phase 6.3 regression. Affects every XI2-using
+      client: xeyes (visible symptom: doesn't track cursor), modern
+      toolkits relying on XI2 motion / scroll valuators / etc.
+
+      **Root cause:** `host_x11/mod.rs:1566-1577` in
+      `read_dispatch_message` discards `header[0] == 35` frames with
+      a comment "XInput2 lives on the per-client kb fanout below,
+      not the host pump." That fanout was dissolved in Step 4 (the
+      Big Flip), so the dispatcher's drop-on-skip path now leaks
+      every GenericEvent. Pre-Phase-6.3, the per-client kb pump's
+      separate connection received and fanned out XI2 GenericEvents
+      directly to its client.
+
+      **Fix shape:** dispatcher classifies GenericEvent (type 35) +
+      its variable-length extra payload as a new
+      `BackendEvent::HostEvent(HostEvent::Generic { ... })` carrying
+      the full bytes. Sink fans it out to whichever client selected
+      XI2 events on the relevant window (`xi2_select_masks`
+      bookkeeping in `nested.rs` already exists from Phase 3.x —
+      reuse). Either translate to a typed XI2 event variant in
+      `decode_host_event` or pass the raw 32+extra bytes through
+      and let the client-side fanout do the parsing.
+
+      Reproduction: `RUST_LOG=debug target/release/ynest 99 &;
+      DISPLAY=:99 xeyes &`; move mouse over xeyes; observe that
+      xeyes never queries position (no `QueryPointer` in log) and
+      that no XI2 GenericEvent reaches a client. xev works in the
+      same setup because xev selects core `PointerMotion` (event
+      type 6), which decode_host_event still handles.
 
 ## Drawing / rendering artifacts
 
