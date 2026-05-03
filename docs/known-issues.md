@@ -78,12 +78,6 @@ once the underlying patterns are understood.
 
 ## Drawing / rendering artifacts
 
-- [ ] **xclock seconds hand not drawn.** Pre-existing — was working
-      at some earlier point; not a Phase 6.3 regression. The minute
-      and hour hands render. Investigation: trace which RENDER /
-      core drawing op xclock uses for the seconds hand vs the others;
-      likely a clip / coord / opcode subtlety in one path that the
-      others avoid.
 - [ ] **wmaker icon-edge clamped to 800×600 with larger geometries.**
       Start ynest with e.g. `--geometry 1200x900`, run wmaker:
       icons/dock are laid out as if the right edge is at column 800.
