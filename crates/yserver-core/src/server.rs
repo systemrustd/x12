@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, randr as x11randr, shape,
     xfixes,
@@ -969,6 +969,16 @@ pub fn pointer_event_fanout(
     event: crate::host_x11::HostPointerEvent,
 ) {
     use crate::host_x11::PointerEventKind;
+    trace!(
+        "pointer_event_fanout: kind={:?} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
+        event.kind,
+        event.host_xid,
+        event.root_x,
+        event.root_y,
+        event.event_x,
+        event.event_y,
+        event.state
+    );
 
     // Translate root_x/root_y from host-screen coordinates into ynest-root
     // coordinates. The host pump reports root_x/y relative to the host server's
@@ -1179,8 +1189,17 @@ pub fn pointer_event_fanout(
         PointerEventKind::EnterNotify => 7,
         PointerEventKind::LeaveNotify => 8,
     };
+    // XI2 raw events fire alongside the device events when a client has
+    // selected XI_Raw* on the root window (xeyes uses RawMotion as a
+    // cursor-moved trigger, then calls XIQueryPointer for the position).
+    let xi2_raw_evtype: Option<u16> = match event.kind {
+        PointerEventKind::ButtonPress => Some(15),  // XI_RawButtonPress
+        PointerEventKind::ButtonRelease => Some(16), // XI_RawButtonRelease
+        PointerEventKind::MotionNotify => Some(17), // XI_RawMotion
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => None,
+    };
 
-    let (nested_id, event_x, event_y, core_targets, xi2_targets) = match state.lock() {
+    let (nested_id, event_x, event_y, core_targets, xi2_targets, xi2_raw_targets) = match state.lock() {
         Ok(g) => {
             let (target, target_x, target_y) = g
                 .resources
@@ -1196,16 +1215,65 @@ pub fn pointer_event_fanout(
                 .unwrap_or((target, target_x, target_y, Vec::new()));
 
             let mut xi2_targets = Vec::new();
+            let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
-                for c in g.clients.values() {
+                for (cid, c) in g.clients.iter() {
                     let mask = xi2_mask_for_client(c, target, top_level_id, &[2, 1, 0]);
+                    trace!(
+                        "  xi2 lookup: client={} target=0x{:x} top_level=0x{:x} mask=0x{:x} want_bit={}",
+                        cid,
+                        target.0,
+                        top_level_id.0,
+                        mask,
+                        1u32 << xi2_evtype
+                    );
                     if mask & (1 << xi2_evtype) != 0 {
                         xi2_targets.push(ServerState::event_target_for_client(c));
+                    }
+                    // XI_Raw* events are typically selected on the root
+                    // window; xi2_mask_for_client falls back through
+                    // (target, fallback) so a root-window selection on
+                    // device 0/1/2 will be found when the cursor is over
+                    // any window.
+                    if let Some(raw_evtype) = xi2_raw_evtype
+                        && mask & (1 << raw_evtype) != 0
+                    {
+                        xi2_raw_targets.push(ServerState::event_target_for_client(c));
+                    }
+                    // Also probe the root window for raw events — clients
+                    // commonly select XI_Raw* on root with deviceid=1
+                    // (XIAllDevices). The lookup above already includes
+                    // (target, fallback=top_level); add an explicit root
+                    // fallback for raw events specifically.
+                    if let Some(raw_evtype) = xi2_raw_evtype {
+                        let root_mask = xi2_mask_for_client(
+                            c,
+                            crate::resources::ROOT_WINDOW,
+                            crate::resources::ROOT_WINDOW,
+                            &[1, 0, 2],
+                        );
+                        if root_mask & (1 << raw_evtype) != 0
+                            // Avoid double-add if the per-target lookup
+                            // also found the same client via the same
+                            // selection.
+                            && !xi2_raw_targets
+                                .iter()
+                                .any(|t: &EventTarget| Arc::ptr_eq(&t.writer, &c.writer))
+                        {
+                            xi2_raw_targets.push(ServerState::event_target_for_client(c));
+                        }
                     }
                 }
             }
 
-            (nested_id, event_x, event_y, core_targets, xi2_targets)
+            (
+                nested_id,
+                event_x,
+                event_y,
+                core_targets,
+                xi2_targets,
+                xi2_raw_targets,
+            )
         }
         Err(_) => return,
     };
@@ -1293,6 +1361,29 @@ pub fn pointer_event_fanout(
                 },
             ),
         }
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(&buf);
+        }
+    }
+
+    for target in xi2_raw_targets {
+        let Some(raw_evtype) = xi2_raw_evtype else {
+            break;
+        };
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(68);
+        x11::encode_xi2_raw_event(
+            &mut buf,
+            seq,
+            137, // XI2 major opcode
+            raw_evtype,
+            2,            // deviceid: Master Pointer
+            event.time,
+            u32::from(event.detail),
+            2,            // sourceid: Master Pointer
+            i32::from(event.root_x),
+            i32::from(event.root_y),
+        );
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
         }

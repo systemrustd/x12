@@ -8321,6 +8321,10 @@ fn handle_request(
                                 } else {
                                     0
                                 };
+                                debug!(
+                                    "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
+                                    client_id.0, window.0, deviceid, mask
+                                );
                                 if mask == 0 {
                                     client.xi2_masks.remove(&(window, deviceid));
                                 } else {

@@ -63,36 +63,18 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
-- [ ] **XInput2 GenericEvents (event type 35) silently dropped by the
-      dispatcher.** Phase 6.3 regression. Affects every XI2-using
-      client: xeyes (visible symptom: doesn't track cursor), modern
-      toolkits relying on XI2 motion / scroll valuators / etc.
-
-      **Root cause:** `host_x11/mod.rs:1566-1577` in
-      `read_dispatch_message` discards `header[0] == 35` frames with
-      a comment "XInput2 lives on the per-client kb fanout below,
-      not the host pump." That fanout was dissolved in Step 4 (the
-      Big Flip), so the dispatcher's drop-on-skip path now leaks
-      every GenericEvent. Pre-Phase-6.3, the per-client kb pump's
-      separate connection received and fanned out XI2 GenericEvents
-      directly to its client.
-
-      **Fix shape:** dispatcher classifies GenericEvent (type 35) +
-      its variable-length extra payload as a new
-      `BackendEvent::HostEvent(HostEvent::Generic { ... })` carrying
-      the full bytes. Sink fans it out to whichever client selected
-      XI2 events on the relevant window (`xi2_select_masks`
-      bookkeeping in `nested.rs` already exists from Phase 3.x —
-      reuse). Either translate to a typed XI2 event variant in
-      `decode_host_event` or pass the raw 32+extra bytes through
-      and let the client-side fanout do the parsing.
-
-      Reproduction: `RUST_LOG=debug target/release/ynest 99 &;
-      DISPLAY=:99 xeyes &`; move mouse over xeyes; observe that
-      xeyes never queries position (no `QueryPointer` in log) and
-      that no XI2 GenericEvent reaches a client. xev works in the
-      same setup because xev selects core `PointerMotion` (event
-      type 6), which decode_host_event still handles.
+- [x] ~~**xeyes doesn't track cursor.**~~ Fixed: xeyes selects
+      `XI_RawMotion` (XI2 event type 17) on root, which our
+      `pointer_event_fanout` was not synthesizing —
+      pre-fix only synthesized `XI_Motion` (type 6). Initial
+      "GenericEvent dropped" theory was wrong; the dispatcher does
+      drop GenericEvents, but ynest never asks the host to send
+      them so no XI2 events arrive from the host in the first
+      place. Real fix: synthesize `XI_RawMotion` (and
+      `XI_RawButtonPress` / `XI_RawButtonRelease`) alongside the
+      existing `XI_Motion` / `XI_ButtonPress` / `XI_ButtonRelease`
+      synthesis in `server.rs::pointer_event_fanout`. Raw events
+      include X+Y valuators with FP3232 root coords.
 
 ## Drawing / rendering artifacts
 

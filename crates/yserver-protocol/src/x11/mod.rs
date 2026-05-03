@@ -1706,6 +1706,62 @@ pub fn encode_xi2_device_event(
     debug_assert_eq!(out.len(), 84);
 }
 
+/// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
+/// XI_RawButtonPress / XI_RawButtonRelease / XI_RawMotion / XI_RawTouch*).
+/// Includes X and Y valuators with the supplied root-coordinate values
+/// stored as FP3232 (signed 32-bit integer + unsigned 32-bit fraction).
+/// xeyes selects XI_RawMotion as a "cursor moved" notification and then
+/// calls XIQueryPointer for the actual position; we only need to supply
+/// enough payload to wake the client.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi2_raw_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    detail: u32,
+    sourceid: u16,
+    raw_x: i32,
+    raw_y: i32,
+) {
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
+    // length in 4-byte units beyond the 32-byte header.
+    // Tail = valuator_mask(4) + axisvalues(2 * 8) + axisvalues_raw(2 * 8) = 36 bytes = 9 units.
+    write_u32(ClientByteOrder::LittleEndian, out, 9);
+
+    write_u16(ClientByteOrder::LittleEndian, out, evtype);
+    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
+    write_u32(ClientByteOrder::LittleEndian, out, time);
+    write_u32(ClientByteOrder::LittleEndian, out, detail);
+    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
+    write_u16(ClientByteOrder::LittleEndian, out, 2); // valuators_len: X and Y
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // flags
+    out.extend_from_slice(&[0; 4]); // pad to 32-byte fixed area
+
+    debug_assert_eq!(out.len(), 32);
+
+    // Variable tail: valuator_mask + axisvalues + axisvalues_raw.
+    write_u32(ClientByteOrder::LittleEndian, out, 0x3); // valuator_mask: bits 0+1 (X, Y)
+
+    // FP3232 values: integer part (i32) + fractional part (u32 = 0).
+    write_u32(ClientByteOrder::LittleEndian, out, raw_x as u32);
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // X fractional
+    write_u32(ClientByteOrder::LittleEndian, out, raw_y as u32);
+    write_u32(ClientByteOrder::LittleEndian, out, 0); // Y fractional
+
+    // axisvalues_raw — same as axisvalues for our purposes.
+    write_u32(ClientByteOrder::LittleEndian, out, raw_x as u32);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(ClientByteOrder::LittleEndian, out, raw_y as u32);
+    write_u32(ClientByteOrder::LittleEndian, out, 0);
+
+    debug_assert_eq!(out.len(), 68);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_crossing_event(
     out: &mut Vec<u8>,
