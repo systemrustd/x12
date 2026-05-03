@@ -76,8 +76,10 @@ fn open_error(path: &str, err: &io::Error) -> io::Error {
     use io::ErrorKind;
     let msg = match err.kind() {
         ErrorKind::NotFound => format!(
-            "DRM device {path} not found — is virtio-gpu attached? In vng pass --graphics or \
-             --qemu-opts=\"-device virtio-gpu-pci\""
+            "DRM device {path} not found. In vng: pass --graphics or \
+             --qemu-opts=\"-device virtio-gpu-pci\". On bare metal: check `ls /dev/dri/` — \
+             the GPU may be at card1 instead. Override with \
+             `YSERVER_DRM_DEVICE=/dev/dri/cardN`."
         ),
         ErrorKind::PermissionDenied => format!(
             "opening {path} requires root — vng runs as root by default; on host use sudo \

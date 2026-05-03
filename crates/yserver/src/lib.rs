@@ -19,7 +19,7 @@ pub fn run() -> io::Result<()> {
 
     let signal_fd = block_termination_signals()?;
 
-    let device = Arc::new(drm::Device::open("/dev/dri/card0")?);
+    let device = Arc::new(open_drm_device()?);
     log::info!(
         "yserver: opened DRM device {}, master + atomic capabilities acquired",
         device.path()
@@ -105,6 +105,27 @@ pub fn run() -> io::Result<()> {
     drop(device);
     log::info!("yserver: master released, exiting");
     loop_result
+}
+
+fn open_drm_device() -> io::Result<drm::Device> {
+    if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
+        return drm::Device::open(&explicit);
+    }
+    let candidates = ["/dev/dri/card0", "/dev/dri/card1"];
+    let mut last_err: Option<io::Error> = None;
+    for path in candidates {
+        match drm::Device::open(path) {
+            Ok(device) => return Ok(device),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                log::debug!("yserver: {path} not present, trying next candidate");
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no DRM card devices found")
+    }))
 }
 
 fn block_termination_signals() -> io::Result<SignalFd> {
