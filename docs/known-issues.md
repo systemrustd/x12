@@ -63,6 +63,21 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
+- [ ] **xeyes doesn't track cursor.** Likely regression. status.md
+      line 75 documents "xeyes now tracks cursor via real
+      `MotionNotify` events" as Phase 1 working behavior. No longer
+      true on current master. Suspect: Phase 6.3 changed event
+      routing fundamentally (host pump dissolved into the merged
+      connection's dispatcher → crossbeam channel → `HostPumpEventSink`
+      → `pointer_event_fanout`); somewhere in that chain `MotionNotify`
+      delivery to non-focused / pointer-grab-less clients was dropped.
+      Bisect candidates: `9bfa688` (dispatcher introduction),
+      `6ed3d8a` (Big Flip — pump dissolution + xid_map move).
+      Reproduce: `just ynest-wmaker-xterm`, then `DISPLAY=:99 xeyes`
+      and move the mouse over the host container. Check whether
+      ynest's dispatcher classifies event type 6 (`MotionNotify`)
+      and whether the sink fans it out to clients selecting
+      `PointerMotion` or `ButtonMotion` masks.
 
 ## Drawing / rendering artifacts
 
