@@ -77,7 +77,10 @@ mod tests {
             cursor_y: 0.0,
         };
         update(&mut s, 0.1, &[], 1024, 768);
-        assert!(s.vel_x < 0.0, "velocity should flip negative on right-edge bounce");
+        assert!(
+            s.vel_x < 0.0,
+            "velocity should flip negative on right-edge bounce"
+        );
     }
 
     #[test]

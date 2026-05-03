@@ -7,15 +7,23 @@
 //! pulls pending libinput events and translates the relevant subset to
 //! [`InputEvent`].
 
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+        unix::fs::OpenOptionsExt,
+    },
+    path::Path,
+};
 
-use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
-use input::event::pointer::{ButtonState, PointerEvent};
-use input::{Event, Libinput, LibinputInterface};
+use input::{
+    Event, Libinput, LibinputInterface,
+    event::{
+        keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
+        pointer::{ButtonState, PointerEvent},
+    },
+};
 use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
 
 use crate::input::event::InputEvent;

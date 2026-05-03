@@ -22,3 +22,4 @@ drm = "0.15"
 input = "0.10"
 nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "signal"] }
 signal-hook = "0.4"
+crossbeam-channel = "0.5"

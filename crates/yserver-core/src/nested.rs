@@ -21,8 +21,8 @@ use yserver_protocol::x11::{
 use crate::{
     backend::{Backend, FillState, PixmapHandle, WindowHandle},
     host_x11::{
-        HostEvent, HostInputPump, HostInputPumpHandle, HostSubwindowConfig, HostSubwindowVisual,
-        HostX11Backend,
+        HostKeyEvent, HostSubwindowConfig, HostSubwindowVisual, HostX11Backend, POINTER_EVENT_MASK,
+        SUBWINDOW_EVENT_MASK,
     },
     resources::{
         ARGB_VISUAL, GlyphSetState, HostDrawableTarget, MapState, NamedCompositePixmap,
@@ -264,15 +264,16 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         }
     }
     if let Some(host) = host.as_ref() {
-        let _ = host.lock().map(|mut host| host.ping());
+        let _ = host.lock().map(|mut host| host.ping(None));
     }
     let host_window_id = host
         .as_ref()
         .and_then(|host| host.lock().ok().map(|host| host.window_id()));
 
-    if let Some(window_id) = host_window_id {
-        spawn_window_close_watcher(window_id);
-    }
+    // Phase 6.3 Step 4: the dispatcher in `HostX11Backend` decodes
+    // `DestroyNotify` (event type 17 → `HostEvent::Closed`) and
+    // routes it through the sink, which calls `std::process::exit(0)`.
+    // No separate close-watcher thread / connection is needed.
 
     let server = Arc::new(Mutex::new(ServerState::with_geometry(width, height)));
     // Route root-window drawing/clearing to the host container window so
@@ -303,51 +304,25 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         }
     }
 
-    let input_pump_handle: Option<HostInputPumpHandle> = match host_window_id {
-        Some(window_id) => match HostInputPump::open_from_env(window_id) {
-            Ok(mut pump) => {
-                let handle = pump.handle();
-                let server_for_thread = server.clone();
-                let xid_map = handle.xid_map();
-                thread::spawn(move || {
-                    loop {
-                        match pump.read_event() {
-                            Ok(HostEvent::Key(_)) => {}
-                            Ok(HostEvent::Pointer(event)) => {
-                                crate::server::pointer_event_fanout(
-                                    &server_for_thread,
-                                    &xid_map,
-                                    event,
-                                );
-                            }
-                            Ok(HostEvent::Expose(ev)) => {
-                                expose_event_fanout(&server_for_thread, &xid_map, ev);
-                            }
-                            Ok(HostEvent::Configure(ev)) => {
-                                if ev.host_xid == window_id {
-                                    handle_host_container_resize(&server_for_thread, ev);
-                                }
-                            }
-                            Ok(HostEvent::Closed) => {
-                                info!("host pump: window closed, exiting");
-                                std::process::exit(0);
-                            }
-                            Err(err) => {
-                                info!("host pump: connection lost ({err}), exiting");
-                                std::process::exit(0);
-                            }
-                        }
-                    }
-                });
-                Some(handle)
+    // Phase 6.3 Step 4 ("Big Flip"): no second X11 connection. The
+    // merged dispatcher in `HostX11Backend` reads every event off the
+    // main connection and routes through `host_pump_event_sink` via
+    // the existing `set_event_sink` channel. Step 6 deletes the
+    // `HostInputPumpHandle` compat wrapper too — registration calls
+    // now go through the `Backend` trait directly.
+    if let (Some(window_id), Some(host_arc)) = (host_window_id, host.as_ref()) {
+        let xid_map = match host_arc.lock() {
+            Ok(host) => host.xid_map(),
+            Err(_) => {
+                warn!("host backend mutex poisoned; aborting nested run");
+                return Ok(());
             }
-            Err(err) => {
-                warn!("could not start host input pump: {err}");
-                None
-            }
-        },
-        None => None,
-    };
+        };
+        let sink = crate::server::host_pump_event_sink(server.clone(), xid_map, window_id);
+        if let Ok(mut host) = host_arc.lock() {
+            host.set_event_sink(Some(Box::new(sink)));
+        }
+    }
 
     for stream in listener.incoming() {
         match stream {
@@ -355,16 +330,9 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
                 let client_id = ClientId(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
                 let host = host.clone();
                 let server = server.clone();
-                let input_handle = input_pump_handle.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(
-                        client_id,
-                        stream,
-                        server,
-                        host,
-                        host_window_id,
-                        input_handle,
-                    ) {
+                    if let Err(err) = handle_client(client_id, stream, server, host, host_window_id)
+                    {
                         info!("client {} disconnected: {err}", client_id.0);
                     }
                 });
@@ -514,9 +482,8 @@ fn fanout_destroy_sequence(pending: &PendingDestroy) {
 }
 
 // `server` and `host` are Arc clones that are logically "owned" by this
-// thread; `input_handle` holds a shared handle we keep alive for the session.
-// Clippy pedantic flags these as needless_pass_by_value but they cannot be
-// references because they are moved into the thread.
+// thread. Clippy pedantic flags these as needless_pass_by_value but they
+// cannot be references because they are moved into the thread.
 #[allow(clippy::needless_pass_by_value)]
 fn handle_client(
     client_id: ClientId,
@@ -524,7 +491,6 @@ fn handle_client(
     server: Arc<Mutex<ServerState>>,
     host: Option<Arc<Mutex<dyn Backend>>>,
     host_window_id: Option<u32>,
-    input_handle: Option<HostInputPumpHandle>,
 ) -> io::Result<()> {
     let setup = x11::read_setup_request(&mut stream)?;
     if setup.byte_order != ClientByteOrder::LittleEndian {
@@ -618,18 +584,27 @@ fn handle_client(
         );
     }
 
-    if let Some(host_window_id) = host_window_id {
-        match HostInputPump::open_from_env(host_window_id) {
-            Ok(keyboard) => spawn_keyboard_forwarder(
-                client_id,
-                keyboard,
-                writer.clone(),
-                focused_window.clone(),
-                last_sequence.clone(),
-                Arc::clone(&server),
-            ),
-            Err(err) => warn!("client {} keyboard forwarding disabled: {err}", client_id.0),
+    // Phase 6.3 Step 4: register a key Sender with the merged
+    // dispatcher so this client's forwarder receives every host
+    // KeyPress / KeyRelease. Pre-Step-4 each client opened its own
+    // X11 connection here (the per-client kb pump); now they all
+    // share the merged dispatcher and apply their own focus state on
+    // the events that arrive on their per-client receiver.
+    if host_window_id.is_some()
+        && let Some(host_arc) = host.as_ref()
+    {
+        let (key_tx, key_rx) = crossbeam_channel::unbounded::<HostKeyEvent>();
+        if let Ok(mut backend) = host_arc.lock() {
+            backend.add_key_subscriber(key_tx);
         }
+        spawn_keyboard_forwarder(
+            client_id,
+            key_rx,
+            writer.clone(),
+            focused_window.clone(),
+            last_sequence.clone(),
+            Arc::clone(&server),
+        );
     }
 
     #[allow(clippy::redundant_closure_call)]
@@ -661,7 +636,6 @@ fn handle_client(
                 client_id,
                 &server,
                 host.as_ref(),
-                input_handle.as_ref(),
                 &writer,
                 &focused_window,
                 sequence,
@@ -754,15 +728,12 @@ fn handle_client(
         (removed, pending)
     };
     for pending in pending_destroys {
-        if let Some(xid) = pending.host_xid {
-            if let Some(host) = host.as_ref()
-                && let Ok(mut h) = host.lock()
-            {
-                let _ = h.destroy_subwindow(xid.as_raw());
-            }
-            if let Some(input_handle) = input_handle.as_ref() {
-                input_handle.unregister_top_level(xid.as_raw());
-            }
+        if let Some(xid) = pending.host_xid
+            && let Some(host) = host.as_ref()
+            && let Ok(mut h) = host.lock()
+        {
+            let _ = h.destroy_subwindow(None, xid.as_raw());
+            h.unregister_host_window(xid.as_raw());
         }
         fanout_destroy_sequence(&pending);
     }
@@ -770,54 +741,22 @@ fn handle_client(
         && let Ok(mut h) = host.lock()
     {
         for xid in removed.closed_fonts {
-            let _ = h.close_font(xid);
+            let _ = h.close_font(None, xid);
         }
         for xid in removed.freed_pixmaps {
-            let _ = h.free_pixmap(xid);
+            let _ = h.free_pixmap(None, xid);
         }
         for (pic_xid, owned_pix) in removed.freed_pictures {
-            let _ = h.render_free_picture(pic_xid);
+            let _ = h.render_free_picture(None, pic_xid);
             if let Some(pix_xid) = owned_pix {
-                let _ = h.free_pixmap(pix_xid);
+                let _ = h.free_pixmap(None, pix_xid);
             }
         }
         for gs_xid in removed.freed_glyphsets {
-            let _ = h.render_free_glyphset(gs_xid);
+            let _ = h.render_free_glyphset(None, gs_xid);
         }
     }
     result
-}
-
-fn spawn_window_close_watcher(window_id: u32) {
-    thread::spawn(move || {
-        debug!("window-close watcher starting for 0x{window_id:x}");
-        let mut watcher = match HostInputPump::open_from_env(window_id) {
-            Ok(w) => w,
-            Err(err) => {
-                error!("could not start window-close watcher: {err}");
-                return;
-            }
-        };
-        debug!("window-close watcher ready");
-        loop {
-            match watcher.read_event() {
-                Ok(
-                    HostEvent::Key(_)
-                    | HostEvent::Pointer(_)
-                    | HostEvent::Expose(_)
-                    | HostEvent::Configure(_),
-                ) => {}
-                Ok(HostEvent::Closed) => {
-                    info!("host window closed, exiting");
-                    std::process::exit(0);
-                }
-                Err(err) => {
-                    info!("host connection lost ({err}), exiting");
-                    std::process::exit(0);
-                }
-            }
-        }
-    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -895,7 +834,7 @@ fn route_key_event(
 
 fn spawn_keyboard_forwarder(
     client_id: ClientId,
-    mut keyboard: HostInputPump,
+    keyboard: crossbeam_channel::Receiver<HostKeyEvent>,
     writer: Arc<Mutex<UnixStream>>,
     focused_window: Arc<Mutex<ResourceId>>,
     last_sequence: Arc<AtomicU16>,
@@ -903,20 +842,15 @@ fn spawn_keyboard_forwarder(
 ) {
     thread::spawn(move || {
         loop {
-            let event = loop {
-                match keyboard.read_event() {
-                    Ok(HostEvent::Key(event)) => break event,
-                    Ok(HostEvent::Pointer(_) | HostEvent::Expose(_) | HostEvent::Configure(_)) => {
-                        continue;
-                    }
-                    Ok(HostEvent::Closed) => {
-                        info!("host window closed, exiting");
-                        std::process::exit(0);
-                    }
-                    Err(err) => {
-                        info!("client {} kb pump connection lost ({err})", client_id.0);
-                        return;
-                    }
+            // Phase 6.3 Step 4: events arrive on a crossbeam channel
+            // fed by the merged dispatcher in `HostX11Backend`. A
+            // `RecvError` means every Sender has dropped — i.e. the
+            // backend is tearing down — so we exit the forwarder.
+            let event = match keyboard.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    info!("client {} kb forwarder channel closed", client_id.0);
+                    return;
                 }
             };
             let focus = focused_window
@@ -1037,7 +971,7 @@ fn spawn_keyboard_forwarder(
 
 /// Forward a host Expose event to nested clients that selected ExposureMask.
 /// Called from the host input-pump thread when the host uncovers a subwindow.
-fn expose_event_fanout(
+pub(crate) fn expose_event_fanout(
     server: &Arc<Mutex<ServerState>>,
     xid_map: &crate::host_x11::HostXidMap,
     ev: crate::host_x11::HostExposeEvent,
@@ -1088,142 +1022,6 @@ fn expose_event_fanout(
                 0,
             );
         });
-    }
-}
-
-fn handle_host_container_resize(
-    server: &Arc<Mutex<ServerState>>,
-    ev: crate::host_x11::HostConfigureEvent,
-) {
-    #[allow(clippy::type_complexity)]
-    let update = {
-        let mut s = match server.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if ev.width == 0
-            || ev.height == 0
-            || (s.randr.screen_width == ev.width && s.randr.screen_height == ev.height)
-        {
-            return;
-        }
-
-        let timestamp = s.timestamp_now();
-        s.randr.resize(timestamp, ev.width, ev.height);
-        if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
-            root.width = ev.width;
-            root.height = ev.height;
-        }
-
-        let width_mm = u16::try_from(s.randr.width_mm).unwrap_or(u16::MAX);
-        let height_mm = u16::try_from(s.randr.height_mm).unwrap_or(u16::MAX);
-        let targets = s
-            .randr_select_masks
-            .iter()
-            .filter_map(|((owner, window), mask)| {
-                s.client_target(ClientId(*owner))
-                    .map(|target| (target, *window, *mask))
-            })
-            .collect::<Vec<_>>();
-
-        Some((timestamp, ev.width, ev.height, width_mm, height_mm, targets))
-    };
-
-    let Some((timestamp, width, height, width_mm, height_mm, targets)) = update else {
-        return;
-    };
-
-    debug!(
-        "host container resized to {}x{} at {}, emitting RANDR updates",
-        width, height, timestamp
-    );
-
-    // Spec-correct: emit a core ConfigureNotify on root *before* the RANDR
-    // fanout so non-RANDR-aware clients (panels, "fill the screen" apps)
-    // reflow at the same point in the event stream that RANDR-aware toolkits
-    // see screen-change. Subscribers selected via StructureNotifyMask on root.
-    crate::server::emit_window_event(
-        server,
-        ROOT_WINDOW,
-        0x0002_0000, // StructureNotifyMask
-        |buf, seq, order| {
-            x11::encode_configure_notify_event(
-                buf,
-                seq,
-                order,
-                ROOT_WINDOW,
-                ROOT_WINDOW,
-                x11::Geometry {
-                    root: ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    border_width: 0,
-                    depth: 24,
-                },
-                false,
-            );
-        },
-    );
-
-    for (target, request_window, mask) in targets {
-        let sequence = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
-            let event = x11randr::encode_screen_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::ScreenChangeNotify {
-                    timestamp,
-                    config_timestamp: timestamp,
-                    root: ROOT_WINDOW.0,
-                    request_window: request_window.0,
-                    width,
-                    height,
-                    width_mm,
-                    height_mm,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
-        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
-            let event = x11randr::encode_crtc_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::CrtcChangeNotify {
-                    timestamp,
-                    request_window: request_window.0,
-                    crtc: crate::randr::CRTC_ID,
-                    mode: crate::randr::MODE_ID,
-                    x: ev.x,
-                    y: ev.y,
-                    width,
-                    height,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
-        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            let event = x11randr::encode_output_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::OutputChangeNotify {
-                    timestamp,
-                    config_timestamp: timestamp,
-                    request_window: request_window.0,
-                    output: crate::randr::OUTPUT_ID,
-                    crtc: crate::randr::CRTC_ID,
-                    mode: crate::randr::MODE_ID,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
     }
 }
 
@@ -1393,6 +1191,7 @@ where
 
 #[allow(clippy::too_many_lines)]
 fn handle_render_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -1412,7 +1211,7 @@ fn handle_render_request(
         // QueryVersion
         0 => {
             let (major, minor_ver) = lock_host()
-                .and_then(|mut h| h.render_query_version().ok())
+                .and_then(|mut h| h.render_query_version(origin).ok())
                 .unwrap_or((0, 11));
             debug!(
                 "client {} #{} RENDER::QueryVersion -> {}.{}",
@@ -1464,9 +1263,15 @@ fn handle_render_request(
             }
             let host_pic = host_drawable_handle.and_then(|host_drawable| {
                 lock_host().and_then(|mut h| {
-                    h.render_create_picture(host_drawable, req.format, req.value_mask, &req.values)
-                        .ok()
-                        .flatten()
+                    h.render_create_picture(
+                        origin,
+                        host_drawable,
+                        req.format,
+                        req.value_mask,
+                        &req.values,
+                    )
+                    .ok()
+                    .flatten()
                 })
             });
             if let Some(host_pic) = host_pic {
@@ -1541,7 +1346,7 @@ fn handle_render_request(
                 .picture(pic_id)
                 .map(|p| p.host_picture_xid.as_raw());
             if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
-                let _ = h.render_change_picture(hp, &patched);
+                let _ = h.render_change_picture(origin, hp, &patched);
             }
             Ok(())
         }
@@ -1590,6 +1395,7 @@ fn handle_render_request(
                 (host_src, host_mask, host_dst, lock_host())
             {
                 let _ = h.render_composite(
+                    origin,
                     req.op,
                     host_src,
                     host_mask,
@@ -1658,6 +1464,7 @@ fn handle_render_request(
                 (host_src, host_dst, host_mask_format, lock_host())
             {
                 let _ = h.render_trapezoids(
+                    origin,
                     op,
                     host_src,
                     host_dst,
@@ -1685,9 +1492,9 @@ fn handle_render_request(
                 s.resources.free_picture(pic_id)
             };
             if let (Some(state), Some(mut h)) = (state, lock_host()) {
-                let _ = h.render_free_picture(state.host_picture_xid.as_raw());
+                let _ = h.render_free_picture(origin, state.host_picture_xid.as_raw());
                 if let Some(pix) = state.host_owned_pixmap {
-                    let _ = h.free_pixmap(pix.as_raw());
+                    let _ = h.free_pixmap(origin, pix.as_raw());
                 }
             }
             Ok(())
@@ -1702,7 +1509,7 @@ fn handle_render_request(
                 client_id.0, sequence.0, gs_id.0, fmt
             );
             let host_gs =
-                lock_host().and_then(|mut h| h.render_create_glyphset(fmt).ok().flatten());
+                lock_host().and_then(|mut h| h.render_create_glyphset(origin, fmt).ok().flatten());
             if let Some(host_gs) = host_gs {
                 let mut s = lock_server(server)?;
                 s.resources.create_glyphset(
@@ -1745,7 +1552,7 @@ fn handle_render_request(
                 s.resources.free_glyphset(gs_id)
             };
             if let (Some(state), Some(mut h)) = (state, lock_host()) {
-                let _ = h.render_free_glyphset(state.host_glyphset_xid.as_raw());
+                let _ = h.render_free_glyphset(origin, state.host_glyphset_xid.as_raw());
             }
             Ok(())
         }
@@ -1765,7 +1572,7 @@ fn handle_render_request(
                     .map(|g| g.host_glyphset_xid.as_raw())
             };
             if let (Some(host_gs), Some(mut h)) = (host_gs, lock_host()) {
-                let _ = h.render_add_glyphs(host_gs, &tail);
+                let _ = h.render_add_glyphs(origin, host_gs, &tail);
             }
             Ok(())
         }
@@ -1788,7 +1595,7 @@ fn handle_render_request(
                     .map(|g| g.host_glyphset_xid.as_raw())
             };
             if let (Some(host_gs), Some(mut h)) = (host_gs, lock_host()) {
-                let _ = h.render_free_glyphs(host_gs, &glyph_ids);
+                let _ = h.render_free_glyphs(origin, host_gs, &glyph_ids);
             }
             Ok(())
         }
@@ -1834,8 +1641,8 @@ fn handle_render_request(
                     h.render_format_for_ynest_id(req.mask_format).unwrap_or(0)
                 };
                 let _ = h.render_composite_glyphs(
-                    minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x, req.src_y,
-                    &req.items, x_off, y_off,
+                    origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
+                    req.src_y, &req.items, x_off, y_off,
                 );
             }
             Ok(())
@@ -1856,8 +1663,9 @@ fn handle_render_request(
                 })
             };
             if let (Some(host_dst), Some(mut h)) = (host_dst, lock_host()) {
-                let _ =
-                    h.render_fill_rectangles(host_dst, req.op, req.color, &req.rects, x_off, y_off);
+                let _ = h.render_fill_rectangles(
+                    origin, host_dst, req.op, req.color, &req.rects, x_off, y_off,
+                );
             }
             Ok(())
         }
@@ -1870,8 +1678,8 @@ fn handle_render_request(
                 "client {} #{} RENDER::CreateSolidFill pic=0x{:x}",
                 client_id.0, sequence.0, pic_id.0
             );
-            let host_pic =
-                lock_host().and_then(|mut h| h.render_create_solid_fill(color).ok().flatten());
+            let host_pic = lock_host()
+                .and_then(|mut h| h.render_create_solid_fill(origin, color).ok().flatten());
             if let Some(host_pic) = host_pic {
                 let mut s = lock_server(server)?;
                 s.resources.create_picture(
@@ -1904,7 +1712,10 @@ fn handle_render_request(
             };
             if let Some(host_src) = host_src
                 && let Some(mut h) = lock_host()
-                && let Some(cursor_handle) = h.render_create_cursor(host_src, x, y).ok().flatten()
+                && let Some(cursor_handle) = h
+                    .render_create_cursor(origin, host_src, x, y)
+                    .ok()
+                    .flatten()
             {
                 drop(h);
                 let mut s = lock_server(server)?;
@@ -1928,7 +1739,7 @@ fn handle_render_request(
                 client_id.0, sequence.0, pic_id.0, host_pic
             );
             if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
-                let _ = h.render_set_picture_transform(hp, body);
+                let _ = h.render_set_picture_transform(origin, hp, body);
             }
             Ok(())
         }
@@ -1955,7 +1766,7 @@ fn handle_render_request(
                 client_id.0, sequence.0, pic_id.0, host_pic
             );
             if let (Some(hp), Some(mut h)) = (host_pic, lock_host()) {
-                let _ = h.render_set_picture_filter(hp, body);
+                let _ = h.render_set_picture_filter(origin, hp, body);
             }
             Ok(())
         }
@@ -1979,14 +1790,14 @@ fn handle_render_request(
                     client_id.0, sequence.0, pic_id.0, host_pic, x_off, y_off
                 );
                 if x_off == 0 && y_off == 0 {
-                    let _ = h.render_set_picture_clip_rectangles(hp, body);
+                    let _ = h.render_set_picture_clip_rectangles(origin, hp, body);
                 } else {
                     let clip_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
                     let clip_y = i16::from_le_bytes([body[6], body[7]]).wrapping_add(y_off);
                     let mut adj = body.to_vec();
                     adj[4..6].copy_from_slice(&clip_x.to_le_bytes());
                     adj[6..8].copy_from_slice(&clip_y.to_le_bytes());
-                    let _ = h.render_set_picture_clip_rectangles(hp, &adj);
+                    let _ = h.render_set_picture_clip_rectangles(origin, hp, &adj);
                 }
             }
             Ok(())
@@ -2001,8 +1812,8 @@ fn handle_render_request(
                 "client {} #{} RENDER::CreateLinearGradient pic=0x{:x}",
                 client_id.0, sequence.0, pic_id.0
             );
-            let host_pic =
-                lock_host().and_then(|mut h| h.render_create_linear_gradient(body).ok().flatten());
+            let host_pic = lock_host()
+                .and_then(|mut h| h.render_create_linear_gradient(origin, body).ok().flatten());
             if let Some(host_pic) = host_pic {
                 lock_server(server)?.resources.create_picture(
                     pic_id,
@@ -2042,8 +1853,8 @@ fn handle_render_request(
                 "client {} #{} RENDER::CreateRadialGradient pic=0x{:x}",
                 client_id.0, sequence.0, pic_id.0
             );
-            let host_pic =
-                lock_host().and_then(|mut h| h.render_create_radial_gradient(body).ok().flatten());
+            let host_pic = lock_host()
+                .and_then(|mut h| h.render_create_radial_gradient(origin, body).ok().flatten());
             if let Some(host_pic) = host_pic {
                 lock_server(server)?.resources.create_picture(
                     pic_id,
@@ -2581,6 +2392,7 @@ where
 }
 
 fn handle_get_atom_name(
+    origin: Option<crate::backend::OriginContext>,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
     writer: &Arc<Mutex<UnixStream>>,
@@ -2590,12 +2402,13 @@ fn handle_get_atom_name(
     handle_get_atom_name_with_host_lookup(server, writer, sequence, atom, |atom_id| {
         let host = host?;
         let mut h = host.lock().ok()?;
-        h.get_atom_name(atom_id).ok().flatten()
+        h.get_atom_name(origin, atom_id).ok().flatten()
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_mit_shm_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -2736,7 +2549,7 @@ fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            handle_mit_shm_create_pixmap(client_id, server, host, writer, sequence, req)
+            handle_mit_shm_create_pixmap(origin, client_id, server, host, writer, sequence, req)
         }
         shm::PUT_IMAGE => {
             let Some(req) = shm::parse_put_image(body) else {
@@ -2748,7 +2561,7 @@ fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            handle_mit_shm_put_image(client_id, server, host, writer, sequence, req)
+            handle_mit_shm_put_image(origin, client_id, server, host, writer, sequence, req)
         }
         shm::GET_IMAGE => {
             let Some(req) = shm::parse_get_image(body) else {
@@ -2760,7 +2573,7 @@ fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            handle_mit_shm_get_image(client_id, server, host, writer, sequence, req)
+            handle_mit_shm_get_image(origin, client_id, server, host, writer, sequence, req)
         }
         shm::CREATE_SEGMENT => {
             let Some(req) = shm::parse_create_segment(body) else {
@@ -2896,6 +2709,7 @@ fn handle_mit_shm_create_segment(
 }
 
 fn handle_mit_shm_create_pixmap(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -2973,7 +2787,7 @@ fn handle_mit_shm_create_pixmap(
     let host_xid = if let Some(host) = host
         && let Ok(mut host) = host.lock()
     {
-        match host.create_pixmap(req.depth, req.width, req.height) {
+        match host.create_pixmap(origin, req.depth, req.width, req.height) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 warn!(
@@ -3019,8 +2833,9 @@ fn handle_mit_shm_create_pixmap(
     {
         // No client GC for MIT-SHM CreatePixmap snapshot — clear any
         // leftover clip-mask before the synthetic put_image.
-        let _ = host.clear_clip_rectangles();
+        let _ = host.clear_clip_rectangles(origin);
         if let Err(err) = host.put_image(
+            origin,
             host_xid.as_raw(),
             req.depth,
             req.width,
@@ -3071,6 +2886,7 @@ fn handle_mit_shm_create_pixmap(
 }
 
 fn handle_mit_shm_put_image(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -3160,8 +2976,9 @@ fn handle_mit_shm_put_image(
         // MIT-SHM PutImage doesn't carry a client GC; reset host clip so
         // a clip-mask left over from an unrelated draw (e.g. wmaker
         // close-button symbol) doesn't restrict the image upload.
-        host.clear_clip_rectangles()?;
+        host.clear_clip_rectangles(origin)?;
         host.put_image(
+            origin,
             target.host_xid(),
             req.depth,
             req.src_width,
@@ -3187,6 +3004,7 @@ fn handle_mit_shm_put_image(
 }
 
 fn handle_mit_shm_get_image(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -3240,6 +3058,7 @@ fn handle_mit_shm_get_image(
             );
         };
         host.get_image(
+            origin,
             target.host_xid(),
             req.format,
             req.x,
@@ -3313,6 +3132,7 @@ fn handle_mit_shm_get_image(
 }
 
 fn handle_xfixes_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -3622,7 +3442,8 @@ fn handle_xfixes_request(
                     .cursor_host_xid(ResourceId(cursor_xid));
                 if let (Some(host), Some(host_cursor)) = (host, host_cursor) {
                     if let Ok(mut h) = host.lock()
-                        && let Err(err) = h.xfixes_change_cursor_by_name(host_cursor, name_bytes)
+                        && let Err(err) =
+                            h.xfixes_change_cursor_by_name(origin, host_cursor, name_bytes)
                     {
                         debug!(
                             "host XFIXES::ChangeCursorByName failed for cursor 0x{cursor_xid:x}: {err}"
@@ -3757,6 +3578,7 @@ fn set_shape_rects(
 /// no host backing (sub-windows below top-levels keep their local-only
 /// behavior — the parent's host shape already clips them).
 fn mirror_shape_to_host(
+    origin: Option<crate::backend::OriginContext>,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
     window: ResourceId,
@@ -3780,7 +3602,7 @@ fn mirror_shape_to_host(
         (host_xid, shape_rects_for(&s, window, kind))
     };
     if let Ok(mut h) = host.lock()
-        && let Err(err) = h.set_shape_rectangles(host_xid.as_raw(), kind, &rects)
+        && let Err(err) = h.set_shape_rectangles(origin, host_xid.as_raw(), kind, &rects)
     {
         debug!(
             "host SHAPE mirror failed for window 0x{:x} kind={kind}: {err}",
@@ -3807,6 +3629,7 @@ fn clear_shape_rects(server: &mut ServerState, window: ResourceId, kind: u8) {
 }
 
 fn handle_shape_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -3855,7 +3678,7 @@ fn handle_shape_request(
                 None
             };
             if let Some((window, kind)) = mirror_target {
-                mirror_shape_to_host(server, host, window, kind);
+                mirror_shape_to_host(origin, server, host, window, kind);
             }
             Ok(())
         }
@@ -3876,7 +3699,7 @@ fn handle_shape_request(
                         region_extents(&rects)
                     );
                     drop(s);
-                    mirror_shape_to_host(server, host, window, req.dest_kind);
+                    mirror_shape_to_host(origin, server, host, window, req.dest_kind);
                     return Ok(());
                 }
                 let source = {
@@ -3905,7 +3728,7 @@ fn handle_shape_request(
                 None
             };
             if let Some((window, kind)) = mirror_target {
-                mirror_shape_to_host(server, host, window, kind);
+                mirror_shape_to_host(origin, server, host, window, kind);
             }
             Ok(())
         }
@@ -3939,7 +3762,7 @@ fn handle_shape_request(
                 None
             };
             if let Some((window, kind)) = mirror_target {
-                mirror_shape_to_host(server, host, window, kind);
+                mirror_shape_to_host(origin, server, host, window, kind);
             }
             Ok(())
         }
@@ -3961,7 +3784,7 @@ fn handle_shape_request(
             };
             debug!("client {} #{} SHAPE::Offset", client_id.0, sequence.0);
             if let Some((window, kind)) = mirror_target {
-                mirror_shape_to_host(server, host, window, kind);
+                mirror_shape_to_host(origin, server, host, window, kind);
             }
             Ok(())
         }
@@ -4332,6 +4155,7 @@ pub fn accumulate_damage(
 /// COMPOSITE spec, a resize or destroy invalidates *all* previously
 /// named pixmaps on the window simultaneously.
 pub fn invalidate_composite_named_pixmaps(
+    origin: Option<crate::backend::OriginContext>,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
     window: ResourceId,
@@ -4359,7 +4183,7 @@ pub fn invalidate_composite_named_pixmaps(
         && let Ok(mut h) = host_arc.lock()
     {
         for a in &aliases {
-            let _ = h.free_pixmap(a.host_pixmap.as_raw());
+            let _ = h.free_pixmap(origin, a.host_pixmap.as_raw());
         }
     }
 }
@@ -4526,6 +4350,7 @@ fn handle_damage_request(
 }
 
 fn handle_composite_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -4688,7 +4513,7 @@ fn handle_composite_request(
                         COMPOSITE_MAJOR_OPCODE,
                     );
                 }
-                match h.name_window_pixmap(host_window_xid) {
+                match h.name_window_pixmap(origin, host_window_xid) {
                     Ok(handle) => handle,
                     Err(_) => {
                         return emit_x11_error(
@@ -4766,6 +4591,7 @@ fn handle_composite_request(
 }
 
 fn handle_present_request(
+    origin: Option<crate::backend::OriginContext>,
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
@@ -4902,6 +4728,7 @@ fn handle_present_request(
                     && let Ok(mut host) = host.lock()
                 {
                     host.copy_area(
+                        origin,
                         host_xid.as_raw(),
                         dst.host_xid(),
                         req.x_off,
@@ -4964,7 +4791,6 @@ fn handle_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<dyn Backend>>>,
-    input_handle: Option<&HostInputPumpHandle>,
     writer: &Arc<Mutex<UnixStream>>,
     focused_window: &Arc<Mutex<ResourceId>>,
     sequence: SequenceNumber,
@@ -4977,6 +4803,11 @@ fn handle_request(
             .lock()
             .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
     };
+    let origin = Some(crate::backend::OriginContext {
+        client_id,
+        nested_seq: sequence.0,
+        opcode: header.opcode,
+    });
     match header.opcode {
         1 => {
             if let Some(request) = x11::create_window_request(header.data, body) {
@@ -5086,6 +4917,7 @@ fn handle_request(
                         host_parent_handle.and_then(|host_parent| {
                             host.lock().ok().and_then(|mut h| {
                                 match h.create_subwindow(
+                                    origin,
                                     host_parent,
                                     geometry.0,
                                     geometry.1,
@@ -5115,12 +4947,12 @@ fn handle_request(
                                 w.host_xid = Some(host_handle);
                             }
                         }
-                        if let Some(input_handle) = input_handle {
+                        if let Ok(mut h) = host.lock() {
                             let host_xid = host_handle.as_raw();
                             let result = if parent == ROOT_WINDOW {
-                                input_handle.register_top_level(window_id, host_xid)
+                                h.register_top_level(origin, window_id, host_xid)
                             } else {
-                                input_handle.register_subwindow(window_id, host_xid)
+                                h.register_subwindow(origin, window_id, host_xid)
                             };
                             if let Err(err) = result {
                                 warn!(
@@ -5206,7 +5038,7 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.free_pixmap(old_host_xid.as_raw());
+                        let _ = h.free_pixmap(origin, old_host_xid.as_raw());
                     }
                     want_focus_check = s
                         .clients
@@ -5247,11 +5079,12 @@ fn handle_request(
                     if request.background_pixmap.is_some()
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.set_container_background_pixmap(root_bg_host_xid.unwrap_or(0));
+                        let _ = h
+                            .set_container_background_pixmap(origin, root_bg_host_xid.unwrap_or(0));
                     } else if let Some(pixel) = request.background_pixel
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.set_container_background_pixel(pixel);
+                        let _ = h.set_container_background_pixel(origin, pixel);
                     }
                 }
                 if viewable && want_focus_check & 0x3 != 0 {
@@ -5292,6 +5125,7 @@ fn handle_request(
                         }
                         if let Ok(mut h) = host.lock() {
                             let _ = h.change_subwindow_attributes(
+                                origin,
                                 host_xid.as_raw(),
                                 value_mask,
                                 &values,
@@ -5310,7 +5144,7 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.define_cursor(hw.as_raw(), ch);
+                        let _ = h.define_cursor(origin, hw.as_raw(), ch);
                     }
                 }
             }
@@ -5389,7 +5223,7 @@ fn handle_request(
                     && let Ok(mut h) = host.lock()
                 {
                     for xid in &bg_pixmap_xids {
-                        let _ = h.free_pixmap(*xid);
+                        let _ = h.free_pixmap(origin, *xid);
                     }
                 }
                 for pending in pending {
@@ -5401,13 +5235,23 @@ fn handle_request(
                         // misroute to a destroyed ResourceId; with the
                         // mapping cleared first, lookup misses and the
                         // event drops silently.
-                        if let Some(input_handle) = input_handle {
-                            input_handle.unregister_top_level(xid.as_raw());
-                        }
-                        if let Some(host) = host
+                        if let Some(host) = host.as_ref()
                             && let Ok(mut h) = host.lock()
                         {
-                            let _ = h.destroy_subwindow(xid.as_raw());
+                            h.unregister_host_window(xid.as_raw());
+                            let _ = h.update_host_event_mask(
+                                origin,
+                                xid.as_raw(),
+                                POINTER_EVENT_MASK,
+                                false,
+                            );
+                            let _ = h.update_host_event_mask(
+                                origin,
+                                xid.as_raw(),
+                                SUBWINDOW_EVENT_MASK,
+                                false,
+                            );
+                            let _ = h.destroy_subwindow(origin, xid.as_raw());
                         }
                     }
                     fanout_destroy_sequence(&pending);
@@ -5457,15 +5301,24 @@ fn handle_request(
                         pending
                     };
                     for entry in pending {
-                        if let Some(xid) = entry.host_xid {
-                            if let Some(host) = host
-                                && let Ok(mut h) = host.lock()
-                            {
-                                let _ = h.destroy_subwindow(xid.as_raw());
-                            }
-                            if let Some(input_handle) = input_handle {
-                                input_handle.unregister_top_level(xid.as_raw());
-                            }
+                        if let Some(xid) = entry.host_xid
+                            && let Some(host) = host
+                            && let Ok(mut h) = host.lock()
+                        {
+                            h.unregister_host_window(xid.as_raw());
+                            let _ = h.update_host_event_mask(
+                                origin,
+                                xid.as_raw(),
+                                POINTER_EVENT_MASK,
+                                false,
+                            );
+                            let _ = h.update_host_event_mask(
+                                origin,
+                                xid.as_raw(),
+                                SUBWINDOW_EVENT_MASK,
+                                false,
+                            );
+                            let _ = h.destroy_subwindow(origin, xid.as_raw());
                         }
                         fanout_destroy_sequence(&entry);
                     }
@@ -5556,7 +5409,13 @@ fn handle_request(
                     if let Some(host_parent) = new_host_parent
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.reparent_subwindow(xid.as_raw(), host_parent, result.x, result.y);
+                        let _ = h.reparent_subwindow(
+                            origin,
+                            xid.as_raw(),
+                            host_parent,
+                            result.x,
+                            result.y,
+                        );
                     }
                     // If the window stops being a top-level (left root),
                     // re-register it as a sub-window. This switches the
@@ -5572,27 +5431,41 @@ fn handle_request(
                     // click bug.
                     if result.old_parent == ROOT_WINDOW
                         && result.new_parent != ROOT_WINDOW
-                        && let Some(input_handle) = input_handle
-                        && let Err(err) =
-                            input_handle.register_subwindow(result.window, xid.as_raw())
+                        && let Ok(mut h) = host.lock()
                     {
-                        warn!(
-                            "client {} register_subwindow for 0x{:x} on reparent failed: {err}",
-                            client_id.0, result.window.0
+                        let _ = h.update_host_event_mask(
+                            origin,
+                            xid.as_raw(),
+                            POINTER_EVENT_MASK,
+                            false,
                         );
+                        if let Err(err) = h.register_subwindow(origin, result.window, xid.as_raw())
+                        {
+                            warn!(
+                                "client {} register_subwindow for 0x{:x} on reparent failed: {err}",
+                                client_id.0, result.window.0
+                            );
+                        }
                     }
                     // If the window becomes a top-level (moved to root),
                     // re-register so pointer events can find it again.
                     if result.old_parent != ROOT_WINDOW
                         && result.new_parent == ROOT_WINDOW
-                        && let Some(input_handle) = input_handle
-                        && let Err(err) =
-                            input_handle.register_top_level(result.window, xid.as_raw())
+                        && let Ok(mut h) = host.lock()
                     {
-                        warn!(
-                            "client {} register_top_level for 0x{:x} on reparent failed: {err}",
-                            client_id.0, result.window.0
+                        let _ = h.update_host_event_mask(
+                            origin,
+                            xid.as_raw(),
+                            SUBWINDOW_EVENT_MASK,
+                            false,
                         );
+                        if let Err(err) = h.register_top_level(origin, result.window, xid.as_raw())
+                        {
+                            warn!(
+                                "client {} register_top_level for 0x{:x} on reparent failed: {err}",
+                                client_id.0, result.window.0
+                            );
+                        }
                     }
                 }
                 fanout_event(&on_window, |buf, seq, order| {
@@ -5714,7 +5587,7 @@ fn handle_request(
                             && let Some(host) = host
                             && let Ok(mut h) = host.lock()
                         {
-                            let _ = h.map_subwindow(xid.as_raw());
+                            let _ = h.map_subwindow(origin, xid.as_raw());
                         }
                         let wants_focus = {
                             let s = lock_server(server)?;
@@ -5798,7 +5671,7 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.map_subwindow(xid.as_raw());
+                        let _ = h.map_subwindow(origin, xid.as_raw());
                     }
                     let wants_focus = {
                         let s = lock_server(server)?;
@@ -5889,7 +5762,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut h) = host.lock()
                 {
-                    let _ = h.unmap_subwindow(xid.as_raw());
+                    let _ = h.unmap_subwindow(origin, xid.as_raw());
                 }
                 if let Some((parent, on_window, on_parent)) = snapshot {
                     fanout_event(&on_window, |buf, seq, order| {
@@ -5941,7 +5814,7 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.unmap_subwindow(xid.as_raw());
+                        let _ = h.unmap_subwindow(origin, xid.as_raw());
                     }
                     fanout_event(&item.on_child, |buf, seq, order| {
                         x11::encode_unmap_notify_event(
@@ -6037,6 +5910,7 @@ fn handle_request(
                         && let Ok(mut h) = host.lock()
                     {
                         let _ = h.configure_subwindow(
+                            origin,
                             xid.as_raw(),
                             HostSubwindowConfig {
                                 x: request.x,
@@ -6093,7 +5967,7 @@ fn handle_request(
                         let resized = old_size
                             .is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
                         if resized {
-                            invalidate_composite_named_pixmaps(server, host, window_id);
+                            invalidate_composite_named_pixmaps(origin, server, host, window_id);
                         }
                         let grew = old_size
                             .is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
@@ -6229,7 +6103,7 @@ fn handle_request(
                 "client {} #{} GetAtomName {}",
                 client_id.0, sequence.0, atom.0,
             );
-            handle_get_atom_name(server, host, writer, sequence, atom)
+            handle_get_atom_name(origin, server, host, writer, sequence, atom)
         }
         18 => {
             let Some(req) = x11::change_property_request(header.data, body) else {
@@ -6896,7 +6770,7 @@ fn handle_request(
         38 => {
             log_reply(client_id, sequence, "QueryPointer");
             let pointer = host
-                .and_then(|host| host.lock().ok()?.query_pointer().ok())
+                .and_then(|host| host.lock().ok()?.query_pointer(origin).ok())
                 .filter(|pointer| pointer.same_screen);
             let reply_data = if let Some(pointer) = pointer {
                 x11::QueryPointerReply {
@@ -6971,7 +6845,7 @@ fn handle_request(
                     && let Some(h) = host
                     && let Ok(mut h) = h.lock()
                 {
-                    let _ = h.warp_pointer(host_xid, x, y);
+                    let _ = h.warp_pointer(origin, host_xid, x, y);
                 }
             }
             log_void(client_id, sequence, "WarpPointer")
@@ -7016,7 +6890,7 @@ fn handle_request(
                 let host_result = if let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    match host.open_font(&request.name) {
+                    match host.open_font(origin, &request.name) {
                         Ok(pair) => Some(pair),
                         Err(err) => {
                             warn!(
@@ -7054,7 +6928,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    let _ = host.close_font(removed.host_xid.as_raw());
+                    let _ = host.close_font(origin, removed.host_xid.as_raw());
                 }
             }
             log_void(client_id, sequence, "CloseFont")
@@ -7089,7 +6963,8 @@ fn handle_request(
             if let Some(request) = x11::list_fonts_request(body)
                 && let Some(host) = host
                 && let Ok(mut host) = host.lock()
-                && let Ok(mut reply) = host.list_fonts_proxy(request.max_names, &request.pattern)
+                && let Ok(mut reply) =
+                    host.list_fonts_proxy(origin, request.max_names, &request.pattern)
             {
                 rewrite_reply_sequence(&mut reply, sequence);
                 lock_writer()?.write_all(&reply)?;
@@ -7102,7 +6977,7 @@ fn handle_request(
                 && let Some(host) = host
                 && let Ok(mut host) = host.lock()
                 && let Ok(replies) =
-                    host.list_fonts_with_info_proxy(request.max_names, &request.pattern)
+                    host.list_fonts_with_info_proxy(origin, request.max_names, &request.pattern)
             {
                 for mut reply in replies {
                     rewrite_reply_sequence(&mut reply, sequence);
@@ -7161,7 +7036,7 @@ fn handle_request(
                 let host_xid = if let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    match host.create_pixmap(request.depth, request.width, request.height) {
+                    match host.create_pixmap(origin, request.depth, request.width, request.height) {
                         Ok(handle) => Some(handle),
                         Err(err) => {
                             warn!("client {} host CreatePixmap failed: {err}", client_id.0);
@@ -7199,7 +7074,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.free_pixmap(xid.as_raw())?;
+                    host.free_pixmap(origin, xid.as_raw())?;
                 }
             }
             log_void(client_id, sequence, "FreePixmap")
@@ -7283,9 +7158,10 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
-                        host.clear_clip_rectangles()?;
+                        host.clear_clip_rectangles(origin)?;
                         if let Some(bg_host_xid) = bg_pixmap_host {
                             host.copy_area(
+                                origin,
                                 bg_host_xid,
                                 target.host_xid(),
                                 request.x,
@@ -7297,6 +7173,7 @@ fn handle_request(
                             )?;
                         } else {
                             host.fill_rectangle(
+                                origin,
                                 target.host_xid(),
                                 background_pixel,
                                 request.x,
@@ -7390,9 +7267,10 @@ fn handle_request(
                             && let Ok(mut host) = host.lock()
                         {
                             let state = draw_state.unwrap_or_default();
-                            host.apply_clip_state(&state.clip)?;
-                            host.apply_draw_state(&state)?;
+                            host.apply_clip_state(origin, &state.clip)?;
+                            host.apply_draw_state(origin, &state)?;
                             host.copy_area(
+                                origin,
                                 src.host_xid(),
                                 dst.host_xid(),
                                 request.src_x,
@@ -7448,9 +7326,10 @@ fn handle_request(
                         && let Ok(mut hh) = host_arc.lock()
                     {
                         let state = draw_state.unwrap_or_default();
-                        hh.apply_clip_state(&state.clip)?;
-                        hh.apply_draw_state(&state)?;
+                        hh.apply_clip_state(origin, &state.clip)?;
+                        hh.apply_draw_state(origin, &state)?;
                         hh.copy_plane(
+                            origin,
                             srct.host_xid(),
                             dstt.host_xid(),
                             sx,
@@ -7484,9 +7363,15 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_point(target.host_xid(), state.foreground, header.data, points)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_point(
+                        origin,
+                        target.host_xid(),
+                        state.foreground,
+                        header.data,
+                        points,
+                    )?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7508,9 +7393,15 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_line(target.host_xid(), state.foreground, header.data, points)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_line(
+                        origin,
+                        target.host_xid(),
+                        state.foreground,
+                        header.data,
+                        points,
+                    )?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7532,9 +7423,9 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_segment(target.host_xid(), state.foreground, segments)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_segment(origin, target.host_xid(), state.foreground, segments)?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7556,9 +7447,9 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_rectangle(target.host_xid(), state.foreground, rectangles)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_rectangle(origin, target.host_xid(), state.foreground, rectangles)?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7580,9 +7471,9 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_arc(target.host_xid(), state.foreground, arcs)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_arc(origin, target.host_xid(), state.foreground, arcs)?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7607,12 +7498,18 @@ fn handle_request(
                 {
                     let state = draw_state.unwrap_or_default();
                     let needs_fill_reset = !matches!(state.fill, FillState::Solid);
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_fill_state(&state.fill)?;
-                    host.apply_draw_state(&state)?;
-                    host.fill_poly(target.host_xid(), state.foreground, coord_mode, points)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_fill_state(origin, &state.fill)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.fill_poly(
+                        origin,
+                        target.host_xid(),
+                        state.foreground,
+                        coord_mode,
+                        points,
+                    )?;
                     if needs_fill_reset {
-                        let _ = host.set_gc_fill_solid();
+                        let _ = host.set_gc_fill_solid(origin);
                     }
                 }
                 accumulate_damage_full(server, drawable);
@@ -7636,14 +7533,19 @@ fn handle_request(
                 {
                     let state = draw_state.unwrap_or_default();
                     let needs_fill_reset = !matches!(state.fill, FillState::Solid);
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_fill_state(&state.fill)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_fill_rectangle(target.host_xid(), state.foreground, rectangles)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_fill_state(origin, &state.fill)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_fill_rectangle(
+                        origin,
+                        target.host_xid(),
+                        state.foreground,
+                        rectangles,
+                    )?;
                     // Reset shared host GC to Solid so unrelated draws don't
                     // inherit the tile.
                     if needs_fill_reset {
-                        let _ = host.set_gc_fill_solid();
+                        let _ = host.set_gc_fill_solid(origin);
                     }
                 }
                 accumulate_damage_full(server, drawable);
@@ -7667,12 +7569,12 @@ fn handle_request(
                 {
                     let state = draw_state.unwrap_or_default();
                     let needs_fill_reset = !matches!(state.fill, FillState::Solid);
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_fill_state(&state.fill)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_fill_arc(target.host_xid(), state.foreground, arcs)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_fill_state(origin, &state.fill)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_fill_arc(origin, target.host_xid(), state.foreground, arcs)?;
                     if needs_fill_reset {
-                        let _ = host.set_gc_fill_solid();
+                        let _ = host.set_gc_fill_solid(origin);
                     }
                 }
                 accumulate_damage_full(server, drawable);
@@ -7750,9 +7652,10 @@ fn handle_request(
                         && let Ok(mut host) = host.lock()
                     {
                         let state = draw_state.unwrap_or_default();
-                        host.apply_clip_state(&state.clip)?;
-                        host.apply_draw_state(&state)?;
+                        host.apply_clip_state(origin, &state.clip)?;
+                        host.apply_draw_state(origin, &state)?;
                         host.put_image(
+                            origin,
                             target.host_xid(),
                             request.depth,
                             request.width,
@@ -7796,6 +7699,7 @@ fn handle_request(
                 host.as_ref().and_then(|h| {
                     h.lock().ok().and_then(|mut h| {
                         h.get_image(
+                            origin,
                             xid,
                             req.format,
                             req.x,
@@ -7850,9 +7754,9 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_text8(target.host_xid(), state.foreground, text_body)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_text8(origin, target.host_xid(), state.foreground, text_body)?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7873,9 +7777,9 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
-                    host.poly_text16(target.host_xid(), state.foreground, text_body)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
+                    host.poly_text16(origin, target.host_xid(), state.foreground, text_body)?;
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7898,9 +7802,10 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
                     host.image_text8(
+                        origin,
                         target.host_xid(),
                         state.foreground,
                         state.background,
@@ -7929,9 +7834,10 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     let state = draw_state.unwrap_or_default();
-                    host.apply_clip_state(&state.clip)?;
-                    host.apply_draw_state(&state)?;
+                    host.apply_clip_state(origin, &state.clip)?;
+                    host.apply_draw_state(origin, &state)?;
                     host.image_text16(
+                        origin,
                         target.host_xid(),
                         state.foreground,
                         state.background,
@@ -8038,7 +7944,7 @@ fn handle_request(
                     && let Some(host) = host
                     && let Ok(mut h) = host.lock()
                 {
-                    match h.create_cursor(src_host, mask_host, fore, back, hot_x, hot_y) {
+                    match h.create_cursor(origin, src_host, mask_host, fore, back, hot_x, hot_y) {
                         Ok(handle) => {
                             let mut s = lock_server(server)?;
                             s.resources.set_cursor_host_xid(cursor_id, handle);
@@ -8138,9 +8044,10 @@ fn handle_request(
             log_reply(client_id, sequence, "GetKeyboardMapping");
             let first_keycode = body.first().copied().unwrap_or(8);
             let keycode_count = body.get(1).copied().unwrap_or(0);
-            let proxied = host
-                .and_then(|h| h.lock().ok())
-                .and_then(|mut h| h.get_keyboard_mapping(first_keycode, keycode_count).ok());
+            let proxied = host.and_then(|h| h.lock().ok()).and_then(|mut h| {
+                h.get_keyboard_mapping(origin, first_keycode, keycode_count)
+                    .ok()
+            });
             if let Some((kpc, keysyms)) = proxied {
                 x11::write_get_keyboard_mapping_reply_from_keysyms(
                     &mut *lock_writer()?,
@@ -8179,7 +8086,7 @@ fn handle_request(
             log_reply(client_id, sequence, "GetModifierMapping");
             let proxied = host
                 .and_then(|h| h.lock().ok())
-                .and_then(|mut h| h.get_modifier_mapping().ok());
+                .and_then(|mut h| h.get_modifier_mapping(origin).ok());
             if let Some((kpm, keycodes)) = proxied {
                 x11::write_get_modifier_mapping_reply_with_keycodes(
                     &mut *lock_writer()?,
@@ -8201,6 +8108,7 @@ fn handle_request(
             body,
         ),
         RENDER_MAJOR_OPCODE => handle_render_request(
+            origin,
             client_id,
             server,
             host,
@@ -8210,6 +8118,7 @@ fn handle_request(
             body,
         ),
         XFIXES_MAJOR_OPCODE => handle_xfixes_request(
+            origin,
             client_id,
             server,
             host,
@@ -8219,6 +8128,7 @@ fn handle_request(
             body,
         ),
         SHAPE_MAJOR_OPCODE => handle_shape_request(
+            origin,
             client_id,
             server,
             host,
@@ -8244,6 +8154,7 @@ fn handle_request(
             body,
         ),
         COMPOSITE_MAJOR_OPCODE => handle_composite_request(
+            origin,
             client_id,
             server,
             host,
@@ -8253,6 +8164,7 @@ fn handle_request(
             body,
         ),
         PRESENT_MAJOR_OPCODE => handle_present_request(
+            origin,
             client_id,
             server,
             host,
@@ -8262,6 +8174,7 @@ fn handle_request(
             body,
         ),
         MIT_SHM_MAJOR_OPCODE => handle_mit_shm_request(
+            origin,
             client_id,
             server,
             host,
@@ -8322,7 +8235,7 @@ fn handle_request(
             }
             let reply = host
                 .and_then(|h| h.lock().ok())
-                .and_then(|mut h| h.xkb_proxy(minor, body).ok())
+                .and_then(|mut h| h.xkb_proxy(origin, minor, body).ok())
                 .flatten();
             if let Some(mut bytes) = reply {
                 // Patch the sequence number in the reply to match the client's.
@@ -9296,6 +9209,7 @@ mod tests {
             for minor in [x11xfixes::HIDE_CURSOR, x11xfixes::SHOW_CURSOR] {
                 assert!(
                     handle_xfixes_request(
+                        None,
                         ClientId(1),
                         &server,
                         None,
@@ -9318,6 +9232,7 @@ mod tests {
             body[4..8].copy_from_slice(&1u32.to_le_bytes());
             body[8..12].copy_from_slice(&7u32.to_le_bytes());
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9334,6 +9249,7 @@ mod tests {
             }
             body[8..12].copy_from_slice(&0u32.to_le_bytes());
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9358,6 +9274,7 @@ mod tests {
             body[0..4].copy_from_slice(&0x200u32.to_le_bytes());
             body[4..8].copy_from_slice(&3u32.to_le_bytes());
             handle_xfixes_request(
+                None,
                 ClientId(2),
                 &server,
                 None,
@@ -9376,6 +9293,7 @@ mod tests {
             }
             body[4..8].copy_from_slice(&0u32.to_le_bytes());
             handle_xfixes_request(
+                None,
                 ClientId(2),
                 &server,
                 None,
@@ -9400,6 +9318,7 @@ mod tests {
             let writer = make_writer();
             let server = make_server();
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9413,6 +9332,7 @@ mod tests {
             let mut body2 = [0u8; 4];
             body2[0..4].copy_from_slice(&0x300u32.to_le_bytes());
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9430,6 +9350,7 @@ mod tests {
             let writer = make_writer();
             let server = make_server();
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9440,6 +9361,7 @@ mod tests {
             )
             .unwrap();
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9461,6 +9383,7 @@ mod tests {
             body[0..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
             assert!(
                 handle_xfixes_request(
+                    None,
                     ClientId(1),
                     &server,
                     None,
@@ -9479,6 +9402,7 @@ mod tests {
             let writer = make_writer();
             let server = make_server();
             handle_xfixes_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9489,6 +9413,7 @@ mod tests {
             )
             .unwrap();
             handle_xfixes_request(
+                None,
                 ClientId(2),
                 &server,
                 None,
@@ -9618,6 +9543,7 @@ mod tests {
             }];
             let body = rectangles_body(dest.0, &rects);
             handle_shape_request(
+                None,
                 ClientId(1),
                 &server,
                 None, // host mirror is no-op here; we test local resolved state
@@ -9669,6 +9595,7 @@ mod tests {
                 height: 10,
             };
             handle_shape_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9687,6 +9614,7 @@ mod tests {
                 height: 60,
             };
             handle_shape_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9697,6 +9625,7 @@ mod tests {
             )
             .unwrap();
             handle_shape_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -9735,11 +9664,10 @@ mod tests {
             sync::{Arc, Mutex, atomic::AtomicU16},
         };
 
-        use super::super::handle_host_container_resize;
         use crate::{
             host_x11::HostConfigureEvent,
             resources::ROOT_WINDOW,
-            server::{ClientHandle, ServerState},
+            server::{ClientHandle, ServerState, handle_host_container_resize},
         };
         use yserver_protocol::x11::ClientByteOrder;
 
@@ -10142,6 +10070,7 @@ mod tests {
             let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
             let writer = Arc::new(Mutex::new(writer_local));
             handle_composite_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -10193,6 +10122,7 @@ mod tests {
             let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
             let writer = Arc::new(Mutex::new(writer_local));
             handle_composite_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -10218,6 +10148,7 @@ mod tests {
             let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
             let writer = Arc::new(Mutex::new(writer_local));
             handle_composite_request(
+                None,
                 ClientId(1),
                 &server,
                 None, // no host -> cannot satisfy NameWindowPixmap
@@ -10275,7 +10206,7 @@ mod tests {
                     height: 100,
                 });
             }
-            invalidate_composite_named_pixmaps(&server, None, window);
+            invalidate_composite_named_pixmaps(None, &server, None, window);
             let s = server.lock().unwrap();
             assert!(s.resources.pixmap(p1).is_none(), "p1 freed locally");
             assert!(s.resources.pixmap(p2).is_none(), "p2 freed locally");
@@ -10333,7 +10264,6 @@ mod tests {
             handle_request(
                 ClientId(1),
                 &server,
-                None,
                 None,
                 &writer,
                 &focused_window,
@@ -10514,7 +10444,6 @@ mod tests {
                     ClientId(1),
                     &server,
                     None,
-                    None,
                     &writer,
                     &focused_window,
                     SequenceNumber(i as u16),
@@ -10551,6 +10480,7 @@ mod tests {
             let (writer_local, mut reader_remote) = UnixStream::pair().unwrap();
             let writer = Arc::new(Mutex::new(writer_local));
             handle_composite_request(
+                None,
                 ClientId(1),
                 &server,
                 None,
@@ -10681,7 +10611,6 @@ mod tests {
                 client,
                 &server,
                 host_arc,
-                None,
                 &writer,
                 &focused,
                 SequenceNumber(1),
@@ -10733,7 +10662,6 @@ mod tests {
                 client,
                 &server,
                 host_arc,
-                None,
                 &writer,
                 &focused,
                 SequenceNumber(1),
@@ -10760,7 +10688,6 @@ mod tests {
                 client,
                 &server,
                 host_arc,
-                None,
                 &writer,
                 &focused,
                 SequenceNumber(2),
@@ -10807,7 +10734,6 @@ mod tests {
                 client,
                 &server,
                 host_arc,
-                None,
                 &writer,
                 &focused,
                 SequenceNumber(1),
@@ -10831,7 +10757,6 @@ mod tests {
                 client,
                 &server,
                 host_arc,
-                None,
                 &writer,
                 &focused,
                 SequenceNumber(2),

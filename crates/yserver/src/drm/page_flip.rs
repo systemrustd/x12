@@ -17,14 +17,9 @@ use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, framebuffer,
 };
 
-use crate::drm::Device;
-use crate::drm::modeset::Output;
+use crate::drm::{Device, modeset::Output};
 
-pub fn submit_flip(
-    device: &Device,
-    output: &Output,
-    fb_id: framebuffer::Handle,
-) -> io::Result<()> {
+pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
     let mut req = AtomicModeReq::new();
     req.add_raw_property(
         output.plane.into(),

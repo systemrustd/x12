@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::io;
+use std::{collections::HashMap, io};
 
 use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, PlaneType,
@@ -95,9 +94,7 @@ pub fn discover_output(device: &Device) -> io::Result<Output> {
         .current_encoder()
         .or_else(|| connector_info.encoders().first().copied())
         .ok_or_else(|| {
-            io::Error::other(format!(
-                "connector {connector_name} has no usable encoder",
-            ))
+            io::Error::other(format!("connector {connector_name} has no usable encoder",))
         })?;
     let encoder = device.get_encoder(encoder_handle)?;
     let crtc = encoder
@@ -148,7 +145,10 @@ fn pick_primary_plane(
 ) -> io::Result<plane::Handle> {
     for handle in device.plane_handles()? {
         let info = device.get_plane(handle)?;
-        if !resources.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+        if !resources
+            .filter_crtcs(info.possible_crtcs())
+            .contains(&crtc)
+        {
             continue;
         }
         let props = device.get_properties(handle)?;
@@ -225,23 +225,11 @@ pub fn disable_output(device: &Device, output: &Output) -> io::Result<()> {
     let crtc_props = PropMap::for_object(device, output.crtc)?;
 
     let mut req = AtomicModeReq::new();
-    req.add_raw_property(
-        output.plane.into(),
-        output.plane_fb_id_prop,
-        0,
-    );
-    req.add_raw_property(
-        output.plane.into(),
-        output.plane_crtc_id_prop,
-        0,
-    );
+    req.add_raw_property(output.plane.into(), output.plane_fb_id_prop, 0);
+    req.add_raw_property(output.plane.into(), output.plane_crtc_id_prop, 0);
     req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 0);
     req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, 0);
-    req.add_raw_property(
-        output.connector.into(),
-        connector_props.id("CRTC_ID")?,
-        0,
-    );
+    req.add_raw_property(output.connector.into(), connector_props.id("CRTC_ID")?, 0);
 
     device
         .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
@@ -278,11 +266,7 @@ pub fn commit_modeset(
         connector_props.id("CRTC_ID")?,
         u64::from(crtc_id_raw),
     );
-    req.add_raw_property(
-        output.crtc.into(),
-        crtc_props.id("MODE_ID")?,
-        mode_blob_raw,
-    );
+    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, mode_blob_raw);
     req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 1);
     req.add_raw_property(
         output.plane.into(),

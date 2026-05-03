@@ -9,14 +9,22 @@ use std::{
     time::Instant,
 };
 
+use log::{debug, info, warn};
 use yserver_protocol::x11::{
-    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
+    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, randr as x11randr, shape,
+    xfixes,
 };
 
-use crate::{randr::RandrState, resources::ResourceTable};
+use crate::{
+    backend::{BackendEvent, BackendEventSink},
+    host_x11::{HostConfigureEvent, HostEvent, HostXidMap},
+    randr::RandrState,
+    resources::{ROOT_WINDOW, ResourceTable},
+};
 
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
 pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
+const RANDR_FIRST_EVENT: u8 = 89;
 
 #[derive(Debug)]
 pub struct IdAllocator {
@@ -771,6 +779,187 @@ pub fn emit_window_event(
         Err(_) => return,
     };
     fanout_event(&targets, encode);
+}
+
+#[derive(Clone)]
+pub(crate) struct HostPumpEventSink {
+    server: Arc<Mutex<ServerState>>,
+    xid_map: HostXidMap,
+    container_window_id: u32,
+}
+
+pub(crate) fn host_pump_event_sink(
+    server: Arc<Mutex<ServerState>>,
+    xid_map: HostXidMap,
+    container_window_id: u32,
+) -> HostPumpEventSink {
+    HostPumpEventSink {
+        server,
+        xid_map,
+        container_window_id,
+    }
+}
+
+impl BackendEventSink for HostPumpEventSink {
+    fn handle_backend_event(&mut self, event: BackendEvent) {
+        match event {
+            BackendEvent::HostEvent(HostEvent::Key(_)) => {}
+            BackendEvent::HostEvent(HostEvent::Pointer(ev)) => {
+                pointer_event_fanout(&self.server, &self.xid_map, ev);
+            }
+            BackendEvent::HostEvent(HostEvent::Expose(ev)) => {
+                crate::nested::expose_event_fanout(&self.server, &self.xid_map, ev);
+            }
+            BackendEvent::HostEvent(HostEvent::Configure(ev)) => {
+                if ev.host_xid == self.container_window_id {
+                    handle_host_container_resize(&self.server, ev);
+                }
+            }
+            BackendEvent::HostEvent(HostEvent::Closed) => {
+                info!("host window closed, exiting");
+                std::process::exit(0);
+            }
+            BackendEvent::HostError { origin, error } => {
+                warn!("host backend error origin={origin:?}: {error}");
+            }
+        }
+    }
+}
+
+pub(crate) fn handle_host_container_resize(
+    server: &Arc<Mutex<ServerState>>,
+    ev: HostConfigureEvent,
+) {
+    #[allow(clippy::type_complexity)]
+    let update = {
+        let mut s = match server.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if ev.width == 0
+            || ev.height == 0
+            || (s.randr.screen_width == ev.width && s.randr.screen_height == ev.height)
+        {
+            return;
+        }
+
+        let timestamp = s.timestamp_now();
+        s.randr.resize(timestamp, ev.width, ev.height);
+        if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
+            root.width = ev.width;
+            root.height = ev.height;
+        }
+
+        let width_mm = u16::try_from(s.randr.width_mm).unwrap_or(u16::MAX);
+        let height_mm = u16::try_from(s.randr.height_mm).unwrap_or(u16::MAX);
+        let targets = s
+            .randr_select_masks
+            .iter()
+            .filter_map(|((owner, window), mask)| {
+                s.client_target(ClientId(*owner))
+                    .map(|target| (target, *window, *mask))
+            })
+            .collect::<Vec<_>>();
+
+        Some((timestamp, ev.width, ev.height, width_mm, height_mm, targets))
+    };
+
+    let Some((timestamp, width, height, width_mm, height_mm, targets)) = update else {
+        return;
+    };
+
+    debug!(
+        "host container resized to {}x{} at {}, emitting RANDR updates",
+        width, height, timestamp
+    );
+
+    // Spec-correct: emit a core ConfigureNotify on root *before* the RANDR
+    // fanout so non-RANDR-aware clients (panels, "fill the screen" apps)
+    // reflow at the same point in the event stream that RANDR-aware toolkits
+    // see screen-change. Subscribers selected via StructureNotifyMask on root.
+    emit_window_event(
+        server,
+        ROOT_WINDOW,
+        0x0002_0000, // StructureNotifyMask
+        |buf, seq, order| {
+            x11::encode_configure_notify_event(
+                buf,
+                seq,
+                order,
+                ROOT_WINDOW,
+                ROOT_WINDOW,
+                x11::Geometry {
+                    root: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    border_width: 0,
+                    depth: 24,
+                },
+                false,
+            );
+        },
+    );
+
+    for (target, request_window, mask) in targets {
+        let sequence = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
+            let event = x11randr::encode_screen_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::ScreenChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    root: ROOT_WINDOW.0,
+                    request_window: request_window.0,
+                    width,
+                    height,
+                    width_mm,
+                    height_mm,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
+            let event = x11randr::encode_crtc_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::CrtcChangeNotify {
+                    timestamp,
+                    request_window: request_window.0,
+                    crtc: crate::randr::CRTC_ID,
+                    mode: crate::randr::MODE_ID,
+                    x: ev.x,
+                    y: ev.y,
+                    width,
+                    height,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+            let event = x11randr::encode_output_change_notify_event(
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::OutputChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    request_window: request_window.0,
+                    output: crate::randr::OUTPUT_ID,
+                    crtc: crate::randr::CRTC_ID,
+                    mode: crate::randr::MODE_ID,
+                },
+            );
+            if let Ok(mut writer) = target.writer.lock() {
+                let _ = writer.write_all(&event);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]

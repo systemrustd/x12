@@ -2,12 +2,15 @@ pub mod drm;
 pub mod input;
 pub mod present;
 
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::{
+    io,
+    sync::{Arc, atomic::AtomicBool},
+};
 
-use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
-use nix::sys::signalfd::SignalFd;
+use nix::sys::{
+    signal::{SigSet, SigmaskHow, Signal, sigprocmask},
+    signalfd::SignalFd,
+};
 
 use crate::present::State;
 
@@ -123,9 +126,8 @@ fn open_drm_device() -> io::Result<drm::Device> {
             Err(err) => return Err(err),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no DRM card devices found")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DRM card devices found")))
 }
 
 fn block_termination_signals() -> io::Result<SignalFd> {

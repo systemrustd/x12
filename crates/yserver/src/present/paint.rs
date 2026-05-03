@@ -3,8 +3,10 @@
 //! `state.cursor_*`. Naive bounds-checked write loops; not optimised
 //! because it's about to be deleted in C.
 
-use crate::drm::Buffer;
-use crate::present::state::{CURSOR_SIZE, RECT_SIZE, State};
+use crate::{
+    drm::Buffer,
+    present::state::{CURSOR_SIZE, RECT_SIZE, State},
+};
 
 const BACKGROUND: u32 = 0x0020_2020;
 const MAGENTA: u32 = 0x00FF_0080;

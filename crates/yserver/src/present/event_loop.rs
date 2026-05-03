@@ -9,18 +9,26 @@
 //! Step 12 layers a signalfd into the epoll set as the primary
 //! shutdown signal with the flag retained as backup.
 
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::{
+    io,
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
-use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
-use nix::sys::signalfd::SignalFd;
+use nix::sys::{
+    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
+    signalfd::SignalFd,
+};
 
-use crate::drm::{self, Device, Swapchain};
-use crate::input::{self, InputEvent};
-use crate::present::{self, State};
+use crate::{
+    drm::{self, Device, Swapchain},
+    input::{self, InputEvent},
+    present::{self, State},
+};
 
 const DRM_TOKEN: u64 = 1;
 const INPUT_TOKEN: u64 = 2;
@@ -128,8 +136,6 @@ pub fn run_loop(
         }
     }
 
-    log::info!(
-        "yserver: loop exit — {completed_flips} flips, {input_events} input events"
-    );
+    log::info!("yserver: loop exit — {completed_flips} flips, {input_events} input events");
     Ok(())
 }

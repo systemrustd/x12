@@ -19,16 +19,23 @@
 
 #![cfg(test)]
 
-use std::{io, sync::Mutex};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, Mutex},
+};
 
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, xfixes};
+use crossbeam_channel::Sender;
+use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle,
-        GlyphSetHandle, PictureHandle, PixmapHandle, WindowHandle,
+        GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, WindowHandle,
     },
-    host_x11::{HostSubwindowConfig, HostSubwindowVisual, PointerPosition},
+    host_x11::{
+        HostKeyEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition,
+    },
 };
 
 /// Records each method call. Variants are added on demand; tests
@@ -63,6 +70,20 @@ pub enum RecordedCall {
         value_mask: u32,
         values: Vec<u32>,
     },
+    UpdateHostEventMask {
+        host_xid: u32,
+        mask: u32,
+        enabled: bool,
+    },
+    RegisterTopLevel {
+        nested_id: ResourceId,
+        host_xid: u32,
+    },
+    RegisterSubwindow {
+        nested_id: ResourceId,
+        host_xid: u32,
+    },
+    UnregisterHostWindow(u32),
     CreatePixmap {
         depth: u8,
         width: u16,
@@ -83,6 +104,10 @@ pub struct RecordingBackend {
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
+    /// Phase 6.3 Step 4: shared `host_xid → ResourceId` map exposed
+    /// through `Backend::xid_map`. Tests inspect it via `Backend`'s
+    /// trait surface.
+    xid_map: HostXidMap,
 }
 
 impl Default for RecordingBackend {
@@ -98,6 +123,7 @@ impl RecordingBackend {
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
+            xid_map: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -157,15 +183,18 @@ impl Backend for RecordingBackend {
         None
     }
 
-    fn ping(&mut self) -> io::Result<()> {
+    fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.record(RecordedCall::Ping);
         Ok(())
     }
+
+    fn set_event_sink(&mut self, _sink: Option<Box<dyn crate::backend::BackendEventSink>>) {}
 
     // Subwindow lifecycle
 
     fn create_subwindow(
         &mut self,
+        _origin: Option<OriginContext>,
         host_parent: WindowHandle,
         x: i16,
         y: i16,
@@ -190,23 +219,28 @@ impl Backend for RecordingBackend {
         Ok(WindowHandle::from_raw_panicking(xid))
     }
 
-    fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+    fn destroy_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
         self.record(RecordedCall::DestroySubwindow(host_xid));
         Ok(())
     }
 
-    fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+    fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::MapSubwindow(host_xid));
         Ok(())
     }
 
-    fn unmap_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+    fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::UnmapSubwindow(host_xid));
         Ok(())
     }
 
     fn configure_subwindow(
         &mut self,
+        _origin: Option<OriginContext>,
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
@@ -216,6 +250,7 @@ impl Backend for RecordingBackend {
 
     fn reparent_subwindow(
         &mut self,
+        _origin: Option<OriginContext>,
         host_xid: u32,
         host_parent: u32,
         x: i16,
@@ -232,6 +267,7 @@ impl Backend for RecordingBackend {
 
     fn change_subwindow_attributes(
         &mut self,
+        _origin: Option<OriginContext>,
         host_xid: u32,
         value_mask: u32,
         values: &[u32],
@@ -244,11 +280,84 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn name_window_pixmap(&mut self, _host_window: WindowHandle) -> io::Result<PixmapHandle> {
+    fn update_host_event_mask(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        mask: u32,
+        enabled: bool,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::UpdateHostEventMask {
+            host_xid,
+            mask,
+            enabled,
+        });
+        Ok(())
+    }
+
+    fn register_top_level(
+        &mut self,
+        _origin: Option<OriginContext>,
+        nested_id: ResourceId,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if let Ok(mut map) = self.xid_map.lock() {
+            map.insert(host_xid, nested_id);
+        }
+        self.record(RecordedCall::RegisterTopLevel {
+            nested_id,
+            host_xid,
+        });
+        Ok(())
+    }
+
+    fn register_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        nested_id: ResourceId,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if let Ok(mut map) = self.xid_map.lock() {
+            map.insert(host_xid, nested_id);
+        }
+        self.record(RecordedCall::RegisterSubwindow {
+            nested_id,
+            host_xid,
+        });
+        Ok(())
+    }
+
+    fn unregister_host_window(&mut self, host_xid: u32) {
+        if let Ok(mut map) = self.xid_map.lock() {
+            map.remove(&host_xid);
+        }
+        self.record(RecordedCall::UnregisterHostWindow(host_xid));
+    }
+
+    fn xid_map(&self) -> HostXidMap {
+        Arc::clone(&self.xid_map)
+    }
+
+    fn add_key_subscriber(&mut self, _tx: Sender<HostKeyEvent>) {
+        // RecordingBackend doesn't have a dispatcher; tests that need
+        // to drive kb fanout do so directly through their own channel.
+    }
+
+    fn name_window_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_window: WindowHandle,
+    ) -> io::Result<PixmapHandle> {
         unimplemented!("RecordingBackend: name_window_pixmap not implemented for the current tests")
     }
 
-    fn create_pixmap(&mut self, depth: u8, width: u16, height: u16) -> io::Result<PixmapHandle> {
+    fn create_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        depth: u8,
+        width: u16,
+        height: u16,
+    ) -> io::Result<PixmapHandle> {
         let xid = self.allocate_handle();
         self.record(RecordedCall::CreatePixmap {
             depth,
@@ -258,12 +367,16 @@ impl Backend for RecordingBackend {
         Ok(PixmapHandle::from_raw_panicking(xid))
     }
 
-    fn free_pixmap(&mut self, host_xid: u32) -> io::Result<()> {
+    fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())
     }
 
-    fn open_font(&mut self, name: &str) -> io::Result<(FontHandle, FontMetrics)> {
+    fn open_font(
+        &mut self,
+        _origin: Option<OriginContext>,
+        name: &str,
+    ) -> io::Result<(FontHandle, FontMetrics)> {
         let xid = self.allocate_handle();
         self.record(RecordedCall::OpenFont(name.to_string()));
         // FontMetrics is private to the protocol crate; return a Default-ish
@@ -272,13 +385,14 @@ impl Backend for RecordingBackend {
         Ok((FontHandle::from_raw_panicking(xid), FontMetrics::default()))
     }
 
-    fn close_font(&mut self, host_xid: u32) -> io::Result<()> {
+    fn close_font(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::CloseFont(host_xid));
         Ok(())
     }
 
     fn create_cursor(
         &mut self,
+        _origin: Option<OriginContext>,
         _source_pixmap: PixmapHandle,
         _mask_pixmap: Option<PixmapHandle>,
         _fore: (u16, u16, u16),
@@ -290,32 +404,50 @@ impl Backend for RecordingBackend {
         Ok(CursorHandle::from_raw_panicking(xid))
     }
 
-    fn define_cursor(&mut self, _host_window_xid: u32, _cursor_host_xid: u32) -> io::Result<()> {
+    fn define_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_window_xid: u32,
+        _cursor_host_xid: u32,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn set_container_background_pixel(&mut self, pixel: u32) -> io::Result<()> {
+    fn set_container_background_pixel(
+        &mut self,
+        _origin: Option<OriginContext>,
+        pixel: u32,
+    ) -> io::Result<()> {
         self.record(RecordedCall::SetContainerBackgroundPixel(pixel));
         Ok(())
     }
 
-    fn set_container_background_pixmap(&mut self, host_pixmap_xid: u32) -> io::Result<()> {
+    fn set_container_background_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_pixmap_xid: u32,
+    ) -> io::Result<()> {
         self.record(RecordedCall::SetContainerBackgroundPixmap(host_pixmap_xid));
         Ok(())
     }
 
     // GC state — silently no-op for tests that drive lifecycle paths.
 
-    fn clear_clip_rectangles(&mut self) -> io::Result<()> {
+    fn clear_clip_rectangles(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         Ok(())
     }
 
-    fn set_clip_rectangles(&mut self, _clip: Option<ClipRectangles>) -> io::Result<()> {
+    fn set_clip_rectangles(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _clip: Option<ClipRectangles>,
+    ) -> io::Result<()> {
         Ok(())
     }
 
     fn set_clip_pixmap(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_pixmap: u32,
         _clip_x_origin: i16,
         _clip_y_origin: i16,
@@ -323,12 +455,13 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn set_gc_fill_solid(&mut self) -> io::Result<()> {
+    fn set_gc_fill_solid(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         Ok(())
     }
 
     fn set_gc_fill_tiled(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_pixmap: u32,
         _tile_x_origin: i16,
         _tile_y_origin: i16,
@@ -336,15 +469,27 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn apply_clip_state(&mut self, _clip: &ClipState) -> io::Result<()> {
+    fn apply_clip_state(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _clip: &ClipState,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn apply_fill_state(&mut self, _fill: &FillState) -> io::Result<()> {
+    fn apply_fill_state(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _fill: &FillState,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn apply_draw_state(&mut self, _state: &DrawState) -> io::Result<()> {
+    fn apply_draw_state(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _state: &DrawState,
+    ) -> io::Result<()> {
         Ok(())
     }
 
@@ -354,6 +499,7 @@ impl Backend for RecordingBackend {
 
     fn copy_area(
         &mut self,
+        _origin: Option<OriginContext>,
         _src_host_xid: u32,
         _dst_host_xid: u32,
         _src_x: i16,
@@ -368,6 +514,7 @@ impl Backend for RecordingBackend {
 
     fn copy_plane(
         &mut self,
+        _origin: Option<OriginContext>,
         _src_host_xid: u32,
         _dst_host_xid: u32,
         _src_x: i16,
@@ -383,6 +530,7 @@ impl Backend for RecordingBackend {
 
     fn put_image(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _depth: u8,
         _width: u16,
@@ -396,6 +544,7 @@ impl Backend for RecordingBackend {
 
     fn get_image(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _format: u8,
         _x: i16,
@@ -409,6 +558,7 @@ impl Backend for RecordingBackend {
 
     fn poly_line(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _coordinate_mode: u8,
@@ -419,6 +569,7 @@ impl Backend for RecordingBackend {
 
     fn poly_segment(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _segments: &[u8],
@@ -428,6 +579,7 @@ impl Backend for RecordingBackend {
 
     fn poly_rectangle(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _rectangles: &[u8],
@@ -435,12 +587,19 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: poly_rectangle")
     }
 
-    fn poly_arc(&mut self, _host_xid: u32, _foreground: u32, _arcs: &[u8]) -> io::Result<()> {
+    fn poly_arc(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _foreground: u32,
+        _arcs: &[u8],
+    ) -> io::Result<()> {
         unimplemented!("RecordingBackend: poly_arc")
     }
 
     fn poly_point(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _coordinate_mode: u8,
@@ -451,6 +610,7 @@ impl Backend for RecordingBackend {
 
     fn poly_fill_rectangle(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _rectangles: &[u8],
@@ -458,12 +618,19 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: poly_fill_rectangle")
     }
 
-    fn poly_fill_arc(&mut self, _host_xid: u32, _foreground: u32, _arcs: &[u8]) -> io::Result<()> {
+    fn poly_fill_arc(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _foreground: u32,
+        _arcs: &[u8],
+    ) -> io::Result<()> {
         unimplemented!("RecordingBackend: poly_fill_arc")
     }
 
     fn fill_poly(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _coord_mode: u8,
@@ -474,6 +641,7 @@ impl Backend for RecordingBackend {
 
     fn fill_rectangle(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _x: i16,
@@ -484,16 +652,29 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: fill_rectangle")
     }
 
-    fn poly_text8(&mut self, _host_xid: u32, _foreground: u32, _body: &[u8]) -> io::Result<()> {
+    fn poly_text8(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _foreground: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
         unimplemented!("RecordingBackend: poly_text8")
     }
 
-    fn poly_text16(&mut self, _host_xid: u32, _foreground: u32, _body: &[u8]) -> io::Result<()> {
+    fn poly_text16(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _foreground: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
         unimplemented!("RecordingBackend: poly_text16")
     }
 
     fn image_text8(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _background: u32,
@@ -505,6 +686,7 @@ impl Backend for RecordingBackend {
 
     fn image_text16(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _foreground: u32,
         _background: u32,
@@ -519,6 +701,7 @@ impl Backend for RecordingBackend {
 
     fn render_create_picture(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_drawable: AnyHandle,
         _ynest_format: u32,
         _value_mask: u32,
@@ -527,32 +710,60 @@ impl Backend for RecordingBackend {
         Ok(None)
     }
 
-    fn render_change_picture(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+    fn render_change_picture(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_pic: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_free_picture(&mut self, _host_pic: u32) -> io::Result<()> {
+    fn render_free_picture(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_pic: u32,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_create_glyphset(&mut self, _ynest_format: u32) -> io::Result<Option<GlyphSetHandle>> {
+    fn render_create_glyphset(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _ynest_format: u32,
+    ) -> io::Result<Option<GlyphSetHandle>> {
         Ok(None)
     }
 
-    fn render_free_glyphset(&mut self, _host_gs: u32) -> io::Result<()> {
+    fn render_free_glyphset(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_gs: u32,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_add_glyphs(&mut self, _host_gs: u32, _body_tail: &[u8]) -> io::Result<()> {
+    fn render_add_glyphs(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_gs: u32,
+        _body_tail: &[u8],
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_free_glyphs(&mut self, _host_gs: u32, _glyph_ids: &[u8]) -> io::Result<()> {
+    fn render_free_glyphs(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_gs: u32,
+        _glyph_ids: &[u8],
+    ) -> io::Result<()> {
         Ok(())
     }
 
     fn render_composite(
         &mut self,
+        _origin: Option<OriginContext>,
         _op: u8,
         _host_src: u32,
         _host_mask: u32,
@@ -571,6 +782,7 @@ impl Backend for RecordingBackend {
 
     fn render_composite_glyphs(
         &mut self,
+        _origin: Option<OriginContext>,
         _minor: u8,
         _op: u8,
         _host_src: u32,
@@ -588,6 +800,7 @@ impl Backend for RecordingBackend {
 
     fn render_fill_rectangles(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_dst: u32,
         _op: u8,
         _color: [u8; 8],
@@ -600,6 +813,7 @@ impl Backend for RecordingBackend {
 
     fn render_trapezoids(
         &mut self,
+        _origin: Option<OriginContext>,
         _op: u8,
         _host_src: u32,
         _host_dst: u32,
@@ -613,20 +827,33 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn render_create_solid_fill(&mut self, _color: [u8; 8]) -> io::Result<Option<PictureHandle>> {
+    fn render_create_solid_fill(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _color: [u8; 8],
+    ) -> io::Result<Option<PictureHandle>> {
         Ok(None)
     }
 
-    fn render_create_linear_gradient(&mut self, _body: &[u8]) -> io::Result<Option<PictureHandle>> {
+    fn render_create_linear_gradient(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _body: &[u8],
+    ) -> io::Result<Option<PictureHandle>> {
         Ok(None)
     }
 
-    fn render_create_radial_gradient(&mut self, _body: &[u8]) -> io::Result<Option<PictureHandle>> {
+    fn render_create_radial_gradient(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _body: &[u8],
+    ) -> io::Result<Option<PictureHandle>> {
         Ok(None)
     }
 
     fn render_create_cursor(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_src_pic: PictureHandle,
         _x: u16,
         _y: u16,
@@ -636,30 +863,47 @@ impl Backend for RecordingBackend {
 
     fn render_set_picture_clip_rectangles(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_set_picture_filter(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+    fn render_set_picture_filter(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_pic: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_set_picture_transform(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+    fn render_set_picture_transform(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_pic: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn render_query_version(&mut self) -> io::Result<(u32, u32)> {
+    fn render_query_version(&mut self, _origin: Option<OriginContext>) -> io::Result<(u32, u32)> {
         Ok((0, 11))
     }
 
-    fn xkb_proxy(&mut self, _minor: u8, _body: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    fn xkb_proxy(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _minor: u8,
+        _body: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
         Ok(None)
     }
 
     fn xfixes_change_cursor_by_name(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_cursor_xid: u32,
         _name_bytes: &[u8],
     ) -> io::Result<()> {
@@ -668,6 +912,7 @@ impl Backend for RecordingBackend {
 
     fn set_shape_rectangles(
         &mut self,
+        _origin: Option<OriginContext>,
         _host_xid: u32,
         _kind: u8,
         _rects: &[xfixes::RegionRect],
@@ -675,11 +920,17 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn warp_pointer(&mut self, _dst_host_xid: u32, _dst_x: i16, _dst_y: i16) -> io::Result<()> {
+    fn warp_pointer(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _dst_host_xid: u32,
+        _dst_x: i16,
+        _dst_y: i16,
+    ) -> io::Result<()> {
         Ok(())
     }
 
-    fn query_pointer(&mut self) -> io::Result<PointerPosition> {
+    fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
         Ok(PointerPosition {
             same_screen: true,
             win_x: 0,
@@ -688,25 +939,36 @@ impl Backend for RecordingBackend {
         })
     }
 
-    fn list_fonts_proxy(&mut self, _max_names: u16, _pattern: &str) -> io::Result<Vec<u8>> {
+    fn list_fonts_proxy(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _max_names: u16,
+        _pattern: &str,
+    ) -> io::Result<Vec<u8>> {
         // 32-byte stub reply header that downstream parsers can ignore.
         Ok(vec![0u8; 32])
     }
 
     fn list_fonts_with_info_proxy(
         &mut self,
+        _origin: Option<OriginContext>,
         _max_names: u16,
         _pattern: &str,
     ) -> io::Result<Vec<Vec<u8>>> {
         Ok(Vec::new())
     }
 
-    fn get_atom_name(&mut self, _atom: u32) -> io::Result<Option<String>> {
+    fn get_atom_name(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _atom: u32,
+    ) -> io::Result<Option<String>> {
         Ok(None)
     }
 
     fn get_keyboard_mapping(
         &mut self,
+        _origin: Option<OriginContext>,
         _first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
@@ -714,7 +976,10 @@ impl Backend for RecordingBackend {
         Ok((2, vec![0; usize::from(count) * 2]))
     }
 
-    fn get_modifier_mapping(&mut self) -> io::Result<(u8, Vec<u8>)> {
+    fn get_modifier_mapping(
+        &mut self,
+        _origin: Option<OriginContext>,
+    ) -> io::Result<(u8, Vec<u8>)> {
         Ok((0, Vec::new()))
     }
 }
@@ -738,6 +1003,7 @@ mod tests {
         let parent = WindowHandle::from_raw_panicking(g.window_id());
         let child = g
             .create_subwindow(
+                None,
                 parent,
                 10,
                 20,
@@ -749,9 +1015,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        g.map_subwindow(child.as_raw()).unwrap();
-        g.unmap_subwindow(child.as_raw()).unwrap();
-        g.destroy_subwindow(child.as_raw()).unwrap();
+        g.map_subwindow(None, child.as_raw()).unwrap();
+        g.unmap_subwindow(None, child.as_raw()).unwrap();
+        g.destroy_subwindow(None, child.as_raw()).unwrap();
     }
 
     #[test]
@@ -760,6 +1026,7 @@ mod tests {
         let parent = WindowHandle::from_raw_panicking(rec.window_id());
         let a = rec
             .create_subwindow(
+                None,
                 parent,
                 0,
                 0,
@@ -773,6 +1040,7 @@ mod tests {
             .unwrap();
         let b = rec
             .create_subwindow(
+                None,
                 parent,
                 0,
                 0,
@@ -784,9 +1052,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        rec.map_subwindow(a.as_raw()).unwrap();
-        rec.map_subwindow(b.as_raw()).unwrap();
-        rec.destroy_subwindow(a.as_raw()).unwrap();
+        rec.map_subwindow(None, a.as_raw()).unwrap();
+        rec.map_subwindow(None, b.as_raw()).unwrap();
+        rec.destroy_subwindow(None, a.as_raw()).unwrap();
 
         assert_ne!(a.as_raw(), b.as_raw(), "fresh handles each create");
         let calls = rec.calls();
@@ -809,5 +1077,72 @@ mod tests {
         assert!(matches!(calls[2], RecordedCall::MapSubwindow(_)));
         assert!(matches!(calls[3], RecordedCall::MapSubwindow(_)));
         assert!(matches!(calls[4], RecordedCall::DestroySubwindow(_)));
+    }
+
+    /// Phase 6.3 Step 4: `register_top_level` records the call AND
+    /// inserts into the shared `xid_map` so the dispatcher's sink
+    /// sees the new mapping. Replicates the contract `nested::run`
+    /// relies on after the merge.
+    #[test]
+    fn register_top_level_updates_xid_map_and_records() {
+        let mut rec = RecordingBackend::new();
+        let nested_id = ResourceId(0x100);
+        let host_xid = 0xdead_beef;
+        rec.register_top_level(None, nested_id, host_xid)
+            .expect("register_top_level");
+        // xid_map sees the new entry.
+        let map = rec.xid_map();
+        let g = map.lock().unwrap();
+        assert_eq!(g.get(&host_xid).copied(), Some(nested_id));
+        drop(g);
+        // Call is recorded with the same nested_id / host_xid.
+        let calls = rec.calls();
+        assert!(matches!(
+            calls.last().unwrap(),
+            RecordedCall::RegisterTopLevel {
+                nested_id: r,
+                host_xid: h
+            } if *r == nested_id && *h == host_xid
+        ));
+    }
+
+    /// Same shape for sub-windows — separate call variant so tests
+    /// can distinguish the top-level vs sub-window path.
+    #[test]
+    fn register_subwindow_updates_xid_map_and_records() {
+        let mut rec = RecordingBackend::new();
+        let nested_id = ResourceId(0x200);
+        let host_xid = 0xc0ff_eecc;
+        rec.register_subwindow(None, nested_id, host_xid)
+            .expect("register_subwindow");
+        let map = rec.xid_map();
+        assert_eq!(map.lock().unwrap().get(&host_xid).copied(), Some(nested_id),);
+        let calls = rec.calls();
+        assert!(matches!(
+            calls.last().unwrap(),
+            RecordedCall::RegisterSubwindow {
+                nested_id: r,
+                host_xid: h
+            } if *r == nested_id && *h == host_xid
+        ));
+    }
+
+    /// `unregister_host_window` clears the xid_map entry — stale
+    /// host events on a destroyed xid never resolve to a defunct
+    /// ResourceId.
+    #[test]
+    fn unregister_host_window_clears_xid_map_entry() {
+        let mut rec = RecordingBackend::new();
+        let nested_id = ResourceId(0x300);
+        let host_xid = 0xfeed_face;
+        rec.register_top_level(None, nested_id, host_xid).unwrap();
+        rec.unregister_host_window(host_xid);
+        let map = rec.xid_map();
+        assert!(map.lock().unwrap().get(&host_xid).is_none());
+        let calls = rec.calls();
+        assert!(matches!(
+            calls.last().unwrap(),
+            RecordedCall::UnregisterHostWindow(h) if *h == host_xid
+        ));
     }
 }

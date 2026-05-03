@@ -1245,7 +1245,7 @@ ran cleanly across all three WM smokes — zero log lines at
 creates / DrawState / module split / dyn trait) introduced no
 observable behavioural change.
 
-### Phase 6.3 — Pump / sink rework (planned)
+### Phase 6.3 — Pump / sink rework (complete)
 
 Goal: fold today's three host X11 connections (main + `HostInputPump`
 + per-client kb pumps) into one, behind a clean
@@ -1297,13 +1297,110 @@ events, role-transitions on reparent, create-then-register
 ordering. The unit test bench is the safety net for the merge
 mechanic — manual smoke alone is insufficient.
 
-Open design questions documented in v3 of Phase 6.2's design doc
-that need resolution before 6.3 starts: dispatch topology
-(single epoll on `yserver-core`'s main thread vs a backend pump
-thread feeding a queue), event-queue wakeup semantics, the
-`ReplyMap` wrap-promotion algorithm.
+#### Landed (branch `feature/phase-6-3-pump-sink-rework`)
 
-Not started.
+- **Step 1 — `BackendEventSink` + `OriginContext` plumbing.**
+  `OriginContext` threads through the `Backend` trait,
+  `HostX11Backend`'s trait impl, and every `nested.rs` host-call
+  path that issues a request on behalf of a client. Each trait
+  method that may produce an async host error now takes
+  `Option<OriginContext>`; the backend snapshots it onto the
+  issued sequence so a late error can be logged with the
+  originating `(client_id, nested_seq, opcode)` instead of a bare
+  host error code.
+- **Step 2 — `SequenceMap` + background dispatcher.**
+  `host_x11::sequence_map::SequenceMap<T>` provides a sliding-
+  window store keyed on promoted 64-bit sequences. The
+  `hostx11-dispatch` thread owns a clone of the host stream's read
+  half and is the *only* reader after `open_from_env` returns. It
+  decodes replies / errors / events into a `HostMessage` enum and
+  fans them out to `pending_replies` / `pending_errors` (replies)
+  and the crossbeam `BackendEvent` channel (events). 16→64
+  sequence promotion is anchored on a `seq_full_atomic` mirror so
+  the dispatcher reads it without contending with the Backend
+  mutex.
+- **Step 3 — `wait_for_reply` Condvar pathway.** `PendingReplies`
+  and `PendingErrors` are `Condvar`-guarded sliding maps; reply
+  consumers block on the Condvar instead of draining the stream
+  themselves. The Backend mutex stays locked while a waiter
+  blocks — safe because the dispatcher only ever locks
+  `PendingReplies::state`, never the Backend mutex. Synchronous
+  `read_until_response` is preserved only for the init phase
+  (`init_render` / `init_xkb` / `query_extension_opcode`) where
+  the dispatcher hasn't been spawned yet.
+- **Step 4 — connection merge ("Big Flip").** `HostInputPump` and
+  per-client keyboard pumps are deleted. The container window
+  selects a unioned `CONTAINER_EVENT_MASK` (KeyPress | KeyRelease
+  | ButtonPress | ButtonRelease | Enter | Leave | PointerMotion |
+  Exposure | StructureNotify) at create time so the merged
+  dispatcher sees every event class on one connection. Per-client
+  keyboard forwarders now read from a crossbeam channel fed by
+  the dispatcher; each forwarder applies its own focus state on
+  the events it receives. `register_top_level` /
+  `register_subwindow` / `unregister_host_window` migrated onto
+  the `Backend` trait — same wire side-effects, just on the
+  merged main connection.
+- **Step 5 — sink integration.** `host_pump_event_sink` lives in
+  `server.rs` and wraps the existing pointer / expose / configure
+  fan-outs as a `BackendEventSink`. The backend dispatcher feeds
+  it via the `BackendEvent` channel; a `hostx11-sink` consumer
+  thread (spawned by `set_event_sink`) drains the channel and
+  drives the sink without touching the Backend mutex.
+- **Step 6 — cleanup.** `sync_main_connection` removed (the
+  cross-connection fence it implemented is unnecessary now that
+  `CreateWindow` and the follow-up event-mask write travel on the
+  same socket). `HostInputPumpHandle` removed: each `nested.rs`
+  call site uses `Backend::register_top_level` /
+  `register_subwindow` / `unregister_host_window` directly. The
+  legacy `reply_buffer` codepath is gone; `read_until_response` /
+  `stash_or_log_response` survive only as init-phase synchronous
+  fallbacks (documented in `mod.rs`). Async errors on the merged
+  connection log with `OriginContext` and emit
+  `BackendEvent::HostError` for the sink.
+
+#### Validation (Step 6)
+
+End-to-end manual smoke against the Phase 3.x WM matrix on the
+merged-connection runtime. 360 tests passing
+(16 yserver + 9 ynest + 248 yserver-core + 87 yserver-protocol).
+
+WMs available in this environment: wmaker, fvwm3, openbox.
+Not installed (skipped, not regressions): enlightenment-16,
+gtk3-demo.
+
+- **wmaker** (`/tmp/phase6-3-wmaker.png`): chrome + clip + dock +
+  appicons render. xterm with title bar shows the prompt cleanly;
+  xclock with title bar + analog face visible. xterm/xclock
+  appicons populate the dock. ynest log: zero panics, zero
+  ERRORs; the WARNs are async host errors with attached
+  `OriginContext` (the post-Phase-6.3 attribution path), all from
+  XFIXES probes wmaker fires at startup — pre-existing condition,
+  not a regression.
+- **fvwm3** (`/tmp/phase6-3-fvwm3.png`): chrome renders. FVWM
+  pager + IconMan + FvwmScript-DateTime ("23:25 Sun May 03")
+  visible in the right panel. xclock with title bar text visible
+  top-left. Zero panics, zero ERRORs.
+- **openbox** (`/tmp/phase6-3-openbox.png`): xclock and xeyes
+  render inside openbox frames with three-button title bars and
+  correct widget chrome. Zero panics, zero ERRORs.
+
+Programmatic widget click / xdotool key-synthesis is *not*
+exercised — bwrap sandbox doesn't expose XTEST, so input-event
+synthesis isn't possible. The merged-connection runtime is
+validated structurally (ynest accepts clients, dispatcher is
+alive, sink consumer drains BackendEvents, register/unregister
+through the trait propagates to the host correctly, no
+deadlocks). The canonical "type into xterm under wmaker" check
+is left for the user to verify on real hardware. Residual risk:
+keyboard fanout regression that only manifests under live
+keypresses would slip past this gate; the unit-test bench covers
+sequence wrap, late errors, multi-reply interleaving, and
+create-then-register ordering, but not the full focus-routing
+loop.
+
+No regressions surfaced against the Phase 6.2 baseline. The
+warning counts and screenshot quality match what 6.2 produced
+under the dual-connection topology.
 
 ### Phase 6.4 — KMS backend + `yserver` integration (planned)
 
@@ -1606,9 +1703,10 @@ Notes:
   caused either wire misalignment with the host or trailing-zero
   pollution of glyph data.
 - `host_x11.rs::create_subwindow` uses `GetInputFocus` (not
-  `GetGeometry`) for sync, with a `reply_buffer` for over-read
-  responses, so unrelated RENDER errors interleaved with sync replies
-  no longer cause the drain loop to hang.
+  `GetGeometry`) for sync, with `PendingReplies` / `PendingErrors`
+  queues for over-read responses and structured host errors, so
+  unrelated RENDER errors interleaved with sync replies no longer
+  cause the drain loop to hang.
 
 ### Known follow-ups (RENDER)
 

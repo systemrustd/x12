@@ -9,6 +9,7 @@ repository.workspace = true
 yserver-protocol.workspace = true
 log.workspace = true
 libc.workspace = true
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 proptest = "1"

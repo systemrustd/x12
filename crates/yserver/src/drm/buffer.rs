@@ -1,10 +1,9 @@
-use std::io;
-use std::mem;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use std::{io, mem, ptr::NonNull, sync::Arc};
 
-use drm::buffer::{Buffer as _, DrmFourcc};
-use drm::control::{Device as ControlDevice, dumbbuffer::DumbBuffer, framebuffer};
+use drm::{
+    buffer::{Buffer as _, DrmFourcc},
+    control::{Device as ControlDevice, dumbbuffer::DumbBuffer, framebuffer},
+};
 
 use crate::drm::Device;
 

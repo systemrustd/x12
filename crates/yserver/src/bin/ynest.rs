@@ -52,7 +52,9 @@ fn parse_geometry(s: &str) -> Result<(u16, u16), String> {
         .parse()
         .map_err(|_| format!("--geometry height is not a u16: {h:?}"))?;
     if w == 0 || h == 0 {
-        return Err(format!("--geometry dimensions must be non-zero, got {w}x{h}"));
+        return Err(format!(
+            "--geometry dimensions must be non-zero, got {w}x{h}"
+        ));
     }
     Ok((w, h))
 }

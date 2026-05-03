@@ -57,10 +57,7 @@ impl SwapState {
     }
 
     pub fn acquire(&mut self) -> Option<usize> {
-        let idx = self
-            .states
-            .iter()
-            .position(|s| *s == BufferState::Free)?;
+        let idx = self.states.iter().position(|s| *s == BufferState::Free)?;
         self.states[idx] = BufferState::Acquired;
         Some(idx)
     }

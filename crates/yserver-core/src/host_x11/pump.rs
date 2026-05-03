@@ -1,11 +1,12 @@
-//! Host X11 input pump and connection setup.
+//! Host X11 connection setup.
 //!
-//! Owns the read-side of the host connection (used by `nested::run` to
-//! pull input/expose/configure events) and the per-client write handles
-//! used to register host-window-id → nested-id mappings. The pump opens
-//! its own socket to the host (separate from `HostX11Backend`'s request stream)
-//! so reads can block in one thread while the request side fans out
-//! across worker threads.
+//! Pre-Phase-6.3 this module owned the *second* X11 connection ynest
+//! used: the input pump's read side, alongside `HostX11Backend`'s
+//! request stream. Phase 6.3 Step 4 ("Big Flip") merges those into one
+//! — the host event read path now lives on the backend's dispatcher
+//! thread; Step 6 then deletes the `HostInputPumpHandle` compat wrapper
+//! entirely so call sites in `nested.rs` go through the `Backend` trait
+//! directly.
 //!
 //! Setup-time helpers live here too: `connect_to_host`, `XAuthority`,
 //! `read_setup_reply`. `HostX11Backend::open_from_env` calls them through
@@ -13,30 +14,15 @@
 //! decoding.
 
 use std::{
-    collections::HashMap,
     env, fs,
     io::{self, ErrorKind, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
-    sync::{Arc, Mutex},
 };
 
-use yserver_protocol::x11::ResourceId;
-
-use super::{HostXidMap, pad4, padded_len, read_i16, read_u16, read_u32, write_u16, write_u32};
+use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
-
-pub struct HostInputPump {
-    read_stream: UnixStream,
-    handle: HostInputPumpHandle,
-}
-
-#[derive(Clone)]
-pub struct HostInputPumpHandle {
-    write_stream: Arc<Mutex<UnixStream>>,
-    xid_map: HostXidMap,
-}
 
 pub(super) fn connect_to_host() -> io::Result<UnixStream> {
     let display = env::var("DISPLAY").map_err(|_| {
@@ -54,216 +40,92 @@ pub(super) fn connect_to_host() -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-impl HostInputPump {
-    pub fn open_from_env(window_id: u32) -> io::Result<Self> {
-        let mut stream = connect_to_host()?;
-        let _setup = read_setup_reply(&mut stream)?;
-        select_keyboard_events(&mut stream, window_id)?;
-        // The main pump owns POINTER_EVENT_MASK on the container. ButtonPress
-        // is exclusive in X11 — only the main pump (not per-client kb pumps)
-        // can hold it. Without this, clicks on the container area (where no
-        // top-level child intervenes) drop on the host side and never reach
-        // any nested client.
-        select_pointer_events_on_container(&mut stream, window_id)?;
-        stream.flush()?;
-        let read_stream = stream.try_clone()?;
-        // Map the host container window to ynest's ROOT_WINDOW so Expose
-        // events on the container (raised by the host when subwindows uncover
-        // the desktop area) are delivered as Expose on ROOT_WINDOW. Without
-        // this entry expose_event_fanout drops the event and the desktop
-        // background is never repainted after a window drag.
-        let mut xid_map = HashMap::new();
-        xid_map.insert(window_id, crate::resources::ROOT_WINDOW);
-        let handle = HostInputPumpHandle {
-            write_stream: Arc::new(Mutex::new(stream)),
-            xid_map: Arc::new(Mutex::new(xid_map)),
-        };
-        Ok(Self {
-            read_stream,
-            handle,
-        })
-    }
-
-    #[must_use]
-    pub fn handle(&self) -> HostInputPumpHandle {
-        self.handle.clone()
-    }
-
-    pub fn read_event(&mut self) -> io::Result<HostEvent> {
-        loop {
-            let mut event = [0; 32];
-            self.read_stream.read_exact(&mut event)?;
-            let event_type = event[0] & 0x7f;
-            match event_type {
-                2 | 3 => {
-                    return Ok(HostEvent::Key(HostKeyEvent {
-                        pressed: event_type == 2,
-                        keycode: event[1],
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                4..=6 => {
-                    let kind = match event_type {
-                        4 => PointerEventKind::ButtonPress,
-                        5 => PointerEventKind::ButtonRelease,
-                        _ => PointerEventKind::MotionNotify,
-                    };
-                    return Ok(HostEvent::Pointer(HostPointerEvent {
-                        kind,
-                        host_xid: read_u32(&event[12..16]), // event window
-                        detail: event[1],
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                7 | 8 => {
-                    let kind = if event_type == 7 {
-                        PointerEventKind::EnterNotify
-                    } else {
-                        PointerEventKind::LeaveNotify
-                    };
-                    return Ok(HostEvent::Pointer(HostPointerEvent {
-                        kind,
-                        host_xid: read_u32(&event[12..16]),
-                        detail: 0,
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                12 => {
-                    let host_xid = read_u32(&event[4..8]);
-                    let x = read_u16(&event[8..10]);
-                    let y = read_u16(&event[10..12]);
-                    let width = read_u16(&event[12..14]);
-                    let height = read_u16(&event[14..16]);
-                    let count = read_u16(&event[16..18]);
-                    log::trace!(
-                        "host pump: Expose host_xid=0x{host_xid:x} x={x} y={y} w={width} h={height} count={count}",
-                    );
-                    return Ok(HostEvent::Expose(HostExposeEvent {
-                        host_xid,
-                        x,
-                        y,
-                        width,
-                        height,
-                        count,
-                    }));
-                }
-                22 => {
-                    return Ok(HostEvent::Configure(HostConfigureEvent {
-                        host_xid: read_u32(&event[8..12]),
-                        x: read_i16(&event[16..18]),
-                        y: read_i16(&event[18..20]),
-                        width: read_u16(&event[20..22]),
-                        height: read_u16(&event[22..24]),
-                    }));
-                }
-                17 => return Ok(HostEvent::Closed),
-                _ => {}
-            }
+/// Decode a raw 32-byte X11 event header into a `HostEvent`. Returns
+/// `None` for event types this layer ignores (synthetic flag is masked
+/// off via the bit-7 strip; the rest of the cases mirror the previous
+/// inline decode in `HostInputPump::read_event`).
+///
+/// Phase 6.3 Step 4 makes this reusable from `HostX11Backend`'s
+/// dispatcher thread so that the merged main connection can fan host
+/// events out to the sink without going through a separate socket /
+/// thread (Xnest's classic pattern, but simplified to one connection).
+pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
+    let event_type = event[0] & 0x7f;
+    match event_type {
+        2 | 3 => Some(HostEvent::Key(HostKeyEvent {
+            pressed: event_type == 2,
+            keycode: event[1],
+            time: read_u32(&event[4..8]),
+            root_x: read_i16(&event[20..22]),
+            root_y: read_i16(&event[22..24]),
+            event_x: read_i16(&event[24..26]),
+            event_y: read_i16(&event[26..28]),
+            state: read_u16(&event[28..30]),
+        })),
+        4..=6 => {
+            let kind = match event_type {
+                4 => PointerEventKind::ButtonPress,
+                5 => PointerEventKind::ButtonRelease,
+                _ => PointerEventKind::MotionNotify,
+            };
+            Some(HostEvent::Pointer(HostPointerEvent {
+                kind,
+                host_xid: read_u32(&event[12..16]), // event window
+                detail: event[1],
+                time: read_u32(&event[4..8]),
+                root_x: read_i16(&event[20..22]),
+                root_y: read_i16(&event[22..24]),
+                event_x: read_i16(&event[24..26]),
+                event_y: read_i16(&event[26..28]),
+                state: read_u16(&event[28..30]),
+            }))
         }
-    }
-}
-
-const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
-    | 0x0000_0008 // ButtonRelease
-    | 0x0000_0010 // EnterWindow
-    | 0x0000_0020 // LeaveWindow
-    | 0x0000_0040 // PointerMotion
-    | 0x0000_8000; // Exposure
-
-/// Mask used for sub-window host children: Exposure only. Per X11
-/// event-propagation rules a host event with no listener at the leaf
-/// bubbles up to the closest interested ancestor — for our sub-windows
-/// that's the container, where input is dispatched. Selecting any
-/// pointer events here would short-circuit our internal dispatch and
-/// deliver to the wrong client. See Xnest `Window.c:91` and the design
-/// doc's "Input event path" section.
-const SUBWINDOW_EVENT_MASK: u32 = 0x0000_8000; // Exposure
-
-impl HostInputPumpHandle {
-    pub fn register_top_level(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
-        self.register_host_window(nested_id, host_xid, POINTER_EVENT_MASK)
-    }
-
-    /// Mirror a sub-window's host child for Expose-event delivery.
-    /// Adds the host_xid → nested_id mapping so the pump can route
-    /// host Exposes through `expose_event_fanout`, and selects
-    /// `ExposureMask` only on the host child. Phase 3.6 Step 3+4
-    /// invariant: every InputOutput sub-window goes through this
-    /// register call after CreateWindow + before its first map.
-    pub fn register_subwindow(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
-        self.register_host_window(nested_id, host_xid, SUBWINDOW_EVENT_MASK)
-    }
-
-    fn register_host_window(
-        &self,
-        nested_id: ResourceId,
-        host_xid: u32,
-        event_mask: u32,
-    ) -> io::Result<()> {
-        // Insert into the map *before* writing to X11 so that any pointer
-        // events arriving on this subwindow after ChangeWindowAttributes are
-        // sent can be resolved to a nested window id immediately.
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
+        7 | 8 => {
+            let kind = if event_type == 7 {
+                PointerEventKind::EnterNotify
+            } else {
+                PointerEventKind::LeaveNotify
+            };
+            Some(HostEvent::Pointer(HostPointerEvent {
+                kind,
+                host_xid: read_u32(&event[12..16]),
+                detail: 0,
+                time: read_u32(&event[4..8]),
+                root_x: read_i16(&event[20..22]),
+                root_y: read_i16(&event[22..24]),
+                event_x: read_i16(&event[24..26]),
+                event_y: read_i16(&event[26..28]),
+                state: read_u16(&event[28..30]),
+            }))
         }
-        // ChangeWindowAttributes — value-mask = (1<<11) (event-mask), value = pointer mask.
-        let mut out = Vec::new();
-        out.push(2); // ChangeWindowAttributes
-        out.push(0);
-        write_u16(&mut out, 4);
-        write_u32(&mut out, host_xid);
-        write_u32(&mut out, 1 << 11);
-        write_u32(&mut out, event_mask);
-        let mut stream = self
-            .write_stream
-            .lock()
-            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "host pump stream poisoned"))?;
-        stream.write_all(&out)?;
-        stream.flush()?;
-        log::debug!(
-            "host pump: register host_window nested=0x{:x} host=0x{:x} event_mask=0x{:x}",
-            nested_id.0,
-            host_xid,
-            event_mask
-        );
-        Ok(())
-    }
-
-    /// Drop the host_xid → nested ResourceId mapping. Used at
-    /// DestroyWindow / Reparent-away-from-root for any host-mirrored
-    /// window — top-level or sub-window — so stale host events on
-    /// the now-defunct xid drop silently instead of misrouting.
-    pub fn unregister_host_window(&self, host_xid: u32) {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.remove(&host_xid);
+        12 => {
+            let host_xid = read_u32(&event[4..8]);
+            let x = read_u16(&event[8..10]);
+            let y = read_u16(&event[10..12]);
+            let width = read_u16(&event[12..14]);
+            let height = read_u16(&event[14..16]);
+            let count = read_u16(&event[16..18]);
+            log::trace!(
+                "host dispatch: Expose host_xid=0x{host_xid:x} x={x} y={y} w={width} h={height} count={count}",
+            );
+            Some(HostEvent::Expose(HostExposeEvent {
+                host_xid,
+                x,
+                y,
+                width,
+                height,
+                count,
+            }))
         }
-    }
-
-    /// Compatibility shim — `unregister_host_window` is the canonical
-    /// name; older call sites use this one. Will be folded into the
-    /// canonical name in a follow-up.
-    pub fn unregister_top_level(&self, host_xid: u32) {
-        self.unregister_host_window(host_xid);
-    }
-
-    #[must_use]
-    pub fn xid_map(&self) -> HostXidMap {
-        self.xid_map.clone()
+        22 => Some(HostEvent::Configure(HostConfigureEvent {
+            host_xid: read_u32(&event[8..12]),
+            x: read_i16(&event[16..18]),
+            y: read_i16(&event[18..20]),
+            width: read_u16(&event[20..22]),
+            height: read_u16(&event[22..24]),
+        })),
+        17 => Some(HostEvent::Closed),
+        _ => None,
     }
 }
 
@@ -540,40 +402,11 @@ fn scan_for_argb_visual(body: &[u8], mut off: usize, depth_count: usize) -> Opti
     None
 }
 
-fn select_pointer_events_on_container(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(2); // ChangeWindowAttributes
-    out.push(0);
-    write_u16(&mut out, 4);
-    write_u32(&mut out, window_id);
-    write_u32(&mut out, 1 << 11); // value-mask = event-mask
-    write_u32(&mut out, POINTER_EVENT_MASK);
-    stream.write_all(&out)
-}
-
-fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(2);
-    out.push(0);
-    write_u16(&mut out, 4);
-    write_u32(&mut out, window_id);
-    write_u32(&mut out, 1 << 11);
-    // KeyPress | KeyRelease | StructureNotify only.
-    //
-    // Per X11 spec ButtonPress is *exclusive* — only one client at a
-    // time per window. The main `HostInputPump` (created in
-    // `nested::run`) already selects POINTER_EVENT_MASK (which
-    // includes ButtonPress) on the container; if the per-client kb
-    // pump tries to also select ButtonPress here the host returns
-    // BadAccess for the entire ChangeWindowAttributes request,
-    // leaving the kb pump connection with no mask at all on
-    // container — the pump then silently receives nothing including
-    // KeyPress. Selecting only KeyPress / KeyRelease /
-    // StructureNotify avoids the conflict; pointer events arrive on
-    // the main pump's connection where they belong.
-    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17));
-    stream.write_all(&out)
-}
+// Phase 6.3 Step 4: the helpers `select_pointer_events_on_container`
+// and `select_keyboard_events` were removed when `HostInputPump`
+// stopped owning a connection. The merged event-mask now lives on
+// `HostX11Backend`'s `CONTAINER_EVENT_MASK` (set at CreateWindow time)
+// and `update_host_event_mask` for everything past container init.
 
 fn read_be_u16_record(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
     let end = *cursor + 2;

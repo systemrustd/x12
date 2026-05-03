@@ -14,7 +14,7 @@
 //! blocks across the module's files.
 
 use std::{
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind, Write},
     os::unix::net::UnixStream,
 };
 
@@ -26,52 +26,35 @@ use crate::backend::{
 
 use super::{
     HostClipRectangles, HostClipState, HostFillState, HostSubwindowConfig, HostSubwindowVisual,
-    HostX11Backend, PointerPosition, open_font, padded_len, read_i16, read_response, read_u16,
-    read_u32, write_i16, write_u16, write_u32,
+    HostX11Backend, PointerPosition, open_font, padded_len, read_i16, read_u16, read_u32,
+    write_i16, write_u16, write_u32,
 };
 
 impl HostX11Backend {
     pub fn open_font(&mut self, name: &str) -> io::Result<(FontHandle, FontMetrics)> {
         let host_xid = self.next_xid();
-        let open_seq = self.sequence;
+        let (_open_seq, _open_seq_full) = self.issue_sequence();
         write_open_font(&mut self.stream, host_xid, name.as_bytes())?;
-        self.sequence = self.sequence.wrapping_add(1);
-        let query_seq = self.sequence;
+        let (_query_seq, query_seq_full) = self.issue_sequence();
         write_query_font(&mut self.stream, host_xid)?;
-        self.sequence = self.sequence.wrapping_add(1);
         self.stream.flush()?;
 
         // OpenFont yields no response on success and one error on failure.
         // QueryFont always yields exactly one response (reply or error).
-        // Drain by sequence to keep the host stream aligned.
-        let mut open_error: Option<u8> = None;
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == open_seq && resp.bytes[0] == 0 {
-                open_error = Some(resp.bytes[1]);
-                continue;
-            }
-            if resp.sequence == query_seq {
-                if resp.bytes[0] == 0 {
-                    let code = open_error.unwrap_or(resp.bytes[1]);
-                    return Err(io::Error::other(format!(
-                        "host OpenFont {name:?} failed (error {code})"
-                    )));
-                }
-                if let Some(code) = open_error {
-                    return Err(io::Error::other(format!(
-                        "host OpenFont {name:?} failed (error {code})"
-                    )));
-                }
-                let metrics = x11::parse_query_font_reply(&resp.bytes[8..]).ok_or_else(|| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        "could not parse host QueryFont reply",
-                    )
-                })?;
-                return Ok((FontHandle::from_raw_panicking(host_xid), metrics));
-            }
-        }
+        // The dispatcher routes the OpenFont error (if any) through the
+        // sink as an async error — we only block here on the QueryFont
+        // reply. If OpenFont failed, QueryFont will *also* fail with
+        // BadFont, so we still surface a useful error to the caller.
+        let resp = self
+            .wait_for_reply(query_seq_full)?
+            .map_err(|error| error.into_io_error("QueryFont (OpenFont chain)"))?;
+        let metrics = x11::parse_query_font_reply(&resp[8..]).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "could not parse host QueryFont reply",
+            )
+        })?;
+        Ok((FontHandle::from_raw_panicking(host_xid), metrics))
     }
 
     /// Send `GetKeyboardMapping` (op 101) to the host and return
@@ -82,7 +65,7 @@ impl HostX11Backend {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        let target = self.sequence;
+        let (_target, target_full) = self.issue_sequence();
         let mut out = [0u8; 8];
         out[0] = 101;
         out[2] = 2; // length in 4-byte units
@@ -91,71 +74,51 @@ impl HostX11Backend {
         out[5] = count;
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence != target {
-                continue;
-            }
-            if resp.bytes[0] == 0 {
-                return Err(io::Error::other(format!(
-                    "host GetKeyboardMapping failed (error {})",
-                    resp.bytes[1]
-                )));
-            }
-            let kpc = resp.bytes[1];
-            // Body bytes start at offset 32 in the response.
-            let n = usize::from(count) * usize::from(kpc);
-            if resp.bytes.len() < 32 + n * 4 {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "GetKeyboardMapping reply truncated",
-                ));
-            }
-            let mut keysyms = Vec::with_capacity(n);
-            for i in 0..n {
-                let base = 32 + i * 4;
-                keysyms.push(u32::from_le_bytes([
-                    resp.bytes[base],
-                    resp.bytes[base + 1],
-                    resp.bytes[base + 2],
-                    resp.bytes[base + 3],
-                ]));
-            }
-            return Ok((kpc, keysyms));
+        let resp = self
+            .wait_for_reply(target_full)?
+            .map_err(|error| error.into_io_error("GetKeyboardMapping"))?;
+        let kpc = resp[1];
+        // Body bytes start at offset 32 in the response.
+        let n = usize::from(count) * usize::from(kpc);
+        if resp.len() < 32 + n * 4 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "GetKeyboardMapping reply truncated",
+            ));
         }
+        let mut keysyms = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = 32 + i * 4;
+            keysyms.push(u32::from_le_bytes([
+                resp[base],
+                resp[base + 1],
+                resp[base + 2],
+                resp[base + 3],
+            ]));
+        }
+        Ok((kpc, keysyms))
     }
 
     /// Send `GetModifierMapping` (op 119) to the host and return
     /// `(keycodes_per_modifier, keycodes)` where keycodes has
     /// `8 * keycodes_per_modifier` bytes.
     pub fn get_modifier_mapping(&mut self) -> io::Result<(u8, Vec<u8>)> {
-        let target = self.sequence;
+        let (_target, target_full) = self.issue_sequence();
         let out = [119u8, 0, 1, 0];
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence != target {
-                continue;
-            }
-            if resp.bytes[0] == 0 {
-                return Err(io::Error::other(format!(
-                    "host GetModifierMapping failed (error {})",
-                    resp.bytes[1]
-                )));
-            }
-            let kpm = resp.bytes[1];
-            let n = 8 * usize::from(kpm);
-            if resp.bytes.len() < 32 + n {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "GetModifierMapping reply truncated",
-                ));
-            }
-            return Ok((kpm, resp.bytes[32..32 + n].to_vec()));
+        let resp = self
+            .wait_for_reply(target_full)?
+            .map_err(|error| error.into_io_error("GetModifierMapping"))?;
+        let kpm = resp[1];
+        let n = 8 * usize::from(kpm);
+        if resp.len() < 32 + n {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "GetModifierMapping reply truncated",
+            ));
         }
+        Ok((kpm, resp[32..32 + n].to_vec()))
     }
 
     pub fn close_font(&mut self, host_xid: u32) -> io::Result<()> {
@@ -164,7 +127,7 @@ impl HostX11Backend {
         out.push(0);
         write_u16(&mut out, 2);
         write_u32(&mut out, host_xid);
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         self.stream.write_all(&out)?;
         self.stream.flush()
     }
@@ -172,16 +135,11 @@ impl HostX11Backend {
     /// Send a `ListFonts` request to the host and return the full reply
     /// bytes (including the 32-byte standard reply header).
     pub fn list_fonts_proxy(&mut self, max_names: u16, pattern: &str) -> io::Result<Vec<u8>> {
-        let target = self.sequence;
+        let (_target, target_full) = self.issue_sequence();
         write_list_fonts(&mut self.stream, 49, max_names, pattern.as_bytes())?;
-        self.sequence = self.sequence.wrapping_add(1);
         self.stream.flush()?;
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == target {
-                return Ok(resp.bytes);
-            }
-        }
+        self.wait_for_reply(target_full)?
+            .map_err(|error| error.into_io_error("ListFonts"))
     }
 
     /// Send a `ListFontsWithInfo` request and return all replies (one per
@@ -191,20 +149,18 @@ impl HostX11Backend {
         max_names: u16,
         pattern: &str,
     ) -> io::Result<Vec<Vec<u8>>> {
-        let target = self.sequence;
+        let (_target, target_full) = self.issue_sequence();
         write_list_fonts(&mut self.stream, 50, max_names, pattern.as_bytes())?;
-        self.sequence = self.sequence.wrapping_add(1);
         self.stream.flush()?;
 
         let mut replies = Vec::new();
         loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence != target {
-                continue;
-            }
-            let name_len = resp.bytes[1];
-            replies.push(resp.bytes);
-            if name_len == 0 || replies.last().is_some_and(|r| r[0] == 0) {
+            let resp = self
+                .wait_for_reply(target_full)?
+                .map_err(|error| error.into_io_error("ListFontsWithInfo"))?;
+            let name_len = resp[1];
+            replies.push(resp);
+            if name_len == 0 {
                 return Ok(replies);
             }
         }
@@ -226,7 +182,7 @@ impl HostX11Backend {
         let Some(bytes) = build_shape_rectangles(self.shape_opcode, host_xid, kind, rects) else {
             return Ok(());
         };
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         self.stream.write_all(&bytes)?;
         self.stream.flush()
     }
@@ -244,7 +200,7 @@ impl HostX11Backend {
         else {
             return Ok(());
         };
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         self.stream.write_all(&bytes)?;
         self.stream.flush()
     }
@@ -278,7 +234,7 @@ impl HostX11Backend {
         let nvals = (values.len() / 4) as u16;
         // header(4) + pid(4) + drawable(4) + format(4) + value-mask(4) = 20 bytes = 5 units
         let length_units = 5 + nvals;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(4); // CreatePicture
@@ -315,7 +271,7 @@ impl HostX11Backend {
         let opcode = r.opcode;
         // header(4) + op_pad(4) + src(4) + mask(4) + dst(4) + src_xy(4)
         // + mask_xy(4) + dst_xy(4) + size(4) = 36 bytes = 9 units
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(36);
         out.push(opcode);
         out.push(8); // Composite
@@ -342,7 +298,7 @@ impl HostX11Backend {
             return Ok(());
         };
         let opcode = r.opcode;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(7); // FreePicture
@@ -368,7 +324,7 @@ impl HostX11Backend {
         };
         let opcode = r.opcode;
         let host_gs = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(17); // CreateGlyphSet
@@ -385,7 +341,7 @@ impl HostX11Backend {
             return Ok(());
         };
         let opcode = r.opcode;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(19); // FreeGlyphSet
@@ -403,7 +359,7 @@ impl HostX11Backend {
         // body_tail (already padded on the wire): num_glyphs(4) + glyph_ids + glyph_infos + glyph_data
         let padded_tail = padded_len(body_tail.len());
         let length_units = 2 + (padded_tail / 4) as u16;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(20); // AddGlyphs
@@ -422,7 +378,7 @@ impl HostX11Backend {
         let opcode = r.opcode;
         let padded_ids = padded_len(glyph_ids.len());
         let length_units = 2 + (padded_ids / 4) as u16;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(22); // FreeGlyphs
@@ -463,7 +419,7 @@ impl HostX11Backend {
         patch_glyph_command_offsets(&mut patched, x_off, y_off, id_size);
         let padded_items = padded_len(patched.len());
         let length_units = 7 + (padded_items / 4) as u16;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(minor);
@@ -499,7 +455,7 @@ impl HostX11Backend {
         let total = 4 + body.len();
         let length_units =
             u16::try_from(total / 4).map_err(|_| io::Error::other("RENDER request too large"))?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(total);
         out.push(opcode);
         out.push(minor);
@@ -572,7 +528,7 @@ impl HostX11Backend {
         };
         let opcode = r.opcode;
         let host_pic = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(33); // CreateSolidFill
@@ -600,7 +556,7 @@ impl HostX11Backend {
         let nrects = rects.len() / 8;
         // header(4) + op_pad(4) + dst(4) + color(8) = 20 bytes = 5 units, plus 2 units per rect
         let length_units = 5 + (nrects * 2) as u16;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(26); // FillRectangles
@@ -649,7 +605,7 @@ impl HostX11Backend {
         // header(4) + op_pad(4) + src(4) + dst(4) + mask_format(4)
         // + src_xy(4) = 24 bytes = 6 units, plus 10 units (40 bytes) per trap
         let length_units = 6u16 + (n_traps as u16) * 10;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(24 + n_traps * 40);
         out.push(opcode);
         out.push(10); // Trapezoids
@@ -693,8 +649,7 @@ impl HostX11Backend {
             return Ok((0, 0));
         };
         let opcode = r.opcode;
-        let seq = self.sequence; // use current BEFORE increment
-        self.sequence = self.sequence.wrapping_add(1);
+        let (_seq, seq_full) = self.issue_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(0); // QueryVersion
@@ -703,22 +658,19 @@ impl HostX11Backend {
         write_u32(&mut out, 11); // client minor
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == seq {
-                let major = read_u32(&resp.bytes[8..12]);
-                let minor = read_u32(&resp.bytes[12..16]);
-                return Ok((major, minor));
-            }
-        }
+        let resp = self
+            .wait_for_reply(seq_full)?
+            .map_err(|error| error.into_io_error("RENDER QueryVersion"))?;
+        let major = read_u32(&resp[8..12]);
+        let minor = read_u32(&resp[12..16]);
+        Ok((major, minor))
     }
 
     pub fn xkb_proxy(&mut self, minor: u8, body: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        let Some(xkb) = self.xkb.as_ref() else {
+        let Some(xkb_opcode) = self.xkb.as_ref().map(|xkb| xkb.opcode) else {
             return Err(io::Error::other("XKB not available on host"));
         };
-        let target = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
+        let (_target, target_full) = self.issue_sequence();
 
         // Standard X11 request: major(1) minor(1) length(2)
         let total_len = body.len() + 4;
@@ -726,7 +678,7 @@ impl HostX11Backend {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "XKB request too large"))?;
 
         let mut out = Vec::with_capacity(total_len);
-        out.push(xkb.opcode);
+        out.push(xkb_opcode);
         out.push(minor);
         write_u16(&mut out, length_units);
         out.extend_from_slice(body);
@@ -737,26 +689,19 @@ impl HostX11Backend {
             return Ok(None);
         }
 
-        if let Some(pos) = self.reply_buffer.iter().position(|r| r.sequence == target) {
-            return Ok(Some(self.reply_buffer.remove(pos).bytes));
-        }
-
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == target {
-                return Ok(Some(resp.bytes));
-            }
-            self.reply_buffer.push(resp);
-        }
+        Ok(Some(
+            self.wait_for_reply(target_full)?
+                .map_err(|error| error.into_io_error("XKB proxy"))?,
+        ))
     }
 
     pub fn ping(&mut self) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         self.stream.write_all(&[127, 0, 1, 0])
     }
 
     pub fn query_pointer(&mut self) -> io::Result<PointerPosition> {
-        self.sequence = self.sequence.wrapping_add(1);
+        let (_target, target_full) = self.issue_sequence();
 
         let mut out = Vec::new();
         out.push(38);
@@ -766,14 +711,9 @@ impl HostX11Backend {
         self.stream.write_all(&out)?;
         self.stream.flush()?;
 
-        let mut reply = [0; 32];
-        self.read_fixed_reply(&mut reply)?;
-        if reply[0] != 1 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("expected QueryPointer reply, got response {}", reply[0]),
-            ));
-        }
+        let reply = self
+            .wait_for_reply(target_full)?
+            .map_err(|error| error.into_io_error("QueryPointer"))?;
 
         Ok(PointerPosition {
             same_screen: reply[1] != 0,
@@ -792,8 +732,8 @@ impl HostX11Backend {
     /// allocated.
     ///
     /// `event_mask = 0` always — pointer/exposure events are selected
-    /// later via `HostInputPumpHandle::register_top_level` (top-levels
-    /// only during Phase 3.6 Step 2; sub-window mirroring stays dormant).
+    /// later via `Backend::register_top_level` (top-levels only during
+    /// Phase 3.6 Step 2; sub-window mirroring stays dormant).
     pub fn create_subwindow(
         &mut self,
         host_parent: WindowHandle,
@@ -862,21 +802,13 @@ impl HostX11Backend {
             write_u32(&mut out, colormap_xid);
         }
         self.stream.write_all(&out)?;
-        self.sequence = self.sequence.wrapping_add(1);
-        // Cross-connection sync fence. The dispatch layer about to
-        // call us is going to follow up with a `ChangeWindowAttributes`
-        // on the *pump* connection (`HostInputPumpHandle::register_*`)
-        // to select `ExposureMask` on this xid. Pump and main are
-        // separate X11 connections; without a fence, the pump's CWA
-        // can arrive at the host before this CreateWindow is processed
-        // and the host returns `BadWindow`, which we absorb silently
-        // — leaving `ExposureMask` unselected, no host Expose, client
-        // never redraws. The Phase 3.6 design doc called this out
-        // (Step 2 constraint #2). One round-trip per window-create
-        // is the price for the dual-connection model; fixing it
-        // cheaper means folding the pump and main connections into
-        // one (Phase 3.7+ work).
-        self.sync_main_connection()?;
+        self.advance_sequence();
+        // Phase 6.3 Step 6: the cross-connection sync fence
+        // (`sync_main_connection`) is gone. With the merged main
+        // connection, the follow-up `ChangeWindowAttributes` selecting
+        // `ExposureMask` on this xid travels on the same socket as
+        // this `CreateWindow` — wire ordering is naturally sequential,
+        // so the host can never see CWA before the create.
         log::debug!(
             "create_subwindow: host_xid=0x{:x} parent=0x{:x} pos=({x},{y}) size={width}x{height} bw={border_width} bg_pixel={background_pixel:?} bg_pixmap={background_pixmap:?}",
             host_xid,
@@ -885,40 +817,8 @@ impl HostX11Backend {
         Ok(WindowHandle::from_raw_panicking(host_xid))
     }
 
-    /// Round-trip on the main host connection: send GetInputFocus,
-    /// drain replies until the matching one arrives. Used as a fence
-    /// before any pump-connection ChangeWindowAttributes that depends
-    /// on a window we just created. Replies for unrelated requests
-    /// arriving while we wait are buffered for later
-    /// `read_response`/sync calls.
-    fn sync_main_connection(&mut self) -> io::Result<()> {
-        let sync_seq = self.sequence;
-        let mut sync = Vec::with_capacity(4);
-        sync.push(43); // GetInputFocus
-        sync.push(0);
-        write_u16(&mut sync, 1);
-        self.stream.write_all(&sync)?;
-        self.sequence = self.sequence.wrapping_add(1);
-        self.stream.flush()?;
-        if let Some(pos) = self
-            .reply_buffer
-            .iter()
-            .position(|r| r.sequence == sync_seq)
-        {
-            self.reply_buffer.remove(pos);
-            return Ok(());
-        }
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == sync_seq {
-                return Ok(());
-            }
-            self.reply_buffer.push(resp);
-        }
-    }
-
     pub fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(4); // DestroyWindow
         out.push(0);
@@ -978,7 +878,7 @@ impl HostX11Backend {
         let length_units = 3 + u16::try_from(values.len() / 4).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "too many ConfigureWindow values")
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(12); // ConfigureWindow
         out.push(0);
@@ -1015,7 +915,7 @@ impl HostX11Backend {
         write_i16(&mut out, y);
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         Ok(())
     }
 
@@ -1047,7 +947,7 @@ impl HostX11Backend {
         }
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         Ok(())
     }
 
@@ -1059,7 +959,7 @@ impl HostX11Backend {
     pub fn set_container_background_pixmap(&mut self, host_pixmap_xid: u32) -> io::Result<()> {
         // ChangeWindowAttributes (opcode 2): window(4) value-mask(4) values(4*n)
         // value-mask CWBackPixmap = 0x00000001
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(16);
         out.push(2);
         out.push(0);
@@ -1072,7 +972,7 @@ impl HostX11Backend {
         // Force the host to repaint immediately so the new bg shows up
         // even if nothing has triggered an Expose yet. ClearArea(window,
         // 0,0,0,0, false) clears the entire window.
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut clear = Vec::with_capacity(16);
         clear.push(61); // ClearArea
         clear.push(0); // exposures = false
@@ -1092,7 +992,7 @@ impl HostX11Backend {
         // solid color whenever a region is exposed (e.g. a top-level
         // subwindow is moved across it). Without this, drags leave trails of
         // stale window content on the desktop.
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(16);
         out.push(2);
         out.push(0);
@@ -1103,7 +1003,7 @@ impl HostX11Backend {
         self.stream.write_all(&out)?;
 
         // ClearArea so the new color is visible immediately.
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut clear = Vec::with_capacity(16);
         clear.push(61);
         clear.push(0);
@@ -1118,7 +1018,7 @@ impl HostX11Backend {
     }
 
     pub fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(8); // MapWindow
         out.push(0);
@@ -1129,7 +1029,7 @@ impl HostX11Backend {
     }
 
     pub fn unmap_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(10); // UnmapWindow
         out.push(0);
@@ -1140,7 +1040,7 @@ impl HostX11Backend {
     }
 
     pub fn warp_pointer(&mut self, dst_host_xid: u32, dst_x: i16, dst_y: i16) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(41); // WarpPointer
         out.push(0);
@@ -1162,7 +1062,7 @@ impl HostX11Backend {
     /// Used to resolve atoms that leak in via host-proxied replies — most
     /// notably the `FONTPROP` atoms in `ListFontsWithInfo` payloads.
     pub fn get_atom_name(&mut self, atom: u32) -> io::Result<Option<String>> {
-        let target = self.sequence;
+        let (_target, target_full) = self.issue_sequence();
         let mut out = Vec::new();
         out.push(17u8); // GetAtomName
         out.push(0);
@@ -1170,31 +1070,24 @@ impl HostX11Backend {
         write_u32(&mut out, atom);
         self.stream.write_all(&out)?;
         self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence != target {
-                self.reply_buffer.push(resp);
-                continue;
-            }
-            if resp.bytes[0] == 0 {
-                // BadAtom (or other) error — host doesn't know this atom.
-                return Ok(None);
-            }
-            let name_len = u16::from_le_bytes([resp.bytes[8], resp.bytes[9]]) as usize;
-            let name_start = 32usize;
-            let end = name_start.checked_add(name_len).ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "GetAtomName name length overflow")
-            })?;
-            if resp.bytes.len() < end {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "GetAtomName reply truncated",
-                ));
-            }
-            let name = String::from_utf8_lossy(&resp.bytes[name_start..end]).into_owned();
-            return Ok(Some(name));
+        let resp = match self.wait_for_reply(target_full)? {
+            Ok(reply) => reply,
+            Err(error) if error.code == x11::error::BAD_ATOM => return Ok(None),
+            Err(error) => return Err(error.into_io_error("GetAtomName")),
+        };
+        let name_len = u16::from_le_bytes([resp[8], resp[9]]) as usize;
+        let name_start = 32usize;
+        let end = name_start.checked_add(name_len).ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidData, "GetAtomName name length overflow")
+        })?;
+        if resp.len() < end {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "GetAtomName reply truncated",
+            ));
         }
+        let name = String::from_utf8_lossy(&resp[name_start..end]).into_owned();
+        Ok(Some(name))
     }
 
     pub fn create_pixmap(
@@ -1204,7 +1097,7 @@ impl HostX11Backend {
         height: u16,
     ) -> io::Result<PixmapHandle> {
         let host_xid = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(53); // CreatePixmap opcode
         out.push(depth);
@@ -1219,7 +1112,7 @@ impl HostX11Backend {
     }
 
     pub fn free_pixmap(&mut self, host_xid: u32) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(54); // FreePixmap opcode
         out.push(0);
@@ -1239,7 +1132,7 @@ impl HostX11Backend {
         hot_y: u16,
     ) -> io::Result<CursorHandle> {
         let cursor_xid = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut buf = Vec::with_capacity(32);
         buf.push(93u8);
         buf.push(0u8);
@@ -1271,7 +1164,7 @@ impl HostX11Backend {
         };
         let opcode = r.opcode;
         let cursor_xid = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut buf = Vec::with_capacity(16);
         buf.push(opcode);
         buf.push(27); // CreateCursor minor opcode
@@ -1286,7 +1179,7 @@ impl HostX11Backend {
     }
 
     pub fn define_cursor(&mut self, host_window_xid: u32, cursor_host_xid: u32) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut buf = Vec::with_capacity(12);
         buf.push(43u8);
         buf.push(0u8);
@@ -1344,7 +1237,7 @@ impl HostX11Backend {
                         "too many clip rectangles for one X11 request",
                     )
                 })?;
-                self.sequence = self.sequence.wrapping_add(1);
+                self.advance_sequence();
                 let mut out = Vec::new();
                 out.push(59); // SetClipRectangles
                 out.push(clip.ordering);
@@ -1362,7 +1255,7 @@ impl HostX11Backend {
             } => {
                 // Single ChangeGC with three components: clip_x_origin
                 // (1<<17) + clip_y_origin (1<<18) + clip-mask (1<<19).
-                self.sequence = self.sequence.wrapping_add(1);
+                self.advance_sequence();
                 let mut out = Vec::new();
                 out.push(56); // ChangeGC
                 out.push(0);
@@ -1377,7 +1270,7 @@ impl HostX11Backend {
                 self.stream.write_all(&out)?;
             }
             HostClipState::None => {
-                self.sequence = self.sequence.wrapping_add(1);
+                self.advance_sequence();
                 let mut out = Vec::new();
                 out.push(56); // ChangeGC
                 out.push(0);
@@ -1413,7 +1306,7 @@ impl HostX11Backend {
         }
         // Single ChangeGC: fill-style (1<<8) + tile (1<<10) +
         // tile-stipple-x-origin (1<<12) + tile-stipple-y-origin (1<<13).
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(28);
         out.push(56); // ChangeGC
         out.push(0);
@@ -1561,7 +1454,7 @@ impl HostX11Backend {
         let length_units = u16::try_from(length_bytes / 4).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "apply_draw_state: too many fields")
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(length_bytes);
         out.push(56); // ChangeGC
         out.push(0);
@@ -1619,7 +1512,7 @@ impl HostX11Backend {
         if self.current_fill == HostFillState::Solid {
             return Ok(());
         }
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::with_capacity(16);
         out.push(56); // ChangeGC
         out.push(0);
@@ -1648,7 +1541,7 @@ impl HostX11Backend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(62); // CopyArea opcode
         out.push(0);
@@ -1679,7 +1572,7 @@ impl HostX11Backend {
         height: u16,
         plane: u32,
     ) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(63); // CopyPlane opcode
         out.push(0);
@@ -1711,8 +1604,7 @@ impl HostX11Backend {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        let target_seq = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
+        let (_target_seq, target_seq_full) = self.issue_sequence();
 
         let mut out = [0u8; 20];
         out[0] = 73; // GetImage
@@ -1728,15 +1620,9 @@ impl HostX11Backend {
         self.stream.write_all(&out)?;
         self.stream.flush()?;
 
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == target_seq {
-                if resp.bytes[0] == 0 {
-                    // host returned an error (e.g. BadMatch for out-of-bounds)
-                    return Ok(None);
-                }
-                return Ok(Some(resp.bytes));
-            }
+        match self.wait_for_reply(target_seq_full)? {
+            Ok(reply) => Ok(Some(reply)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -1751,7 +1637,7 @@ impl HostX11Backend {
             return Ok(gc);
         }
         let gc = self.next_xid();
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(55); // CreateGC opcode
         out.push(0);
@@ -1801,7 +1687,7 @@ impl HostX11Backend {
             let length_units = 6 + (padded_data_len / 4) as u16;
             let chunk_dst_y = dst_y.wrapping_add(row as i16);
             let chunk_height = rows as u16;
-            self.sequence = self.sequence.wrapping_add(1);
+            self.advance_sequence();
             let mut out = Vec::with_capacity(24 + padded_data_len);
             out.push(72); // PutImage opcode
             out.push(2); // ZPixmap format
@@ -1878,7 +1764,7 @@ impl HostX11Backend {
                 "too many rectangles for one X11 request",
             )
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(0);
@@ -1927,7 +1813,7 @@ impl HostX11Backend {
                 "too many points for one X11 request",
             )
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(65);
         out.push(coordinate_mode);
@@ -1955,7 +1841,7 @@ impl HostX11Backend {
         let text = &body[12..];
         let length_units = 4 + u16::try_from(text.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(76);
         out.push(text_len);
@@ -1984,7 +1870,7 @@ impl HostX11Backend {
         let text = &body[12..];
         let length_units = 4 + u16::try_from(text.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(77);
         out.push(text_len);
@@ -2005,7 +1891,7 @@ impl HostX11Backend {
 
         let length_units = 1 + u16::try_from(body.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(74);
         out.push(0);
@@ -2025,7 +1911,7 @@ impl HostX11Backend {
 
         let length_units = 1 + u16::try_from(body.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(75);
         out.push(0);
@@ -2057,7 +1943,7 @@ impl HostX11Backend {
                 "too many points for one X11 request",
             )
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(64);
         out.push(coordinate_mode);
@@ -2091,7 +1977,7 @@ impl HostX11Backend {
                 "too many points for one X11 request",
             )
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(69);
         out.push(0); // unused
@@ -2123,7 +2009,7 @@ impl HostX11Backend {
         let length_units = 3 + u16::try_from(arcs.len() / 4).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "too many arcs for one X11 request")
         })?;
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(opcode);
         out.push(0);
@@ -2140,7 +2026,7 @@ impl HostX11Backend {
             return Ok(());
         }
 
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(56);
         out.push(0);
@@ -2158,7 +2044,7 @@ impl HostX11Backend {
             return Ok(());
         }
 
-        self.sequence = self.sequence.wrapping_add(1);
+        self.advance_sequence();
         let mut out = Vec::new();
         out.push(56);
         out.push(0);
@@ -2171,15 +2057,6 @@ impl HostX11Backend {
         self.current_foreground = foreground;
         self.current_background = background;
         Ok(())
-    }
-
-    fn read_fixed_reply(&mut self, reply: &mut [u8; 32]) -> io::Result<()> {
-        loop {
-            self.stream.read_exact(reply)?;
-            if reply[0] == 1 {
-                return Ok(());
-            }
-        }
     }
 }
 

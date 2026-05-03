@@ -16,4 +16,13 @@ pub use params::{
     ArcMode, BgState, CapStyle, ClipState, DrawState, FillRule, FillState, FillStyle, GcFunction,
     JoinStyle, LineStyle, SubwindowMode,
 };
-pub use trait_def::Backend;
+pub use trait_def::{Backend, BackendEvent, BackendEventSink};
+
+use yserver_protocol::x11::ClientId;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OriginContext {
+    pub client_id: ClientId,
+    pub nested_seq: u16,
+    pub opcode: u8,
+}

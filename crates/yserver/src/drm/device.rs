@@ -1,9 +1,10 @@
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::unix::io::{AsFd, BorrowedFd};
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    os::unix::io::{AsFd, BorrowedFd},
+};
 
-use drm::ClientCapability;
-use drm::Device as DrmDevice;
+use drm::{ClientCapability, Device as DrmDevice};
 
 pub struct Device {
     file: File,
