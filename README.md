@@ -145,6 +145,6 @@ Before committing:
 
 ```sh
 cargo fmt
-cargo clippy -- -W clippy::pedantic
+cargo clippy
 cargo test
 ```
