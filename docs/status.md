@@ -1245,23 +1245,117 @@ ran cleanly across all three WM smokes — zero log lines at
 creates / DrawState / module split / dyn trait) introduced no
 observable behavioural change.
 
-#### Phase 6.2 follow-ups (deferred)
+### Phase 6.3 — Pump / sink rework (planned)
 
-The pump/main connection merge — Phase 3.7's structural fix and
-prework item #5 — is its own future slice (Phase 6.2.5 or fold
-into Phase 6.3 design). It carries:
+Goal: fold today's three host X11 connections (main + `HostInputPump`
++ per-client kb pumps) into one, behind a clean
+`Backend::dispatch()` / `BackendEventSink` shape on the trait. This
+is Phase 3.7's "cross-connection sync is a design smell" follow-up
+and Phase 6.2's deferred prework item #5, designed as one slice
+because the pieces are mutually load-bearing.
 
-- Single-X11-connection merge.
-- `BackendEventSink` / `register_event_sink` on the trait + sink
-  routing.
-- `fd()` / `dispatch()` / `drain_events()` on the trait.
-- Per-client kb pump dissolution.
-- Migration of pump construction sites to `dyn Backend`
-  (eliminating the separate concrete-typed clone).
-- 64-bit `seq_full` tracking for X11 16-bit sequence wrap.
-- Retention window for late void-request errors.
-- `OriginContext` plumbing for async host-error attribution.
-- Reply demux / `ReplyMap` rework.
+Scope:
+
+- **Single-X11-connection merge.** `HostX11Backend` owns one X11
+  connection; the pump and per-client kb pump connections fold in.
+  Eliminates the cross-connection race that motivated
+  `sync_main_connection` and `reply_buffer`.
+- **`fd()` / `dispatch()` / `drain_events()` on the `Backend` trait.**
+  Replaces the `register_event_sink` deferral from Phase 6.2's
+  Step 5. Backend exposes a readiness fd; `yserver-core`'s main
+  loop epolls it; `dispatch()` drains and classifies bytes into
+  replies (resolved against an internal `ReplyMap`) and events
+  (queued for `drain_events(sink)`).
+- **`BackendEventSink` trait + sink-routing.** Implementation in
+  `yserver-core` wraps the existing per-client fanout
+  (`pointer_event_fanout`, `expose_event_fanout`, etc.). Backend's
+  internal threading feeds the sink; `nested.rs` event handlers
+  are unchanged.
+- **Per-client kb pump dissolution.** Each kb pump's `client_id` /
+  `focused_window` / writer / sequence state moves into the central
+  fanout that the sink drives. Eliminates the per-client thread.
+- **Pump-construction migration to `dyn Backend`.** Today's
+  separate concrete-typed `Arc<Mutex<HostX11Backend>>` clone for
+  pump construction goes away — pump becomes a backend internal
+  detail, not a `nested.rs` responsibility.
+- **64-bit `seq_full` tracking + wrap retention window.** X11
+  wire seq is 16-bit and wraps every 65,536 requests. The reply
+  demux tracks `seq_full: u64` with extended-sequence promotion
+  on incoming wire seq; void-request errors retain a window of
+  ~50,000 sequences before being dropped to a debug log.
+- **`OriginContext` plumbing for async host-error attribution.**
+  Today every host error arrives synchronously on the calling
+  request handler's call stack; after the merge, void-request
+  errors arrive later and need attribution back to (client_id,
+  nested_seq, nested_opcode). Each trait method that may produce
+  a host error takes an `OriginContext`; the backend stores it
+  alongside the seq_full and includes it in delivered errors.
+
+Tests: explicit unit coverage for partial reads, sequence wrap,
+late errors, `ListFontsWithInfo` multi-reply with interleaved
+events, role-transitions on reparent, create-then-register
+ordering. The unit test bench is the safety net for the merge
+mechanic — manual smoke alone is insufficient.
+
+Open design questions documented in v3 of Phase 6.2's design doc
+that need resolution before 6.3 starts: dispatch topology
+(single epoll on `yserver-core`'s main thread vs a backend pump
+thread feeding a queue), event-queue wakeup semantics, the
+`ReplyMap` wrap-promotion algorithm.
+
+Not started.
+
+### Phase 6.4 — KMS backend + `yserver` integration (planned)
+
+Goal: implement a `KmsBackend` impl of the `Backend` trait and
+wire `yserver-core` into the `yserver` binary. First real X11
+client (xterm, xeyes) running on bare DRM/KMS — the headline
+deliverable of the Phase 6 trajectory.
+
+Scope (minimum viable):
+
+- **`KmsBackend` impl of the `Backend` trait.** Phase 6.1's DRM
+  module (modeset, swapchain, dumb buffers, page-flip events,
+  libinput) reshaped to satisfy the trait. Drawing methods
+  rasterize directly into the dumb-buffer scanout (Pixman or
+  hand-rolled) instead of forwarding XPolyLine etc. to a host X
+  server. Event delivery feeds Phase 6.3's `BackendEventSink`
+  from libinput input + DRM page-flip + signalfd.
+- **Wire `yserver-core` into the `yserver` binary.** `lib.rs::run()`
+  no longer constructs a throwaway `present::State` + bouncing
+  rectangle. It constructs a `KmsBackend`, hands it to
+  `yserver_core` as `Arc<Mutex<dyn Backend>>`, and calls the
+  client-listener entry point. Listens on
+  `/tmp/.X11-unix/X<display>` like `ynest`.
+- **First X client on KMS.** `DISPLAY=:N xterm` or
+  `DISPLAY=:N xeyes` against the running yserver, painting on
+  bare metal. The success criterion that distinguishes Phase 6.4
+  from "still the bouncing square."
+- **xkbcommon.** Keymap translation from Linux input keycodes
+  to X11 keysyms. Phase 6.1 deferred this; Phase 6.4 needs it
+  for any real client to receive sensible keyboard input.
+
+Out of scope (deferred to Phase 6.5+):
+
+- Full WM session under yserver (wmaker/fvwm3/e16 etc.) — likely
+  works once the basics are right, but validation is its own
+  slice.
+- VT_SETMODE coordination so `yserver` and `kmscon` (or any other
+  DRM master) can coexist on different VTs. Today's bare-metal
+  recipe is "stop the conflicting master first."
+- logind handoff so non-root users can run `yserver` on their
+  active session without `sudo`.
+- Suspend / resume.
+- Hotplug response.
+- Multi-output / multi-plane.
+- GBM / EGL / GLES / Vulkan render path.
+- Bare-metal validation of the polished case (kmscon coexistence,
+  logind handoff, console restore on exit). Today's bare-metal
+  pass requires stopping kmscon on the target VT and accepting
+  no console restore — Phase 6.1 follow-ups note above documents
+  the recipe.
+
+Not started. Depends on Phase 6.3.
 
 ## Phase 7 — Security hardening
 
