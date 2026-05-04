@@ -169,6 +169,27 @@ gaps in our rasterisation surface here that the host hides for us.
       rasterise as 1-pixel Bresenham. Most clients use line_width=0
       (server-discretion thin) but anything wanting a 3- or 5-px line
       would render too thin.
+- [ ] **fvwm3 modules wedge on missing ConfigureNotify.** fvwm3 itself
+      starts and reparents client windows correctly (SubstructureRedirect
+      / MapRequest forwarding works), but at least one module
+      (FvwmIconMan / FvwmPager / FvwmButtons depending on config) goes
+      into a tight `ConfigureWindow → ChangeWindowAttributes →
+      GetInputFocus` busy loop reconfiguring the same panel windows to
+      `(-1, -1)` and back. The pattern matches "module configured a
+      window and is waiting for a ConfigureNotify before continuing,
+      never gets one, retries". Likely fix: have
+      `KmsBackend::configure_subwindow` synthesize a ConfigureNotify to
+      StructureNotify-subscribed clients (and SubstructureNotify-
+      subscribed parents) the way the host backend gets via the host X
+      server. Reference: x11trace of fvwm3 under Xephyr at
+      `Xephyr-fvwm3.log` shows 25× ConfigureNotify, 24× MapNotify, 21×
+      ReparentNotify, 16× CreateNotify delivered during fvwm startup.
+- [ ] **Opcode 58 (SetDashes) unsupported.** Logged as
+      `unsupported opcode 58` from fvwm modules; means dashed lines
+      aren't honoured.  Cosmetic — dashes fall back to solid.
+- [ ] **Opcode 81 (InstallColormap) unsupported.** fvwm3 calls it once.
+      Safe to ignore on a TrueColor backend; could just reply "did it"
+      to silence the unsupported-opcode log.
 
 ## WM-specific behaviour
 
