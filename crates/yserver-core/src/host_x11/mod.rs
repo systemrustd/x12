@@ -1917,8 +1917,7 @@ mod tests {
     /// dispatcher can fan keys out to the registered subscribers.
     #[test]
     fn decode_host_event_translates_key_press_and_release() {
-        use crate::host_x11::HostEvent;
-        use crate::host_x11::pump::decode_host_event;
+        use crate::host_x11::{HostEvent, pump::decode_host_event};
 
         let mut press = [0u8; 32];
         press[0] = 2; // KeyPress
@@ -1960,8 +1959,7 @@ mod tests {
     /// SendEvent. Decoding must mask it off before classifying.
     #[test]
     fn decode_host_event_strips_synthetic_flag() {
-        use crate::host_x11::HostEvent;
-        use crate::host_x11::pump::decode_host_event;
+        use crate::host_x11::{HostEvent, pump::decode_host_event};
 
         let mut synthetic_press = [0u8; 32];
         synthetic_press[0] = 2 | 0x80; // KeyPress with synthetic bit set

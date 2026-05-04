@@ -23,3 +23,6 @@ input = "0.10"
 nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "signal"] }
 signal-hook = "0.4"
 crossbeam-channel = "0.5"
+pixman = "0.2"
+freetype-rs = "0.38"
+xkbcommon = "0.9"

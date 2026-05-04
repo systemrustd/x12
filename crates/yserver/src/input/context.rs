@@ -50,6 +50,33 @@ pub struct Context {
     libinput: Libinput,
 }
 
+/// Newtype wrapper around `Context` that implements `Send`.
+/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// The main thread owns the input context; libinput's raw pointers
+/// and Rc are safe because there's only one thread accessing them.
+pub struct SendContext(Context);
+unsafe impl Send for SendContext {}
+
+impl SendContext {
+    pub fn new() -> io::Result<Self> {
+        Context::new().map(Self)
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.0.fd()
+    }
+
+    pub fn dispatch(&mut self) -> io::Result<Vec<InputEvent>> {
+        self.0.dispatch()
+    }
+}
+
+impl AsFd for SendContext {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 impl Context {
     pub fn new() -> io::Result<Self> {
         let mut libinput = Libinput::new_with_udev(Interface);
@@ -97,6 +124,16 @@ fn translate(event: &Event) -> Option<InputEvent> {
             dx: motion.dx(),
             dy: motion.dy(),
         }),
+        Event::Pointer(PointerEvent::MotionAbsolute(motion)) => {
+            // libinput's `absolute_x/y_transformed(W)` maps the device's full
+            // axis range to `0..W`.  Pass a large W and divide to recover a
+            // normalised 0..1 coordinate; the backend scales to scanout size.
+            const SCALE: u32 = 1_000_000;
+            Some(InputEvent::PointerMotionAbsolute {
+                x_norm: motion.absolute_x_transformed(SCALE) / SCALE as f64,
+                y_norm: motion.absolute_y_transformed(SCALE) / SCALE as f64,
+            })
+        }
         Event::Pointer(PointerEvent::Button(btn)) => Some(InputEvent::Button {
             code: btn.button(),
             pressed: btn.button_state() == ButtonState::Pressed,

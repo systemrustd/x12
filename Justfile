@@ -4,7 +4,7 @@ KERNEL := "/boot/vmlinuz-linux-cachyos"
 yserver:
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci" \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- target/debug/yserver
 
 # Run yserver in virtme-ng headless; stdout/stderr reach the host terminal.
@@ -28,7 +28,7 @@ yserver-headless-ssh:
 yserver-ssh:
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw --ssh \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci" \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- target/debug/yserver
 
 # Connect to the SSH server in a running yserver-*-ssh guest.
@@ -73,8 +73,36 @@ ynest-xeyes display="99" geometry="1024x768":
         trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
         wait $ynest_pid
 
+# QEMU window + SSH + debug logging. Run `just yserver-ssh-shell` in a second
+# terminal to get a shell, then: DISPLAY=:7 xterm
+yserver-debug-ssh:
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw --ssh \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c 'RUST_LOG=trace RUST_BACKTRACE=1 target/debug/yserver'
+
+# Run yserver in virtme-ng with a QEMU window + RUST_LOG=debug + RUST_BACKTRACE=1.
+# Shows window content; on crash prints a backtrace if it's a Rust panic.
+yserver-debug:
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c 'RUST_LOG=debug RUST_BACKTRACE=1 target/debug/yserver'
+
+# Run yserver headless + wait 8 s + start xterm inside the guest.
+# Use to smoke-test the xterm path without needing two terminals.
+yserver-xterm:
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-device virtio-gpu-pci" \
+        -- bash -c 'RUST_LOG=info RUST_BACKTRACE=1 target/debug/yserver &\
+            yserver_pid=$!;\
+            sleep 8;\
+            DISPLAY=:7 xterm -e "echo xterm connected; sleep 10" &\
+            wait $yserver_pid'
+
 # Smoke-test virtme harness: bring up Xorg + xterm in a QEMU window.
 harness-check:
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci" \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c "Xorg :1 vt1 -logfile /tmp/xorg-test.log & sleep 5 && DISPLAY=:1 xterm"

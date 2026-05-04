@@ -485,7 +485,7 @@ fn fanout_destroy_sequence(pending: &PendingDestroy) {
 // thread. Clippy pedantic flags these as needless_pass_by_value but they
 // cannot be references because they are moved into the thread.
 #[allow(clippy::needless_pass_by_value)]
-fn handle_client(
+pub fn handle_client(
     client_id: ClientId,
     mut stream: UnixStream,
     server: Arc<Mutex<ServerState>>,

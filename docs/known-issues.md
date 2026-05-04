@@ -106,6 +106,70 @@ once the underlying patterns are understood.
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
 
+## KMS backend (Phase 6.4)
+
+Surfaced while bringing up xeyes / xterm / xclock against `KmsBackend`.
+The backend is the bare-metal counterpart to `HostX11Backend` — primitives
+go straight to a pixman scanout buffer instead of a host X server, so
+gaps in our rasterisation surface here that the host hides for us.
+
+- [ ] **GC `function` not honoured.** `apply_draw_state` ignores the GC
+      `function` field; we always composite with `Operation::Src`.
+      Visible: xclock's second-hand line is invisible (xclock draws it
+      with `GXxor` so it can erase by overdrawing on the next tick). 
+      Likely also blocks xterm's text cursor blink and any client that
+      does the standard XOR-rubber-band trick. Fix needs:
+      (1) pipe `function` from GC state into `DrawState`, (2) translate
+      to a pixman op (`GXcopy → Src`, `GXxor → Xor`, `GXand → ...`, etc.)
+      per-primitive in the backend.
+- [ ] **xterm glyph baseline / placement.** xterm runs without crashing
+      and the white background is correct, but rendered text appears as
+      scattered black dots instead of legible glyphs. Suggests the
+      `bitmap_top` / baseline math in `render_text_string`'s phase-2
+      composite is off — most of each glyph is composited above or below
+      the visible row. Compare against XLFD ascent/descent reported to
+      the client and the actual freetype glyph metrics; likely a sign
+      flip or off-by-`font_ascent`.
+- [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
+      treat any arc as a full ellipse regardless of `angle1`/`angle2`.
+      Fine for xeyes (full circles) but anything that draws actual
+      pie slices renders as full discs. Add an angular mask: for each
+      candidate pixel, check `atan2(py - cy, px - cx)` against
+      `[angle1, angle1 + angle2)` (with X11's "0 = 3 o'clock,
+      counter-clockwise" convention).
+- [ ] **`poly_arc` outline only handles full ellipses.** Same root
+      cause as above — the cap/connector logic doesn't know about
+      partial arcs. Once angle clipping is in, the outline algorithm
+      needs the same treatment plus proper arc endpoints (so a
+      half-arc outline doesn't close itself across the chord).
+- [ ] **Pixman `fill_rectangles` segfaults on partly-out-of-bounds
+      rects.** `clip_rects_to_image` works around it for `poly_line`,
+      `poly_segment`, `poly_arc`, `poly_fill_arc`. Other call sites
+      (`fill_rectangle`, `poly_fill_rectangle`, `image_text8`'s
+      background rect, …) currently rely on either pre-clamping or on
+      the rect being in-bounds by construction. Audit them all and
+      either route through the helper or guarantee bounds. Investigate
+      *why* pixman segfaults — our build / version may be misbehaving
+      and an upgrade could let us drop the workaround.
+- [ ] **Host (GTK) cursor and guest cursor drift.** virtio-tablet gives
+      libinput absolute positions, but the host's QEMU GTK window also
+      shows its own cursor at a different spot — they diverge after a
+      few movements because libinput rescales by device range and we
+      rescale to scanout. Either lock the GTK cursor to the guest
+      cursor (so user only sees one) or pass through *true* host
+      coordinates and skip the libinput rescale.
+- [ ] **`list_fonts_proxy` returns empty list.** We synthesise a valid
+      32-byte "no fonts" reply so font-querying clients (xclock) don't
+      block, but real font enumeration is missing.  XListFonts /
+      XListFontsWithInfo against a real font path would let the host
+      pretend to have e.g. the standard `*-fixed-*` set. Cosmetic —
+      every client we tested falls back to the built-in font and
+      proceeds.
+- [ ] **`poly_line` thick lines.** GC `line_width` ignored; we always
+      rasterise as 1-pixel Bresenham. Most clients use line_width=0
+      (server-discretion thin) but anything wanting a 3- or 5-px line
+      would render too thin.
+
 ## WM-specific behaviour
 
 - [ ] **xterm scrollback misbehaviour.** `seq 1 200` scrolls forward

@@ -782,13 +782,13 @@ pub fn emit_window_event(
 }
 
 #[derive(Clone)]
-pub(crate) struct HostPumpEventSink {
+pub struct HostPumpEventSink {
     server: Arc<Mutex<ServerState>>,
     xid_map: HostXidMap,
     container_window_id: u32,
 }
 
-pub(crate) fn host_pump_event_sink(
+pub fn host_pump_event_sink(
     server: Arc<Mutex<ServerState>>,
     xid_map: HostXidMap,
     container_window_id: u32,
@@ -1193,13 +1193,15 @@ pub fn pointer_event_fanout(
     // selected XI_Raw* on the root window (xeyes uses RawMotion as a
     // cursor-moved trigger, then calls XIQueryPointer for the position).
     let xi2_raw_evtype: Option<u16> = match event.kind {
-        PointerEventKind::ButtonPress => Some(15),  // XI_RawButtonPress
+        PointerEventKind::ButtonPress => Some(15), // XI_RawButtonPress
         PointerEventKind::ButtonRelease => Some(16), // XI_RawButtonRelease
         PointerEventKind::MotionNotify => Some(17), // XI_RawMotion
         PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => None,
     };
 
-    let (nested_id, event_x, event_y, core_targets, xi2_targets, xi2_raw_targets) = match state.lock() {
+    let (nested_id, event_x, event_y, core_targets, xi2_targets, xi2_raw_targets) = match state
+        .lock()
+    {
         Ok(g) => {
             let (target, target_x, target_y) = g
                 .resources
@@ -1377,10 +1379,10 @@ pub fn pointer_event_fanout(
             seq,
             137, // XI2 major opcode
             raw_evtype,
-            2,            // deviceid: Master Pointer
+            2, // deviceid: Master Pointer
             event.time,
             u32::from(event.detail),
-            2,            // sourceid: Master Pointer
+            2, // sourceid: Master Pointer
             i32::from(event.root_x),
             i32::from(event.root_y),
         );

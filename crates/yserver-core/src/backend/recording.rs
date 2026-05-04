@@ -190,6 +190,14 @@ impl Backend for RecordingBackend {
 
     fn set_event_sink(&mut self, _sink: Option<Box<dyn crate::backend::BackendEventSink>>) {}
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     // Subwindow lifecycle
 
     fn create_subwindow(

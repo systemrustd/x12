@@ -63,6 +63,14 @@ impl Backend for HostX11Backend {
         HostX11Backend::set_event_sink(self, sink);
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn create_subwindow(
         &mut self,
         origin: Option<OriginContext>,

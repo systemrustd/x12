@@ -20,7 +20,7 @@
 //! / `register_subwindow` / `unregister_host_window` migrated onto the
 //! trait at Step 6 — replacing the deleted pump-handle wrapper.
 
-use std::io;
+use std::{any::Any, io};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, xfixes};
 
@@ -71,6 +71,11 @@ pub trait Backend: Send {
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
     fn ping(&mut self, origin: Option<OriginContext>) -> io::Result<()>;
     fn set_event_sink(&mut self, sink: Option<Box<dyn BackendEventSink>>);
+
+    /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
+    fn as_any(&self) -> &dyn Any;
+    /// Mutable downcast to `Any` for backend-specific operations.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     // ──────────────────────────────────────────────────────────────
     // Subwindow lifecycle

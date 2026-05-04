@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 yserver-core.workspace = true
+yserver-protocol.workspace = true
+crossbeam-channel.workspace = true
 env_logger.workspace = true
 log.workspace = true
 libc.workspace = true
@@ -18,6 +20,9 @@ drm.workspace = true
 input.workspace = true
 nix.workspace = true
 signal-hook.workspace = true
+pixman.workspace = true
+freetype-rs.workspace = true
+xkbcommon.workspace = true
 
 [[bin]]
 name = "ynest"

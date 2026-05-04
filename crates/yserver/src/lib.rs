@@ -1,133 +1,235 @@
 pub mod drm;
 pub mod input;
+pub mod kms;
 pub mod present;
 
 use std::{
-    io,
-    sync::{Arc, atomic::AtomicBool},
+    fs,
+    io::{self, ErrorKind},
+    os::{
+        fd::{AsRawFd, BorrowedFd},
+        unix::{fs::PermissionsExt, net::UnixListener},
+    },
+    path::PathBuf,
+    sync::Arc,
+    thread,
 };
 
 use nix::sys::{
+    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
     signal::{SigSet, SigmaskHow, Signal, sigprocmask},
     signalfd::SignalFd,
 };
 
-use crate::present::State;
+use yserver_core::{
+    backend::Backend,
+    nested::handle_client,
+    server::{ServerState, host_pump_event_sink},
+};
 
-const RECT_VEL_X: f32 = 220.0;
-const RECT_VEL_Y: f32 = 175.0;
+use crate::kms::KmsBackend;
+
+const DISPLAY: u16 = 7;
+const LISTENER_TOKEN: u64 = 0;
+const DRM_TOKEN: u64 = 1;
+const INPUT_TOKEN: u64 = 2;
+const SIGNAL_TOKEN: u64 = 3;
 
 pub fn run() -> io::Result<()> {
-    log::info!("yserver: Phase 6 bootstrap — startup");
+    log::info!("yserver: Phase 6.4 KMS bootstrap — startup");
 
     let signal_fd = block_termination_signals()?;
+    let device_path = resolve_drm_device()?;
+    log::info!("yserver: opening DRM device {device_path}");
 
-    let device = Arc::new(open_drm_device()?);
-    log::info!(
-        "yserver: opened DRM device {}, master + atomic capabilities acquired",
-        device.path()
-    );
+    let backend = KmsBackend::open(&device_path)?;
+    let fb_w = backend.fb_dimensions().0;
+    let fb_h = backend.fb_dimensions().1;
+    log::info!("yserver: scanout {fb_w}x{fb_h}");
 
-    let output = drm::modeset::discover_output(&device)?;
-    drm::modeset::dump_properties(&device, &output)?;
+    let backend_arc: Arc<std::sync::Mutex<dyn Backend>> = Arc::new(std::sync::Mutex::new(backend));
 
-    let fb_w = output.picked.width;
-    let fb_h = output.picked.height;
+    let server = Arc::new(std::sync::Mutex::new(ServerState::with_geometry(
+        fb_w, fb_h,
+    )));
 
-    let mut state = State {
-        rect_x: f32::from(fb_w) / 2.0,
-        rect_y: f32::from(fb_h) / 2.0,
-        vel_x: RECT_VEL_X,
-        vel_y: RECT_VEL_Y,
-        cursor_x: f32::from(fb_w) / 2.0,
-        cursor_y: f32::from(fb_h) / 2.0,
-    };
+    let xid_map = backend_arc.lock().unwrap().xid_map();
+    let window_id = backend_arc.lock().unwrap().window_id();
+    let sink = host_pump_event_sink(server.clone(), xid_map, window_id);
+    backend_arc
+        .lock()
+        .unwrap()
+        .set_event_sink(Some(Box::new(sink)));
 
-    let mut buffers = Vec::with_capacity(2);
-    for idx in 0..2 {
-        let mut b = drm::Buffer::new(Arc::clone(&device), fb_w, fb_h)?;
-        present::paint(&state, &mut b);
-        log::info!(
-            "yserver: allocated buffer[{idx}] {}x{} fb=0x{:x}",
-            b.width(),
-            b.height(),
-            u32::from(b.fb_id())
-        );
-        buffers.push(b);
+    let socket_dir = PathBuf::from("/tmp/.X11-unix");
+    fs::create_dir_all(&socket_dir)?;
+    let socket_path = socket_dir.join(format!("X{DISPLAY}"));
+    match fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
-    let initial_fb = buffers[0].fb_id();
-    drm::modeset::commit_modeset(&device, &output, initial_fb)?;
-    log::info!(
-        "yserver: atomic modeset committed — buffer[0] on {}",
-        output.connector_name
-    );
+    let listener = UnixListener::bind(&socket_path)?;
+    // X clients connect as the invoking user; the socket needs world write
+    // (connect() on AF_UNIX requires `w`). Xorg sets 0777 on /tmp/.X11-unix/X*.
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777))?;
+    log::info!("yserver: listening on unix socket DISPLAY=:{DISPLAY}");
 
-    let mut swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-
-    let mut input_ctx = match input::Context::new() {
-        Ok(ctx) => {
-            log::info!("yserver: libinput context attached to seat0");
-            Some(ctx)
+    // Submit initial flip with root background
+    {
+        let mut b = backend_arc.lock().unwrap();
+        let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
+        if let Err(e) = kms.composite_and_flip() {
+            log::warn!("yserver: initial composite_and_flip failed: {e}");
         }
-        Err(err) => {
-            log::warn!("yserver: libinput unavailable, continuing without input: {err}");
-            None
-        }
-    };
-
-    let running = Arc::new(AtomicBool::new(true));
-
-    // Submit the first flip with buffer[1].
-    if let Some(idx) = swapchain.acquire_idx() {
-        let fb_id = swapchain.buffer(idx).fb_id();
-        drm::page_flip::submit_flip(&device, &output, fb_id)?;
-        swapchain
-            .submit(idx)
-            .map_err(|e| io::Error::other(format!("swapchain.submit: {e}")))?;
     }
 
-    let loop_result = present::run_loop(
-        &device,
-        &output,
-        &mut swapchain,
-        input_ctx.as_mut(),
+    let epoll = Epoll::new(EpollCreateFlags::empty())?;
+
+    // SAFETY: we're borrowing the fd from objects that outlive the epoll set
+    let drm_fd = {
+        let b = backend_arc.lock().unwrap();
+        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
+        kms.drm_fd()
+    };
+    let drm_borrow = unsafe { BorrowedFd::borrow_raw(drm_fd) };
+    epoll.add(drm_borrow, EpollEvent::new(EpollFlags::EPOLLIN, DRM_TOKEN))?;
+
+    let input_fd = {
+        let b = backend_arc.lock().unwrap();
+        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
+        kms.input_fd()
+    };
+    if let Some(fd) = input_fd {
+        let input_borrow = unsafe { BorrowedFd::borrow_raw(fd) };
+        epoll.add(
+            input_borrow,
+            EpollEvent::new(EpollFlags::EPOLLIN, INPUT_TOKEN),
+        )?;
+    }
+
+    let listener_fd = listener.as_raw_fd();
+    let listener_borrow = unsafe { BorrowedFd::borrow_raw(listener_fd) };
+    epoll.add(
+        listener_borrow,
+        EpollEvent::new(EpollFlags::EPOLLIN, LISTENER_TOKEN),
+    )?;
+
+    epoll.add(
         &signal_fd,
-        &mut state,
-        fb_w,
-        fb_h,
-        &running,
-    );
+        EpollEvent::new(EpollFlags::EPOLLIN, SIGNAL_TOKEN),
+    )?;
 
-    log::info!("yserver: disabling plane + CRTC");
-    if let Err(err) = drm::modeset::disable_output(&device, &output) {
-        log::warn!("yserver: disable_output failed (continuing shutdown): {err}");
+    let mut events_buf = [EpollEvent::empty(); 8];
+    let mut running = true;
+    let mut client_count: u32 = 0;
+
+    log::info!("yserver: entering epoll event loop");
+
+    while running {
+        let n = match epoll.wait(&mut events_buf, EpollTimeout::NONE) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(err) => return Err(io::Error::other(format!("epoll_wait: {err}"))),
+        };
+
+        for ev in &events_buf[..n] {
+            match ev.data() {
+                LISTENER_TOKEN => match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let client_id = yserver_protocol::x11::ClientId(client_count);
+                        client_count += 1;
+                        let host = backend_arc.clone();
+                        let server = server.clone();
+                        let handle = thread::spawn(move || {
+                            if let Err(err) = handle_client(
+                                client_id,
+                                stream,
+                                server,
+                                Some(host),
+                                Some(window_id),
+                            ) {
+                                log::info!("client {} disconnected: {err}", client_id.0);
+                            }
+                        });
+                        thread::spawn(move || {
+                            if let Err(panic) = handle.join() {
+                                let msg = panic
+                                    .downcast_ref::<String>()
+                                    .map(|s| s.as_str())
+                                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                                    .unwrap_or("(non-string panic)");
+                                log::error!("client {} panicked: {msg}", client_id.0);
+                            }
+                        });
+                        log::info!("yserver: client {} connected", client_id.0);
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => log::warn!("yserver: accept failed: {err}"),
+                },
+                DRM_TOKEN => {
+                    let mut b = backend_arc.lock().unwrap();
+                    let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
+                    if let Err(e) = kms.drain_page_flips_and_composite() {
+                        log::warn!("yserver: page flip / composite error: {e}");
+                    }
+                }
+                INPUT_TOKEN => {
+                    let mut b = backend_arc.lock().unwrap();
+                    let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
+                    if let Err(e) = kms.process_input_events() {
+                        log::warn!("yserver: input event error: {e}");
+                    }
+                }
+                SIGNAL_TOKEN => match signal_fd.read_signal() {
+                    Ok(Some(siginfo)) => {
+                        log::info!(
+                            "yserver: received signal {}, shutting down",
+                            siginfo.ssi_signo
+                        );
+                        running = false;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::warn!("yserver: signalfd read error: {err}");
+                    }
+                },
+                _ => {}
+            }
+        }
     }
 
-    drop(swapchain);
-    drop(input_ctx);
-    drop(device);
+    log::info!("yserver: shutting down, disabling output");
+    {
+        let b = backend_arc.lock().unwrap();
+        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
+        if let Err(e) = kms.disable_output() {
+            log::warn!("yserver: disable_output failed: {e}");
+        }
+    }
+
+    let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");
-    loop_result
+    Ok(())
 }
 
-fn open_drm_device() -> io::Result<drm::Device> {
+fn resolve_drm_device() -> io::Result<String> {
     if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
-        return drm::Device::open(&explicit);
+        return Ok(explicit);
     }
     let candidates = ["/dev/dri/card0", "/dev/dri/card1"];
     let mut last_err: Option<io::Error> = None;
     for path in candidates {
         match drm::Device::open(path) {
-            Ok(device) => return Ok(device),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                log::debug!("yserver: {path} not present, trying next candidate");
+            Ok(_) => return Ok(path.to_string()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
                 last_err = Some(err);
             }
             Err(err) => return Err(err),
         }
     }
     Err(last_err
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DRM card devices found")))
+        .unwrap_or_else(|| io::Error::new(ErrorKind::NotFound, "no DRM card devices found")))
 }
 
 fn block_termination_signals() -> io::Result<SignalFd> {
