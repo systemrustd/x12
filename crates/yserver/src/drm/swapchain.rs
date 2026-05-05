@@ -96,6 +96,14 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            buffers: Vec::new(),
+            state: SwapState::new(0),
+        }
+    }
+
     pub fn with_initial_scanout(buffers: Vec<Buffer>, scanout_idx: usize) -> Self {
         let n = buffers.len();
         Self {

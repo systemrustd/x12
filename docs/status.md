@@ -1818,6 +1818,120 @@ Out of scope (deferred to 6.7+):
 - Host (GTK) cursor and guest cursor drift / lock.
 - VT_SETMODE / logind / suspend-resume / hotplug polish.
 
+### Phase 6.7 — Full X11 implementation pass (complete)
+
+Goal: replace every Phase 6.6 stub on `KmsBackend` with a spec-correct
+implementation across input, drawing, RENDER, glyphs, SHAPE, font
+enumeration, and XKB. TDD throughout: failing test → minimal impl →
+commit, one task per sub-phase. Squash-merged from `phase6.7` branch.
+
+Design:
+[`2026-05-05-phase67-design.md`](superpowers/specs/2026-05-05-phase67-design.md).
+Plan:
+[`2026-05-05-phase67-full-x11-pass.md`](superpowers/plans/2026-05-05-phase67-full-x11-pass.md).
+
+#### Landed
+
+- **6.7.1 — input.** `warp_pointer` updates `cursor_x`/`cursor_y`
+  (relative to destination window if given, otherwise current pointer
+  position) and pushes a synthetic `MotionNotify` through the event
+  sink; coords clamped to the framebuffer. `AllowEvents` mode=2
+  (ReplayPointer) thaws the frozen `ButtonPress` and re-routes via a
+  new `route_button_press_no_grab` free function in `server.rs` that
+  walks the window-tree from the deepest window under the event coords
+  upward until it finds a window with `ButtonPressMask` — without
+  re-checking passive grabs and without delivering to the former grab
+  owner. e16 widget clicks now activate.
+- **6.7.2 — drawing.** `copy_plane` builds a temporary ARGB image by
+  testing the plane bit on every source pixel and substituting
+  foreground/background colour, then composites onto the destination
+  through `fill_rects_with_gc_function`. `poly_text16` and
+  `image_text16` parse CHAR2B (`high<<8 | low`) text items, advancing
+  the pen by per-glyph `character_width` from the font's
+  `char_info_cache`; sentinel `len=255` skips the 7-byte font-change
+  payload, and `image_text16` paints the background rect first.
+- **6.7.3 — RENDER attributes / gradients / transforms.**
+  `PictureState::Drawable` extended with `repeat`, `alpha_map`,
+  `alpha_x/y`, `clip_x/y`, `component_alpha`, `transform`, plus stored-
+  but-no-op fields for `graphics_exposure`, `subwindow_mode`,
+  `poly_edge`, `poly_mode`. `render_change_picture` parses every
+  CPxxx bit (CPRepeat, CPAlphaMap/Origin, CPClip, CPGraphicsExposure,
+  CPSubwindowMode, CPPolyEdge/Mode/Dither, CPComponentAlpha) — clearing
+  clip on `CPClipMask=0`. New `PictureState::Gradient` variant backed
+  by pixman `pixman_image_create_linear_gradient` /
+  `pixman_image_create_radial_gradient` via FFI; both wired into
+  `render_composite` source dispatch with `set_repeat` /
+  `set_transform` applied per-composite. `render_set_picture_transform`
+  decodes the 9×4-byte 16.16 Fixed matrix, stores it on the picture
+  (skipping if it's the identity), and applies in `render_composite`
+  via `pixman_image_set_transform`, resetting to identity afterwards.
+- **6.7.4 — CompositeGlyphs.** Pen advancement now applies both
+  `delta_x` and `delta_y` per item run; mid-stream glyphset switch via
+  the count=255 sentinel + 4-byte XID is honoured (function signature
+  expanded to take `&HashMap<u32, GlyphSetState>` so the active
+  glyphset XID can change per group). `GlyphSetFormat::A1` added with
+  X11 ZPixmap-style 32-bit-padded MSB-first scanlines stored verbatim;
+  `parse_add_glyphs` routes A1 glyphs into the new format and
+  `composite_glyphs_onto` feeds them through pixman as `FormatCode::A1`
+  masks. fvwm3 / xclock / xterm panel text is correct and toolkits
+  using A1 cursor or icon glyph fonts now render.
+- **6.7.5 — SHAPE.** `KmsBackend` gains
+  `shape_bounding`/`shape_clip`/`shape_input` `HashMap<u32, Vec<RegionRect>>`
+  fields. `set_shape_rectangles` stores rects keyed by `kind`; empty
+  rects encode "window clips to nothing" (still hittable=false) and a
+  separate `clear_shape_rectangles` removes the entry to restore the
+  default rectangular shape. `DestroyWindow` sweeps all three maps.
+  Compositor pass installs each window's bounding region via
+  `pixman_image_set_clip_region` before its composite call and clears
+  it after. `window_under_cursor` checks input shape first
+  (precedence), bounding shape second, with empty regions = no hit.
+- **6.7.6 — font enumeration.** `fontconfig = "0.7"` added to the
+  workspace. `list_fonts_proxy` queries fontconfig for matching
+  patterns and synthesises XLFD names via `fc_match_to_xlfd` (encodes
+  family, weight, slant, size, spacing). `list_fonts_with_info_proxy`
+  reuses the same enumeration and attaches `FontMetrics` from the
+  freetype loader. `FontLoader::open_font` detects XLFDs (leading `-`)
+  and parses the family / style / size fields into a fontconfig
+  pattern before opening — clients selecting fonts by XLFD now
+  succeed instead of falling back to the default face.
+- **6.7.7 — XKB proxy.** New `crates/yserver/src/kms/xkb.rs` builds
+  reply payloads for `UseExtension` (minor 0), `GetMap` (8) with
+  correct min/max keycode from `xkbcommon::xkb::Keymap`, `GetNames`
+  (17), `GetCompatMap` (20), and `GetControls` (24) with default
+  500ms / 33ms repeat delay / interval. Unknown reply-requiring minors
+  fall through to a 32-byte minimal reply. `xkb_proxy` on
+  `KmsBackend` dispatches on minor and consults the backend-owned
+  keymap. Clients calling `XkbUseExtension` / `XkbGetMap` no longer
+  hang waiting for replies on bare KMS.
+
+#### Validation
+
+- TDD-driven: every task lands its failing test before the impl. New
+  unit tests across `backend.rs` (~12 new), `server.rs` (1 new for
+  `route_button_press_no_grab`), and `xkb.rs` (4 new). Workspace test
+  suite green.
+- `clippy -p yserver -- -D warnings` clean.
+- The merged-master commits cover all 13 spec items in the plan's
+  self-review table.
+
+#### Phase 6.7 follow-ups
+
+- **CompositeGlyphs ARGB32 format.** A1 + A8 supported; ARGB32 still
+  routes to `Other` and is silently skipped.
+- **CPClipMask non-zero pixmap path.** Clip from a 1-bit pixmap is
+  approximated as a full-rect clip derived from the pixmap geometry;
+  honouring the actual bit pattern would require building a pixman
+  region from the mask.
+- **XKB GetMap full table encoding.** Current reply carries correct
+  min/max keycode + present=0 (no tables). Toolkits that introspect
+  key types / sym maps / modifier maps still see empty data; promote
+  to full table encoding if a real client needs it.
+- **`fontconfig`-crate API surface.** `list_fonts_proxy` uses the 0.7
+  surface — revisit if the crate adds a richer object-set API.
+- **Host (GTK) cursor and guest cursor drift / lock** — still open.
+- **VT_SETMODE / logind / suspend-resume / hotplug polish** — still
+  open.
+
 ## Phase 7 — Security hardening
 
 Goal: per-client capabilities, permission prompts or launch-time

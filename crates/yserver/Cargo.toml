@@ -23,6 +23,7 @@ signal-hook.workspace = true
 pixman.workspace = true
 freetype-rs.workspace = true
 xkbcommon.workspace = true
+fontconfig = "0.10.1"
 
 [[bin]]
 name = "ynest"

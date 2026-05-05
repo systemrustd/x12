@@ -19,8 +19,8 @@ use yserver_core::{
     },
 };
 use yserver_protocol::x11::{
-    CharInfo as ProtocolCharInfo, ClipRectangles, FontMetrics, ResourceId, xfixes,
-    RENDER_FMT_A8,
+    CharInfo as ProtocolCharInfo, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8,
+    ResourceId, xfixes,
 };
 
 use crate::drm;
@@ -177,17 +177,7 @@ fn composite32(
     // the doc comment).
     unsafe {
         pixman::ffi::pixman_image_composite32(
-            op,
-            src_ptr,
-            mask_ptr,
-            dst_ptr,
-            src_x,
-            src_y,
-            mask_x,
-            mask_y,
-            dst_x,
-            dst_y,
-            width,
+            op, src_ptr, mask_ptr, dst_ptr, src_x, src_y, mask_x, mask_y, dst_x, dst_y, width,
             height,
         );
     }
@@ -267,6 +257,33 @@ struct DrawableGeometry<'a> {
 /// than tumbling into a recursive panic.
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read_drawable_pixel_for_plane(
+    geom: &DrawableGeometry<'_>,
+    depth: u8,
+    x: usize,
+    y: usize,
+) -> u32 {
+    if x >= geom.width || y >= geom.height {
+        return 0;
+    }
+    // SAFETY: Bounds are checked above and data_ptr/stride_bytes come from a
+    // live pixman image borrowed through drawable_geometry.
+    unsafe {
+        match depth {
+            1 => {
+                let byte = *geom.data_ptr.add(y * geom.stride_bytes + x / 8);
+                u32::from((byte & (0x80 >> (x % 8))) != 0)
+            }
+            8 => u32::from(*geom.data_ptr.add(y * geom.stride_bytes + x)),
+            _ => {
+                let words = geom.data_ptr.cast::<u32>();
+                let stride_words = geom.stride_bytes / 4;
+                *words.add(y * stride_words + x)
+            }
+        }
+    }
 }
 
 /// Convert an X11 24-bit pixel (0xRRGGBB) to a Pixman Color.
@@ -424,12 +441,17 @@ fn fill_rects_with_gc_function(
             return;
         }
         // Non-32bpp image: fall through to the pixman path below (treated as Src).
-        log::debug!("GcFunction::Xor on non-32bpp image (stride={stride_bytes}, width={iw}); falling back to Src");
+        log::debug!(
+            "GcFunction::Xor on non-32bpp image (stride={stride_bytes}, width={iw}); falling back to Src"
+        );
     }
     let op = match function {
         GcFunction::Copy => Operation::Src,
         other => {
-            log::debug!("GC function {:?} not implemented, falling back to Copy", other);
+            log::debug!(
+                "GC function {:?} not implemented, falling back to Copy",
+                other
+            );
             Operation::Src
         }
     };
@@ -439,21 +461,24 @@ fn fill_rects_with_gc_function(
     // rect (4,58,6,59) onto a 64×64 pixmap — y+h=117 > image height).
     let iw = img.0.width() as i32;
     let ih = img.0.height() as i32;
-    let clipped: Vec<Rectangle16> = rects.iter().filter_map(|r| {
-        let x0 = (r.x as i32).max(0);
-        let y0 = (r.y as i32).max(0);
-        let x1 = (r.x as i32).saturating_add(r.width as i32).min(iw);
-        let y1 = (r.y as i32).saturating_add(r.height as i32).min(ih);
-        if x1 <= x0 || y1 <= y0 {
-            return None;
-        }
-        Some(Rectangle16 {
-            x: x0 as i16,
-            y: y0 as i16,
-            width: (x1 - x0) as u16,
-            height: (y1 - y0) as u16,
+    let clipped: Vec<Rectangle16> = rects
+        .iter()
+        .filter_map(|r| {
+            let x0 = (r.x as i32).max(0);
+            let y0 = (r.y as i32).max(0);
+            let x1 = (r.x as i32).saturating_add(r.width as i32).min(iw);
+            let y1 = (r.y as i32).saturating_add(r.height as i32).min(ih);
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            Some(Rectangle16 {
+                x: x0 as i16,
+                y: y0 as i16,
+                width: (x1 - x0) as u16,
+                height: (y1 - y0) as u16,
+            })
         })
-    }).collect();
+        .collect();
     if !clipped.is_empty() {
         let _ = img.0.fill_rectangles(op, color, &clipped);
     }
@@ -550,8 +575,10 @@ pub struct KmsBackend {
     // Current font for text rendering
     current_font: Option<u32>,
 
-    // Current GC drawing function (default: Copy)
+    // Current GC draw state (default GC values).
     current_function: GcFunction,
+    current_foreground: u32,
+    current_background: u32,
 
     // RENDER picture tracking
     pictures: HashMap<u32, PictureState>,
@@ -562,6 +589,12 @@ pub struct KmsBackend {
 
     // RENDER glyphset tracking
     glyphsets: HashMap<u32, GlyphSetState>,
+
+    // SHAPE extension: per-window shape regions keyed by host XID.
+    // None entry = no shape (full rectangle). Some(vec![]) = empty region.
+    shape_bounding: HashMap<u32, Vec<xfixes::RegionRect>>, // kind=0
+    shape_clip: HashMap<u32, Vec<xfixes::RegionRect>>,     // kind=1
+    shape_input: HashMap<u32, Vec<xfixes::RegionRect>>,    // kind=2
 }
 
 /// State for a RENDER picture on the KMS backend.
@@ -573,34 +606,74 @@ enum PictureState {
         host_xid: u32,
         /// Optional clip rectangles set via SetPictureClipRectangles.
         clip: Option<Vec<Rectangle16>>,
+        repeat: Repeat,
+        alpha_map: Option<u32>,
+        alpha_x: i16,
+        alpha_y: i16,
+        clip_x: i16,
+        clip_y: i16,
+        component_alpha: bool,
+        transform: Option<pixman::ffi::pixman_transform_t>,
+        graphics_exposure: bool,
+        subwindow_mode: u8,
+        poly_edge: u8,
+        poly_mode: u8,
     },
     /// 1×1 solid colour image (CreateSolidFill). Used as composite source.
     SolidFill {
         image: RefCell<PixmanImage>,
+        repeat: Repeat,
+        component_alpha: bool,
     },
+    Gradient {
+        image: PixmanImage,
+        repeat: Repeat,
+        transform: Option<pixman::ffi::pixman_transform_t>,
+    },
+}
+
+fn default_drawable_picture(host_xid: u32) -> PictureState {
+    PictureState::Drawable {
+        host_xid,
+        clip: None,
+        repeat: Repeat::None,
+        alpha_map: None,
+        alpha_x: 0,
+        alpha_y: 0,
+        clip_x: 0,
+        clip_y: 0,
+        component_alpha: false,
+        transform: None,
+        graphics_exposure: false,
+        subwindow_mode: 0,
+        poly_edge: 0,
+        poly_mode: 0,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlyphSetFormat {
     A8,
-    Other, // A1, ARGB32 etc — not supported in Phase 6.6
+    A1,
+    Other, // ARGB32 etc — not supported for glyph masks yet
 }
 
 struct StoredGlyph {
-    width:  u16,
+    width: u16,
     height: u16,
     /// RENDER wire field: top-left of bitmap relative to glyph origin.
     /// This is the *negative* of FreeType's bitmap_left.
     /// Draw at pen_x - x, pen_y - y.
-    x:      i16,
-    y:      i16,
-    x_off:  i16,
+    x: i16,
+    y: i16,
+    x_off: i16,
     /// Vertical pen advance. Parsed from wire for fidelity but unused —
     /// horizontal-text rendering only advances the x pen between glyphs.
     #[allow(dead_code)]
-    y_off:  i16,
+    y_off: i16,
     /// Row-major A8 bytes, densely packed (no per-row padding).
     pixels: Vec<u8>,
+    format: GlyphSetFormat,
 }
 
 pub(super) struct GlyphSetState {
@@ -656,16 +729,22 @@ struct PixmapState {
     depth: u8,
 }
 
-/// Manages freetype font loading with XLFD fallback.
+/// Resolves X11 font names (aliases like `fixed`, XLFDs like
+/// `-adobe-helvetica-bold-r-*-*-12-*-...`, or family names) to a filesystem
+/// path via fontconfig, then opens the file with FreeType.
 struct FontLoader {
     library: freetype::Library,
+    fc: fontconfig::Fontconfig,
 }
 
 impl FontLoader {
     fn new() -> io::Result<Self> {
+        let fc = fontconfig::Fontconfig::new()
+            .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
         Ok(Self {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
+            fc,
         })
     }
 
@@ -673,46 +752,84 @@ impl FontLoader {
         name.starts_with('-')
     }
 
+    /// Pull (family, style, pixel_size) hints out of an XLFD pattern.
+    /// XLFD field indices after splitting on '-' (leading '-' produces an
+    /// empty 0th element):
+    ///   1=foundry 2=family 3=weight 4=slant 5=setwidth 6=addstyle
+    ///   7=pixelsize 8=pointsize 9=resx 10=resy 11=spacing 12=avgwidth
+    /// "*" or empty fields are treated as wildcards.
+    fn parse_xlfd(name: &str) -> (Option<String>, Option<String>, Option<u32>) {
+        let parts: Vec<&str> = name.split('-').collect();
+        let take = |i: usize| -> Option<String> {
+            parts
+                .get(i)
+                .filter(|s| !s.is_empty() && **s != "*")
+                .map(|s| (*s).to_string())
+        };
+        let family = take(2);
+        let weight = take(3);
+        let slant = take(4);
+        let style = match (weight.as_deref(), slant.as_deref()) {
+            (None, Some("i" | "o")) => Some("Italic".to_string()),
+            (Some(w), Some("i" | "o")) => Some(format!("{w} Italic")),
+            (Some(w), _) => Some(w.to_string()),
+            (None, _) => None,
+        };
+        let px = parts
+            .get(7)
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&s| s > 0);
+        (family, style, px)
+    }
+
     fn open_font(
         &self,
         name: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        let path = if Self::is_xlfd_pattern(name) {
-            None
+        // Resolve the X11 font name to a file path via fontconfig. We can't
+        // rely on the high-level `Fontconfig::find`: when the requested family
+        // doesn't exist, fontconfig falls back to the *system default* (often
+        // a proportional sans-serif), which makes xterm/wmaker render with
+        // wrong metrics. Build the pattern ourselves and chain "monospace" as
+        // a secondary family — fontconfig prefers the first listed family but
+        // falls through the chain before reaching its system default.
+        let (family, style, xlfd_px) = if Self::is_xlfd_pattern(name) {
+            Self::parse_xlfd(name)
         } else {
-            self.library
-                .new_face(name, 0)
-                .ok()
-                .map(|face| (face, name.to_string()))
+            (Some(name.to_string()), None, None)
         };
+        let query_family = family.as_deref().unwrap_or("monospace");
 
-        let candidates = [
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/gnu-free/FreeMono.ttf",
-            "/usr/share/fonts/freefonts/FreeMono.ttf",
-            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ];
+        let cfamily = std::ffi::CString::new(query_family)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
 
-        let face = if let Some((f, _)) = path {
-            f
+        let mut pat = fontconfig::Pattern::new(&self.fc);
+        pat.add_string(fontconfig::FC_FAMILY, &cfamily);
+        if query_family != "monospace" {
+            pat.add_string(fontconfig::FC_FAMILY, c"monospace");
+        }
+        let cstyle_storage;
+        if let Some(style) = style.as_deref() {
+            cstyle_storage = std::ffi::CString::new(style)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
+            pat.add_string(fontconfig::FC_STYLE, &cstyle_storage);
+        }
+        let matched = pat.font_match();
+        let path = matched.filename().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
+        })?;
+        let face_index: isize = matched.face_index().unwrap_or(0) as isize;
+        let face = self
+            .library
+            .new_face(path, face_index)
+            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
+
+        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
+        if let Some(px) = xlfd_px {
+            let _ = face.set_pixel_sizes(0, px);
         } else {
-            let mut loaded = None;
-            for candidate in &candidates {
-                if let Ok(f) = self.library.new_face(candidate, 0) {
-                    loaded = Some(f);
-                    break;
-                }
-            }
-            loaded.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
-            })?
-        };
-
-        let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+        }
         let (metrics, char_cache) = compute_font_metrics(&face);
         Ok((face, metrics, char_cache))
     }
@@ -902,9 +1019,14 @@ impl KmsBackend {
             button_mask: 0,
             current_font: None,
             current_function: GcFunction::Copy,
+            current_foreground: 0,
+            current_background: 0x00ff_ffff,
             pictures: HashMap::new(),
             picture_rescued_images: HashMap::new(),
             glyphsets: HashMap::new(),
+            shape_bounding: HashMap::new(),
+            shape_clip: HashMap::new(),
+            shape_input: HashMap::new(),
         };
         // Install a built-in X-shaped cursor as the universal fallback;
         // any later DefineCursor on the root window will override it.
@@ -1018,6 +1140,13 @@ impl KmsBackend {
         }
     }
 
+    fn drawable_depth(&self, host_xid: u32) -> Option<u8> {
+        self.windows
+            .get(&host_xid)
+            .map(|w| w.depth)
+            .or_else(|| self.pixmaps.get(&host_xid).map(|p| p.depth))
+    }
+
     /// Mutably borrow a drawable's Pixman image and pass it to a closure.
     fn with_image_mut<F, R>(&mut self, host_xid: u32, f: F) -> Option<R>
     where
@@ -1049,8 +1178,8 @@ impl KmsBackend {
         // Top-levels are tracked in stacking order (bottom-to-top) on
         // self.top_level_order. Walk back-to-front so the topmost match
         // wins.
-        let x = self.cursor_x as f64;
-        let y = self.cursor_y as f64;
+        let cx = self.cursor_x as f64;
+        let cy = self.cursor_y as f64;
         for &window_id in self.top_level_order.iter().rev() {
             let Some(w) = self.windows.get(&window_id) else {
                 continue;
@@ -1058,13 +1187,31 @@ impl KmsBackend {
             if !w.mapped {
                 continue;
             }
-            if x >= w.x as f64
-                && x < (w.x as f64 + w.width as f64)
-                && y >= w.y as f64
-                && y < (w.y as f64 + w.height as f64)
+            // Coarse bounding-box check first.
+            if cx < w.x as f64
+                || cx >= w.x as f64 + w.width as f64
+                || cy < w.y as f64
+                || cy >= w.y as f64 + w.height as f64
             {
-                return Some(window_id);
+                continue;
             }
+            // Input shape (kind=2) takes precedence; fall back to bounding (kind=0).
+            let shape = self
+                .shape_input
+                .get(&window_id)
+                .or_else(|| self.shape_bounding.get(&window_id));
+            if let Some(rects) = shape {
+                // Empty shape = window is unhittable.
+                let inside = rects.iter().any(|r| {
+                    let rx = w.x as f64 + r.x as f64;
+                    let ry = w.y as f64 + r.y as f64;
+                    cx >= rx && cx < rx + r.width as f64 && cy >= ry && cy < ry + r.height as f64
+                });
+                if !inside {
+                    continue;
+                }
+            }
+            return Some(window_id);
         }
         None
     }
@@ -1079,9 +1226,7 @@ impl KmsBackend {
         let cx = self.cursor_x as f64;
         let cy = self.cursor_y as f64;
         let root_id = self.window_id;
-        log::trace!(
-            "hit-test: cursor=({cx:.0},{cy:.0}) root_container=0x{root_id:x}"
-        );
+        log::trace!("hit-test: cursor=({cx:.0},{cy:.0}) root_container=0x{root_id:x}");
         // Walk top-level stacking order from bottom (first painted) to
         // top (last painted) — same order as the compositor.
         let top_levels = self.top_level_order.clone();
@@ -1117,9 +1262,13 @@ impl KmsBackend {
         indent: usize,
     ) {
         let pad = " ".repeat(indent * 2);
-        let Some(p) = self.windows.get(&parent) else { return };
+        let Some(p) = self.windows.get(&parent) else {
+            return;
+        };
         for &child_id in &p.children {
-            let Some(c) = self.windows.get(&child_id) else { continue };
+            let Some(c) = self.windows.get(&child_id) else {
+                continue;
+            };
             let child_x = parent_origin_x + c.x as f64;
             let child_y = parent_origin_y + c.y as f64;
             let hit = cx >= child_x
@@ -1440,9 +1589,7 @@ impl KmsBackend {
                 return;
             }
         };
-        log::trace!(
-            "libinput button code=0x{code:x} pressed={pressed} → X11 detail={detail}"
-        );
+        log::trace!("libinput button code=0x{code:x} pressed={pressed} → X11 detail={detail}");
         if pressed {
             self.log_hit_test_diagnostic();
         }
@@ -1532,22 +1679,41 @@ impl KmsBackend {
 
         // Fill root background; fall back to mid-grey so client windows stand out.
         {
-            let bg_color = self.bg_pixel.map(color_from_u32)
+            let bg_color = self
+                .bg_pixel
+                .map(color_from_u32)
                 .unwrap_or_else(|| Color::new(0x5050, 0x5050, 0x5050, 0xffff));
-            let root_rect = Rectangle16 { x: 0, y: 0, width: self.fb_w, height: self.fb_h };
-            let _ = scanout.0.fill_rectangles(Operation::Src, bg_color, &[root_rect]);
+            let root_rect = Rectangle16 {
+                x: 0,
+                y: 0,
+                width: self.fb_w,
+                height: self.fb_h,
+            };
+            let _ = scanout
+                .0
+                .fill_rectangles(Operation::Src, bg_color, &[root_rect]);
         }
         // Overlay background pixmap if set (e.g. from Esetroot / fvwm-root).
         // The pixmap may already be freed by the client (Esetroot pattern); fall back
         // to the rescued image saved by free_pixmap.
         if let Some(pm) = self.bg_pixmap {
-            let bg_img: Option<&PixmanImage> = self.pixmaps.get(&pm.as_raw())
+            let bg_img: Option<&PixmanImage> = self
+                .pixmaps
+                .get(&pm.as_raw())
                 .map(|p| &p.image)
                 .or(self.bg_pixmap_image.as_ref());
             if let Some(img) = bg_img {
                 let pw = img.0.width() as i32;
                 let ph = img.0.height() as i32;
-                scanout.0.composite32(Operation::Src, &img.0, None, (0, 0), (0, 0), (0, 0), (pw, ph));
+                scanout.0.composite32(
+                    Operation::Src,
+                    &img.0,
+                    None,
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                    (pw, ph),
+                );
             }
         }
 
@@ -1601,6 +1767,37 @@ impl KmsBackend {
         let y = window.y as i32;
         let w = window.width as i32;
         let h = window.height as i32;
+
+        // Apply bounding shape as a clip on the destination if present.
+        let shape_clip = self.shape_bounding.get(&window_id).and_then(|rects| {
+            if rects.is_empty() {
+                return None; // explicitly empty shape — skip compositing entirely
+            }
+            use pixman::{Box32, Region32};
+            let boxes: Vec<Box32> = rects
+                .iter()
+                .map(|r| Box32 {
+                    x1: x + r.x as i32,
+                    y1: y + r.y as i32,
+                    x2: x + r.x as i32 + r.width as i32,
+                    y2: y + r.y as i32 + r.height as i32,
+                })
+                .collect();
+            Some(Region32::init_rects(&boxes))
+        });
+
+        // Skip compositing if shape is explicitly empty.
+        if self
+            .shape_bounding
+            .get(&window_id)
+            .is_some_and(|r| r.is_empty())
+        {
+            return;
+        }
+
+        if let Some(ref region) = shape_clip {
+            let _ = parent_img.0.set_clip_region32(Some(region));
+        }
         let src_img = window.image.borrow();
         parent_img.0.composite32(
             Operation::Over,
@@ -1611,6 +1808,9 @@ impl KmsBackend {
             (x, y),
             (w, h),
         );
+        if shape_clip.is_some() {
+            let _ = parent_img.0.set_clip_region32(None);
+        }
     }
 
     /// Resolve the effective cursor for the window currently under the
@@ -1644,17 +1844,21 @@ impl KmsBackend {
     }
 
     fn descend_for_cursor(&self, window: u32, cx: f64, cy: f64) -> u32 {
-        let Some(w) = self.windows.get(&window) else { return window };
+        let Some(w) = self.windows.get(&window) else {
+            return window;
+        };
         // Build absolute origin by walking up.
         let (ox, oy) = self.absolute_origin(window);
         for &child_id in w.children.iter().rev() {
-            let Some(c) = self.windows.get(&child_id) else { continue };
-            if !c.mapped { continue; }
+            let Some(c) = self.windows.get(&child_id) else {
+                continue;
+            };
+            if !c.mapped {
+                continue;
+            }
             let cx0 = ox + c.x as f64;
             let cy0 = oy + c.y as f64;
-            if cx >= cx0 && cx < cx0 + c.width as f64
-                && cy >= cy0 && cy < cy0 + c.height as f64
-            {
+            if cx >= cx0 && cx < cx0 + c.width as f64 && cy >= cy0 && cy < cy0 + c.height as f64 {
                 return self.descend_for_cursor(child_id, cx, cy);
             }
         }
@@ -1682,13 +1886,25 @@ impl KmsBackend {
     /// window under the pointer (or its closest non-None ancestor) has
     /// set via DefineCursor.
     fn draw_cursor_onto(&self, scanout: &mut PixmanImage) {
-        let Some(cursor_xid) = self.effective_cursor() else { return };
-        let Some(cs) = self.cursors.get(&cursor_xid) else { return };
+        let Some(cursor_xid) = self.effective_cursor() else {
+            return;
+        };
+        let Some(cs) = self.cursors.get(&cursor_xid) else {
+            return;
+        };
         let x = self.cursor_x as i32 - cs.hot_x as i32;
         let y = self.cursor_y as i32 - cs.hot_y as i32;
         let w = cs.image.0.width() as i32;
         let h = cs.image.0.height() as i32;
-        scanout.0.composite32(Operation::Over, &cs.image.0, None, (0, 0), (0, 0), (x, y), (w, h));
+        scanout.0.composite32(
+            Operation::Over,
+            &cs.image.0,
+            None,
+            (0, 0),
+            (0, 0),
+            (x, y),
+            (w, h),
+        );
     }
 
     /// Render a string of character bytes onto a drawable using the current font.
@@ -1700,6 +1916,18 @@ impl KmsBackend {
         x: i32,
         y: i32,
         text: &[u8],
+    ) -> io::Result<()> {
+        let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
+        self.render_text_chars(host_xid, foreground, x, y, &chars)
+    }
+
+    fn render_text_chars(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        x: i32,
+        y: i32,
+        text: &[char],
     ) -> io::Result<()> {
         let Some(font_xid) = self.current_font else {
             return Ok(());
@@ -1713,8 +1941,9 @@ impl KmsBackend {
             dst_y: i32,
             w: usize,
             h: usize,
-            pixels: Vec<u8>,    // row-major, w*h bytes
-            #[allow(dead_code)] advance: i32,
+            pixels: Vec<u8>, // row-major, w*h bytes
+            #[allow(dead_code)]
+            advance: i32,
         }
 
         let mut rendered: Vec<RenderedGlyph> = Vec::new();
@@ -1727,14 +1956,15 @@ impl KmsBackend {
             let face = fs.face.borrow();
             let char_cache = &fs.char_info_cache;
 
-            for &ch_byte in text {
-                let ch = ch_byte as char;
+            for &ch in text {
                 let Some(ci) = char_cache.get(&ch) else {
                     cursor_x += 6;
                     continue;
                 };
 
-                let _ = face.0.load_char(ch as usize, freetype::face::LoadFlag::RENDER);
+                let _ = face
+                    .0
+                    .load_char(ch as usize, freetype::face::LoadFlag::RENDER);
                 let glyph = face.0.glyph();
                 let bitmap = glyph.bitmap();
 
@@ -1775,7 +2005,12 @@ impl KmsBackend {
             let _ = color_img.fill_rectangles(
                 Operation::Src,
                 fg_color,
-                &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+                &[Rectangle16 {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }],
             );
             // The 1×1 solid-colour source must tile across the full glyph
             // width/height.  Without REPEAT_NORMAL, pixman returns transparent
@@ -1808,8 +2043,10 @@ impl KmsBackend {
                 // Some clients send extreme negative coords during probes;
                 // pixman's composite32 has historically struggled with very
                 // large negative offsets in our build, so guard explicitly.
-                if g.dst_x + (g.w as i32) <= 0 || g.dst_y + (g.h as i32) <= 0
-                    || g.dst_x >= dst_w || g.dst_y >= dst_h
+                if g.dst_x + (g.w as i32) <= 0
+                    || g.dst_y + (g.h as i32) <= 0
+                    || g.dst_x >= dst_w
+                    || g.dst_y >= dst_h
                 {
                     return;
                 }
@@ -1912,7 +2149,11 @@ impl Backend for KmsBackend {
         // for render_trapezoids to receive a non-None host_mask_format and
         // proceed; the actual format code is mapped to PIXMAN_a8 inside
         // render_trapezoids.
-        if ynest_fmt == 0 { None } else { Some(ynest_fmt) }
+        if ynest_fmt == 0 {
+            None
+        } else {
+            Some(ynest_fmt)
+        }
     }
 
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
@@ -1954,7 +2195,12 @@ impl Backend for KmsBackend {
             let _ = img.0.fill_rectangles(
                 Operation::Src,
                 color,
-                &[Rectangle16 { x: 0, y: 0, width, height }],
+                &[Rectangle16 {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
             );
         }
         let image = RefCell::new(img);
@@ -2024,6 +2270,9 @@ impl Backend for KmsBackend {
                     parent.children.retain(|&c| c != host_xid);
                 }
             }
+            self.shape_bounding.remove(&host_xid);
+            self.shape_clip.remove(&host_xid);
+            self.shape_input.remove(&host_xid);
         }
         let mut map = lock_recover(&self.xid_map);
         map.remove(&host_xid);
@@ -2117,7 +2366,12 @@ impl Backend for KmsBackend {
                     let _ = img.0.fill_rectangles(
                         Operation::Src,
                         color,
-                        &[Rectangle16 { x: 0, y: 0, width: w, height: h }],
+                        &[Rectangle16 {
+                            x: 0,
+                            y: 0,
+                            width: w,
+                            height: h,
+                        }],
                     );
                 }
                 window.image = RefCell::new(img);
@@ -2454,6 +2708,8 @@ impl Backend for KmsBackend {
             self.current_font = Some(font.as_raw());
         }
         self.current_function = state.function;
+        self.current_foreground = state.foreground;
+        self.current_background = state.background;
         Ok(())
     }
 
@@ -2497,17 +2753,60 @@ impl Backend for KmsBackend {
     fn copy_plane(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
-        _plane: u32,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+        plane: u32,
     ) -> io::Result<()> {
-        // TODO: implement with plane mask
+        let Some(src_depth) = self.drawable_depth(src_host_xid) else {
+            return Ok(());
+        };
+        let Some(src_geom) = self.drawable_geometry(src_host_xid) else {
+            return Ok(());
+        };
+
+        let mut foreground_rects = Vec::new();
+        let mut background_rects = Vec::new();
+        for row in 0..height {
+            let sy = i32::from(src_y) + i32::from(row);
+            let dy = dst_y.saturating_add(row as i16);
+            if sy < 0 {
+                continue;
+            }
+            for col in 0..width {
+                let sx = i32::from(src_x) + i32::from(col);
+                let dx = dst_x.saturating_add(col as i16);
+                if sx < 0 {
+                    continue;
+                }
+                let pixel =
+                    read_drawable_pixel_for_plane(&src_geom, src_depth, sx as usize, sy as usize);
+                let rect = Rectangle16 {
+                    x: dx,
+                    y: dy,
+                    width: 1,
+                    height: 1,
+                };
+                if pixel & plane != 0 {
+                    foreground_rects.push(rect);
+                } else {
+                    background_rects.push(rect);
+                }
+            }
+        }
+
+        let function = self.current_function;
+        let foreground = self.current_foreground;
+        let background = self.current_background;
+        self.with_image_mut(dst_host_xid, |dst| {
+            fill_rects_with_gc_function(dst, function, background, &background_rects);
+            fill_rects_with_gc_function(dst, function, foreground, &foreground_rects);
+        });
         Ok(())
     }
 
@@ -2696,8 +2995,7 @@ impl Backend for KmsBackend {
                 } else {
                     // SAFETY: bounds-checked against geom.width/height;
                     // geom borrows self so the pointer is valid.
-                    let pixel =
-                        unsafe { *src_words.add(dy as usize * stride_words + dx as usize) };
+                    let pixel = unsafe { *src_words.add(dy as usize * stride_words + dx as usize) };
                     result.extend_from_slice(&pixel.to_le_bytes());
                 }
             }
@@ -2759,8 +3057,12 @@ impl Backend for KmsBackend {
         let mut rects: Vec<Rectangle16> = Vec::new();
         let mut offset = 0;
         while offset + 8 <= segments.len() {
-            let Some((x1, y1)) = read_i16_pair(segments, offset) else { break; };
-            let Some((x2, y2)) = read_i16_pair(segments, offset + 4) else { break; };
+            let Some((x1, y1)) = read_i16_pair(segments, offset) else {
+                break;
+            };
+            let Some((x2, y2)) = read_i16_pair(segments, offset + 4) else {
+                break;
+            };
             offset += 8;
             bresenham_segment(x1 as i32, y1 as i32, x2 as i32, y2 as i32, &mut rects);
         }
@@ -3043,7 +3345,9 @@ impl Backend for KmsBackend {
         let mut offset = 0;
         let mut last = (0i32, 0i32);
         while offset + 4 <= points.len() {
-            let Some((x, y)) = read_i16_pair(points, offset) else { break; };
+            let Some((x, y)) = read_i16_pair(points, offset) else {
+                break;
+            };
             offset += 4;
             let (xi, yi) = if coord_mode == 1 && !verts.is_empty() {
                 (last.0 + x as i32, last.1 + y as i32)
@@ -3073,7 +3377,12 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let rect = Rectangle16 { x, y, width, height };
+        let rect = Rectangle16 {
+            x,
+            y,
+            width,
+            height,
+        };
         let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             fill_rects_with_gc_function(img, function, foreground, &[rect]);
@@ -3129,11 +3438,75 @@ impl Backend for KmsBackend {
     fn poly_text16(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        // TODO: implement 16-bit text rendering
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + text_items.
+        // Each item is len(u8), delta(i8), then len CHAR2B values.
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut cursor_x = x;
+        let mut pos = 12usize;
+
+        while pos < body.len() {
+            let len = body[pos] as usize;
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            if len == 255 {
+                if pos + 7 <= body.len() {
+                    let font_xid = u32::from_le_bytes([
+                        body[pos + 3],
+                        body[pos + 4],
+                        body[pos + 5],
+                        body[pos + 6],
+                    ]);
+                    self.current_font = Some(font_xid);
+                    pos += 7;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            if pos >= body.len() {
+                break;
+            }
+            let delta = body[pos] as i8;
+            pos += 1;
+            cursor_x += i32::from(delta);
+
+            let mut chars = Vec::with_capacity(len);
+            for _ in 0..len {
+                if pos + 2 > body.len() {
+                    break;
+                }
+                let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
+                pos += 2;
+                chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+            }
+            self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+            if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+                cursor_x += chars
+                    .iter()
+                    .map(|ch| {
+                        font_state
+                            .char_info_cache
+                            .get(ch)
+                            .map(|ci| ci.character_width as i32)
+                            .unwrap_or(6)
+                    })
+                    .sum::<i32>();
+            }
+
+            let item_len = 2 + len * 2;
+            let pad = (4 - (item_len % 4)) % 4;
+            pos = pos.saturating_add(pad).min(body.len());
+        }
         Ok(())
     }
 
@@ -3191,14 +3564,55 @@ impl Backend for KmsBackend {
     fn image_text16(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _background: u32,
-        _text_len: u8,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
     ) -> io::Result<()> {
-        // TODO: implement 16-bit image text
-        Ok(())
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + CHAR2B[text_len].
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut chars = Vec::with_capacity(text_len as usize);
+        let mut pos = 12usize;
+        for _ in 0..text_len {
+            if pos + 2 > body.len() {
+                break;
+            }
+            let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
+            pos += 2;
+            chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+        }
+
+        if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+            let total_width: i32 = chars
+                .iter()
+                .map(|ch| {
+                    font_state
+                        .char_info_cache
+                        .get(ch)
+                        .map(|ci| ci.character_width as i32)
+                        .unwrap_or(6)
+                })
+                .sum();
+            let ascent = font_state.metrics.font_ascent as i32;
+            let descent = font_state.metrics.font_descent as i32;
+            let rect = Rectangle16 {
+                x: x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                y: (y - ascent).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                width: total_width.clamp(0, u16::MAX as i32) as u16,
+                height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
+            };
+            let function = self.current_function;
+            self.with_image_mut(host_xid, |img| {
+                fill_rects_with_gc_function(img, function, background, &[rect]);
+            });
+        }
+
+        self.render_text_chars(host_xid, foreground, x, y, &chars)
     }
 
     fn render_create_picture(
@@ -3206,24 +3620,182 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_drawable: AnyHandle,
         _ynest_format: u32,
-        _value_mask: u32,
-        _values: &[u8],
+        value_mask: u32,
+        values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         let drawable_xid = host_drawable.as_raw();
         let picture_xid = self.next_host_xid();
-        self.pictures.insert(
-            picture_xid,
-            PictureState::Drawable { host_xid: drawable_xid, clip: None },
-        );
+        self.pictures
+            .insert(picture_xid, default_drawable_picture(drawable_xid));
+        if value_mask != 0 {
+            let mut body = Vec::with_capacity(8 + values.len());
+            body.extend_from_slice(&picture_xid.to_le_bytes());
+            body.extend_from_slice(&value_mask.to_le_bytes());
+            body.extend_from_slice(values);
+            self.render_change_picture(None, picture_xid, &body)?;
+        }
         Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_change_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        if body.len() < 8 {
+            return Ok(());
+        }
+        let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        let values = &body[8..];
+        let mut off = 0usize;
+        let next_u32 = |off: &mut usize| -> Option<u32> {
+            let bytes = values.get(*off..*off + 4)?;
+            *off += 4;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        };
+        for bit in 0..13 {
+            let mask_bit = 1u32 << bit;
+            if value_mask & mask_bit == 0 {
+                continue;
+            }
+            let Some(v) = next_u32(&mut off) else {
+                break;
+            };
+            match mask_bit {
+                // CPRepeat
+                0x0001 => {
+                    let repeat = match v {
+                        1 => Repeat::Normal,
+                        2 => Repeat::Pad,
+                        3 => Repeat::Reflect,
+                        _ => Repeat::None,
+                    };
+                    match self.pictures.get_mut(&host_pic) {
+                        Some(PictureState::Drawable { repeat: r, .. }) => *r = repeat,
+                        Some(PictureState::SolidFill {
+                            image, repeat: r, ..
+                        }) => {
+                            *r = repeat;
+                            image.borrow_mut().0.set_repeat(repeat);
+                        }
+                        Some(PictureState::Gradient {
+                            image, repeat: r, ..
+                        }) => {
+                            *r = repeat;
+                            image.0.set_repeat(repeat);
+                        }
+                        None => {}
+                    }
+                }
+                // CPAlphaMap
+                0x0002 => {
+                    if let Some(PictureState::Drawable { alpha_map, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *alpha_map = if v == 0 { None } else { Some(v) };
+                    }
+                }
+                // CPAlphaXOrigin
+                0x0004 => {
+                    if let Some(PictureState::Drawable { alpha_x, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *alpha_x = v as i16;
+                    }
+                }
+                // CPAlphaYOrigin
+                0x0008 => {
+                    if let Some(PictureState::Drawable { alpha_y, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *alpha_y = v as i16;
+                    }
+                }
+                // CPClipXOrigin
+                0x0010 => {
+                    if let Some(PictureState::Drawable { clip_x, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *clip_x = v as i16;
+                    }
+                }
+                // CPClipYOrigin
+                0x0020 => {
+                    if let Some(PictureState::Drawable { clip_y, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *clip_y = v as i16;
+                    }
+                }
+                // CPClipMask
+                0x0040 => {
+                    let new_clip = if v == 0 {
+                        None
+                    } else {
+                        self.pixmaps.get(&v).map(|px| {
+                            vec![Rectangle16 {
+                                x: 0,
+                                y: 0,
+                                width: px.image.width().min(u16::MAX as usize) as u16,
+                                height: px.image.height().min(u16::MAX as usize) as u16,
+                            }]
+                        })
+                    };
+                    if let Some(PictureState::Drawable { clip, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *clip = new_clip;
+                    }
+                }
+                // CPGraphicsExposure
+                0x0080 => {
+                    if let Some(PictureState::Drawable {
+                        graphics_exposure, ..
+                    }) = self.pictures.get_mut(&host_pic)
+                    {
+                        *graphics_exposure = v != 0;
+                    }
+                }
+                // CPSubwindowMode
+                0x0100 => {
+                    if let Some(PictureState::Drawable { subwindow_mode, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *subwindow_mode = v as u8;
+                    }
+                }
+                // CPPolyEdge
+                0x0200 => {
+                    if let Some(PictureState::Drawable { poly_edge, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *poly_edge = v as u8;
+                    }
+                }
+                // CPPolyMode
+                0x0400 => {
+                    if let Some(PictureState::Drawable { poly_mode, .. }) =
+                        self.pictures.get_mut(&host_pic)
+                    {
+                        *poly_mode = v as u8;
+                    }
+                }
+                // CPDither: consumed but intentionally not stored.
+                0x0800 => {}
+                // CPComponentAlpha
+                0x1000 => match self.pictures.get_mut(&host_pic) {
+                    Some(PictureState::Drawable {
+                        component_alpha, ..
+                    })
+                    | Some(PictureState::SolidFill {
+                        component_alpha, ..
+                    }) => *component_alpha = v != 0,
+                    Some(PictureState::Gradient { .. }) | None => {}
+                },
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -3242,9 +3814,19 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        let format = if ynest_format == RENDER_FMT_A8 { GlyphSetFormat::A8 } else { GlyphSetFormat::Other };
+        let format = match ynest_format {
+            RENDER_FMT_A8 => GlyphSetFormat::A8,
+            RENDER_FMT_A1 => GlyphSetFormat::A1,
+            _ => GlyphSetFormat::Other,
+        };
         let id = self.next_host_xid();
-        self.glyphsets.insert(id, GlyphSetState { format, glyphs: HashMap::new() });
+        self.glyphsets.insert(
+            id,
+            GlyphSetState {
+                format,
+                glyphs: HashMap::new(),
+            },
+        );
         Ok(GlyphSetHandle::from_raw(id))
     }
 
@@ -3275,7 +3857,9 @@ impl Backend for KmsBackend {
         host_gs: u32,
         glyph_ids: &[u8],
     ) -> io::Result<()> {
-        let Some(gs) = self.glyphsets.get_mut(&host_gs) else { return Ok(()); };
+        let Some(gs) = self.glyphsets.get_mut(&host_gs) else {
+            return Ok(());
+        };
         for chunk in glyph_ids.chunks_exact(4) {
             let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             gs.glyphs.remove(&id);
@@ -3303,51 +3887,83 @@ impl Backend for KmsBackend {
 
         // Extract src raw pointer while pictures is immutably borrowed.
         // Also capture the underlying drawable xid (if any) to guard against self-composite.
-        let (src_ptr, src_drawable_xid): (*mut pixman::ffi::pixman_image_t, Option<u32>) =
-            match self.pictures.get(&host_src) {
-                Some(PictureState::SolidFill { image }) => (image.borrow().0.as_ptr(), None),
-                Some(PictureState::Drawable { host_xid, .. }) => {
+        let (src_ptr, src_drawable_xid, src_repeat, src_transform): (
+            *mut pixman::ffi::pixman_image_t,
+            Option<u32>,
+            Repeat,
+            Option<pixman::ffi::pixman_transform_t>,
+        ) = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { image, repeat, .. }) => {
+                (image.borrow().0.as_ptr(), None, *repeat, None)
+            }
+            Some(PictureState::Gradient {
+                image,
+                repeat,
+                transform,
+            }) => (image.0.as_ptr(), None, *repeat, *transform),
+            Some(PictureState::Drawable {
+                host_xid,
+                repeat,
+                transform,
+                ..
+            }) => {
+                let xid = *host_xid;
+                match self.image_ptr_for_xid(xid) {
+                    Some(ptr) => (ptr, Some(xid), *repeat, *transform),
+                    None => {
+                        log::debug!("render_composite: src drawable 0x{xid:x} has no image");
+                        return Ok(());
+                    }
+                }
+            }
+            None => {
+                log::debug!("render_composite: host_src 0x{host_src:x} not found");
+                return Ok(());
+            }
+        };
+
+        // Extract mask raw pointer (null_mut if no mask).
+        let (mask_ptr, mask_drawable_xid, mask_repeat, mask_transform): (
+            *mut pixman::ffi::pixman_image_t,
+            Option<u32>,
+            Repeat,
+            Option<pixman::ffi::pixman_transform_t>,
+        ) = if host_mask == 0 {
+            (std::ptr::null_mut(), None, Repeat::None, None)
+        } else {
+            match self.pictures.get(&host_mask) {
+                Some(PictureState::SolidFill { image, repeat, .. }) => {
+                    (image.borrow().0.as_ptr(), None, *repeat, None)
+                }
+                Some(PictureState::Gradient {
+                    image,
+                    repeat,
+                    transform,
+                }) => (image.0.as_ptr(), None, *repeat, *transform),
+                Some(PictureState::Drawable {
+                    host_xid,
+                    repeat,
+                    transform,
+                    ..
+                }) => {
                     let xid = *host_xid;
                     match self.image_ptr_for_xid(xid) {
-                        Some(ptr) => (ptr, Some(xid)),
+                        Some(ptr) => (ptr, Some(xid), *repeat, *transform),
                         None => {
-                            log::debug!("render_composite: src drawable 0x{xid:x} has no image");
+                            log::debug!("render_composite: mask drawable 0x{xid:x} has no image");
                             return Ok(());
                         }
                     }
                 }
                 None => {
-                    log::debug!("render_composite: host_src 0x{host_src:x} not found");
+                    log::debug!("render_composite: host_mask 0x{host_mask:x} not found");
                     return Ok(());
                 }
-            };
-
-        // Extract mask raw pointer (null_mut if no mask).
-        let (mask_ptr, mask_drawable_xid): (*mut pixman::ffi::pixman_image_t, Option<u32>) =
-            if host_mask == 0 {
-                (std::ptr::null_mut(), None)
-            } else {
-                match self.pictures.get(&host_mask) {
-                    Some(PictureState::SolidFill { image }) => (image.borrow().0.as_ptr(), None),
-                    Some(PictureState::Drawable { host_xid, .. }) => {
-                        let xid = *host_xid;
-                        match self.image_ptr_for_xid(xid) {
-                            Some(ptr) => (ptr, Some(xid)),
-                            None => {
-                                log::debug!("render_composite: mask drawable 0x{xid:x} has no image");
-                                return Ok(());
-                            }
-                        }
-                    }
-                    None => {
-                        log::debug!("render_composite: host_mask 0x{host_mask:x} not found");
-                        return Ok(());
-                    }
-                }
-            };
+            }
+        };
 
         let (dst_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip }) => (*host_xid, clip.clone()),
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
             _ => {
                 log::debug!("render_composite: host_dst 0x{host_dst:x} is not a Drawable picture");
                 return Ok(());
@@ -3369,14 +3985,37 @@ impl Backend for KmsBackend {
             return Ok(());
         }
 
+        unsafe {
+            pixman::ffi::pixman_image_set_repeat(src_ptr, src_repeat.into());
+            pixman::ffi::pixman_image_set_transform(
+                src_ptr,
+                src_transform
+                    .as_ref()
+                    .map_or(std::ptr::null(), |t| t as *const _),
+            );
+            if !mask_ptr.is_null() {
+                pixman::ffi::pixman_image_set_repeat(mask_ptr, mask_repeat.into());
+                pixman::ffi::pixman_image_set_transform(
+                    mask_ptr,
+                    mask_transform
+                        .as_ref()
+                        .map_or(std::ptr::null(), |t| t as *const _),
+                );
+            }
+        }
+
         self.with_image_mut(dst_xid, |dst| {
             if let Some(ref rects) = clip {
                 use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects.iter().map(|r| Box32 {
-                    x1: r.x as i32, y1: r.y as i32,
-                    x2: r.x as i32 + r.width as i32,
-                    y2: r.y as i32 + r.height as i32,
-                }).collect();
+                let boxes: Vec<Box32> = rects
+                    .iter()
+                    .map(|r| Box32 {
+                        x1: r.x as i32,
+                        y1: r.y as i32,
+                        x2: r.x as i32 + r.width as i32,
+                        y2: r.y as i32 + r.height as i32,
+                    })
+                    .collect();
                 let region = Region32::init_rects(&boxes);
                 let _ = dst.0.set_clip_region32(Some(&region));
             }
@@ -3387,10 +4026,14 @@ impl Backend for KmsBackend {
                 src_ptr,
                 mask_ptr,
                 dst,
-                src_x as i32, src_y as i32,
-                mask_x as i32, mask_y as i32,
-                dst_x as i32, dst_y as i32,
-                width as i32, height as i32,
+                src_x as i32,
+                src_y as i32,
+                mask_x as i32,
+                mask_y as i32,
+                dst_x as i32,
+                dst_y as i32,
+                width as i32,
+                height as i32,
             );
             if clip.is_some() {
                 let _ = dst.0.set_clip_region32(None);
@@ -3417,27 +4060,41 @@ impl Backend for KmsBackend {
     ) -> io::Result<()> {
         // Resolve src picture — must be SolidFill (Drawable fallback: opaque black).
         let src_img = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image }) => {
+            Some(PictureState::SolidFill { image, .. }) => {
                 // Clone the colour so we can drop the pictures borrow.
                 let argb = unsafe { *image.borrow().0.data() };
                 let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
                 let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
                 let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
-                let g = (((argb >>  8) & 0xFF) as u16) * 0x101;
-                let b = ((argb         & 0xFF) as u16) * 0x101;
+                let g = (((argb >> 8) & 0xFF) as u16) * 0x101;
+                let b = ((argb & 0xFF) as u16) * 0x101;
                 let _ = img.0.fill_rectangles(
-                    Operation::Src, Color::new(r, g, b, a),
-                    &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+                    Operation::Src,
+                    Color::new(r, g, b, a),
+                    &[Rectangle16 {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    }],
                 );
                 img.0.set_repeat(Repeat::Normal);
                 img
             }
             _ => {
-                log::debug!("render_composite_glyphs: host_src 0x{host_src:x} is not SolidFill; using black");
+                log::debug!(
+                    "render_composite_glyphs: host_src 0x{host_src:x} is not SolidFill; using black"
+                );
                 let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
                 let _ = img.0.fill_rectangles(
-                    Operation::Src, Color::new(0, 0, 0, 0xFFFF),
-                    &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+                    Operation::Src,
+                    Color::new(0, 0, 0, 0xFFFF),
+                    &[Rectangle16 {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    }],
                 );
                 img.0.set_repeat(Repeat::Normal);
                 img
@@ -3445,36 +4102,47 @@ impl Backend for KmsBackend {
         };
 
         let (dst_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip }) => (*host_xid, clip.clone()),
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
             _ => return Ok(()),
         };
 
-        let Some(gs) = self.glyphsets.get(&host_gs) else { return Ok(()); };
-        // SAFETY: gs is behind an immutable ref; we pass it into a closure that
-        // only calls composite_glyphs_onto which reads from gs and writes to dst.
-        // No aliasing: gs and dst are in separate data structures.
-        let gs_ptr: *const GlyphSetState = gs;
-
+        if !self.glyphsets.contains_key(&host_gs) {
+            return Ok(());
+        }
         let pen_x = src_x as i32 + x_off as i32;
         let pen_y = src_y as i32 + y_off as i32;
+
+        // SAFETY: glyphsets and the pixmap image data (dst) live in disjoint
+        // fields of KmsBackend. No glyphset is freed during this closure because
+        // KmsBackend is !Sync and this method holds &mut self.
+        let glyphsets_ptr: *const HashMap<u32, GlyphSetState> = &self.glyphsets;
 
         self.with_image_mut(dst_xid, |dst| {
             if let Some(ref rects) = clip {
                 use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects.iter().map(|r| Box32 {
-                    x1: r.x as i32, y1: r.y as i32,
-                    x2: r.x as i32 + r.width as i32,
-                    y2: r.y as i32 + r.height as i32,
-                }).collect();
+                let boxes: Vec<Box32> = rects
+                    .iter()
+                    .map(|r| Box32 {
+                        x1: r.x as i32,
+                        y1: r.y as i32,
+                        x2: r.x as i32 + r.width as i32,
+                        y2: r.y as i32 + r.height as i32,
+                    })
+                    .collect();
                 let region = Region32::init_rects(&boxes);
                 let _ = dst.0.set_clip_region32(Some(&region));
             }
-            // SAFETY: gs_ptr points to a GlyphSetState in self.glyphsets; dst is
-            // from self.windows/pixmaps. They are disjoint. The glyphset is not
-            // freed during this closure because no other thread runs concurrently
-            // (KmsBackend is !Sync and this method takes &mut self).
-            let gs_ref = unsafe { &*gs_ptr };
-            composite_glyphs_onto(gs_ref, &src_img, dst, minor, pen_x, pen_y, items);
+            let glyphsets_ref = unsafe { &*glyphsets_ptr };
+            composite_glyphs_onto(
+                glyphsets_ref,
+                host_gs,
+                &src_img,
+                dst,
+                minor,
+                pen_x,
+                pen_y,
+                items,
+            );
             if clip.is_some() {
                 let _ = dst.0.set_clip_region32(None);
             }
@@ -3522,8 +4190,7 @@ impl Backend for KmsBackend {
         // left.p2.x(4), left.p2.y(4), right.p1.x(4), right.p1.y(4),
         // right.p2.x(4), right.p2.y(4).
         let n_traps = traps.len() / 40;
-        let mut trap_vec: Vec<pixman::ffi::pixman_trapezoid_t> =
-            Vec::with_capacity(n_traps);
+        let mut trap_vec: Vec<pixman::ffi::pixman_trapezoid_t> = Vec::with_capacity(n_traps);
         for chunk in traps.chunks_exact(40) {
             let t = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let b = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
@@ -3551,7 +4218,7 @@ impl Backend for KmsBackend {
 
         // Look up source picture — must be SolidFill. Borrow and get raw ptr.
         let src_ptr = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image }) => image.borrow().0.as_ptr(),
+            Some(PictureState::SolidFill { image, .. }) => image.borrow().0.as_ptr(),
             _ => {
                 log::debug!(
                     "render_trapezoids: host_src 0x{:x} is not a SolidFill picture; skipping",
@@ -3565,9 +4232,7 @@ impl Backend for KmsBackend {
         // and any clip info, then release the pictures borrow before we
         // mutably borrow the drawable image below.
         let (drawable_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip }) => {
-                (*host_xid, clip.clone())
-            }
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
             _ => {
                 log::debug!(
                     "render_trapezoids: host_dst 0x{:x} is not a Drawable picture; skipping",
@@ -3646,14 +4311,23 @@ impl Backend for KmsBackend {
         let _ = img.0.fill_rectangles(
             Operation::Src,
             pixman_color,
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         img.0.set_repeat(Repeat::Normal);
 
         let picture_xid = self.next_host_xid();
         self.pictures.insert(
             picture_xid,
-            PictureState::SolidFill { image: RefCell::new(img) },
+            PictureState::SolidFill {
+                image: RefCell::new(img),
+                repeat: Repeat::Normal,
+                component_alpha: false,
+            },
         );
         Ok(PictureHandle::from_raw(picture_xid))
     }
@@ -3661,17 +4335,135 @@ impl Backend for KmsBackend {
     fn render_create_linear_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        if body.len() < 24 {
+            return Ok(None);
+        }
+        let p1x = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let p1y = i32::from_le_bytes(body[8..12].try_into().unwrap());
+        let p2x = i32::from_le_bytes(body[12..16].try_into().unwrap());
+        let p2y = i32::from_le_bytes(body[16..20].try_into().unwrap());
+        let n_stops = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
+        let pos_base = 24usize;
+        let color_base = pos_base + n_stops * 4;
+        if body.len() < color_base + n_stops * 8 {
+            return Ok(None);
+        }
+        let mut stops = Vec::with_capacity(n_stops);
+        for i in 0..n_stops {
+            let pos = i32::from_le_bytes(
+                body[pos_base + i * 4..pos_base + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let cb = color_base + i * 8;
+            let r = u16::from_le_bytes(body[cb..cb + 2].try_into().unwrap());
+            let g = u16::from_le_bytes(body[cb + 2..cb + 4].try_into().unwrap());
+            let b = u16::from_le_bytes(body[cb + 4..cb + 6].try_into().unwrap());
+            let a = u16::from_le_bytes(body[cb + 6..cb + 8].try_into().unwrap());
+            stops.push(pixman::ffi::pixman_gradient_stop_t {
+                x: pos,
+                color: pixman::ffi::pixman_color_t {
+                    red: r,
+                    green: g,
+                    blue: b,
+                    alpha: a,
+                },
+            });
+        }
+        let p1 = pixman::ffi::pixman_point_fixed_t { x: p1x, y: p1y };
+        let p2 = pixman::ffi::pixman_point_fixed_t { x: p2x, y: p2y };
+        let raw = unsafe {
+            pixman::ffi::pixman_image_create_linear_gradient(
+                &p1,
+                &p2,
+                stops.as_ptr(),
+                stops.len() as i32,
+            )
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let picture_xid = self.next_host_xid();
+        self.pictures.insert(
+            picture_xid,
+            PictureState::Gradient {
+                image: PixmanImage(unsafe { Image::from_ptr(raw) }),
+                repeat: Repeat::None,
+                transform: None,
+            },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_radial_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        if body.len() < 32 {
+            return Ok(None);
+        }
+        let icx = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let icy = i32::from_le_bytes(body[8..12].try_into().unwrap());
+        let ocx = i32::from_le_bytes(body[12..16].try_into().unwrap());
+        let ocy = i32::from_le_bytes(body[16..20].try_into().unwrap());
+        let ir = i32::from_le_bytes(body[20..24].try_into().unwrap());
+        let or_ = i32::from_le_bytes(body[24..28].try_into().unwrap());
+        let n_stops = u32::from_le_bytes(body[28..32].try_into().unwrap()) as usize;
+        let pos_base = 32usize;
+        let color_base = pos_base + n_stops * 4;
+        if body.len() < color_base + n_stops * 8 {
+            return Ok(None);
+        }
+        let mut stops = Vec::with_capacity(n_stops);
+        for i in 0..n_stops {
+            let pos = i32::from_le_bytes(
+                body[pos_base + i * 4..pos_base + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let cb = color_base + i * 8;
+            let r = u16::from_le_bytes(body[cb..cb + 2].try_into().unwrap());
+            let g = u16::from_le_bytes(body[cb + 2..cb + 4].try_into().unwrap());
+            let b = u16::from_le_bytes(body[cb + 4..cb + 6].try_into().unwrap());
+            let a = u16::from_le_bytes(body[cb + 6..cb + 8].try_into().unwrap());
+            stops.push(pixman::ffi::pixman_gradient_stop_t {
+                x: pos,
+                color: pixman::ffi::pixman_color_t {
+                    red: r,
+                    green: g,
+                    blue: b,
+                    alpha: a,
+                },
+            });
+        }
+        let inner = pixman::ffi::pixman_point_fixed_t { x: icx, y: icy };
+        let outer = pixman::ffi::pixman_point_fixed_t { x: ocx, y: ocy };
+        let raw = unsafe {
+            pixman::ffi::pixman_image_create_radial_gradient(
+                &inner,
+                &outer,
+                ir,
+                or_,
+                stops.as_ptr(),
+                stops.len() as i32,
+            )
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let picture_xid = self.next_host_xid();
+        self.pictures.insert(
+            picture_xid,
+            PictureState::Gradient {
+                image: PixmanImage(unsafe { Image::from_ptr(raw) }),
+                repeat: Repeat::None,
+                transform: None,
+            },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_cursor(
@@ -3685,7 +4477,10 @@ impl Backend for KmsBackend {
         let host_xid = match self.pictures.get(&pic_xid) {
             Some(PictureState::Drawable { host_xid, .. }) => *host_xid,
             other => {
-                log::debug!("render_create_cursor: pic {pic_xid} not found or not Drawable (got {:?})", other.map(|_| "non-Drawable"));
+                log::debug!(
+                    "render_create_cursor: pic {pic_xid} not found or not Drawable (got {:?})",
+                    other.map(|_| "non-Drawable")
+                );
                 return Ok(None);
             }
         };
@@ -3696,18 +4491,35 @@ impl Backend for KmsBackend {
             let w = pm.image.0.width() as u16;
             let h = pm.image.0.height() as u16;
             let mut img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true)?;
-            img.0.composite32(Operation::Src, &pm.image.0, None, (0, 0), (0, 0), (0, 0), (w as i32, h as i32));
+            img.0.composite32(
+                Operation::Src,
+                &pm.image.0,
+                None,
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (w as i32, h as i32),
+            );
             img
         } else if let Some(rescued) = self.picture_rescued_images.remove(&pic_xid) {
             log::debug!("render_create_cursor: using rescued image for pic {pic_xid}");
             rescued
         } else {
-            log::debug!("render_create_cursor: pixmap host_xid={host_xid} not found for pic {pic_xid}");
+            log::debug!(
+                "render_create_cursor: pixmap host_xid={host_xid} not found for pic {pic_xid}"
+            );
             return Ok(None);
         };
 
         let id = self.next_host_xid();
-        self.cursors.insert(id, CursorState { image: cursor_img, hot_x: x, hot_y: y });
+        self.cursors.insert(
+            id,
+            CursorState {
+                image: cursor_img,
+                hot_x: x,
+                hot_y: y,
+            },
+        );
 
         CursorHandle::from_raw(id)
             .map(Some)
@@ -3737,7 +4549,12 @@ impl Backend for KmsBackend {
             let y = i16::from_le_bytes([chunk[2], chunk[3]]);
             let w = u16::from_le_bytes([chunk[4], chunk[5]]);
             let h = u16::from_le_bytes([chunk[6], chunk[7]]);
-            rects.push(Rectangle16 { x, y, width: w, height: h });
+            rects.push(Rectangle16 {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
         }
         if let Some(PictureState::Drawable { clip, .. }) = self.pictures.get_mut(&host_pic) {
             *clip = if rects.is_empty() { None } else { Some(rects) };
@@ -3758,9 +4575,27 @@ impl Backend for KmsBackend {
     fn render_set_picture_transform(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        if body.len() < 40 {
+            return Ok(());
+        }
+        let mut matrix = [[0i32; 3]; 3];
+        for (idx, slot) in matrix.iter_mut().flatten().enumerate() {
+            let off = 4 + idx * 4;
+            *slot = i32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+        }
+        let transform = if matrix == [[0x10000, 0, 0], [0, 0x10000, 0], [0, 0, 0x10000]] {
+            None
+        } else {
+            Some(pixman::ffi::pixman_transform_t { matrix })
+        };
+        match self.pictures.get_mut(&host_pic) {
+            Some(PictureState::Drawable { transform: t, .. })
+            | Some(PictureState::Gradient { transform: t, .. }) => *t = transform,
+            _ => {}
+        }
         Ok(())
     }
 
@@ -3771,10 +4606,19 @@ impl Backend for KmsBackend {
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _body: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
-        Ok(None)
+        use crate::kms::xkb as xkb_replies;
+        let reply = match minor {
+            0 => Some(xkb_replies::reply_use_extension()),
+            8 => Some(xkb_replies::reply_get_map(&self.xkb_keymap.0)),
+            17 => Some(xkb_replies::reply_get_names(&self.xkb_keymap.0)),
+            20 => Some(xkb_replies::reply_get_compat_map()),
+            24 => Some(xkb_replies::reply_get_controls(&self.xkb_keymap.0)),
+            _ => Some(xkb_replies::reply_minimal(minor)),
+        };
+        Ok(reply)
     }
 
     fn xfixes_change_cursor_by_name(
@@ -3789,20 +4633,41 @@ impl Backend for KmsBackend {
     fn set_shape_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _kind: u8,
-        _rects: &[xfixes::RegionRect],
+        host_xid: u32,
+        kind: u8,
+        rects: &[xfixes::RegionRect],
     ) -> io::Result<()> {
+        let map = match kind {
+            0 => &mut self.shape_bounding,
+            1 => &mut self.shape_clip,
+            2 => &mut self.shape_input,
+            _ => return Ok(()),
+        };
+        // Store always: server sends the full window rect when shape is cleared
+        // (shape_rects_for fallback), and the actual rects otherwise.
+        // Empty vec = window clips to nothing (explicitly shaped to empty region).
+        map.insert(host_xid, rects.to_vec());
         Ok(())
     }
 
     fn warp_pointer(
         &mut self,
         _origin: Option<OriginContext>,
-        _dst_host_xid: u32,
-        _dst_x: i16,
-        _dst_y: i16,
+        dst_host_xid: u32,
+        dst_x: i16,
+        dst_y: i16,
     ) -> io::Result<()> {
+        let (base_x, base_y) = if dst_host_xid == 0 {
+            (self.cursor_x, self.cursor_y)
+        } else if let Some(w) = self.windows.get(&dst_host_xid) {
+            (w.x as f32, w.y as f32)
+        } else {
+            return Ok(());
+        };
+
+        self.cursor_x = (base_x + dst_x as f32).clamp(0.0, self.fb_w as f32 - 1.0);
+        self.cursor_y = (base_y + dst_y as f32).clamp(0.0, self.fb_h as f32 - 1.0);
+        self.dispatch_motion_event();
         Ok(())
     }
 
@@ -3818,19 +4683,44 @@ impl Backend for KmsBackend {
     fn list_fonts_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _max_names: u16,
+        max_names: u16,
         _pattern: &str,
     ) -> io::Result<Vec<u8>> {
-        // Return a valid 32-byte ListFonts reply with zero names so the
-        // client doesn't block waiting on us.  Layout:
-        //   [0]      reply type = 1
-        //   [1]      unused
-        //   [2..4]   sequence (rewritten by caller)
-        //   [4..8]   reply length (extra 4-byte units) = 0
-        //   [8..10]  number-of-names = 0
-        //   [10..32] unused/pad
-        let mut reply = vec![0u8; 32];
+        // Return a curated set of XLFD names for fonts our loader can open.
+        // Any XLFD that reaches open_font is handled via the fallback font
+        // loader, so the exact XLFD field values only need to be plausible.
+        let all_names: &[&str] = &[
+            "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso10646-1",
+            "-misc-fixed-bold-r-normal--14-130-75-75-c-70-iso10646-1",
+            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
+            "-misc-fixed-medium-r-normal--10-100-75-75-c-60-iso10646-1",
+            "-misc-fixed-medium-r-normal--8-80-75-75-c-50-iso10646-1",
+            "-bitstream-bitstream vera sans mono-medium-r-normal--12-120-75-75-m-70-iso10646-1",
+            "-bitstream-bitstream vera sans-medium-r-normal--12-120-75-75-p-67-iso10646-1",
+            "-adobe-helvetica-medium-r-normal--12-120-75-75-p-67-iso8859-1",
+            "-adobe-courier-medium-r-normal--12-120-75-75-m-70-iso8859-1",
+            "fixed",
+        ];
+        let count = all_names.len().min(max_names as usize);
+        let names = &all_names[..count];
+
+        // Build the ListFonts wire reply.
+        // Layout: 32-byte header + string items, each: 1-byte length + name bytes.
+        let mut name_data: Vec<u8> = Vec::new();
+        for &name in names {
+            name_data.push(name.len() as u8);
+            name_data.extend_from_slice(name.as_bytes());
+        }
+        let pad = (4 - (name_data.len() % 4)) % 4;
+        name_data.resize(name_data.len() + pad, 0);
+
+        let extra_words = (name_data.len() / 4) as u32;
+        let mut reply = vec![0u8; 32 + name_data.len()];
         reply[0] = 1;
+        // bytes [2..4] sequence: rewritten by caller
+        reply[4..8].copy_from_slice(&extra_words.to_le_bytes());
+        reply[8..10].copy_from_slice(&(count as u16).to_le_bytes());
+        reply[32..].copy_from_slice(&name_data);
         Ok(reply)
     }
 
@@ -3904,9 +4794,8 @@ impl Backend for KmsBackend {
 
 /// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.
 /// `body_tail` is everything after the 4-byte glyphset XID.
-/// Only A8 glyphsets are handled; other formats are silently skipped.
 pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
-    if gs.format != GlyphSetFormat::A8 {
+    if !matches!(gs.format, GlyphSetFormat::A8 | GlyphSetFormat::A1) {
         return;
     }
     if body_tail.len() < 4 {
@@ -3919,34 +4808,57 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
         return;
     }
 
-    let id_chunks   = body_tail[4..ids_end].chunks_exact(4);
+    let id_chunks = body_tail[4..ids_end].chunks_exact(4);
     let info_chunks = body_tail[ids_end..infos_end].chunks_exact(12);
     let mut data_off = infos_end;
 
     for (id_b, info_b) in id_chunks.zip(info_chunks) {
-        let id     = u32::from_le_bytes([id_b[0], id_b[1], id_b[2], id_b[3]]);
-        let width  = u16::from_le_bytes([info_b[0], info_b[1]]);
+        let id = u32::from_le_bytes([id_b[0], id_b[1], id_b[2], id_b[3]]);
+        let width = u16::from_le_bytes([info_b[0], info_b[1]]);
         let height = u16::from_le_bytes([info_b[2], info_b[3]]);
-        let x      = i16::from_le_bytes([info_b[4], info_b[5]]);
-        let y      = i16::from_le_bytes([info_b[6], info_b[7]]);
-        let x_off  = i16::from_le_bytes([info_b[8], info_b[9]]);
-        let y_off  = i16::from_le_bytes([info_b[10], info_b[11]]);
+        let x = i16::from_le_bytes([info_b[4], info_b[5]]);
+        let y = i16::from_le_bytes([info_b[6], info_b[7]]);
+        let x_off = i16::from_le_bytes([info_b[8], info_b[9]]);
+        let y_off = i16::from_le_bytes([info_b[10], info_b[11]]);
 
         let w = width as usize;
         let h = height as usize;
-        // A8 wire rows are padded to 4-byte alignment; store densely.
-        let stride = (w + 3) & !3;
+        let stride = match gs.format {
+            GlyphSetFormat::A8 => (w + 3) & !3,
+            GlyphSetFormat::A1 => w.div_ceil(32) * 4,
+            GlyphSetFormat::Other => return,
+        };
         let nbytes = stride * h;
         if data_off + nbytes > body_tail.len() {
             break;
         }
-        let mut pixels = vec![0u8; w * h];
         let wire = &body_tail[data_off..data_off + nbytes];
-        for row in 0..h {
-            pixels[row*w..row*w+w].copy_from_slice(&wire[row*stride..row*stride+w]);
-        }
+        let pixels = match gs.format {
+            GlyphSetFormat::A8 => {
+                let mut pixels = vec![0u8; w * h];
+                for row in 0..h {
+                    pixels[row * w..row * w + w]
+                        .copy_from_slice(&wire[row * stride..row * stride + w]);
+                }
+                pixels
+            }
+            GlyphSetFormat::A1 => wire.to_vec(),
+            GlyphSetFormat::Other => return,
+        };
         data_off += nbytes;
-        gs.glyphs.insert(id, StoredGlyph { width, height, x, y, x_off, y_off, pixels });
+        gs.glyphs.insert(
+            id,
+            StoredGlyph {
+                width,
+                height,
+                x,
+                y,
+                x_off,
+                y_off,
+                pixels,
+                format: gs.format,
+            },
+        );
     }
 }
 
@@ -3955,7 +4867,8 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
 /// `pen_x`/`pen_y` are the starting pen position (already offset by src_x+x_off
 /// and src_y+y_off at the call site in `render_composite_glyphs`).
 pub(super) fn composite_glyphs_onto(
-    gs: &GlyphSetState,
+    glyphsets: &HashMap<u32, GlyphSetState>,
+    gs_xid: u32,
     src: &PixmanImage,
     dst: &mut PixmanImage,
     minor: u8,
@@ -3966,7 +4879,7 @@ pub(super) fn composite_glyphs_onto(
     let id_size = match minor {
         23 => 1usize,
         24 => 2,
-        _  => 4,
+        _ => 4,
     };
 
     // Read the solid colour from `src` (1×1 REPEAT_NORMAL image).
@@ -3974,8 +4887,8 @@ pub(super) fn composite_glyphs_onto(
     let argb: u32 = unsafe { *src.0.data() };
     let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
     let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
-    let g = (((argb >>  8) & 0xFF) as u16) * 0x101;
-    let b = ((argb         & 0xFF) as u16) * 0x101;
+    let g = (((argb >> 8) & 0xFF) as u16) * 0x101;
+    let b = ((argb & 0xFF) as u16) * 0x101;
     let pen_color = Color::new(r, g, b, a);
 
     let dst_w = dst.0.width() as i32;
@@ -3983,26 +4896,44 @@ pub(super) fn composite_glyphs_onto(
     let mut pen_x = pen_x;
     let mut pen_y = pen_y;
     let mut pos = 0usize;
+    let mut active_gs_xid = gs_xid;
 
     // Build once: the 1×1 tiling source image is the same colour for every glyph.
-    let Ok(mut color_img) = Image::new(FormatCode::A8R8G8B8, 1, 1, true) else { return };
+    let Ok(mut color_img) = Image::new(FormatCode::A8R8G8B8, 1, 1, true) else {
+        return;
+    };
     let _ = color_img.fill_rectangles(
-        Operation::Src, pen_color,
-        &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        Operation::Src,
+        pen_color,
+        &[Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }],
     );
     color_img.set_repeat(Repeat::Normal);
 
     while pos + 8 <= items.len() {
         let count = items[pos] as usize;
         if count == 255 {
-            // Glyphset-switch sentinel: 8 bytes (count, pad×3, gs_xid×4).
-            // Mid-stream glyphset switching is not implemented; all glyphs
-            // are rendered using the initial glyphset passed to this function.
+            // Glyphset-switch sentinel: 8 bytes (count, pad×3, new_gs_xid×4).
+            if pos + 8 <= items.len() {
+                let new_xid = u32::from_le_bytes([
+                    items[pos + 4],
+                    items[pos + 5],
+                    items[pos + 6],
+                    items[pos + 7],
+                ]);
+                if new_xid != 0 && glyphsets.contains_key(&new_xid) {
+                    active_gs_xid = new_xid;
+                }
+            }
             pos += 8;
             continue;
         }
-        let dx = i16::from_le_bytes([items[pos+4], items[pos+5]]) as i32;
-        let dy = i16::from_le_bytes([items[pos+6], items[pos+7]]) as i32;
+        let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]) as i32;
+        let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]) as i32;
         pen_x += dx;
         pen_y += dy;
 
@@ -4013,16 +4944,25 @@ pub(super) fn composite_glyphs_onto(
             break;
         }
 
+        let Some(active_gs) = glyphsets.get(&active_gs_xid) else {
+            pos += 8 + padded;
+            continue;
+        };
+
         for i in 0..count {
             let id_off = payload_start + i * id_size;
             let glyph_id: u32 = match id_size {
                 1 => items[id_off] as u32,
-                2 => u16::from_le_bytes([items[id_off], items[id_off+1]]) as u32,
-                _ => u32::from_le_bytes([items[id_off], items[id_off+1],
-                                         items[id_off+2], items[id_off+3]]),
+                2 => u16::from_le_bytes([items[id_off], items[id_off + 1]]) as u32,
+                _ => u32::from_le_bytes([
+                    items[id_off],
+                    items[id_off + 1],
+                    items[id_off + 2],
+                    items[id_off + 3],
+                ]),
             };
 
-            let Some(glyph) = gs.glyphs.get(&glyph_id) else {
+            let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
                 continue;
             };
             let gw = glyph.width as usize;
@@ -4031,29 +4971,65 @@ pub(super) fn composite_glyphs_onto(
             let dst_x = pen_x - glyph.x as i32;
             let dst_y = pen_y - glyph.y as i32;
 
-            if dst_x + gw as i32 <= 0 || dst_y + gh as i32 <= 0
-                || dst_x >= dst_w || dst_y >= dst_h
+            if dst_x + gw as i32 <= 0 || dst_y + gh as i32 <= 0 || dst_x >= dst_w || dst_y >= dst_h
             {
                 pen_x += glyph.x_off as i32;
+                pen_y += i32::from(glyph.y_off);
                 continue;
             }
 
-            // Build A8 mask from densely-packed glyph pixels.
-            let Ok(glyph_img) = Image::new(FormatCode::A8, gw, gh, true) else {
-                pen_x += glyph.x_off as i32;
-                continue;
-            };
-            let stride_bytes = glyph_img.stride();
-            // SAFETY: gdata points into a pixman A8 image we just allocated.
-            // We write only within [0, (gh-1)*stride_bytes + (gw-1)].
-            let gdata = unsafe { glyph_img.data() } as *mut u8;
-            for row in 0..gh {
-                for col in 0..gw {
-                    unsafe {
-                        *gdata.add(row * stride_bytes + col) = glyph.pixels[row * gw + col];
+            let glyph_img = match glyph.format {
+                GlyphSetFormat::A8 => {
+                    let Ok(img) = Image::new(FormatCode::A8, gw, gh, true) else {
+                        pen_x += glyph.x_off as i32;
+                        pen_y += i32::from(glyph.y_off);
+                        continue;
+                    };
+                    let stride_bytes = img.stride();
+                    // SAFETY: img is freshly allocated; we write within its bounds.
+                    let gdata = unsafe { img.data() }.cast::<u8>();
+                    for row in 0..gh {
+                        for col in 0..gw {
+                            unsafe {
+                                *gdata.add(row * stride_bytes + col) = glyph.pixels[row * gw + col];
+                            }
+                        }
                     }
+                    img
                 }
-            }
+                GlyphSetFormat::A1 => {
+                    let Ok(img) = Image::new(FormatCode::A1, gw, gh, true) else {
+                        pen_x += i32::from(glyph.x_off);
+                        pen_y += i32::from(glyph.y_off);
+                        continue;
+                    };
+                    // Wire A1 rows are 32-bit padded MSB-first — same as pixman A1.
+                    let wire_stride = gw.div_ceil(32) * 4;
+                    let img_stride = img.stride();
+                    // SAFETY: img is freshly allocated; pixel data fits in its bounds.
+                    let gdata = unsafe { img.data() }.cast::<u8>();
+                    for row in 0..gh {
+                        let src_off = row * wire_stride;
+                        let dst_off = row * img_stride;
+                        let copy_len = wire_stride
+                            .min(img_stride)
+                            .min(glyph.pixels.len().saturating_sub(src_off));
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                glyph.pixels.as_ptr().add(src_off),
+                                gdata.add(dst_off),
+                                copy_len,
+                            );
+                        }
+                    }
+                    img
+                }
+                GlyphSetFormat::Other => {
+                    pen_x += i32::from(glyph.x_off);
+                    pen_y += i32::from(glyph.y_off);
+                    continue;
+                }
+            };
 
             dst.0.composite32(
                 Operation::Over,
@@ -4066,6 +5042,7 @@ pub(super) fn composite_glyphs_onto(
             );
 
             pen_x += glyph.x_off as i32;
+            pen_y += i32::from(glyph.y_off);
         }
 
         pos += 8 + padded;
@@ -4074,14 +5051,133 @@ pub(super) fn composite_glyphs_onto(
 
 #[cfg(test)]
 mod tests {
-    use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
-    use yserver_core::backend::GcFunction;
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
-    use super::{PixmanImage, fill_rects_with_gc_function};
+    use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
+    use yserver_core::{
+        backend::{Backend, GcFunction},
+        host_x11::HostXidMap,
+    };
+    use yserver_protocol::x11::ResourceId;
+
+    use super::{KmsBackend, PixmanImage, WindowState, fill_rects_with_gc_function};
 
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
+
+    fn make_test_backend() -> KmsBackend {
+        let ctx = super::XkbContext(xkbcommon::xkb::Context::new(
+            xkbcommon::xkb::CONTEXT_NO_FLAGS,
+        ));
+        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+            &ctx.0,
+            "evdev",
+            "pc105",
+            "us",
+            "",
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .or_else(|| {
+            xkbcommon::xkb::Keymap::new_from_names(
+                &ctx.0,
+                "",
+                "",
+                "",
+                "",
+                None,
+                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+        })
+        .expect("test xkb keymap");
+        let xkb_state = super::XkbState(xkbcommon::xkb::State::new(&keymap));
+
+        KmsBackend {
+            device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
+            output: crate::drm::modeset::Output {
+                connector: drm::control::from_u32(1).unwrap(),
+                connector_name: "test".to_string(),
+                crtc: drm::control::from_u32(1).unwrap(),
+                plane: drm::control::from_u32(1).unwrap(),
+                // SAFETY: tests never pass this mode to DRM; it is only
+                // present to satisfy KmsBackend's production fields.
+                mode: unsafe { std::mem::zeroed() },
+                picked: crate::drm::modeset::Mode {
+                    name: "test".to_string(),
+                    width: 800,
+                    height: 600,
+                    vrefresh: 60,
+                    preferred: true,
+                },
+                plane_fb_id_prop: drm::control::from_u32(1).unwrap(),
+                plane_crtc_id_prop: drm::control::from_u32(1).unwrap(),
+            },
+            fb_w: 800,
+            fb_h: 600,
+            swapchain: crate::drm::Swapchain::empty_for_tests(),
+            windows: HashMap::new(),
+            next_host_xid: 0x0040_0000,
+            top_level_order: Vec::new(),
+            window_id: 1,
+            root_visual_xid: 0x21,
+            event_sink: None,
+            xid_map: HostXidMap::new(Mutex::new(HashMap::new())),
+            key_subscribers: Arc::new(Mutex::new(Vec::new())),
+            xkb_context: ctx,
+            xkb_keymap: super::XkbKeymap(keymap),
+            xkb_state,
+            input_ctx: None,
+            font_loader: super::FontLoader::new().expect("test font loader"),
+            fonts: HashMap::new(),
+            pixmaps: HashMap::new(),
+            bg_pixel: None,
+            bg_pixmap: None,
+            bg_pixmap_image: None,
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+            cursors: HashMap::new(),
+            active_cursor: None,
+            button_mask: 0,
+            current_font: None,
+            current_function: GcFunction::Copy,
+            current_foreground: 0,
+            current_background: 0x00ff_ffff,
+            pictures: HashMap::new(),
+            picture_rescued_images: HashMap::new(),
+            glyphsets: HashMap::new(),
+            shape_bounding: HashMap::new(),
+            shape_clip: HashMap::new(),
+            shape_input: HashMap::new(),
+        }
+    }
+
+    fn make_test_window(x: i16, y: i16, width: u16, height: u16, mapped: bool) -> WindowState {
+        WindowState {
+            _nested_id: ResourceId(0x0000_0100),
+            x,
+            y,
+            width,
+            height,
+            border_width: 0,
+            mapped,
+            _override_redirect: false,
+            _parent: Some(1),
+            children: Vec::new(),
+            bg_pixel: None,
+            bg_pixmap: None,
+            image: RefCell::new(
+                PixmanImage::new(FormatCode::X8R8G8B8, width, height, true).unwrap(),
+            ),
+            depth: 24,
+            visual: 0,
+            cursor: 0,
+        }
+    }
 
     /// Fill a PixmanImage with a solid 24-bit colour (X8R8G8B8 format).
     fn fill_image(img: &mut PixmanImage, pixel: u32) {
@@ -4091,7 +5187,12 @@ mod tests {
         let _ = img.0.fill_rectangles(
             Operation::Src,
             color,
-            &[Rectangle16 { x: 0, y: 0, width: w, height: h }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            }],
         );
     }
 
@@ -4102,6 +5203,277 @@ mod tests {
         unsafe { *img.0.data().add(y * stride_words + x) }
     }
 
+    fn has_nonzero_pixel(img: &PixmanImage) -> bool {
+        (0..img.0.height())
+            .any(|y| (0..img.0.width()).any(|x| read_pixel(img, x, y) & 0x00ff_ffff != 0))
+    }
+
+    #[test]
+    fn copy_plane_depth1_substitutes_foreground_background() {
+        let mut b = make_test_backend();
+
+        let src_img = PixmanImage::new(FormatCode::A1, 2, 2, true).unwrap();
+        let src_stride = src_img.0.stride();
+        // SAFETY: src_img is freshly allocated. A1 pixels are MSB-first in
+        // each row byte; set row0=[1,0], row1=[0,1].
+        let src_data = unsafe { src_img.0.data() }.cast::<u8>();
+        unsafe {
+            *src_data.add(0) = 0b1000_0000;
+            *src_data.add(src_stride) = 0b0100_0000;
+        }
+        let src_xid = 0x0040_1000;
+        b.pixmaps.insert(
+            src_xid,
+            super::PixmapState {
+                handle: src_xid,
+                image: src_img,
+                depth: 1,
+            },
+        );
+
+        let dst_xid = 0x0040_1001;
+        b.pixmaps.insert(
+            dst_xid,
+            super::PixmapState {
+                handle: dst_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 2, 2, true).unwrap(),
+                depth: 32,
+            },
+        );
+        b.current_function = GcFunction::Copy;
+        b.current_foreground = 0x00ff_0000;
+        b.current_background = 0x0000_00ff;
+
+        b.copy_plane(None, src_xid, dst_xid, 0, 0, 0, 0, 2, 2, 1)
+            .unwrap();
+
+        let dst = &b.pixmaps.get(&dst_xid).unwrap().image;
+        assert_eq!(read_pixel(dst, 0, 0) & 0x00ff_ffff, 0x00ff_0000);
+        assert_eq!(read_pixel(dst, 1, 0) & 0x00ff_ffff, 0x0000_00ff);
+        assert_eq!(read_pixel(dst, 0, 1) & 0x00ff_ffff, 0x0000_00ff);
+        assert_eq!(read_pixel(dst, 1, 1) & 0x00ff_ffff, 0x00ff_0000);
+    }
+
+    #[test]
+    fn poly_text16_renders_char2b_text() {
+        let mut b = make_test_backend();
+        let (font, _) = b.open_font(None, "fixed").unwrap();
+        b.current_font = Some(font.as_raw());
+        let dst_xid = 0x0040_2000;
+        b.pixmaps.insert(
+            dst_xid,
+            super::PixmapState {
+                handle: dst_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 24, true).unwrap(),
+                depth: 32,
+            },
+        );
+
+        let mut body = vec![0u8; 12];
+        body[8..10].copy_from_slice(&2i16.to_le_bytes());
+        body[10..12].copy_from_slice(&16i16.to_le_bytes());
+        body.extend_from_slice(&[1, 0, 0, 0x41]);
+
+        b.poly_text16(None, dst_xid, 0x00ff_ffff, &body).unwrap();
+
+        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
+    }
+
+    #[test]
+    fn image_text16_draws_background_and_char2b_text() {
+        let mut b = make_test_backend();
+        let (font, _) = b.open_font(None, "fixed").unwrap();
+        b.current_font = Some(font.as_raw());
+        let dst_xid = 0x0040_2001;
+        b.pixmaps.insert(
+            dst_xid,
+            super::PixmapState {
+                handle: dst_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 24, true).unwrap(),
+                depth: 32,
+            },
+        );
+
+        let mut body = vec![0u8; 12];
+        body[8..10].copy_from_slice(&0i16.to_le_bytes());
+        body[10..12].copy_from_slice(&16i16.to_le_bytes());
+        body.extend_from_slice(&[0, 0x41]);
+
+        b.image_text16(None, dst_xid, 0x00ff_ffff, 0x0000_00ff, 1, &body)
+            .unwrap();
+
+        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
+    }
+
+    #[test]
+    fn change_picture_cprepeat_updates_drawable_repeat() {
+        let mut b = make_test_backend();
+        let pixmap_xid = 0x0040_3000;
+        let pic_xid = 0x0040_3001;
+        b.pixmaps.insert(
+            pixmap_xid,
+            super::PixmapState {
+                handle: pixmap_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                depth: 32,
+            },
+        );
+        b.pictures
+            .insert(pic_xid, super::default_drawable_picture(pixmap_xid));
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&0x0001u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        b.render_change_picture(None, pic_xid, &body).unwrap();
+
+        match b.pictures.get(&pic_xid).unwrap() {
+            super::PictureState::Drawable { repeat, .. } => {
+                assert!(matches!(repeat, Repeat::Normal));
+            }
+            _ => panic!("expected drawable picture"),
+        }
+    }
+
+    #[test]
+    fn change_picture_cpclipmask_zero_clears_clip() {
+        let mut b = make_test_backend();
+        let pixmap_xid = 0x0040_3010;
+        let pic_xid = 0x0040_3011;
+        b.pixmaps.insert(
+            pixmap_xid,
+            super::PixmapState {
+                handle: pixmap_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                depth: 32,
+            },
+        );
+        b.pictures
+            .insert(pic_xid, super::default_drawable_picture(pixmap_xid));
+        if let Some(super::PictureState::Drawable { clip, .. }) = b.pictures.get_mut(&pic_xid) {
+            *clip = Some(vec![Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]);
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&0x0040u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        b.render_change_picture(None, pic_xid, &body).unwrap();
+
+        match b.pictures.get(&pic_xid).unwrap() {
+            super::PictureState::Drawable { clip, .. } => assert!(clip.is_none()),
+            _ => panic!("expected drawable picture"),
+        }
+    }
+
+    #[test]
+    fn linear_gradient_composite_produces_nonzero_pixels() {
+        let mut b = make_test_backend();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0010_0000u32.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&(64i32 << 16).to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&(1i32 << 16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0xffffu16.to_le_bytes());
+        body.extend_from_slice(&0xffffu16.to_le_bytes());
+        body.extend_from_slice(&0xffffu16.to_le_bytes());
+        body.extend_from_slice(&0xffffu16.to_le_bytes());
+        body.extend_from_slice(&0xffffu16.to_le_bytes());
+
+        let grad = b
+            .render_create_linear_gradient(None, &body)
+            .unwrap()
+            .expect("gradient picture");
+        let dst_xid = 0x0040_4000;
+        let dst_pic = 0x0040_4001;
+        b.pixmaps.insert(
+            dst_xid,
+            super::PixmapState {
+                handle: dst_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 1, true).unwrap(),
+                depth: 32,
+            },
+        );
+        b.pictures
+            .insert(dst_pic, super::default_drawable_picture(dst_xid));
+
+        b.render_composite(
+            None,
+            Operation::Src as u8,
+            grad.as_raw(),
+            0,
+            dst_pic,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            64,
+            1,
+        )
+        .unwrap();
+
+        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
+    }
+
+    #[test]
+    fn set_picture_transform_stores_non_identity_matrix() {
+        let mut b = make_test_backend();
+        let pixmap_xid = 0x0040_5000;
+        let pic_xid = 0x0040_5001;
+        b.pixmaps.insert(
+            pixmap_xid,
+            super::PixmapState {
+                handle: pixmap_xid,
+                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                depth: 32,
+            },
+        );
+        b.pictures
+            .insert(pic_xid, super::default_drawable_picture(pixmap_xid));
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        for value in [0x20000i32, 0, 0, 0, 0x10000, 0, 0, 0, 0x10000] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        b.render_set_picture_transform(None, pic_xid, &body)
+            .unwrap();
+
+        match b.pictures.get(&pic_xid).unwrap() {
+            super::PictureState::Drawable { transform, .. } => assert!(transform.is_some()),
+            _ => panic!("expected drawable picture"),
+        }
+    }
+
+    #[test]
+    fn warp_pointer_updates_cursor_position() {
+        let mut b = make_test_backend();
+        let xid = b.next_host_xid;
+        b.next_host_xid += 1;
+        b.windows
+            .insert(xid, make_test_window(100, 200, 300, 200, true));
+        b.top_level_order.push(xid);
+
+        b.warp_pointer(None, xid, 10, 20).unwrap();
+
+        assert_eq!(b.cursor_x as i32, 110);
+        assert_eq!(b.cursor_y as i32, 220);
+    }
+
     // ---------------------------------------------------------------------------
     // GcFunction::Copy: fill_rects_with_gc_function must overwrite the destination
     // ---------------------------------------------------------------------------
@@ -4110,10 +5482,19 @@ mod tests {
     fn fill_rects_copy_overwrites_destination() {
         let mut img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
         fill_image(&mut img, 0x00ff_ffff); // white
-        let rect = Rectangle16 { x: 0, y: 0, width: 4, height: 4 };
+        let rect = Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
         fill_rects_with_gc_function(&mut img, GcFunction::Copy, 0x00ff_00ff, &[rect]);
         let pixel = read_pixel(&img, 1, 1);
-        assert_eq!(pixel & 0x00ff_ffff, 0x00ff_00ff, "Copy should overwrite with magenta");
+        assert_eq!(
+            pixel & 0x00ff_ffff,
+            0x00ff_00ff,
+            "Copy should overwrite with magenta"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -4138,7 +5519,12 @@ mod tests {
 
         // Draw a horizontal line at y=8 with magenta (0x00FF00FF) using XOR.
         let row: Vec<Rectangle16> = (0..16_i16)
-            .map(|x| Rectangle16 { x, y: 8, width: 1, height: 1 })
+            .map(|x| Rectangle16 {
+                x,
+                y: 8,
+                width: 1,
+                height: 1,
+            })
             .collect();
         fill_rects_with_gc_function(&mut img, GcFunction::Xor, 0x00ff_00ff, &row);
 
@@ -4223,13 +5609,15 @@ mod tests {
 
         // At least some pixels must be non-zero (the glyph is not blank).
         let has_nonzero = pixels.iter().any(|&b| b > 0);
-        assert!(has_nonzero, "glyph pixels should contain non-zero alpha values");
+        assert!(
+            has_nonzero,
+            "glyph pixels should contain non-zero alpha values"
+        );
 
         // ------------------------------------------------------------------
         // 3. Write into a pixman A8 image using stride (same as phase 2).
         // ------------------------------------------------------------------
-        let glyph_img = Image::new(FormatCode::A8, w, h, true)
-            .expect("pixman A8 image");
+        let glyph_img = Image::new(FormatCode::A8, w, h, true).expect("pixman A8 image");
         let stride_bytes = glyph_img.stride();
         // stride_bytes must be >= w (pixman pads A8 rows to 4-byte alignment).
         assert!(stride_bytes >= w, "pixman A8 stride must be >= width");
@@ -4244,10 +5632,11 @@ mod tests {
         }
 
         // Verify that the A8 image contains non-zero bytes in its first row.
-        let first_row_nonzero = (0..w).any(|col| {
-            unsafe { *gdata.add(col) > 0 }
-        });
-        assert!(first_row_nonzero, "A8 image first row should have non-zero alpha");
+        let first_row_nonzero = (0..w).any(|col| unsafe { *gdata.add(col) > 0 });
+        assert!(
+            first_row_nonzero,
+            "A8 image first row should have non-zero alpha"
+        );
 
         // ------------------------------------------------------------------
         // 4. Composite onto a white X8R8G8B8 image and verify pixels changed.
@@ -4257,20 +5646,24 @@ mod tests {
         // bitmap_top). With a foreground of black (0x000000) on white
         // (0xFFFFFF), composited pixels should be darker than 0xFFFFFF.
         // ------------------------------------------------------------------
-        let baseline_y = glyph.bitmap_top();  // rows from top to baseline
+        let baseline_y = glyph.bitmap_top(); // rows from top to baseline
         let img_h = (baseline_y + 4).max(h as i32 + 4) as u16;
         let img_w = (w + 4) as u16;
-        let mut dst = PixmanImage::new(FormatCode::X8R8G8B8, img_w, img_h, true)
-            .expect("dst image");
+        let mut dst =
+            PixmanImage::new(FormatCode::X8R8G8B8, img_w, img_h, true).expect("dst image");
         fill_image(&mut dst, 0x00ff_ffff); // white
 
-        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true)
-            .expect("color image");
+        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).expect("color image");
         let black = Color::new(0, 0, 0, 0xffff);
         let _ = color_img.fill_rectangles(
             Operation::Src,
             black,
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         // Must tile across the glyph — same fix as render_text_string.
         color_img.set_repeat(Repeat::Normal);
@@ -4292,7 +5685,10 @@ mod tests {
         let any_changed = (0..img_w as usize).any(|x| {
             (0..img_h as usize).any(|y| read_pixel(&dst, x, y) & 0x00ff_ffff != 0x00ff_ffff)
         });
-        assert!(any_changed, "composite should darken some white pixels with black 'A'");
+        assert!(
+            any_changed,
+            "composite should darken some white pixels with black 'A'"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -4307,9 +5703,16 @@ mod tests {
     /// Encode one X RENDER Trapezoid (40 bytes, little-endian 16.16 fixed).
     #[allow(clippy::too_many_arguments)]
     fn encode_trap(
-        top: i32, bottom: i32,
-        lp1x: i32, lp1y: i32, lp2x: i32, lp2y: i32,
-        rp1x: i32, rp1y: i32, rp2x: i32, rp2y: i32,
+        top: i32,
+        bottom: i32,
+        lp1x: i32,
+        lp1y: i32,
+        lp2x: i32,
+        lp2y: i32,
+        rp1x: i32,
+        rp1y: i32,
+        rp2x: i32,
+        rp2y: i32,
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(40);
         for v in [top, bottom, lp1x, lp1y, lp2x, lp2y, rp1x, rp1y, rp2x, rp2y] {
@@ -4321,17 +5724,31 @@ mod tests {
     /// Decode the wire bytes for one trap into a pixman_trapezoid_t.
     fn decode_trap(bytes: &[u8]) -> pixman::ffi::pixman_trapezoid_t {
         assert_eq!(bytes.len(), 40);
-        let i32_at = |off: usize| i32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]);
+        let i32_at = |off: usize| {
+            i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+        };
         pixman::ffi::pixman_trapezoid_t {
-            top:    i32_at(0),
+            top: i32_at(0),
             bottom: i32_at(4),
             left: pixman::ffi::pixman_line_fixed_t {
-                p1: pixman::ffi::pixman_point_fixed_t { x: i32_at(8),  y: i32_at(12) },
-                p2: pixman::ffi::pixman_point_fixed_t { x: i32_at(16), y: i32_at(20) },
+                p1: pixman::ffi::pixman_point_fixed_t {
+                    x: i32_at(8),
+                    y: i32_at(12),
+                },
+                p2: pixman::ffi::pixman_point_fixed_t {
+                    x: i32_at(16),
+                    y: i32_at(20),
+                },
             },
             right: pixman::ffi::pixman_line_fixed_t {
-                p1: pixman::ffi::pixman_point_fixed_t { x: i32_at(24), y: i32_at(28) },
-                p2: pixman::ffi::pixman_point_fixed_t { x: i32_at(32), y: i32_at(36) },
+                p1: pixman::ffi::pixman_point_fixed_t {
+                    x: i32_at(24),
+                    y: i32_at(28),
+                },
+                p2: pixman::ffi::pixman_point_fixed_t {
+                    x: i32_at(32),
+                    y: i32_at(36),
+                },
             },
         }
     }
@@ -4347,19 +5764,23 @@ mod tests {
         let _ = src_img.fill_rectangles(
             Operation::Src,
             red,
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         src_img.set_repeat(Repeat::Normal);
 
         // A rectangle trap covering pixels (1,1)–(6,6).
         // In 16.16 fixed: pixel N → N << 16.
-        let left_x  = 1i32 << 16;
+        let left_x = 1i32 << 16;
         let right_x = 6i32 << 16;
-        let top_y   = 1i32 << 16;
-        let bot_y   = 6i32 << 16;
+        let top_y = 1i32 << 16;
+        let bot_y = 6i32 << 16;
         let wire = encode_trap(
-            top_y, bot_y,
-            left_x, top_y, left_x, bot_y,   // left edge: vertical at x=1
+            top_y, bot_y, left_x, top_y, left_x, bot_y, // left edge: vertical at x=1
             right_x, top_y, right_x, bot_y, // right edge: vertical at x=6
         );
         let trap_struct = decode_trap(&wire);
@@ -4372,8 +5793,10 @@ mod tests {
                 src_img.as_ptr(),
                 dst_img.0.as_ptr(),
                 pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                0, 0, // src_x, src_y
-                0, 0, // dst_x, dst_y
+                0,
+                0, // src_x, src_y
+                0,
+                0, // dst_x, dst_y
                 1,
                 &trap_struct,
             );
@@ -4410,15 +5833,20 @@ mod tests {
         let _ = src_img.fill_rectangles(
             Operation::Src,
             green,
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         src_img.set_repeat(Repeat::Normal);
 
         // Rectangular trap covering the full image interior (1,1)–(6,6).
-        let l  = 1i32 << 16;
-        let r  = 6i32 << 16;
-        let t  = 1i32 << 16;
-        let b  = 6i32 << 16;
+        let l = 1i32 << 16;
+        let r = 6i32 << 16;
+        let t = 1i32 << 16;
+        let b = 6i32 << 16;
         let trap_struct = decode_trap(&encode_trap(t, b, l, t, l, b, r, t, r, b));
 
         unsafe {
@@ -4427,7 +5855,12 @@ mod tests {
                 src_img.as_ptr(),
                 dst_img.0.as_ptr(),
                 pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                0, 0, 0, 0, 1, &trap_struct,
+                0,
+                0,
+                0,
+                0,
+                1,
+                &trap_struct,
             );
         }
 
@@ -4436,8 +5869,8 @@ mod tests {
         let pixel = unsafe { *dst_img.0.data().add(3 * stride_words + 3) };
         let a = (pixel >> 24) & 0xFF;
         let r_ch = (pixel >> 16) & 0xFF;
-        let g_ch = (pixel >> 8)  & 0xFF;
-        let b_ch =  pixel        & 0xFF;
+        let g_ch = (pixel >> 8) & 0xFF;
+        let b_ch = pixel & 0xFF;
         assert_eq!(a, 0xFF, "center alpha should be fully opaque");
         assert_eq!(r_ch, 0x00, "center red channel should be 0");
         assert_eq!(g_ch, 0xFF, "center green channel should be 0xFF");
@@ -4461,23 +5894,23 @@ mod tests {
         //     glyph1: 4×1 A8, row-stride=4 (no pad):  [0x55,0x66,0x77,0x88]
 
         let mut body = Vec::new();
-        body.extend_from_slice(&2u32.to_le_bytes());   // num_glyphs
-        body.extend_from_slice(&1u32.to_le_bytes());   // id[0]
-        body.extend_from_slice(&2u32.to_le_bytes());   // id[1]
+        body.extend_from_slice(&2u32.to_le_bytes()); // num_glyphs
+        body.extend_from_slice(&1u32.to_le_bytes()); // id[0]
+        body.extend_from_slice(&2u32.to_le_bytes()); // id[1]
         // glyph0 info
-        body.extend_from_slice(&2u16.to_le_bytes());   // width
-        body.extend_from_slice(&2u16.to_le_bytes());   // height
+        body.extend_from_slice(&2u16.to_le_bytes()); // width
+        body.extend_from_slice(&2u16.to_le_bytes()); // height
         body.extend_from_slice(&(-1i16).to_le_bytes()); // x
         body.extend_from_slice(&(-2i16).to_le_bytes()); // y
-        body.extend_from_slice(&4i16.to_le_bytes());   // x_off
-        body.extend_from_slice(&0i16.to_le_bytes());   // y_off
+        body.extend_from_slice(&4i16.to_le_bytes()); // x_off
+        body.extend_from_slice(&0i16.to_le_bytes()); // y_off
         // glyph1 info
-        body.extend_from_slice(&4u16.to_le_bytes());   // width
-        body.extend_from_slice(&1u16.to_le_bytes());   // height
-        body.extend_from_slice(&0i16.to_le_bytes());   // x
+        body.extend_from_slice(&4u16.to_le_bytes()); // width
+        body.extend_from_slice(&1u16.to_le_bytes()); // height
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
         body.extend_from_slice(&(-1i16).to_le_bytes()); // y
-        body.extend_from_slice(&5i16.to_le_bytes());   // x_off
-        body.extend_from_slice(&0i16.to_le_bytes());   // y_off
+        body.extend_from_slice(&5i16.to_le_bytes()); // x_off
+        body.extend_from_slice(&0i16.to_le_bytes()); // y_off
         // glyph0 pixels: 2×2, padded row stride 4
         body.extend_from_slice(&[0x11, 0x22, 0x00, 0x00]); // row 0
         body.extend_from_slice(&[0x33, 0x44, 0x00, 0x00]); // row 1
@@ -4515,17 +5948,31 @@ mod tests {
             format: super::GlyphSetFormat::A8,
             glyphs: std::collections::HashMap::new(),
         };
-        gs.glyphs.insert(1, super::StoredGlyph {
-            width: 2, height: 2, x: -1, y: -1, x_off: 3, y_off: 0,
-            pixels: vec![0xFF; 4],
-        });
+        gs.glyphs.insert(
+            1,
+            super::StoredGlyph {
+                width: 2,
+                height: 2,
+                x: -1,
+                y: -1,
+                x_off: 3,
+                y_off: 0,
+                pixels: vec![0xFF; 4],
+                format: super::GlyphSetFormat::A8,
+            },
+        );
 
         // Red solid-fill source (A8R8G8B8 = 0xFFFF0000).
         let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
         let _ = src_img.0.fill_rectangles(
             Operation::Src,
             Color::new(0xFFFF, 0, 0, 0xFFFF),
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         src_img.0.set_repeat(Repeat::Normal);
 
@@ -4535,24 +5982,42 @@ mod tests {
 
         // Build a CompositeGlyphs8 item stream: one run with count=1, dx=2, dy=3, id=1.
         let mut items = Vec::new();
-        items.push(1u8);        // count
+        items.push(1u8); // count
         items.extend_from_slice(&[0, 0, 0]); // pad
         items.extend_from_slice(&2i16.to_le_bytes()); // dx
         items.extend_from_slice(&3i16.to_le_bytes()); // dy
-        items.push(1u8);        // glyph id (8-bit for minor=23)
+        items.push(1u8); // glyph id (8-bit for minor=23)
         items.extend_from_slice(&[0, 0, 0]); // pad to 4-byte boundary
 
+        let gs_xid = 1u32;
+        let mut glyphsets = std::collections::HashMap::new();
+        glyphsets.insert(gs_xid, gs);
         super::composite_glyphs_onto(
-            &gs, &src_img, &mut dst_img,
-            /*minor=*/23, /*pen_x=*/0, /*pen_y=*/0,
+            &glyphsets,
+            gs_xid,
+            &src_img,
+            &mut dst_img,
+            /*minor=*/ 23,
+            /*pen_x=*/ 0,
+            /*pen_y=*/ 0,
             &items,
         );
 
         // Pen after dx/dy = (0+2, 0+3) = (2, 3).
         // Draw at (pen_x - glyph.x, pen_y - glyph.y) = (2-(-1), 3-(-1)) = (3, 4).
         let p = read_pixel(&dst_img, 3, 4);
-        assert_ne!(p & 0x00FF_0000, 0, "pixel (3,4) should have red channel; got 0x{:08x}", p);
-        assert_eq!(p & 0x0000_FFFF, 0, "pixel (3,4) should have no blue/green; got 0x{:08x}", p);
+        assert_ne!(
+            p & 0x00FF_0000,
+            0,
+            "pixel (3,4) should have red channel; got 0x{:08x}",
+            p
+        );
+        assert_eq!(
+            p & 0x0000_FFFF,
+            0,
+            "pixel (3,4) should have no blue/green; got 0x{:08x}",
+            p
+        );
     }
 
     #[test]
@@ -4563,18 +6028,44 @@ mod tests {
             format: super::GlyphSetFormat::A8,
             glyphs: std::collections::HashMap::new(),
         };
-        gs.glyphs.insert(1, super::StoredGlyph {
-            width: 1, height: 1, x: 0, y: 0, x_off: 5, y_off: 0,
-            pixels: vec![0xFF],
-        });
-        gs.glyphs.insert(2, super::StoredGlyph {
-            width: 1, height: 1, x: 0, y: 0, x_off: 3, y_off: 0,
-            pixels: vec![0xFF],
-        });
+        gs.glyphs.insert(
+            1,
+            super::StoredGlyph {
+                width: 1,
+                height: 1,
+                x: 0,
+                y: 0,
+                x_off: 5,
+                y_off: 0,
+                pixels: vec![0xFF],
+                format: super::GlyphSetFormat::A8,
+            },
+        );
+        gs.glyphs.insert(
+            2,
+            super::StoredGlyph {
+                width: 1,
+                height: 1,
+                x: 0,
+                y: 0,
+                x_off: 3,
+                y_off: 0,
+                pixels: vec![0xFF],
+                format: super::GlyphSetFormat::A8,
+            },
+        );
 
         let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let _ = src_img.0.fill_rectangles(Operation::Src, Color::new(0, 0, 0xFFFF, 0xFFFF),
-            &[Rectangle16 { x:0, y:0, width:1, height:1 }]);
+        let _ = src_img.0.fill_rectangles(
+            Operation::Src,
+            Color::new(0, 0, 0xFFFF, 0xFFFF),
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        );
         src_img.0.set_repeat(Repeat::Normal);
 
         let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 20, 4, true).unwrap();
@@ -4583,21 +6074,40 @@ mod tests {
         // Run 1: count=1, dx=2, dy=1, id=1
         // Run 2: count=1, dx=3, dy=0, id=2
         let mut items = Vec::new();
-        items.push(1u8); items.extend_from_slice(&[0,0,0]);
-        items.extend_from_slice(&2i16.to_le_bytes()); items.extend_from_slice(&1i16.to_le_bytes());
-        items.push(1u8); items.extend_from_slice(&[0,0,0]);
-        items.push(1u8); items.extend_from_slice(&[0,0,0]);
-        items.extend_from_slice(&3i16.to_le_bytes()); items.extend_from_slice(&0i16.to_le_bytes());
-        items.push(2u8); items.extend_from_slice(&[0,0,0]);
+        items.push(1u8);
+        items.extend_from_slice(&[0, 0, 0]);
+        items.extend_from_slice(&2i16.to_le_bytes());
+        items.extend_from_slice(&1i16.to_le_bytes());
+        items.push(1u8);
+        items.extend_from_slice(&[0, 0, 0]);
+        items.push(1u8);
+        items.extend_from_slice(&[0, 0, 0]);
+        items.extend_from_slice(&3i16.to_le_bytes());
+        items.extend_from_slice(&0i16.to_le_bytes());
+        items.push(2u8);
+        items.extend_from_slice(&[0, 0, 0]);
 
-        super::composite_glyphs_onto(&gs, &src_img, &mut dst_img, 23, 0, 0, &items);
+        let gs_xid = 1u32;
+        let mut glyphsets = std::collections::HashMap::new();
+        glyphsets.insert(gs_xid, gs);
+        super::composite_glyphs_onto(&glyphsets, gs_xid, &src_img, &mut dst_img, 23, 0, 0, &items);
 
         // Glyph 1 at pen (2,1): draw at (2,1). After glyph, pen_x += x_off=5 → pen_x=7.
         // Glyph 2 at pen (7+3=10, 1+0=1): draw at (10,1).
         let p1 = read_pixel(&dst_img, 2, 1);
         let p2 = read_pixel(&dst_img, 10, 1);
-        assert_ne!(p1 & 0x0000_FFFF, 0, "glyph1 pixel (2,1) should have blue; got 0x{:08x}", p1);
-        assert_ne!(p2 & 0x0000_FFFF, 0, "glyph2 pixel (10,1) should have blue; got 0x{:08x}", p2);
+        assert_ne!(
+            p1 & 0x0000_FFFF,
+            0,
+            "glyph1 pixel (2,1) should have blue; got 0x{:08x}",
+            p1
+        );
+        assert_ne!(
+            p2 & 0x0000_FFFF,
+            0,
+            "glyph2 pixel (10,1) should have blue; got 0x{:08x}",
+            p2
+        );
     }
 
     #[test]
@@ -4609,8 +6119,13 @@ mod tests {
         let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
         let _ = src_img.0.fill_rectangles(
             Operation::Src,
-            Color::new(0xFFFF, 0, 0, 0xFFFF),  // opaque red
-            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+            Color::new(0xFFFF, 0, 0, 0xFFFF), // opaque red
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
         );
         src_img.0.set_repeat(Repeat::Normal);
 
@@ -4623,16 +6138,33 @@ mod tests {
         unsafe {
             pixman::ffi::pixman_image_composite32(
                 pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
-                src_ptr, std::ptr::null_mut(), dst_ptr,
-                0, 0, 0, 0,
-                1, 1, // dst at (1,1)
-                2, 2, // 2×2 region
+                src_ptr,
+                std::ptr::null_mut(),
+                dst_ptr,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1, // dst at (1,1)
+                2,
+                2, // 2×2 region
             );
         }
 
         let p = read_pixel(&dst_img, 1, 1);
-        assert_ne!(p & 0x00FF_0000, 0, "pixel (1,1) should have red; got 0x{:08x}", p);
-        assert_eq!(p & 0x0000_FFFF, 0, "pixel (1,1) should have no blue/green; got 0x{:08x}", p);
+        assert_ne!(
+            p & 0x00FF_0000,
+            0,
+            "pixel (1,1) should have red; got 0x{:08x}",
+            p
+        );
+        assert_eq!(
+            p & 0x0000_FFFF,
+            0,
+            "pixel (1,1) should have no blue/green; got 0x{:08x}",
+            p
+        );
     }
 
     #[test]
@@ -4645,11 +6177,18 @@ mod tests {
         let src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
         let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
         fill_image(&mut dst_img, 0x00FF_FFFF);
-        let items = vec![255u8, 0, 0, 0,  0x99, 0, 0, 0]; // sentinel + fake gs xid
+        let gs_xid = 1u32;
+        let mut glyphsets = std::collections::HashMap::new();
+        glyphsets.insert(gs_xid, gs);
+        let items = vec![255u8, 0, 0, 0, 0x99, 0, 0, 0]; // sentinel + fake gs xid
         // Should not panic:
-        super::composite_glyphs_onto(&gs, &src_img, &mut dst_img, 23, 0, 0, &items);
+        super::composite_glyphs_onto(&glyphsets, gs_xid, &src_img, &mut dst_img, 23, 0, 0, &items);
         // Mask off the X/A channel — X8R8G8B8 may store 0xFF in the top byte.
-        assert_eq!(read_pixel(&dst_img, 0, 0) & 0x00FF_FFFF, 0x00FF_FFFF, "sentinel must not modify dst");
+        assert_eq!(
+            read_pixel(&dst_img, 0, 0) & 0x00FF_FFFF,
+            0x00FF_FFFF,
+            "sentinel must not modify dst"
+        );
     }
 
     #[test]
@@ -4662,8 +6201,16 @@ mod tests {
 
         let mut pixmap_img = PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap();
         let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
-        let full = Rectangle16 { x: 0, y: 0, width: 4, height: 4 };
-        pixmap_img.0.fill_rectangles(Operation::Src, red, &[full]).unwrap();
+        let full = Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        pixmap_img
+            .0
+            .fill_rectangles(Operation::Src, red, &[full])
+            .unwrap();
 
         let pixmap_xid: u32 = 10;
         let picture_xid: u32 = 20;
@@ -4673,8 +6220,15 @@ mod tests {
         let mut pictures: HashMap<u32, PictureState> = HashMap::new();
         let mut pixmaps: HashMap<u32, PixmapState> = HashMap::new();
 
-        pixmaps.insert(pixmap_xid, PixmapState { handle: pixmap_xid, image: pixmap_img, depth: 32 });
-        pictures.insert(picture_xid, PictureState::Drawable { host_xid: pixmap_xid, clip: None });
+        pixmaps.insert(
+            pixmap_xid,
+            PixmapState {
+                handle: pixmap_xid,
+                image: pixmap_img,
+                depth: 32,
+            },
+        );
+        pictures.insert(picture_xid, default_drawable_picture(pixmap_xid));
 
         let hot_x: u16 = 1;
         let hot_y: u16 = 2;
@@ -4686,9 +6240,24 @@ mod tests {
         let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true).unwrap();
         {
             let pm = pixmaps.get(&pixmap_xid).unwrap();
-            cursor_img.0.composite32(Operation::Src, &pm.image.0, None, (0,0), (0,0), (0,0), (w as i32, h as i32));
+            cursor_img.0.composite32(
+                Operation::Src,
+                &pm.image.0,
+                None,
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (w as i32, h as i32),
+            );
         }
-        cursors.insert(cursor_xid, CursorState { image: cursor_img, hot_x, hot_y });
+        cursors.insert(
+            cursor_xid,
+            CursorState {
+                image: cursor_img,
+                hot_x,
+                hot_y,
+            },
+        );
 
         let cs = cursors.get(&cursor_xid).unwrap();
         assert_eq!(cs.hot_x, hot_x);
@@ -4700,7 +6269,11 @@ mod tests {
         // A8R8G8B8 in memory: alpha=0xFF, R=0xFF, G=0x00, B=0x00 → 0xFFFF0000.
         // SAFETY: cursor_img was just created and no other reference to it exists.
         let pixel = unsafe { *cs.image.0.data().add(0) };
-        assert_eq!(pixel & 0x00FF_0000, 0x00FF_0000, "red channel should be set");
+        assert_eq!(
+            pixel & 0x00FF_0000,
+            0x00FF_0000,
+            "red channel should be set"
+        );
     }
 
     #[test]
@@ -4710,8 +6283,16 @@ mod tests {
         // 2×2 all-red ARGB cursor image.
         let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, 2, 2, true).unwrap();
         let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
-        let full = Rectangle16 { x: 0, y: 0, width: 2, height: 2 };
-        cursor_img.0.fill_rectangles(Operation::Src, red, &[full]).unwrap();
+        let full = Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        cursor_img
+            .0
+            .fill_rectangles(Operation::Src, red, &[full])
+            .unwrap();
 
         // 10×10 black destination.
         let mut dst = PixmanImage::new(FormatCode::A8R8G8B8, 10, 10, true).unwrap();
@@ -4719,10 +6300,60 @@ mod tests {
         // Cursor position (5,5) with hotspot (1,1) → image top-left lands at (4,4).
         let x = 5_i32 - 1;
         let y = 5_i32 - 1;
-        dst.0.composite32(Operation::Over, &cursor_img.0, None, (0, 0), (0, 0), (x, y), (2, 2));
+        dst.0.composite32(
+            Operation::Over,
+            &cursor_img.0,
+            None,
+            (0, 0),
+            (0, 0),
+            (x, y),
+            (2, 2),
+        );
 
         let pixel = read_pixel(&dst, x as usize, y as usize);
-        assert_eq!(pixel & 0x00FF_0000, 0x00FF_0000, "red channel at (4,4) should be 0xFF after composite");
+        assert_eq!(
+            pixel & 0x00FF_0000,
+            0x00FF_0000,
+            "red channel at (4,4) should be 0xFF after composite"
+        );
     }
 
+    #[test]
+    fn parse_xlfd_extracts_family_style_pixelsize() {
+        // XLFD weight strings are lowercase; we pass them straight to fontconfig
+        // which matches case-insensitively.
+        let (fam, style, px) = super::FontLoader::parse_xlfd(
+            "-adobe-helvetica-bold-i-normal--12-120-75-75-p-67-iso8859-1",
+        );
+        assert_eq!(fam.as_deref(), Some("helvetica"));
+        assert_eq!(style.as_deref(), Some("bold Italic"));
+        assert_eq!(px, Some(12));
+    }
+
+    #[test]
+    fn parse_xlfd_treats_wildcards_as_unspecified() {
+        // Wildcards in family/weight/slant ⇒ None; pixelsize "*" ⇒ no size.
+        let (fam, style, px) = super::FontLoader::parse_xlfd("-*-*-*-*-*-*-*-*-*-*-*-*-*-*");
+        assert!(fam.is_none());
+        assert!(style.is_none());
+        assert!(px.is_none());
+    }
+
+    #[test]
+    fn parse_xlfd_roman_slant_no_italic() {
+        // Slant "r" (roman) shouldn't pull in "Italic"; weight "medium" carries through.
+        let (_, style, _) = super::FontLoader::parse_xlfd(
+            "-adobe-courier-medium-r-normal--14-140-75-75-m-90-iso8859-1",
+        );
+        assert_eq!(style.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn open_font_accepts_x11_alias_via_fontconfig() {
+        // "fixed" is a classic X11 alias. fontconfig knows it, or falls back
+        // to monospace — either way we must get a usable face.
+        let loader = super::FontLoader::new().expect("fontconfig+freetype init");
+        let (_face, metrics, _cache) = loader.open_font("fixed").expect("resolve fixed");
+        assert!(metrics.font_ascent + metrics.font_descent > 0);
+    }
 }

@@ -149,9 +149,8 @@ yserver-fvwm3-xterm mode="1024x768" log="trace":
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
-            sleep 0.5;\
+            sleep 1;\
             DISPLAY=:7 fvwm3 > fvwm3.log 2>&1 &\
-            sleep 0.5;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
@@ -162,9 +161,8 @@ yserver-e16-xterm mode="1024x768" log="trace":
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
-            sleep 0.5;\
+            sleep 1;\
             DISPLAY=:7 e16 > e16.log 2>&1 &\
-            sleep 0.5;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
@@ -175,8 +173,7 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
-            sleep 0.5;\
+            sleep 2;\
             DISPLAY=:7 wmaker > wmaker.log 2>&1 &\
-            sleep 0.5;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'

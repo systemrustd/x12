@@ -21,6 +21,18 @@ impl DrmDevice for Device {}
 impl drm::control::Device for Device {}
 
 impl Device {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        Ok(Self {
+            file,
+            path: "/dev/null".to_string(),
+        })
+    }
+
     pub fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)

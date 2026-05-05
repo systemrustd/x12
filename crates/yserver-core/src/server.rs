@@ -966,6 +966,28 @@ pub fn pointer_event_fanout(
     xid_map: &crate::host_x11::HostXidMap,
     event: crate::host_x11::HostPointerEvent,
 ) {
+    pointer_event_fanout_inner(state, xid_map, event, true);
+}
+
+/// Re-routes a thawed ButtonPress as if no passive grab had matched.
+/// Called by AllowEvents ReplayPointer. This intentionally does not
+/// re-check passive grabs, otherwise the same event would immediately
+/// refreeze on the same grab.
+pub fn route_button_press_no_grab(
+    state: &Mutex<ServerState>,
+    xid_map: &crate::host_x11::HostXidMap,
+    event: crate::host_x11::HostPointerEvent,
+) {
+    pointer_event_fanout_inner(state, xid_map, event, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn pointer_event_fanout_inner(
+    state: &Mutex<ServerState>,
+    xid_map: &crate::host_x11::HostXidMap,
+    event: crate::host_x11::HostPointerEvent,
+    handle_grabs: bool,
+) {
     use crate::host_x11::PointerEventKind;
     trace!(
         "pointer_event_fanout: kind={:?} detail={} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
@@ -1016,13 +1038,17 @@ pub fn pointer_event_fanout(
     // the grab owner can locate which child window (menu item, button…)
     // was clicked. Without this translation a WM-popup grab sees clicks at
     // root coordinates and can't match them against its menu-item children.
-    let grab_state = match state.lock() {
-        Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
-            let target = g.client_target(client_id)?;
-            let (gx, gy) = g.resources.window_absolute_position(grab_window);
-            Some((grab_window, target, gx, gy))
-        }),
-        Err(_) => return,
+    let grab_state = if handle_grabs {
+        match state.lock() {
+            Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
+                let target = g.client_target(client_id)?;
+                let (gx, gy) = g.resources.window_absolute_position(grab_window);
+                Some((grab_window, target, gx, gy))
+            }),
+            Err(_) => return,
+        }
+    } else {
+        None
     };
     if let Some((grab_window, target, grab_x, grab_y)) = grab_state {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -1099,7 +1125,7 @@ pub fn pointer_event_fanout(
     }
 
     // Passive button grab matching for ButtonPress events.
-    if event.kind == PointerEventKind::ButtonPress {
+    if handle_grabs && event.kind == PointerEventKind::ButtonPress {
         let top_level_id_opt = xid_map
             .lock()
             .ok()
@@ -1811,6 +1837,144 @@ mod tests {
         assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
         // Surviving window's subscription stays.
         assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
+    }
+
+    #[test]
+    fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
+        use std::{
+            collections::HashMap as StdHashMap,
+            io::{ErrorKind, Read},
+            sync::Mutex as StdMutex,
+        };
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (target_writer_local, mut target_reader_remote) =
+            UnixStream::pair().expect("socketpair");
+        grab_reader_remote.set_nonblocking(true).unwrap();
+        target_reader_remote.set_nonblocking(true).unwrap();
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            let grab_window = ResourceId(0x0010_0002);
+            let target_window = ResourceId(0x0020_0002);
+            s.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: grab_window,
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    background_pixel: None,
+                    event_mask: None,
+                    override_redirect: None,
+                },
+            );
+            s.resources.create_window(
+                ClientId(2),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: target_window,
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    background_pixel: None,
+                    event_mask: None,
+                    override_redirect: None,
+                },
+            );
+            let _ = s.resources.map_window(grab_window);
+            let _ = s.resources.map_window(target_window);
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+            s.clients.insert(
+                2,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(target_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0020_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(target_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                },
+            );
+            s.pointer_grab = Some((ClientId(1), grab_window));
+            s.pointer_grab_is_passive = true;
+            assert_eq!(s.subscribers(grab_window, 0x0000_0004).len(), 1);
+            assert_eq!(s.subscribers(target_window, 0x0000_0004).len(), 1);
+            assert!(s.resources.window(target_window).is_some());
+            assert!(
+                s.resources
+                    .pointer_target_at(target_window, 10, 10)
+                    .is_some()
+            );
+            assert!(
+                s.pointer_propagation_target(target_window, 10, 10, 0x0000_0004)
+                    .is_some()
+            );
+        }
+
+        let mut map = StdHashMap::new();
+        map.insert(0xCAFE_u32, ResourceId(0x0020_0002));
+        let xid_map = Arc::new(StdMutex::new(map));
+
+        route_button_press_no_grab(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 10,
+                root_y: 10,
+                event_x: 10,
+                event_y: 10,
+                state: 0,
+            },
+        );
+
+        let mut buf = [0u8; 32];
+        let grab_read = grab_reader_remote.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "grab owner must not receive replayed ButtonPress; got {grab_read:?}",
+        );
+        let target_read = target_reader_remote.read(&mut buf);
+        assert!(
+            matches!(target_read, Ok(32)),
+            "target window subscriber should receive replayed ButtonPress; got {target_read:?}",
+        );
+        assert_eq!(buf[0], 4, "event type should be ButtonPress");
+        assert_eq!(&buf[12..16], &0x0020_0002u32.to_le_bytes());
     }
 
     #[test]

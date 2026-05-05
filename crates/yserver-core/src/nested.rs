@@ -30,7 +30,7 @@ use crate::{
     },
     server::{
         ClientHandle, DamageObject, EventTarget, PresentEventSelection, ServerState, SyncAlarm,
-        SyncCounter, XFixesRegion, fanout_event, fanout_raw_event,
+        SyncCounter, XFixesRegion, fanout_event, fanout_raw_event, route_button_press_no_grab,
     },
     unix_fd::FdReader,
 };
@@ -8487,17 +8487,29 @@ fn handle_request(
         35 => {
             let mode = header.data;
             if mode == 0 || mode == 1 || mode == 2 {
-                let mut s = lock_server(server)?;
-                s.frozen_pointer_event = None;
-                if mode == 0 || mode == 1 {
-                    // AsyncPointer / SyncPointer: release passive grab
-                    if s.pointer_grab_is_passive {
+                let frozen = {
+                    let mut s = lock_server(server)?;
+                    let frozen = s.frozen_pointer_event.take();
+                    if mode == 0 || mode == 1 {
+                        // AsyncPointer / SyncPointer: release passive grab
+                        if s.pointer_grab_is_passive {
+                            s.pointer_grab = None;
+                            s.pointer_grab_is_passive = false;
+                        }
+                    } else if mode == 2 && s.pointer_grab_is_passive {
                         s.pointer_grab = None;
                         s.pointer_grab_is_passive = false;
                     }
+                    frozen
+                };
+                if mode == 2
+                    && let Some(event) = frozen
+                    && let Some(host) = host
+                    && let Ok(host) = host.lock()
+                {
+                    let xid_map = host.xid_map();
+                    route_button_press_no_grab(server, &xid_map, event);
                 }
-                // ReplayPointer (mode==2): frozen event is cleared; normal routing will
-                // handle next events. Full replay needs inter-thread plumbing (follow-up).
             }
             log_void(client_id, sequence, "AllowEvents")
         }

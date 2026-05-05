@@ -19,4 +19,3 @@ Current status is in docs/status.md and should be kept up to date
 * in /home/jos/Projects/xserver/hw/xnest/ you can find the sources to Xnest for reference
 * to test you can run ynest with RUST_LOG=debug, capture its output
 * x11trace is available if you want to trace how Xephyr/Xnest does things, x11trace always needs -n flag
-* to push, apparently you need `ssh -F`
