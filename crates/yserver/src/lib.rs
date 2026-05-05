@@ -22,7 +22,8 @@ use nix::sys::{
 };
 
 use yserver_core::{
-    backend::Backend,
+    backend::{Backend, BackendEvent, BackendEventSink},
+    host_x11::HostEvent,
     nested::handle_client,
     server::{ServerState, host_pump_event_sink},
 };
@@ -56,6 +57,12 @@ pub fn run() -> io::Result<()> {
     let xid_map = backend_arc.lock().unwrap().xid_map();
     let window_id = backend_arc.lock().unwrap().window_id();
     let sink = host_pump_event_sink(server.clone(), xid_map, window_id);
+    // Clone the sink so the input thread can dispatch buffered pointer
+    // events through it WITHOUT holding the backend mutex. The sink in
+    // the backend itself is unused for the KMS pointer path (see the
+    // `pending_pointer_events` doc) but stays wired for the
+    // `BackendEventSink` trait surface.
+    let input_sink = sink.clone();
     backend_arc
         .lock()
         .unwrap()
@@ -111,6 +118,7 @@ pub fn run() -> io::Result<()> {
     };
     if let Some(mut input_ctx) = input_ctx {
         let backend_for_input = backend_arc.clone();
+        let mut input_sink = input_sink;
         log::info!("yserver: spawning dedicated libinput thread");
         thread::spawn(move || {
             // Dedicated input epoll set — wakes only on libinput events,
@@ -146,14 +154,29 @@ pub fn run() -> io::Result<()> {
                     }
                 };
                 for event in events {
-                    let mut b = match backend_for_input.lock() {
-                        Ok(b) => b,
-                        Err(_) => return,
+                    // Hold the backend mutex only for the state mutation
+                    // and event buffering. Forwarding to the sink — which
+                    // takes `server.lock()` — must happen AFTER the
+                    // backend mutex is dropped, otherwise we deadlock
+                    // against request handlers that hold `server.lock()`
+                    // while reaching for the backend mutex.
+                    let pending = {
+                        let mut b = match backend_for_input.lock() {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        };
+                        let Some(kms) = b.as_any_mut().downcast_mut::<KmsBackend>() else {
+                            return;
+                        };
+                        kms.process_one_input_event(event);
+                        kms.drain_pending_pointer_events()
                     };
-                    let Some(kms) = b.as_any_mut().downcast_mut::<KmsBackend>() else {
-                        return;
-                    };
-                    kms.process_one_input_event(event);
+                    for ptr_event in pending {
+                        input_sink
+                            .handle_backend_event(BackendEvent::HostEvent(HostEvent::Pointer(
+                                ptr_event,
+                            )));
+                    }
                 }
             }
         });

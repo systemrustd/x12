@@ -521,13 +521,20 @@ pub fn handle_client(
         client_id.0, setup.protocol_major, setup.protocol_minor, resource_id_base
     );
 
-    let current_input_masks: u32 = {
+    let (current_input_masks, screen_width_px, screen_height_px) = {
         let s = lock_server(&server)?;
-        s.clients
+        let masks = s
+            .clients
             .values()
             .filter_map(|c| c.event_masks.get(&ROOT_WINDOW).copied())
-            .fold(0u32, |a, b| a | b)
+            .fold(0u32, |a, b| a | b);
+        (masks, s.randr.screen_width, s.randr.screen_height)
     };
+    // 96 DPI: mm = pixels * 25.4 / 96 = pixels * 254 / 960 (rounded).
+    let screen_width_mm =
+        (((u32::from(screen_width_px) * 254 + 480) / 960).max(1)).min(u32::from(u16::MAX)) as u16;
+    let screen_height_mm =
+        (((u32::from(screen_height_px) * 254 + 480) / 960).max(1)).min(u32::from(u16::MAX)) as u16;
 
     x11::write_setup_success(
         &mut stream,
@@ -552,10 +559,10 @@ pub fn handle_client(
                 white_pixel: 0x00ff_ffff,
                 black_pixel: 0,
                 current_input_masks,
-                width_px: 800,
-                height_px: 600,
-                width_mm: 211,
-                height_mm: 158,
+                width_px: screen_width_px,
+                height_px: screen_height_px,
+                width_mm: screen_width_mm,
+                height_mm: screen_height_mm,
                 min_installed_maps: 1,
                 max_installed_maps: 1,
                 root_visual: ROOT_VISUAL,
@@ -6712,6 +6719,10 @@ fn handle_request(
                         && (g.button == button || button == 0)
                         && (g.modifiers == modifiers || modifiers == 0x8000))
                 });
+                debug!(
+                    "client {} UngrabButton window=0x{:x} button={} modifiers=0x{:x}",
+                    client_id.0, grab_window.0, button, modifiers
+                );
             }
             log_void(client_id, sequence, "UngrabButton")
         }
@@ -8486,6 +8497,13 @@ fn handle_request(
         }
         35 => {
             let mode = header.data;
+            debug!(
+                "client {} #{} AllowEvents mode={} frozen_pending={}",
+                client_id.0,
+                sequence.0,
+                mode,
+                lock_server(server)?.frozen_pointer_event.is_some()
+            );
             if mode == 0 || mode == 1 || mode == 2 {
                 let frozen = {
                     let mut s = lock_server(server)?;

@@ -78,15 +78,16 @@ once the underlying patterns are understood.
 
 ## Drawing / rendering artifacts
 
-- [ ] **wmaker icon-edge clamped to 800×600 with larger geometries.**
-      Start ynest with e.g. `--geometry 1200x900`, run wmaker:
-      icons/dock are laid out as if the right edge is at column 800.
-      Windows can be dragged beyond that edge into the actually-empty
-      area to the right, so the X11 root size is correct end-to-end —
-      this is wmaker holding a stale screen-size somewhere. Maybe a
-      RANDR `RRGetScreenInfo` / `RRGetScreenResources` reply path that
-      still reports 800×600 even when the container was created
-      larger. Worth a `xrandr -d :99` check after a startup vs. later.
+- [x] **wmaker icon-edge clamped to 800×600 with larger geometries.**
+      Two stale-screen-size sources fed clients the wrong dimensions
+      regardless of `--geometry` / actual scanout: the connection-setup
+      `Screen` reply hardcoded `width_px=800, height_px=600` (which
+      `DisplayWidth/Height` reads — wmaker icon placement), and
+      `ResourceTable::new()` initialised the root window to 800×600
+      (which `GetGeometry(root)` returns — e16 virtual-desktop layout).
+      Fixed by sourcing both from the requested geometry; mm computed
+      at 96 DPI from the actual pixel size. Verified visually on
+      wmaker, fvwm3, e16.
 - [ ] **Per-client GC mirroring** (Phase 3.7 task #26). The shared
       host GC creates subtle bugs when GC state leaks between clients.
       Phase 3.7's fill-style fix needed careful "reset to Solid after

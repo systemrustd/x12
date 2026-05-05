@@ -78,6 +78,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 event_x: read_i16(&event[24..26]),
                 event_y: read_i16(&event[26..28]),
                 state: read_u16(&event[28..30]),
+                crossing_mode: 0,
             }))
         }
         7 | 8 => {
@@ -86,16 +87,18 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
             } else {
                 PointerEventKind::LeaveNotify
             };
+            // Crossing wire layout: detail at byte 1, mode at byte 30.
             Some(HostEvent::Pointer(HostPointerEvent {
                 kind,
                 host_xid: read_u32(&event[12..16]),
-                detail: 0,
+                detail: event[1],
                 time: read_u32(&event[4..8]),
                 root_x: read_i16(&event[20..22]),
                 root_y: read_i16(&event[22..24]),
                 event_x: read_i16(&event[24..26]),
                 event_y: read_i16(&event[26..28]),
                 state: read_u16(&event[28..30]),
+                crossing_mode: event[30],
             }))
         }
         12 => {
@@ -177,6 +180,9 @@ pub struct HostPointerEvent {
     pub event_x: i16,
     pub event_y: i16,
     pub state: u16,
+    /// X11 crossing mode: 0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab.
+    /// Only meaningful when `kind` is `EnterNotify`/`LeaveNotify`.
+    pub crossing_mode: u8,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -145,6 +145,11 @@ pub struct CrossingEvent {
     pub event_x: i16,
     pub event_y: i16,
     pub state: u16,
+    /// X11 detail: 0=NotifyAncestor, 1=NotifyVirtual, 2=NotifyInferior,
+    /// 3=NotifyNonlinear, 4=NotifyNonlinearVirtual.
+    pub detail: u8,
+    /// X11 mode: 0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab.
+    pub mode: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2549,7 +2554,7 @@ fn encode_crossing_event(
     event: CrossingEvent,
 ) {
     out.push(event_code);
-    out.push(0); // detail = NotifyAncestor
+    out.push(event.detail);
     write_u16(order, out, event.sequence.0);
     write_u32(order, out, event.time);
     write_u32(order, out, event.root.0);
@@ -2560,7 +2565,7 @@ fn encode_crossing_event(
     write_i16(order, out, event.event_x);
     write_i16(order, out, event.event_y);
     write_u16(order, out, event.state);
-    out.push(0); // mode = NotifyNormal
+    out.push(event.mode);
     out.push(0x03); // same_screen + focus
 }
 
@@ -3347,6 +3352,8 @@ mod tests {
                     event_x: 10,
                     event_y: 20,
                     state: 0,
+                    detail: 0,
+                    mode: 0,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -3382,6 +3389,8 @@ mod tests {
                     event_x: 0,
                     event_y: 0,
                     state: 0,
+                    detail: 0,
+                    mode: 0,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -3493,6 +3502,8 @@ mod tests {
                                 event_x,
                                 event_y,
                                 state,
+                                detail: 0,
+                                mode: 0,
                             },
                         );
                     }
@@ -3512,6 +3523,8 @@ mod tests {
                                 event_x,
                                 event_y,
                                 state,
+                                detail: 0,
+                                mode: 0,
                             },
                         );
                     }

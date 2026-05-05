@@ -218,9 +218,14 @@ impl ServerState {
 
     #[must_use]
     pub fn with_geometry(width: u16, height: u16) -> Self {
+        let mut resources = ResourceTable::new();
+        if let Some(root) = resources.window_mut(ROOT_WINDOW) {
+            root.width = width;
+            root.height = height;
+        }
         Self {
             atoms: AtomTable::new(),
-            resources: ResourceTable::new(),
+            resources,
             clients: HashMap::new(),
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
@@ -1370,6 +1375,8 @@ fn pointer_event_fanout_inner(
                     event_x,
                     event_y,
                     state: event.state,
+                    detail: event.detail,
+                    mode: event.crossing_mode,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -1385,6 +1392,8 @@ fn pointer_event_fanout_inner(
                     event_x,
                     event_y,
                     state: event.state,
+                    detail: event.detail,
+                    mode: event.crossing_mode,
                 },
             ),
         }
@@ -1959,6 +1968,7 @@ mod tests {
                 event_x: 10,
                 event_y: 10,
                 state: 0,
+                crossing_mode: 0,
             },
         );
 
@@ -2054,6 +2064,7 @@ mod tests {
                 event_x: 3,
                 event_y: 4,
                 state: 0,
+                crossing_mode: 0,
             },
         );
 
@@ -2160,6 +2171,7 @@ mod tests {
                 event_x: 5,
                 event_y: 5,
                 state: 0x0100,
+                crossing_mode: 0,
             },
         );
 
@@ -2191,6 +2203,7 @@ mod tests {
                 event_x: 5,
                 event_y: 5,
                 state: 0,
+                crossing_mode: 0,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -2242,6 +2255,7 @@ mod tests {
                 event_x: 0,
                 event_y: 0,
                 state: 0,
+                crossing_mode: 0,
             },
         );
 
