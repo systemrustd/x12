@@ -53,8 +53,10 @@ Full implementation:
    - Clear `pointer_grab`, `pointer_grab_is_passive`.
 2. Pass the extracted event to a new `route_button_press_no_grab(event, server, writers)`
    free function that:
-   - Finds the deepest child window under event coords via `pointer_target_at`.
-   - Fans out the ButtonPress to clients with matching event masks.
+   - Performs normal X11 ButtonPress event propagation: start at the deepest window under
+     event coords (`pointer_target_at`), walk up the ancestor chain, deliver to the first
+     window that has `ButtonPressMask` selected, respecting `do_not_propagate_mask` at each
+     step. This matches what `deliver_pointer_event` does for non-grabbed events.
    - Skips passive grab matching entirely (no re-grab loop).
 3. `route_button_press_no_grab` is extracted from / shared with the existing `server.rs`
    ButtonPress delivery path so the logic is not duplicated.
@@ -120,9 +122,10 @@ Full CPxxx attribute support. `PictureState::Drawable` gains new fields for all 
 New `PictureState::Gradient { image: PixmanImage }` variant.
 
 - **LinearGradient**: parse two `PointFixed` (16.16) endpoints + N `(Fixed stop, PictureColor)`
-  pairs → `pixman_image_create_linear_gradient` FFI. Set `Repeat::Normal` by default.
+  pairs → `pixman_image_create_linear_gradient` FFI. Default repeat is `RepeatNone` (0),
+  matching the RENDER spec — clients that want tiling set `CPRepeat` explicitly.
 - **RadialGradient**: parse inner circle `(cx, cy, r)` + outer circle `(cx, cy, r)` + stops
-  → `pixman_image_create_radial_gradient` FFI.
+  → `pixman_image_create_radial_gradient` FFI. Same `RepeatNone` default.
 
 If `pixman-rs` does not expose gradient creation in its safe API (likely), add `unsafe` FFI
 wrappers in the existing pixman module alongside the existing `composite32` /
@@ -181,23 +184,27 @@ via `mirror_shape_to_host`. That method is currently a no-op.
 ```rust
 shape_bounding: HashMap<u32, Vec<RegionRect>>,  // kind=0
 shape_clip:     HashMap<u32, Vec<RegionRect>>,  // kind=1
+shape_input:    HashMap<u32, Vec<RegionRect>>,  // kind=2
 ```
 
 keyed by `host_xid`. `set_shape_rectangles` stores into the appropriate map by `kind`.
-Empty rects → remove entry (restore default rectangular shape).
-`DestroyWindow` / `free_pixmap` also removes entries.
+Empty rects → remove entry (restoring default rectangular shape).
+`DestroyWindow` / `free_pixmap` also removes all three entries.
 
 ### Compositor application
 
 During the KMS scanout / compositing pass, when blitting a window's `PixmanImage` onto the
 framebuffer:
 
-- **Bounding shape (kind=0)**: if present, build a pixman region from the stored `RegionRect`
-  list, set as clip on the destination image before `composite32`, clear after. No bounding
-  shape → full rectangle (unchanged behaviour).
-- **Clip shape (kind=1)**: used by the existing `window_under_cursor` hit-test path, which
-  currently uses the full rectangle. Update to intersect with stored clip shape rects when
-  present.
+- **Bounding shape (kind=0)**: controls what pixels are visible. If present, build a pixman
+  region from the stored `RegionRect` list, set as clip on the destination image before
+  `composite32`, clear after. No bounding shape → full rectangle (unchanged behaviour).
+- **Clip shape (kind=1)**: controls which part of the window's content is exposed to the
+  client's own rendering. No compositor-level change needed; stored for completeness.
+- **Pointer hit-testing** (`window_under_cursor`): use the **input shape** (kind=2) if set;
+  otherwise fall back to the **bounding shape** (kind=0); otherwise use the full rectangle.
+  This is the correct X11 precedence — input shape overrides bounding for pointer events,
+  and both exclude transparent corners from receiving clicks.
 
 ### ShapeNotify
 
