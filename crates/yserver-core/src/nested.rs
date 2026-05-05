@@ -396,6 +396,10 @@ fn emit_x11_error(
     bad_value: u32,
     major_opcode: u8,
 ) -> io::Result<()> {
+    debug!(
+        "emit_x11_error: seq={} code={} bad_value=0x{:x} major_opcode={}",
+        sequence.0, code, bad_value, major_opcode
+    );
     let mut w = writer
         .lock()
         .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
@@ -5134,17 +5138,44 @@ fn handle_request(
                     }
                 }
                 if let Some(cid) = cursor_id {
-                    let (host_window_xid, cursor_host_xid) = {
-                        let s = lock_server(server)?;
-                        let hw = s.resources.window(target_window).and_then(|w| w.host_xid);
-                        let ch = s.resources.cursor_host_xid(cid);
-                        (hw, ch)
+                    // Root has host_xid = None in our resource model
+                    // (the root container isn't a regular window), so
+                    // fall back to the backend's notion of "root host
+                    // xid" via Backend::window_id() when the target is
+                    // root. Without this, root-cursor changes never
+                    // reach the backend, leaving the visible
+                    // wallpaper-area cursor stuck on whatever was
+                    // first defined for some frame edge.
+                    //
+                    // We resolve the root host xid OUTSIDE the
+                    // lock_server scope to avoid acquiring
+                    // host->server while the input pump is acquiring
+                    // server->host (lock-order inversion → deadlock,
+                    // observed as fvwm wedging on its first
+                    // ChangeWindowAttributes(root, CWCursor)).
+                    let host_root_xid = if target_window == ROOT_WINDOW {
+                        host.and_then(|h| h.lock().ok().map(|h| h.window_id()))
+                    } else {
+                        None
                     };
-                    if let (Some(hw), Some(ch)) = (host_window_xid, cursor_host_xid)
+                    let (host_window_raw, cursor_host_xid) = {
+                        let s = lock_server(server)?;
+                        let hw_raw = if target_window == ROOT_WINDOW {
+                            host_root_xid
+                        } else {
+                            s.resources
+                                .window(target_window)
+                                .and_then(|w| w.host_xid)
+                                .map(|w| w.as_raw())
+                        };
+                        let ch = s.resources.cursor_host_xid(cid);
+                        (hw_raw, ch)
+                    };
+                    if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid)
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
-                        let _ = h.define_cursor(origin, hw.as_raw(), ch);
+                        let _ = h.define_cursor(origin, hw, ch);
                     }
                 }
             }
@@ -5527,7 +5558,7 @@ fn handle_request(
                             .clients
                             .get(&client_id.0)
                             .and_then(|c| c.event_masks.get(&parent).copied())
-                            .map_or(false, |m| m & 0x0010_0000 != 0);
+                            .is_some_and(|m| m & 0x0010_0000 != 0);
                         if requester_has {
                             Vec::new()
                         } else {
@@ -5843,7 +5874,7 @@ fn handle_request(
                         .clients
                         .get(&client_id.0)
                         .and_then(|c| c.event_masks.get(&parent).copied())
-                        .map_or(false, |m| m & 0x0010_0000 != 0);
+                        .is_some_and(|m| m & 0x0010_0000 != 0);
                     if requester_has {
                         Vec::new()
                     } else {
@@ -7252,45 +7283,42 @@ fn handle_request(
                     );
                 }
                 // src/dst exist but have no host backing yet — silently drop
-                match (src.as_ref(), dst.as_ref()) {
-                    (Some(src), Some(dst)) => {
-                        if src.depth() != dst.depth() {
-                            return emit_x11_error(
-                                writer,
-                                sequence,
-                                x11::error::BAD_MATCH,
-                                request.dst.0,
-                                62,
-                            );
-                        }
-                        if let Some(host) = host
-                            && let Ok(mut host) = host.lock()
-                        {
-                            let state = draw_state.unwrap_or_default();
-                            host.apply_clip_state(origin, &state.clip)?;
-                            host.apply_draw_state(origin, &state)?;
-                            host.copy_area(
-                                origin,
-                                src.host_xid(),
-                                dst.host_xid(),
-                                request.src_x,
-                                request.src_y,
-                                request.dst_x,
-                                request.dst_y,
-                                request.width,
-                                request.height,
-                            )?;
-                        }
-                        accumulate_damage(
-                            server,
-                            request.dst,
+                if let (Some(src), Some(dst)) = (src.as_ref(), dst.as_ref()) {
+                    if src.depth() != dst.depth() {
+                        return emit_x11_error(
+                            writer,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            request.dst.0,
+                            62,
+                        );
+                    }
+                    if let Some(host) = host
+                        && let Ok(mut host) = host.lock()
+                    {
+                        let state = draw_state.unwrap_or_default();
+                        host.apply_clip_state(origin, &state.clip)?;
+                        host.apply_draw_state(origin, &state)?;
+                        host.copy_area(
+                            origin,
+                            src.host_xid(),
+                            dst.host_xid(),
+                            request.src_x,
+                            request.src_y,
                             request.dst_x,
                             request.dst_y,
                             request.width,
                             request.height,
-                        );
+                        )?;
                     }
-                    _ => {}
+                    accumulate_damage(
+                        server,
+                        request.dst,
+                        request.dst_x,
+                        request.dst_y,
+                        request.width,
+                        request.height,
+                    );
                 }
             }
             log_void(client_id, sequence, "CopyArea")
@@ -8610,7 +8638,7 @@ mod tests {
     #[test]
     fn extension_registry_non_zero_bases_are_unique() {
         let non_zero_event_bases = EXTENSIONS
-            .into_iter()
+            .iter()
             .map(|ext| ext.first_event)
             .filter(|base| *base != 0)
             .collect::<Vec<_>>();
@@ -8620,7 +8648,7 @@ mod tests {
         assert_eq!(sorted.len(), non_zero_event_bases.len());
 
         let non_zero_error_bases = EXTENSIONS
-            .into_iter()
+            .iter()
             .map(|ext| ext.first_error)
             .filter(|base| *base != 0)
             .collect::<Vec<_>>();
@@ -8978,7 +9006,7 @@ mod tests {
             // Composite's dst_x/dst_y which are also shifted by (x_off, y_off).
             let x_off: i16 = 100;
             let y_off: i16 = 50;
-            let mut body = vec![0u8; 16];
+            let mut body = [0u8; 16];
             body[4..6].copy_from_slice(&10i16.to_le_bytes());
             body[6..8].copy_from_slice(&20i16.to_le_bytes());
             let adj_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
@@ -8992,7 +9020,7 @@ mod tests {
             // Pixmap-backed pictures have x_off=y_off=0; clip must pass through unmodified.
             let x_off: i16 = 0;
             let y_off: i16 = 0;
-            let mut body = vec![0u8; 16];
+            let mut body = [0u8; 16];
             body[4..6].copy_from_slice(&(-5i16).to_le_bytes());
             body[6..8].copy_from_slice(&30i16.to_le_bytes());
             let adj_x = i16::from_le_bytes([body[4], body[5]]).wrapping_add(x_off);
@@ -9266,7 +9294,7 @@ mod tests {
             {
                 let s = server.lock().unwrap();
                 let key = (1u32, ResourceId(0x100), AtomId(1));
-                assert!(s.xfixes_selection_masks.get(&key).is_none());
+                assert!(!s.xfixes_selection_masks.contains_key(&key));
             }
         }
 
@@ -9310,9 +9338,8 @@ mod tests {
             {
                 let s = server.lock().unwrap();
                 assert!(
-                    s.xfixes_cursor_masks
-                        .get(&(2u32, ResourceId(0x200)))
-                        .is_none()
+                    !s.xfixes_cursor_masks
+                        .contains_key(&(2u32, ResourceId(0x200)))
                 );
             }
         }

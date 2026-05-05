@@ -17,6 +17,26 @@ pub struct Mode {
 }
 
 pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
+    // Optional override: YSERVER_MODE=WxH (e.g. "1024x768") wins over the
+    // kernel-reported PREFERRED mode. Useful when virtio-gpu's EDID hint
+    // is ignored and the driver advertises 640x480 as preferred. Refresh
+    // is matched best-effort: 60 Hz first, then any rate.
+    if let Ok(spec) = std::env::var("YSERVER_MODE")
+        && let Some((w, h)) = parse_mode_spec(&spec)
+    {
+        if let Some(m) = modes
+            .iter()
+            .find(|m| m.width == w && m.height == h && m.vrefresh == 60)
+        {
+            return Some(m);
+        }
+        if let Some(m) = modes.iter().find(|m| m.width == w && m.height == h) {
+            return Some(m);
+        }
+        log::warn!(
+            "YSERVER_MODE={spec} not advertised by the connector; falling back to preferred mode"
+        );
+    }
     if let Some(m) = modes.iter().find(|m| m.preferred) {
         return Some(m);
     }
@@ -27,6 +47,13 @@ pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
         return Some(m);
     }
     modes.first()
+}
+
+fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
+    let (w, h) = spec.split_once('x')?;
+    let w: u16 = w.trim().parse().ok()?;
+    let h: u16 = h.trim().parse().ok()?;
+    Some((w, h))
 }
 
 fn local_mode_from(m: &DrmMode) -> Mode {

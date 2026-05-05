@@ -106,6 +106,107 @@ once the underlying patterns are understood.
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
 
+## wmaker on KMS
+
+- [x] **Window Maker reparents but never `MapWindow`s its own frame.**
+      Fixed by `911fa38`. `KmsBackend::get_image` was returning raw
+      pixel bytes instead of a complete X11 wire reply, so wmaker's
+      first GetImage during MapRequest handling produced what looked
+      like a malformed error reply (byte 0 = pixel byte ≈ 0 → wmaker
+      treated it as Error). wmaker's catchXError logged "internal X
+      error: 0" and short-circuited the rest of the frame
+      installation, leaving the frame and client unmapped. Fix:
+      prepend the standard 32-byte X11 reply header in
+      `get_image`, matching what `nested.rs:7744` expects (it
+      patches sequence + visual into bytes 2..4 / 8..12 there).
+- [x] **wmaker appicon clipped diagonally.** Fixed by `93742cc`.
+      Root cause was depth-1 PutImage being a no-op, so wmaker's
+      icon shape masks (24×24 ZPixmap d1 via MIT-SHM) never reached
+      our pixmaps. Implementing the depth-1 path (row-wise memcpy —
+      X11 and pixman both use 32-bit-aligned MSB-first scanlines)
+      restored the appicon.
+- [ ] **e16 widget clicks don't activate.** Enlightenment 16 comes
+      up on KMS, the right-click-desktop menu opens, the post-startup
+      "Menu generation complete" dialog renders with an OK button,
+      and the settings menu opens — but clicks on any of those
+      widgets (OK, menu items, settings buttons) don't activate
+      anything. Click delivery does happen (we deliver ButtonPress
+      via e16's passive-grab on `button=AnyButton
+      modifiers=AnyModifier`, e16 calls `AllowEvents` and redraws),
+      but the action behind the widget doesn't fire.
+
+      Likely root cause: e16 uses Sync-mode passive grabs and
+      depends on a particular event-replay sequence (frozen pointer
+      event → AllowEvents(ReplayPointer) → server replays the press
+      to the actual subwindow target). Our `pointer_grab` machinery
+      stores `frozen_pointer_event` when `pointer_mode == 0` (Sync)
+      but doesn't have a full replay path on AllowEvents. e16
+      visually works otherwise — drag, resize, switch workspaces,
+      menu navigation via Alt+arrows function — so xterm under e16
+      is usable, just menu/dialog clicks aren't.
+
+- [ ] **wmaker title-bar close/minimize button glyphs missing.**
+      Same general area as the appicon (CWBackPixmap-driven small
+      icons) but the depth-1 PutImage fix didn't cover it. The
+      buttons render as plain coloured 25×25 squares without their
+      X / − glyphs. Probably a different drawing path — wmaker may
+      be using PolySegment / PolyLine to stroke the glyphs after a
+      ClearArea, and either the glyph strokes are clipped or our
+      drawing primitives don't honour something they need. Cosmetic;
+      drag/move/close-via-menu still work.
+      wmaker comes up on KMS and draws its dock/clip; xterm under
+      wmaker connects, sends MapRequest, gets reparented into a
+      wmaker frame, gets configured to fit, and renders text into
+      its (now-hidden) backing pixmap — but the frame itself is
+      never mapped, so xterm is invisible.
+
+      Trace from client 0 (wmaker) shows the typical sequence:
+      `GrabServer` → frame `CreateWindow` → frame-children
+      `CreateWindow` + `MapWindow` → long restack chain across all
+      existing top-levels → frame `ConfigureWindow` (geometry + border
+      width) → `ReparentWindow` xterm into frame → `ConfigureWindow`
+      xterm to fit. After that point wmaker continues drawing
+      decorations and creating an appicon, but no `MapWindow` is
+      ever sent on the frame xid (0x10051b in the captured run) and
+      no `MapWindow` on xterm's own xid follows the reparent.
+
+      wmaker also logs `internal X error: 0 Request code: 0 DUMMY
+      Request minor code: 2 Resource ID: 0xff000000 Error serial:
+      10172` early — the resource id `0xff000000` doesn't match any
+      xid yserver allocates and `code: 0` isn't a real X11 error
+      code, so wmaker is either mis-parsing one of our replies or
+      reacting to something our error encoder produced with a wrong
+      `code`/`major_opcode`/`bad_value` triple. That error happens
+      well before xterm starts, so it may or may not be related to
+      the missing `MapWindow`.
+
+      fvwm3 (`yserver-fvwm3-xterm` recipe) is fully working;
+      wmaker's flow has different expectations that we don't meet.
+
+      **Diff against ynest (where wmaker+xterm works):** in ynest,
+      wmaker's MapRequest handling continues past frame creation to:
+      ```
+      CreatePixmap 64x64 (appicon)
+      MIT-SHM::PutImage (upload appicon image)
+      MIT-SHM::Detach
+      ChangeSaveSet (on the xterm window)
+      MapWindow frame
+      MapWindow xterm
+      ```
+      In yserver, wmaker stops before any of these — the `ChangeSaveSet`
+      / `MapWindow frame` / `MapWindow xterm` lines are entirely absent
+      from the trace, and the appicon MIT-SHM upload for the new
+      window never happens (MIT-SHM count: ynest 430, yserver 409).
+      Combined with the early `internal X error: 0 ... Error serial:
+      10172` wmaker logs to its catchXError handler, the most likely
+      story is that we're sending wmaker a malformed error reply
+      somewhere during frame setup, and wmaker's XSetErrorHandler
+      branches into a "skip mapping" recovery path. Bisect candidates:
+      the long restack chain (~150 ConfigureWindow with stack_mode +
+      sibling), one of the SHAPE::SelectInput / SHAPE::QueryExtents
+      probes, or a CWCursor / CWBorderPixmap attribute we silently
+      drop in change_subwindow_attributes.
+
 ## KMS backend (Phase 6.4 / 6.5)
 
 Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against

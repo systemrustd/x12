@@ -1644,6 +1644,180 @@ Out of scope (deferred to 6.6+):
 - `line_width` thick lines in `poly_line`.
 - Partial-angle clipping for `poly_arc` / `poly_fill_arc`.
 
+### Phase 6.6 — RENDER completion on KMS (complete)
+
+Goal: implement `CompositeGlyphs` and `Composite` on `KmsBackend` so
+fvwm3 panel text renders on bare DRM/KMS, then smoke-run wmaker/e16
+on bare KMS to close the WM matrix.
+
+#### Landed (branch `phase6.6`)
+
+- **GlyphSet lifecycle (`5204d56 .. fcd17f9`).** Adds `GlyphSetState`
+  (format + glyph map) and `StoredGlyph` (A8 pixel data, metrics) to
+  `KmsBackend`. Implements `render_create_glyphset`, `render_free_glyphset`,
+  and `render_free_glyphs`. Format 2 (A8) is supported; other formats
+  stored as `Other` and silently skipped at render time.
+
+- **`render_add_glyphs` (`724376f .. 0265373`).** Parses the AddGlyphs
+  wire format (num_glyphs, glyph IDs, 12-byte glyph info structs,
+  A8 pixel data with 4-byte-padded rows) and stores glyphs densely.
+  Factored as `parse_add_glyphs` free function for direct unit testing.
+
+- **`render_composite_glyphs` (`e66869c .. ff01dba`).** Processes the
+  CompositeGlyphs item stream (count/dx/dy runs, count-255 sentinel,
+  1/2/4-byte glyph IDs for minor 23/24/25). For each glyph: composite
+  A8 mask × solid-colour source onto dst via pixman `composite32`.
+  Clip regions applied when set. Colour image hoisted out of the inner
+  loop for efficiency. Factored as `composite_glyphs_onto` free function
+  for direct unit testing.
+
+- **`render_composite` (`983b04f .. 1934769`).** Generic Composite
+  operation via `pixman_image_composite32` FFI (same module as
+  `render_trapezoids`). Supports SolidFill and Drawable sources, Drawable
+  destination, optional clip region. Mask compositing not supported (warn
+  + skip). Guards against self-composite (src and dst same drawable)
+  to prevent pixman aliasing UB.
+
+- **Software cursor (`e5edd4a .. f2ee936` + later).** Replaces 16×16
+  white rectangle placeholder with a real ARGB cursor sourced from
+  `RENDER::CreateCursor`. Adds `CursorState { image: PixmanImage, hot_x,
+  hot_y }` and `cursors`/`active_cursor` fields to `KmsBackend`.
+  `render_create_cursor` copies pixel data from the source picture's
+  backing pixmap into a new A8R8G8B8 `PixmanImage`. `define_cursor` sets
+  the global active cursor. `draw_cursor_onto` composites the cursor image
+  at `(cursor_x − hot_x, cursor_y − hot_y)` using `Operation::Over`.
+  No cursor is drawn until `define_cursor` is called. Requires visual
+  smoke test under vng to confirm shape.
+
+#### Tests
+
+27 tests passing in `yserver` lib (up from 21 before Phase 6.6).
+New tests: `add_glyphs_stores_pixel_data_correctly`,
+`composite_glyphs_single_run_places_glyph_on_dst`,
+`composite_glyphs_multi_run_advances_pen`,
+`composite_glyphs_sentinel_does_not_panic`,
+`render_composite_solid_fill_onto_drawable`,
+`render_create_cursor_stores_image_and_hotspot`,
+`draw_cursor_onto_composites_at_hotspot_adjusted_position`.
+
+#### Validation
+
+Headless KMS smoke test (vng + virtio-gpu-pci): yserver started cleanly —
+opened `/dev/dri/card0`, selected `Virtual-1` 1280x800 mode, entered epoll
+event loop, and shut down gracefully on SIGTERM with no panics or crashes.
+
+Visual KMS smoke (vng `--graphics`, fvwm3 + xeyes): FvwmPager desktop
+labels (`0 1 2 3`) and FvwmButtons clock (`19:42 Mon May 04`) rendered
+correctly via `CompositeGlyphs8`. xeyes managed and framed by fvwm3.
+CompositeGlyphs is confirmed working on bare DRM/KMS.
+
+#### Phase 6.6 follow-up session (May 5)
+
+After the initial RENDER completion landed, an extended session
+added structural cleanups and a series of bug fixes that take the
+WM matrix from "fvwm3 visually rendering" to "fvwm3 fully
+interactive + wmaker mostly + e16 mostly":
+
+- **Workspace clippy clean (`0a7994f .. 7c90c6b`).** Added
+  `[workspace.lints.clippy]` allowing `too_many_arguments` (X11
+  protocol encoders inherently have many parameters) and removed
+  remaining warnings via `cargo clippy --fix` plus a few hand-fixes.
+- **Pixman safety (`e63d87a`).** Wrapped the four ad-hoc
+  `pixman::ffi::pixman_image_composite32` / `pixman_composite_trapezoids`
+  unsafe blocks in two `composite32` / `composite_trapezoids` helpers
+  taking `&mut PixmanImage` for dst; marked `PixmanImage::data()` as
+  `unsafe fn` so every raw-pointer use surfaces in `unsafe` blocks
+  with explicit SAFETY comments.
+- **Mutex poison-tolerance + `DrawableGeometry` accessor (`2da0546`).**
+  `lock_recover()` recovers from poison instead of double-panicking;
+  `DrawableGeometry<'_>` consolidates the
+  width/height/stride/data-pointer lookup that put_image and
+  get_image both used (replaces 4 `.unwrap()` sites).
+- **Top-level stacking + `ConfigureWindow` `stack_mode` (`bf39c3e`).**
+  Added `top_level_order: Vec<u32>` so compositor and hit-test walk
+  windows in deterministic stacking order rather than HashMap-iteration
+  order. `restack_window()` honours X11 Above/Below modes.  Fixed
+  fvwm3 popup menus that were non-deterministically hidden behind
+  other top-levels.
+- **`YSERVER_MODE` env-var override for resolution (`99e21d3`).**
+  virtio-gpu's `xres`/`yres` hint is unreliable; `pick_mode()` now
+  honours `YSERVER_MODE=WxH` to force a specific mode from the
+  advertised list.
+- **`event_x` / `event_y` wire-correct (`31d777b`).** Pointer events
+  were sending root-relative cursor coords in the X11 spec's "event
+  window relative" fields, breaking server.rs's descend-into-children
+  logic — the click landed on the top-level instead of the deepest
+  descendant. Fix: subtract the top-level's `(x, y)` from the cursor
+  before populating event_x/event_y. Unblocked fvwm3 pager clicks
+  and decoration buttons.
+- **Held-button mask in `state` field + dedicated input thread
+  (`877a399`).** Pointer event `state` field now includes
+  Button1Mask..Button5Mask bits while the corresponding button is
+  held — without this, motion events during a drag had `state=0x0`
+  and fvwm3's drag detector saw "not actually dragging". Same commit
+  moves libinput dispatch off the main epoll thread so motion events
+  flow continuously instead of in batches gated by per-client X11
+  request handlers holding the backend mutex.
+- **Per-window cursor + root-cursor forwarding (`954fa1e`).**
+  Replaced the global `active_cursor` with per-window cursors that
+  inherit up the parent chain (X11 spec). Resolves the "every window
+  shows the same wrong cursor" symptom. nested.rs forwards root-window
+  CWCursor changes to the backend via `Backend::window_id()` (root
+  has no `host_xid` in resources, so the call previously dropped).
+- **Built-in default X cursor + lock-order fix (`6f7754b`).**
+  `KmsBackend::open()` now installs a 16×16 X-shaped cursor as the
+  fallback, so something is always drawn before any client calls
+  DefineCursor. Also fixed a server→backend / backend→server
+  lock-order inversion in the root-cursor path that wedged fvwm3
+  startup (the input pump acquires backend→server through the
+  event-sink path; the new CWCursor handler was acquiring
+  server→backend inside the same critical section).
+- **GetImage wire-format fix (`911fa38`).**
+  `KmsBackend::get_image` was returning raw pixel bytes instead of
+  a complete X11 wire reply (header + data). nested.rs treats the
+  return value as a full reply and patches sequence/visual into it,
+  so the first byte (a pixel value, often 0) ended up looking like
+  an X11 error to the client. wmaker's `catchXError` then logged
+  "internal X error: 0" and short-circuited frame mapping —
+  preventing xterm under wmaker from ever showing.
+- **Depth-1 PutImage (`93742cc`).** Was a no-op; now a row-wise
+  memcpy (X11 ZPixmap d1 and pixman A1 share scanline conventions).
+  Restored wmaker's appicon (was clipped diagonally) — it uses
+  depth-1 ZPixmaps via MIT-SHM as icon shape masks.
+- **Click-on-desktop falls through to root (`5f8f1f0`).**
+  `window_under_cursor()` returned `None` when the cursor was over
+  the wallpaper, so events were delivered with `host_xid=0` and
+  dropped. Fall back to the root container so right-click-desktop
+  menus reach the WM. Unblocked e16's main menu.
+
+#### WM matrix on bare KMS
+
+| WM    | Status                                                              |
+|-------|---------------------------------------------------------------------|
+| fvwm3 | fully working: pager click, decoration buttons, drag, resize, cursors, panel text, popup menus |
+| wmaker| mostly: dock + appicon render, xterm framed and usable, drag, resize. Title-bar close/minimize button glyphs missing (cosmetic). |
+| e16   | comes up, dock + workspace previews render, right-click menu opens, dialogs render. Widget actions don't fire on click — likely Sync-grab replay semantics not fully implemented. |
+
+Tracked in `docs/known-issues.md` under "wmaker on KMS" and the e16
+section.
+
+Out of scope (deferred to 6.7+):
+
+- Sync-mode passive-grab replay (`AllowEvents(ReplayPointer)`). e16
+  widget clicks block on this.
+- wmaker title-bar close/minimize glyph rendering.
+- `y_off` per-glyph pen advancement (horizontal text only for now).
+- CompositeGlyphs glyphset-switch mid-stream (sentinel switches to
+  a new glyphset; current impl ignores the switch and uses the
+  original glyphset for all glyphs).
+- `CompositeGlyphs` RENDER operator (always composites with `Over`;
+  other ops ignored).
+- Mask compositing in `render_composite`.
+- CompositeGlyphs for formats other than A8 (A1, ARGB32).
+- Real font enumeration / `list_fonts_proxy` populated.
+- Host (GTK) cursor and guest cursor drift / lock.
+- VT_SETMODE / logind / suspend-resume / hotplug polish.
+
 ## Phase 7 — Security hardening
 
 Goal: per-client capabilities, permission prompts or launch-time

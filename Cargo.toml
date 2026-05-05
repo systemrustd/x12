@@ -12,6 +12,12 @@ edition = "2024"
 license = "GPL-3.0-only"
 repository = ""
 
+[workspace.lints.clippy]
+# X11 protocol encoders and request handlers naturally take many
+# parameters (one per wire field). Wrapping them in structs adds churn
+# without aiding readability — the parameter list mirrors the spec.
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 yserver-core = { path = "crates/yserver-core" }
 yserver-protocol = { path = "crates/yserver-protocol" }

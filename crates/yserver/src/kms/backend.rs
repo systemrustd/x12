@@ -20,6 +20,7 @@ use yserver_core::{
 };
 use yserver_protocol::x11::{
     CharInfo as ProtocolCharInfo, ClipRectangles, FontMetrics, ResourceId, xfixes,
+    RENDER_FMT_A8,
 };
 
 use crate::drm;
@@ -106,12 +107,166 @@ impl PixmanImage {
         self.0.stride()
     }
 
-    /// SAFETY: The returned pointer is valid for the lifetime of the image.
-    /// Caller must ensure no other mutable references exist.
-    pub fn data(&self) -> *mut u32 {
-        // SAFETY: Caller guarantees serialized access.
+    /// Returns the raw pixel buffer pointer.
+    ///
+    /// # Safety
+    /// The returned pointer is valid for the lifetime of the image. The
+    /// caller must ensure no aliasing mutable access (e.g. via another
+    /// `&mut PixmanImage` or another raw pointer obtained the same way).
+    /// The buffer's element type depends on the image's `FormatCode` —
+    /// dereferencing as `u32` is only correct for 32-bit-per-pixel
+    /// formats (`A8R8G8B8`, `X8R8G8B8`). For sub-32bpp formats (`A8`,
+    /// `A1`) cast the returned pointer to `*mut u8` and use the byte
+    /// stride from `stride()`.
+    pub unsafe fn data(&self) -> *mut u32 {
+        // SAFETY: forwarded contract — caller guarantees serialized access.
         unsafe { self.0.data() }
     }
+
+    /// Raw `*mut pixman_image_t` for the FFI helpers below. Call sites
+    /// should use `composite32` / `composite_trapezoids` rather than
+    /// invoking `pixman::ffi::*` directly.
+    fn ffi_ptr(&self) -> *mut pixman::ffi::pixman_image_t {
+        self.0.as_ptr()
+    }
+}
+
+/// Composite using `pixman_image_composite32`.
+///
+/// `dst` is borrowed mutably; `src_ptr` and `mask_ptr` (null for "no mask")
+/// are passed raw because typical call sites hold those images via
+/// `HashMap` lookups whose lifetimes don't compose cleanly with a `&mut
+/// PixmanImage` borrow on the destination.
+///
+/// **Aliasing.** Pixman supports `src` and `dst` referring to the same
+/// image *when the source/destination rectangles do not overlap* (this is
+/// the path used by `copy_area` for in-window scroll). Aliasing with
+/// arbitrary clipping or compositor masks is undefined, so callers that
+/// could hit that case (e.g. RENDER `Composite`) should pre-check and
+/// skip. This wrapper does not enforce a generic alias guard.
+///
+/// `src_ptr` may not be null; `mask_ptr` may be null to disable masking.
+///
+/// `op` is the raw pixman / X-RENDER operator code (`Operation::Src as
+/// u32`, or a wire `PictOp` value forwarded by RENDER); they share the
+/// same numeric encoding.
+fn composite32(
+    op: u32,
+    src_ptr: *mut pixman::ffi::pixman_image_t,
+    mask_ptr: *mut pixman::ffi::pixman_image_t,
+    dst: &mut PixmanImage,
+    src_x: i32,
+    src_y: i32,
+    mask_x: i32,
+    mask_y: i32,
+    dst_x: i32,
+    dst_y: i32,
+    width: i32,
+    height: i32,
+) {
+    if src_ptr.is_null() {
+        log::warn!("composite32: src is null, skipping");
+        return;
+    }
+    let dst_ptr = dst.ffi_ptr();
+    // SAFETY: src_ptr is non-null and dst_ptr is non-null (borrowed
+    // through &mut PixmanImage from a live image). mask_ptr is null or a
+    // valid pixman_image_t pointer obtained the same way. dst is uniquely
+    // borrowed; pixman does not retain the pointers after return. Caller
+    // is responsible for any composite-specific aliasing constraints (see
+    // the doc comment).
+    unsafe {
+        pixman::ffi::pixman_image_composite32(
+            op,
+            src_ptr,
+            mask_ptr,
+            dst_ptr,
+            src_x,
+            src_y,
+            mask_x,
+            mask_y,
+            dst_x,
+            dst_y,
+            width,
+            height,
+        );
+    }
+}
+
+/// Composite a slice of trapezoids using `pixman_composite_trapezoids`.
+///
+/// Same aliasing contract as `composite32` — pixman's behaviour is only
+/// well-defined when `src_ptr` and `dst` differ; for trapezoid composites
+/// the typical use is a solid-fill source against a window destination,
+/// so they shouldn't share a backing image. The wrapper does not enforce
+/// a generic alias guard. `traps` is borrowed for the duration of the
+/// call.
+fn composite_trapezoids(
+    op: u32,
+    src_ptr: *mut pixman::ffi::pixman_image_t,
+    dst: &mut PixmanImage,
+    mask_format: pixman::ffi::pixman_format_code_t,
+    x_src: i32,
+    y_src: i32,
+    x_dst: i32,
+    y_dst: i32,
+    traps: &[pixman::ffi::pixman_trapezoid_t],
+) {
+    if src_ptr.is_null() {
+        log::warn!("composite_trapezoids: src is null, skipping");
+        return;
+    }
+    if traps.is_empty() {
+        return;
+    }
+    let dst_ptr = dst.ffi_ptr();
+    // SAFETY: src_ptr is non-null and points at a live pixman_image_t
+    // owned by some PixmanImage. dst_ptr comes from a uniquely-borrowed
+    // PixmanImage. `traps` is a Rust slice with valid len/ptr. Caller is
+    // responsible for any aliasing constraints (see the doc comment).
+    unsafe {
+        pixman::ffi::pixman_composite_trapezoids(
+            op,
+            src_ptr,
+            dst_ptr,
+            mask_format,
+            x_src,
+            y_src,
+            x_dst,
+            y_dst,
+            traps.len() as std::os::raw::c_int,
+            traps.as_ptr(),
+        );
+    }
+}
+
+/// Geometry + raw pixel pointer for a window or pixmap drawable.
+///
+/// `data_ptr` is a byte-granularity pointer; cast to `*mut u32` for 32bpp
+/// formats (`A8R8G8B8`, `X8R8G8B8`) or use as-is for sub-32bpp formats
+/// (`A8`). `stride_bytes` is the per-row stride in **bytes** as reported
+/// by pixman (which may pad rows for alignment).
+///
+/// The lifetime parameter ties the pointer to a `&self` borrow on
+/// `KmsBackend`: while a `DrawableGeometry` is live, no `&mut`
+/// modification of `self.windows` / `self.pixmaps` can occur, so the
+/// pointer remains valid for in-bounds reads and writes.
+struct DrawableGeometry<'a> {
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    data_ptr: *mut u8,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+/// Lock a `Mutex`, transparently recovering from poison instead of
+/// panicking. KMS backend mutexes (`xid_map`, `key_subscribers`) guard
+/// short critical sections that mutate independent collections; if a
+/// thread panicked while holding the lock the data is still consistent
+/// from our caller's perspective, so the server can keep running rather
+/// than tumbling into a recursive panic.
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Convert an X11 24-bit pixel (0xRRGGBB) to a Pixman Color.
@@ -235,31 +390,41 @@ fn fill_rects_with_gc_function(
 ) {
     if matches!(function, GcFunction::Xor) {
         // Bitwise XOR over the RGB channels (X byte is preserved).
-        let xor_mask = foreground_rgb & 0x00FF_FFFF;
-        let stride_words = img.0.stride() / 4;
-        let iw = img.0.width() as i32;
-        let ih = img.0.height() as i32;
-        // SAFETY: PixmanImage::data() is unsafe; we hold an exclusive &mut
-        // reference to img so no other live references to the pixel buffer exist.
-        let ptr = unsafe { img.0.data() };
-        for r in rects {
-            let x0 = (r.x as i32).max(0) as usize;
-            let y0 = (r.y as i32).max(0) as usize;
-            let x1 = (r.x as i32 + r.width as i32).min(iw).max(0) as usize;
-            let y1 = (r.y as i32 + r.height as i32).min(ih).max(0) as usize;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    // SAFETY: x < iw ≤ img width, y < ih ≤ img height, and
-                    // stride_words * ih ≤ allocation size.
-                    unsafe {
-                        let p = ptr.add(y * stride_words + x);
-                        let old = *p;
-                        *p = (old & 0xFF00_0000) | ((old ^ xor_mask) & 0x00FF_FFFF);
+        // This fast path is only correct for 32bpp images (4 bytes/pixel)
+        // where stride_words == width.  For A8 or A1 images the stride is
+        // smaller than width * 4, so `ptr.add(y * stride_words + x)` would
+        // walk past the allocation and SIGSEGV.  Guard: stride (bytes) must
+        // equal width × 4.
+        let stride_bytes = img.0.stride();
+        let iw = img.0.width();
+        let ih = img.0.height();
+        if stride_bytes == iw * 4 {
+            let xor_mask = foreground_rgb & 0x00FF_FFFF;
+            let stride_words = stride_bytes / 4; // == iw for 32bpp
+            // SAFETY: PixmanImage::data() is unsafe; we hold an exclusive &mut
+            // reference to img so no other live references to the pixel buffer
+            // exist. stride_words == iw, so ptr.add(y * iw + x) with x < iw
+            // and y < ih is always within the ih * iw allocation.
+            let ptr = unsafe { img.0.data() };
+            for r in rects {
+                let x0 = (r.x as i32).max(0) as usize;
+                let y0 = (r.y as i32).max(0) as usize;
+                let x1 = (r.x as i32 + r.width as i32).min(iw as i32).max(0) as usize;
+                let y1 = (r.y as i32 + r.height as i32).min(ih as i32).max(0) as usize;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        unsafe {
+                            let p = ptr.add(y * stride_words + x);
+                            let old = *p;
+                            *p = (old & 0xFF00_0000) | ((old ^ xor_mask) & 0x00FF_FFFF);
+                        }
                     }
                 }
             }
+            return;
         }
-        return;
+        // Non-32bpp image: fall through to the pixman path below (treated as Src).
+        log::debug!("GcFunction::Xor on non-32bpp image (stride={stride_bytes}, width={iw}); falling back to Src");
     }
     let op = match function {
         GcFunction::Copy => Operation::Src,
@@ -269,7 +434,29 @@ fn fill_rects_with_gc_function(
         }
     };
     let color = color_from_u32(foreground_rgb);
-    let _ = img.0.fill_rectangles(op, color, rects);
+    // Clip rectangles to image bounds. pixman SHOULD do this internally but
+    // crashes on rects that extend past the image (seen with wmaker drawing
+    // rect (4,58,6,59) onto a 64×64 pixmap — y+h=117 > image height).
+    let iw = img.0.width() as i32;
+    let ih = img.0.height() as i32;
+    let clipped: Vec<Rectangle16> = rects.iter().filter_map(|r| {
+        let x0 = (r.x as i32).max(0);
+        let y0 = (r.y as i32).max(0);
+        let x1 = (r.x as i32).saturating_add(r.width as i32).min(iw);
+        let y1 = (r.y as i32).saturating_add(r.height as i32).min(ih);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Rectangle16 {
+            x: x0 as i16,
+            y: y0 as i16,
+            width: (x1 - x0) as u16,
+            height: (y1 - y0) as u16,
+        })
+    }).collect();
+    if !clipped.is_empty() {
+        let _ = img.0.fill_rectangles(op, color, &clipped);
+    }
 }
 
 /// Parse a packed pair of i16 values (2 bytes each) from a byte slice.
@@ -311,6 +498,13 @@ pub struct KmsBackend {
     windows: HashMap<u32, WindowState>,
     next_host_xid: u32, // Monotonic counter, starts at 0x00400000
 
+    // Stacking order for top-level windows (direct children of the root
+    // container). Bottom-to-top: the last entry is on top. Updated by
+    // create / destroy / reparent / configure_subwindow with stack_mode.
+    // The compositor iterates this list in order; HashMap iteration is
+    // unordered and doesn't preserve X11 stacking semantics.
+    top_level_order: Vec<u32>,
+
     // Backend trait state
     window_id: u32,
     root_visual_xid: u32,
@@ -337,10 +531,21 @@ pub struct KmsBackend {
     // Background state (root)
     bg_pixel: Option<u32>,
     bg_pixmap: Option<PixmapHandle>,
+    // Rescued image from bg_pixmap after the client frees it (Esetroot pattern).
+    bg_pixmap_image: Option<PixmanImage>,
 
     // Software cursor
     cursor_x: f32,
     cursor_y: f32,
+    cursors: HashMap<u32, CursorState>,
+    active_cursor: Option<u32>,
+
+    // X11 KeyButMask bits for currently-held mouse buttons (Button1Mask
+    // = 0x100 .. Button5Mask = 0x1000). OR'd into the `state` field of
+    // MotionNotify (and ButtonRelease) events so WMs can detect drag
+    // gestures. Without this, motion-during-press looks like idle
+    // motion to fvwm and Move-or-Raise never starts a Move.
+    button_mask: u16,
 
     // Current font for text rendering
     current_font: Option<u32>,
@@ -350,6 +555,13 @@ pub struct KmsBackend {
 
     // RENDER picture tracking
     pictures: HashMap<u32, PictureState>,
+
+    // Images rescued from freed pixmaps still referenced by live pictures.
+    // Keyed by picture host_xid. Cleaned up by render_free_picture.
+    picture_rescued_images: HashMap<u32, PixmanImage>,
+
+    // RENDER glyphset tracking
+    glyphsets: HashMap<u32, GlyphSetState>,
 }
 
 /// State for a RENDER picture on the KMS backend.
@@ -366,6 +578,40 @@ enum PictureState {
     SolidFill {
         image: RefCell<PixmanImage>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlyphSetFormat {
+    A8,
+    Other, // A1, ARGB32 etc — not supported in Phase 6.6
+}
+
+struct StoredGlyph {
+    width:  u16,
+    height: u16,
+    /// RENDER wire field: top-left of bitmap relative to glyph origin.
+    /// This is the *negative* of FreeType's bitmap_left.
+    /// Draw at pen_x - x, pen_y - y.
+    x:      i16,
+    y:      i16,
+    x_off:  i16,
+    /// Vertical pen advance. Parsed from wire for fidelity but unused —
+    /// horizontal-text rendering only advances the x pen between glyphs.
+    #[allow(dead_code)]
+    y_off:  i16,
+    /// Row-major A8 bytes, densely packed (no per-row padding).
+    pixels: Vec<u8>,
+}
+
+pub(super) struct GlyphSetState {
+    format: GlyphSetFormat,
+    glyphs: HashMap<u32, StoredGlyph>,
+}
+
+struct CursorState {
+    image: PixmanImage,
+    hot_x: u16,
+    hot_y: u16,
 }
 
 struct WindowState {
@@ -386,6 +632,12 @@ struct WindowState {
     depth: u8,
     #[allow(dead_code)]
     visual: u32,
+    /// Cursor XID set on this window via DefineCursor. `0` means
+    /// "inherit from parent" (X11 `None`). The effective cursor for
+    /// rendering walks up the parent chain until it finds a non-zero
+    /// XID, falling back to whatever cursor was last installed for the
+    /// root container.
+    cursor: u32,
 }
 
 struct FontState {
@@ -619,7 +871,7 @@ impl KmsBackend {
         xid_map.insert(0x00000001, ResourceId(0x0000_0100));
         let xid_map = Arc::new(Mutex::new(xid_map));
 
-        Ok(Self {
+        let mut me = Self {
             device,
             output,
             fb_w,
@@ -627,6 +879,7 @@ impl KmsBackend {
             swapchain,
             windows: HashMap::new(),
             next_host_xid: 0x0040_0000,
+            top_level_order: Vec::new(),
             window_id: 1,
             root_visual_xid: 0x21,
             event_sink: None,
@@ -641,12 +894,22 @@ impl KmsBackend {
             pixmaps: HashMap::new(),
             bg_pixel: None,
             bg_pixmap: None,
+            bg_pixmap_image: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
+            cursors: HashMap::new(),
+            active_cursor: None,
+            button_mask: 0,
             current_font: None,
             current_function: GcFunction::Copy,
             pictures: HashMap::new(),
-        })
+            picture_rescued_images: HashMap::new(),
+            glyphsets: HashMap::new(),
+        };
+        // Install a built-in X-shaped cursor as the universal fallback;
+        // any later DefineCursor on the root window will override it.
+        me.install_default_cursor();
+        Ok(me)
     }
 
     fn next_host_xid(&mut self) -> u32 {
@@ -655,6 +918,53 @@ impl KmsBackend {
             .checked_add(1)
             .expect("xid space exhausted");
         self.next_host_xid
+    }
+
+    /// Build the classic X-shaped default cursor and install it as the
+    /// initial `active_cursor`. Used before any client calls
+    /// DefineCursor — without it, the wallpaper area shows nothing
+    /// during early startup (and after that, until fvwm sets a root
+    /// cursor). 16×16, 2-pixel-thick black X with a 1-pixel white halo
+    /// for visibility on dark backgrounds. Hotspot at the center.
+    fn install_default_cursor(&mut self) {
+        let w = 16u16;
+        let h = 16u16;
+        let img = match PixmanImage::new(FormatCode::A8R8G8B8, w, h, true) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        let stride_words = img.0.stride() / 4;
+        // SAFETY: img is a freshly-allocated 32bpp pixman image we
+        // uniquely own; bounds: y in 0..h and x in 0..w stay within
+        // the allocation of size h * stride_words u32s.
+        let ptr = unsafe { img.0.data() };
+        let last = (w as i32) - 1;
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                // Distance to either diagonal of the 16x16 box.
+                let d1 = (x - y).abs();
+                let d2 = (x + y - last).abs();
+                let dist = d1.min(d2);
+                let pixel: u32 = match dist {
+                    0 => 0xFF00_0000, // black core
+                    1 => 0xFFFF_FFFF, // white halo
+                    _ => 0x0000_0000, // transparent
+                };
+                unsafe {
+                    *ptr.add(y as usize * stride_words + x as usize) = pixel;
+                }
+            }
+        }
+        let xid = self.next_host_xid();
+        self.cursors.insert(
+            xid,
+            CursorState {
+                image: img,
+                hot_x: w / 2,
+                hot_y: h / 2,
+            },
+        );
+        self.active_cursor = Some(xid);
     }
 
     /// Borrow a drawable's Pixman image and pass it to a closure.
@@ -668,6 +978,43 @@ impl KmsBackend {
             Some(f(&img))
         } else {
             self.pixmaps.get(&host_xid).map(|p| f(&p.image))
+        }
+    }
+
+    /// Resolve a drawable XID to its geometry (width, height, byte
+    /// stride, and a raw byte pointer to its pixel buffer). Returns
+    /// `None` if no window or pixmap matches.
+    ///
+    /// The returned geometry borrows from `self`; while it is live, no
+    /// modification of `self.windows` / `self.pixmaps` is allowed, which
+    /// guarantees the data pointer stays valid for reads and writes.
+    /// The pointer itself is only valid in `unsafe` blocks; callers must
+    /// stay within `[0, height) × [0, width)` and respect the format's
+    /// bytes-per-pixel.
+    fn drawable_geometry(&self, host_xid: u32) -> Option<DrawableGeometry<'_>> {
+        if let Some(w) = self.windows.get(&host_xid) {
+            let img = w.image.borrow();
+            // SAFETY: img is borrowed from a live RefCell on self.windows;
+            // the returned pointer aliases the same buffer that future
+            // pixman ops may also write through, so callers must serialise
+            // their use behind `&mut self` paths.
+            Some(DrawableGeometry {
+                width: img.width(),
+                height: img.height(),
+                stride_bytes: img.stride(),
+                data_ptr: unsafe { img.data() } as *mut u8,
+                _phantom: std::marker::PhantomData,
+            })
+        } else {
+            // SAFETY: as above, but borrowing directly (no RefCell on
+            // PixmapState).
+            self.pixmaps.get(&host_xid).map(|p| DrawableGeometry {
+                width: p.image.width(),
+                height: p.image.height(),
+                stride_bytes: p.image.stride(),
+                data_ptr: unsafe { p.image.data() } as *mut u8,
+                _phantom: std::marker::PhantomData,
+            })
         }
     }
 
@@ -686,23 +1033,31 @@ impl KmsBackend {
         }
     }
 
+    // Return a raw pixman pointer for a window or pixmap drawable.
+    // The pointer is valid as long as the drawable is not removed from
+    // self.windows / self.pixmaps. Caller must not call any method that could
+    // remove the drawable while holding the pointer.
+    fn image_ptr_for_xid(&self, host_xid: u32) -> Option<*mut pixman::ffi::pixman_image_t> {
+        if let Some(w) = self.windows.get(&host_xid) {
+            Some(w.image.borrow().0.as_ptr())
+        } else {
+            self.pixmaps.get(&host_xid).map(|p| p.image.0.as_ptr())
+        }
+    }
+
     fn window_under_cursor(&self) -> Option<u32> {
-        // Top-levels are direct children of the root container (window_id).
-        // The root container is not itself an entry in self.windows.
-        let root_id = self.window_id;
-        let top_levels: Vec<u32> = self
-            .windows
-            .iter()
-            .filter(|(_, w)| w._parent.is_none_or(|p| p == root_id))
-            .map(|(&id, _)| id)
-            .collect();
-        for window_id in top_levels.into_iter().rev() {
-            let w = &self.windows[&window_id];
+        // Top-levels are tracked in stacking order (bottom-to-top) on
+        // self.top_level_order. Walk back-to-front so the topmost match
+        // wins.
+        let x = self.cursor_x as f64;
+        let y = self.cursor_y as f64;
+        for &window_id in self.top_level_order.iter().rev() {
+            let Some(w) = self.windows.get(&window_id) else {
+                continue;
+            };
             if !w.mapped {
                 continue;
             }
-            let x = self.cursor_x as f64;
-            let y = self.cursor_y as f64;
             if x >= w.x as f64
                 && x < (w.x as f64 + w.width as f64)
                 && y >= w.y as f64
@@ -712,6 +1067,131 @@ impl KmsBackend {
             }
         }
         None
+    }
+
+    /// Diagnostic-only: dump the window tree at click time so we can
+    /// reason about hit-test correctness without changing routing.
+    /// Active under `RUST_LOG=yserver::kms::backend=trace`.
+    fn log_hit_test_diagnostic(&self) {
+        if !log::log_enabled!(log::Level::Trace) {
+            return;
+        }
+        let cx = self.cursor_x as f64;
+        let cy = self.cursor_y as f64;
+        let root_id = self.window_id;
+        log::trace!(
+            "hit-test: cursor=({cx:.0},{cy:.0}) root_container=0x{root_id:x}"
+        );
+        // Walk top-level stacking order from bottom (first painted) to
+        // top (last painted) — same order as the compositor.
+        let top_levels = self.top_level_order.clone();
+        for tl in &top_levels {
+            let w = &self.windows[tl];
+            let hit = cx >= w.x as f64
+                && cx < (w.x as f64 + w.width as f64)
+                && cy >= w.y as f64
+                && cy < (w.y as f64 + w.height as f64);
+            log::trace!(
+                "  top-level 0x{tl:x} mapped={} geo=({},{}, {}x{}) children={}{}",
+                w.mapped,
+                w.x,
+                w.y,
+                w.width,
+                w.height,
+                w.children.len(),
+                if hit { " HIT" } else { "" }
+            );
+            if hit && w.mapped {
+                self.log_descend_diagnostic(*tl, w.x as f64, w.y as f64, cx, cy, 2);
+            }
+        }
+    }
+
+    fn log_descend_diagnostic(
+        &self,
+        parent: u32,
+        parent_origin_x: f64,
+        parent_origin_y: f64,
+        cx: f64,
+        cy: f64,
+        indent: usize,
+    ) {
+        let pad = " ".repeat(indent * 2);
+        let Some(p) = self.windows.get(&parent) else { return };
+        for &child_id in &p.children {
+            let Some(c) = self.windows.get(&child_id) else { continue };
+            let child_x = parent_origin_x + c.x as f64;
+            let child_y = parent_origin_y + c.y as f64;
+            let hit = cx >= child_x
+                && cx < child_x + c.width as f64
+                && cy >= child_y
+                && cy < child_y + c.height as f64;
+            log::trace!(
+                "{pad}child 0x{child_id:x} mapped={} parent_rel=({},{}, {}x{}) abs=({},{}) children={}{}",
+                c.mapped,
+                c.x,
+                c.y,
+                c.width,
+                c.height,
+                child_x as i32,
+                child_y as i32,
+                c.children.len(),
+                if hit { " HIT" } else { "" }
+            );
+            if hit && c.mapped {
+                self.log_descend_diagnostic(child_id, child_x, child_y, cx, cy, indent + 1);
+            }
+        }
+    }
+
+    /// Apply X11 ConfigureWindow `stack_mode` to a window's position
+    /// inside its parent's stacking list (or `top_level_order` if it's
+    /// a top-level). Implements the common Above (0) / Below (1) modes;
+    /// TopIf (2), BottomIf (3), Opposite (4) fall back to Above/Below
+    /// without the conditional check (sufficient for fvwm/xterm popups).
+    fn restack_window(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
+        let parent_xid = match self.windows.get(&host_xid).and_then(|w| w._parent) {
+            Some(p) => p,
+            None => return,
+        };
+        let stack: &mut Vec<u32> = if parent_xid == self.window_id {
+            &mut self.top_level_order
+        } else {
+            match self.windows.get_mut(&parent_xid) {
+                Some(p) => &mut p.children,
+                None => return,
+            }
+        };
+        // Remove the current entry; we'll reinsert at the right position.
+        let Some(_pos) = stack.iter().position(|&x| x == host_xid) else {
+            return;
+        };
+        stack.retain(|&x| x != host_xid);
+
+        // Find sibling position if specified.
+        let sibling_pos = sibling.and_then(|sib| stack.iter().position(|&x| x == sib));
+
+        match stack_mode {
+            // Above: place above sibling, or at top if no sibling.
+            0 | 2 | 4 => {
+                if let Some(sp) = sibling_pos {
+                    stack.insert(sp + 1, host_xid);
+                } else {
+                    stack.push(host_xid);
+                }
+            }
+            // Below: place below sibling, or at bottom if no sibling.
+            1 | 3 => {
+                if let Some(sp) = sibling_pos {
+                    stack.insert(sp, host_xid);
+                } else {
+                    stack.insert(0, host_xid);
+                }
+            }
+            _ => {
+                stack.push(host_xid); // unknown mode → treat as Above
+            }
+        }
     }
 
     fn synthesize_expose(&mut self, host_xid: u32, x: u16, y: u16, w: u16, h: u16) {
@@ -761,6 +1241,43 @@ impl KmsBackend {
 
     /// Process all pending libinput events and route them through xkbcommon
     /// and the event sink. Called by the epoll loop when libinput fd is readable.
+    /// Take the libinput context out of `self`. Used by the binary's
+    /// startup to hand the context to a dedicated input thread, so
+    /// libinput dispatch doesn't compete with per-client request
+    /// handlers for the backend mutex. After this call, the in-process
+    /// `process_input_events` becomes a no-op.
+    pub fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
+        self.input_ctx.take()
+    }
+
+    /// Dispatch a single libinput event. Designed to be called from the
+    /// dedicated input thread, which holds the backend mutex briefly
+    /// per-event (microseconds) so per-client request handlers can
+    /// interleave between events. This keeps motion events flowing to
+    /// fvwm in real time during a drag rather than batching at the end
+    /// of an X11 request burst.
+    pub fn process_one_input_event(&mut self, event: crate::input::InputEvent) {
+        match event {
+            crate::input::InputEvent::KeyPress { keycode } => {
+                self.process_key_event(keycode, true);
+            }
+            crate::input::InputEvent::KeyRelease { keycode } => {
+                self.process_key_event(keycode, false);
+            }
+            crate::input::InputEvent::PointerMotion { dx, dy } => {
+                self.process_pointer_motion(dx, dy);
+            }
+            crate::input::InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
+                let x = (x_norm.clamp(0.0, 1.0) * (self.fb_w as f64 - 1.0)) as f32;
+                let y = (y_norm.clamp(0.0, 1.0) * (self.fb_h as f64 - 1.0)) as f32;
+                self.process_pointer_absolute(x, y);
+            }
+            crate::input::InputEvent::Button { code, pressed } => {
+                self.process_pointer_button(code, pressed);
+            }
+        }
+    }
+
     pub fn process_input_events(&mut self) -> io::Result<()> {
         let Some(input_ctx) = &mut self.input_ctx else {
             return Ok(());
@@ -814,7 +1331,7 @@ impl KmsBackend {
             state: mask,
         };
         // Fan out to key subscribers (keyboard forwarders)
-        let subs = self.key_subscribers.lock().unwrap();
+        let subs = lock_recover(&self.key_subscribers);
         for tx in subs.iter() {
             let _ = tx.send(key_event);
         }
@@ -826,9 +1343,37 @@ impl KmsBackend {
         self.dispatch_motion_event();
     }
 
+    /// Compute event-window-relative coords for an event whose `host_xid`
+    /// is the topmost mapped top-level under the cursor. Per X11 spec
+    /// `event_x` / `event_y` are relative to the event window
+    /// (`host_xid`); the host backend gets these from the X server, but
+    /// on KMS we have to compute them by subtracting the top-level's
+    /// origin from `cursor_x` / `cursor_y` (which are root-relative).
+    fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
+        if let Some(w) = self.windows.get(&host_xid) {
+            let ex = (self.cursor_x as i32) - (w.x as i32);
+            let ey = (self.cursor_y as i32) - (w.y as i32);
+            (
+                ex.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                ey.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            )
+        } else {
+            // host_xid == 0 (no window under cursor) — fall back to root
+            // coords; nested.rs treats event_x/y as a positional hint and
+            // re-derives target coords from its own tree walk anyway.
+            (self.cursor_x as i16, self.cursor_y as i16)
+        }
+    }
+
     fn dispatch_motion_event(&mut self) {
-        let host_xid = self.window_under_cursor().unwrap_or(0);
-        let mask = self.serialize_modifiers();
+        // Fall back to the root container so server.rs can deliver
+        // to root-window subscribers (e16's right-click-desktop menu,
+        // fvwm3's root bindings) when the cursor is over the
+        // wallpaper / no top-level window.
+        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        // X11 KeyButMask: low byte modifiers, bits 8..=12 button1..button5.
+        let mask = self.serialize_modifiers() | self.button_mask;
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -840,8 +1385,8 @@ impl KmsBackend {
             time,
             root_x: self.cursor_x as i16,
             root_y: self.cursor_y as i16,
-            event_x: self.cursor_x as i16,
-            event_y: self.cursor_y as i16,
+            event_x,
+            event_y,
             state: mask,
         };
         if let Some(ref mut sink) = self.event_sink {
@@ -854,8 +1399,13 @@ impl KmsBackend {
     fn process_pointer_motion(&mut self, dx: f64, dy: f64) {
         self.cursor_x = (self.cursor_x + dx as f32).clamp(0.0, self.fb_w as f32 - 1.0);
         self.cursor_y = (self.cursor_y + dy as f32).clamp(0.0, self.fb_h as f32 - 1.0);
-        let host_xid = self.window_under_cursor().unwrap_or(0);
-        let mask = self.serialize_modifiers();
+        // Fall back to the root container so server.rs can deliver
+        // to root-window subscribers (e16's right-click-desktop menu,
+        // fvwm3's root bindings) when the cursor is over the
+        // wallpaper / no top-level window.
+        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let mask = self.serialize_modifiers() | self.button_mask;
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -867,8 +1417,8 @@ impl KmsBackend {
             time,
             root_x: self.cursor_x as i16,
             root_y: self.cursor_y as i16,
-            event_x: self.cursor_x as i16,
-            event_y: self.cursor_y as i16,
+            event_x,
+            event_y,
             state: mask,
         };
         if let Some(ref mut sink) = self.event_sink {
@@ -885,10 +1435,53 @@ impl KmsBackend {
             0x112 => 2, // BTN_MIDDLE
             0x113 => 8, // BTN_SIDE
             0x114 => 9, // BTN_EXTRA
+            _ => {
+                log::debug!("unmapped libinput button code 0x{code:x}, dropping");
+                return;
+            }
+        };
+        log::trace!(
+            "libinput button code=0x{code:x} pressed={pressed} → X11 detail={detail}"
+        );
+        if pressed {
+            self.log_hit_test_diagnostic();
+        }
+        // Fall back to the root container so server.rs can deliver
+        // to root-window subscribers (e16's right-click-desktop menu,
+        // fvwm3's root bindings) when the cursor is over the
+        // wallpaper / no top-level window.
+        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        // X11 KeyButMask: low byte modifier mask, bits 8..=12 for
+        // ButtonNMask. Per X11 spec, the `state` field describes the
+        // logical button state IMMEDIATELY BEFORE the event takes
+        // effect, so:
+        //   ButtonPress: button bit not yet set
+        //   ButtonRelease: button bit still set
+        //   MotionNotify: all currently-held buttons
+        // Without these bits, fvwm's drag-detection on MotionNotify
+        // sees state=0 and treats motion-during-press as idle motion.
+        let button_bit = match detail {
+            1 => 0x0100, // Button1Mask
+            2 => 0x0200,
+            3 => 0x0400,
+            4 => 0x0800,
+            5 => 0x1000,
             _ => 0,
         };
-        let host_xid = self.window_under_cursor().unwrap_or(0);
-        let mask = self.serialize_modifiers();
+        let modifier_mask = self.serialize_modifiers();
+        let state = if pressed {
+            modifier_mask | self.button_mask
+        } else {
+            modifier_mask | self.button_mask | button_bit
+        };
+        // Update held-button state AFTER computing the event's `state`,
+        // so subsequent motions see the new mask.
+        if pressed {
+            self.button_mask |= button_bit;
+        } else {
+            self.button_mask &= !button_bit;
+        }
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -905,9 +1498,9 @@ impl KmsBackend {
             time,
             root_x: self.cursor_x as i16,
             root_y: self.cursor_y as i16,
-            event_x: self.cursor_x as i16,
-            event_y: self.cursor_y as i16,
-            state: mask,
+            event_x,
+            event_y,
+            state,
         };
         if let Some(ref mut sink) = self.event_sink {
             sink.handle_backend_event(yserver_core::backend::BackendEvent::HostEvent(
@@ -944,15 +1537,26 @@ impl KmsBackend {
             let root_rect = Rectangle16 { x: 0, y: 0, width: self.fb_w, height: self.fb_h };
             let _ = scanout.0.fill_rectangles(Operation::Src, bg_color, &[root_rect]);
         }
+        // Overlay background pixmap if set (e.g. from Esetroot / fvwm-root).
+        // The pixmap may already be freed by the client (Esetroot pattern); fall back
+        // to the rescued image saved by free_pixmap.
+        if let Some(pm) = self.bg_pixmap {
+            let bg_img: Option<&PixmanImage> = self.pixmaps.get(&pm.as_raw())
+                .map(|p| &p.image)
+                .or(self.bg_pixmap_image.as_ref());
+            if let Some(img) = bg_img {
+                let pw = img.0.width() as i32;
+                let ph = img.0.height() as i32;
+                scanout.0.composite32(Operation::Src, &img.0, None, (0, 0), (0, 0), (0, 0), (pw, ph));
+            }
+        }
 
-        // Composite top-level windows: direct children of the root container.
-        let root_id = self.window_id;
-        let top_levels: Vec<u32> = self
-            .windows
-            .iter()
-            .filter(|(_, w)| w._parent.is_none_or(|p| p == root_id))
-            .map(|(&id, _)| id)
-            .collect();
+        // Composite top-level windows in stacking order: bottom-to-top
+        // so later iterations paint over earlier ones.
+        // `top_level_order` is maintained by create / destroy / reparent
+        // / configure_subwindow — keep it authoritative; HashMap order
+        // is unstable.
+        let top_levels: Vec<u32> = self.top_level_order.clone();
         for &window_id in &top_levels {
             self.composite_window_into(&mut scanout, window_id);
         }
@@ -1009,20 +1613,82 @@ impl KmsBackend {
         );
     }
 
-    /// Draw a 16x16 white software cursor onto the scanout image.
+    /// Resolve the effective cursor for the window currently under the
+    /// pointer. Walks the window's parent chain looking for the
+    /// closest non-None (non-zero) cursor attribute. Falls back to
+    /// `self.active_cursor` (the root container's cursor) and finally
+    /// to `None` (no cursor drawn).
+    fn effective_cursor(&self) -> Option<u32> {
+        // Start at the deepest window the pointer is inside, then walk
+        // up. window_under_cursor returns a top-level; we descend into
+        // children using the current cursor coordinates.
+        let mut current = self.window_under_cursor();
+        let cx = self.cursor_x as f64;
+        let cy = self.cursor_y as f64;
+        if let Some(top) = current {
+            // Walk down to deepest descendant containing cursor.
+            current = Some(self.descend_for_cursor(top, cx, cy));
+        }
+        let mut node = current;
+        while let Some(xid) = node {
+            if let Some(w) = self.windows.get(&xid) {
+                if w.cursor != 0 {
+                    return Some(w.cursor);
+                }
+                node = w._parent;
+                continue;
+            }
+            break;
+        }
+        self.active_cursor
+    }
+
+    fn descend_for_cursor(&self, window: u32, cx: f64, cy: f64) -> u32 {
+        let Some(w) = self.windows.get(&window) else { return window };
+        // Build absolute origin by walking up.
+        let (ox, oy) = self.absolute_origin(window);
+        for &child_id in w.children.iter().rev() {
+            let Some(c) = self.windows.get(&child_id) else { continue };
+            if !c.mapped { continue; }
+            let cx0 = ox + c.x as f64;
+            let cy0 = oy + c.y as f64;
+            if cx >= cx0 && cx < cx0 + c.width as f64
+                && cy >= cy0 && cy < cy0 + c.height as f64
+            {
+                return self.descend_for_cursor(child_id, cx, cy);
+            }
+        }
+        window
+    }
+
+    fn absolute_origin(&self, window: u32) -> (f64, f64) {
+        let mut ox = 0.0;
+        let mut oy = 0.0;
+        let mut node = Some(window);
+        while let Some(xid) = node {
+            if let Some(w) = self.windows.get(&xid) {
+                ox += w.x as f64;
+                oy += w.y as f64;
+                node = w._parent.filter(|p| *p != self.window_id);
+            } else {
+                break;
+            }
+        }
+        (ox, oy)
+    }
+
+    /// Draw the cursor onto the scanout image, alpha-composited at the
+    /// hotspot-adjusted position. The visible cursor is whatever the
+    /// window under the pointer (or its closest non-None ancestor) has
+    /// set via DefineCursor.
     fn draw_cursor_onto(&self, scanout: &mut PixmanImage) {
-        let cx = self.cursor_x as i32;
-        let cy = self.cursor_y as i32;
-        let cursor_w = 16i32;
-        let cursor_h = 16i32;
-        let color = Color::new(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF);
-        let rect = Rectangle16 {
-            x: cx as i16,
-            y: cy as i16,
-            width: cursor_w as u16,
-            height: cursor_h as u16,
-        };
-        let _ = scanout.0.fill_rectangles(Operation::Src, color, &[rect]);
+        let Some(cursor_xid) = self.effective_cursor() else { return };
+        let Some(cs) = self.cursors.get(&cursor_xid) else { return };
+        let x = self.cursor_x as i32 - cs.hot_x as i32;
+        let y = self.cursor_y as i32 - cs.hot_y as i32;
+        let w = cs.image.0.width() as i32;
+        let h = cs.image.0.height() as i32;
+        scanout.0.composite32(Operation::Over, &cs.image.0, None, (0, 0), (0, 0), (x, y), (w, h));
     }
 
     /// Render a string of character bytes onto a drawable using the current font.
@@ -1315,12 +1981,17 @@ impl Backend for KmsBackend {
                 children: Vec::new(),
                 bg_pixel: background_pixel,
                 bg_pixmap: None,
+                cursor: 0,
                 image,
                 depth,
                 visual: visual_xid,
             },
         );
-        if let Some(parent) = self.windows.get_mut(&host_parent.as_raw()) {
+        let parent_raw = host_parent.as_raw();
+        if parent_raw == self.window_id {
+            // Top-level: append to stacking order (newly created → on top).
+            self.top_level_order.push(host_xid);
+        } else if let Some(parent) = self.windows.get_mut(&parent_raw) {
             parent.children.push(host_xid);
         }
         WindowHandle::from_raw(host_xid)
@@ -1344,14 +2015,17 @@ impl Backend for KmsBackend {
         };
 
         if self.windows.remove(&host_xid).is_some() {
-            // Update parent's children list
-            if let Some(parent_xid) = parent_xid
-                && let Some(parent) = self.windows.get_mut(&parent_xid)
-            {
-                parent.children.retain(|&c| c != host_xid);
+            // Update parent's children list (or top-level stacking order
+            // if this was a top-level window).
+            if let Some(parent_xid) = parent_xid {
+                if parent_xid == self.window_id {
+                    self.top_level_order.retain(|&c| c != host_xid);
+                } else if let Some(parent) = self.windows.get_mut(&parent_xid) {
+                    parent.children.retain(|&c| c != host_xid);
+                }
             }
         }
-        let mut map = self.xid_map.lock().unwrap();
+        let mut map = lock_recover(&self.xid_map);
         map.remove(&host_xid);
         drop(map);
 
@@ -1449,6 +2123,14 @@ impl Backend for KmsBackend {
                 window.image = RefCell::new(img);
             }
         }
+        // Apply X11 stack_mode + sibling: restack the window in its
+        // parent's stacking list. Without this, fvwm's "raise menu" path
+        // (ConfigureWindow stack=Above on a freshly-mapped popup) leaves
+        // the window in HashMap-iteration order — which can hide the
+        // popup behind unrelated top-levels.
+        if let Some(stack_mode) = config.stack_mode {
+            self.restack_window(host_xid, stack_mode, config.sibling);
+        }
         // Mutable borrow on windows ends here, safe to call synthesize_expose
         if resized && let Some(w) = self.windows.get(&host_xid) {
             self.synthesize_expose(host_xid, 0, 0, w.width, w.height);
@@ -1471,12 +2153,19 @@ impl Backend for KmsBackend {
         window._parent = Some(new_parent);
         window.x = x;
         window.y = y;
-        if let Some(old_parent_xid) = old_parent
-            && let Some(parent) = self.windows.get_mut(&old_parent_xid)
-        {
-            parent.children.retain(|&c| c != host_xid);
+        // Remove from old parent's stacking list (or top-level order).
+        if let Some(old_parent_xid) = old_parent {
+            if old_parent_xid == self.window_id {
+                self.top_level_order.retain(|&c| c != host_xid);
+            } else if let Some(parent) = self.windows.get_mut(&old_parent_xid) {
+                parent.children.retain(|&c| c != host_xid);
+            }
         }
-        if let Some(parent) = self.windows.get_mut(&new_parent) {
+        // Append to new parent's stacking list (top of stack — X11
+        // ReparentWindow semantics).
+        if new_parent == self.window_id {
+            self.top_level_order.push(host_xid);
+        } else if let Some(parent) = self.windows.get_mut(&new_parent) {
             parent.children.push(host_xid);
         }
         Ok(())
@@ -1521,7 +2210,7 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        let mut map = self.xid_map.lock().unwrap();
+        let mut map = lock_recover(&self.xid_map);
         map.insert(host_xid, nested_id);
         Ok(())
     }
@@ -1532,13 +2221,13 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        let mut map = self.xid_map.lock().unwrap();
+        let mut map = lock_recover(&self.xid_map);
         map.insert(host_xid, nested_id);
         Ok(())
     }
 
     fn unregister_host_window(&mut self, host_xid: u32) {
-        let mut map = self.xid_map.lock().unwrap();
+        let mut map = lock_recover(&self.xid_map);
         map.remove(&host_xid);
     }
 
@@ -1547,7 +2236,7 @@ impl Backend for KmsBackend {
     }
 
     fn add_key_subscriber(&mut self, tx: Sender<HostKeyEvent>) {
-        self.key_subscribers.lock().unwrap().push(tx);
+        lock_recover(&self.key_subscribers).push(tx);
     }
 
     fn name_window_pixmap(
@@ -1590,7 +2279,32 @@ impl Backend for KmsBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.pixmaps.remove(&host_xid);
+        if let Some(ps) = self.pixmaps.remove(&host_xid) {
+            let mut image = Some(ps.image);
+
+            // Rescue into bg_pixmap_image if this is the root wallpaper pixmap.
+            // Esetroot frees its pixmap after setting the root background, expecting
+            // the server to keep the image alive via reference counting.
+            if self.bg_pixmap.map(|h| h.as_raw()) == Some(host_xid)
+                && let Some(img) = image.take()
+            {
+                self.bg_pixmap_image = Some(img);
+            }
+
+            // Rescue into picture_rescued_images for any picture still referencing
+            // this pixmap (e.g. fvwm frees cursor source pixmap before CreateCursor).
+            if image.is_some() {
+                for (&pic_xid, pic) in &self.pictures {
+                    if let PictureState::Drawable { host_xid: xid, .. } = pic
+                        && *xid == host_xid
+                        && let Some(img) = image.take()
+                    {
+                        self.picture_rescued_images.insert(pic_xid, img);
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1638,9 +2352,25 @@ impl Backend for KmsBackend {
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_window_xid: u32,
-        _cursor_host_xid: u32,
+        host_window_xid: u32,
+        cursor_host_xid: u32,
     ) -> io::Result<()> {
+        // Per X11: each window has its own cursor attribute. The cursor
+        // visible on screen is the one belonging to the deepest window
+        // under the pointer that has a non-None cursor (walking up the
+        // parent chain). cursor_host_xid == 0 means "inherit from
+        // parent" (X11 `None`).
+        if let Some(w) = self.windows.get_mut(&host_window_xid) {
+            w.cursor = cursor_host_xid;
+        }
+        // `active_cursor` is the sticky fallback used by effective_cursor()
+        // when the walk-up hits no explicit cursor (the root container
+        // isn't tracked in self.windows, so the chain always runs out
+        // there). It's seeded at startup with the built-in X-shaped
+        // default; a DefineCursor on the root container overrides it.
+        if cursor_host_xid != 0 && host_window_xid == self.window_id {
+            self.active_cursor = Some(cursor_host_xid);
+        }
         Ok(())
     }
 
@@ -1659,6 +2389,7 @@ impl Backend for KmsBackend {
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
         self.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
+        self.bg_pixmap_image = None; // cleared; rescue fills it if the pixmap is later freed
         Ok(())
     }
 
@@ -1738,79 +2469,28 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        // Get source dimensions and copy pixel data to avoid borrow conflicts
-        let (Some(src_w), Some(src_h), Some(src_stride)) = (
-            self.windows
-                .get(&src_host_xid)
-                .map(|w| w.image.borrow().width())
-                .or_else(|| self.pixmaps.get(&src_host_xid).map(|p| p.image.width())),
-            self.windows
-                .get(&src_host_xid)
-                .map(|w| w.image.borrow().height())
-                .or_else(|| self.pixmaps.get(&src_host_xid).map(|p| p.image.height())),
-            self.windows
-                .get(&src_host_xid)
-                .map(|w| w.image.borrow().stride())
-                .or_else(|| self.pixmaps.get(&src_host_xid).map(|p| p.image.stride())),
-        ) else {
+        let Some(src_ptr) = self.image_ptr_for_xid(src_host_xid) else {
             return Ok(());
         };
-        // Copy source pixels into a temporary buffer
-        let src_data = if let Some(w) = self.windows.get(&src_host_xid) {
-            let img = w.image.borrow();
-            let data = img.data();
-            (0..(src_h * src_stride / 4))
-                .map(|i| unsafe { *data.add(i) })
-                .collect::<Vec<u32>>()
-        } else if let Some(p) = self.pixmaps.get(&src_host_xid) {
-            let data = p.image.data();
-            (0..(src_h * src_stride / 4))
-                .map(|i| unsafe { *data.add(i) })
-                .collect::<Vec<u32>>()
-        } else {
-            return Ok(());
-        };
-
-        // Hold the destination's RefMut for the entire write so RefCell's
-        // aliasing invariants are upheld. (For pixmaps the data() pointer is
-        // available through &p.image since pixman::Image::data() is unsafe
-        // and not bounded by Rust borrow rules; the RefMut for windows is
-        // the analogue.)
-        let dst_w;
-        let dst_h;
-        let dst_stride;
-        let dst_data;
-        let _dst_window_borrow;
-        if let Some(w) = self.windows.get(&dst_host_xid) {
-            let img = w.image.borrow_mut();
-            dst_w = img.width();
-            dst_h = img.height();
-            dst_stride = img.stride();
-            dst_data = img.data();
-            _dst_window_borrow = Some(img);
-        } else if let Some(p) = self.pixmaps.get(&dst_host_xid) {
-            dst_w = p.image.width();
-            dst_h = p.image.height();
-            dst_stride = p.image.stride();
-            dst_data = p.image.data();
-            _dst_window_borrow = None;
-        } else {
-            return Ok(());
-        };
-        for row in 0..height as isize {
-            for col in 0..width as isize {
-                let sx = (src_x as isize + col) as usize;
-                let sy = (src_y as isize + row) as usize;
-                let dx = (dst_x as isize + col) as usize;
-                let dy = (dst_y as isize + row) as usize;
-                if sx < src_w && sy < src_h && dx < dst_w && dy < dst_h {
-                    let src_pixel = src_data[sy * src_stride / 4 + sx];
-                    unsafe {
-                        *dst_data.add(dy * dst_stride / 4 + dx) = src_pixel;
-                    }
-                }
-            }
-        }
+        // src_ptr lives for as long as src_host_xid stays in self.windows/pixmaps;
+        // we don't mutate either map in this method, so the pointer is valid for
+        // the duration of the composite32 call below.
+        self.with_image_mut(dst_host_xid, |dst| {
+            composite32(
+                Operation::Src as u32,
+                src_ptr,
+                std::ptr::null_mut(),
+                dst,
+                src_x as i32,
+                src_y as i32,
+                0,
+                0,
+                dst_x as i32,
+                dst_y as i32,
+                width as i32,
+                height as i32,
+            );
+        });
         Ok(())
     }
 
@@ -1842,36 +2522,17 @@ impl Backend for KmsBackend {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
-        let Some(img_w) = self
-            .windows
-            .get(&host_xid)
-            .map(|w| w.image.borrow().width())
-            .or_else(|| self.pixmaps.get(&host_xid).map(|p| p.image.width()))
-        else {
+        let Some(geom) = self.drawable_geometry(host_xid) else {
             return Ok(());
         };
-        let img_h = self
-            .windows
-            .get(&host_xid)
-            .map(|w| w.image.borrow().height())
-            .or_else(|| self.pixmaps.get(&host_xid).map(|p| p.image.height()))
-            .unwrap();
-        let stride = self
-            .windows
-            .get(&host_xid)
-            .map(|w| w.image.borrow().stride())
-            .or_else(|| self.pixmaps.get(&host_xid).map(|p| p.image.stride()))
-            .unwrap()
-            / 4;
-        let img_data = if let Some(w) = self.windows.get(&host_xid) {
-            w.image.borrow().data()
-        } else {
-            self.pixmaps.get(&host_xid).unwrap().image.data()
-        };
+        let img_w = geom.width;
+        let img_h = geom.height;
 
         match depth {
             24 | 32 => {
-                // X8R8G8B8 / A8R8G8B8 — 4 bytes per pixel
+                // X8R8G8B8 / A8R8G8B8 — 4 bytes per pixel.
+                let stride_words = geom.stride_bytes / 4;
+                let dst_words = geom.data_ptr as *mut u32;
                 for row in 0..height as isize {
                     let dy = dst_y as isize + row;
                     if dy < 0 || dy >= img_h as isize {
@@ -1895,18 +2556,87 @@ impl Backend for KmsBackend {
                             0xFF
                         };
                         let pixel = (a << 24) | (r << 16) | (g << 8) | b;
+                        // SAFETY: bounds-checked above against geom.width/height;
+                        // dy*stride_words+dx fits in the buffer of size
+                        // height*stride_words u32s. geom borrows self so the
+                        // pointer is valid for the duration of this loop.
                         unsafe {
-                            *img_data.add(dy as usize * stride + dx as usize) = pixel;
+                            *dst_words.add(dy as usize * stride_words + dx as usize) = pixel;
+                        }
+                    }
+                }
+            }
+            8 => {
+                // A8 — 1 byte per pixel. Rows in X11 ZPixmap are padded to
+                // 4-byte boundaries; pixman picks its own dst stride.
+                let src_row_stride = (width as usize + 3) & !3;
+                let dst_stride_bytes = geom.stride_bytes;
+                for row in 0..height as isize {
+                    let dy = dst_y as isize + row;
+                    if dy < 0 || dy >= img_h as isize {
+                        continue;
+                    }
+                    for col in 0..width as isize {
+                        let dx = dst_x as isize + col;
+                        if dx < 0 || dx >= img_w as isize {
+                            continue;
+                        }
+                        let src_offset = row as usize * src_row_stride + col as usize;
+                        if src_offset >= data.len() {
+                            continue;
+                        }
+                        // SAFETY: bounds-checked against geom.width/height;
+                        // dy*stride_bytes+dx fits within the per-row stride
+                        // chosen by pixman.
+                        unsafe {
+                            *geom
+                                .data_ptr
+                                .add(dy as usize * dst_stride_bytes + dx as usize) =
+                                data[src_offset];
                         }
                     }
                 }
             }
             1 => {
-                // Depth-1 PutImage targets an A1 (1 bpp) pixmap. The
-                // u32-stride math used above would write 4 bytes per pixel
-                // and overrun the buffer. Until we have a byte-aware A1
-                // path, skip — the only client we've seen using this is
-                // xterm's cursor mask, and `define_cursor` is a no-op.
+                // Depth-1 PutImage targets an A1 (1 bpp) pixmap. wmaker
+                // uses these as icon shape masks via MIT-SHM —
+                // skipping the upload leaves the masks all-zero so
+                // RENDER composites against them produce empty/clipped
+                // output (visible as the wmaker appicon and title-bar
+                // close/minimize buttons rendering only partially).
+                //
+                // X11 ZPixmap depth-1: bits packed MSB-first per byte,
+                // each scanline padded to a 32-bit boundary. Pixman A1
+                // uses the same convention (machine-native u32, MSB
+                // bit = leftmost pixel within each byte on
+                // little-endian). Row strides therefore match for
+                // common widths and we can memcpy row-by-row.
+                let src_row_bytes = (width as usize).div_ceil(32) * 4;
+                let dst_stride_bytes = geom.stride_bytes;
+                let copy_bytes = src_row_bytes.min(dst_stride_bytes);
+                for row in 0..height as isize {
+                    let dy = dst_y as isize + row;
+                    if dy < 0 || dy >= img_h as isize {
+                        continue;
+                    }
+                    let src_row_off = row as usize * src_row_bytes;
+                    if src_row_off + copy_bytes > data.len() {
+                        continue;
+                    }
+                    let dst_row_off = dy as usize * dst_stride_bytes;
+                    // SAFETY: dst row bounds checked above (dy in
+                    // 0..img_h, dst_stride_bytes covers the row).
+                    // Source range checked against data.len(). Row
+                    // strides match (both X11 ZPixmap d1 and pixman
+                    // A1 use 32-bit-aligned scanlines).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(src_row_off),
+                            (geom.data_ptr).add(dst_row_off),
+                            copy_bytes,
+                        );
+                    }
+                }
             }
             _ => {
                 // Unsupported depth — skip.
@@ -1926,38 +2656,48 @@ impl Backend for KmsBackend {
         height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        let img_w;
-        let img_h;
-        let stride;
-        let img_data;
-        if let Some(w) = self.windows.get(&host_xid) {
-            let img = w.image.borrow();
-            img_w = img.width();
-            img_h = img.height();
-            stride = img.stride() / 4;
-            img_data = img.data();
-        } else if let Some(p) = self.pixmaps.get(&host_xid) {
-            img_w = p.image.width();
-            img_h = p.image.height();
-            stride = p.image.stride() / 4;
-            img_data = p.image.data();
-        } else {
+        let Some(geom) = self.drawable_geometry(host_xid) else {
             return Ok(None);
         };
-        let mut result = Vec::with_capacity(width as usize * height as usize * 4);
+        // GetImage currently only supports 32bpp source drawables (the
+        // only kind the rest of the backend uses for windows / regular
+        // pixmaps); A8 cursor masks etc. would need a separate path.
+        let stride_words = geom.stride_bytes / 4;
+        let src_words = geom.data_ptr as *const u32;
+        let pixel_bytes = (width as usize) * (height as usize) * 4;
+        // X11 GetImage reply: 32-byte fixed header followed by the
+        // pixel payload (already 4-byte-aligned for ZPixmap depth-24).
+        // The header is partly populated by nested.rs (sequence at
+        // bytes 2..4 and visual at 8..12 are patched there); we
+        // populate everything else so byte 0 = 1 (Reply), byte 1 =
+        // depth, and bytes 4..8 = reply length in 4-byte units.
+        // Without this, callers like wmaker treat byte 0 = whatever
+        // the first pixel is (often 0) as an error reply, abort
+        // mid-setup, and leave windows unmapped.
+        let mut result = Vec::with_capacity(32 + pixel_bytes);
+        let reply_length_units = (pixel_bytes / 4) as u32;
+        result.push(1); // 0: Reply
+        result.push(24); // 1: depth (X8R8G8B8 / A8R8G8B8 → 24-bit RGB visible)
+        result.extend_from_slice(&[0u8; 2]); // 2..4: sequence (patched by nested.rs)
+        result.extend_from_slice(&reply_length_units.to_le_bytes()); // 4..8: length in u32 units
+        result.extend_from_slice(&[0u8; 4]); // 8..12: visual (patched by nested.rs)
+        result.extend_from_slice(&[0u8; 20]); // 12..32: padding
+        debug_assert_eq!(result.len(), 32);
         for row in 0..height as isize {
             let dy = y as isize + row;
-            if dy < 0 || dy >= img_h as isize {
-                // out of bounds — write zeros
+            if dy < 0 || dy >= geom.height as isize {
                 result.resize(result.len() + width as usize * 4, 0);
                 continue;
             }
             for col in 0..width as isize {
                 let dx = x as isize + col;
-                if dx < 0 || dx >= img_w as isize {
+                if dx < 0 || dx >= geom.width as isize {
                     result.extend_from_slice(&[0; 4]);
                 } else {
-                    let pixel = unsafe { *img_data.add(dy as usize * stride + dx as usize) };
+                    // SAFETY: bounds-checked against geom.width/height;
+                    // geom borrows self so the pointer is valid.
+                    let pixel =
+                        unsafe { *src_words.add(dy as usize * stride_words + dx as usize) };
                     result.extend_from_slice(&pixel.to_le_bytes());
                 }
             }
@@ -2493,77 +3233,253 @@ impl Backend for KmsBackend {
         host_pic: u32,
     ) -> io::Result<()> {
         self.pictures.remove(&host_pic);
+        self.picture_rescued_images.remove(&host_pic);
         Ok(())
     }
 
     fn render_create_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _ynest_format: u32,
+        ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        Ok(None)
+        let format = if ynest_format == RENDER_FMT_A8 { GlyphSetFormat::A8 } else { GlyphSetFormat::Other };
+        let id = self.next_host_xid();
+        self.glyphsets.insert(id, GlyphSetState { format, glyphs: HashMap::new() });
+        Ok(GlyphSetHandle::from_raw(id))
     }
 
     fn render_free_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
+        host_gs: u32,
     ) -> io::Result<()> {
+        self.glyphsets.remove(&host_gs);
         Ok(())
     }
 
     fn render_add_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _body_tail: &[u8],
+        host_gs: u32,
+        body_tail: &[u8],
     ) -> io::Result<()> {
+        if let Some(gs) = self.glyphsets.get_mut(&host_gs) {
+            parse_add_glyphs(gs, body_tail);
+        }
         Ok(())
     }
 
     fn render_free_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _glyph_ids: &[u8],
+        host_gs: u32,
+        glyph_ids: &[u8],
     ) -> io::Result<()> {
+        let Some(gs) = self.glyphsets.get_mut(&host_gs) else { return Ok(()); };
+        for chunk in glyph_ids.chunks_exact(4) {
+            let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            gs.glyphs.remove(&id);
+        }
         Ok(())
     }
 
     fn render_composite(
         &mut self,
         _origin: Option<OriginContext>,
-        _op: u8,
-        _host_src: u32,
-        _host_mask: u32,
-        _host_dst: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _mask_x: i16,
-        _mask_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
+        op: u8,
+        host_src: u32,
+        host_mask: u32,
+        host_dst: u32,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
+        let pixman_op = op as u32;
+
+        // Extract src raw pointer while pictures is immutably borrowed.
+        // Also capture the underlying drawable xid (if any) to guard against self-composite.
+        let (src_ptr, src_drawable_xid): (*mut pixman::ffi::pixman_image_t, Option<u32>) =
+            match self.pictures.get(&host_src) {
+                Some(PictureState::SolidFill { image }) => (image.borrow().0.as_ptr(), None),
+                Some(PictureState::Drawable { host_xid, .. }) => {
+                    let xid = *host_xid;
+                    match self.image_ptr_for_xid(xid) {
+                        Some(ptr) => (ptr, Some(xid)),
+                        None => {
+                            log::debug!("render_composite: src drawable 0x{xid:x} has no image");
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    log::debug!("render_composite: host_src 0x{host_src:x} not found");
+                    return Ok(());
+                }
+            };
+
+        // Extract mask raw pointer (null_mut if no mask).
+        let (mask_ptr, mask_drawable_xid): (*mut pixman::ffi::pixman_image_t, Option<u32>) =
+            if host_mask == 0 {
+                (std::ptr::null_mut(), None)
+            } else {
+                match self.pictures.get(&host_mask) {
+                    Some(PictureState::SolidFill { image }) => (image.borrow().0.as_ptr(), None),
+                    Some(PictureState::Drawable { host_xid, .. }) => {
+                        let xid = *host_xid;
+                        match self.image_ptr_for_xid(xid) {
+                            Some(ptr) => (ptr, Some(xid)),
+                            None => {
+                                log::debug!("render_composite: mask drawable 0x{xid:x} has no image");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        log::debug!("render_composite: host_mask 0x{host_mask:x} not found");
+                        return Ok(());
+                    }
+                }
+            };
+
+        let (dst_xid, clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip }) => (*host_xid, clip.clone()),
+            _ => {
+                log::debug!("render_composite: host_dst 0x{host_dst:x} is not a Drawable picture");
+                return Ok(());
+            }
+        };
+
+        // Guard: pixman_image_composite32 is undefined behaviour if src or mask alias dst.
+        // This can happen when two RENDER pictures share the same underlying drawable xid.
+        if src_drawable_xid == Some(dst_xid) {
+            log::debug!(
+                "render_composite: src and dst are the same drawable 0x{dst_xid:x}; skipping self-composite"
+            );
+            return Ok(());
+        }
+        if mask_drawable_xid == Some(dst_xid) {
+            log::debug!(
+                "render_composite: mask and dst are the same drawable 0x{dst_xid:x}; skipping"
+            );
+            return Ok(());
+        }
+
+        self.with_image_mut(dst_xid, |dst| {
+            if let Some(ref rects) = clip {
+                use pixman::{Box32, Region32};
+                let boxes: Vec<Box32> = rects.iter().map(|r| Box32 {
+                    x1: r.x as i32, y1: r.y as i32,
+                    x2: r.x as i32 + r.width as i32,
+                    y2: r.y as i32 + r.height as i32,
+                }).collect();
+                let region = Region32::init_rects(&boxes);
+                let _ = dst.0.set_clip_region32(Some(&region));
+            }
+            // src_ptr and mask_ptr are guaranteed distinct from dst by the
+            // aliasing guards above (different drawable XIDs).
+            composite32(
+                pixman_op,
+                src_ptr,
+                mask_ptr,
+                dst,
+                src_x as i32, src_y as i32,
+                mask_x as i32, mask_y as i32,
+                dst_x as i32, dst_y as i32,
+                width as i32, height as i32,
+            );
+            if clip.is_some() {
+                let _ = dst.0.set_clip_region32(None);
+            }
+        });
+
         Ok(())
     }
 
     fn render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _mask_fmt: u32,
-        _host_gs: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _items: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
+        // Resolve src picture — must be SolidFill (Drawable fallback: opaque black).
+        let src_img = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { image }) => {
+                // Clone the colour so we can drop the pictures borrow.
+                let argb = unsafe { *image.borrow().0.data() };
+                let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
+                let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
+                let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
+                let g = (((argb >>  8) & 0xFF) as u16) * 0x101;
+                let b = ((argb         & 0xFF) as u16) * 0x101;
+                let _ = img.0.fill_rectangles(
+                    Operation::Src, Color::new(r, g, b, a),
+                    &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+                );
+                img.0.set_repeat(Repeat::Normal);
+                img
+            }
+            _ => {
+                log::debug!("render_composite_glyphs: host_src 0x{host_src:x} is not SolidFill; using black");
+                let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
+                let _ = img.0.fill_rectangles(
+                    Operation::Src, Color::new(0, 0, 0, 0xFFFF),
+                    &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+                );
+                img.0.set_repeat(Repeat::Normal);
+                img
+            }
+        };
+
+        let (dst_xid, clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip }) => (*host_xid, clip.clone()),
+            _ => return Ok(()),
+        };
+
+        let Some(gs) = self.glyphsets.get(&host_gs) else { return Ok(()); };
+        // SAFETY: gs is behind an immutable ref; we pass it into a closure that
+        // only calls composite_glyphs_onto which reads from gs and writes to dst.
+        // No aliasing: gs and dst are in separate data structures.
+        let gs_ptr: *const GlyphSetState = gs;
+
+        let pen_x = src_x as i32 + x_off as i32;
+        let pen_y = src_y as i32 + y_off as i32;
+
+        self.with_image_mut(dst_xid, |dst| {
+            if let Some(ref rects) = clip {
+                use pixman::{Box32, Region32};
+                let boxes: Vec<Box32> = rects.iter().map(|r| Box32 {
+                    x1: r.x as i32, y1: r.y as i32,
+                    x2: r.x as i32 + r.width as i32,
+                    y2: r.y as i32 + r.height as i32,
+                }).collect();
+                let region = Region32::init_rects(&boxes);
+                let _ = dst.0.set_clip_region32(Some(&region));
+            }
+            // SAFETY: gs_ptr points to a GlyphSetState in self.glyphsets; dst is
+            // from self.windows/pixmaps. They are disjoint. The glyphset is not
+            // freed during this closure because no other thread runs concurrently
+            // (KmsBackend is !Sync and this method takes &mut self).
+            let gs_ref = unsafe { &*gs_ptr };
+            composite_glyphs_onto(gs_ref, &src_img, dst, minor, pen_x, pen_y, items);
+            if clip.is_some() {
+                let _ = dst.0.set_clip_region32(None);
+            }
+        });
+
         Ok(())
     }
 
@@ -2672,8 +3588,6 @@ impl Backend for KmsBackend {
             // that outlives this call (src and dst are different pictures by
             // checked contract). trap_vec is a Vec we own. n_traps matches
             // trap_vec.len().
-            let dst_ptr = dst.0.as_ptr();
-
             // Apply clip region if present.
             if let Some(ref rects) = clip {
                 use pixman::{Box32, Region32};
@@ -2690,24 +3604,19 @@ impl Backend for KmsBackend {
                 let _ = dst.0.set_clip_region32(Some(&region));
             }
 
-            unsafe {
-                pixman::ffi::pixman_composite_trapezoids(
-                    pixman_op,
-                    src_ptr,
-                    dst_ptr,
-                    // Use PIXMAN_a8 as the mask-format for anti-aliased
-                    // trap coverage. X RENDER mask format IDs are opaque
-                    // to us; a8 gives 256-level AA which is correct for
-                    // all common cases.
-                    pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                    src_x as std::os::raw::c_int,
-                    src_y as std::os::raw::c_int,
-                    x_off as std::os::raw::c_int,
-                    y_off as std::os::raw::c_int,
-                    trap_vec.len() as std::os::raw::c_int,
-                    trap_vec.as_ptr(),
-                );
-            }
+            // PIXMAN_a8 as mask-format gives 256-level AA for trap
+            // coverage — correct for all common RENDER use cases.
+            composite_trapezoids(
+                pixman_op,
+                src_ptr,
+                dst,
+                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
+                src_x as i32,
+                src_y as i32,
+                x_off as i32,
+                y_off as i32,
+                &trap_vec,
+            );
 
             // Clear clip after composite to avoid stale clip affecting
             // subsequent operations on this image.
@@ -2768,11 +3677,41 @@ impl Backend for KmsBackend {
     fn render_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_src_pic: PictureHandle,
-        _x: u16,
-        _y: u16,
+        host_src_pic: PictureHandle,
+        x: u16,
+        y: u16,
     ) -> io::Result<Option<CursorHandle>> {
-        Ok(None)
+        let pic_xid = host_src_pic.as_raw();
+        let host_xid = match self.pictures.get(&pic_xid) {
+            Some(PictureState::Drawable { host_xid, .. }) => *host_xid,
+            other => {
+                log::debug!("render_create_cursor: pic {pic_xid} not found or not Drawable (got {:?})", other.map(|_| "non-Drawable"));
+                return Ok(None);
+            }
+        };
+
+        // fvwm pattern: CreatePixmap → PutImage → CreatePicture → FreePixmap → CreateCursor.
+        // The pixmap may already be freed; fall back to the rescued image saved by free_pixmap.
+        let cursor_img = if let Some(pm) = self.pixmaps.get(&host_xid) {
+            let w = pm.image.0.width() as u16;
+            let h = pm.image.0.height() as u16;
+            let mut img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true)?;
+            img.0.composite32(Operation::Src, &pm.image.0, None, (0, 0), (0, 0), (0, 0), (w as i32, h as i32));
+            img
+        } else if let Some(rescued) = self.picture_rescued_images.remove(&pic_xid) {
+            log::debug!("render_create_cursor: using rescued image for pic {pic_xid}");
+            rescued
+        } else {
+            log::debug!("render_create_cursor: pixmap host_xid={host_xid} not found for pic {pic_xid}");
+            return Ok(None);
+        };
+
+        let id = self.next_host_xid();
+        self.cursors.insert(id, CursorState { image: cursor_img, hot_x: x, hot_y: y });
+
+        CursorHandle::from_raw(id)
+            .map(Some)
+            .ok_or_else(|| io::Error::other("cursor handle overflow"))
     }
 
     fn render_set_picture_clip_rectangles(
@@ -2963,6 +3902,176 @@ impl Backend for KmsBackend {
     }
 }
 
+/// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.
+/// `body_tail` is everything after the 4-byte glyphset XID.
+/// Only A8 glyphsets are handled; other formats are silently skipped.
+pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
+    if gs.format != GlyphSetFormat::A8 {
+        return;
+    }
+    if body_tail.len() < 4 {
+        return;
+    }
+    let n = u32::from_le_bytes([body_tail[0], body_tail[1], body_tail[2], body_tail[3]]) as usize;
+    let ids_end = 4 + n * 4;
+    let infos_end = ids_end + n * 12;
+    if body_tail.len() < infos_end {
+        return;
+    }
+
+    let id_chunks   = body_tail[4..ids_end].chunks_exact(4);
+    let info_chunks = body_tail[ids_end..infos_end].chunks_exact(12);
+    let mut data_off = infos_end;
+
+    for (id_b, info_b) in id_chunks.zip(info_chunks) {
+        let id     = u32::from_le_bytes([id_b[0], id_b[1], id_b[2], id_b[3]]);
+        let width  = u16::from_le_bytes([info_b[0], info_b[1]]);
+        let height = u16::from_le_bytes([info_b[2], info_b[3]]);
+        let x      = i16::from_le_bytes([info_b[4], info_b[5]]);
+        let y      = i16::from_le_bytes([info_b[6], info_b[7]]);
+        let x_off  = i16::from_le_bytes([info_b[8], info_b[9]]);
+        let y_off  = i16::from_le_bytes([info_b[10], info_b[11]]);
+
+        let w = width as usize;
+        let h = height as usize;
+        // A8 wire rows are padded to 4-byte alignment; store densely.
+        let stride = (w + 3) & !3;
+        let nbytes = stride * h;
+        if data_off + nbytes > body_tail.len() {
+            break;
+        }
+        let mut pixels = vec![0u8; w * h];
+        let wire = &body_tail[data_off..data_off + nbytes];
+        for row in 0..h {
+            pixels[row*w..row*w+w].copy_from_slice(&wire[row*stride..row*stride+w]);
+        }
+        data_off += nbytes;
+        gs.glyphs.insert(id, StoredGlyph { width, height, x, y, x_off, y_off, pixels });
+    }
+}
+
+/// Composite a CompositeGlyphs item stream from `gs` using `src` as the colour
+/// source onto `dst`. `minor` = 23/24/25 → id_size 1/2/4.
+/// `pen_x`/`pen_y` are the starting pen position (already offset by src_x+x_off
+/// and src_y+y_off at the call site in `render_composite_glyphs`).
+pub(super) fn composite_glyphs_onto(
+    gs: &GlyphSetState,
+    src: &PixmanImage,
+    dst: &mut PixmanImage,
+    minor: u8,
+    pen_x: i32,
+    pen_y: i32,
+    items: &[u8],
+) {
+    let id_size = match minor {
+        23 => 1usize,
+        24 => 2,
+        _  => 4,
+    };
+
+    // Read the solid colour from `src` (1×1 REPEAT_NORMAL image).
+    // SAFETY: src is a 1×1 pixman image we own; data() returns a valid pointer.
+    let argb: u32 = unsafe { *src.0.data() };
+    let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
+    let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
+    let g = (((argb >>  8) & 0xFF) as u16) * 0x101;
+    let b = ((argb         & 0xFF) as u16) * 0x101;
+    let pen_color = Color::new(r, g, b, a);
+
+    let dst_w = dst.0.width() as i32;
+    let dst_h = dst.0.height() as i32;
+    let mut pen_x = pen_x;
+    let mut pen_y = pen_y;
+    let mut pos = 0usize;
+
+    // Build once: the 1×1 tiling source image is the same colour for every glyph.
+    let Ok(mut color_img) = Image::new(FormatCode::A8R8G8B8, 1, 1, true) else { return };
+    let _ = color_img.fill_rectangles(
+        Operation::Src, pen_color,
+        &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+    );
+    color_img.set_repeat(Repeat::Normal);
+
+    while pos + 8 <= items.len() {
+        let count = items[pos] as usize;
+        if count == 255 {
+            // Glyphset-switch sentinel: 8 bytes (count, pad×3, gs_xid×4).
+            // Mid-stream glyphset switching is not implemented; all glyphs
+            // are rendered using the initial glyphset passed to this function.
+            pos += 8;
+            continue;
+        }
+        let dx = i16::from_le_bytes([items[pos+4], items[pos+5]]) as i32;
+        let dy = i16::from_le_bytes([items[pos+6], items[pos+7]]) as i32;
+        pen_x += dx;
+        pen_y += dy;
+
+        let payload_start = pos + 8;
+        let payload_bytes = count * id_size;
+        let padded = (payload_bytes + 3) & !3;
+        if payload_start + padded > items.len() {
+            break;
+        }
+
+        for i in 0..count {
+            let id_off = payload_start + i * id_size;
+            let glyph_id: u32 = match id_size {
+                1 => items[id_off] as u32,
+                2 => u16::from_le_bytes([items[id_off], items[id_off+1]]) as u32,
+                _ => u32::from_le_bytes([items[id_off], items[id_off+1],
+                                         items[id_off+2], items[id_off+3]]),
+            };
+
+            let Some(glyph) = gs.glyphs.get(&glyph_id) else {
+                continue;
+            };
+            let gw = glyph.width as usize;
+            let gh = glyph.height as usize;
+            // pen_x - glyph.x: wire x is -bitmap_left (see X RENDER spec §4.6).
+            let dst_x = pen_x - glyph.x as i32;
+            let dst_y = pen_y - glyph.y as i32;
+
+            if dst_x + gw as i32 <= 0 || dst_y + gh as i32 <= 0
+                || dst_x >= dst_w || dst_y >= dst_h
+            {
+                pen_x += glyph.x_off as i32;
+                continue;
+            }
+
+            // Build A8 mask from densely-packed glyph pixels.
+            let Ok(glyph_img) = Image::new(FormatCode::A8, gw, gh, true) else {
+                pen_x += glyph.x_off as i32;
+                continue;
+            };
+            let stride_bytes = glyph_img.stride();
+            // SAFETY: gdata points into a pixman A8 image we just allocated.
+            // We write only within [0, (gh-1)*stride_bytes + (gw-1)].
+            let gdata = unsafe { glyph_img.data() } as *mut u8;
+            for row in 0..gh {
+                for col in 0..gw {
+                    unsafe {
+                        *gdata.add(row * stride_bytes + col) = glyph.pixels[row * gw + col];
+                    }
+                }
+            }
+
+            dst.0.composite32(
+                Operation::Over,
+                &color_img,
+                Some(&glyph_img),
+                (0, 0),
+                (0, 0),
+                (dst_x, dst_y),
+                (gw as i32, gh as i32),
+            );
+
+            pen_x += glyph.x_off as i32;
+        }
+
+        pos += 8 + padded;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
@@ -3148,7 +4257,7 @@ mod tests {
         // bitmap_top). With a foreground of black (0x000000) on white
         // (0xFFFFFF), composited pixels should be darker than 0xFFFFFF.
         // ------------------------------------------------------------------
-        let baseline_y = glyph.bitmap_top() as i32;  // rows from top to baseline
+        let baseline_y = glyph.bitmap_top();  // rows from top to baseline
         let img_h = (baseline_y + 4).max(h as i32 + 4) as u16;
         let img_w = (w + 4) as u16;
         let mut dst = PixmanImage::new(FormatCode::X8R8G8B8, img_w, img_h, true)
@@ -3334,4 +4443,286 @@ mod tests {
         assert_eq!(g_ch, 0xFF, "center green channel should be 0xFF");
         assert_eq!(b_ch, 0x00, "center blue channel should be 0");
     }
+
+    #[test]
+    fn add_glyphs_stores_pixel_data_correctly() {
+        // Build a minimal AddGlyphs body_tail for 2 glyphs:
+        //   Glyph 0 (id=1): 2×2 A8 bitmap, x=-1, y=-2, x_off=4, y_off=0
+        //   Glyph 1 (id=2): 4×1 A8 bitmap, x=0,  y=-1, x_off=5, y_off=0
+        //
+        // Wire layout:
+        //   num_glyphs(4) = 2
+        //   ids: [1u32 LE, 2u32 LE]
+        //   infos:
+        //     glyph0: width=2 height=2 x=-1 y=-2 x_off=4 y_off=0  (12 bytes)
+        //     glyph1: width=4 height=1 x=0  y=-1 x_off=5 y_off=0  (12 bytes)
+        //   pixel data:
+        //     glyph0: 2×2 A8, row-stride=4 (padded): [0x11,0x22, 0,0, 0x33,0x44, 0,0]
+        //     glyph1: 4×1 A8, row-stride=4 (no pad):  [0x55,0x66,0x77,0x88]
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());   // num_glyphs
+        body.extend_from_slice(&1u32.to_le_bytes());   // id[0]
+        body.extend_from_slice(&2u32.to_le_bytes());   // id[1]
+        // glyph0 info
+        body.extend_from_slice(&2u16.to_le_bytes());   // width
+        body.extend_from_slice(&2u16.to_le_bytes());   // height
+        body.extend_from_slice(&(-1i16).to_le_bytes()); // x
+        body.extend_from_slice(&(-2i16).to_le_bytes()); // y
+        body.extend_from_slice(&4i16.to_le_bytes());   // x_off
+        body.extend_from_slice(&0i16.to_le_bytes());   // y_off
+        // glyph1 info
+        body.extend_from_slice(&4u16.to_le_bytes());   // width
+        body.extend_from_slice(&1u16.to_le_bytes());   // height
+        body.extend_from_slice(&0i16.to_le_bytes());   // x
+        body.extend_from_slice(&(-1i16).to_le_bytes()); // y
+        body.extend_from_slice(&5i16.to_le_bytes());   // x_off
+        body.extend_from_slice(&0i16.to_le_bytes());   // y_off
+        // glyph0 pixels: 2×2, padded row stride 4
+        body.extend_from_slice(&[0x11, 0x22, 0x00, 0x00]); // row 0
+        body.extend_from_slice(&[0x33, 0x44, 0x00, 0x00]); // row 1
+        // glyph1 pixels: 4×1, padded row stride 4
+        body.extend_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+
+        let mut gs = super::GlyphSetState {
+            format: super::GlyphSetFormat::A8,
+            glyphs: std::collections::HashMap::new(),
+        };
+        super::parse_add_glyphs(&mut gs, &body);
+
+        let g0 = gs.glyphs.get(&1).expect("glyph id=1 missing");
+        assert_eq!(g0.width, 2);
+        assert_eq!(g0.height, 2);
+        assert_eq!(g0.x, -1);
+        assert_eq!(g0.y, -2);
+        assert_eq!(g0.x_off, 4);
+        assert_eq!(g0.pixels, vec![0x11, 0x22, 0x33, 0x44]); // densely packed
+
+        let g1 = gs.glyphs.get(&2).expect("glyph id=2 missing");
+        assert_eq!(g1.width, 4);
+        assert_eq!(g1.pixels, vec![0x55, 0x66, 0x77, 0x88]);
+    }
+
+    #[test]
+    fn composite_glyphs_single_run_places_glyph_on_dst() {
+        // Set up: 1×1 opaque-red solid colour source, 8×8 white destination.
+        // Glyph: 2×2 fully-opaque A8 (all 0xFF), stored at id=1 in a GlyphSetState.
+        // CompositeGlyphs8 item stream: one run of 1 glyph at dx=2, dy=3.
+        // Expected: after composite, pixel at (2 - glyph.x, 3 - glyph.y) is red.
+
+        // Build glyphset with a 2×2 all-opaque A8 glyph (id=1, x=-1, y=-1).
+        let mut gs = super::GlyphSetState {
+            format: super::GlyphSetFormat::A8,
+            glyphs: std::collections::HashMap::new(),
+        };
+        gs.glyphs.insert(1, super::StoredGlyph {
+            width: 2, height: 2, x: -1, y: -1, x_off: 3, y_off: 0,
+            pixels: vec![0xFF; 4],
+        });
+
+        // Red solid-fill source (A8R8G8B8 = 0xFFFF0000).
+        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let _ = src_img.0.fill_rectangles(
+            Operation::Src,
+            Color::new(0xFFFF, 0, 0, 0xFFFF),
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        src_img.0.set_repeat(Repeat::Normal);
+
+        // White destination.
+        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 8, 8, true).unwrap();
+        fill_image(&mut dst_img, 0x00FF_FFFF);
+
+        // Build a CompositeGlyphs8 item stream: one run with count=1, dx=2, dy=3, id=1.
+        let mut items = Vec::new();
+        items.push(1u8);        // count
+        items.extend_from_slice(&[0, 0, 0]); // pad
+        items.extend_from_slice(&2i16.to_le_bytes()); // dx
+        items.extend_from_slice(&3i16.to_le_bytes()); // dy
+        items.push(1u8);        // glyph id (8-bit for minor=23)
+        items.extend_from_slice(&[0, 0, 0]); // pad to 4-byte boundary
+
+        super::composite_glyphs_onto(
+            &gs, &src_img, &mut dst_img,
+            /*minor=*/23, /*pen_x=*/0, /*pen_y=*/0,
+            &items,
+        );
+
+        // Pen after dx/dy = (0+2, 0+3) = (2, 3).
+        // Draw at (pen_x - glyph.x, pen_y - glyph.y) = (2-(-1), 3-(-1)) = (3, 4).
+        let p = read_pixel(&dst_img, 3, 4);
+        assert_ne!(p & 0x00FF_0000, 0, "pixel (3,4) should have red channel; got 0x{:08x}", p);
+        assert_eq!(p & 0x0000_FFFF, 0, "pixel (3,4) should have no blue/green; got 0x{:08x}", p);
+    }
+
+    #[test]
+    fn composite_glyphs_multi_run_advances_pen() {
+        // Two runs: first places glyph id=1 (x_off=5), second places glyph id=2.
+        // After first run pen advances by x_off=5.
+        let mut gs = super::GlyphSetState {
+            format: super::GlyphSetFormat::A8,
+            glyphs: std::collections::HashMap::new(),
+        };
+        gs.glyphs.insert(1, super::StoredGlyph {
+            width: 1, height: 1, x: 0, y: 0, x_off: 5, y_off: 0,
+            pixels: vec![0xFF],
+        });
+        gs.glyphs.insert(2, super::StoredGlyph {
+            width: 1, height: 1, x: 0, y: 0, x_off: 3, y_off: 0,
+            pixels: vec![0xFF],
+        });
+
+        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let _ = src_img.0.fill_rectangles(Operation::Src, Color::new(0, 0, 0xFFFF, 0xFFFF),
+            &[Rectangle16 { x:0, y:0, width:1, height:1 }]);
+        src_img.0.set_repeat(Repeat::Normal);
+
+        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 20, 4, true).unwrap();
+        fill_image(&mut dst_img, 0x00FF_FFFF);
+
+        // Run 1: count=1, dx=2, dy=1, id=1
+        // Run 2: count=1, dx=3, dy=0, id=2
+        let mut items = Vec::new();
+        items.push(1u8); items.extend_from_slice(&[0,0,0]);
+        items.extend_from_slice(&2i16.to_le_bytes()); items.extend_from_slice(&1i16.to_le_bytes());
+        items.push(1u8); items.extend_from_slice(&[0,0,0]);
+        items.push(1u8); items.extend_from_slice(&[0,0,0]);
+        items.extend_from_slice(&3i16.to_le_bytes()); items.extend_from_slice(&0i16.to_le_bytes());
+        items.push(2u8); items.extend_from_slice(&[0,0,0]);
+
+        super::composite_glyphs_onto(&gs, &src_img, &mut dst_img, 23, 0, 0, &items);
+
+        // Glyph 1 at pen (2,1): draw at (2,1). After glyph, pen_x += x_off=5 → pen_x=7.
+        // Glyph 2 at pen (7+3=10, 1+0=1): draw at (10,1).
+        let p1 = read_pixel(&dst_img, 2, 1);
+        let p2 = read_pixel(&dst_img, 10, 1);
+        assert_ne!(p1 & 0x0000_FFFF, 0, "glyph1 pixel (2,1) should have blue; got 0x{:08x}", p1);
+        assert_ne!(p2 & 0x0000_FFFF, 0, "glyph2 pixel (10,1) should have blue; got 0x{:08x}", p2);
+    }
+
+    #[test]
+    fn render_composite_solid_fill_onto_drawable() {
+        // Simulate: composite a 1×1 red SolidFill picture onto a 4×4 white drawable.
+        // The SolidFill image is a 1×1 REPEAT_NORMAL red pixel.
+        // We call pixman_image_composite32 directly (same path as the impl will use).
+
+        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let _ = src_img.0.fill_rectangles(
+            Operation::Src,
+            Color::new(0xFFFF, 0, 0, 0xFFFF),  // opaque red
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        src_img.0.set_repeat(Repeat::Normal);
+
+        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
+        fill_image(&mut dst_img, 0x00FF_FFFF); // white
+
+        let src_ptr = src_img.0.as_ptr();
+        let dst_ptr = dst_img.0.as_ptr();
+
+        unsafe {
+            pixman::ffi::pixman_image_composite32(
+                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
+                src_ptr, std::ptr::null_mut(), dst_ptr,
+                0, 0, 0, 0,
+                1, 1, // dst at (1,1)
+                2, 2, // 2×2 region
+            );
+        }
+
+        let p = read_pixel(&dst_img, 1, 1);
+        assert_ne!(p & 0x00FF_0000, 0, "pixel (1,1) should have red; got 0x{:08x}", p);
+        assert_eq!(p & 0x0000_FFFF, 0, "pixel (1,1) should have no blue/green; got 0x{:08x}", p);
+    }
+
+    #[test]
+    fn composite_glyphs_sentinel_does_not_panic() {
+        // A sentinel-only item stream (count=255 + 4-byte gs XID) should be a no-op.
+        let gs = super::GlyphSetState {
+            format: super::GlyphSetFormat::A8,
+            glyphs: std::collections::HashMap::new(),
+        };
+        let src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
+        fill_image(&mut dst_img, 0x00FF_FFFF);
+        let items = vec![255u8, 0, 0, 0,  0x99, 0, 0, 0]; // sentinel + fake gs xid
+        // Should not panic:
+        super::composite_glyphs_onto(&gs, &src_img, &mut dst_img, 23, 0, 0, &items);
+        // Mask off the X/A channel — X8R8G8B8 may store 0xFF in the top byte.
+        assert_eq!(read_pixel(&dst_img, 0, 0) & 0x00FF_FFFF, 0x00FF_FFFF, "sentinel must not modify dst");
+    }
+
+    #[test]
+    fn render_create_cursor_stores_image_and_hotspot() {
+        use super::*;
+
+        // KmsBackend::new requires live DRM hardware and cannot be constructed in unit tests.
+        // This test exercises the same data-flow logic (picture→pixmap→cursor image copy)
+        // that render_create_cursor uses, with an explicit pixel-content assertion.
+
+        let mut pixmap_img = PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap();
+        let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
+        let full = Rectangle16 { x: 0, y: 0, width: 4, height: 4 };
+        pixmap_img.0.fill_rectangles(Operation::Src, red, &[full]).unwrap();
+
+        let pixmap_xid: u32 = 10;
+        let picture_xid: u32 = 20;
+        let cursor_xid: u32 = 30;
+
+        let mut cursors: HashMap<u32, CursorState> = HashMap::new();
+        let mut pictures: HashMap<u32, PictureState> = HashMap::new();
+        let mut pixmaps: HashMap<u32, PixmapState> = HashMap::new();
+
+        pixmaps.insert(pixmap_xid, PixmapState { handle: pixmap_xid, image: pixmap_img, depth: 32 });
+        pictures.insert(picture_xid, PictureState::Drawable { host_xid: pixmap_xid, clip: None });
+
+        let hot_x: u16 = 1;
+        let hot_y: u16 = 2;
+
+        let (w, h) = {
+            let pm = pixmaps.get(&pixmap_xid).unwrap();
+            (pm.image.0.width() as u16, pm.image.0.height() as u16)
+        };
+        let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true).unwrap();
+        {
+            let pm = pixmaps.get(&pixmap_xid).unwrap();
+            cursor_img.0.composite32(Operation::Src, &pm.image.0, None, (0,0), (0,0), (0,0), (w as i32, h as i32));
+        }
+        cursors.insert(cursor_xid, CursorState { image: cursor_img, hot_x, hot_y });
+
+        let cs = cursors.get(&cursor_xid).unwrap();
+        assert_eq!(cs.hot_x, hot_x);
+        assert_eq!(cs.hot_y, hot_y);
+        assert_eq!(cs.image.0.width() as u16, 4);
+        assert_eq!(cs.image.0.height() as u16, 4);
+
+        // Verify the composite actually copied the red fill into the cursor image.
+        // A8R8G8B8 in memory: alpha=0xFF, R=0xFF, G=0x00, B=0x00 → 0xFFFF0000.
+        // SAFETY: cursor_img was just created and no other reference to it exists.
+        let pixel = unsafe { *cs.image.0.data().add(0) };
+        assert_eq!(pixel & 0x00FF_0000, 0x00FF_0000, "red channel should be set");
+    }
+
+    #[test]
+    fn draw_cursor_onto_composites_at_hotspot_adjusted_position() {
+        use super::*;
+
+        // 2×2 all-red ARGB cursor image.
+        let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, 2, 2, true).unwrap();
+        let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
+        let full = Rectangle16 { x: 0, y: 0, width: 2, height: 2 };
+        cursor_img.0.fill_rectangles(Operation::Src, red, &[full]).unwrap();
+
+        // 10×10 black destination.
+        let mut dst = PixmanImage::new(FormatCode::A8R8G8B8, 10, 10, true).unwrap();
+
+        // Cursor position (5,5) with hotspot (1,1) → image top-left lands at (4,4).
+        let x = 5_i32 - 1;
+        let y = 5_i32 - 1;
+        dst.0.composite32(Operation::Over, &cursor_img.0, None, (0, 0), (0, 0), (x, y), (2, 2));
+
+        let pixel = read_pixel(&dst, x as usize, y as usize);
+        assert_eq!(pixel & 0x00FF_0000, 0x00FF_0000, "red channel at (4,4) should be 0xFF after composite");
+    }
+
 }

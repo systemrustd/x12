@@ -573,9 +573,7 @@ impl ServerState {
             if !subs.is_empty() {
                 return Some((current, x, y, subs));
             }
-            let Some(window) = self.resources.window(current) else {
-                return None;
-            };
+            let window = self.resources.window(current)?;
             // Root's parent points to itself; stop after probing root.
             if window.parent == current {
                 return None;
@@ -970,8 +968,9 @@ pub fn pointer_event_fanout(
 ) {
     use crate::host_x11::PointerEventKind;
     trace!(
-        "pointer_event_fanout: kind={:?} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
+        "pointer_event_fanout: kind={:?} detail={} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
         event.kind,
+        event.detail,
         event.host_xid,
         event.root_x,
         event.root_y,

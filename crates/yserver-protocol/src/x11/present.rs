@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn pixmap_request_rejects_misaligned_notify_tail() {
-        assert!(parse_pixmap(&vec![0u8; 72]).is_none());
+        assert!(parse_pixmap(&[0u8; 72]).is_none());
     }
 
     #[test]

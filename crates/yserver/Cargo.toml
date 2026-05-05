@@ -31,3 +31,6 @@ path = "src/bin/ynest.rs"
 [[bin]]
 name = "yserver"
 path = "src/bin/yserver.rs"
+
+[lints]
+workspace = true

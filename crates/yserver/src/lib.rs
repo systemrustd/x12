@@ -95,17 +95,68 @@ pub fn run() -> io::Result<()> {
     let drm_borrow = unsafe { BorrowedFd::borrow_raw(drm_fd) };
     epoll.add(drm_borrow, EpollEvent::new(EpollFlags::EPOLLIN, DRM_TOKEN))?;
 
-    let input_fd = {
-        let b = backend_arc.lock().unwrap();
-        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
-        kms.input_fd()
+    // Spawn a dedicated thread for libinput dispatch. The thread owns
+    // the libinput context, polls the input fd, and for each event
+    // briefly acquires the backend mutex (microseconds) to call
+    // process_one_input_event. This decouples motion-event delivery
+    // from per-client X11 request handlers — without it, a tight burst
+    // of X11 requests (e.g. fvwm processing a Press) holds the backend
+    // mutex long enough that motion events accumulate in libinput and
+    // arrive at fvwm too late, breaking drag-to-move and similar
+    // interactions that depend on prompt motion delivery.
+    let input_ctx = {
+        let mut b = backend_arc.lock().unwrap();
+        let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
+        kms.take_input_ctx()
     };
-    if let Some(fd) = input_fd {
-        let input_borrow = unsafe { BorrowedFd::borrow_raw(fd) };
-        epoll.add(
-            input_borrow,
-            EpollEvent::new(EpollFlags::EPOLLIN, INPUT_TOKEN),
-        )?;
+    if let Some(mut input_ctx) = input_ctx {
+        let backend_for_input = backend_arc.clone();
+        log::info!("yserver: spawning dedicated libinput thread");
+        thread::spawn(move || {
+            // Dedicated input epoll set — wakes only on libinput events,
+            // never blocked by other epoll consumers.
+            let input_epoll = match Epoll::new(EpollCreateFlags::empty()) {
+                Ok(e) => e,
+                Err(err) => {
+                    log::error!("input thread: epoll_create failed: {err}");
+                    return;
+                }
+            };
+            let fd = input_ctx.fd();
+            let borrow = unsafe { BorrowedFd::borrow_raw(fd) };
+            if let Err(err) = input_epoll.add(borrow, EpollEvent::new(EpollFlags::EPOLLIN, 0)) {
+                log::error!("input thread: epoll_add failed: {err}");
+                return;
+            }
+            let mut buf = [EpollEvent::empty(); 4];
+            loop {
+                match input_epoll.wait(&mut buf, EpollTimeout::NONE) {
+                    Ok(_) => {}
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(err) => {
+                        log::warn!("input thread: epoll_wait error: {err}");
+                        continue;
+                    }
+                }
+                let events = match input_ctx.dispatch() {
+                    Ok(evs) => evs,
+                    Err(err) => {
+                        log::warn!("input thread: libinput dispatch error: {err}");
+                        continue;
+                    }
+                };
+                for event in events {
+                    let mut b = match backend_for_input.lock() {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let Some(kms) = b.as_any_mut().downcast_mut::<KmsBackend>() else {
+                        return;
+                    };
+                    kms.process_one_input_event(event);
+                }
+            }
+        });
     }
 
     let listener_fd = listener.as_raw_fd();
@@ -175,11 +226,11 @@ pub fn run() -> io::Result<()> {
                     }
                 }
                 INPUT_TOKEN => {
-                    let mut b = backend_arc.lock().unwrap();
-                    let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
-                    if let Err(e) = kms.process_input_events() {
-                        log::warn!("yserver: input event error: {e}");
-                    }
+                    // Input is handled by a dedicated thread now; this
+                    // arm should never fire because we don't register
+                    // INPUT_TOKEN with epoll. Kept as a defensive
+                    // no-op in case a future refactor re-introduces the
+                    // registration.
                 }
                 SIGNAL_TOKEN => match signal_fd.read_signal() {
                     Ok(Some(siginfo)) => {
