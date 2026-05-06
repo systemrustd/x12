@@ -122,6 +122,8 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
         25 => &[u32f!(0), u32f!(4), OpaqueTail { from: 8 }],
         // 26 GrabPointer: window(u32) event_mask(u16) [u8 u8] confine_to(u32) cursor(u32) time(u32)
         26 => &[u32f!(0), u16f!(4), u32f!(8), u32f!(12), u32f!(16)],
+        // 27 UngrabPointer: time(u32)
+        27 => &[u32f!(0)],
         // 28 GrabButton: window(u32) event_mask(u16) [u8 u8] confine_to(u32) cursor(u32) [u8 button]
         //               [u8 pad] modifiers(u16)
         28 => &[u32f!(0), u16f!(4), u32f!(8), u32f!(12), u16f!(20)],
@@ -131,6 +133,8 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
         30 => &[u32f!(0), u32f!(4), u16f!(8)],
         // 31 GrabKeyboard: window(u32) time(u32) [u8 u8 u8 u8]
         31 => &[u32f!(0), u32f!(4)],
+        // 32 UngrabKeyboard: time(u32)
+        32 => &[u32f!(0)],
         // 33 GrabKey: window(u32) modifiers(u16) [u8 u8 u8 u8]
         33 => &[u32f!(0), u16f!(4)],
         // 34 UngrabKey: window(u32) modifiers(u16)

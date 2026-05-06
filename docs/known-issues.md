@@ -474,25 +474,16 @@ that the host hides for us.
 
 ## Validation surface
 
-- [ ] **xts XI / XIproto blocked on missing XI 1.x reply handlers.** Our
-      `XInputExtension` dispatcher only implements minor 1
-      (`GetExtensionVersion`) and a handful of XI2 minors (42, 44–48, 60).
-      The xts `XI` (36 cases / 316 purposes) and `XIproto` (35 cases /
-      107 purposes) scenarios test the original X Input Extension
-      (XI 1.x). Every XI test uses Xlib's `XListInputDevices` /
-      `XOpenDevice` (XI1 minors 2 / 3 — both reply-required) via
-      `Setup_Extension_DeviceInfo`; without replies the client blocks
-      in `_XReply()` and the test hangs the full timeout. Confirmed
-      2026-05-07 by running `just xts-ynest XI 99 1024x768 600` — first
-      test (`AllowDeviceEvents`) hung 600s and tcc was SIGTERM'd. To
-      unblock measurement we need the ~20 reply-required XI1 minors
-      (`ListInputDevices`, `OpenDevice`, `SetDeviceMode`,
-      `GetSelectedExtensionEvents`, `GetDeviceMotionEvents`, `GrabDevice`,
-      `GetDeviceFocus`, `GetFeedbackControl`, `GetDeviceKeyMapping`,
-      `QueryDeviceState`, …) stubbed with "no devices / empty list /
-      not-granted" replies. Test bodies will mostly UNTESTED ("required
-      extension devices are not present") rather than PASS — but the
-      suite will at least run to completion and produce a baseline.
+- [x] **xts XI / XIproto reply-required-handler hang** (resolved
+      2026-05-07, commit `d00191a`). 22 XI 1.x minors (2, 3, 5, 7,
+      9–13, 20, 22, 24, 26–30, 33–36, 39) now emit a 32-byte zero-fill
+      stub reply, so xts no longer blocks in `_XReply` on
+      `XListInputDevices` / `XOpenDevice`. Both suites complete and
+      produce a baseline. Most tests are UNTESTED because
+      `ListInputDevices` advertises 0 devices (preconditions unmet) —
+      getting actual PASSes is a separate task: surface real
+      pointer/keyboard with valid class info and wire `XOpenDevice` /
+      `GrabDevice` / event paths to per-device state.
 - [ ] **XTEST extension in ynest.** Implementing `XTestFakeKeyEvent` /
       `XTestFakeButtonEvent` (extension major 138, opcodes 2 and 3)
       would let `xdotool key`/`xdotool click` drive ynest in headless

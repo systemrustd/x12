@@ -2169,6 +2169,18 @@ the suite tell us where the real gaps are.
   | 2026-05-07 |    5 |    6 | First ShapeExt run; `GetRectangles` reported `Unsorted` and `QueryExtents` ignored `border_width`. |
   | 2026-05-07 |   11 |    0 | `GetRectangles` reports `YXBanded`, `normalize_region_rects` sorts by (y, x), `default_shape_rect` is kind-aware (BOUNDING includes border, CLIP/INPUT do not). Plus a wmaker-spotted typo: opcode 36 in the FreeColors content-aware shape gate is GrabServer; arm relabelled to opcode 88. **PASS 5 → 11**. |
 
+  XI scenario (36 cases / 316 tests) — previously timed out at 600s:
+
+  | Date       | PASS | FAIL | UNRES | UNTST | Change |
+  |------------|-----:|-----:|------:|------:|--------|
+  | 2026-05-07 |    0 |   21 |     0 |   289 | `xts-followups` branch — XI 1.x reply-required minor stubs (22 minors, 32-byte zero-fill replies). Suite no longer hangs in `_XReply`; most tests UNTST because `ListInputDevices` advertises 0 devices, so device-dependent preconditions go unmet. |
+
+  XIproto scenario (35 cases / 107 tests) — previously timed out at 600s:
+
+  | Date       | PASS | FAIL | UNRES | UNTST | Change |
+  |------------|-----:|-----:|------:|------:|--------|
+  | 2026-05-07 |    0 |    0 |     0 |   107 | Same XI 1.x stub branch; suite completes cleanly, all UNTST on missing-device preconditions. |
+
 - **`BadLength` enforcement landed.** A per-opcode length contract
   table covers all of opcodes 1–127 in
   `crates/yserver-protocol/src/x11/request_lengths.rs`: `Fixed(n)`
@@ -2219,34 +2231,49 @@ the suite tell us where the real gaps are.
 
 #### Phase 6.9 remaining follow-ups
 
-The 40 residual FAIL + 99 UNRES are real protocol bugs, not BE
-artefacts. In rough priority:
+Most of the originally-listed gaps landed in commit `b12d25f`
+("residual xts Xproto fixes — PASS 229 → 337") and the `xts-followups`
+branch (`816d6f4` + `d00191a`):
 
-- **Missing reply implementations** (~6 tests): GetMotionEvents (39),
-  GetFontPath (52), ListInstalledColormaps (83), GetKeyboardControl
-  (103), GetPointerControl (106), GetScreenSaver (108) — server is
-  silent where xts expects a reply.
-- **Per-opcode validation gaps** (~12 tests): `BadAlloc` /
-  `BadIDChoice` / `BadAccess` / `BadValue` not raised for
-  duplicate-ID `CreateColormap`, read-only colormap `StoreColors`,
-  invalid `CopyGC` value-list bits, etc.
-- **Event-generation gaps** (~5 tests): `MapWindow`/`MapSubwindows`
-  don't deliver expected `Expose`; `SetModifierMapping` /
-  `SetPointerMapping` don't fire `MappingNotify`.
-- **Less-common opcodes not in `request_swap_table`** (a handful):
-  pads through unchanged, so BE-only probes still UNRES.
+- [x] **Missing reply implementations** (6 opcodes — `b12d25f`).
+      GetMotionEvents (39), GetFontPath (52), ListInstalledColormaps
+      (83), GetKeyboardControl (103), GetPointerControl (106),
+      GetScreenSaver (108) all return sane stub replies; handlers
+      wired at `process_request.rs:172-180`.
+- [x] **Per-opcode validation gaps** (`b12d25f`). `BadIDChoice` on
+      duplicate XIDs (CreateColormap, CopyColormapAndFree,
+      CreateCursor); `BadAlloc` for AllocColorCells/Planes on
+      TrueColor; `BadAccess` for StoreColors/StoreNamedColor on
+      TrueColor; `ChangeKeyboardControl` mask validation.
+- [x] **Event-generation gaps** (`b12d25f`). `SetPointerMapping` /
+      `SetModifierMapping` fan out `MappingNotify` before the reply;
+      `MapWindow` emits `Expose` on the window itself when newly
+      Viewable; `MapSubwindows` emits `Expose` only when the child
+      becomes Viewable; `ClearArea` / `CopyArea` / `CopyPlane` emit
+      `Expose` / `GraphicsExpose` per GC settings.
+- [x] **`request_swap_table` for less-common opcodes** (`816d6f4`).
+      Added entries for opcodes 27 (UngrabPointer) and 32
+      (UngrabKeyboard); they were the only core opcodes with
+      multi-byte body fields not in the table.
+- [x] **xts `XI` / `XIproto` baseline** (`d00191a`). 22 reply-required
+      XI 1.x minors (2, 3, 5, 7, 9–13, 20, 22, 24, 26–30, 33–36, 39)
+      now emit a 32-byte zero-fill stub reply. Both suites complete
+      without hanging; see XI/XIproto run-history tables above.
+
+Still open:
+
+- **Real XI device advertisement.** Current `ListInputDevices` stub
+  returns 0 devices, so most XI tests are UNTST (preconditions
+  unmet). To get actual PASSes we'd need to surface
+  pointer + keyboard with valid class info (key/button/valuator
+  records), wire `XOpenDevice` to allocate per-device state, and
+  honour the XI 1.x grab/event request paths properly.
 - **`yserver` (KMS) baseline.** Deferred — running xts in a vng
   guest needs either an in-guest xts build or a tunneled DISPLAY.
-- **xts `XI` / `XIproto` baseline.** Blocked on missing XI 1.x reply
-  handlers. Our `XInputExtension` dispatcher only implements XI2 plus
-  XI1 minor 1 (`GetExtensionVersion`); xts probes the XI 1.x surface
-  through `Setup_Extension_DeviceInfo`, which calls Xlib's
-  `XListInputDevices` (minor 2) and `XOpenDevice` (minor 3) — both
-  reply-required. Without replies the client blocks in `_XReply()`.
-  Confirmed 2026-05-07: `XI` first test (`AllowDeviceEvents`) hung the
-  full 600s timeout. Unblocking requires stubbing ~20 reply-required
-  XI1 minors with empty / not-granted replies; full ticket in
-  `docs/known-issues.md` under "Validation surface".
+- **Residual ~25 Xproto FAIL.** Per `b12d25f` commit log: mostly
+  BIG-REQUESTS oversized-length tests that xts itself documents as
+  "no known portable test method", plus a few host-backend
+  forwarding edge cases. Not addressable without xts-side changes.
 
 ## Phase 7 — Security hardening
 

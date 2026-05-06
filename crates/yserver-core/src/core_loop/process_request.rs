@@ -3325,6 +3325,40 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 4]);
             buf.extend_from_slice(&reply);
         }
+        // XI 1.x reply-required minors. xts opens a probe XListInputDevices /
+        // XOpenDevice on every test, so without these stubs the entire
+        // XI / XIproto suites hang on _XReply. Each reply is exactly
+        // 32 bytes (the standard reply header + 24 zero bytes); all
+        // count/status fields default to 0 which means
+        // "empty list" / "Success" in their respective contexts.
+        2 |  // ListInputDevices: ndevices = 0
+        3 |  // OpenDevice: num_classes = 0
+        5 |  // SetDeviceMode: status = Success
+        7 |  // GetSelectedExtensionEvents: counts = 0
+        9 |  // GetDeviceDontPropagateList: count = 0
+        10 | // GetDeviceMotionEvents: nEvents = 0
+        11 | // ChangeKeyboardDevice: status = Success
+        12 | // ChangePointerDevice: status = Success
+        13 | // GrabDevice: status = GrabSuccess
+        20 | // GetDeviceFocus: focus = None
+        22 | // GetFeedbackControl: num_feedbacks = 0
+        24 | // GetDeviceKeyMapping: keysyms_per_keycode = 0
+        26 | // GetDeviceModifierMapping: numKeyPerModifier = 0
+        27 | // SetDeviceModifierMapping: success = MappingSuccess
+        28 | // GetDeviceButtonMapping: nElts = 0
+        29 | // SetDeviceButtonMapping: status = MappingSuccess
+        30 | // QueryDeviceState: num_classes = 0
+        33 | // SetDeviceValuators: status = Success
+        34 | // GetDeviceControl: status = Success
+        35 | // ChangeDeviceControl: status = Success
+        36 | // ListDeviceProperties: nAtoms = 0
+        39   // GetDeviceProperty: propertyType = None
+        => {
+            debug!("client {} #{} XI 1.x stub minor={}", client_id.0, sequence.0, minor);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            reply.extend_from_slice(&[0u8; 24]);
+            buf.extend_from_slice(&reply);
+        }
         _ => {
             debug!("unhandled XI2 request minor={}", minor);
             return Ok(RequestOutcome::Handled);
