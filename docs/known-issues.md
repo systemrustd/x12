@@ -91,10 +91,15 @@ once the underlying patterns are understood.
       KMS path and run xterm under yserver — xterm renders text
       correctly, so its QueryFont reply path is fine; diff what
       changes between xterm's font query and fvwm3's font query.
-- [ ] **xterm stops receiving KeyPress after focus/state-changing
+- [x] **xterm stops receiving KeyPress after focus/state-changing
       interaction (WM-independent, backend-independent — likely a
       regression from the single-threaded core refactor).**
-      Surfaced during Phase J smoke. Triggers we've reproduced:
+      Confirmed gone after the BE-client / xproto / Xlib3 cleanup
+      pass (master `3ee8530` and earlier in that session). Verified
+      by user 2026-05-06 against ynest + e16 + xterm on native Linux.
+      Original report kept below for archaeology.
+
+      Surfaced during Phase J smoke. Triggers we'd reproduced:
         - **ynest + wmaker**: type `ls` Enter four times in xterm.
           The 4th invocation reliably leaves xterm unresponsive to
           subsequent keystrokes. Typing once worked at first, so
@@ -125,21 +130,6 @@ once the underlying patterns are understood.
       sticks forever and keys keep funneling to grab_window
       (typically the WM frame, which has no KeyPress mask in its
       `event_masks` and just drops them).
-      Diagnostics needed:
-        - trace in `host_x11/pump.rs::decode_host_event` for
-          KeyPress/KeyRelease so we know the host is actually
-          firing keys when the user types
-        - trace in `key_event_fanout_to_state`'s entry +
-          grab-activation + grab-release + target-resolution
-          branches
-        - log `state.active_keyboard_grab` on every keypress at the
-          point of decision, so the stuck-grab condition is
-          observable
-      Then re-run the fvwm3+resize repro (cleaner than the wmaker
-      one — fvwm3 has no passive key grabs in its trace). If the
-      grab IS stuck, fix the release condition: clear the active
-      grab when the modifier set returns to grabable state, not
-      just on the exact triggering-keycode release.
 - [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
       Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
       smoke. After fixing two prerequisite routing bugs (the
