@@ -30,6 +30,9 @@ flavour of not-passing.
 |------------|-----:|-----:|------:|-----:|------:|-------|
 | 2026-05-06 |    1 |  210 |   160 |   11 |     7 | First run after XTEST landed. |
 | 2026-05-06 |    1 |   74 |   296 |   11 |     7 | After `BadLength` enforcement at the top of `process_request` (per-opcode length table for opcodes 1–127). 136 tests moved FAIL → UNRES: each AllocColor-style probe runs 2 native + 2 BE sub-checks; previously the native sub-checks FAILed (BadLength not raised) so the test result was FAIL; now those sub-checks pass but the BE sub-checks still UNRES on connection rejection, leaving the test as UNRES. Real BadLength progress; PASS count gated on big-endian client support. |
+| 2026-05-06 |   26 |   91 |   252 |    0 |     0 | After Phases 0+A+B+C+D+D1 of BE client support (request reader, setup, errors, replies, events, shared `wire_swap` module). BE clients now complete setup, receive replies/errors/events in their byte order. Phase D2 (raw event templates / SendEvent re-encoding) and Phase E (inbound request body swap) still pending — explains the remaining 252 UNRES. |
+| 2026-05-06 |  195 |   78 |    97 |    0 |     0 | Phase E lands — per-opcode `request_swap_table` covers ~70 core opcodes; inbound BE request bodies are byte-swapped in place at the reader thread before dispatch. **PASS 26 → 195** (+169). UNRES 252 → 97 (-155). The remaining 97 UNRES are mostly tests of opcodes not yet covered by the swap table or of BE behaviour blocked by other gaps (Phase D2 / variable-length BadLength). |
+| 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 (raw event templates re-encode per recipient) + F (content-aware `BadLength` for variable-length opcodes). **PASS 195 → 229** (+34); FAIL 78 → 40 (-38). End-to-end **PASS 1 → 229** for the full BE branch. |
 
 (Total tests: 122 cases / 389 purposes throughout.)
 

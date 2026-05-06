@@ -1,4 +1,7 @@
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_i16, write_u16, write_u32},
+};
 
 pub const QUERY_VERSION: u8 = 0;
 pub const CREATE: u8 = 1;
@@ -58,14 +61,19 @@ pub fn parse_add(body: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[must_use]
-pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u32) -> Vec<u8> {
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major: u32,
+    minor: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&major.to_le_bytes());
-    out.extend_from_slice(&minor.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, major);
+    write_u32(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -99,6 +107,7 @@ pub struct Rectangle {
 #[must_use]
 #[allow(clippy::too_many_arguments)] // wire encoder — fields are part of the protocol
 pub fn encode_damage_notify_event(
+    byte_order: ClientByteOrder,
     first_event: u8,
     sequence: SequenceNumber,
     level: u8,
@@ -111,18 +120,42 @@ pub fn encode_damage_notify_event(
     let mut out = [0u8; 32];
     out[0] = first_event;
     out[1] = level;
-    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    out[4..8].copy_from_slice(&drawable.to_le_bytes());
-    out[8..12].copy_from_slice(&damage.to_le_bytes());
-    out[12..16].copy_from_slice(&timestamp.to_le_bytes());
-    out[16..18].copy_from_slice(&area.x.to_le_bytes());
-    out[18..20].copy_from_slice(&area.y.to_le_bytes());
-    out[20..22].copy_from_slice(&area.width.to_le_bytes());
-    out[22..24].copy_from_slice(&area.height.to_le_bytes());
-    out[24..26].copy_from_slice(&geometry.x.to_le_bytes());
-    out[26..28].copy_from_slice(&geometry.y.to_le_bytes());
-    out[28..30].copy_from_slice(&geometry.width.to_le_bytes());
-    out[30..32].copy_from_slice(&geometry.height.to_le_bytes());
+    let mut tmp: Vec<u8> = Vec::with_capacity(2);
+    write_u16(byte_order, &mut tmp, sequence.0);
+    out[2..4].copy_from_slice(&tmp);
+    let mut tmp4: Vec<u8> = Vec::with_capacity(4);
+    write_u32(byte_order, &mut tmp4, drawable);
+    out[4..8].copy_from_slice(&tmp4);
+    tmp4.clear();
+    write_u32(byte_order, &mut tmp4, damage);
+    out[8..12].copy_from_slice(&tmp4);
+    tmp4.clear();
+    write_u32(byte_order, &mut tmp4, timestamp);
+    out[12..16].copy_from_slice(&tmp4);
+    tmp.clear();
+    write_i16(byte_order, &mut tmp, area.x);
+    out[16..18].copy_from_slice(&tmp);
+    tmp.clear();
+    write_i16(byte_order, &mut tmp, area.y);
+    out[18..20].copy_from_slice(&tmp);
+    tmp.clear();
+    write_u16(byte_order, &mut tmp, area.width);
+    out[20..22].copy_from_slice(&tmp);
+    tmp.clear();
+    write_u16(byte_order, &mut tmp, area.height);
+    out[22..24].copy_from_slice(&tmp);
+    tmp.clear();
+    write_i16(byte_order, &mut tmp, geometry.x);
+    out[24..26].copy_from_slice(&tmp);
+    tmp.clear();
+    write_i16(byte_order, &mut tmp, geometry.y);
+    out[26..28].copy_from_slice(&tmp);
+    tmp.clear();
+    write_u16(byte_order, &mut tmp, geometry.width);
+    out[28..30].copy_from_slice(&tmp);
+    tmp.clear();
+    write_u16(byte_order, &mut tmp, geometry.height);
+    out[30..32].copy_from_slice(&tmp);
     out
 }
 
@@ -132,7 +165,8 @@ mod tests {
 
     #[test]
     fn query_version_reply_shape() {
-        let reply = encode_query_version_reply(SequenceNumber(6), 1, 1);
+        let reply =
+            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(6), 1, 1);
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
@@ -155,6 +189,7 @@ mod tests {
             height: 200,
         };
         let evt = encode_damage_notify_event(
+            ClientByteOrder::LittleEndian,
             94,
             SequenceNumber(0xabcd),
             report_level::NON_EMPTY,
@@ -193,6 +228,7 @@ mod tests {
             height: 1,
         };
         let intermediate = encode_damage_notify_event(
+            ClientByteOrder::LittleEndian,
             94,
             SequenceNumber(1),
             report_level::DELTA_RECTANGLES | MORE_FLAG,
@@ -203,6 +239,7 @@ mod tests {
             r,
         );
         let last = encode_damage_notify_event(
+            ClientByteOrder::LittleEndian,
             94,
             SequenceNumber(1),
             report_level::DELTA_RECTANGLES,

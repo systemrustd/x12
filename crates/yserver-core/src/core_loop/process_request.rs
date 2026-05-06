@@ -103,6 +103,24 @@ pub fn process_request(
             header.opcode,
         );
     }
+    // Phase F: variable-length opcodes need content-derived exact-length
+    // validation (the spec's `length one less/greater than the minimum
+    // required to contain the request` xts probes).
+    if !x11::request_lengths::validate_exact_request_length(
+        header.opcode,
+        header.data,
+        header.length_units,
+        body,
+    ) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
     match header.opcode {
         // ── log-only no-ops (no reply, no state mutation) ──
         36 => log_void(client_id, sequence, "GrabServer"),
@@ -514,21 +532,30 @@ fn handle_render_request(
         nested::{ChangePictureAttr, change_picture_translate_xids},
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
+    use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         0 => {
             let (major, minor_ver) = backend.render_query_version(origin).unwrap_or((0, 11));
             let mut buf: Vec<u8> = Vec::with_capacity(32);
-            x11::write_render_query_version_reply(&mut buf, sequence, major, minor_ver)?;
+            x11::write_render_query_version_reply(
+                &mut buf, byte_order, sequence, major, minor_ver,
+            )?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         1 => {
             let mut buf: Vec<u8> = Vec::with_capacity(256);
             x11::write_render_query_pict_formats_reply(
                 &mut buf,
+                byte_order,
                 sequence,
                 crate::resources::ROOT_VISUAL,
                 ARGB_VISUAL,
@@ -536,14 +563,16 @@ fn handle_render_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         2 => {
             let mut buf: Vec<u8> = Vec::with_capacity(32);
-            x11::write_render_query_pict_index_values_reply(&mut buf, sequence)?;
+            x11::write_render_query_pict_index_values_reply(&mut buf, byte_order, sequence)?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         4 => {
@@ -845,10 +874,11 @@ fn handle_render_request(
         }
         29 => {
             let mut buf: Vec<u8> = Vec::with_capacity(64);
-            x11::write_render_query_filters_reply(&mut buf, sequence)?;
+            x11::write_render_query_filters_reply(&mut buf, byte_order, sequence)?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         30 => {
@@ -943,8 +973,12 @@ fn handle_randr_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::randr as x11randr;
+    use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11randr::RR_QUERY_VERSION => {
@@ -959,27 +993,38 @@ fn handle_randr_request(
                     (reply_major, reply_minor)
                 })
                 .unwrap_or((x11randr::MAJOR_VERSION, x11randr::MINOR_VERSION));
-            let buf = x11randr::encode_query_version_reply(sequence, reply_major, reply_minor);
+            let buf = x11randr::encode_query_version_reply(
+                byte_order,
+                sequence,
+                reply_major,
+                reply_minor,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_SIZE_RANGE => {
             let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
-            let buf =
-                x11randr::encode_get_screen_size_range_reply(sequence, min_w, min_h, max_w, max_h);
+            let buf = x11randr::encode_get_screen_size_range_reply(
+                byte_order, sequence, min_w, min_h, max_w, max_h,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_RESOURCES | x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
             let resources = state.randr.screen_resources_current();
-            let buf = x11randr::encode_get_screen_resources_current_reply(sequence, &resources);
+            let buf = x11randr::encode_get_screen_resources_current_reply(
+                byte_order, sequence, &resources,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_OUTPUT_INFO => {
@@ -1006,6 +1051,7 @@ fn handle_randr_request(
             let crtc_ids = [crate::randr::CRTC_ID];
             let mode_ids = [crate::randr::MODE_ID];
             let buf = x11randr::encode_get_output_info_reply(
+                byte_order,
                 sequence,
                 &x11randr::OutputInfoReply {
                     timestamp: info_data.timestamp,
@@ -1023,6 +1069,7 @@ fn handle_randr_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_INFO => {
@@ -1048,6 +1095,7 @@ fn handle_randr_request(
             };
             let output_ids = [crate::randr::OUTPUT_ID];
             let buf = x11randr::encode_get_crtc_info_reply(
+                byte_order,
                 sequence,
                 &x11randr::CrtcInfoReply {
                     timestamp: crtc_data.timestamp,
@@ -1065,43 +1113,49 @@ fn handle_randr_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_TRANSFORM => {
-            let buf = x11randr::encode_get_crtc_transform_reply(sequence);
+            let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_LIST_OUTPUT_PROPERTIES => {
-            let buf = x11randr::encode_list_output_properties_reply(sequence);
+            let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_PANNING => {
             let timestamp = state.randr.timestamp;
-            let buf = x11randr::encode_get_panning_reply(sequence, timestamp);
+            let buf = x11randr::encode_get_panning_reply(byte_order, sequence, timestamp);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_OUTPUT_PRIMARY => {
-            let buf = x11randr::encode_get_output_primary_reply(sequence, 0);
+            let buf = x11randr::encode_get_output_primary_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_PROVIDERS => {
             let timestamp = state.randr.timestamp;
-            let buf = x11randr::encode_get_providers_reply(sequence, timestamp);
+            let buf = x11randr::encode_get_providers_reply(byte_order, sequence, timestamp);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_MONITORS => {
@@ -1113,6 +1167,7 @@ fn handle_randr_request(
             let name_atom = state.atoms.intern("ynest-0", false).0;
             let output_ids = [crate::randr::OUTPUT_ID];
             let buf = x11randr::encode_get_monitors_reply(
+                byte_order,
                 sequence,
                 t,
                 &[x11randr::MonitorInfo {
@@ -1130,27 +1185,31 @@ fn handle_randr_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
-            let buf = x11randr::encode_get_crtc_gamma_size_reply(sequence, 0);
+            let buf = x11randr::encode_get_crtc_gamma_size_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA => {
-            let buf = x11randr::encode_get_crtc_gamma_reply(sequence, 0);
+            let buf = x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_OUTPUT_PROPERTY => {
-            let buf = x11randr::encode_get_output_property_reply(sequence);
+            let buf = x11randr::encode_get_output_property_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SELECT_INPUT => {
@@ -1174,6 +1233,7 @@ fn handle_randr_request(
             let mwidth = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
             let mheight = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
             let buf = x11randr::encode_get_screen_info_reply(
+                byte_order,
                 sequence,
                 ROOT_WINDOW.0,
                 timestamp,
@@ -1186,6 +1246,7 @@ fn handle_randr_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
@@ -1215,7 +1276,11 @@ fn handle_sync_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::sync as x11sync;
+    use yserver_protocol::x11::{ClientByteOrder, sync as x11sync};
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11sync::INITIALIZE => {
@@ -1227,17 +1292,19 @@ fn handle_sync_request(
             } else {
                 x11sync::MINOR_VERSION
             };
-            let reply = x11sync::encode_initialize_reply(sequence, major, minor_ver);
+            let reply = x11sync::encode_initialize_reply(byte_order, sequence, major, minor_ver);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::LIST_SYSTEM_COUNTERS => {
-            let reply = x11sync::encode_list_system_counters_empty_reply(sequence);
+            let reply = x11sync::encode_list_system_counters_empty_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::CREATE_COUNTER => {
@@ -1268,10 +1335,11 @@ fn handle_sync_request(
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
             let value = state.sync_counters.get(&counter).map_or(0, |c| c.value);
-            let reply = x11sync::encode_query_counter_reply(sequence, value);
+            let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::DESTROY_COUNTER => {
@@ -1308,6 +1376,7 @@ fn handle_sync_request(
                 .cloned()
                 .unwrap_or_default();
             let reply = x11sync::encode_query_alarm_reply(
+                byte_order,
                 sequence,
                 alarm.counter,
                 alarm.wait_value,
@@ -1318,6 +1387,7 @@ fn handle_sync_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::DESTROY_ALARM => {
@@ -1329,10 +1399,11 @@ fn handle_sync_request(
             // Stub.
         }
         x11sync::GET_PRIORITY => {
-            let reply = x11sync::encode_get_priority_reply(sequence, 0);
+            let reply = x11sync::encode_get_priority_reply(byte_order, sequence, 0);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         other => {
@@ -1355,14 +1426,19 @@ fn handle_shape_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::shape as x11shape;
+    use yserver_protocol::x11::{ClientByteOrder, shape as x11shape};
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11shape::QUERY_VERSION => {
-            let reply = x11shape::encode_query_version_reply(sequence);
+            let reply = x11shape::encode_query_version_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11shape::RECTANGLES => {
@@ -1433,6 +1509,7 @@ fn handle_shape_request(
             let bounding = crate::nested::region_extents(&bounding_rects);
             let clip = crate::nested::region_extents(&clip_rects);
             let reply = x11shape::encode_query_extents_reply(
+                byte_order,
                 sequence,
                 bounding_shaped,
                 clip_shaped,
@@ -1442,6 +1519,7 @@ fn handle_shape_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11shape::SELECT_INPUT => {
@@ -1461,10 +1539,11 @@ fn handle_shape_request(
                 .get(&(client_id.0, window))
                 .copied()
                 .unwrap_or(false);
-            let reply = x11shape::encode_input_selected_reply(sequence, enabled);
+            let reply = x11shape::encode_input_selected_reply(byte_order, sequence, enabled);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11shape::GET_RECTANGLES => {
@@ -1472,10 +1551,11 @@ fn handle_shape_request(
                 .map(|(w, k)| (ResourceId(w), k))
                 .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
             let rects = crate::nested::shape_rects_for(state, window, kind);
-            let reply = x11shape::encode_get_rectangles_reply(sequence, 0, &rects);
+            let reply = x11shape::encode_get_rectangles_reply(byte_order, sequence, 0, &rects);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         other => {
@@ -1498,11 +1578,16 @@ fn handle_xfixes_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::xfixes as x11xfixes;
+    use yserver_protocol::x11::{ClientByteOrder, xfixes as x11xfixes};
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11xfixes::QUERY_VERSION => {
             let reply = x11xfixes::encode_query_version_reply(
+                byte_order,
                 sequence,
                 x11xfixes::MAJOR_VERSION,
                 x11xfixes::MINOR_VERSION,
@@ -1510,6 +1595,7 @@ fn handle_xfixes_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::SELECT_SELECTION_INPUT => {
@@ -1537,10 +1623,11 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::GET_CURSOR_IMAGE => {
-            let reply = x11xfixes::encode_get_cursor_image_empty_reply(sequence);
+            let reply = x11xfixes::encode_get_cursor_image_empty_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::CREATE_REGION => {
@@ -1709,10 +1796,11 @@ fn handle_xfixes_request(
                 .map(|r| r.rects.clone())
                 .unwrap_or_default();
             let extents = crate::nested::region_extents(&rects);
-            let reply = x11xfixes::encode_fetch_region_reply(sequence, extents, &rects);
+            let reply = x11xfixes::encode_fetch_region_reply(byte_order, sequence, extents, &rects);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::CHANGE_CURSOR_BY_NAME => {
@@ -1755,8 +1843,12 @@ fn handle_composite_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::composite as x11composite;
+    use yserver_protocol::x11::{ClientByteOrder, composite as x11composite};
     const COMPOSITE_MAJOR_OPCODE: u8 = 144;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11composite::QUERY_VERSION => {
@@ -1767,10 +1859,12 @@ fn handle_composite_request(
                 "client {} #{} COMPOSITE::QueryVersion -> {}.{}",
                 client_id.0, sequence.0, major, minor_ver
             );
-            let reply = x11composite::encode_query_version_reply(sequence, major, minor_ver);
+            let reply =
+                x11composite::encode_query_version_reply(byte_order, sequence, major, minor_ver);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
@@ -1898,10 +1992,12 @@ fn handle_composite_request(
         x11composite::GET_OVERLAY_WINDOW => {
             let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
             let overlay = ROOT_WINDOW.0;
-            let reply = x11composite::encode_get_overlay_window_reply(sequence, overlay);
+            let reply =
+                x11composite::encode_get_overlay_window_reply(byte_order, sequence, overlay);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11composite::RELEASE_OVERLAY_WINDOW => {
@@ -1976,10 +2072,11 @@ fn handle_mit_shm_request(
     );
     match minor {
         shm::QUERY_VERSION => {
-            let reply = shm::encode_query_version_reply(sequence, false);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let byte_order = client.byte_order;
+            let reply = shm::encode_query_version_reply(byte_order, sequence, false);
             return Ok(write_to_client(client, client_id, &reply));
         }
         shm::ATTACH => {
@@ -2438,10 +2535,11 @@ fn handle_mit_shm_get_image(
     let visual = crate::resources::ROOT_VISUAL.0;
     #[allow(clippy::cast_possible_truncation)]
     let size = pixel_data.len() as u32;
-    let reply = shm::encode_get_image_reply(sequence, depth, visual, size);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
+    let reply = shm::encode_get_image_reply(byte_order, sequence, depth, visual, size);
     Ok(write_to_client(client, client_id, &reply))
 }
 
@@ -2511,9 +2609,14 @@ fn handle_mit_shm_create_segment(
         }
     };
     state.mit_shm_segments.insert(req.shmseg, segment);
-    let reply = yserver_protocol::x11::mit_shm::encode_create_segment_reply(sequence);
     let send_res = match state.clients.get_mut(&client_id.0) {
-        Some(client) => send_reply_with_fd(client, &reply, fd_for_client),
+        Some(client) => {
+            let reply = yserver_protocol::x11::mit_shm::encode_create_segment_reply(
+                client.byte_order,
+                sequence,
+            );
+            send_reply_with_fd(client, &reply, fd_for_client)
+        }
         None => Ok(()),
     };
     unsafe { libc::close(fd_for_client) };
@@ -2544,10 +2647,12 @@ fn handle_damage_request(
                 "client {} #{} DAMAGE::QueryVersion -> {}.{}",
                 client_id.0, sequence.0, major, minor_ver
             );
-            let reply = x11damage::encode_query_version_reply(sequence, major, minor_ver);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let byte_order = client.byte_order;
+            let reply =
+                x11damage::encode_query_version_reply(byte_order, sequence, major, minor_ver);
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11damage::CREATE => {
@@ -2656,14 +2761,16 @@ fn handle_xtest_request(
                 x11xtest::MAJOR_VERSION,
                 x11xtest::MINOR_VERSION,
             );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let byte_order = client.byte_order;
             let reply = x11xtest::encode_get_version_reply(
+                byte_order,
                 sequence,
                 u8::try_from(x11xtest::MAJOR_VERSION).unwrap_or(2),
                 x11xtest::MINOR_VERSION,
             );
-            let Some(client) = state.clients.get_mut(&client_id.0) else {
-                return Ok(RequestOutcome::Handled);
-            };
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xtest::COMPARE_CURSOR => {
@@ -2673,10 +2780,11 @@ fn handle_xtest_request(
                 "client {} #{} XTEST::CompareCursor (stub: same=true)",
                 client_id.0, sequence.0
             );
-            let reply = x11xtest::encode_compare_cursor_reply(sequence, true);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let byte_order = client.byte_order;
+            let reply = x11xtest::encode_compare_cursor_reply(byte_order, sequence, true);
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xtest::FAKE_INPUT => {
@@ -2797,8 +2905,12 @@ fn handle_present_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::present as x11present;
+    use yserver_protocol::x11::{ClientByteOrder, present as x11present};
     const PRESENT_MAJOR_OPCODE: u8 = 145;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     match minor {
         x11present::QUERY_VERSION => {
@@ -2811,6 +2923,7 @@ fn handle_present_request(
                 x11present::MINOR_VERSION
             );
             let reply = x11present::encode_query_version_reply(
+                byte_order,
                 sequence,
                 x11present::MAJOR_VERSION,
                 x11present::MINOR_VERSION,
@@ -2818,6 +2931,7 @@ fn handle_present_request(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11present::QUERY_CAPABILITIES => {
@@ -2826,11 +2940,15 @@ fn handle_present_request(
                 "client {} #{} PRESENT::QueryCapabilities -> none",
                 client_id.0, sequence.0
             );
-            let reply =
-                x11present::encode_query_capabilities_reply(sequence, x11present::CAPABILITY_NONE);
+            let reply = x11present::encode_query_capabilities_reply(
+                byte_order,
+                sequence,
+                x11present::CAPABILITY_NONE,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11present::SELECT_INPUT => {
@@ -2983,6 +3101,10 @@ fn handle_xi2_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     match minor {
@@ -2992,7 +3114,7 @@ fn handle_xi2_request(
                 "client {} #{} XIGetExtensionVersion",
                 client_id.0, sequence.0
             );
-            let mut reply = x11::fixed_reply(sequence, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
             reply.push(1);
@@ -3009,7 +3131,7 @@ fn handle_xi2_request(
         }
         45 => {
             debug!("client {} #{} XIGetClientPointer", client_id.0, sequence.0);
-            let mut reply = x11::fixed_reply(sequence, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.push(1);
             reply.push(0);
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
@@ -3061,7 +3183,7 @@ fn handle_xi2_request(
         }
         47 => {
             debug!("client {} #{} XIQueryVersion", client_id.0, sequence.0);
-            let mut reply = x11::fixed_reply(sequence, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
             reply.extend_from_slice(&[0; 20]);
@@ -3084,7 +3206,12 @@ fn handle_xi2_request(
                 infos.extend_from_slice(name.as_bytes());
                 x11::pad_vec4(&mut infos);
             }
-            let mut reply = x11::fixed_reply(sequence, 0, x11::checked_units(infos.len())? as u32);
+            let mut reply = x11::fixed_reply(
+                byte_order,
+                sequence,
+                0,
+                x11::checked_units(infos.len())? as u32,
+            );
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&infos);
@@ -3095,7 +3222,7 @@ fn handle_xi2_request(
                 "client {} #{} XIGetProperty -> not found",
                 client_id.0, sequence.0
             );
-            let mut reply = x11::fixed_reply(sequence, 0, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
         }
@@ -3116,7 +3243,12 @@ fn handle_xi2_request(
                 }
             }
             let num_masks = (masks.len() / 8) as u16;
-            let mut reply = x11::fixed_reply(sequence, 0, x11::checked_units(masks.len())? as u32);
+            let mut reply = x11::fixed_reply(
+                byte_order,
+                sequence,
+                0,
+                x11::checked_units(masks.len())? as u32,
+            );
             x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, num_masks);
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&masks);
@@ -3124,7 +3256,7 @@ fn handle_xi2_request(
         }
         40 => {
             debug!("client {} #{} XIQueryPointer", client_id.0, sequence.0);
-            let mut reply = x11::fixed_reply(sequence, 1, 6);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 1, 6);
             x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, ROOT_WINDOW.0);
             x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
             x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
@@ -3145,6 +3277,7 @@ fn handle_xi2_request(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let _byte_order = client.byte_order;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -3186,6 +3319,7 @@ fn handle_xkb_request(
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
+        let _byte_order = client.byte_order;
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
@@ -3915,8 +4049,18 @@ fn emit_x11_error(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let _byte_order = client.byte_order;
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_error(&mut buf, sequence, code, bad_value, 0, major_opcode)?;
+    x11::write_error(
+        &mut buf,
+        byte_order,
+        sequence,
+        code,
+        bad_value,
+        0,
+        major_opcode,
+    )?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -3938,13 +4082,14 @@ fn handle_get_input_focus(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let focus = if client.focused_window == ResourceId(0) {
         ROOT_WINDOW
     } else {
         client.focused_window
     };
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_input_focus_reply(&mut buf, sequence, focus)?;
+    x11::write_get_input_focus_reply(&mut buf, byte_order, sequence, focus)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -3957,8 +4102,9 @@ fn handle_query_keymap(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(40);
-    x11::write_query_keymap_reply(&mut buf, sequence)?;
+    x11::write_query_keymap_reply(&mut buf, byte_order, sequence)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -3971,8 +4117,9 @@ fn handle_list_hosts(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_list_hosts_reply(&mut buf, sequence)?;
+    x11::write_list_hosts_reply(&mut buf, byte_order, sequence)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -3985,8 +4132,9 @@ fn handle_get_pointer_mapping(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_pointer_mapping_reply(&mut buf, sequence)?;
+    x11::write_get_pointer_mapping_reply(&mut buf, byte_order, sequence)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4014,8 +4162,9 @@ fn handle_get_geometry(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_geometry_reply(&mut buf, sequence, geometry)?;
+    x11::write_get_geometry_reply(&mut buf, byte_order, sequence, geometry)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4037,8 +4186,16 @@ fn handle_query_tree(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
-    x11::write_query_tree_reply(&mut buf, sequence, ROOT_WINDOW, parent, &children)?;
+    x11::write_query_tree_reply(
+        &mut buf,
+        byte_order,
+        sequence,
+        ROOT_WINDOW,
+        parent,
+        &children,
+    )?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4058,8 +4215,9 @@ fn handle_intern_atom(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_intern_atom_reply(&mut buf, sequence, atom)?;
+    x11::write_intern_atom_reply(&mut buf, byte_order, sequence, atom)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4083,8 +4241,9 @@ fn handle_list_properties(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32 + atoms.len() * 4);
-    x11::write_list_properties_reply(&mut buf, sequence, &atoms)?;
+    x11::write_list_properties_reply(&mut buf, byte_order, sequence, &atoms)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4513,8 +4672,9 @@ fn handle_ge_request(
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
+        let byte_order = client.byte_order;
         let mut buf: Vec<u8> = Vec::with_capacity(32);
-        x11::write_ge_query_version_reply(&mut buf, sequence)?;
+        x11::write_ge_query_version_reply(&mut buf, byte_order, sequence)?;
         return Ok(write_to_client(client, client_id, &buf));
     }
     Ok(RequestOutcome::Handled)
@@ -4542,9 +4702,10 @@ fn handle_big_requests_request(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     client.big_requests_enabled = true;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_big_requests_enable_reply(&mut buf, sequence, 256 * 1024)?;
+    x11::write_big_requests_enable_reply(&mut buf, byte_order, sequence, 256 * 1024)?;
     let outcome = write_to_client(client, client_id, &buf);
     // Unblock the reader so subsequent requests use big-framing.
     if let Some(tx) = client.reader_control.as_ref() {
@@ -4584,8 +4745,9 @@ fn handle_get_window_attributes(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(48);
-    x11::write_get_window_attributes_reply(&mut buf, sequence, attrs)?;
+    x11::write_get_window_attributes_reply(&mut buf, byte_order, sequence, attrs)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4647,8 +4809,9 @@ fn handle_circulate_window(
         .into_iter()
         .next();
     if let Some(target) = redirect_target {
-        let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, _order| {
-            let _ = x11::write_circulate_request_event(buf, seq, container, child, direction);
+        let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
+            let _ =
+                x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
         let _ = state.resources.circulate_window(container, direction);
@@ -4660,8 +4823,8 @@ fn handle_circulate_window(
                 targets.push(cid);
             }
         }
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, _order| {
-            let _ = x11::write_circulate_notify_event(buf, seq, child, child, direction);
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
     }
     debug!("client {} #{} CirculateWindow", client_id.0, sequence.0);
@@ -4772,9 +4935,11 @@ fn handle_query_extension(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     x11::write_query_extension_reply(
         &mut buf,
+        byte_order,
         sequence,
         present,
         major_opcode,
@@ -4795,8 +4960,9 @@ fn handle_list_extensions(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32 + names.len() * 16);
-    x11::write_list_extensions_reply(&mut buf, sequence, &names)?;
+    x11::write_list_extensions_reply(&mut buf, byte_order, sequence, &names)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -4868,7 +5034,7 @@ fn handle_get_image(
     let Some(req) = x11::get_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
-    let order = state
+    let byte_order = state
         .clients
         .get(&client_id.0)
         .map_or(yserver_protocol::x11::ClientByteOrder::LittleEndian, |c| {
@@ -4911,8 +5077,8 @@ fn handle_get_image(
         let mut buf: Vec<u8> = Vec::with_capacity(64);
         x11::write_get_image_reply(
             &mut buf,
+            byte_order,
             sequence,
-            order,
             &req,
             crate::resources::ROOT_VISUAL.0,
         )?;
@@ -4921,6 +5087,7 @@ fn handle_get_image(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let _byte_order = client.byte_order;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -5677,6 +5844,7 @@ fn handle_list_fonts(
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
+        let _byte_order = client.byte_order;
         return Ok(write_to_client(client, client_id, &reply));
     }
     Ok(RequestOutcome::Handled)
@@ -5700,6 +5868,7 @@ fn handle_list_fonts_with_info(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let _byte_order = client.byte_order;
             let outcome = write_to_client(client, client_id, &reply);
             if matches!(outcome, RequestOutcome::Disconnect(_)) {
                 return Ok(outcome);
@@ -5722,8 +5891,8 @@ fn handle_change_keyboard_mapping(
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
     let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, _order| {
-        let _ = x11::write_mapping_notify_event(buf, seq, 1, first_keycode, count);
+    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
     });
     debug!(
         "client {} #{} ChangeKeyboardMapping",
@@ -5749,11 +5918,21 @@ fn handle_get_keyboard_mapping(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     if let Some((kpc, keysyms)) = proxied {
-        x11::write_get_keyboard_mapping_reply_from_keysyms(&mut buf, sequence, kpc, &keysyms)?;
+        x11::write_get_keyboard_mapping_reply_from_keysyms(
+            &mut buf, byte_order, sequence, kpc, &keysyms,
+        )?;
     } else {
-        x11::write_get_keyboard_mapping_reply(&mut buf, sequence, first_keycode, keycode_count, 4)?;
+        x11::write_get_keyboard_mapping_reply(
+            &mut buf,
+            byte_order,
+            sequence,
+            first_keycode,
+            keycode_count,
+            4,
+        )?;
     }
     Ok(write_to_client(client, client_id, &buf))
 }
@@ -5769,8 +5948,9 @@ fn handle_alloc_color(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_alloc_color_reply(&mut buf, sequence, color)?;
+    x11::write_alloc_color_reply(&mut buf, byte_order, sequence, color)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -5799,8 +5979,9 @@ fn handle_alloc_named_color(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_alloc_named_color_reply(&mut buf, sequence, color)?;
+    x11::write_alloc_named_color_reply(&mut buf, byte_order, sequence, color)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -5820,8 +6001,9 @@ fn handle_query_colors(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32 + pixels.len() * 8);
-    x11::write_query_colors_reply(&mut buf, sequence, &pixels)?;
+    x11::write_query_colors_reply(&mut buf, byte_order, sequence, &pixels)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -5850,8 +6032,9 @@ fn handle_lookup_color(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_lookup_color_reply(&mut buf, sequence, color)?;
+    x11::write_lookup_color_reply(&mut buf, byte_order, sequence, color)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6102,7 +6285,12 @@ fn handle_convert_selection(
             template[12..16].copy_from_slice(&selection.0.to_le_bytes());
             template[16..20].copy_from_slice(&target_atom.0.to_le_bytes());
             // property = 0 (None): conversion failed.
-            let _dropped = fanout_raw_event_to_clients(state, &[rt], &template);
+            let _dropped = fanout_raw_event_to_clients(
+                state,
+                &[rt],
+                &template,
+                yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            );
         }
         debug!(
             "client {} #{} ConvertSelection: no owner, sent SelectionNotify(None)",
@@ -6119,6 +6307,16 @@ fn handle_send_event(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    // The 32-byte event template inside SendEvent is in the *sender's*
+    // byte order. Note: the request body's typed prefix (destination +
+    // event_mask) was already swapped to LE by request_swap; only the
+    // template itself stays in the sender's byte order so we can
+    // re-encode per recipient.
+    let sender_byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let Some(req) = x11::send_event_request(header.data, body) else {
         debug!(
             "client {} #{} SendEvent (parse failed)",
@@ -6155,7 +6353,7 @@ fn handle_send_event(
             current = parent;
         }
     };
-    let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy);
+    let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
     debug!(
         "client {} #{} SendEvent type={} dest=0x{:x}",
         client_id.0,
@@ -6189,8 +6387,9 @@ fn handle_get_atom_name(
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let byte_order = client.byte_order;
             let mut buf: Vec<u8> = Vec::with_capacity(32 + name.len());
-            x11::write_get_atom_name_reply(&mut buf, sequence, &name)?;
+            x11::write_get_atom_name_reply(&mut buf, byte_order, sequence, &name)?;
             Ok(write_to_client(client, client_id, &buf))
         }
         None => emit_x11_error(state, client_id, sequence, x11::error::BAD_ATOM, atom.0, 17),
@@ -6226,8 +6425,9 @@ fn handle_query_pointer(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_query_pointer_reply(&mut buf, sequence, reply_data)?;
+    x11::write_query_pointer_reply(&mut buf, byte_order, sequence, reply_data)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6271,11 +6471,14 @@ fn handle_get_modifier_mapping(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     if let Some((kpm, keys)) = proxied {
-        x11::write_get_modifier_mapping_reply_with_keycodes(&mut buf, sequence, kpm, &keys)?;
+        x11::write_get_modifier_mapping_reply_with_keycodes(
+            &mut buf, byte_order, sequence, kpm, &keys,
+        )?;
     } else {
-        x11::write_get_modifier_mapping_reply(&mut buf, sequence)?;
+        x11::write_get_modifier_mapping_reply(&mut buf, byte_order, sequence)?;
     }
     Ok(write_to_client(client, client_id, &buf))
 }
@@ -6393,6 +6596,11 @@ fn handle_get_property(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let Some(req) = x11::get_property_request(header.data, body) else {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 20);
     };
@@ -6461,6 +6669,7 @@ fn handle_get_property(
         let mut buf: Vec<u8> = Vec::with_capacity(32 + slice.value.len());
         x11::write_get_property_reply(
             &mut buf,
+            byte_order,
             sequence,
             x11::GetPropertyReply {
                 format: slice.format,
@@ -6548,8 +6757,9 @@ fn handle_query_font(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
-    x11::write_query_font_reply(&mut buf, sequence, &metrics)?;
+    x11::write_query_font_reply(&mut buf, byte_order, sequence, &metrics)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6572,8 +6782,9 @@ fn handle_query_text_extents(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_query_text_extents_reply(&mut buf, sequence, extents)?;
+    x11::write_query_text_extents_reply(&mut buf, byte_order, sequence, extents)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6597,8 +6808,9 @@ fn handle_query_best_size(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_query_best_size_reply(&mut buf, sequence, width, height)?;
+    x11::write_query_best_size_reply(&mut buf, byte_order, sequence, width, height)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6627,8 +6839,9 @@ fn handle_grab_pointer(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_grab_reply(&mut buf, sequence, 0)?;
+    x11::write_grab_reply(&mut buf, byte_order, sequence, 0)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6749,8 +6962,9 @@ fn handle_grab_keyboard(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_grab_reply(&mut buf, sequence, 0)?;
+    x11::write_grab_reply(&mut buf, byte_order, sequence, 0)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6844,8 +7058,9 @@ fn handle_get_selection_owner(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_selection_owner_reply(&mut buf, sequence, owner)?;
+    x11::write_get_selection_owner_reply(&mut buf, byte_order, sequence, owner)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -6906,8 +7121,9 @@ fn handle_translate_coordinates(
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
+    let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_translate_coordinates_reply(&mut buf, sequence, child, dst_x, dst_y)?;
+    x11::write_translate_coordinates_reply(&mut buf, byte_order, sequence, child, dst_x, dst_y)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 

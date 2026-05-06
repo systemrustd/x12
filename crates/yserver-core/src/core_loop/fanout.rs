@@ -212,8 +212,19 @@ pub fn emit_xi2_focus_event_to_state(
     if targets.is_empty() {
         return Vec::new();
     }
-    fanout_event_to_clients(state, &targets, |buf, seq, _order| {
-        x11::encode_xi2_focus_event(buf, seq, xi2_major_opcode, evtype, 3, 0, window, 0, 0);
+    fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        x11::encode_xi2_focus_event(
+            buf,
+            order,
+            seq,
+            xi2_major_opcode,
+            evtype,
+            3,
+            0,
+            window,
+            0,
+            0,
+        );
     })
 }
 
@@ -313,15 +324,26 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
     }
 }
 
-/// Raw-event variant: `event` is a 32-byte template; bytes 2..4 are
-/// patched with each client's per-stream sequence number.
+/// Raw-event variant: `event` is a 32-byte template encoded in
+/// `template_byte_order`. For each recipient we copy the template,
+/// re-encode into the recipient's byte order via the per-event-type
+/// swap table, then patch the sequence number in the recipient's
+/// byte order.
+///
+/// `template_byte_order` is `LittleEndian` for events the server
+/// builds itself (SelectionNotify, RANDR, …) and the sender's byte
+/// order for `SendEvent`.
 pub fn fanout_raw_event_to_clients(
     state: &mut ServerState,
     client_ids: &[ClientId],
     event: &[u8; 32],
+    template_byte_order: ClientByteOrder,
 ) -> Vec<ClientId> {
+    use yserver_protocol::x11::wire_swap;
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
+    let event_type = event[0] & 0x7f;
+    let entries = wire_swap::core_event_swap_table(event_type);
     for cid in client_ids {
         if !seen.insert(cid.0) {
             continue;
@@ -329,10 +351,21 @@ pub fn fanout_raw_event_to_clients(
         let Some(client) = state.clients.get_mut(&cid.0) else {
             continue;
         };
-        let seq = client.last_sequence.load(Ordering::Relaxed);
+        let recipient_order = client.byte_order;
         let mut buf = *event;
-        buf[2] = (seq & 0xff) as u8;
-        buf[3] = ((seq >> 8) & 0xff) as u8;
+        // Step 1: undo source byte order to native LE so the swap to
+        // recipient byte order produces correct bytes.
+        wire_swap::swap_in_place(entries, template_byte_order, &mut buf);
+        // Step 2: convert from native LE to recipient byte order.
+        wire_swap::swap_in_place(entries, recipient_order, &mut buf);
+        // Patch the sequence number in the recipient's byte order.
+        let seq = client.last_sequence.load(Ordering::Relaxed);
+        let seq_bytes = match recipient_order {
+            ClientByteOrder::LittleEndian => seq.to_le_bytes(),
+            ClientByteOrder::BigEndian => seq.to_be_bytes(),
+        };
+        buf[2] = seq_bytes[0];
+        buf[3] = seq_bytes[1];
         match client_io::write_or_buffer(client, &buf) {
             Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
             Ok(WriteOutcome::Disconnect) => disconnected.push(*cid),
@@ -438,8 +471,12 @@ mod tests {
             .store(0x5678, Ordering::Relaxed);
 
         let template = [0xCDu8; 32];
-        let dropped =
-            fanout_raw_event_to_clients(&mut state, &[ClientId(1), ClientId(2)], &template);
+        let dropped = fanout_raw_event_to_clients(
+            &mut state,
+            &[ClientId(1), ClientId(2)],
+            &template,
+            ClientByteOrder::LittleEndian,
+        );
         assert!(dropped.is_empty());
 
         let mut got1 = [0u8; 32];

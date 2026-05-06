@@ -87,9 +87,10 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
         })
         .collect();
     if !xi2_targets.is_empty() {
-        let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, _order| {
+        let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
             x11::encode_xi2_device_event(
                 buf,
+                order,
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,

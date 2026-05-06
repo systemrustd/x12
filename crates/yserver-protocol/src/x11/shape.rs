@@ -1,4 +1,8 @@
-use super::{SequenceNumber, xfixes::RegionRect};
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_i16, write_u16, write_u32},
+    xfixes::RegionRect,
+};
 
 pub const QUERY_VERSION: u8 = 0;
 pub const RECTANGLES: u8 = 1;
@@ -80,12 +84,17 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
+fn fixed_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    data: u8,
+    length: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(data);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&length.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length);
     out
 }
 
@@ -195,10 +204,13 @@ pub fn parse_rectangles(mut bytes: &[u8]) -> Vec<RegionRect> {
 }
 
 #[must_use]
-pub fn encode_query_version_reply(sequence: SequenceNumber) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&MAJOR_VERSION.to_le_bytes());
-    out.extend_from_slice(&MINOR_VERSION.to_le_bytes());
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    write_u16(byte_order, &mut out, MAJOR_VERSION);
+    write_u16(byte_order, &mut out, MINOR_VERSION);
     out.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -206,32 +218,37 @@ pub fn encode_query_version_reply(sequence: SequenceNumber) -> Vec<u8> {
 
 #[must_use]
 pub fn encode_query_extents_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     bounding_shaped: bool,
     clip_shaped: bool,
     bounding: RegionRect,
     clip: RegionRect,
 ) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
     out.push(u8::from(bounding_shaped));
     out.push(u8::from(clip_shaped));
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&bounding.x.to_le_bytes());
-    out.extend_from_slice(&bounding.y.to_le_bytes());
-    out.extend_from_slice(&bounding.width.to_le_bytes());
-    out.extend_from_slice(&bounding.height.to_le_bytes());
-    out.extend_from_slice(&clip.x.to_le_bytes());
-    out.extend_from_slice(&clip.y.to_le_bytes());
-    out.extend_from_slice(&clip.width.to_le_bytes());
-    out.extend_from_slice(&clip.height.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    write_u16(byte_order, &mut out, 0);
+    write_i16(byte_order, &mut out, bounding.x);
+    write_i16(byte_order, &mut out, bounding.y);
+    write_u16(byte_order, &mut out, bounding.width);
+    write_u16(byte_order, &mut out, bounding.height);
+    write_i16(byte_order, &mut out, clip.x);
+    write_i16(byte_order, &mut out, clip.y);
+    write_u16(byte_order, &mut out, clip.width);
+    write_u16(byte_order, &mut out, clip.height);
+    write_u32(byte_order, &mut out, 0);
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 #[must_use]
-pub fn encode_input_selected_reply(sequence: SequenceNumber, enabled: bool) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, u8::from(enabled), 0);
+pub fn encode_input_selected_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    enabled: bool,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, u8::from(enabled), 0);
     out.extend_from_slice(&[0u8; 24]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -239,21 +256,23 @@ pub fn encode_input_selected_reply(sequence: SequenceNumber, enabled: bool) -> V
 
 #[must_use]
 pub fn encode_get_rectangles_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     ordering: u8,
     rects: &[RegionRect],
 ) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)]
     let length = (rects.len() * 2) as u32;
-    let mut out = fixed_reply(sequence, ordering, length);
+    let mut out = fixed_reply(byte_order, sequence, ordering, length);
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+    let count = rects.len() as u32;
+    write_u32(byte_order, &mut out, count);
     out.extend_from_slice(&[0u8; 20]);
     for rect in rects {
-        out.extend_from_slice(&rect.x.to_le_bytes());
-        out.extend_from_slice(&rect.y.to_le_bytes());
-        out.extend_from_slice(&rect.width.to_le_bytes());
-        out.extend_from_slice(&rect.height.to_le_bytes());
+        write_i16(byte_order, &mut out, rect.x);
+        write_i16(byte_order, &mut out, rect.y);
+        write_u16(byte_order, &mut out, rect.width);
+        write_u16(byte_order, &mut out, rect.height);
     }
     debug_assert_eq!(out.len(), 32 + rects.len() * 8);
     out
@@ -265,7 +284,7 @@ mod tests {
 
     #[test]
     fn query_version_reply_shape() {
-        let reply = encode_query_version_reply(SequenceNumber(4));
+        let reply = encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(4));
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
@@ -281,7 +300,14 @@ mod tests {
             width: 3,
             height: 4,
         };
-        let reply = encode_query_extents_reply(SequenceNumber(8), true, false, rect, rect);
+        let reply = encode_query_extents_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(8),
+            true,
+            false,
+            rect,
+            rect,
+        );
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[8], 1);
         assert_eq!(reply[9], 0);
@@ -290,7 +316,8 @@ mod tests {
 
     #[test]
     fn input_selected_reply_shape() {
-        let reply = encode_input_selected_reply(SequenceNumber(8), true);
+        let reply =
+            encode_input_selected_reply(ClientByteOrder::LittleEndian, SequenceNumber(8), true);
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[1], 1);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
@@ -304,7 +331,12 @@ mod tests {
             width: 3,
             height: 4,
         }];
-        let reply = encode_get_rectangles_reply(SequenceNumber(9), 0, &rects);
+        let reply = encode_get_rectangles_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0,
+            &rects,
+        );
         assert_eq!(reply.len(), 40);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 1);

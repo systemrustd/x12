@@ -160,6 +160,192 @@ pub fn validate_core_request_length(opcode: u8, length_units: u32) -> bool {
     }
 }
 
+/// Helper: round `bytes` up to the next 4-byte multiple, expressed
+/// in 4-byte units.
+const fn pad_units(bytes: u32) -> u32 {
+    (bytes + 3) / 4
+}
+
+const fn read_u16_le(b: &[u8]) -> u32 {
+    (b[0] as u32) | ((b[1] as u32) << 8)
+}
+
+const fn read_u32_le(b: &[u8]) -> u32 {
+    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+}
+
+/// Compute the *exact* required `length_units` for a variable-length
+/// core opcode given its header.data byte and (LE-decoded) body.
+/// Returns `None` for opcodes whose length is fully determined by
+/// `core_request_length` (i.e., fixed) or for those we don't model
+/// content-aware.
+///
+/// Body must be at least the spec minimum length; callers should
+/// have already passed `validate_core_request_length`.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option<u32> {
+    match opcode {
+        // 1 CreateWindow: 8 + popcount(value_mask u32 at body[24..28])
+        1 if body.len() >= 28 => {
+            let mask = read_u32_le(&body[24..28]);
+            Some(8 + mask.count_ones())
+        }
+        // 2 ChangeWindowAttributes: 3 + popcount(mask u32 at body[4..8])
+        2 if body.len() >= 8 => {
+            let mask = read_u32_le(&body[4..8]);
+            Some(3 + mask.count_ones())
+        }
+        // 12 ConfigureWindow: 3 + popcount(mask u16 at body[4..6])
+        12 if body.len() >= 6 => {
+            let mask = read_u16_le(&body[4..6]);
+            Some(3 + mask.count_ones())
+        }
+        // 16 InternAtom: 2 + pad_units(name_len)
+        16 if body.len() >= 2 => {
+            let nlen = read_u16_le(&body[0..2]);
+            Some(2 + pad_units(nlen))
+        }
+        // 18 ChangeProperty: 6 + pad_units(value_len * format / 8)
+        // header.data = format ∈ {8, 16, 32}. body[12..16] = value_len (u32, units).
+        18 if body.len() >= 16 => {
+            let format = u32::from(header_data);
+            if format != 8 && format != 16 && format != 32 {
+                return None;
+            }
+            let value_len = read_u32_le(&body[12..16]);
+            let bytes = value_len.checked_mul(format / 8)?;
+            Some(6 + pad_units(bytes))
+        }
+        // 45 OpenFont: 3 + pad_units(name_len u16 at body[4..6])
+        45 if body.len() >= 6 => {
+            let nlen = read_u16_le(&body[4..6]);
+            Some(3 + pad_units(nlen))
+        }
+        // 49 ListFonts / 50 ListFontsWithInfo: 2 + pad_units(name_len u16 at body[2..4])
+        49 | 50 if body.len() >= 4 => {
+            let nlen = read_u16_le(&body[2..4]);
+            Some(2 + pad_units(nlen))
+        }
+        // 55 CreateGC: 4 + popcount(mask u32 at body[8..12])
+        55 if body.len() >= 12 => {
+            let mask = read_u32_le(&body[8..12]);
+            Some(4 + mask.count_ones())
+        }
+        // 56 ChangeGC: 3 + popcount(mask u32 at body[4..8])
+        56 if body.len() >= 8 => {
+            let mask = read_u32_le(&body[4..8]);
+            Some(3 + mask.count_ones())
+        }
+        // 58 SetDashes: 3 + pad_units(ndashes u16 at body[6..8])
+        58 if body.len() >= 8 => {
+            let ndash = read_u16_le(&body[6..8]);
+            Some(3 + pad_units(ndash))
+        }
+        // 85 AllocNamedColor: 3 + pad_units(name_len u16 at body[4..6])
+        // 92 LookupColor: same shape
+        85 | 92 if body.len() >= 6 => {
+            let nlen = read_u16_le(&body[4..6]);
+            Some(3 + pad_units(nlen))
+        }
+        // 90 StoreNamedColor: 4 + pad_units(name_len u16 at body[8..10])
+        90 if body.len() >= 10 => {
+            let nlen = read_u16_le(&body[8..10]);
+            Some(4 + pad_units(nlen))
+        }
+        // 98 QueryExtension: 2 + pad_units(name_len u16 at body[0..2])
+        98 if body.len() >= 2 => {
+            let nlen = read_u16_le(&body[0..2]);
+            Some(2 + pad_units(nlen))
+        }
+        // 100 ChangeKeyboardMapping: 2 + keycode_count * keysyms_per_keycode
+        // header.data = keycode_count, body[1] = keysyms_per_keycode
+        100 if body.len() >= 2 => {
+            let kpk = u32::from(body[1]);
+            let count = u32::from(header_data);
+            Some(2 + count.checked_mul(kpk)?)
+        }
+        // 102 ChangeKeyboardControl: 2 + popcount(mask u32 at body[0..4])
+        102 if body.len() >= 4 => {
+            let mask = read_u32_le(&body[0..4]);
+            Some(2 + mask.count_ones())
+        }
+        // 109 ChangeHosts: 2 + pad_units(nbytes u16 at body[2..4])
+        109 if body.len() >= 4 => {
+            let n = read_u16_le(&body[2..4]);
+            Some(2 + pad_units(n))
+        }
+        // 114 RotateProperties: 3 + nprops (u16 at body[4..6])
+        114 if body.len() >= 6 => {
+            let n = read_u16_le(&body[4..6]);
+            Some(3 + n)
+        }
+        // 116 SetPointerMapping: 1 + pad_units(map_len = header.data)
+        116 => Some(1 + pad_units(u32::from(header_data))),
+        // 118 SetModifierMapping: 1 + 2 * keycodes_per_modifier (header.data)
+        118 => Some(1 + 2 * u32::from(header_data)),
+        _ => None,
+    }
+}
+
+/// Returns `true` iff the request's `length_units` matches the exact
+/// content-derived required length, when applicable. Returns `true`
+/// for opcodes we don't model (the simple AtLeast/Fixed check from
+/// `validate_core_request_length` is the only gate for those).
+#[must_use]
+pub fn validate_exact_request_length(
+    opcode: u8,
+    header_data: u8,
+    length_units: u32,
+    body: &[u8],
+) -> bool {
+    exact_required_length(opcode, header_data, body).map_or(true, |req| length_units == req)
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+
+    #[test]
+    fn alloc_color_is_not_modeled() {
+        // Fixed-length AllocColor (84) is fully covered by Fixed(4); no
+        // content-aware check needed.
+        assert!(exact_required_length(84, 0, &[0; 12]).is_none());
+    }
+
+    #[test]
+    fn change_gc_zero_mask_is_3_units() {
+        // body: gc(4) + mask(4) = 8 bytes, mask = 0, no values.
+        let body = [0u8; 8];
+        assert_eq!(exact_required_length(56, 0, &body), Some(3));
+    }
+
+    #[test]
+    fn change_gc_two_bits_set_is_5_units() {
+        let mut body = [0u8; 8];
+        body[4] = 0b0000_0011; // mask = 3
+        assert_eq!(exact_required_length(56, 0, &body), Some(5));
+    }
+
+    #[test]
+    fn intern_atom_eight_byte_name_is_4_units() {
+        let mut body = [0u8; 12];
+        body[0] = 8; // nlen LO
+        body[1] = 0;
+        // Required = 2 + ceil(8/4) = 2 + 2 = 4
+        assert_eq!(exact_required_length(16, 0, &body), Some(4));
+    }
+
+    #[test]
+    fn change_keyboard_mapping_3_keycodes_2_keysyms_each_is_8_units() {
+        let mut body = [0u8; 4];
+        body[1] = 2; // keysyms_per_keycode
+        // header.data = 3 keycodes
+        // Required = 2 + 3 * 2 = 8
+        assert_eq!(exact_required_length(100, 3, &body), Some(8));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LenSpec, core_request_length, validate_core_request_length};

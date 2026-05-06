@@ -31,7 +31,7 @@ use std::{
 use crossbeam_channel::bounded;
 use log::{info, warn};
 
-use yserver_protocol::x11::{self, ClientByteOrder, ClientId};
+use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
@@ -125,14 +125,10 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
     let setup = x11::read_setup_request(&mut stream)?;
-    if setup.byte_order != ClientByteOrder::LittleEndian {
-        x11::write_setup_failed(
-            &mut stream,
-            setup.byte_order,
-            "ynest currently supports only little-endian clients",
-        )?;
-        return Ok(());
-    }
+    info!(
+        "client {} setup: byte_order={:?} protocol {}.{}",
+        id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
+    );
 
     // Sync rendezvous with the core: allocate ids + snapshot geometry.
     let (response_tx, response_rx) = bounded::<SetupAllocateResponse>(1);
@@ -166,6 +162,7 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
 
     x11::write_setup_success(
         &mut stream,
+        setup.byte_order,
         x11::SetupSuccess {
             protocol_major: setup.protocol_major,
             protocol_minor: setup.protocol_minor,
@@ -224,6 +221,7 @@ mod tests {
         io::{Read, Write},
         time::Instant,
     };
+    use yserver_protocol::x11::ClientByteOrder;
 
     /// Hand-encode a minimal little-endian SetupRequest with empty auth.
     fn write_setup_request(s: &mut UnixStream) -> io::Result<()> {
@@ -340,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_order_mismatch_writes_setup_failed_and_no_complete() {
+    fn big_endian_setup_completes_with_be_encoded_reply() {
         let (poll, sender, rx) = channel().unwrap();
         let _ = poll;
         let registry = make_registry();
@@ -350,17 +348,42 @@ mod tests {
         spawn(id, server_side, sender, registry.clone()).unwrap();
         write_big_endian_setup(&mut client_side).unwrap();
 
-        // First byte of setup_failed is 0.
-        let head = read_n_with_timeout(&mut client_side, 8, Duration::from_secs(2)).unwrap();
-        assert_eq!(head[0], 0, "first byte should be setup_failed code");
+        // Core sees SetupAllocate.
+        let alloc_msg = wait_for_message(&rx, Duration::from_secs(2)).unwrap();
+        let response_tx = match alloc_msg {
+            Message::SetupAllocate { response_tx, .. } => response_tx,
+            other => panic!("expected SetupAllocate, got {other:?}"),
+        };
+        response_tx
+            .send(SetupAllocateResponse {
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                screen_width_px: 800,
+                screen_height_px: 600,
+                current_input_masks: 0,
+            })
+            .unwrap();
 
-        // No SetupAllocate or ClientSetupComplete should arrive.
-        let elapsed = Instant::now();
-        while elapsed.elapsed() < Duration::from_millis(200) {
-            if let Some(m) = try_recv(&rx) {
-                panic!("unexpected message after byte-order mismatch: {m:?}");
+        // Reply header: success(1), pad, protocol_major (BE u16),
+        // protocol_minor (BE u16), additional_data length (BE u16).
+        let head = read_n_with_timeout(&mut client_side, 8, Duration::from_secs(2)).unwrap();
+        assert_eq!(head[0], 1, "first byte should be setup_success code");
+        // protocol_major was 11 — BE encodes it as [0x00, 0x0b] at head[2..4].
+        assert_eq!(head[2..4], [0x00, 0x0b]);
+        // additional_data length lives at head[6..8] in BE.
+        let extra_words = u16::from_be_bytes([head[6], head[7]]);
+        let extra_bytes = (extra_words as usize) * 4;
+        if extra_bytes > 0 {
+            let _ = read_n_with_timeout(&mut client_side, extra_bytes, Duration::from_secs(2));
+        }
+
+        // Core sees ClientSetupComplete with BigEndian byte_order.
+        let complete = wait_for_message(&rx, Duration::from_secs(2)).unwrap();
+        match complete {
+            Message::ClientSetupComplete { byte_order, .. } => {
+                assert_eq!(byte_order, ClientByteOrder::BigEndian);
             }
-            std::thread::sleep(Duration::from_millis(10));
+            other => panic!("expected ClientSetupComplete, got {other:?}"),
         }
 
         wait_until(Duration::from_secs(2), || {

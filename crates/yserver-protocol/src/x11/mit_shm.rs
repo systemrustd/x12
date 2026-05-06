@@ -9,7 +9,10 @@
 //! (minor 1) is rejected with `BadValue` since shared SysV memory across
 //! sandbox boundaries is unreliable.
 
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_u16, write_u32},
+};
 
 pub const QUERY_VERSION: u8 = 0;
 pub const ATTACH: u8 = 1;
@@ -221,12 +224,15 @@ pub fn parse_get_image(body: &[u8]) -> Option<GetImageRequest> {
 /// `nfd = 1` and a length-zero body; the actual file descriptor is
 /// delivered alongside via `SCM_RIGHTS` in the same `sendmsg`.
 #[must_use]
-pub fn encode_create_segment_reply(sequence: SequenceNumber) -> Vec<u8> {
+pub fn encode_create_segment_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
     out.push(1); // nfd = 1
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // length = 0
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length = 0
     out.extend_from_slice(&[0u8; 24]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -240,16 +246,20 @@ pub fn encode_create_segment_reply(sequence: SequenceNumber) -> Vec<u8> {
 /// segment. ynest answers `false` — see the design doc — because we
 /// snapshot the segment at `CreatePixmap` time.
 #[must_use]
-pub fn encode_query_version_reply(sequence: SequenceNumber, shared_pixmaps: bool) -> Vec<u8> {
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    shared_pixmaps: bool,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
     out.push(u8::from(shared_pixmaps));
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // length = 0
-    out.extend_from_slice(&MAJOR_VERSION.to_le_bytes());
-    out.extend_from_slice(&MINOR_VERSION.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // uid
-    out.extend_from_slice(&0u16.to_le_bytes()); // gid
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length = 0
+    write_u16(byte_order, &mut out, MAJOR_VERSION);
+    write_u16(byte_order, &mut out, MINOR_VERSION);
+    write_u16(byte_order, &mut out, 0); // uid
+    write_u16(byte_order, &mut out, 0); // gid
     out.push(PIXMAP_FORMAT_Z_PIXMAP);
     out.extend_from_slice(&[0u8; 15]);
     debug_assert_eq!(out.len(), 32);
@@ -261,6 +271,7 @@ pub fn encode_query_version_reply(sequence: SequenceNumber, shared_pixmaps: bool
 /// the shm segment (we wrote them there before sending the reply).
 #[must_use]
 pub fn encode_get_image_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     depth: u8,
     visual: u32,
@@ -269,10 +280,10 @@ pub fn encode_get_image_reply(
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
     out.push(depth);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // length (no inline data)
-    out.extend_from_slice(&visual.to_le_bytes());
-    out.extend_from_slice(&size.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length (no inline data)
+    write_u32(byte_order, &mut out, visual);
+    write_u32(byte_order, &mut out, size);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -284,7 +295,8 @@ mod tests {
 
     #[test]
     fn query_version_reply_advertises_v1_2_with_shared_pixmaps_false() {
-        let reply = encode_query_version_reply(SequenceNumber(7), false);
+        let reply =
+            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(7), false);
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1, "reply byte");
         assert_eq!(reply[1], 0, "shared_pixmaps = false");
@@ -296,7 +308,8 @@ mod tests {
 
     #[test]
     fn query_version_reply_can_advertise_shared_pixmaps_true() {
-        let reply = encode_query_version_reply(SequenceNumber(1), true);
+        let reply =
+            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(1), true);
         assert_eq!(reply[1], 1);
     }
 

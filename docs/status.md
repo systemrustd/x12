@@ -2116,7 +2116,7 @@ boot every WM in the matrix.
   for their test fixtures — fold those tests onto the
   state-borrowing helpers and delete.
 
-### Phase 6.9 — XTEST + xts5 regression coverage (in progress)
+### Phase 6.9 — XTEST + xts5 regression coverage (BadLength + BE client support landed)
 
 Goal: stand up the X.Org X Test Suite (xts5) as the primary
 protocol-coverage feedback loop, replacing ad-hoc manual WM smoke for
@@ -2150,34 +2150,78 @@ the suite tell us where the real gaps are.
   |------------|-----:|-----:|------:|-----:|------:|--------|
   | 2026-05-06 |    1 |  210 |   160 |   11 |     7 | First run after XTEST landed. |
   | 2026-05-06 |    1 |   74 |   296 |   11 |     7 | `BadLength` enforcement at the top of `process_request`. |
+  | 2026-05-06 |   26 |   91 |   252 |    0 |     0 | BE client support phases 0+A+B+C+D+D1 (reader, setup, errors, replies, events, shared `wire_swap` module). |
+  | 2026-05-06 |  195 |   78 |    97 |    0 |     0 | Phase E — per-opcode inbound request body swap. **PASS 26 → 195**. |
+  | 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 + F — raw event templates per-recipient + content-aware BadLength. **PASS 195 → 229**. |
 
 - **`BadLength` enforcement landed.** A per-opcode length contract
-  table covers all of opcodes 1–127: `Fixed(n)` for fixed-length
-  requests, `AtLeast(n)` for variable. `process_request` validates
-  `header.length_units` against the contract before dispatch and
-  replies `BadLength` on mismatch. Cascading effect on the tally:
-  136 tests moved FAIL → UNRES. Each AllocColor-style probe runs
-  native + reversed-byte-sex sub-checks; previously the native
-  sub-checks FAILed (BadLength not raised) so the test result was
-  FAIL; now those sub-checks pass but the BE sub-checks still UNRES
-  on connection rejection. The `BadLength` work is correct on its
-  own merits — surfacing it as a PASS-count delta requires the
-  big-endian fix below.
+  table covers all of opcodes 1–127 in
+  `crates/yserver-protocol/src/x11/request_lengths.rs`: `Fixed(n)`
+  for fixed-length requests, `AtLeast(n)` for variable.
+  `process_request` validates `header.length_units` against the
+  contract before dispatch and replies `BadLength` on mismatch.
+  A second pass (`exact_required_length`) fires content-aware
+  `BadLength` for variable-length opcodes by computing the actual
+  required length from the body (popcount of value-masks, length-
+  prefixed string sizes, `value_len * format / 8` for
+  `ChangeProperty`, etc.).
 
-#### Phase 6.9 follow-ups (next quick wins)
+- **Big-endian client support landed.** xts5 opens a reversed-byte-
+  sex probe connection on every test purpose; previously the setup
+  gate refused those, gating the entire pass count. Now BE clients
+  are accepted end-to-end:
 
-Ranked by ROI on the xts tally:
+  - **Phase 0 — request reader.** `read_request` decodes the 16-bit
+    length field and the BIG-REQUESTS extended length in the client's
+    declared byte order.
+  - **Phase A — setup.** The BE rejection in `setup_thread` is gone;
+    `write_setup_success` and `write_screen` thread `byte_order`.
+  - **Phase B — errors.** `write_error` and `emit_x11_error` honour
+    the client byte order.
+  - **Phase C — replies.** ~70 reply encoders across `mod.rs`,
+    `randr.rs`, `shape.rs`, `xfixes.rs`, `present.rs`, `composite.rs`,
+    `damage.rs`, `mit_shm.rs`, `sync.rs`, `xtest.rs` take a
+    `byte_order` parameter; the `wire::fixed_reply` helper plus four
+    private `fixed_reply` helpers in extension modules and one raw-
+    `to_le_bytes` site in `present.rs` all updated.
+  - **Phase D + D1.** Selection events and the rest of the event
+    encoders honour their `order` parameter; new
+    `crates/yserver-protocol/src/x11/wire_swap.rs` defines shared
+    `FieldKind` / `FieldEntry` types + `swap_in_place`.
+  - **Phase D2 — raw event templates.** `fanout_raw_event_to_clients`
+    takes `template_byte_order` and re-encodes the 32-byte template
+    per recipient via `core_event_swap_table`. Source order is LE
+    for server-built events (SelectionNotify, RANDR notify) and the
+    sender's byte order for `SendEvent`.
+  - **Phase E — inbound request body swap.** New
+    `crates/yserver-protocol/src/x11/request_swap.rs` holds a per-
+    opcode swap table (~70 core opcodes). The per-client reader
+    thread calls `swap_request_body` after `read_request`; the rest
+    of the dispatch path keeps reading bytes as little-endian.
 
-- **Big-endian client byte-order at the wire reader** (now the
-  gating issue, ~136 tests UNRES'd purely on this). Swap tables
-  for request bodies, replies, events, and the setup-success
-  encoder. Realistic scope: 2–4 days of mostly-mechanical work.
-- **`Expose` correctness pass** (131 lines, ~30 tests). Specific
-  Expose-generation gaps; smaller bucket but real bugs.
+  End-to-end the BE branch lifts xts Xproto from **1 PASS to 229
+  PASS** (out of 389) and drops UNRES from 296 to 99.
+
+#### Phase 6.9 remaining follow-ups
+
+The 40 residual FAIL + 99 UNRES are real protocol bugs, not BE
+artefacts. In rough priority:
+
+- **Missing reply implementations** (~6 tests): GetMotionEvents (39),
+  GetFontPath (52), ListInstalledColormaps (83), GetKeyboardControl
+  (103), GetPointerControl (106), GetScreenSaver (108) — server is
+  silent where xts expects a reply.
+- **Per-opcode validation gaps** (~12 tests): `BadAlloc` /
+  `BadIDChoice` / `BadAccess` / `BadValue` not raised for
+  duplicate-ID `CreateColormap`, read-only colormap `StoreColors`,
+  invalid `CopyGC` value-list bits, etc.
+- **Event-generation gaps** (~5 tests): `MapWindow`/`MapSubwindows`
+  don't deliver expected `Expose`; `SetModifierMapping` /
+  `SetPointerMapping` don't fire `MappingNotify`.
+- **Less-common opcodes not in `request_swap_table`** (a handful):
+  pads through unchanged, so BE-only probes still UNRES.
 - **`yserver` (KMS) baseline.** Deferred — running xts in a vng
   guest needs either an in-guest xts build or a tunneled DISPLAY.
-  Worth doing once the ynest-side quick wins land so the
-  comparison is informative.
 
 ## Phase 7 — Security hardening
 

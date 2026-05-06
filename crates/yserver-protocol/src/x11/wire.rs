@@ -9,6 +9,14 @@ pub(super) fn read_u16(byte_order: ClientByteOrder, bytes: &[u8]) -> u16 {
     }
 }
 
+pub fn read_u32(byte_order: ClientByteOrder, bytes: &[u8]) -> u32 {
+    let arr = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    match byte_order {
+        ClientByteOrder::LittleEndian => u32::from_le_bytes(arr),
+        ClientByteOrder::BigEndian => u32::from_be_bytes(arr),
+    }
+}
+
 pub(super) fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
@@ -59,12 +67,17 @@ pub fn pad_vec4(out: &mut Vec<u8>) {
     }
 }
 
-pub fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
+pub fn fixed_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    data: u8,
+    length: u32,
+) -> Vec<u8> {
     let mut reply = Vec::with_capacity(32);
     reply.push(1);
     reply.push(data);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, length);
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, length);
     reply
 }
 

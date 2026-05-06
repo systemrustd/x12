@@ -371,6 +371,7 @@ pub(crate) fn handle_host_container_resize(
         let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
         if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
             let event = x11randr::encode_screen_change_notify_event(
+                client.byte_order,
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
@@ -388,6 +389,7 @@ pub(crate) fn handle_host_container_resize(
         }
         if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
             let event = x11randr::encode_crtc_change_notify_event(
+                client.byte_order,
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::CrtcChangeNotify {
@@ -405,6 +407,7 @@ pub(crate) fn handle_host_container_resize(
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
             let event = x11randr::encode_output_change_notify_event(
+                client.byte_order,
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::OutputChangeNotify {
@@ -581,6 +584,7 @@ fn handle_client_setup_complete(
     crate::core_loop::client_reader::spawn(
         id,
         stream,
+        byte_order,
         BIG_REQUESTS_MAJOR_OPCODE,
         reader_control_rx,
         sender.clone_handle(),

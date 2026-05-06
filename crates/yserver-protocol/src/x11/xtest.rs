@@ -3,7 +3,10 @@
 //! XTEST 2.2 has four requests: `GetVersion`, `CompareCursor`,
 //! `FakeInput`, `GrabControl`. No events, no errors of its own.
 
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_u16, write_u32},
+};
 
 pub const GET_VERSION: u8 = 0;
 pub const COMPARE_CURSOR: u8 = 1;
@@ -50,6 +53,7 @@ pub fn parse_get_version(body: &[u8]) -> Option<(u8, u16)> {
 /// data16 field (byte offset 8) and `minor_version` in bytes 8..10.
 #[must_use]
 pub fn encode_get_version_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major_version: u8,
     minor_version: u16,
@@ -57,9 +61,9 @@ pub fn encode_get_version_reply(
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
     out.push(major_version);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // reply length = 0
-    out.extend_from_slice(&minor_version.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // reply length = 0
+    write_u16(byte_order, &mut out, minor_version);
     out.extend_from_slice(&[0u8; 22]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -68,12 +72,16 @@ pub fn encode_get_version_reply(
 /// Encode a `CompareCursor` reply. `same` is 1 if the window's cursor matches
 /// the comparison cursor. We stub this as always-true.
 #[must_use]
-pub fn encode_compare_cursor_reply(sequence: SequenceNumber, same: bool) -> Vec<u8> {
+pub fn encode_compare_cursor_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    same: bool,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
     out.push(u8::from(same));
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
     out.extend_from_slice(&[0u8; 24]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -140,7 +148,8 @@ mod tests {
 
     #[test]
     fn encode_get_version_reply_is_32_bytes_with_minor_in_data16() {
-        let reply = encode_get_version_reply(SequenceNumber(7), 2, 2);
+        let reply =
+            encode_get_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(7), 2, 2);
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1); // reply tag
         assert_eq!(reply[1], 2); // major in data8
@@ -154,9 +163,11 @@ mod tests {
 
     #[test]
     fn encode_compare_cursor_reply_carries_same_bit() {
-        let yes = encode_compare_cursor_reply(SequenceNumber(3), true);
+        let yes =
+            encode_compare_cursor_reply(ClientByteOrder::LittleEndian, SequenceNumber(3), true);
         assert_eq!(yes[1], 1);
-        let no = encode_compare_cursor_reply(SequenceNumber(3), false);
+        let no =
+            encode_compare_cursor_reply(ClientByteOrder::LittleEndian, SequenceNumber(3), false);
         assert_eq!(no[1], 0);
     }
 

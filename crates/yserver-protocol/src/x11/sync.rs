@@ -1,4 +1,7 @@
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_i16, write_u16, write_u32},
+};
 
 pub const INITIALIZE: u8 = 0;
 pub const LIST_SYSTEM_COUNTERS: u8 = 1;
@@ -30,19 +33,21 @@ fn read_i64(hi: &[u8], lo: &[u8]) -> i64 {
     (i64::from(read_i32_le(hi)) << 32) | i64::from(read_u32_le(lo))
 }
 
-fn write_i64(out: &mut Vec<u8>, value: i64) {
+fn write_i64(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i64) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hi = (value >> 32) as u32;
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&((value >> 32) as i32).to_le_bytes());
-    #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(value as u32).to_le_bytes());
+    let lo = value as u32;
+    write_u32(byte_order, out, hi);
+    write_u32(byte_order, out, lo);
 }
 
-fn fixed_reply(sequence: SequenceNumber, length: u32) -> Vec<u8> {
+fn fixed_reply(byte_order: ClientByteOrder, sequence: SequenceNumber, length: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&length.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length);
     out
 }
 
@@ -79,29 +84,41 @@ pub fn parse_alarm_with_mask(body: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[must_use]
-pub fn encode_initialize_reply(sequence: SequenceNumber, major: u8, minor: u8) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
+pub fn encode_initialize_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major: u8,
+    minor: u8,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
     out.push(major);
     out.push(minor);
-    out.extend_from_slice(&0u16.to_le_bytes());
+    write_u16(byte_order, &mut out, 0);
     out.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 #[must_use]
-pub fn encode_list_system_counters_empty_reply(sequence: SequenceNumber) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
-    out.extend_from_slice(&0i32.to_le_bytes());
+pub fn encode_list_system_counters_empty_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    write_u32(byte_order, &mut out, 0); // counters_len = 0
     out.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 #[must_use]
-pub fn encode_query_counter_reply(sequence: SequenceNumber, value: i64) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
-    write_i64(&mut out, value);
+pub fn encode_query_counter_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    value: i64,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    write_i64(byte_order, &mut out, value);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -109,6 +126,7 @@ pub fn encode_query_counter_reply(sequence: SequenceNumber, value: i64) -> Vec<u
 
 #[must_use]
 pub fn encode_query_alarm_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     counter: u32,
     wait_value: i64,
@@ -116,12 +134,12 @@ pub fn encode_query_alarm_reply(
     events: bool,
     state: u8,
 ) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 2);
-    out.extend_from_slice(&counter.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // absolute value
-    write_i64(&mut out, wait_value);
-    out.extend_from_slice(&0u32.to_le_bytes()); // positive transition
-    write_i64(&mut out, delta);
+    let mut out = fixed_reply(byte_order, sequence, 2);
+    write_u32(byte_order, &mut out, counter);
+    write_u32(byte_order, &mut out, 0); // absolute value
+    write_i64(byte_order, &mut out, wait_value);
+    write_u32(byte_order, &mut out, 0); // positive transition
+    write_i64(byte_order, &mut out, delta);
     out.push(u8::from(events));
     out.push(state);
     out.extend_from_slice(&[0u8; 2]);
@@ -130,9 +148,15 @@ pub fn encode_query_alarm_reply(
 }
 
 #[must_use]
-pub fn encode_get_priority_reply(sequence: SequenceNumber, priority: i32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
-    out.extend_from_slice(&priority.to_le_bytes());
+pub fn encode_get_priority_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    priority: i32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    #[allow(clippy::cast_sign_loss)]
+    let p = priority as u32;
+    write_u32(byte_order, &mut out, p);
     out.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -144,7 +168,7 @@ mod tests {
 
     #[test]
     fn initialize_reply_shape() {
-        let reply = encode_initialize_reply(SequenceNumber(2), 3, 0);
+        let reply = encode_initialize_reply(ClientByteOrder::LittleEndian, SequenceNumber(2), 3, 0);
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
@@ -154,7 +178,7 @@ mod tests {
 
     #[test]
     fn query_counter_reply_shape() {
-        let reply = encode_query_counter_reply(SequenceNumber(2), 5);
+        let reply = encode_query_counter_reply(ClientByteOrder::LittleEndian, SequenceNumber(2), 5);
         assert_eq!(reply.len(), 32);
         assert_eq!(i32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 5);
@@ -162,7 +186,15 @@ mod tests {
 
     #[test]
     fn query_alarm_reply_shape() {
-        let reply = encode_query_alarm_reply(SequenceNumber(2), 7, 0, 0, false, 0);
+        let reply = encode_query_alarm_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(2),
+            7,
+            0,
+            0,
+            false,
+            0,
+        );
         assert_eq!(reply.len(), 40);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 7);

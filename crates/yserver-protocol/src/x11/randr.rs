@@ -1,4 +1,32 @@
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_i16, write_u16, write_u32},
+};
+
+/// Type-dispatched writer that picks `write_u16`/`write_u32`/`write_i16`
+/// based on the integer type. Lets the encoder body stay terse with a
+/// single `put(byte_order, &mut out, x)` form regardless of x's width.
+trait Put {
+    fn put(self, byte_order: ClientByteOrder, out: &mut Vec<u8>);
+}
+impl Put for u16 {
+    fn put(self, byte_order: ClientByteOrder, out: &mut Vec<u8>) {
+        write_u16(byte_order, out, self);
+    }
+}
+impl Put for u32 {
+    fn put(self, byte_order: ClientByteOrder, out: &mut Vec<u8>) {
+        write_u32(byte_order, out, self);
+    }
+}
+impl Put for i16 {
+    fn put(self, byte_order: ClientByteOrder, out: &mut Vec<u8>) {
+        write_i16(byte_order, out, self);
+    }
+}
+fn put<T: Put>(byte_order: ClientByteOrder, out: &mut Vec<u8>, x: T) {
+    x.put(byte_order, out);
+}
 
 // ── Version ──────────────────────────────────────────────────────────────────
 
@@ -63,12 +91,17 @@ fn pad_vec4(out: &mut Vec<u8>) {
 
 /// Create the standard 8-byte prefix for an X11 reply:
 /// `[1, data, seq_lo, seq_hi, length_bytes…]` (little-endian u32 `length`).
-fn fixed_reply(sequence: SequenceNumber, data: u8, length: u32) -> Vec<u8> {
+fn fixed_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    data: u8,
+    length: u32,
+) -> Vec<u8> {
     let mut reply = Vec::with_capacity(32);
     reply.push(1u8); // reply type
     reply.push(data);
-    reply.extend_from_slice(&sequence.0.to_le_bytes());
-    reply.extend_from_slice(&length.to_le_bytes());
+    put(byte_order, &mut reply, sequence.0);
+    put(byte_order, &mut reply, length);
     reply
 }
 
@@ -189,11 +222,16 @@ pub struct ScreenResources {
 // ── Reply encoders ────────────────────────────────────────────────────────────
 
 /// Encodes a `QueryVersion` reply (32 bytes total).
-pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major: u32,
+    minor: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
     // out is now 8 bytes; add major + minor (8 bytes) then pad to 32
-    out.extend_from_slice(&major.to_le_bytes());
-    out.extend_from_slice(&minor.to_le_bytes());
+    put(byte_order, &mut out, major);
+    put(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -207,6 +245,7 @@ pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u
 /// trailing refresh-list section.
 #[must_use]
 pub fn encode_get_screen_info_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     root: u32,
     timestamp: u32,
@@ -225,25 +264,25 @@ pub fn encode_get_screen_info_reply(
     let length = (extra / 4) as u32;
     let rotations: u8 = 1; // RR_Rotate_0 only
 
-    let mut out = fixed_reply(sequence, rotations, length);
-    out.extend_from_slice(&root.to_le_bytes());
-    out.extend_from_slice(&timestamp.to_le_bytes());
-    out.extend_from_slice(&config_timestamp.to_le_bytes());
-    out.extend_from_slice(&n_sizes.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // sizeID = 0 (current)
-    out.extend_from_slice(&1u16.to_le_bytes()); // rotation = RR_Rotate_0
-    out.extend_from_slice(&60u16.to_le_bytes()); // current rate = 60 Hz
-    out.extend_from_slice(&n_info.to_le_bytes());
+    let mut out = fixed_reply(byte_order, sequence, rotations, length);
+    put(byte_order, &mut out, root);
+    put(byte_order, &mut out, timestamp);
+    put(byte_order, &mut out, config_timestamp);
+    put(byte_order, &mut out, n_sizes);
+    put(byte_order, &mut out, 0u16); // sizeID = 0 (current)
+    put(byte_order, &mut out, 1u16); // rotation = RR_Rotate_0
+    put(byte_order, &mut out, 60u16); // current rate = 60 Hz
+    put(byte_order, &mut out, n_info);
     out.extend_from_slice(&[0u8; 2]);
     debug_assert_eq!(out.len(), 32);
 
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&mwidth.to_le_bytes());
-    out.extend_from_slice(&mheight.to_le_bytes());
+    put(byte_order, &mut out, width);
+    put(byte_order, &mut out, height);
+    put(byte_order, &mut out, mwidth);
+    put(byte_order, &mut out, mheight);
 
-    out.extend_from_slice(&n_rates.to_le_bytes());
-    out.extend_from_slice(&60u16.to_le_bytes());
+    put(byte_order, &mut out, n_rates);
+    put(byte_order, &mut out, 60u16);
     pad_vec4(&mut out);
 
     out
@@ -251,17 +290,18 @@ pub fn encode_get_screen_info_reply(
 
 /// Encodes a `GetScreenSizeRange` reply (32 bytes total).
 pub fn encode_get_screen_size_range_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     min_width: u16,
     min_height: u16,
     max_width: u16,
     max_height: u16,
 ) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&min_width.to_le_bytes());
-    out.extend_from_slice(&min_height.to_le_bytes());
-    out.extend_from_slice(&max_width.to_le_bytes());
-    out.extend_from_slice(&max_height.to_le_bytes());
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    put(byte_order, &mut out, min_width);
+    put(byte_order, &mut out, min_height);
+    put(byte_order, &mut out, max_width);
+    put(byte_order, &mut out, max_height);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -269,6 +309,7 @@ pub fn encode_get_screen_size_range_reply(
 
 /// Encodes a `GetScreenResourcesCurrent` reply.
 pub fn encode_get_screen_resources_current_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     resources: &ScreenResources,
 ) -> Vec<u8> {
@@ -283,33 +324,33 @@ pub fn encode_get_screen_resources_current_reply(
     #[allow(clippy::cast_possible_truncation)]
     let length = (extra / 4) as u32;
 
-    let mut out = fixed_reply(sequence, 0, length);
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
     out.extend_from_slice(&resources.timestamp.to_le_bytes());
     // bytes 12-15: config_timestamp
     out.extend_from_slice(&resources.config_timestamp.to_le_bytes());
     // bytes 16-17: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_crtcs as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_crtcs as u16));
     // bytes 18-19: num_outputs
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_outputs as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_outputs as u16));
     // bytes 20-21: num_modes
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_modes as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_modes as u16));
     // bytes 22-23: names_len
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(names_len as u16).to_le_bytes());
+    put(byte_order, &mut out, (names_len as u16));
     // bytes 24-31: 8 bytes padding
     out.extend_from_slice(&[0u8; 8]);
 
     // crtcs array
     for &crtc in &resources.crtcs {
-        out.extend_from_slice(&crtc.to_le_bytes());
+        put(byte_order, &mut out, crtc);
     }
     // outputs array
     for &output in &resources.outputs {
-        out.extend_from_slice(&output.to_le_bytes());
+        put(byte_order, &mut out, output);
     }
     // mode info structs (xRRModeInfo, each 32 bytes)
     for mode in &resources.modes {
@@ -352,6 +393,7 @@ pub struct OutputInfoReply<'a> {
 
 /// Encodes a `GetOutputInfo` reply.
 pub fn encode_get_output_info_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     info: &OutputInfoReply<'_>,
 ) -> Vec<u8> {
@@ -380,47 +422,47 @@ pub fn encode_get_output_info_reply(
     #[allow(clippy::cast_possible_truncation)]
     let length = (extra / 4) as u32;
 
-    let mut out = fixed_reply(sequence, 0, length);
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
-    out.extend_from_slice(&timestamp.to_le_bytes());
+    put(byte_order, &mut out, timestamp);
     // bytes 12-15: crtc
-    out.extend_from_slice(&crtc.to_le_bytes());
+    put(byte_order, &mut out, crtc);
     // bytes 16-19: mm_width
-    out.extend_from_slice(&width_mm.to_le_bytes());
+    put(byte_order, &mut out, width_mm);
     // bytes 20-23: mm_height
-    out.extend_from_slice(&height_mm.to_le_bytes());
+    put(byte_order, &mut out, height_mm);
     // byte 24: connection (CARD8)
     out.push(connection);
     // byte 25: subpixel_order (CARD8)
     out.push(subpixel_order);
     // bytes 26-27: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_crtcs as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_crtcs as u16));
     // bytes 28-29: num_modes
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_modes as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_modes as u16));
     // bytes 30-31: num_preferred (all modes are preferred in this stub)
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_modes as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_modes as u16));
     // bytes 32-33: num_clones  (extra word read by _XReply with extra=1)
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_clones as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_clones as u16));
     // bytes 34-35: name_len
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(name_len as u16).to_le_bytes());
+    put(byte_order, &mut out, (name_len as u16));
     // no pad: byte 36 is 4-byte aligned, arrays follow immediately
 
     // crtcs
     for &c in crtcs {
-        out.extend_from_slice(&c.to_le_bytes());
+        put(byte_order, &mut out, c);
     }
     // modes
     for &m in modes {
-        out.extend_from_slice(&m.to_le_bytes());
+        put(byte_order, &mut out, m);
     }
     // clones
     for &cl in clones {
-        out.extend_from_slice(&cl.to_le_bytes());
+        put(byte_order, &mut out, cl);
     }
     // name (padded to 4)
     out.extend_from_slice(name);
@@ -445,7 +487,11 @@ pub struct CrtcInfoReply<'a> {
 }
 
 /// Encodes a `GetCrtcInfo` reply.
-pub fn encode_get_crtc_info_reply(sequence: SequenceNumber, info: &CrtcInfoReply<'_>) -> Vec<u8> {
+pub fn encode_get_crtc_info_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    info: &CrtcInfoReply<'_>,
+) -> Vec<u8> {
     let timestamp = info.timestamp;
     let x = info.x;
     let y = info.y;
@@ -464,37 +510,37 @@ pub fn encode_get_crtc_info_reply(sequence: SequenceNumber, info: &CrtcInfoReply
     #[allow(clippy::cast_possible_truncation)]
     let length = (extra / 4) as u32;
 
-    let mut out = fixed_reply(sequence, 0, length);
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
-    out.extend_from_slice(&timestamp.to_le_bytes());
+    put(byte_order, &mut out, timestamp);
     // bytes 12-13: x (i16)
-    out.extend_from_slice(&x.to_le_bytes());
+    put(byte_order, &mut out, x);
     // bytes 14-15: y (i16)
-    out.extend_from_slice(&y.to_le_bytes());
+    put(byte_order, &mut out, y);
     // bytes 16-17: width
-    out.extend_from_slice(&width.to_le_bytes());
+    put(byte_order, &mut out, width);
     // bytes 18-19: height
-    out.extend_from_slice(&height.to_le_bytes());
+    put(byte_order, &mut out, height);
     // bytes 20-23: mode
-    out.extend_from_slice(&mode.to_le_bytes());
+    put(byte_order, &mut out, mode);
     // bytes 24-25: rotation
-    out.extend_from_slice(&rotation.to_le_bytes());
+    put(byte_order, &mut out, rotation);
     // bytes 26-27: rotations
-    out.extend_from_slice(&rotations.to_le_bytes());
+    put(byte_order, &mut out, rotations);
     // bytes 28-29: num_outputs
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_outputs as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_outputs as u16));
     // bytes 30-31: num_possible
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(num_possible as u16).to_le_bytes());
+    put(byte_order, &mut out, (num_possible as u16));
 
     // outputs
     for &o in outputs {
-        out.extend_from_slice(&o.to_le_bytes());
+        put(byte_order, &mut out, o);
     }
     // possible outputs
     for &p in possible {
-        out.extend_from_slice(&p.to_le_bytes());
+        put(byte_order, &mut out, p);
     }
 
     out
@@ -505,16 +551,19 @@ pub fn encode_get_crtc_info_reply(sequence: SequenceNumber, info: &CrtcInfoReply
 /// Wire layout: standard 8-byte header + pendingTransform(36) + hasTransforms(1)+pad(3) +
 /// currentTransform(36) + pad(4) + four u16 filter-length fields.
 /// Identity matrix in 16.16 fixed-point: diagonal = 0x0001_0000, off-diagonal = 0.
-pub fn encode_get_crtc_transform_reply(sequence: SequenceNumber) -> Vec<u8> {
+pub fn encode_get_crtc_transform_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
     const IDENTITY: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
-    let mut out = fixed_reply(sequence, 0, 16); // 64 extra bytes = 16 CARD32s
+    let mut out = fixed_reply(byte_order, sequence, 0, 16); // 64 extra bytes = 16 CARD32s
     for &v in &IDENTITY {
-        out.extend_from_slice(&v.to_le_bytes()); // bytes 8-43: pendingTransform
+        put(byte_order, &mut out, v); // bytes 8-43: pendingTransform
     }
     out.push(0); // byte 44: hasTransforms = false
     out.extend_from_slice(&[0u8; 3]); // bytes 45-47: pad
     for &v in &IDENTITY {
-        out.extend_from_slice(&v.to_le_bytes()); // bytes 48-83: currentTransform
+        put(byte_order, &mut out, v); // bytes 48-83: currentTransform
     }
     out.extend_from_slice(&[0u8; 4]); // bytes 84-87: pad
     out.extend_from_slice(&[0u8; 8]); // bytes 88-95: four u16 filter lengths (all 0)
@@ -523,8 +572,11 @@ pub fn encode_get_crtc_transform_reply(sequence: SequenceNumber) -> Vec<u8> {
 }
 
 /// Encodes a `ListOutputProperties` reply with zero properties (32 bytes).
-pub fn encode_list_output_properties_reply(sequence: SequenceNumber) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
+pub fn encode_list_output_properties_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
     out.extend_from_slice(&[0u8; 24]); // nAtoms=0 + pad
     debug_assert_eq!(out.len(), 32);
     out
@@ -532,8 +584,11 @@ pub fn encode_list_output_properties_reply(sequence: SequenceNumber) -> Vec<u8> 
 
 /// Encodes a `GetOutputProperty` reply indicating the property does not exist (format=0,
 /// type=None, bytes_after=0, num_items=0, no data).
-pub fn encode_get_output_property_reply(sequence: SequenceNumber) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0 /* format=0 */, 0);
+pub fn encode_get_output_property_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0 /* format=0 */, 0);
     out.extend_from_slice(&[0u8; 24]); // type=None(4) + bytes_after=0(4) + num_items=0(4) + pad(12)
     debug_assert_eq!(out.len(), 32);
     out
@@ -544,27 +599,39 @@ pub fn encode_get_output_property_reply(sequence: SequenceNumber) -> Vec<u8> {
 /// Wire layout: `status(1) seq(2) length=1(4) timestamp(4) left top width height
 /// trackLeft trackTop trackWidth trackHeight borderLeft borderTop borderRight borderBottom`
 /// (each of the 12 panning fields is u16/i16).
-pub fn encode_get_panning_reply(sequence: SequenceNumber, timestamp: u32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0 /* status=Success */, 1);
-    out.extend_from_slice(&timestamp.to_le_bytes()); // bytes 8-11
+pub fn encode_get_panning_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    timestamp: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0 /* status=Success */, 1);
+    put(byte_order, &mut out, timestamp); // bytes 8-11
     out.extend_from_slice(&[0u8; 24]); // 12 × u16 fields, all zero
     debug_assert_eq!(out.len(), 36);
     out
 }
 
 /// Encodes a `GetOutputPrimary` reply (32 bytes), returning no primary output.
-pub fn encode_get_output_primary_reply(sequence: SequenceNumber, output: u32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&output.to_le_bytes()); // bytes 8-11: primary output XID (0 = none)
+pub fn encode_get_output_primary_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    output: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    put(byte_order, &mut out, output); // bytes 8-11: primary output XID (0 = none)
     out.extend_from_slice(&[0u8; 20]); // pad
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 /// Encodes a `GetProviders` reply (32 bytes) with zero providers.
-pub fn encode_get_providers_reply(sequence: SequenceNumber, timestamp: u32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&timestamp.to_le_bytes()); // bytes 8-11
+pub fn encode_get_providers_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    timestamp: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    put(byte_order, &mut out, timestamp); // bytes 8-11
     out.extend_from_slice(&[0u8; 20]); // nProviders=0 + pad
     debug_assert_eq!(out.len(), 32);
     out
@@ -590,6 +657,7 @@ pub struct MonitorInfo<'a> {
 /// `name(4) primary(1) automatic(1) nOutput(2) x(2) y(2) width(2) height(2)
 ///  widthMM(4) heightMM(4)` followed by output XIDs.
 pub fn encode_get_monitors_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     timestamp: u32,
     monitors: &[MonitorInfo<'_>],
@@ -602,15 +670,15 @@ pub fn encode_get_monitors_reply(
     #[allow(clippy::cast_possible_truncation)]
     let length = (extra / 4) as u32;
 
-    let mut out = fixed_reply(sequence, 0, length);
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
-    out.extend_from_slice(&timestamp.to_le_bytes());
+    put(byte_order, &mut out, timestamp);
     // bytes 12-15: nMonitors
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(n_monitors as u32).to_le_bytes());
+    put(byte_order, &mut out, (n_monitors as u32));
     // bytes 16-19: nOutputs (total across all monitors)
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(n_outputs as u32).to_le_bytes());
+    put(byte_order, &mut out, (n_outputs as u32));
     // bytes 20-31: pad
     out.extend_from_slice(&[0u8; 12]);
     debug_assert_eq!(out.len(), 32);
@@ -621,7 +689,7 @@ pub fn encode_get_monitors_reply(
         out.extend_from_slice(&m.name.to_le_bytes()); // 4: name (Atom)
         out.push(u8::from(m.primary)); // 1: primary
         out.push(0); // 1: automatic = false
-        out.extend_from_slice(&n_out.to_le_bytes()); // 2: nOutput
+        put(byte_order, &mut out, n_out); // 2: nOutput
         out.extend_from_slice(&m.x.to_le_bytes()); // 2: x
         out.extend_from_slice(&m.y.to_le_bytes()); // 2: y
         out.extend_from_slice(&m.width.to_le_bytes()); // 2: width
@@ -629,7 +697,7 @@ pub fn encode_get_monitors_reply(
         out.extend_from_slice(&m.width_mm.to_le_bytes()); // 4: widthInMillimeters
         out.extend_from_slice(&m.height_mm.to_le_bytes()); // 4: heightInMillimeters
         for &oid in m.outputs {
-            out.extend_from_slice(&oid.to_le_bytes());
+            put(byte_order, &mut out, oid);
         }
     }
 
@@ -637,20 +705,28 @@ pub fn encode_get_monitors_reply(
 }
 
 /// Encodes a `GetCrtcGammaSize` reply (32 bytes, `size` = 0 means no gamma support).
-pub fn encode_get_crtc_gamma_size_reply(sequence: SequenceNumber, size: u16) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&size.to_le_bytes()); // bytes 8-9: size
+pub fn encode_get_crtc_gamma_size_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    size: u16,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    put(byte_order, &mut out, size); // bytes 8-9: size
     out.extend_from_slice(&[0u8; 22]); // bytes 10-31: pad
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 /// Encodes a `GetCrtcGamma` reply (32 bytes when `size` = 0; no gamma arrays).
-pub fn encode_get_crtc_gamma_reply(sequence: SequenceNumber, size: u16) -> Vec<u8> {
+pub fn encode_get_crtc_gamma_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    size: u16,
+) -> Vec<u8> {
     // When size=0 the three channel arrays are empty, so length=0.
     // Xlib reads the size field from the fixed header to know array length.
-    let mut out = fixed_reply(sequence, 0, 0);
-    out.extend_from_slice(&size.to_le_bytes()); // bytes 8-9: size
+    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    put(byte_order, &mut out, size); // bytes 8-9: size
     out.extend_from_slice(&[0u8; 22]); // bytes 10-31: pad
     debug_assert_eq!(out.len(), 32);
     out
@@ -692,69 +768,74 @@ pub struct OutputChangeNotify {
 
 #[must_use]
 pub fn encode_screen_change_notify_event(
+    byte_order: ClientByteOrder,
     first_event: u8,
     sequence: SequenceNumber,
     event: ScreenChangeNotify,
 ) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[0] = first_event + EVENT_SCREEN_CHANGE_NOTIFY;
-    out[1] = ROTATION_ROTATE_0 as u8;
-    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
-    out[8..12].copy_from_slice(&event.config_timestamp.to_le_bytes());
-    out[12..16].copy_from_slice(&event.root.to_le_bytes());
-    out[16..20].copy_from_slice(&event.request_window.to_le_bytes());
-    out[20..22].copy_from_slice(&0u16.to_le_bytes());
-    out[22..24].copy_from_slice(&SUBPIXEL_UNKNOWN.to_le_bytes());
-    out[24..26].copy_from_slice(&event.width.to_le_bytes());
-    out[26..28].copy_from_slice(&event.height.to_le_bytes());
-    out[28..30].copy_from_slice(&event.width_mm.to_le_bytes());
-    out[30..32].copy_from_slice(&event.height_mm.to_le_bytes());
-    out
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_SCREEN_CHANGE_NOTIFY);
+    buf.push(ROTATION_ROTATE_0 as u8);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.config_timestamp);
+    put(byte_order, &mut buf, event.root);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, 0u16);
+    put(byte_order, &mut buf, SUBPIXEL_UNKNOWN);
+    put(byte_order, &mut buf, event.width);
+    put(byte_order, &mut buf, event.height);
+    put(byte_order, &mut buf, event.width_mm);
+    put(byte_order, &mut buf, event.height_mm);
+    buf.try_into().expect("32-byte event")
 }
 
 #[must_use]
 pub fn encode_crtc_change_notify_event(
+    byte_order: ClientByteOrder,
     first_event: u8,
     sequence: SequenceNumber,
     event: CrtcChangeNotify,
 ) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[0] = first_event + EVENT_NOTIFY;
-    out[1] = NOTIFY_CRTC_CHANGE;
-    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
-    out[8..12].copy_from_slice(&event.request_window.to_le_bytes());
-    out[12..16].copy_from_slice(&event.crtc.to_le_bytes());
-    out[16..20].copy_from_slice(&event.mode.to_le_bytes());
-    out[20..22].copy_from_slice(&ROTATION_ROTATE_0.to_le_bytes());
-    out[24..26].copy_from_slice(&event.x.to_le_bytes());
-    out[26..28].copy_from_slice(&event.y.to_le_bytes());
-    out[28..30].copy_from_slice(&event.width.to_le_bytes());
-    out[30..32].copy_from_slice(&event.height.to_le_bytes());
-    out
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_CRTC_CHANGE);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.crtc);
+    put(byte_order, &mut buf, event.mode);
+    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    // 2 bytes of pad before x/y per spec (CRTC change notify is 32 bytes total).
+    buf.extend_from_slice(&[0u8; 2]);
+    put(byte_order, &mut buf, event.x);
+    put(byte_order, &mut buf, event.y);
+    put(byte_order, &mut buf, event.width);
+    put(byte_order, &mut buf, event.height);
+    buf.try_into().expect("32-byte event")
 }
 
 #[must_use]
 pub fn encode_output_change_notify_event(
+    byte_order: ClientByteOrder,
     first_event: u8,
     sequence: SequenceNumber,
     event: OutputChangeNotify,
 ) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[0] = first_event + EVENT_NOTIFY;
-    out[1] = NOTIFY_OUTPUT_CHANGE;
-    out[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    out[4..8].copy_from_slice(&event.timestamp.to_le_bytes());
-    out[8..12].copy_from_slice(&event.config_timestamp.to_le_bytes());
-    out[12..16].copy_from_slice(&event.request_window.to_le_bytes());
-    out[16..20].copy_from_slice(&event.output.to_le_bytes());
-    out[20..24].copy_from_slice(&event.crtc.to_le_bytes());
-    out[24..28].copy_from_slice(&event.mode.to_le_bytes());
-    out[28..30].copy_from_slice(&ROTATION_ROTATE_0.to_le_bytes());
-    out[30] = CONNECTION_CONNECTED;
-    out[31] = SUBPIXEL_UNKNOWN as u8;
-    out
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_OUTPUT_CHANGE);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.config_timestamp);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.output);
+    put(byte_order, &mut buf, event.crtc);
+    put(byte_order, &mut buf, event.mode);
+    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    buf.push(CONNECTION_CONNECTED);
+    buf.push(SUBPIXEL_UNKNOWN as u8);
+    buf.try_into().expect("32-byte event")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -805,7 +886,8 @@ mod tests {
 
     #[test]
     fn encode_query_version_reply_shape() {
-        let buf = encode_query_version_reply(SequenceNumber(0xABCD), 1, 2);
+        let buf =
+            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(0xABCD), 1, 2);
         assert_eq!(buf.len(), 32);
         assert_eq!(buf[0], 1); // reply code
         assert_eq!(&buf[2..4], &0xABCDu16.to_le_bytes()); // sequence
@@ -815,7 +897,14 @@ mod tests {
 
     #[test]
     fn encode_get_screen_size_range_reply_shape() {
-        let buf = encode_get_screen_size_range_reply(SequenceNumber(1), 320, 240, 3840, 2160);
+        let buf = encode_get_screen_size_range_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            320,
+            240,
+            3840,
+            2160,
+        );
         assert_eq!(buf.len(), 32);
         assert_eq!(buf[0], 1);
         assert_eq!(&buf[8..10], &320u16.to_le_bytes());
@@ -850,7 +939,11 @@ mod tests {
             mode_names: mode_name.to_vec(),
         };
 
-        let buf = encode_get_screen_resources_current_reply(SequenceNumber(5), &resources);
+        let buf = encode_get_screen_resources_current_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(5),
+            &resources,
+        );
 
         // 32 header + 4 (1 crtc) + 4 (1 output) + 32 (1 mode info) + 8 ("800x600" = 7 bytes, padded to 8)
         let expected_len = 32 + 4 + 4 + 32 + 8;
@@ -877,6 +970,7 @@ mod tests {
         let modes = [3u32];
         let name = b"ynest-0";
         let buf = encode_get_output_info_reply(
+            ClientByteOrder::LittleEndian,
             SequenceNumber(7),
             &OutputInfoReply {
                 timestamp: 42,
@@ -918,7 +1012,8 @@ mod tests {
 
     #[test]
     fn encode_get_output_property_empty_reply_shape() {
-        let buf = encode_get_output_property_reply(SequenceNumber(9));
+        let buf =
+            encode_get_output_property_reply(ClientByteOrder::LittleEndian, SequenceNumber(9));
 
         assert_eq!(buf.len(), 32);
         assert_eq!(buf[0], 1);
@@ -932,6 +1027,7 @@ mod tests {
     fn encode_get_monitors_single_monitor_shape() {
         let outputs = [0x20u32];
         let buf = encode_get_monitors_reply(
+            ClientByteOrder::LittleEndian,
             SequenceNumber(10),
             123,
             &[MonitorInfo {
@@ -963,6 +1059,7 @@ mod tests {
     #[test]
     fn screen_change_notify_event_shape() {
         let event = encode_screen_change_notify_event(
+            ClientByteOrder::LittleEndian,
             89,
             SequenceNumber(11),
             ScreenChangeNotify {
@@ -990,6 +1087,7 @@ mod tests {
     #[test]
     fn crtc_change_notify_event_shape() {
         let event = encode_crtc_change_notify_event(
+            ClientByteOrder::LittleEndian,
             89,
             SequenceNumber(12),
             CrtcChangeNotify {
@@ -1015,6 +1113,7 @@ mod tests {
     #[test]
     fn output_change_notify_event_shape() {
         let event = encode_output_change_notify_event(
+            ClientByteOrder::LittleEndian,
             89,
             SequenceNumber(13),
             OutputChangeNotify {

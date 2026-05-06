@@ -18,8 +18,10 @@ pub mod mit_shm;
 pub mod present;
 pub mod randr;
 pub mod request_lengths;
+pub mod request_swap;
 pub mod shape;
 pub mod sync;
+pub mod wire_swap;
 pub mod xfixes;
 pub mod xtest;
 
@@ -560,6 +562,7 @@ pub fn write_setup_failed(
 
 pub fn write_error(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     error_code: u8,
     bad_value: u32,
@@ -569,48 +572,28 @@ pub fn write_error(
     let mut error = Vec::with_capacity(32);
     error.push(0);
     error.push(error_code);
-    write_u16(ClientByteOrder::LittleEndian, &mut error, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut error, bad_value);
-    write_u16(ClientByteOrder::LittleEndian, &mut error, minor_opcode);
+    write_u16(byte_order, &mut error, sequence.0);
+    write_u32(byte_order, &mut error, bad_value);
+    write_u16(byte_order, &mut error, minor_opcode);
     error.push(major_opcode);
     error.extend_from_slice(&[0; 21]);
     writer.write_all(&error)
 }
 
-pub fn write_setup_success(writer: &mut impl Write, setup: SetupSuccess<'_>) -> io::Result<()> {
+pub fn write_setup_success(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    setup: SetupSuccess<'_>,
+) -> io::Result<()> {
     let vendor = setup.vendor.as_bytes();
 
     let mut extra = Vec::new();
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        setup.release_number,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        setup.resource_id_base,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        setup.resource_id_mask,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        setup.motion_buffer_size,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        vendor.len() as u16,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut extra,
-        setup.maximum_request_length,
-    );
+    write_u32(byte_order, &mut extra, setup.release_number);
+    write_u32(byte_order, &mut extra, setup.resource_id_base);
+    write_u32(byte_order, &mut extra, setup.resource_id_mask);
+    write_u32(byte_order, &mut extra, setup.motion_buffer_size);
+    write_u16(byte_order, &mut extra, vendor.len() as u16);
+    write_u16(byte_order, &mut extra, setup.maximum_request_length);
     extra.push(1); // roots
     extra.push(5); // pixmap formats: depth=1, depth=4, depth=8, depth=24, depth=32
     extra.push(byte_order_value(setup.image_byte_order));
@@ -654,56 +637,32 @@ pub fn write_setup_success(writer: &mut impl Write, setup: SetupSuccess<'_>) -> 
     extra.push(32);
     extra.extend_from_slice(&[0; 5]);
 
-    write_screen(&mut extra, setup.root);
+    write_screen(byte_order, &mut extra, setup.root);
 
     let length_units = checked_units(extra.len())?;
     let mut reply = Vec::with_capacity(8 + extra.len());
     reply.push(1);
     reply.push(0);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        setup.protocol_major,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        setup.protocol_minor,
-    );
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, length_units);
+    write_u16(byte_order, &mut reply, setup.protocol_major);
+    write_u16(byte_order, &mut reply, setup.protocol_minor);
+    write_u16(byte_order, &mut reply, length_units);
     reply.extend_from_slice(&extra);
     writer.write_all(&reply)
 }
 
-fn write_screen(out: &mut Vec<u8>, screen: Screen) {
-    write_u32(ClientByteOrder::LittleEndian, out, screen.root.0);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        screen.default_colormap.0,
-    );
-    write_u32(ClientByteOrder::LittleEndian, out, screen.white_pixel);
-    write_u32(ClientByteOrder::LittleEndian, out, screen.black_pixel);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        screen.current_input_masks,
-    );
-    write_u16(ClientByteOrder::LittleEndian, out, screen.width_px);
-    write_u16(ClientByteOrder::LittleEndian, out, screen.height_px);
-    write_u16(ClientByteOrder::LittleEndian, out, screen.width_mm);
-    write_u16(ClientByteOrder::LittleEndian, out, screen.height_mm);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        out,
-        screen.min_installed_maps,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        out,
-        screen.max_installed_maps,
-    );
-    write_u32(ClientByteOrder::LittleEndian, out, screen.root_visual.0);
+fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) {
+    write_u32(byte_order, out, screen.root.0);
+    write_u32(byte_order, out, screen.default_colormap.0);
+    write_u32(byte_order, out, screen.white_pixel);
+    write_u32(byte_order, out, screen.black_pixel);
+    write_u32(byte_order, out, screen.current_input_masks);
+    write_u16(byte_order, out, screen.width_px);
+    write_u16(byte_order, out, screen.height_px);
+    write_u16(byte_order, out, screen.width_mm);
+    write_u16(byte_order, out, screen.height_mm);
+    write_u16(byte_order, out, screen.min_installed_maps);
+    write_u16(byte_order, out, screen.max_installed_maps);
+    write_u32(byte_order, out, screen.root_visual.0);
     out.push(0); // backing stores: Never
     out.push(0); // save unders: false
     out.push(screen.root_depth);
@@ -712,52 +671,53 @@ fn write_screen(out: &mut Vec<u8>, screen: Screen) {
     // depth=1, no visuals
     out.push(1);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u16(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
 
     // depth=4, no visuals
     out.push(4);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u16(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
 
     // depth=8, no visuals
     out.push(8);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u16(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
 
     // depth=24 (root depth), 1 visual: TrueColor RGB
     out.push(24);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 1);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, screen.root_visual.0);
+    write_u16(byte_order, out, 1);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, screen.root_visual.0);
     out.push(4); // TrueColor
     out.push(8); // bits per rgb
-    write_u16(ClientByteOrder::LittleEndian, out, 256);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x00ff_0000);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_ff00);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_00ff);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u16(byte_order, out, 256);
+    write_u32(byte_order, out, 0x00ff_0000);
+    write_u32(byte_order, out, 0x0000_ff00);
+    write_u32(byte_order, out, 0x0000_00ff);
+    write_u32(byte_order, out, 0);
 
     // depth=32, 1 visual: TrueColor ARGB
     out.push(32);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, out, 1);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, screen.argb_visual.0);
+    write_u16(byte_order, out, 1);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, screen.argb_visual.0);
     out.push(4); // TrueColor
     out.push(8); // bits per rgb
-    write_u16(ClientByteOrder::LittleEndian, out, 256);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x00ff_0000);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_ff00);
-    write_u32(ClientByteOrder::LittleEndian, out, 0x0000_00ff);
-    write_u32(ClientByteOrder::LittleEndian, out, 0xff00_0000); // alpha mask
+    write_u16(byte_order, out, 256);
+    write_u32(byte_order, out, 0x00ff_0000);
+    write_u32(byte_order, out, 0x0000_ff00);
+    write_u32(byte_order, out, 0x0000_00ff);
+    write_u32(byte_order, out, 0xff00_0000); // alpha mask
 }
 
 pub fn read_request(
     reader: &mut impl Read,
+    byte_order: ClientByteOrder,
     big_requests_enabled: bool,
 ) -> io::Result<Option<(RequestHeader, Vec<u8>)>> {
     let mut header = [0; 4];
@@ -774,13 +734,13 @@ pub fn read_request(
         Err(err) => return Err(err),
     }
 
-    let mut length_units = u32::from(u16::from_le_bytes([header[2], header[3]]));
+    let mut length_units = u32::from(read_u16(byte_order, &header[2..4]));
     let body_len;
 
     if length_units == 0 && big_requests_enabled {
         let mut big_len = [0; 4];
         reader.read_exact(&mut big_len)?;
-        length_units = u32::from_le_bytes(big_len);
+        length_units = read_u32(byte_order, &big_len);
         if length_units < 2 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -1245,9 +1205,13 @@ pub fn input_focus_window(body: &[u8]) -> Option<ResourceId> {
     Some(ResourceId(read_u32_le(body.get(0..4)?)))
 }
 
-pub fn write_key_event(writer: &mut impl Write, event: KeyEvent) -> io::Result<()> {
+pub fn write_key_event(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    event: KeyEvent,
+) -> io::Result<()> {
     let mut out = Vec::with_capacity(32);
-    encode_key_event(&mut out, ClientByteOrder::LittleEndian, event);
+    encode_key_event(&mut out, byte_order, event);
     writer.write_all(&out)
 }
 
@@ -1486,118 +1450,87 @@ pub fn query_extension_name(body: &[u8]) -> String {
 
 pub fn write_get_window_attributes_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     attributes: WindowAttributes,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 3);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.visual.0,
-    );
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, attributes.class);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 3);
+    write_u32(byte_order, &mut reply, attributes.visual.0);
+    write_u16(byte_order, &mut reply, attributes.class);
     reply.push(attributes.bit_gravity);
     reply.push(attributes.win_gravity);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.backing_planes,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.backing_pixel,
-    );
+    write_u32(byte_order, &mut reply, attributes.backing_planes);
+    write_u32(byte_order, &mut reply, attributes.backing_pixel);
     reply.push(u8::from(attributes.save_under));
     reply.push(u8::from(attributes.map_is_installed));
     reply.push(attributes.map_state);
     reply.push(u8::from(attributes.override_redirect));
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.colormap.0,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.all_event_masks,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.your_event_mask,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        attributes.do_not_propagate_mask,
-    );
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+    write_u32(byte_order, &mut reply, attributes.colormap.0);
+    write_u32(byte_order, &mut reply, attributes.all_event_masks);
+    write_u32(byte_order, &mut reply, attributes.your_event_mask);
+    write_u16(byte_order, &mut reply, attributes.do_not_propagate_mask);
+    write_u16(byte_order, &mut reply, 0);
     writer.write_all(&reply)
 }
 
 pub fn write_get_geometry_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     geometry: Geometry,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, geometry.depth, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, geometry.root.0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, geometry.x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, geometry.y);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, geometry.width);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, geometry.height);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        geometry.border_width,
-    );
+    let mut reply = fixed_reply(byte_order, sequence, geometry.depth, 0);
+    write_u32(byte_order, &mut reply, geometry.root.0);
+    write_i16(byte_order, &mut reply, geometry.x);
+    write_i16(byte_order, &mut reply, geometry.y);
+    write_u16(byte_order, &mut reply, geometry.width);
+    write_u16(byte_order, &mut reply, geometry.height);
+    write_u16(byte_order, &mut reply, geometry.border_width);
     reply.extend_from_slice(&[0; 10]);
     writer.write_all(&reply)
 }
 
 pub fn write_query_tree_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     root: ResourceId,
     parent: ResourceId,
     children: &[ResourceId],
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, children.len() as u32);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, root.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, parent.0);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        children.len() as u16,
-    );
+    let mut reply = fixed_reply(byte_order, sequence, 0, children.len() as u32);
+    write_u32(byte_order, &mut reply, root.0);
+    write_u32(byte_order, &mut reply, parent.0);
+    write_u16(byte_order, &mut reply, children.len() as u16);
     reply.extend_from_slice(&[0; 14]);
     for child in children {
-        write_u32(ClientByteOrder::LittleEndian, &mut reply, child.0);
+        write_u32(byte_order, &mut reply, child.0);
     }
     writer.write_all(&reply)
 }
 
 pub fn write_intern_atom_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     atom: AtomId,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, atom.0);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u32(byte_order, &mut reply, atom.0);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
 pub fn write_get_atom_name_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     name: &str,
 ) -> io::Result<()> {
     let mut extra = name.as_bytes().to_vec();
     pad_vec4(&mut extra);
-    let mut reply = fixed_reply(sequence, 0, checked_units(extra.len())? as u32);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, name.len() as u16);
+    let mut reply = fixed_reply(byte_order, sequence, 0, checked_units(extra.len())? as u32);
+    write_u16(byte_order, &mut reply, name.len() as u16);
     reply.extend_from_slice(&[0; 22]);
     reply.extend_from_slice(&extra);
     writer.write_all(&reply)
@@ -1614,16 +1547,17 @@ pub struct GetPropertyReply<'a> {
 
 pub fn write_get_property_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     reply: GetPropertyReply<'_>,
 ) -> io::Result<()> {
     let mut padded = reply.value.to_vec();
     pad_vec4(&mut padded);
     let length_units = u32::from(checked_units(padded.len())?);
-    let mut out = fixed_reply(sequence, reply.format, length_units);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.r#type.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.bytes_after);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.value_len);
+    let mut out = fixed_reply(byte_order, sequence, reply.format, length_units);
+    write_u32(byte_order, &mut out, reply.r#type.0);
+    write_u32(byte_order, &mut out, reply.bytes_after);
+    write_u32(byte_order, &mut out, reply.value_len);
     out.extend_from_slice(&[0; 12]);
     out.extend_from_slice(&padded);
     writer.write_all(&out)
@@ -1631,13 +1565,14 @@ pub fn write_get_property_reply(
 
 pub fn write_list_properties_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     atoms: &[AtomId],
 ) -> io::Result<()> {
     let n = u16::try_from(atoms.len()).unwrap_or(u16::MAX);
     // length = number of extra 4-byte units beyond the fixed 32-byte header
-    let mut reply = wire::fixed_reply(sequence, 0, u32::from(n));
-    wire::write_u16(ClientByteOrder::LittleEndian, &mut reply, n);
+    let mut reply = wire::fixed_reply(byte_order, sequence, 0, u32::from(n));
+    wire::write_u16(byte_order, &mut reply, n);
     reply.resize(32, 0);
     writer.write_all(&reply)?;
     for atom in &atoms[..usize::from(n)] {
@@ -1649,6 +1584,7 @@ pub fn write_list_properties_reply(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_device_event(
     out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major_opcode: u8,
     evtype: u16,
@@ -1666,50 +1602,34 @@ pub fn encode_xi2_device_event(
 ) {
     out.push(35); // GenericEvent
     out.push(major_opcode);
-    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, out, 13);
+    write_u16(byte_order, out, sequence.0);
+    write_u32(byte_order, out, 13);
 
-    write_u16(ClientByteOrder::LittleEndian, out, evtype);
-    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
-    write_u32(ClientByteOrder::LittleEndian, out, time);
-    write_u32(ClientByteOrder::LittleEndian, out, detail);
-    write_u32(ClientByteOrder::LittleEndian, out, root.0);
-    write_u32(ClientByteOrder::LittleEndian, out, event.0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // child
+    write_u16(byte_order, out, evtype);
+    write_u16(byte_order, out, deviceid);
+    write_u32(byte_order, out, time);
+    write_u32(byte_order, out, detail);
+    write_u32(byte_order, out, root.0);
+    write_u32(byte_order, out, event.0);
+    write_u32(byte_order, out, 0); // child
 
     // Coordinates are FP16.16
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(root_x) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(root_y) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(event_x) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(event_y) << 16) as u32,
-    );
+    write_u32(byte_order, out, (i32::from(root_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(root_y) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
-    write_u16(ClientByteOrder::LittleEndian, out, 1); // buttons_len
-    write_u16(ClientByteOrder::LittleEndian, out, 0); // valuators_len
-    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
-    write_u16(ClientByteOrder::LittleEndian, out, 0); // pad
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // flags
+    write_u16(byte_order, out, 1); // buttons_len
+    write_u16(byte_order, out, 0); // valuators_len
+    write_u16(byte_order, out, sourceid);
+    write_u16(byte_order, out, 0); // pad
+    write_u32(byte_order, out, 0); // flags
 
     // mods: base, latched, locked, effective
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, u32::from(state));
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, u32::from(state));
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
 
@@ -1733,9 +1653,9 @@ pub fn encode_xi2_device_event(
         } else {
             pre_buttons & !bit
         };
-        write_u32(ClientByteOrder::LittleEndian, out, post_buttons);
+        write_u32(byte_order, out, post_buttons);
     } else {
-        write_u32(ClientByteOrder::LittleEndian, out, 0);
+        write_u32(byte_order, out, 0);
     }
 
     debug_assert_eq!(out.len(), 84);
@@ -1751,6 +1671,7 @@ pub fn encode_xi2_device_event(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_raw_event(
     out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major_opcode: u8,
     evtype: u16,
@@ -1763,36 +1684,36 @@ pub fn encode_xi2_raw_event(
 ) {
     out.push(35); // GenericEvent
     out.push(major_opcode);
-    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
+    write_u16(byte_order, out, sequence.0);
     // length in 4-byte units beyond the 32-byte header.
     // Tail = valuator_mask(4) + axisvalues(2 * 8) + axisvalues_raw(2 * 8) = 36 bytes = 9 units.
-    write_u32(ClientByteOrder::LittleEndian, out, 9);
+    write_u32(byte_order, out, 9);
 
-    write_u16(ClientByteOrder::LittleEndian, out, evtype);
-    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
-    write_u32(ClientByteOrder::LittleEndian, out, time);
-    write_u32(ClientByteOrder::LittleEndian, out, detail);
-    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
-    write_u16(ClientByteOrder::LittleEndian, out, 2); // valuators_len: X and Y
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // flags
+    write_u16(byte_order, out, evtype);
+    write_u16(byte_order, out, deviceid);
+    write_u32(byte_order, out, time);
+    write_u32(byte_order, out, detail);
+    write_u16(byte_order, out, sourceid);
+    write_u16(byte_order, out, 2); // valuators_len: X and Y
+    write_u32(byte_order, out, 0); // flags
     out.extend_from_slice(&[0; 4]); // pad to 32-byte fixed area
 
     debug_assert_eq!(out.len(), 32);
 
     // Variable tail: valuator_mask + axisvalues + axisvalues_raw.
-    write_u32(ClientByteOrder::LittleEndian, out, 0x3); // valuator_mask: bits 0+1 (X, Y)
+    write_u32(byte_order, out, 0x3); // valuator_mask: bits 0+1 (X, Y)
 
     // FP3232 values: integer part (i32) + fractional part (u32 = 0).
-    write_u32(ClientByteOrder::LittleEndian, out, raw_x as u32);
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // X fractional
-    write_u32(ClientByteOrder::LittleEndian, out, raw_y as u32);
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // Y fractional
+    write_u32(byte_order, out, raw_x as u32);
+    write_u32(byte_order, out, 0); // X fractional
+    write_u32(byte_order, out, raw_y as u32);
+    write_u32(byte_order, out, 0); // Y fractional
 
     // axisvalues_raw — same as axisvalues for our purposes.
-    write_u32(ClientByteOrder::LittleEndian, out, raw_x as u32);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, raw_y as u32);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
+    write_u32(byte_order, out, raw_x as u32);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, raw_y as u32);
+    write_u32(byte_order, out, 0);
 
     debug_assert_eq!(out.len(), 68);
 }
@@ -1800,6 +1721,7 @@ pub fn encode_xi2_raw_event(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_crossing_event(
     out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major_opcode: u8,
     evtype: u16,
@@ -1818,52 +1740,36 @@ pub fn encode_xi2_crossing_event(
 ) {
     out.push(35); // GenericEvent
     out.push(major_opcode);
-    write_u16(ClientByteOrder::LittleEndian, out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, out, 11);
+    write_u16(byte_order, out, sequence.0);
+    write_u32(byte_order, out, 11);
 
-    write_u16(ClientByteOrder::LittleEndian, out, evtype);
-    write_u16(ClientByteOrder::LittleEndian, out, deviceid);
-    write_u32(ClientByteOrder::LittleEndian, out, time);
-    write_u16(ClientByteOrder::LittleEndian, out, sourceid);
+    write_u16(byte_order, out, evtype);
+    write_u16(byte_order, out, deviceid);
+    write_u32(byte_order, out, time);
+    write_u16(byte_order, out, sourceid);
     out.push(mode);
     out.push(detail);
-    write_u32(ClientByteOrder::LittleEndian, out, root.0);
-    write_u32(ClientByteOrder::LittleEndian, out, event.0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // child
+    write_u32(byte_order, out, root.0);
+    write_u32(byte_order, out, event.0);
+    write_u32(byte_order, out, 0); // child
 
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(root_x) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(root_y) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(event_x) << 16) as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        out,
-        (i32::from(event_y) << 16) as u32,
-    );
+    write_u32(byte_order, out, (i32::from(root_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(root_y) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
     out.push(1); // same_screen
     out.push(u8::from(matches!(evtype, 9 | 10))); // focus
-    write_u16(ClientByteOrder::LittleEndian, out, 1); // buttons_len
+    write_u16(byte_order, out, 1); // buttons_len
 
     // mods: base, latched, locked, effective
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, 0);
-    write_u32(ClientByteOrder::LittleEndian, out, u32::from(state));
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, u32::from(state));
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
-    write_u32(ClientByteOrder::LittleEndian, out, 0); // button mask
+    write_u32(byte_order, out, 0); // button mask
 
     debug_assert_eq!(out.len(), 76);
 }
@@ -1871,6 +1777,7 @@ pub fn encode_xi2_crossing_event(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_focus_event(
     out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major_opcode: u8,
     evtype: u16,
@@ -1882,6 +1789,7 @@ pub fn encode_xi2_focus_event(
 ) {
     encode_xi2_crossing_event(
         out,
+        byte_order,
         sequence,
         major_opcode,
         evtype,
@@ -1902,21 +1810,23 @@ pub fn encode_xi2_focus_event(
 
 pub fn write_get_selection_owner_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     owner: ResourceId,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, owner.0);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u32(byte_order, &mut reply, owner.0);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
 pub fn write_grab_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     status: u8,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, status, 0);
+    let mut reply = fixed_reply(byte_order, sequence, status, 0);
     reply.extend_from_slice(&[0; 24]);
     writer.write_all(&reply)
 }
@@ -1934,112 +1844,107 @@ pub struct QueryPointerReply {
 
 pub fn write_query_pointer_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     reply_data: QueryPointerReply,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 1, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, reply_data.root.0);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        reply_data.child.0,
-    );
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.root_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.root_y);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.win_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, reply_data.win_y);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, reply_data.mask);
+    let mut reply = fixed_reply(byte_order, sequence, 1, 0);
+    write_u32(byte_order, &mut reply, reply_data.root.0);
+    write_u32(byte_order, &mut reply, reply_data.child.0);
+    write_i16(byte_order, &mut reply, reply_data.root_x);
+    write_i16(byte_order, &mut reply, reply_data.root_y);
+    write_i16(byte_order, &mut reply, reply_data.win_x);
+    write_i16(byte_order, &mut reply, reply_data.win_y);
+    write_u16(byte_order, &mut reply, reply_data.mask);
     reply.extend_from_slice(&[0; 6]);
     writer.write_all(&reply)
 }
 
 pub fn write_translate_coordinates_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     child: ResourceId,
     dst_x: i16,
     dst_y: i16,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 1, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, child.0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, dst_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, dst_y);
+    let mut reply = fixed_reply(byte_order, sequence, 1, 0);
+    write_u32(byte_order, &mut reply, child.0);
+    write_i16(byte_order, &mut reply, dst_x);
+    write_i16(byte_order, &mut reply, dst_y);
     reply.extend_from_slice(&[0; 16]);
     writer.write_all(&reply)
 }
 
 pub fn write_get_input_focus_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     focus: ResourceId,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 1, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, focus.0);
+    let mut reply = fixed_reply(byte_order, sequence, 1, 0);
+    write_u32(byte_order, &mut reply, focus.0);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
 pub fn write_query_keymap_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 2);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 2);
     reply.extend_from_slice(&[0; 32]);
     writer.write_all(&reply)
 }
 
 pub fn write_alloc_color_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     color: Rgb16,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        rgb16_to_pixel(color),
-    );
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u16(byte_order, &mut reply, color.red);
+    write_u16(byte_order, &mut reply, color.green);
+    write_u16(byte_order, &mut reply, color.blue);
+    write_u16(byte_order, &mut reply, 0);
+    write_u32(byte_order, &mut reply, rgb16_to_pixel(color));
     reply.extend_from_slice(&[0; 12]);
     writer.write_all(&reply)
 }
 
 pub fn write_lookup_color_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     color: Rgb16,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u16(byte_order, &mut reply, color.red);
+    write_u16(byte_order, &mut reply, color.green);
+    write_u16(byte_order, &mut reply, color.blue);
+    write_u16(byte_order, &mut reply, color.red);
+    write_u16(byte_order, &mut reply, color.green);
+    write_u16(byte_order, &mut reply, color.blue);
     reply.extend_from_slice(&[0; 12]);
     writer.write_all(&reply)
 }
 
 pub fn write_alloc_named_color_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     color: Rgb16,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        rgb16_to_pixel(color),
-    );
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u32(byte_order, &mut reply, rgb16_to_pixel(color));
+    write_u16(byte_order, &mut reply, color.red);
+    write_u16(byte_order, &mut reply, color.green);
+    write_u16(byte_order, &mut reply, color.blue);
+    write_u16(byte_order, &mut reply, color.red);
+    write_u16(byte_order, &mut reply, color.green);
+    write_u16(byte_order, &mut reply, color.blue);
     reply.extend_from_slice(&[0; 8]);
     writer.write_all(&reply)
 }
@@ -2076,8 +1981,8 @@ pub fn get_image_request(format: u8, body: &[u8]) -> Option<GetImageRequest> {
 /// ZPixmap at 32 bpp is the common case; other formats get 0 bytes of data.
 pub fn write_get_image_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    order: ClientByteOrder,
     request: &GetImageRequest,
     visual_id: u32,
 ) -> io::Result<()> {
@@ -2091,8 +1996,8 @@ pub fn write_get_image_reply(
     } else {
         0
     };
-    let mut reply = fixed_reply(sequence, DEPTH, data_bytes / 4);
-    write_u32(order, &mut reply, visual_id);
+    let mut reply = fixed_reply(byte_order, sequence, DEPTH, data_bytes / 4);
+    write_u32(byte_order, &mut reply, visual_id);
     reply.extend_from_slice(&[0u8; 20]);
     reply.extend(std::iter::repeat_n(0u8, data_bytes as usize));
     writer.write_all(&reply)
@@ -2100,25 +2005,22 @@ pub fn write_get_image_reply(
 
 pub fn write_query_colors_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     pixels: &[u32],
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, (pixels.len() * 2) as u32);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        pixels.len() as u16,
-    );
+    let mut reply = fixed_reply(byte_order, sequence, 0, (pixels.len() * 2) as u32);
+    write_u16(byte_order, &mut reply, pixels.len() as u16);
     reply.extend_from_slice(&[0; 22]);
 
     for pixel in pixels {
         let red = (((pixel >> 16) & 0xff) as u16) * 257;
         let green = (((pixel >> 8) & 0xff) as u16) * 257;
         let blue = ((pixel & 0xff) as u16) * 257;
-        write_u16(ClientByteOrder::LittleEndian, &mut reply, red);
-        write_u16(ClientByteOrder::LittleEndian, &mut reply, green);
-        write_u16(ClientByteOrder::LittleEndian, &mut reply, blue);
-        write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+        write_u16(byte_order, &mut reply, red);
+        write_u16(byte_order, &mut reply, green);
+        write_u16(byte_order, &mut reply, blue);
+        write_u16(byte_order, &mut reply, 0);
     }
 
     writer.write_all(&reply)
@@ -2126,13 +2028,14 @@ pub fn write_query_colors_reply(
 
 pub fn write_query_extension_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     present: bool,
     major_opcode: u8,
     first_event: u8,
     first_error: u8,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
     reply.push(u8::from(present));
     reply.push(major_opcode);
     reply.push(first_event);
@@ -2143,10 +2046,11 @@ pub fn write_query_extension_reply(
 
 pub fn write_ge_query_version_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
     // GEQueryVersion reply: major=1, minor=0, rest padding
-    let mut reply = fixed_reply(sequence, 0, 0);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
     reply.extend_from_slice(&[1, 0]); // major_version = 1
     reply.extend_from_slice(&[0, 0]); // minor_version = 0
     reply.extend_from_slice(&[0; 20]);
@@ -2155,21 +2059,19 @@ pub fn write_ge_query_version_reply(
 
 pub fn write_big_requests_enable_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     max_request_length: u32,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        max_request_length,
-    );
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u32(byte_order, &mut reply, max_request_length);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
 pub fn write_list_extensions_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     names: &[&str],
 ) -> io::Result<()> {
@@ -2182,6 +2084,7 @@ pub fn write_list_extensions_reply(
     pad_vec4(&mut names_raw);
 
     let mut reply = fixed_reply(
+        byte_order,
         sequence,
         names.len() as u8,
         checked_units(names_raw.len())? as u32,
@@ -2193,13 +2096,19 @@ pub fn write_list_extensions_reply(
 
 pub fn write_get_keyboard_mapping_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     first_keycode: u8,
     keycode_count: u8,
     keysyms_per_keycode: u8,
 ) -> io::Result<()> {
     let keysym_count = u32::from(keycode_count) * u32::from(keysyms_per_keycode);
-    let mut reply = fixed_reply(sequence, keysyms_per_keycode, keysyms_per_keycode as u32);
+    let mut reply = fixed_reply(
+        byte_order,
+        sequence,
+        keysyms_per_keycode,
+        keysyms_per_keycode as u32,
+    );
     reply.extend_from_slice(&[0; 24]);
     reply.truncate(32);
     reply[4..8].copy_from_slice(&keysym_count.to_le_bytes());
@@ -2207,12 +2116,12 @@ pub fn write_get_keyboard_mapping_reply(
     for offset in 0..keycode_count {
         let keycode = first_keycode.wrapping_add(offset);
         let (base, shifted) = keysyms_for_keycode(keycode);
-        write_u32(ClientByteOrder::LittleEndian, &mut reply, base);
+        write_u32(byte_order, &mut reply, base);
         if keysyms_per_keycode > 1 {
-            write_u32(ClientByteOrder::LittleEndian, &mut reply, shifted);
+            write_u32(byte_order, &mut reply, shifted);
         }
         for _ in 2..keysyms_per_keycode {
-            write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
+            write_u32(byte_order, &mut reply, 0);
         }
     }
     writer.write_all(&reply)
@@ -2220,6 +2129,7 @@ pub fn write_get_keyboard_mapping_reply(
 
 pub fn write_query_font_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     metrics: &FontMetrics,
 ) -> io::Result<()> {
@@ -2230,50 +2140,22 @@ pub fn write_query_font_reply(
     let m = metrics.char_infos.len();
     let reply_length = 7 + 2 * u32::try_from(n).unwrap_or(0) + 3 * u32::try_from(m).unwrap_or(0);
 
-    let mut reply = fixed_reply(sequence, 0, reply_length);
+    let mut reply = fixed_reply(byte_order, sequence, 0, reply_length);
     write_full_char_info(&mut reply, &metrics.min_bounds);
     reply.extend_from_slice(&[0; 4]);
     write_full_char_info(&mut reply, &metrics.max_bounds);
     reply.extend_from_slice(&[0; 4]);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        metrics.min_char_or_byte2,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        metrics.max_char_or_byte2,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        metrics.default_char,
-    );
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        u16::try_from(n).unwrap_or(0),
-    );
+    write_u16(byte_order, &mut reply, metrics.min_char_or_byte2);
+    write_u16(byte_order, &mut reply, metrics.max_char_or_byte2);
+    write_u16(byte_order, &mut reply, metrics.default_char);
+    write_u16(byte_order, &mut reply, u16::try_from(n).unwrap_or(0));
     reply.push(metrics.draw_direction);
     reply.push(metrics.min_byte1);
     reply.push(metrics.max_byte1);
     reply.push(u8::from(metrics.all_chars_exist));
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        metrics.font_ascent,
-    );
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        metrics.font_descent,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        u32::try_from(m).unwrap_or(0),
-    );
+    write_i16(byte_order, &mut reply, metrics.font_ascent);
+    write_i16(byte_order, &mut reply, metrics.font_descent);
+    write_u32(byte_order, &mut reply, u32::try_from(m).unwrap_or(0));
     reply.extend_from_slice(&metrics.properties[..n * 8]);
     for char_info in &metrics.char_infos {
         write_full_char_info(&mut reply, char_info);
@@ -2283,74 +2165,53 @@ pub fn write_query_font_reply(
 
 pub fn write_query_text_extents_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     extents: TextExtents,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, extents.draw_direction, 0);
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.font_ascent,
-    );
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.font_descent,
-    );
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.overall_ascent,
-    );
-    write_i16(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.overall_descent,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.overall_width as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.overall_left as u32,
-    );
-    write_u32(
-        ClientByteOrder::LittleEndian,
-        &mut reply,
-        extents.overall_right as u32,
-    );
+    let mut reply = fixed_reply(byte_order, sequence, extents.draw_direction, 0);
+    write_i16(byte_order, &mut reply, extents.font_ascent);
+    write_i16(byte_order, &mut reply, extents.font_descent);
+    write_i16(byte_order, &mut reply, extents.overall_ascent);
+    write_i16(byte_order, &mut reply, extents.overall_descent);
+    write_u32(byte_order, &mut reply, extents.overall_width as u32);
+    write_u32(byte_order, &mut reply, extents.overall_left as u32);
+    write_u32(byte_order, &mut reply, extents.overall_right as u32);
     reply.extend_from_slice(&[0; 4]);
     writer.write_all(&reply)
 }
 
-pub fn write_list_hosts_reply(writer: &mut impl Write, sequence: SequenceNumber) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+pub fn write_list_hosts_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u16(byte_order, &mut reply, 0);
     reply.extend_from_slice(&[0; 22]);
     writer.write_all(&reply)
 }
 
 pub fn write_query_best_size_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     width: u16,
     height: u16,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 0, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, width);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, height);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
+    write_u16(byte_order, &mut reply, width);
+    write_u16(byte_order, &mut reply, height);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
 
 pub fn write_get_pointer_mapping_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 3, 1);
+    let mut reply = fixed_reply(byte_order, sequence, 3, 1);
     reply.extend_from_slice(&[0; 24]);
     reply.extend_from_slice(&[1, 2, 3, 0]);
     writer.write_all(&reply)
@@ -2358,9 +2219,10 @@ pub fn write_get_pointer_mapping_reply(
 
 pub fn write_get_modifier_mapping_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 1, 2);
+    let mut reply = fixed_reply(byte_order, sequence, 1, 2);
     reply.extend_from_slice(&[0; 24]);
     reply.extend_from_slice(&[50, 66, 37, 64, 0, 0, 0, 133]);
     writer.write_all(&reply)
@@ -2455,6 +2317,7 @@ pub fn encode_property_notify_event(
 
 pub fn write_property_notify_event(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     window: ResourceId,
     atom: AtomId,
@@ -2463,13 +2326,7 @@ pub fn write_property_notify_event(
 ) -> io::Result<()> {
     let mut out = Vec::with_capacity(32);
     encode_property_notify_event(
-        &mut out,
-        sequence,
-        ClientByteOrder::LittleEndian,
-        window,
-        atom,
-        timestamp,
-        deleted,
+        &mut out, sequence, byte_order, window, atom, timestamp, deleted,
     );
     writer.write_all(&out)
 }
@@ -2610,7 +2467,7 @@ pub fn encode_leave_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, even
 pub fn encode_selection_request_event(
     out: &mut Vec<u8>,
     seq: SequenceNumber,
-    _order: ClientByteOrder,
+    order: ClientByteOrder,
     time: u32,
     owner: ResourceId,
     requestor: ResourceId,
@@ -2618,35 +2475,35 @@ pub fn encode_selection_request_event(
     target: AtomId,
     property: AtomId,
 ) {
-    let mut buf = [0u8; 32];
-    buf[0] = 30;
-    buf[2] = (seq.0 & 0xff) as u8;
-    buf[3] = ((seq.0 >> 8) & 0xff) as u8;
-    buf[4..8].copy_from_slice(&time.to_le_bytes());
-    buf[8..12].copy_from_slice(&owner.0.to_le_bytes());
-    buf[12..16].copy_from_slice(&requestor.0.to_le_bytes());
-    buf[16..20].copy_from_slice(&selection.0.to_le_bytes());
-    buf[20..24].copy_from_slice(&target.0.to_le_bytes());
-    buf[24..28].copy_from_slice(&property.0.to_le_bytes());
-    out.extend_from_slice(&buf);
+    out.push(30); // SelectionRequest
+    out.push(0); // pad
+    write_u16(order, out, seq.0);
+    write_u32(order, out, time);
+    write_u32(order, out, owner.0);
+    write_u32(order, out, requestor.0);
+    write_u32(order, out, selection.0);
+    write_u32(order, out, target.0);
+    write_u32(order, out, property.0);
+    out.extend_from_slice(&[0u8; 4]); // pad to 32
+    debug_assert!(out.len() >= 32);
 }
 
 pub fn encode_selection_clear_event(
     out: &mut Vec<u8>,
     seq: SequenceNumber,
-    _order: ClientByteOrder,
+    order: ClientByteOrder,
     time: u32,
     owner: ResourceId,
     selection: AtomId,
 ) {
-    let mut buf = [0u8; 32];
-    buf[0] = 29;
-    buf[2] = (seq.0 & 0xff) as u8;
-    buf[3] = ((seq.0 >> 8) & 0xff) as u8;
-    buf[4..8].copy_from_slice(&time.to_le_bytes());
-    buf[8..12].copy_from_slice(&owner.0.to_le_bytes());
-    buf[12..16].copy_from_slice(&selection.0.to_le_bytes());
-    out.extend_from_slice(&buf);
+    out.push(29); // SelectionClear
+    out.push(0); // pad
+    write_u16(order, out, seq.0);
+    write_u32(order, out, time);
+    write_u32(order, out, owner.0);
+    write_u32(order, out, selection.0);
+    out.extend_from_slice(&[0u8; 16]); // pad to 32
+    debug_assert!(out.len() >= 32);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2695,6 +2552,7 @@ pub fn parse_ungrab_key(body: &[u8], keycode_in_header_data: u8) -> Option<Ungra
 
 pub fn write_mapping_notify_event(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     request: u8,
     first_keycode: u8,
@@ -2702,7 +2560,9 @@ pub fn write_mapping_notify_event(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = 34;
-    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
     buf[4] = request;
     buf[5] = first_keycode;
     buf[6] = count;
@@ -2711,6 +2571,7 @@ pub fn write_mapping_notify_event(
 
 pub fn write_circulate_notify_event(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     event_window: ResourceId,
     window: ResourceId,
@@ -2718,15 +2579,22 @@ pub fn write_circulate_notify_event(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = 26;
-    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    buf[4..8].copy_from_slice(&event_window.0.to_le_bytes());
-    buf[8..12].copy_from_slice(&window.0.to_le_bytes());
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    let mut u32_buf = Vec::with_capacity(4);
+    write_u32(byte_order, &mut u32_buf, event_window.0);
+    buf[4..8].copy_from_slice(&u32_buf);
+    u32_buf.clear();
+    write_u32(byte_order, &mut u32_buf, window.0);
+    buf[8..12].copy_from_slice(&u32_buf);
     buf[16] = place;
     writer.write_all(&buf)
 }
 
 pub fn write_circulate_request_event(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     parent: ResourceId,
     window: ResourceId,
@@ -2734,31 +2602,41 @@ pub fn write_circulate_request_event(
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = 27;
-    buf[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-    buf[4..8].copy_from_slice(&parent.0.to_le_bytes());
-    buf[8..12].copy_from_slice(&window.0.to_le_bytes());
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    let mut u32_buf = Vec::with_capacity(4);
+    write_u32(byte_order, &mut u32_buf, parent.0);
+    buf[4..8].copy_from_slice(&u32_buf);
+    u32_buf.clear();
+    write_u32(byte_order, &mut u32_buf, window.0);
+    buf[8..12].copy_from_slice(&u32_buf);
     buf[16] = place;
     writer.write_all(&buf)
 }
 
 pub fn write_get_keyboard_mapping_reply_from_keysyms(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     keysyms_per_keycode: u8,
     keysyms: &[u32],
 ) -> io::Result<()> {
     let length_words = u32::try_from(keysyms.len()).unwrap_or(0);
-    let mut reply = fixed_reply(sequence, keysyms_per_keycode, length_words);
+    let mut reply = fixed_reply(byte_order, sequence, keysyms_per_keycode, length_words);
     reply.extend_from_slice(&[0u8; 24]);
     reply.truncate(32);
     for k in keysyms {
-        reply.extend_from_slice(&k.to_le_bytes());
+        let mut tmp = Vec::with_capacity(4);
+        write_u32(byte_order, &mut tmp, *k);
+        reply.extend_from_slice(&tmp);
     }
     writer.write_all(&reply)
 }
 
 pub fn write_get_modifier_mapping_reply_with_keycodes(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     keycodes_per_modifier: u8,
     keycodes: &[u8],
@@ -2770,7 +2648,7 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
     );
     let total = 8 * u32::from(keycodes_per_modifier);
     let length_words = total / 4;
-    let mut reply = fixed_reply(sequence, keycodes_per_modifier, length_words);
+    let mut reply = fixed_reply(byte_order, sequence, keycodes_per_modifier, length_words);
     reply.extend_from_slice(&[0u8; 24]);
     reply.truncate(32);
     reply.extend_from_slice(keycodes);
@@ -2784,7 +2662,8 @@ mod tests {
     #[test]
     fn read_request_rejects_zero_length_without_big_requests() {
         let mut input = std::io::Cursor::new([1, 2, 0, 0]);
-        let err = read_request(&mut input, false).expect_err("zero length must be invalid");
+        let err = read_request(&mut input, ClientByteOrder::LittleEndian, false)
+            .expect_err("zero length must be invalid");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -2795,7 +2674,7 @@ mod tests {
             3, 0, 0, 0, // 12-byte total request: header + big length + 4 body bytes
             0xaa, 0xbb, 0xcc, 0xdd,
         ]);
-        let (header, body) = read_request(&mut input, true)
+        let (header, body) = read_request(&mut input, ClientByteOrder::LittleEndian, true)
             .expect("read should succeed")
             .expect("request should be present");
 
@@ -2806,10 +2685,71 @@ mod tests {
     }
 
     #[test]
+    fn read_request_be_normal_length() {
+        // Opcode 1, data 2, length_units = 3 in BE (00 03), body = 8 bytes.
+        let mut input = std::io::Cursor::new([
+            1, 2, 0x00, 0x03, // BE-encoded length = 3 units
+            0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44,
+        ]);
+        let (header, body) = read_request(&mut input, ClientByteOrder::BigEndian, false)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.opcode, 1);
+        assert_eq!(header.data, 2);
+        assert_eq!(header.length_units, 3);
+        assert_eq!(body.len(), 8);
+        assert_eq!(body, [0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn read_request_be_big_requests_extended_length() {
+        // Opcode 1, data 2, length_units = 0 (BE) → BIG-REQUESTS path,
+        // big length = 3 (BE), so total = 12 bytes, body = 4 bytes.
+        let mut input = std::io::Cursor::new([
+            1, 2, 0x00, 0x00, // BE-encoded length = 0 → BIG path
+            0x00, 0x00, 0x00, 0x03, // BE-encoded big length = 3 units
+            0xaa, 0xbb, 0xcc, 0xdd,
+        ]);
+        let (header, body) = read_request(&mut input, ClientByteOrder::BigEndian, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.opcode, 1);
+        assert_eq!(header.length_units, 3);
+        assert_eq!(body, [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn write_error_be_encodes_fields_in_big_endian() {
+        let mut buf = Vec::new();
+        write_error(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x1234),
+            error::BAD_LENGTH,
+            0xdead_beef,
+            0x4321,
+            42,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 0); // error response_type
+        assert_eq!(buf[1], error::BAD_LENGTH);
+        // sequence is u16 BE at [2..4]
+        assert_eq!(&buf[2..4], &[0x12, 0x34]);
+        // bad_value is u32 BE at [4..8]
+        assert_eq!(&buf[4..8], &[0xde, 0xad, 0xbe, 0xef]);
+        // minor_opcode is u16 BE at [8..10]
+        assert_eq!(&buf[8..10], &[0x43, 0x21]);
+        // major_opcode is u8 at [10]
+        assert_eq!(buf[10], 42);
+    }
+
+    #[test]
     fn xi2_device_event_has_expected_wire_size() {
         let mut out = Vec::new();
         encode_xi2_device_event(
             &mut out,
+            ClientByteOrder::LittleEndian,
             SequenceNumber(7),
             137,
             4,
@@ -2836,6 +2776,7 @@ mod tests {
         let mut out = Vec::new();
         encode_xi2_crossing_event(
             &mut out,
+            ClientByteOrder::LittleEndian,
             SequenceNumber(8),
             137,
             7,
@@ -2942,7 +2883,12 @@ mod tests {
         #[test]
         fn query_pict_index_values_empty_reply_shape() {
             let mut out = Vec::new();
-            write_render_query_pict_index_values_reply(&mut out, SequenceNumber(0x1234)).unwrap();
+            write_render_query_pict_index_values_reply(
+                &mut out,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(0x1234),
+            )
+            .unwrap();
 
             assert_eq!(out.len(), 32);
             assert_eq!(out[0], 1);
@@ -2956,7 +2902,12 @@ mod tests {
         #[test]
         fn query_filters_empty_reply_shape() {
             let mut out = Vec::new();
-            write_render_query_filters_reply(&mut out, SequenceNumber(0x1234)).unwrap();
+            write_render_query_filters_reply(
+                &mut out,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(0x1234),
+            )
+            .unwrap();
 
             assert_eq!(out.len(), 32);
             assert_eq!(out[0], 1);
@@ -3023,6 +2974,7 @@ mod tests {
                 let mut buf = Vec::new();
                 write_get_property_reply(
                     &mut buf,
+                    ClientByteOrder::LittleEndian,
                     SequenceNumber(0xdead),
                     GetPropertyReply {
                         format,
@@ -3758,7 +3710,15 @@ mod tests {
         #[test]
         fn mapping_notify_event_layout() {
             let mut buf = Vec::new();
-            write_mapping_notify_event(&mut buf, SequenceNumber(0), 1, 8, 248).unwrap();
+            write_mapping_notify_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(0),
+                1,
+                8,
+                248,
+            )
+            .unwrap();
             assert_eq!(buf.len(), 32);
             assert_eq!(buf[0], 34);
             assert_eq!(buf[4], 1);
@@ -3771,6 +3731,7 @@ mod tests {
             let mut buf = Vec::new();
             write_circulate_notify_event(
                 &mut buf,
+                ClientByteOrder::LittleEndian,
                 SequenceNumber(0),
                 ResourceId(0x100),
                 ResourceId(0x200),
@@ -3792,6 +3753,7 @@ mod tests {
             let mut buf = Vec::new();
             write_circulate_request_event(
                 &mut buf,
+                ClientByteOrder::LittleEndian,
                 SequenceNumber(0),
                 ResourceId(0x100),
                 ResourceId(0x200),
@@ -3806,8 +3768,14 @@ mod tests {
         fn keyboard_mapping_reply_from_keysyms_layout() {
             let keysyms: &[u32] = &[0x71, 0x51, 0, 0, 0x77, 0x57, 0, 0];
             let mut buf = Vec::new();
-            write_get_keyboard_mapping_reply_from_keysyms(&mut buf, SequenceNumber(7), 4, keysyms)
-                .unwrap();
+            write_get_keyboard_mapping_reply_from_keysyms(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(7),
+                4,
+                keysyms,
+            )
+            .unwrap();
             assert_eq!(buf[0], 1);
             assert_eq!(buf[1], 4);
             assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 8);
@@ -3823,8 +3791,14 @@ mod tests {
             let kpm = 2u8;
             let kc: Vec<u8> = (0..(8 * kpm)).map(|i| i + 8).collect();
             let mut buf = Vec::new();
-            write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc)
-                .unwrap();
+            write_get_modifier_mapping_reply_with_keycodes(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(3),
+                kpm,
+                &kc,
+            )
+            .unwrap();
             assert_eq!(buf[0], 1);
             assert_eq!(buf[1], kpm);
             let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -3837,8 +3811,14 @@ mod tests {
             let kpm = 4u8;
             let kc: Vec<u8> = (0..(8 * kpm)).map(|i| i + 8).collect();
             let mut buf = Vec::new();
-            write_get_modifier_mapping_reply_with_keycodes(&mut buf, SequenceNumber(3), kpm, &kc)
-                .unwrap();
+            write_get_modifier_mapping_reply_with_keycodes(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(3),
+                kpm,
+                &kc,
+            )
+            .unwrap();
             let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
             assert_eq!(length, (8 * u32::from(kpm)) / 4);
             assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
@@ -4038,6 +4018,7 @@ pub fn render_composite_request(body: &[u8]) -> Option<RenderCompositeRequest> {
 /// and maps the root visual (depth 24) to X8R8G8B8 and the ARGB visual (depth 32) to A8R8G8B8.
 pub fn write_render_query_pict_formats_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     root_visual: ResourceId,
     argb_visual: ResourceId,
@@ -4054,104 +4035,105 @@ pub fn write_render_query_pict_formats_reply(
     let mut out = Vec::new();
     out.push(1u8); // Reply
     out.push(0u8); // unused
-    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, body_units);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, num_formats);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, num_screens);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, num_depths);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, num_visuals);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_subpixel
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, body_units);
+    write_u32(byte_order, &mut out, num_formats);
+    write_u32(byte_order, &mut out, num_screens);
+    write_u32(byte_order, &mut out, num_depths);
+    write_u32(byte_order, &mut out, num_visuals);
+    write_u32(byte_order, &mut out, 0); // num_subpixel
+    write_u32(byte_order, &mut out, 0); // pad
 
     // Format 1: A1 (depth=1, alpha only)
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_A1);
+    write_u32(byte_order, &mut out, RENDER_FMT_A1);
     out.push(1); // type=Direct
     out.push(1); // depth=1
     out.extend_from_slice(&[0, 0]); // pad
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // red-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // red-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // green-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // green-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // alpha-mask
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // colormap
+    write_u16(byte_order, &mut out, 0); // red-shift
+    write_u16(byte_order, &mut out, 0); // red-mask
+    write_u16(byte_order, &mut out, 0); // green-shift
+    write_u16(byte_order, &mut out, 0); // green-mask
+    write_u16(byte_order, &mut out, 0); // blue-shift
+    write_u16(byte_order, &mut out, 0); // blue-mask
+    write_u16(byte_order, &mut out, 0); // alpha-shift
+    write_u16(byte_order, &mut out, 1); // alpha-mask
+    write_u32(byte_order, &mut out, 0); // colormap
 
     // Format 2: A8 (depth=8, alpha only)
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_A8);
+    write_u32(byte_order, &mut out, RENDER_FMT_A8);
     out.push(1); // type=Direct
     out.push(8); // depth=8
     out.extend_from_slice(&[0, 0]);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift=0
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // alpha-mask=0xFF
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, 0); // alpha-shift=0
+    write_u16(byte_order, &mut out, 0xFF); // alpha-mask=0xFF
+    write_u32(byte_order, &mut out, 0);
 
     // Format 3: X8R8G8B8 (depth=24, no alpha)
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24);
+    write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
     out.push(1); // type=Direct
     out.push(24); // depth=24
     out.extend_from_slice(&[0, 0]);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 16); // red-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // red-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 8); // green-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // green-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // blue-mask
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // alpha-mask=0 (no alpha)
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(byte_order, &mut out, 16); // red-shift
+    write_u16(byte_order, &mut out, 0xFF); // red-mask
+    write_u16(byte_order, &mut out, 8); // green-shift
+    write_u16(byte_order, &mut out, 0xFF); // green-mask
+    write_u16(byte_order, &mut out, 0); // blue-shift
+    write_u16(byte_order, &mut out, 0xFF); // blue-mask
+    write_u16(byte_order, &mut out, 0); // alpha-shift
+    write_u16(byte_order, &mut out, 0); // alpha-mask=0 (no alpha)
+    write_u32(byte_order, &mut out, 0);
 
     // Format 4: A8R8G8B8 (depth=32, with alpha)
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_ARGB32);
+    write_u32(byte_order, &mut out, RENDER_FMT_ARGB32);
     out.push(1); // type=Direct
     out.push(32); // depth=32
     out.extend_from_slice(&[0, 0]);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 16); // red-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 8); // green-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0); // blue-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 24); // alpha-shift
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 0xFF); // alpha-mask
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0);
+    write_u16(byte_order, &mut out, 16); // red-shift
+    write_u16(byte_order, &mut out, 0xFF);
+    write_u16(byte_order, &mut out, 8); // green-shift
+    write_u16(byte_order, &mut out, 0xFF);
+    write_u16(byte_order, &mut out, 0); // blue-shift
+    write_u16(byte_order, &mut out, 0xFF);
+    write_u16(byte_order, &mut out, 24); // alpha-shift
+    write_u16(byte_order, &mut out, 0xFF); // alpha-mask
+    write_u32(byte_order, &mut out, 0);
 
     // Screen info: 1 screen with 2 depths
-    write_u32(ClientByteOrder::LittleEndian, &mut out, num_depths); // nDepth per screen
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24); // fallback
+    write_u32(byte_order, &mut out, num_depths); // nDepth per screen
+    write_u32(byte_order, &mut out, RENDER_FMT_RGB24); // fallback
     // Depth 24 entry: 8-byte header + 1 visual (8 bytes)
     out.push(24);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // 1 visual
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
-    write_u32(ClientByteOrder::LittleEndian, &mut out, root_visual.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_RGB24);
+    write_u16(byte_order, &mut out, 1); // 1 visual
+    write_u32(byte_order, &mut out, 0); // pad
+    write_u32(byte_order, &mut out, root_visual.0);
+    write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
     // Depth 32 entry: 8-byte header + 1 visual (8 bytes)
     out.push(32);
     out.push(0);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, 1); // 1 visual
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // pad
-    write_u32(ClientByteOrder::LittleEndian, &mut out, argb_visual.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, RENDER_FMT_ARGB32);
+    write_u16(byte_order, &mut out, 1); // 1 visual
+    write_u32(byte_order, &mut out, 0); // pad
+    write_u32(byte_order, &mut out, argb_visual.0);
+    write_u32(byte_order, &mut out, RENDER_FMT_ARGB32);
 
     writer.write_all(&out)
 }
 
 pub fn write_render_query_pict_index_values_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
     let mut out = vec![1u8, 0];
-    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_values
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length
+    write_u32(byte_order, &mut out, 0); // num_values
     out.extend_from_slice(&[0u8; 20]); // pad to 32 bytes
     debug_assert_eq!(out.len(), 32);
     writer.write_all(&out)
@@ -4159,13 +4141,14 @@ pub fn write_render_query_pict_index_values_reply(
 
 pub fn write_render_query_filters_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
     let mut out = vec![1u8, 0];
-    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_filters
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // num_aliases
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length
+    write_u32(byte_order, &mut out, 0); // num_filters
+    write_u32(byte_order, &mut out, 0); // num_aliases
     out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
     debug_assert_eq!(out.len(), 32);
     writer.write_all(&out)
@@ -4173,15 +4156,16 @@ pub fn write_render_query_filters_reply(
 
 pub fn write_render_query_version_reply(
     writer: &mut impl Write,
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     major: u32,
     minor: u32,
 ) -> io::Result<()> {
     let mut out = vec![1u8, 0];
-    write_u16(ClientByteOrder::LittleEndian, &mut out, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // length
-    write_u32(ClientByteOrder::LittleEndian, &mut out, major);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, minor);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // length
+    write_u32(byte_order, &mut out, major);
+    write_u32(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
     writer.write_all(&out)
 }

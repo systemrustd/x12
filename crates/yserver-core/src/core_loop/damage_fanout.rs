@@ -108,8 +108,8 @@ pub fn accumulate_damage_to_state(
         height,
     };
     for n in pending {
-        let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, _order| {
-            encode_damage_notify(buf, seq, &n, timestamp, area);
+        let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
+            encode_damage_notify(buf, order, seq, &n, timestamp, area);
         });
         for cid in extras {
             if !dropped.contains(&cid) {
@@ -122,12 +122,14 @@ pub fn accumulate_damage_to_state(
 
 fn encode_damage_notify(
     buf: &mut Vec<u8>,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
     seq: SequenceNumber,
     n: &PendingNotify,
     timestamp: u32,
     area: x11damage::Rectangle,
 ) {
     let evt = x11damage::encode_damage_notify_event(
+        byte_order,
         DAMAGE_FIRST_EVENT,
         seq,
         n.level,

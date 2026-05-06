@@ -1250,6 +1250,7 @@ fn pointer_event_fanout_inner(
         let mut buf = Vec::with_capacity(68);
         x11::encode_xi2_raw_event(
             &mut buf,
+            target.byte_order,
             seq,
             137, // XI2 major opcode
             raw_evtype,
@@ -1274,6 +1275,7 @@ fn pointer_event_fanout_inner(
         ) {
             x11::encode_xi2_crossing_event(
                 &mut buf,
+                target.byte_order,
                 seq,
                 137,
                 xi2_evtype,
@@ -1293,6 +1295,7 @@ fn pointer_event_fanout_inner(
         } else {
             x11::encode_xi2_device_event(
                 &mut buf,
+                target.byte_order,
                 seq,
                 137, // XI2 major opcode
                 xi2_evtype,

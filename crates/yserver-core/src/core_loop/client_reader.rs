@@ -33,7 +33,7 @@ use std::{
 use crossbeam_channel::{Receiver, TryRecvError};
 use log::warn;
 
-use yserver_protocol::x11::{self, ClientId, SequenceNumber};
+use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 
 use crate::{
     core_loop::{message::Message, sender::CoreSender},
@@ -50,6 +50,7 @@ pub const BIG_REQUESTS_ENABLE_MINOR: u8 = 0;
 pub fn spawn(
     id: ClientId,
     stream: UnixStream,
+    byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
     sender: CoreSender,
@@ -57,7 +58,14 @@ pub fn spawn(
     std::thread::Builder::new()
         .name(format!("yserver-reader-{}", id.0))
         .spawn(move || {
-            if let Err(e) = run(id, stream, big_requests_major, control_rx, &sender) {
+            if let Err(e) = run(
+                id,
+                stream,
+                byte_order,
+                big_requests_major,
+                control_rx,
+                &sender,
+            ) {
                 let _ = sender.send(Message::ClientDisconnected { id, reason: e });
             }
         })?;
@@ -67,6 +75,7 @@ pub fn spawn(
 fn run(
     id: ClientId,
     stream: UnixStream,
+    byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
     sender: &CoreSender,
@@ -92,7 +101,7 @@ fn run(
             Err(TryRecvError::Disconnected) => return Ok(()),
         }
 
-        let frame = match x11::read_request(&mut reader, big) {
+        let frame = match x11::read_request(&mut reader, byte_order, big) {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 // Peer EOF — surface it to the core so
@@ -107,7 +116,10 @@ fn run(
             }
             Err(e) => return Err(e),
         };
-        let (header, body) = frame;
+        let (header, mut body) = frame;
+        // Phase E: swap inbound BE-client request bodies in-place so the
+        // rest of the dispatch path can decode bytes as little-endian.
+        x11::request_swap::swap_request_body(header.opcode, byte_order, &mut body);
         sequence = sequence.wrapping_add(1);
         let attached_fd = reader.pop_fd();
 
@@ -250,7 +262,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(1), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(1),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
 
         // 1. Send Enable: opcode=135 minor=0 length_units=1 (4 bytes).
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
@@ -287,7 +307,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(2), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(2),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
 
         // Pipeline: Enable + big request in one buffer.
         let mut combined = Vec::new();
@@ -323,7 +351,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(3), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(3),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
         // Very first byte the client ever sends is Enable.
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
         let m = recv_with_timeout(&rx, Duration::from_secs(2)).expect("enable");
@@ -338,7 +374,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(4), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(4),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
 
         for _ in 0..2 {
             write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
@@ -358,7 +402,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(5), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(5),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
         // Enable header — reader doesn't validate; it just parks.
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
         let _ = recv_with_timeout(&rx, Duration::from_secs(2)).expect("enable");
@@ -380,7 +432,15 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
 
-        spawn(ClientId(6), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(6),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
         let _ = recv_with_timeout(&rx, Duration::from_secs(2)).expect("enable");
         // Reader is parked.  Shutdown should unblock it.
@@ -405,7 +465,15 @@ mod tests {
         let _ = poll;
         let (server_side, client_side) = UnixStream::pair().unwrap();
         let (_ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
-        spawn(ClientId(7), server_side, BIG_MAJOR, ctrl_rx, sender).unwrap();
+        spawn(
+            ClientId(7),
+            server_side,
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
         drop(client_side);
         // run() returns Ok(None) on peer EOF — no ClientDisconnected sent.
         // We assert no Request arrives. (Peer-close-during-frame would

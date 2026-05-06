@@ -1,4 +1,7 @@
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_i16, write_u16, write_u32},
+};
 
 pub const QUERY_VERSION: u8 = 0;
 pub const SELECT_SELECTION_INPUT: u8 = 2;
@@ -65,12 +68,12 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-fn fixed_reply(sequence: SequenceNumber, length: u32) -> Vec<u8> {
+fn fixed_reply(byte_order: ClientByteOrder, sequence: SequenceNumber, length: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&length.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length);
     out
 }
 
@@ -188,25 +191,33 @@ pub fn parse_rectangles(mut bytes: &[u8]) -> Vec<RegionRect> {
 }
 
 #[must_use]
-pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u32) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
-    out.extend_from_slice(&major.to_le_bytes());
-    out.extend_from_slice(&minor.to_le_bytes());
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major: u32,
+    minor: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    write_u32(byte_order, &mut out, major);
+    write_u32(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 #[must_use]
-pub fn encode_get_cursor_image_empty_reply(sequence: SequenceNumber) -> Vec<u8> {
-    let mut out = fixed_reply(sequence, 0);
-    out.extend_from_slice(&0i16.to_le_bytes()); // x
-    out.extend_from_slice(&0i16.to_le_bytes()); // y
-    out.extend_from_slice(&0u16.to_le_bytes()); // width
-    out.extend_from_slice(&0u16.to_le_bytes()); // height
-    out.extend_from_slice(&0u16.to_le_bytes()); // xhot
-    out.extend_from_slice(&0u16.to_le_bytes()); // yhot
-    out.extend_from_slice(&0u32.to_le_bytes()); // cursor serial
+pub fn encode_get_cursor_image_empty_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    write_i16(byte_order, &mut out, 0); // x
+    write_i16(byte_order, &mut out, 0); // y
+    write_u16(byte_order, &mut out, 0); // width
+    write_u16(byte_order, &mut out, 0); // height
+    write_u16(byte_order, &mut out, 0); // xhot
+    write_u16(byte_order, &mut out, 0); // yhot
+    write_u32(byte_order, &mut out, 0); // cursor serial
     out.extend_from_slice(&[0u8; 8]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -214,23 +225,24 @@ pub fn encode_get_cursor_image_empty_reply(sequence: SequenceNumber) -> Vec<u8> 
 
 #[must_use]
 pub fn encode_fetch_region_reply(
+    byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     extents: RegionRect,
     rects: &[RegionRect],
 ) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)]
     let length = (rects.len() * 2) as u32;
-    let mut out = fixed_reply(sequence, length);
-    out.extend_from_slice(&extents.x.to_le_bytes());
-    out.extend_from_slice(&extents.y.to_le_bytes());
-    out.extend_from_slice(&extents.width.to_le_bytes());
-    out.extend_from_slice(&extents.height.to_le_bytes());
+    let mut out = fixed_reply(byte_order, sequence, length);
+    write_i16(byte_order, &mut out, extents.x);
+    write_i16(byte_order, &mut out, extents.y);
+    write_u16(byte_order, &mut out, extents.width);
+    write_u16(byte_order, &mut out, extents.height);
     out.extend_from_slice(&[0u8; 16]);
     for rect in rects {
-        out.extend_from_slice(&rect.x.to_le_bytes());
-        out.extend_from_slice(&rect.y.to_le_bytes());
-        out.extend_from_slice(&rect.width.to_le_bytes());
-        out.extend_from_slice(&rect.height.to_le_bytes());
+        write_i16(byte_order, &mut out, rect.x);
+        write_i16(byte_order, &mut out, rect.y);
+        write_u16(byte_order, &mut out, rect.width);
+        write_u16(byte_order, &mut out, rect.height);
     }
     debug_assert_eq!(out.len(), 32 + rects.len() * 8);
     out
@@ -242,7 +254,12 @@ mod tests {
 
     #[test]
     fn query_version_reply_shape() {
-        let reply = encode_query_version_reply(SequenceNumber(7), MAJOR_VERSION, MINOR_VERSION);
+        let reply = encode_query_version_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            MAJOR_VERSION,
+            MINOR_VERSION,
+        );
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1);
         assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 7);
@@ -256,7 +273,8 @@ mod tests {
 
     #[test]
     fn cursor_image_empty_reply_shape() {
-        let reply = encode_get_cursor_image_empty_reply(SequenceNumber(9));
+        let reply =
+            encode_get_cursor_image_empty_reply(ClientByteOrder::LittleEndian, SequenceNumber(9));
         assert_eq!(reply.len(), 32);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
         assert_eq!(u16::from_le_bytes(reply[12..14].try_into().unwrap()), 0);
@@ -321,7 +339,12 @@ mod tests {
             width: 3,
             height: 4,
         }];
-        let reply = encode_fetch_region_reply(SequenceNumber(3), rects[0], &rects);
+        let reply = encode_fetch_region_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            rects[0],
+            &rects,
+        );
         assert_eq!(reply.len(), 40);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(i16::from_le_bytes(reply[8..10].try_into().unwrap()), 1);

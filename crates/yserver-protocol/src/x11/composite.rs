@@ -1,4 +1,7 @@
-use super::SequenceNumber;
+use super::{
+    ClientByteOrder, SequenceNumber,
+    wire::{write_u16, write_u32},
+};
 
 pub const QUERY_VERSION: u8 = 0;
 pub const REDIRECT_WINDOW: u8 = 1;
@@ -50,27 +53,36 @@ pub fn parse_window(body: &[u8]) -> Option<u32> {
 }
 
 #[must_use]
-pub fn encode_query_version_reply(sequence: SequenceNumber, major: u32, minor: u32) -> Vec<u8> {
+pub fn encode_query_version_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major: u32,
+    minor: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&major.to_le_bytes());
-    out.extend_from_slice(&minor.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, major);
+    write_u32(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
 }
 
 #[must_use]
-pub fn encode_get_overlay_window_reply(sequence: SequenceNumber, overlay: u32) -> Vec<u8> {
+pub fn encode_get_overlay_window_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    overlay: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
-    out.extend_from_slice(&sequence.0.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&overlay.to_le_bytes());
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, overlay);
     out.extend_from_slice(&[0u8; 20]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -82,7 +94,8 @@ mod tests {
 
     #[test]
     fn query_version_reply_shape() {
-        let reply = encode_query_version_reply(SequenceNumber(1), 0, 4);
+        let reply =
+            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(1), 0, 4);
         assert_eq!(reply.len(), 32);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
@@ -91,7 +104,11 @@ mod tests {
 
     #[test]
     fn overlay_window_reply_shape() {
-        let reply = encode_get_overlay_window_reply(SequenceNumber(1), 0x100);
+        let reply = encode_get_overlay_window_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            0x100,
+        );
         assert_eq!(reply.len(), 32);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 0x100);
     }

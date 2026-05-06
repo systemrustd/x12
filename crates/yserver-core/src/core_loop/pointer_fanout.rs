@@ -248,9 +248,10 @@ pub fn pointer_event_fanout_to_state(
 
     // XI2 raw events.
     if let Some(raw_evtype) = xi2_raw_evtype {
-        let extras = fanout_event_to_clients(state, &xi2_raw_targets, |buf, seq, _order| {
+        let extras = fanout_event_to_clients(state, &xi2_raw_targets, |buf, seq, order| {
             x11::encode_xi2_raw_event(
                 buf,
+                order,
                 seq,
                 XI2_MAJOR_OPCODE,
                 raw_evtype,
@@ -266,13 +267,14 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // XI2 device events (crossing or non-crossing).
-    let extras = fanout_event_to_clients(state, &xi2_targets, |buf, seq, _order| {
+    let extras = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
         if matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
         ) {
             x11::encode_xi2_crossing_event(
                 buf,
+                order,
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,
@@ -292,6 +294,7 @@ pub fn pointer_event_fanout_to_state(
         } else {
             x11::encode_xi2_device_event(
                 buf,
+                order,
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,
