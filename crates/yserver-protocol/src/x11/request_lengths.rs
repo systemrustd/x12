@@ -305,8 +305,8 @@ pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option
                 Some(u32::MAX)
             }
         }
-        // 36 FreeColors: body = cmap(4) + plane_mask(4) + pixels(u32 × N).
-        36 => {
+        // 88 FreeColors: body = cmap(4) + plane_mask(4) + pixels(u32 × N).
+        88 => {
             if body.len() >= 8 && (body.len() - 8).is_multiple_of(4) {
                 None
             } else {
@@ -467,6 +467,25 @@ mod exact_tests {
         body[1] = 0;
         // Required = 2 + ceil(8/4) = 2 + 2 = 4
         assert_eq!(exact_required_length(16, 0, &body), Some(4));
+    }
+
+    #[test]
+    fn grab_server_empty_body_is_not_misclassified_as_freecolors() {
+        // Opcode 36 is GrabServer (Fixed 1 unit, no body). Regression
+        // guard: previously the FreeColors content-aware shape check
+        // was keyed on opcode 36 (the correct opcode is 88), which
+        // made every GrabServer fire spurious BadLength.
+        assert!(validate_exact_request_length(36, 0, 1, &[]));
+    }
+
+    #[test]
+    fn free_colors_shape_check_is_keyed_on_opcode_88() {
+        // body = cmap(4) + plane_mask(4) + 1 pixel(4) = 12 bytes,
+        // length_units = 1 + 12/4 = 4 (header) — but caller passes
+        // length_units, so just verify the shape gate accepts it.
+        assert!(validate_exact_request_length(88, 0, 4, &[0u8; 12]));
+        // 11-byte body is malformed (not 8 + multiple of 4).
+        assert!(!validate_exact_request_length(88, 0, 4, &[0u8; 11]));
     }
 
     #[test]
