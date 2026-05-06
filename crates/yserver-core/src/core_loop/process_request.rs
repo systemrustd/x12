@@ -1602,7 +1602,12 @@ fn handle_shape_request(
                 .map(|(w, k)| (ResourceId(w), k))
                 .unwrap_or((ROOT_WINDOW, x11shape::KIND_BOUNDING));
             let rects = crate::nested::shape_rects_for(state, window, kind);
-            let reply = x11shape::encode_get_rectangles_reply(byte_order, sequence, 0, &rects);
+            let reply = x11shape::encode_get_rectangles_reply(
+                byte_order,
+                sequence,
+                x11shape::ORDERING_YX_BANDED,
+                &rects,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

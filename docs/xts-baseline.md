@@ -35,6 +35,16 @@ flavour of not-passing.
 | 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 (raw event templates re-encode per recipient) + F (content-aware `BadLength` for variable-length opcodes). **PASS 195 → 229** (+34); FAIL 78 → 40 (-38). End-to-end **PASS 1 → 229** for the full BE branch. |
 | 2026-05-06 |  337 |   25 |     7 |    0 |     0 | `xproto` branch — residual fixes on top of BE: 6 missing reply implementations (GetMotionEvents/GetFontPath/GetKeyboardControl/GetPointerControl/GetScreenSaver/ListInstalledColormaps), MappingNotify fanout on Set{Pointer,Modifier}Mapping (event before reply per spec), AllocColorCells/AllocColorPlanes BadAlloc on TrueColor, StoreColors/StoreNamedColor BadAccess on read-only colormap, BadValue mask validation (CW/GC/configure/keyboard), BadIDChoice on duplicate or out-of-range XIDs (CreateColormap/CopyColormapAndFree/CreateCursor/OpenFont), MapWindow self-Expose + parent-tracked Viewable/Unviewable, ClearArea Expose, CopyArea/CopyPlane GraphicsExpose, PolyPoint/Line/Segment/Rectangle/Arc content-shape BadLength, ChangeProperty swap-table fix (format byte at body[12] is u8, not u32), max_request_length enforcement (256K units BIG-REQUESTS, u16::MAX otherwise), error-resilience on backend draw failures. **PASS 229 → 337** (+108). |
 
+## Run history (ynest, `ShapeExt` scenario)
+
+The SHAPE extension scenario is small (11 tests / 11 cases — one purpose
+per X function exposed by `libXext`'s SHAPE binding).
+
+| Date       | PASS | FAIL | Notes |
+|------------|-----:|-----:|-------|
+| 2026-05-07 |    5 |    6 | First ShapeExt run. 5 of 6 FAILs are `XShape{OffsetShape,CombineMask,CombineRectangles,CombineRegion,GetRectangles}` returning `ordering=Unsorted` instead of `YXBanded` from `GetRectangles`. The 6th is `XShapeQueryExtents` ignoring `border_width` in the default unshaped bounding region. |
+| 2026-05-07 |   11 |    0 | `GetRectangles` reply now reports `ORDERING_YX_BANDED`; `normalize_region_rects` sorts by `(y, x)` so the YXBanded claim is honest for non-overlapping bands; `default_shape_rect` is kind-aware (`KIND_BOUNDING` → `(-bw, -bw, w+2bw, h+2bw)`, `KIND_CLIP`/`KIND_INPUT` → `(0, 0, w, h)`). **PASS 5 → 11**. |
+
 ## Run history (ynest, `Xlib3` scenario)
 
 | Date       | PASS | FAIL | UNRES | UNTST | UNSUP | Notes |

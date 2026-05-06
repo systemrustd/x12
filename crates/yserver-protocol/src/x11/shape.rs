@@ -27,6 +27,11 @@ pub const KIND_BOUNDING: u8 = 0;
 pub const KIND_CLIP: u8 = 1;
 pub const KIND_INPUT: u8 = 2;
 
+pub const ORDERING_UNSORTED: u8 = 0;
+pub const ORDERING_Y_SORTED: u8 = 1;
+pub const ORDERING_YX_SORTED: u8 = 2;
+pub const ORDERING_YX_BANDED: u8 = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RectanglesRequest {
     pub op: u8,

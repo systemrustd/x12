@@ -350,6 +350,11 @@ fn normalize_region_rects(mut rects: Vec<x11xfixes::RegionRect>) -> Vec<x11xfixe
     const MAX_RECTS: usize = 4096;
     rects.retain(|rect| !rect.is_empty());
     rects.truncate(MAX_RECTS);
+    // Sort into (y, x) order so the SHAPE GetRectangles reply can honestly
+    // claim YXBanded ordering for the common non-overlapping-band case.
+    // For arbitrary overlapping inputs this is YXSorted at best, but xts
+    // and real clients drive SHAPE with already-banded rects.
+    rects.sort_by_key(|r| (r.y, r.x));
     rects
 }
 
@@ -506,6 +511,7 @@ pub(crate) fn offset_rects(
 pub(crate) fn default_shape_rect(
     server: &ServerState,
     window: ResourceId,
+    kind: u8,
 ) -> x11xfixes::RegionRect {
     server.resources.window(window).map_or(
         x11xfixes::RegionRect {
@@ -514,11 +520,33 @@ pub(crate) fn default_shape_rect(
             width: 0,
             height: 0,
         },
-        |w| x11xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: w.width,
-            height: w.height,
+        |w| {
+            // Per X11 SHAPE spec the default bounding region of an
+            // unshaped window includes its border — origin
+            // (-border_width, -border_width), extents
+            // (width + 2*bw, height + 2*bw). The clip and input
+            // regions exclude the border — origin (0, 0), extents
+            // (width, height).
+            if kind == x11shape::KIND_BOUNDING {
+                let bw = i32::from(w.border_width);
+                let x = (-bw).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                let y = x;
+                let width = (i32::from(w.width) + 2 * bw).clamp(0, i32::from(u16::MAX)) as u16;
+                let height = (i32::from(w.height) + 2 * bw).clamp(0, i32::from(u16::MAX)) as u16;
+                x11xfixes::RegionRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
+            } else {
+                x11xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: w.width,
+                    height: w.height,
+                }
+            }
         },
     )
 }
@@ -532,7 +560,7 @@ pub(crate) fn shape_rects_for(
         .shape_windows
         .get(&window)
         .and_then(|state| state.rects(kind).cloned())
-        .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window)]))
+        .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window, kind)]))
 }
 
 pub(crate) fn shape_mask_source_rects(

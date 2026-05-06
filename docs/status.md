@@ -2162,6 +2162,13 @@ the suite tell us where the real gaps are.
   | 2026-05-06 |   96 |   31 |     3 | First Xlib3 run on top of all Xproto fixes. |
   | 2026-05-06 |  110 |   17 |     3 | xts-xlib3 branch — vendor string, release_number, 7 pixmap formats, screen mm dimensions, SetCloseDownMode validation. **PASS 96 → 110**. |
 
+  ShapeExt scenario (11 tests / 11 cases):
+
+  | Date       | PASS | FAIL | Change |
+  |------------|-----:|-----:|--------|
+  | 2026-05-07 |    5 |    6 | First ShapeExt run; `GetRectangles` reported `Unsorted` and `QueryExtents` ignored `border_width`. |
+  | 2026-05-07 |   11 |    0 | `GetRectangles` reports `YXBanded`, `normalize_region_rects` sorts by (y, x), `default_shape_rect` is kind-aware (BOUNDING includes border, CLIP/INPUT do not). Plus a wmaker-spotted typo: opcode 36 in the FreeColors content-aware shape gate is GrabServer; arm relabelled to opcode 88. **PASS 5 → 11**. |
+
 - **`BadLength` enforcement landed.** A per-opcode length contract
   table covers all of opcodes 1–127 in
   `crates/yserver-protocol/src/x11/request_lengths.rs`: `Fixed(n)`
