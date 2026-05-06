@@ -1,0 +1,20 @@
+WARNING: Cannot open file: share/xts5/doc/VSW_RELEASE
+WARNING: Cannot open file: share/xts5/doc/VSW_SPEC
+                           VSW5 SUMMARY RESULTS REPORT
+
+Test suite version: Release file not found
+Specification version: Version file not found
+Test run by: jos
+System: Linux silence 7.0.3-1-cachyos #1 SMP PREEMPT Fri, 01 May 2026 19:46:26 +0000 x86_64
+Test run started: Wednesday May 06, 2026 04:16:08 PM
+Test run ended:   Wednesday May 06, 2026 04:20:23 PM
+Journal file: /home/jos/Projects/xts/results/2026-05-06-16:16:08/journal
+TCC command line: /home/jos/Projects/xts/src/tet3/tcc/.libs/tcc -e -i results/2026-05-06-16:16:08 -x ./xts5/tetexec.cfg xts5 Xproto
+Report type: -d 2 -s 1 
+
+
+        CASES TESTS  PASS UNSUP UNTST NOTIU  WARN   FIP  FAIL UNRES  UNIN ABORT
+
+Xproto    122   389     1     0     0     0     0     0   210   160    11     0
+
+TOTAL     122   389     1     0     0     0     0     0   210   160    11     0

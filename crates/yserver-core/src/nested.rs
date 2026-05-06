@@ -66,6 +66,8 @@ const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 96;
 const MIT_SHM_FIRST_ERROR: u8 = 160;
 
+const XTEST_MAJOR_OPCODE: u8 = 146;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
     Always,
@@ -191,6 +193,14 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         major_opcode: MIT_SHM_MAJOR_OPCODE,
         first_event: MIT_SHM_FIRST_EVENT,
         first_error: MIT_SHM_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XTEST",
+        major_opcode: XTEST_MAJOR_OPCODE,
+        first_event: 0,
+        first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },

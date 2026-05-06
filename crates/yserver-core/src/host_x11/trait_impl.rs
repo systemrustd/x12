@@ -61,8 +61,85 @@ impl Backend for HostX11Backend {
     fn on_host_input(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _ev: crate::core_loop::HostInputEvent,
+        ev: crate::core_loop::HostInputEvent,
     ) {
+        // Real host pointer/key events arrive via `drain_host_socket` and
+        // go straight onto `pending_events`; this method is normally a
+        // no-op. XTEST `FakeInput` reuses the same enqueue path so
+        // injected events flow through the existing fanout pipeline.
+        use crate::{
+            core_loop::HostInputEvent,
+            host_x11::{HostEvent, HostKeyEvent, HostPointerEvent, PointerEventKind},
+        };
+
+        let container = self.window_id();
+        match ev {
+            HostInputEvent::Key(raw) => {
+                self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
+                    pressed: raw.pressed,
+                    keycode: raw.keycode,
+                    time: raw.time,
+                    root_x: raw.root_x,
+                    root_y: raw.root_y,
+                    event_x: raw.event_x,
+                    event_y: raw.event_y,
+                    state: raw.state,
+                }));
+            }
+            HostInputEvent::PointerMotion { x, y, time } => {
+                self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    kind: PointerEventKind::MotionNotify,
+                    host_xid: container,
+                    detail: 0,
+                    time,
+                    root_x: x as i16,
+                    root_y: y as i16,
+                    event_x: x as i16,
+                    event_y: y as i16,
+                    state: 0,
+                    crossing_mode: 0,
+                }));
+            }
+            HostInputEvent::PointerButton {
+                button,
+                pressed,
+                time,
+            } => {
+                // `button` is a Linux input code (BTN_LEFT = 0x110, …).
+                // Translate to X11 button numbers — same mapping as
+                // `KmsBackend::process_pointer_button`.
+                let detail = match button {
+                    0x110 => 1, // BTN_LEFT
+                    0x111 => 3, // BTN_RIGHT
+                    0x112 => 2, // BTN_MIDDLE
+                    0x113 => 8, // BTN_SIDE
+                    0x114 => 9, // BTN_EXTRA
+                    _ => {
+                        log::debug!(
+                            "ynest: dropping HostInputEvent::PointerButton for unknown linux code 0x{button:x}"
+                        );
+                        return;
+                    }
+                };
+                let kind = if pressed {
+                    PointerEventKind::ButtonPress
+                } else {
+                    PointerEventKind::ButtonRelease
+                };
+                self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    kind,
+                    host_xid: container,
+                    detail,
+                    time,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                    crossing_mode: 0,
+                }));
+            }
+        }
     }
 
     /// Host-X11 backend never page-flips.

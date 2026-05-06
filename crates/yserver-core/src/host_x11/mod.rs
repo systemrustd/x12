@@ -840,6 +840,13 @@ impl HostX11Backend {
         self.pending_events.pop_front()
     }
 
+    /// Enqueue a host event from outside the wire decoder (XTEST `FakeInput`).
+    /// The event is fanned out at the next outer-loop boundary by
+    /// `dispatch_pending_host_events`, exactly like real host events.
+    pub(crate) fn push_pending_host_event(&mut self, event: HostEvent) {
+        self.pending_events.push_back(event);
+    }
+
     pub(super) fn host_socket_eof(&self) -> bool {
         self.socket_eof
     }

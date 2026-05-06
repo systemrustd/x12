@@ -20,6 +20,7 @@ pub mod randr;
 pub mod shape;
 pub mod sync;
 pub mod xfixes;
+pub mod xtest;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientByteOrder {

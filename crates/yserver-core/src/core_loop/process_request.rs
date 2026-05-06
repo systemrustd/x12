@@ -253,6 +253,8 @@ pub fn process_request(
         128 => handle_randr_request(state, client_id, sequence, header, body),
         // ── RENDER extension dispatcher ──
         133 => handle_render_request(state, backend, origin, client_id, sequence, header, body),
+        // ── XTEST extension dispatcher ──
+        146 => handle_xtest_request(state, backend, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -2619,6 +2621,160 @@ fn handle_damage_request(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+fn handle_xtest_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::xtest as x11xtest;
+    let minor = header.data;
+    match minor {
+        x11xtest::GET_VERSION => {
+            let (cmaj, cmin) = x11xtest::parse_get_version(body).unwrap_or((
+                u8::try_from(x11xtest::MAJOR_VERSION).unwrap_or(2),
+                x11xtest::MINOR_VERSION,
+            ));
+            debug!(
+                "client {} #{} XTEST::GetVersion client={cmaj}.{cmin} -> {}.{}",
+                client_id.0,
+                sequence.0,
+                x11xtest::MAJOR_VERSION,
+                x11xtest::MINOR_VERSION,
+            );
+            let reply = x11xtest::encode_get_version_reply(
+                sequence,
+                u8::try_from(x11xtest::MAJOR_VERSION).unwrap_or(2),
+                x11xtest::MINOR_VERSION,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11xtest::COMPARE_CURSOR => {
+            // Stub: report cursors as matching. xts cursor-comparison
+            // tests will fail on real semantics; that's the baseline.
+            debug!(
+                "client {} #{} XTEST::CompareCursor (stub: same=true)",
+                client_id.0, sequence.0
+            );
+            let reply = x11xtest::encode_compare_cursor_reply(sequence, true);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11xtest::FAKE_INPUT => {
+            let Some(fi) = x11xtest::parse_fake_input(body) else {
+                debug!(
+                    "client {} #{} XTEST::FakeInput body too short ({} bytes), dropping",
+                    client_id.0,
+                    sequence.0,
+                    body.len()
+                );
+                return Ok(RequestOutcome::Handled);
+            };
+            debug!(
+                "client {} #{} XTEST::FakeInput type={} detail={} root_xy=({},{})",
+                client_id.0, sequence.0, fi.event_type, fi.detail, fi.root_x, fi.root_y
+            );
+            dispatch_fake_input(state, backend, fi);
+        }
+        x11xtest::GRAB_CONTROL => {
+            debug!(
+                "client {} #{} XTEST::GrabControl (no-op)",
+                client_id.0, sequence.0
+            );
+        }
+        other => {
+            debug!(
+                "client {} #{} XTEST::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+fn dispatch_fake_input(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    fi: yserver_protocol::x11::xtest::FakeInput,
+) {
+    use crate::{core_loop::HostInputEvent, host_x11::HostKeyEvent};
+    use yserver_protocol::x11::xtest as x11xtest;
+
+    match fi.event_type {
+        x11xtest::FAKE_KEY_PRESS | x11xtest::FAKE_KEY_RELEASE => {
+            let pressed = fi.event_type == x11xtest::FAKE_KEY_PRESS;
+            backend.on_host_input(
+                state,
+                HostInputEvent::Key(HostKeyEvent {
+                    pressed,
+                    keycode: fi.detail,
+                    time: fi.time,
+                    root_x: fi.root_x,
+                    root_y: fi.root_y,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                }),
+            );
+        }
+        x11xtest::FAKE_BUTTON_PRESS | x11xtest::FAKE_BUTTON_RELEASE => {
+            let pressed = fi.event_type == x11xtest::FAKE_BUTTON_PRESS;
+            // Translate X button number → Linux input code, since both
+            // backends' `on_host_input` paths consume Linux codes.
+            let linux_code = match fi.detail {
+                1 => 0x110, // BTN_LEFT
+                2 => 0x112, // BTN_MIDDLE
+                3 => 0x111, // BTN_RIGHT
+                8 => 0x113, // BTN_SIDE
+                9 => 0x114, // BTN_EXTRA
+                _ => {
+                    log::debug!(
+                        "XTEST FakeInput: dropping button event for unsupported X button {}",
+                        fi.detail
+                    );
+                    return;
+                }
+            };
+            backend.on_host_input(
+                state,
+                HostInputEvent::PointerButton {
+                    button: linux_code,
+                    pressed,
+                    time: fi.time,
+                },
+            );
+        }
+        x11xtest::FAKE_MOTION_NOTIFY => {
+            // detail==0 means absolute coords; detail==1 means relative.
+            // We only support absolute for now — relative needs the
+            // backend's current cursor position which isn't on the trait
+            // surface. xts does most motion as absolute.
+            if fi.detail != 0 {
+                log::debug!("XTEST FakeInput: relative MotionNotify not supported, dropping");
+                return;
+            }
+            backend.on_host_input(
+                state,
+                HostInputEvent::PointerMotion {
+                    x: i32::from(fi.root_x),
+                    y: i32::from(fi.root_y),
+                    time: fi.time,
+                },
+            );
+        }
+        other => {
+            log::debug!("XTEST FakeInput: unknown event type {other}, dropping");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

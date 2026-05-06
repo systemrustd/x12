@@ -110,6 +110,17 @@ yserver-debug-ssh mode="1024x768":
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci,edid=on,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c 'RUST_LOG=trace RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver'
 
+# Boot ynest on `display` and run an xts5 scenario against it.
+# `scenario` matches an entry in xts5/tet_scen (Xproto, Xlib3, …, all).
+# Tally lands in xts/results/<timestamp>/summary.
+xts-ynest scenario="Xproto" display="99" geometry="1024x768" timeout="600":
+    cargo build --release --bin ynest
+    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > /tmp/ynest-xts.log 2>&1 & \
+        pid=$!; \
+        trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
+        sleep 1; \
+        tools/xts-run.sh :{{display}} {{scenario}} {{timeout}}
+
 # Run yserver in virtme-ng with a QEMU window + RUST_LOG=debug + RUST_BACKTRACE=1.
 # Shows window content; on crash prints a backtrace if it's a Rust panic.
 yserver-debug:
