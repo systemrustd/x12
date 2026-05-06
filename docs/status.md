@@ -2116,6 +2116,58 @@ boot every WM in the matrix.
   for their test fixtures — fold those tests onto the
   state-borrowing helpers and delete.
 
+### Phase 6.9 — XTEST + xts5 regression coverage (in progress)
+
+Goal: stand up the X.Org X Test Suite (xts5) as the primary
+protocol-coverage feedback loop, replacing ad-hoc manual WM smoke for
+regression detection. Land just enough XTEST for xts to *run*; let
+the suite tell us where the real gaps are.
+
+#### Landed
+
+- **XTEST extension (major opcode 146).** `GetVersion` (replies
+  2.2), `CompareCursor` (stub: `same=1`), `FakeInput` (full —
+  KeyPress/KeyRelease/ButtonPress/ButtonRelease/MotionNotify),
+  `GrabControl` (no-op). FakeInput translates to `HostInputEvent`
+  and feeds `Backend::on_host_input`, so both backends route
+  synthesized input through their existing fan-out paths.
+- **`HostX11Backend::on_host_input`** flipped from no-op to
+  enqueue-to-`pending_events` so XTEST FakeInput on `ynest` reaches
+  the same fanout the host-pump path uses. KMS already handled
+  `HostInputEvent` uniformly via libinput.
+- **Tooling:** `tools/xts-run.sh` wraps `xts/check.sh` +
+  `xts-report` to emit a per-scenario tally (
+  `CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`).
+  `just xts-ynest scenario=…` boots release `ynest` on `:99` and
+  runs the scenario, killing ynest on exit.
+- **Baseline:** [`docs/xts-baseline.md`](xts-baseline.md) captures
+  the first ynest Xproto run (1 PASS / 210 FAIL / 160 UNRES out of
+  389 tests). The headline is that **ynest survives the entire
+  battery without panic, hang, or crash** — the per-test pass
+  count is gated on two structural bugs (big-endian client
+  rejection, missing `BadLength` enforcement) that mask hundreds of
+  otherwise-correct paths.
+
+#### Phase 6.9 follow-ups (next quick wins)
+
+Ranked by ROI on the xts tally:
+
+- **`BadLength` enforcement** (433 REPORT lines, ~50–80 tests).
+  Single guard in `process_request` checking
+  `header.length * 4 == 4 + body.len()` (or honouring BIG-REQUESTS
+  extended length). Fires `BadLength` errors for over/under-length
+  requests. Half-day fix.
+- **Big-endian client byte-order at the wire reader** (483 REPORT
+  lines, ~80–150 tests). Swap-on-read for u16/u32 setup + request
+  fields when the client signals big-endian byte sex. Larger scope
+  but unblocks ~161 tests' second-connection probes.
+- **`Expose` correctness pass** (131 lines, ~30 tests). Specific
+  Expose-generation gaps; smaller bucket but real bugs.
+- **`yserver` (KMS) baseline.** Deferred — running xts in a vng
+  guest needs either an in-guest xts build or a tunneled DISPLAY.
+  Worth doing once the ynest-side quick wins land so the
+  comparison is informative.
+
 ## Phase 7 — Security hardening
 
 Goal: per-client capabilities, permission prompts or launch-time
@@ -2296,6 +2348,15 @@ Not started.
 | Minor | Name                  | Status | Notes |
 |-------|-----------------------|--------|-------|
 |   0   | Enable                | ✓ | enables 32-bit length support; max 1MB advertised |
+
+### XTEST extension (major opcode 146)
+
+| Minor | Name           | Status | Notes |
+|-------|----------------|--------|-------|
+|   0   | GetVersion     | ↩ | replies 2.2 |
+|   1   | CompareCursor  | ↩ | stub: always reports `same=1` |
+|   2   | FakeInput      | ✓ | KeyPress/KeyRelease/ButtonPress/ButtonRelease/MotionNotify; translates to `HostInputEvent` and feeds `Backend::on_host_input`; relative motion (`detail=1`) and X buttons 4–7 (wheel) deferred |
+|   3   | GrabControl    | ∅ | accepted no-op |
 
 ### XKEYBOARD extension (major opcode 136)
 

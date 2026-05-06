@@ -19,7 +19,7 @@ thread owns state and a mio poller).
 `ynest` (nested) runs GTK3 apps and fvwm3 / Window Maker / e16 /
 partial openbox via a host X11 connection; extensions implemented
 include BIG-REQUESTS, RANDR, RENDER, XKB, XInput2, XFIXES, SHAPE,
-DAMAGE, COMPOSITE, SYNC, Present, MIT-SHM.
+DAMAGE, COMPOSITE, SYNC, Present, MIT-SHM, XTEST.
 
 `yserver` (standalone DRM/KMS) runs the same WM matrix end-to-end on
 bare DRM/KMS — boots in `virtme-ng`, sets a mode on virtio-gpu,
@@ -27,8 +27,10 @@ drives input via libinput, and renders via pixman + freetype. e16
 and Window Maker work; fvwm3 boots but its core-font menu rendering
 has a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
 
-See [`docs/status.md`](docs/status.md) for per-phase progress and
-[`docs/known-issues.md`](docs/known-issues.md) for current gaps.
+See [`docs/status.md`](docs/status.md) for per-phase progress,
+[`docs/known-issues.md`](docs/known-issues.md) for current gaps, and
+[`docs/xts-baseline.md`](docs/xts-baseline.md) for the X Test Suite
+(xts5) baseline that drives ongoing regression coverage.
 
 ## Layout
 
@@ -153,3 +155,23 @@ cargo fmt
 cargo clippy
 cargo test
 ```
+
+## Regression coverage with xts5
+
+We run the X.Org X Test Suite (xts5) against `ynest` as the primary
+protocol-coverage feedback loop:
+
+```sh
+just xts-ynest                       # default: scenario=Xproto
+just xts-ynest scenario=Xlib3
+```
+
+The recipe boots release `ynest` on `:99`, runs the chosen scenario
+via [`tools/xts-run.sh`](tools/xts-run.sh) (which wraps `xts/check.sh`
++ `xts-report`), and tears down `ynest` on exit. Results land in
+`/home/jos/Projects/xts/results/<timestamp>/summary` — a
+`CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`
+table per scenario. The baseline at
+[`docs/xts-baseline.md`](docs/xts-baseline.md) captures the first run
+and ranks dominant failure modes by REPORT-line frequency to identify
+high-ROI fixes.
