@@ -108,3 +108,39 @@ screen-saver state, error-code edge cases, etc.
   KMS numbers to be lower than ynest (no `RENDER`-via-host fallback,
   fewer extension stubs), and the comparison is only interesting
   after those are fixed.
+
+## rendercheck (RENDER smoke suite)
+
+`rendercheck` (Arch package: `rendercheck`) is a separate suite for
+the X RENDER extension. Wired up via `tools/rendercheck.sh` and the
+`just rendercheck-ynest` recipe.
+
+Default test list excludes `repeat` and `cacomposite` — both run every
+operator against every format and exceed the per-test cap on ynest
+because some operator paths hang (suspected: ynest's RENDER-via-host
+forwarding doesn't terminate on a few op/format combinations, needs
+a proper investigation).
+
+Baseline 2026-05-07 (xts-followups merged to master, ynest on :99,
+60s per-test timeout):
+
+| test       | pass | total | status |
+|------------|-----:|------:|--------|
+| fill       |   30 |    30 | OK     |
+| dcoords    |    2 |     2 | OK     |
+| scoords    |    1 |     1 | OK     |
+| mcoords    |    1 |     1 | OK     |
+| tscoords   |    2 |     2 | OK     |
+| tmcoords   |    2 |     2 | OK     |
+| blend      |    4 |     4 | OK     |
+| triangles  |  174 |   456 | FAIL — 282 ops produce dst=white where xts expects dst=black; suspect `Composite` operator dispatch on triangle paths |
+| bug7366    |    1 |     1 | OK     |
+| composite  |    — |     — | TIMEOUT @ 120s — investigate |
+| gradients  |    — |     — | TIMEOUT @ 120s — investigate |
+| repeat     |    — |     — | TIMEOUT (excluded by default) |
+| cacomposite|    — |     — | TIMEOUT (excluded by default) |
+| **total**  |  217 |   499 | (excludes timeouts) |
+
+Host (`:0`, X.Org Foundation): every test passes — e.g. `fill`
+160/160 vs ynest 30/30 because we advertise 3 picture formats and
+the host advertises 15.
