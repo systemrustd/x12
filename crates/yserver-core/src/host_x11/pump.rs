@@ -299,28 +299,9 @@ struct XAuthority {
 
 impl XAuthority {
     fn load(display_number: u16) -> io::Result<Option<Self>> {
-        // Search order:
-        //   1. $XAUTHORITY if set
-        //   2. $HOME/.Xauthority
-        //   3. $HOME/realhome/.Xauthority — bwrap-style sandboxes mount the
-        //      caller's real home there; the bwrap'd $HOME is empty and the
-        //      cookie file the SSH client wrote lives in the original home.
-        let candidates: Vec<PathBuf> = std::iter::empty()
-            .chain(env::var_os("XAUTHORITY").map(PathBuf::from))
-            .chain(
-                env::var_os("HOME")
-                    .map(|home| PathBuf::from(&home).join(".Xauthority"))
-                    .into_iter(),
-            )
-            .chain(
-                env::var_os("HOME")
-                    .map(|home| PathBuf::from(&home).join("realhome").join(".Xauthority"))
-                    .into_iter(),
-            )
-            .collect();
-        let path = candidates
-            .into_iter()
-            .find(|p| p.exists())
+        let path = env::var_os("XAUTHORITY")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".Xauthority")))
             .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no Xauthority path"))?;
 
         let bytes = fs::read(path)?;
