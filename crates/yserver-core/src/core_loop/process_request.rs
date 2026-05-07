@@ -5193,13 +5193,19 @@ fn window_attributes(
     your_event_mask: u32,
 ) -> x11::WindowAttributes {
     let window = window.expect("root window exists");
+    // X11 protocol defaults for unset attributes — see "Window Attributes"
+    // in the core spec. The Window struct doesn't yet store
+    // bit_gravity / backing-store / backing-planes / backing-pixel /
+    // save-under / colormap / do-not-propagate-mask, so we surface the
+    // spec defaults here. ChangeWindowAttributes accepts the value-
+    // mask but doesn't persist these fields yet — separate task.
     x11::WindowAttributes {
         visual: window.visual,
         class: window.class.protocol_value(),
-        bit_gravity: 1,
-        win_gravity: 1,
+        bit_gravity: 0,        // ForgetGravity (default)
+        win_gravity: 1,        // NorthWestGravity (default)
         backing_planes: u32::MAX,
-        backing_pixel: window.background_pixel,
+        backing_pixel: 0,
         save_under: false,
         map_is_installed: true,
         map_state: window.map_state.protocol_value(),
