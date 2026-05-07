@@ -24,6 +24,7 @@ pub struct ClientRemovedResources {
     pub freed_pixmaps: Vec<u32>,
     pub freed_pictures: Vec<(u32, Option<u32>)>,
     pub freed_glyphsets: Vec<u32>,
+    pub freed_cursors: Vec<u32>,
 }
 
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
@@ -1655,8 +1656,14 @@ impl ResourceTable {
         self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
     }
 
-    pub fn free_cursor(&mut self, id: ResourceId) {
+    /// Remove a cursor from the table and return the host XID (if any)
+    /// so the caller can free it on the host. Caller's responsibility to
+    /// dispatch `backend.free_cursor` — keeping the resource layer
+    /// backend-agnostic.
+    pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
+        let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
+        host_xid.map(|h| h.as_raw())
     }
 
     /// Top-level windows owned by `client`: windows whose parent is *not*
@@ -1694,7 +1701,17 @@ impl ResourceTable {
             }
         });
         self.gcs.retain(|_, g| g.owner != client);
-        self.cursors.retain(|_, c| c.owner != client);
+        let mut freed_cursors = Vec::new();
+        self.cursors.retain(|_, c| {
+            if c.owner == client {
+                if let Some(xid) = c.host_xid {
+                    freed_cursors.push(xid.as_raw());
+                }
+                false
+            } else {
+                true
+            }
+        });
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {
@@ -1732,6 +1749,7 @@ impl ResourceTable {
             freed_pixmaps,
             freed_pictures,
             freed_glyphsets,
+            freed_cursors,
         }
     }
 

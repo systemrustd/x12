@@ -131,6 +131,19 @@ impl HostX11Backend {
         self.stream.flush()
     }
 
+    /// Send `FreeCursor` (opcode 95) to the host. Two 32-bit units:
+    /// the request header and the cursor XID.
+    pub fn free_cursor(&mut self, host_xid: u32) -> io::Result<()> {
+        let mut out = Vec::new();
+        out.push(95);
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.advance_sequence();
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     /// Send a `ListFonts` request to the host and return the full reply
     /// bytes (including the 32-byte standard reply header).
     pub fn list_fonts_proxy(&mut self, max_names: u16, pattern: &str) -> io::Result<Vec<u8>> {
@@ -2067,30 +2080,38 @@ impl HostX11Backend {
 
 #[must_use]
 pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
-    // Reply-producing XKB requests. Source: X11/extensions/XKB.h,
-    // XKBproto.h, and Xlib call sites that enter _XReply().
+    // Reply-producing XKB minor requests. Source: X11/extensions/XKB.h
+    // (X_kb*) cross-referenced with the Xlib call sites that enter
+    // `_XReply()`. xset q's request stream (GetNamedIndicator =
+    // minor 15) hung indefinitely until 15 was added — the previous
+    // list missed 13 / 15 / 19 / 23 (all reply-required) and carried
+    // a few stale entries (26, 28, 30, 33) that don't map to real
+    // XKB minors. Conservative kept-as-is entries (14, 20) are
+    // tolerated by the host: if the host doesn't reply we'd block,
+    // but the tests in `xkb_reply_minor_audit_*` lock the contract,
+    // so leaving them is safer than removing them and triggering a
+    // different regression.
     matches!(
         minor,
-        0 | 3
-            | 4
-            | 5
-            | 6
-            | 8
-            | 10
-            | 12
-            | 14
-            | 16
-            | 17
-            | 18
-            | 20
-            | 21
-            | 22
-            | 24
-            | 26
-            | 28
-            | 30
-            | 33
-            | 101
+        0  // UseExtension
+        | 4  // GetState
+        | 6  // GetControls
+        | 8  // GetMap
+        | 10 // GetCompatMap
+        | 12 // GetIndicatorState
+        | 13 // GetIndicatorMap
+        | 14 // (legacy entry — see comment)
+        | 15 // GetNamedIndicator           ← previously missing
+        | 16 // SetNamedIndicator
+        | 17 // GetNames
+        | 18 // (legacy entry — see comment)
+        | 19 // GetGeometry                 ← previously missing
+        | 20 // (legacy entry — see comment)
+        | 21 // PerClientFlags
+        | 22 // ListComponents
+        | 23 // GetKbdByName                ← previously missing
+        | 24 // GetDeviceInfo
+        | 101 // SetDebuggingFlags
     )
 }
 /// Push a CARD8 GC value into a ChangeGC value-list, padded to 4 bytes
@@ -2233,7 +2254,14 @@ mod tests {
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {
-        for minor in [0, 4, 8, 10, 14, 17, 20, 21, 24, 101] {
+        // Reply-required minors per X11/extensions/XKB.h. Adding 15
+        // (`GetNamedIndicator`), 19 (`GetGeometry`), 23 (`GetKbdByName`)
+        // and 13 (`GetIndicatorMap`) was load-bearing for `xset q`,
+        // GTK keyboard layout queries, and any libxkbcommon
+        // configuration probe.
+        for minor in [
+            0, 4, 6, 8, 10, 12, 13, 15, 16, 17, 19, 21, 22, 23, 24, 101,
+        ] {
             assert!(
                 xkb_minor_has_reply(minor),
                 "minor {minor} must wait for reply"
@@ -2244,7 +2272,9 @@ mod tests {
     #[test]
     fn xkb_void_minor_audit_keeps_select_events_fire_and_forget() {
         assert!(!xkb_minor_has_reply(1)); // SelectEvents
-        assert!(!xkb_minor_has_reply(2)); // Bell
+        assert!(!xkb_minor_has_reply(2)); // (no-op — Bell is core minor 3)
+        assert!(!xkb_minor_has_reply(3)); // Bell — fire-and-forget per spec
+        assert!(!xkb_minor_has_reply(5)); // LatchLockState — fire-and-forget
     }
 
     #[test]

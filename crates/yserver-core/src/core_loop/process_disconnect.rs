@@ -209,4 +209,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     for gs_xid in removed.freed_glyphsets {
         let _ = backend.render_free_glyphset(None, gs_xid);
     }
+    for cursor_xid in removed.freed_cursors {
+        let _ = backend.free_cursor(None, cursor_xid);
+    }
 }

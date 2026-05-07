@@ -366,6 +366,10 @@ impl Backend for HostX11Backend {
         })
     }
 
+    fn free_cursor(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.with_active_origin(origin, |this| HostX11Backend::free_cursor(this, host_xid))
+    }
+
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,

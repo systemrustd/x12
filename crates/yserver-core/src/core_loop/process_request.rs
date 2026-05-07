@@ -237,7 +237,7 @@ pub fn process_request(
         101 => handle_get_keyboard_mapping(state, backend, origin, client_id, sequence, body),
         // ── save-set + cursor lifecycle ──
         6 => handle_change_save_set(state, client_id, sequence, header, body),
-        95 => handle_free_cursor(state, client_id, sequence, body),
+        95 => handle_free_cursor(state, backend, origin, client_id, sequence, body),
         // ── pixmaps (state + backend lifecycle) ──
         53 => handle_create_pixmap(state, backend, origin, client_id, sequence, header, body),
         54 => handle_free_pixmap(state, backend, origin, client_id, sequence, body),
@@ -6252,12 +6252,16 @@ fn handle_change_save_set(
 
 fn handle_free_cursor(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(cursor) = x11::free_resource_id(body) {
-        state.resources.free_cursor(cursor);
+    if let Some(cursor) = x11::free_resource_id(body)
+        && let Some(host_xid) = state.resources.free_cursor(cursor)
+    {
+        let _ = backend.free_cursor(origin, host_xid);
     }
     debug!("client {} #{} FreeCursor", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)

@@ -237,6 +237,13 @@ pub trait Backend: Send {
         hot_y: u16,
     ) -> io::Result<CursorHandle>;
 
+    /// Free a host cursor. Counterpart to `create_cursor`. Default impl
+    /// is a no-op so backends without a real X-server peer (KMS) need
+    /// no boilerplate.
+    fn free_cursor(&mut self, _origin: Option<OriginContext>, _host_xid: u32) -> io::Result<()> {
+        Ok(())
+    }
+
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,
