@@ -6,15 +6,15 @@
 //!
 //! `drain_events` reads pending events with `Device::receive_events()`
 //! and dispatches PageFlip completions to a closure. The drm crate's
-//! parser drops the kernel `user_data` field (it folds it into `crtc`),
-//! so the closure receives no per-flip identifier; callers identify the
-//! flipped buffer via [`crate::drm::Swapchain::submitted_idx`] —
-//! at most one buffer is `Submitted` at a time per the state machine.
+//! parser folds the kernel `user_data` field into `crtc` (preferring
+//! `crtc_id` from the vblank event when present, else falling back to
+//! `user_data`). The closure receives the per-CRTC handle so multi-output
+//! callsites can route the completion to the right swapchain.
 
 use std::io;
 
 use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, framebuffer,
+    AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, crtc, framebuffer,
 };
 
 use crate::drm::{Device, modeset::Output};
@@ -38,12 +38,56 @@ pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle)
     )
 }
 
-pub fn drain_events<F: FnMut()>(device: &Device, mut on_page_flip: F) -> io::Result<()> {
+pub fn drain_events<F: FnMut(crtc::Handle)>(
+    device: &Device,
+    mut on_page_flip: F,
+) -> io::Result<()> {
     for event in device.receive_events()? {
-        match event {
-            Event::PageFlip(_) => on_page_flip(),
-            Event::Vblank(_) | Event::Unknown(_) => {}
-        }
+        dispatch_event(event, &mut on_page_flip);
     }
     Ok(())
+}
+
+/// Dispatch a single drm event: invoke `on_page_flip` for `Event::PageFlip`
+/// with the completing CRTC handle; ignore `Vblank` and `Unknown`.
+///
+/// Factored out of [`drain_events`] so the per-event routing is unit-testable
+/// without a real DRM fd (synthetic [`Event::PageFlip`] values can be
+/// constructed via the public `PageFlipEvent` fields).
+fn dispatch_event<F: FnMut(crtc::Handle)>(event: Event, on_page_flip: &mut F) {
+    if let Event::PageFlip(ev) = event {
+        on_page_flip(ev.crtc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use drm::control::{Event, PageFlipEvent, crtc, from_u32};
+
+    use super::dispatch_event;
+
+    #[test]
+    fn dispatch_event_passes_crtc_handle_for_page_flip() {
+        let handle: crtc::Handle = from_u32(42).expect("non-zero raw handle");
+        let event = Event::PageFlip(PageFlipEvent {
+            frame: 0,
+            duration: Duration::ZERO,
+            crtc: handle,
+        });
+
+        let mut seen: Vec<crtc::Handle> = Vec::new();
+        dispatch_event(event, &mut |c| seen.push(c));
+
+        assert_eq!(seen, vec![handle]);
+    }
+
+    #[test]
+    fn dispatch_event_ignores_unknown() {
+        let event = Event::Unknown(Vec::new());
+        let mut called = 0u32;
+        dispatch_event(event, &mut |_| called += 1);
+        assert_eq!(called, 0);
+    }
 }

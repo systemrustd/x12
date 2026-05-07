@@ -477,6 +477,31 @@ fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
     Some((x, y))
 }
 
+/// Build a pixman clip region from a window's `shape_bounding` rect list,
+/// translated by `(x, y)` (the window's origin in destination coords).
+/// Returns `None` if `rects` is `None` or empty (caller is responsible for
+/// the "explicitly empty shape" skip; this helper just builds the region).
+fn build_shape_clip(
+    rects: Option<&Vec<xfixes::RegionRect>>,
+    x: i32,
+    y: i32,
+) -> Option<pixman::Region32> {
+    let rects = rects?;
+    if rects.is_empty() {
+        return None;
+    }
+    let boxes: Vec<pixman::Box32> = rects
+        .iter()
+        .map(|r| pixman::Box32 {
+            x1: x + i32::from(r.x),
+            y1: y + i32::from(r.y),
+            x2: x + i32::from(r.x) + i32::from(r.width),
+            y2: y + i32::from(r.y) + i32::from(r.height),
+        })
+        .collect();
+    Some(pixman::Region32::init_rects(&boxes))
+}
+
 /// Parse a packed rectangle (x:i16, y:i16, w:u16, h:u16) from a byte slice.
 fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
     if offset + 8 > data.len() {
@@ -494,13 +519,51 @@ fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
     })
 }
 
+/// A simple integer rectangle in virtual-screen coordinates.
+///
+/// Used by `OutputLayout::rect()` to support the per-output window
+/// pre-filter introduced in Step 4 of the multi-monitor work. We use
+/// `i32` widths here (not `u16`) because the virtual-screen extent can
+/// exceed `u16::MAX` for large multi-output setups.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// A single DRM output and its dedicated swapchain, positioned in the
+/// virtual screen. `KmsBackend` owns one of these per discovered
+/// output. `fb_w` / `fb_h` on the backend describe the virtual-screen
+/// extent (max(x + width), max(y + height)); per-output dimensions
+/// live here.
+pub(crate) struct OutputLayout {
+    pub output: crate::drm::modeset::Output,
+    pub swapchain: crate::drm::Swapchain,
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl OutputLayout {
+    pub fn rect(&self) -> Rect {
+        Rect {
+            x: self.x,
+            y: self.y,
+            w: i32::from(self.width),
+            h: i32::from(self.height),
+        }
+    }
+}
+
 pub struct KmsBackend {
     // DRM (Phase 6.1 reuse)
     device: Arc<drm::Device>,
-    output: drm::modeset::Output,
+    outputs: Vec<OutputLayout>,
     fb_w: u16,
     fb_h: u16,
-    swapchain: drm::Swapchain,
 
     // Window tracking: nested window resource ID -> local window state
     windows: HashMap<u32, WindowState>,
@@ -937,21 +1000,84 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
 
 impl KmsBackend {
     pub fn open(device_path: &str) -> io::Result<Self> {
-        let device = Arc::new(drm::Device::open(device_path)?);
-        let output = drm::modeset::discover_output(&device)?;
-        let fb_w = output.picked.width;
-        let fb_h = output.picked.height;
+        Self::open_with_commit(device_path, drm::modeset::commit_modeset)
+    }
 
-        let mut buffers = Vec::with_capacity(2);
-        for _ in 0..2 {
-            let b = drm::Buffer::new(Arc::clone(&device), fb_w, fb_h)?;
-            buffers.push(b);
+    fn open_with_commit(
+        device_path: &str,
+        commit: fn(
+            &crate::drm::Device,
+            &crate::drm::modeset::Output,
+            ::drm::control::framebuffer::Handle,
+        ) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let device = Arc::new(drm::Device::open(device_path)?);
+        let outputs = drm::modeset::discover_outputs(&device)?;
+
+        // Horizontal layout in connector order. If anything fails part
+        // way through bring-up, disable everything we have already
+        // committed so the next caller starts from a clean slate.
+        // TODO(phase-6.10): no unit test exercises this rollback yet —
+        // discover_outputs requires a real DRM device, so a synthetic
+        // seam isn't cheap. Manual smoke at Step 5/6 covers it.
+        let mut layouts: Vec<OutputLayout> = Vec::with_capacity(outputs.len());
+        let mut next_x: i32 = 0;
+        let mut bring_up_err: Option<io::Error> = None;
+        for output in outputs {
+            let w = output.picked.width;
+            let h = output.picked.height;
+            let mut buffers = Vec::with_capacity(2);
+            let mut buffer_err: Option<io::Error> = None;
+            for _ in 0..2 {
+                match drm::Buffer::new(Arc::clone(&device), w, h) {
+                    Ok(b) => buffers.push(b),
+                    Err(e) => {
+                        buffer_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = buffer_err {
+                bring_up_err = Some(e);
+                break;
+            }
+            let initial_fb = buffers[0].fb_id();
+            if let Err(e) = commit(&device, &output, initial_fb) {
+                bring_up_err = Some(e);
+                break;
+            }
+            let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
+            layouts.push(OutputLayout {
+                output,
+                swapchain,
+                x: next_x,
+                y: 0,
+                width: w,
+                height: h,
+            });
+            next_x = next_x.saturating_add(i32::from(w));
+        }
+        if let Some(err) = bring_up_err {
+            for done in layouts.iter().rev() {
+                let _ = drm::modeset::disable_output(&device, &done.output);
+            }
+            return Err(err);
         }
 
-        let initial_fb = buffers[0].fb_id();
-        drm::modeset::commit_modeset(&device, &output, initial_fb)?;
-
-        let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
+        // fb_w / fb_h carry the virtual-screen extent. Saturating
+        // cast: huge layouts that exceed u16 are clamped — the rest
+        // of the backend assumes u16 framebuffer dims (changing that
+        // is out of scope for Step 3).
+        let fb_w: u16 = layouts
+            .iter()
+            .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
+            .max()
+            .unwrap_or(0);
+        let fb_h: u16 = layouts
+            .iter()
+            .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
+            .max()
+            .unwrap_or(0);
 
         let input_ctx = match crate::input::SendContext::new() {
             Ok(ctx) => Some(ctx),
@@ -993,10 +1119,9 @@ impl KmsBackend {
 
         let mut me = Self {
             device,
-            output,
+            outputs: layouts,
             fb_w,
             fb_h,
-            swapchain,
             windows: HashMap::new(),
             next_host_xid: 0x0040_0000,
             top_level_order: Vec::new(),
@@ -1661,26 +1786,83 @@ impl KmsBackend {
         }
     }
 
-    /// Acquire a swapchain buffer, composite all windows onto it, draw the
+    /// Acquire a swapchain buffer per output, composite all visible windows
+    /// onto it (translated into per-output scanout coordinates), draw the
     /// software cursor, and submit the flip. Called by the epoll loop on
     /// page-flip completion or on a timer.
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
-        let buf_idx = self
-            .swapchain
-            .acquire_idx()
-            .ok_or_else(|| io::Error::other("no swapchain buffer available"))?;
+        let top_levels: Vec<u32> = self.top_level_order.clone();
 
-        let buf = self.swapchain.buffer_mut(buf_idx);
-        let w = buf.width();
-        let h = buf.height();
-        let stride_bytes = buf.stride() as usize;
-        let pixels = buf.pixels_mut().as_mut_ptr();
+        // Pre-filter visible top-levels per output (spec §2.5: avoid
+        // descending whole off-screen subtrees).
+        let visible_per_output: Vec<Vec<u32>> = self
+            .outputs
+            .iter()
+            .map(|layout| {
+                let bbox = layout.rect();
+                top_levels
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.window_intersects(id, bbox))
+                    .collect()
+            })
+            .collect();
 
-        // Create a temporary scanout image wrapping the swapchain buffer.
-        // SAFETY: the buffer is owned by the swapchain and outlives this image.
-        let mut scanout = unsafe {
-            PixmanImage::from_buffer(FormatCode::X8R8G8B8, w, h, pixels, stride_bytes, false)?
-        };
+        #[allow(clippy::needless_range_loop)] // index needed to split &mut/& borrows on self
+        for layout_idx in 0..self.outputs.len() {
+            let visible = &visible_per_output[layout_idx];
+            // Acquire swapchain buffer; if none available, skip this output
+            // for this frame.
+            let Some(buf_idx) = self.outputs[layout_idx].swapchain.acquire_idx() else {
+                continue;
+            };
+
+            // Wrap the swapchain buffer as a transient PixmanImage. SAFETY:
+            // the buffer is owned by the swapchain and outlives this image.
+            let mut scanout = {
+                let buf = self.outputs[layout_idx].swapchain.buffer_mut(buf_idx);
+                let w = buf.width();
+                let h = buf.height();
+                let stride_bytes = buf.stride() as usize;
+                let pixels = buf.pixels_mut().as_mut_ptr();
+                unsafe {
+                    PixmanImage::from_buffer(
+                        FormatCode::X8R8G8B8,
+                        w,
+                        h,
+                        pixels,
+                        stride_bytes,
+                        false,
+                    )?
+                }
+            };
+
+            self.paint_output(&mut scanout, layout_idx, visible);
+
+            // Drop scanout (releases mutable borrow on the swapchain buffer)
+            // before page-flip submit.
+            drop(scanout);
+
+            let fb_id = self.outputs[layout_idx].swapchain.buffer(buf_idx).fb_id();
+            drm::page_flip::submit_flip(&self.device, &self.outputs[layout_idx].output, fb_id)?;
+            self.outputs[layout_idx]
+                .swapchain
+                .submit(buf_idx)
+                .map_err(|e| io::Error::other(format!("swapchain.submit: {e}")))?;
+        }
+
+        Ok(())
+    }
+
+    /// Paint a single output's scanout image. Translates virtual-screen
+    /// coordinates by `(-layout.x, -layout.y)` so layout `(layout.x,
+    /// layout.y)` lands at scanout `(0, 0)`. Pixman implicitly clips writes
+    /// outside the destination image.
+    fn paint_output(&self, scanout: &mut PixmanImage, layout_idx: usize, visible: &[u32]) {
+        let layout_x = self.outputs[layout_idx].x;
+        let layout_y = self.outputs[layout_idx].y;
+        let layout_w = self.outputs[layout_idx].width;
+        let layout_h = self.outputs[layout_idx].height;
 
         // Fill root background; fall back to mid-grey so client windows stand out.
         {
@@ -1691,16 +1873,19 @@ impl KmsBackend {
             let root_rect = Rectangle16 {
                 x: 0,
                 y: 0,
-                width: self.fb_w,
-                height: self.fb_h,
+                width: layout_w,
+                height: layout_h,
             };
             let _ = scanout
                 .0
                 .fill_rectangles(Operation::Src, bg_color, &[root_rect]);
         }
+
         // Overlay background pixmap if set (e.g. from Esetroot / fvwm-root).
-        // The pixmap may already be freed by the client (Esetroot pattern); fall back
-        // to the rescued image saved by free_pixmap.
+        // The pixmap is sized to the virtual-screen extent (fb_w/fb_h); use
+        // pixman's source offset so the pixmap pixel at (layout_x, layout_y)
+        // lands at scanout (0, 0). composite32 src_x/src_y are documented as
+        // source-image offsets by pixman_image_composite32.
         if let Some(pm) = self.bg_pixmap {
             let bg_img: Option<&PixmanImage> = self
                 .pixmaps
@@ -1708,44 +1893,109 @@ impl KmsBackend {
                 .map(|p| &p.image)
                 .or(self.bg_pixmap_image.as_ref());
             if let Some(img) = bg_img {
-                let pw = img.0.width() as i32;
-                let ph = img.0.height() as i32;
                 scanout.0.composite32(
                     Operation::Src,
                     &img.0,
                     None,
+                    (layout_x, layout_y),
                     (0, 0),
                     (0, 0),
-                    (0, 0),
-                    (pw, ph),
+                    (i32::from(layout_w), i32::from(layout_h)),
                 );
             }
         }
 
-        // Composite top-level windows in stacking order: bottom-to-top
-        // so later iterations paint over earlier ones.
-        // `top_level_order` is maintained by create / destroy / reparent
-        // / configure_subwindow — keep it authoritative; HashMap order
-        // is unstable.
-        let top_levels: Vec<u32> = self.top_level_order.clone();
-        for &window_id in &top_levels {
-            self.composite_window_into(&mut scanout, window_id);
+        // Composite each visible top-level in stacking order, translated into
+        // scanout coordinates.
+        for &window_id in visible {
+            self.composite_window_into_offset(scanout, window_id, -layout_x, -layout_y);
         }
 
-        // Draw software cursor (16x16 white rectangle)
-        self.draw_cursor_onto(&mut scanout);
+        // Draw the software cursor onto the scanout, translated by the
+        // layout offset.
+        self.draw_cursor_onto_offset(scanout, layout_x, layout_y);
+    }
 
-        // Image is dropped here (before submit), releasing the mutable borrow
-        // on the swapchain buffer's pixels.
-        drop(scanout);
+    /// Return whether the (mapped) top-level window's bounding box overlaps
+    /// `rect` in virtual-screen coordinates. Used by the per-output painter
+    /// to skip whole off-screen subtrees.
+    fn window_intersects(&self, window_id: u32, rect: Rect) -> bool {
+        let Some(window) = self.windows.get(&window_id) else {
+            return false;
+        };
+        if !window.mapped {
+            return false;
+        }
+        let (ox, oy) = self.absolute_origin(window_id);
+        // absolute_origin returns the top-left in virtual-screen coords; for a
+        // top-level the parent is the root, so this equals (window.x, window.y).
+        #[allow(clippy::cast_possible_truncation)]
+        let wx = ox as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let wy = oy as i32;
+        let wx2 = wx.saturating_add(i32::from(window.width));
+        let wy2 = wy.saturating_add(i32::from(window.height));
+        let bx2 = rect.x.saturating_add(rect.w);
+        let by2 = rect.y.saturating_add(rect.h);
+        wx < bx2 && rect.x < wx2 && wy < by2 && rect.y < wy2
+    }
 
-        let fb_id = self.swapchain.buffer(buf_idx).fb_id();
-        drm::page_flip::submit_flip(&self.device, &self.output, fb_id)?;
-        self.swapchain
-            .submit(buf_idx)
-            .map_err(|e| io::Error::other(format!("swapchain.submit: {e}")))?;
+    /// Top-level entry point used by the per-output painter. Applies an
+    /// `(ox, oy)` translation to the top-level window's `(x, y)`, so child
+    /// recursion (which works in parent-relative coordinates) doesn't need
+    /// to know about the layout offset.
+    fn composite_window_into_offset(
+        &self,
+        parent_img: &mut PixmanImage,
+        window_id: u32,
+        ox: i32,
+        oy: i32,
+    ) {
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        if !window.mapped {
+            return;
+        }
 
-        Ok(())
+        // Composite children into this window's image first (parent-relative;
+        // no offset translation needed for descendants).
+        let children: Vec<u32> = window.children.clone();
+        for &child_id in &children {
+            let child_target = &mut window.image.borrow_mut();
+            self.composite_window_into(child_target, child_id);
+        }
+
+        let window = &self.windows[&window_id];
+        let x = i32::from(window.x) + ox;
+        let y = i32::from(window.y) + oy;
+        let w = i32::from(window.width);
+        let h = i32::from(window.height);
+
+        if self
+            .shape_bounding
+            .get(&window_id)
+            .is_some_and(|r| r.is_empty())
+        {
+            return;
+        }
+        let shape_clip = build_shape_clip(self.shape_bounding.get(&window_id), x, y);
+        if let Some(ref region) = shape_clip {
+            let _ = parent_img.0.set_clip_region32(Some(region));
+        }
+        let src_img = window.image.borrow();
+        parent_img.0.composite32(
+            Operation::Over,
+            &src_img.0,
+            None,
+            (0, 0),
+            (0, 0),
+            (x, y),
+            (w, h),
+        );
+        if shape_clip.is_some() {
+            let _ = parent_img.0.set_clip_region32(None);
+        }
     }
 
     /// Recursively composite a window and its children into the target image.
@@ -1768,28 +2018,10 @@ impl KmsBackend {
 
         // Now composite the window (with its children painted) onto the parent
         let window = &self.windows[&window_id];
-        let x = window.x as i32;
-        let y = window.y as i32;
-        let w = window.width as i32;
-        let h = window.height as i32;
-
-        // Apply bounding shape as a clip on the destination if present.
-        let shape_clip = self.shape_bounding.get(&window_id).and_then(|rects| {
-            if rects.is_empty() {
-                return None; // explicitly empty shape — skip compositing entirely
-            }
-            use pixman::{Box32, Region32};
-            let boxes: Vec<Box32> = rects
-                .iter()
-                .map(|r| Box32 {
-                    x1: x + r.x as i32,
-                    y1: y + r.y as i32,
-                    x2: x + r.x as i32 + r.width as i32,
-                    y2: y + r.y as i32 + r.height as i32,
-                })
-                .collect();
-            Some(Region32::init_rects(&boxes))
-        });
+        let x = i32::from(window.x);
+        let y = i32::from(window.y);
+        let w = i32::from(window.width);
+        let h = i32::from(window.height);
 
         // Skip compositing if shape is explicitly empty.
         if self
@@ -1800,6 +2032,7 @@ impl KmsBackend {
             return;
         }
 
+        let shape_clip = build_shape_clip(self.shape_bounding.get(&window_id), x, y);
         if let Some(ref region) = shape_clip {
             let _ = parent_img.0.set_clip_region32(Some(region));
         }
@@ -1890,15 +2123,20 @@ impl KmsBackend {
     /// hotspot-adjusted position. The visible cursor is whatever the
     /// window under the pointer (or its closest non-None ancestor) has
     /// set via DefineCursor.
-    fn draw_cursor_onto(&self, scanout: &mut PixmanImage) {
+    /// Draw the cursor onto the scanout image, translated by `(-layout_x,
+    /// -layout_y)` so virtual-screen cursor coordinates land in scanout
+    /// coordinates. Pixman implicitly clips writes that fall outside the
+    /// destination, so cursors that straddle output boundaries draw their
+    /// visible portion on each scanout.
+    fn draw_cursor_onto_offset(&self, scanout: &mut PixmanImage, layout_x: i32, layout_y: i32) {
         let Some(cursor_xid) = self.effective_cursor() else {
             return;
         };
         let Some(cs) = self.cursors.get(&cursor_xid) else {
             return;
         };
-        let x = self.cursor_x as i32 - cs.hot_x as i32;
-        let y = self.cursor_y as i32 - cs.hot_y as i32;
+        let x = self.cursor_x as i32 - i32::from(cs.hot_x) - layout_x;
+        let y = self.cursor_y as i32 - i32::from(cs.hot_y) - layout_y;
         let w = cs.image.0.width() as i32;
         let h = cs.image.0.height() as i32;
         scanout.0.composite32(
@@ -2074,6 +2312,49 @@ impl KmsBackend {
         (self.fb_w, self.fb_h)
     }
 
+    /// Build the RANDR output records for every connected DRM output.
+    ///
+    /// ID allocation per spec §2.6.1:
+    /// - outputs `1..=N`
+    /// - CRTCs `(N+1)..=2N`
+    /// - modes `2N+1..` deduped by `(width, height, vrefresh)`
+    #[must_use]
+    pub fn randr_outputs(&self) -> Vec<yserver_core::randr::RandrOutput> {
+        use yserver_core::randr::RandrOutput;
+        let n = self.outputs.len();
+        let mut mode_ids: HashMap<(u16, u16, u32), u32> = HashMap::new();
+        #[allow(clippy::cast_possible_truncation)]
+        let mut next_mode_id: u32 = (2 * n + 1) as u32;
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(i, layout)| {
+                let vrefresh = layout.output.picked.vrefresh;
+                let key = (layout.width, layout.height, vrefresh);
+                let mode_id = *mode_ids.entry(key).or_insert_with(|| {
+                    let id = next_mode_id;
+                    next_mode_id += 1;
+                    id
+                });
+                #[allow(clippy::cast_possible_truncation)]
+                let output_id = (i + 1) as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let crtc_id = (n + i + 1) as u32;
+                RandrOutput {
+                    name: layout.output.connector_name.clone(),
+                    output_id,
+                    crtc_id,
+                    mode_id,
+                    x: i16::try_from(layout.x).unwrap_or(i16::MAX),
+                    y: i16::try_from(layout.y).unwrap_or(i16::MAX),
+                    width: layout.width,
+                    height: layout.height,
+                    vrefresh,
+                }
+            })
+            .collect()
+    }
+
     /// Return the raw libinput fd for epoll registration, if available.
     pub fn input_fd(&self) -> Option<std::os::unix::io::RawFd> {
         self.input_ctx.as_ref().map(|ctx| ctx.fd())
@@ -2088,22 +2369,41 @@ impl KmsBackend {
     /// Drain pending page-flip events, acquire the next swapchain buffer,
     /// composite all windows onto it, draw the cursor, and submit a new flip.
     pub fn drain_page_flips_and_composite(&mut self) -> io::Result<()> {
-        let mut handled = 0u32;
-        drm::page_flip::drain_events(&self.device, || handled += 1)?;
-        for _ in 0..handled {
-            if let Some(idx) = self.swapchain.submitted_idx() {
-                self.swapchain
-                    .complete(idx)
-                    .map_err(|e| io::Error::other(format!("swapchain.complete: {e}")))?;
+        use ::drm::control::crtc;
+        let mut flipped: Vec<crtc::Handle> = Vec::new();
+        drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
+
+        for c in flipped {
+            if let Some(layout) = self.outputs.iter_mut().find(|o| o.output.crtc == c) {
+                if let Some(idx) = layout.swapchain.submitted_idx() {
+                    layout
+                        .swapchain
+                        .complete(idx)
+                        .map_err(|e| io::Error::other(format!("swapchain.complete: {e}")))?;
+                }
+            } else {
+                log::warn!("page-flip event for unknown CRTC {c:?}");
             }
         }
         // Always composite on flip completion (self-driving at vsync)
         self.composite_and_flip()
     }
 
-    /// Disable the DRM output (CRTC + plane) for clean shutdown.
+    /// Disable each DRM output (CRTC + plane) for clean shutdown.
+    /// Logs any per-output error and returns the last one so callers
+    /// still see a failure, while attempting to tear down everything.
     pub fn disable_output(&self) -> io::Result<()> {
-        drm::modeset::disable_output(&self.device, &self.output)
+        let mut last_err: Option<io::Error> = None;
+        for layout in &self.outputs {
+            if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
+                log::warn!(
+                    "disable_output failed for {}: {e}",
+                    layout.output.connector_name
+                );
+                last_err = Some(e);
+            }
+        }
+        last_err.map_or(Ok(()), Err)
     }
 }
 
@@ -5134,27 +5434,33 @@ mod tests {
 
         KmsBackend {
             device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
-            output: crate::drm::modeset::Output {
-                connector: drm::control::from_u32(1).unwrap(),
-                connector_name: "test".to_string(),
-                crtc: drm::control::from_u32(1).unwrap(),
-                plane: drm::control::from_u32(1).unwrap(),
-                // SAFETY: tests never pass this mode to DRM; it is only
-                // present to satisfy KmsBackend's production fields.
-                mode: unsafe { std::mem::zeroed() },
-                picked: crate::drm::modeset::Mode {
-                    name: "test".to_string(),
-                    width: 800,
-                    height: 600,
-                    vrefresh: 60,
-                    preferred: true,
+            outputs: vec![super::OutputLayout {
+                output: crate::drm::modeset::Output {
+                    connector: drm::control::from_u32(1).unwrap(),
+                    connector_name: "test".to_string(),
+                    crtc: drm::control::from_u32(1).unwrap(),
+                    plane: drm::control::from_u32(1).unwrap(),
+                    // SAFETY: tests never pass this mode to DRM; it is only
+                    // present to satisfy KmsBackend's production fields.
+                    mode: unsafe { std::mem::zeroed() },
+                    picked: crate::drm::modeset::Mode {
+                        name: "test".to_string(),
+                        width: 800,
+                        height: 600,
+                        vrefresh: 60,
+                        preferred: true,
+                    },
+                    plane_fb_id_prop: drm::control::from_u32(1).unwrap(),
+                    plane_crtc_id_prop: drm::control::from_u32(1).unwrap(),
                 },
-                plane_fb_id_prop: drm::control::from_u32(1).unwrap(),
-                plane_crtc_id_prop: drm::control::from_u32(1).unwrap(),
-            },
+                swapchain: crate::drm::Swapchain::empty_for_tests(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }],
             fb_w: 800,
             fb_h: 600,
-            swapchain: crate::drm::Swapchain::empty_for_tests(),
             windows: HashMap::new(),
             next_host_xid: 0x0040_0000,
             top_level_order: Vec::new(),
@@ -5507,6 +5813,90 @@ mod tests {
 
         assert_eq!(b.cursor_x as i32, 110);
         assert_eq!(b.cursor_y as i32, 220);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Step 4 — multi-monitor: per-output bbox pre-filter
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn window_intersects_bbox_filters_off_screen_top_levels() {
+        let mut b = make_test_backend();
+        // Top-level placed off the default test layout (0,0,800,600).
+        let xid = b.next_host_xid;
+        b.next_host_xid += 1;
+        b.windows
+            .insert(xid, make_test_window(2000, 100, 100, 100, true));
+        b.top_level_order.push(xid);
+
+        // Whole virtual screen including (0..1024, 0..768) — does not reach x=2000.
+        assert!(!b.window_intersects(
+            xid,
+            super::Rect {
+                x: 0,
+                y: 0,
+                w: 1024,
+                h: 768,
+            }
+        ));
+        // Output positioned at virtual-screen x=1900 with width 1024 — overlaps window.
+        assert!(b.window_intersects(
+            xid,
+            super::Rect {
+                x: 1900,
+                y: 0,
+                w: 1024,
+                h: 768,
+            }
+        ));
+        // Top-left corner of virtual screen — far away from the window.
+        assert!(!b.window_intersects(
+            xid,
+            super::Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            }
+        ));
+    }
+
+    #[test]
+    fn paint_output_offsets_window_into_scanout() {
+        // Simulate a second-of-two-output layout positioned at virtual x=1024,
+        // and assert paint_output translates a top-level window at virtual
+        // (2000, 100) so it lands at (2000-1024, 100) = (976, 100) on the
+        // scanout. Skips paint when no window intersects the bbox.
+        let mut b = make_test_backend();
+        b.outputs[0].x = 1024;
+        b.outputs[0].y = 0;
+        b.outputs[0].width = 1024;
+        b.outputs[0].height = 768;
+        b.fb_w = 1024 + 1024;
+        b.fb_h = 768;
+
+        // A 100x100 window at virtual (2000, 100) filled red.
+        let xid = b.next_host_xid;
+        b.next_host_xid += 1;
+        let mut win = make_test_window(2000, 100, 100, 100, true);
+        fill_image(win.image.get_mut(), 0x00ff_0000);
+        b.windows.insert(xid, win);
+        b.top_level_order.push(xid);
+
+        // Scanout sized to layout dimensions.
+        let mut scanout = PixmanImage::new(FormatCode::X8R8G8B8, 1024, 768, true).unwrap();
+        b.paint_output(&mut scanout, 0, &[xid]);
+
+        // Window pixel at virtual (2000, 100) should land at scanout (976, 100).
+        assert_eq!(read_pixel(&scanout, 976, 100) & 0x00ff_ffff, 0x00ff_0000);
+        // The pixel at scanout (0, 0) is bg only — definitely not the window red.
+        assert_ne!(read_pixel(&scanout, 0, 0) & 0x00ff_ffff, 0x00ff_0000);
+
+        // Empty visible list (window pre-filtered out) must not panic and must
+        // not stamp the window onto the scanout.
+        let mut scanout2 = PixmanImage::new(FormatCode::X8R8G8B8, 1024, 768, true).unwrap();
+        b.paint_output(&mut scanout2, 0, &[]);
+        assert_ne!(read_pixel(&scanout2, 976, 100) & 0x00ff_ffff, 0x00ff_0000);
     }
 
     // ---------------------------------------------------------------------------

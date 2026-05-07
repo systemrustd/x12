@@ -377,9 +377,14 @@ pub(crate) fn handle_host_container_resize(
         .iter()
         .map(|((owner, window), mask)| (*owner, *window, *mask))
         .collect();
-    let crtc = crate::randr::CRTC_ID;
-    let mode = crate::randr::MODE_ID;
-    let output = crate::randr::OUTPUT_ID;
+    // Capture the IDs *after* `state.randr.resize` (above) so the
+    // fanout uses the current values. Defensive defaults for the
+    // (unreachable post-init) empty-outputs case.
+    let (output, crtc, mode) = state
+        .randr
+        .outputs
+        .first()
+        .map_or((0, 0, 0), |o| (o.output_id, o.crtc_id, o.mode_id));
     for (owner, request_window, mask) in subscribers {
         let Some(client) = state.clients.get_mut(&owner) else {
             continue;

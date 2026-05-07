@@ -15,7 +15,7 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    randr::RandrState,
+    randr::{RandrOutput, RandrState},
     resources::{ROOT_WINDOW, ResourceTable},
 };
 
@@ -249,6 +249,23 @@ impl ServerState {
             present_msc: HashMap::new(),
             mit_shm_segments: HashMap::new(),
         }
+    }
+
+    /// Build a `ServerState` seeded with a caller-supplied set of
+    /// RANDR outputs (e.g. from `KmsBackend::randr_outputs`). The
+    /// aggregated screen extent from `outputs` overrides `width` /
+    /// `height` for the root window when non-zero.
+    #[must_use]
+    pub fn with_randr_outputs(width: u16, height: u16, outputs: Vec<RandrOutput>) -> Self {
+        let mut s = Self::with_geometry(width, height);
+        s.randr = RandrState::from_outputs(0, outputs);
+        // Re-apply aggregated screen extent to root window if outputs
+        // imply a different size than the (width, height) args.
+        if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
+            root.width = s.randr.screen_width;
+            root.height = s.randr.screen_height;
+        }
+        s
     }
 
     #[must_use]

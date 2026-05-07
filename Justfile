@@ -43,6 +43,23 @@ yserver-headless-shutdown seconds="3":
         --qemu-opts="-device virtio-gpu-pci" \
         -- bash -c 'target/debug/yserver & pid=$!; sleep {{seconds}}; kill -TERM $pid; wait $pid'
 
+# Multi-monitor smoke: virtio-gpu with two scanouts under GTK
+# (SDL collapses Virtual-2 — see docs/superpowers/notes/2026-05-07-phase6-10-vng-recipe.md).
+# YSERVER_MODE pin keeps both outputs at 1024x768 so seam = x=1024.
+yserver-multihead:
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci,max_outputs=2 \
+                     -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- env YSERVER_MODE=1024x768 bash -c '\
+            target/debug/yserver &\
+            yserver_pid=$!;\
+            sleep 2;\
+            DISPLAY=:7 wmaker > wmaker.log 2>&1 &\
+            sleep 2;\
+            DISPLAY=:7 xterm &\
+            wait $yserver_pid'
+
 # Run the nested ynest binary on the host's X server (no virtme).
 ynest display="99":
     cargo run --bin ynest -- {{display}}

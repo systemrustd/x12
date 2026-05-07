@@ -244,7 +244,21 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
 
     let host_window_id = backend.window_id();
 
-    let mut state = ServerState::with_geometry(width, height);
+    // Build the synthetic ynest output explicitly. The exact integer
+    // IDs (output=1, crtc=2, mode=3) and `ynest-0` name are
+    // load-bearing for existing xts wire-byte fixtures.
+    let synthetic = crate::randr::RandrOutput {
+        name: "ynest-0".to_string(),
+        output_id: 1,
+        crtc_id: 2,
+        mode_id: 3,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        vrefresh: 60,
+    };
+    let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
     // bg pixmap) produce visible output in the nested viewport.

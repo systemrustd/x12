@@ -2552,3 +2552,81 @@ Notes:
   sub-windows themselves have no host backing. Currently fine because
   the host's own backing store keeps the rendered output, but tiled
   bg pixmaps wouldn't survive a forced expose.
+
+## Phase 6.10 — Multi-monitor on KMS (complete)
+
+Goal: drive every connected DRM connector as an independent X11 RANDR
+output, laid out side-by-side in a single virtual screen. Validated
+under `vng` with `virtio-gpu-pci,max_outputs=2`.
+
+**Spec:** [`superpowers/specs/2026-05-07-phase6-10-multi-monitor-design.md`](superpowers/specs/2026-05-07-phase6-10-multi-monitor-design.md)
+**Plan:** [`superpowers/plans/2026-05-07-phase6-10-multi-monitor.md`](superpowers/plans/2026-05-07-phase6-10-multi-monitor.md)
+**Validation note:** [`superpowers/notes/2026-05-07-phase6-10-validation.md`](superpowers/notes/2026-05-07-phase6-10-validation.md)
+**vng recipe:** [`superpowers/notes/2026-05-07-phase6-10-vng-recipe.md`](superpowers/notes/2026-05-07-phase6-10-vng-recipe.md)
+
+### Working
+
+- `discover_outputs(&Device) -> io::Result<Vec<Output>>` walks every
+  connected connector with usable modes; pure `assign_outputs` helper
+  greedily pairs each with an unclaimed CRTC + primary plane and
+  hard-errors on stranded connectors.
+- `KmsBackend.outputs: Vec<OutputLayout>` — each layout owns its own
+  `Output`, `Swapchain`, virtual-screen `(x, y, width, height)`. Bring-up
+  loops with rollback (any modeset or buffer-allocation failure tears
+  down already-committed outputs in reverse order).
+- Per-output paint loop in `composite_and_flip`: top-level windows
+  pre-filtered by bbox intersection with each output's rect (avoids
+  descending whole off-screen subtrees), origins translated by
+  `(-layout.x, -layout.y)`, cursor drawn at scanout-relative coords.
+- Page-flip events route via `crtc::Handle` from `drain_events` to the
+  matching `OutputLayout`; one swapchain completion per CRTC.
+- `RandrState` carries `Vec<RandrOutput>` + deduped `Vec<RandrMode>` +
+  `primary_output` + aggregated `screen_*` / `*_mm`. Every RANDR
+  handler (`RRGetScreenResources`, `RRGetOutputInfo`, `RRGetCrtcInfo`,
+  `RRGetMonitors`, `RRGetOutputPrimary`, ...) reads from the new
+  collections; `OUTPUT_ID`/`CRTC_ID`/`MODE_ID` consts removed.
+- ID allocation per spec: outputs `1..=N`, CRTCs `(N+1)..=2N`, modes
+  `2N+1..` with `(w, h, vrefresh)` dedup.
+- ynest wire bytes preserved: single output `ynest-0`, output_id=1,
+  crtc_id=2, mode_id=3, position (0, 0). xts Xrandr fixtures still
+  green.
+- `just yserver-multihead` recipe; GTK display backend (SDL collapses
+  the second connector — see vng-recipe note).
+
+### Validation gate (plan §5)
+
+`xrandr -q` under `virtio-gpu-pci,max_outputs=2` with
+`YSERVER_MODE=1024x768`:
+
+```
+Screen 0: minimum 2048 x 768, current 2048 x 768, maximum 2048 x 768
+Virtual-1 connected primary 1024x768+0+0 27mm x 20mm
+   1024x768      46.02*+
+Virtual-2 connected 1024x768+1024+0 27mm x 20mm
+   1024x768      46.02*+
+```
+
+`xrandr --listmonitors`: 2 monitors, first marked primary, both at
+matching mm dimensions, second at `+1024+0` past the seam. xdpyinfo
+root dimensions `2048x768`. Mode line shared (dedup verified).
+
+ynest single-output regression: `xrandr -q` byte-identical to
+pre-Phase-6.10. Single output `ynest-0 connected primary 1024x768+0+0
+27mm x 20mm`.
+
+### Out of scope (deferred to Phase 6.10.x)
+
+- Real-hardware encoder/CRTC matching (Intel/AMD shared encoder pools);
+  current greedy first-fit will strand connectors that share encoder
+  pools.
+- Hotplug (connector add/remove at runtime, KMS uevent drain,
+  `RRScreenChangeNotify` fanout).
+- Runtime mode switching (`RRSetCrtcConfig`).
+- Mirror/clone mode.
+- Overlay / cursor planes.
+- Per-output EDID-derived physical mm (currently 96 DPI assumption).
+- `YSERVER_LAYOUT` env override (default horizontal-by-enumeration is
+  enough).
+- xrandr-driven layout reconfigure.
+- Bare-metal multi-output validation (Phase 6.10 is virtio-gpu-scoped;
+  bare-metal is informational follow-up only).

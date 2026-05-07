@@ -37,7 +37,8 @@ pub fn run() -> io::Result<()> {
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
-    let mut state = ServerState::with_geometry(fb_w, fb_h);
+    let randr_outputs = backend.randr_outputs();
+    let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir)?;

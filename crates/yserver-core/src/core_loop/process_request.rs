@@ -1178,8 +1178,9 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let crtc_ids = [crate::randr::CRTC_ID];
-            let mode_ids = [crate::randr::MODE_ID];
+            let crtc_ids = [info_data.crtc];
+            let mode_ids = [info_data.mode_id];
+            let name_bytes = info_data.name.as_bytes();
             let buf = x11randr::encode_get_output_info_reply(
                 byte_order,
                 sequence,
@@ -1193,7 +1194,7 @@ fn handle_randr_request(
                     crtcs: &crtc_ids,
                     modes: &mode_ids,
                     clones: &[],
-                    name: b"ynest-0",
+                    name: name_bytes,
                 },
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -1223,17 +1224,17 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let output_ids = [crate::randr::OUTPUT_ID];
+            let output_ids = [crtc_data.output_id];
             let buf = x11randr::encode_get_crtc_info_reply(
                 byte_order,
                 sequence,
                 &x11randr::CrtcInfoReply {
                     timestamp: crtc_data.timestamp,
-                    x: 0,
-                    y: 0,
+                    x: crtc_data.x,
+                    y: crtc_data.y,
                     width: crtc_data.width,
                     height: crtc_data.height,
-                    mode: crate::randr::MODE_ID,
+                    mode: crtc_data.mode_id,
                     rotation: 1,
                     rotations: 1,
                     outputs: &output_ids,
@@ -1272,7 +1273,8 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_OUTPUT_PRIMARY => {
-            let buf = x11randr::encode_get_output_primary_reply(byte_order, sequence, 0);
+            let primary = state.randr.primary_output;
+            let buf = x11randr::encode_get_output_primary_reply(byte_order, sequence, primary);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -1290,28 +1292,56 @@ fn handle_randr_request(
         }
         x11randr::RR_GET_MONITORS => {
             let t = state.randr.timestamp;
-            let w = state.randr.screen_width;
-            let h = state.randr.screen_height;
-            let wmm = state.randr.width_mm;
-            let hmm = state.randr.height_mm;
-            let name_atom = state.atoms.intern("ynest-0", false).0;
-            let output_ids = [crate::randr::OUTPUT_ID];
-            let buf = x11randr::encode_get_monitors_reply(
-                byte_order,
-                sequence,
-                t,
-                &[x11randr::MonitorInfo {
-                    name: name_atom,
-                    primary: true,
-                    x: 0,
-                    y: 0,
-                    width: w,
-                    height: h,
-                    width_mm: wmm,
-                    height_mm: hmm,
-                    outputs: &output_ids,
-                }],
-            );
+            // Pre-resolve per-monitor name atom + output-id storage so
+            // the borrow inside MonitorInfo points at stable memory.
+            struct MonitorRow {
+                name_atom: u32,
+                primary: bool,
+                x: i16,
+                y: i16,
+                width: u16,
+                height: u16,
+                width_mm: u32,
+                height_mm: u32,
+                outputs: Vec<u32>,
+            }
+            let rows: Vec<MonitorRow> = state
+                .randr
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let name_atom = state.atoms.intern(&o.name, false).0;
+                    let width_mm = ((u32::from(o.width) * 254 + 4800) / 9600).max(1);
+                    let height_mm = ((u32::from(o.height) * 254 + 4800) / 9600).max(1);
+                    MonitorRow {
+                        name_atom,
+                        primary: i == 0,
+                        x: o.x,
+                        y: o.y,
+                        width: o.width,
+                        height: o.height,
+                        width_mm,
+                        height_mm,
+                        outputs: vec![o.output_id],
+                    }
+                })
+                .collect();
+            let monitors: Vec<x11randr::MonitorInfo<'_>> = rows
+                .iter()
+                .map(|r| x11randr::MonitorInfo {
+                    name: r.name_atom,
+                    primary: r.primary,
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                    width_mm: r.width_mm,
+                    height_mm: r.height_mm,
+                    outputs: &r.outputs,
+                })
+                .collect();
+            let buf = x11randr::encode_get_monitors_reply(byte_order, sequence, t, &monitors);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

@@ -1,8 +1,11 @@
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, PlaneType,
-    atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property,
+    atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
 };
 
 use crate::drm::Device;
@@ -79,30 +82,206 @@ pub struct Output {
     pub plane_crtc_id_prop: property::Handle,
 }
 
-pub fn discover_output(device: &Device) -> io::Result<Output> {
+/// One connected connector along with its candidate CRTCs and primary planes.
+///
+/// `candidate_planes` is each plane paired with the set of CRTCs that plane
+/// can drive (i.e. the plane's `possible_crtcs` mask, already filtered to
+/// `resources.crtcs()`). `assign_outputs` uses this to verify the final
+/// (CRTC, plane) pairing for each connector.
+pub(crate) struct ConnectorCandidate {
+    pub connector: connector::Handle,
+    pub connector_name: String,
+    pub encoder: encoder::Handle,
+    pub candidate_crtcs: Vec<crtc::Handle>,
+    pub candidate_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Assignment {
+    pub connector: connector::Handle,
+    pub connector_name: String,
+    // Step 3 will surface the bound encoder on `Output`; keep it on the
+    // assignment so that change is local to `discover_outputs`.
+    #[allow(dead_code)]
+    pub encoder: encoder::Handle,
+    pub crtc: crtc::Handle,
+    pub plane: plane::Handle,
+}
+
+/// Greedy first-fit assignment of (CRTC, primary plane) pairs to connectors.
+///
+/// Walks `connectors` in input order. For each, picks the first
+/// `candidate_crtc` not yet claimed, then the first `candidate_plane` that
+/// can drive that CRTC and is not yet claimed. Returns the connector's name
+/// as `Err` if no unclaimed (CRTC, plane) pair exists.
+///
+// TODO(phase-6.10.x): real-hardware shared encoder pools (Intel/AMD) need
+// bipartite matching here — current scope is virtio-gpu where assignments
+// are always disjoint.
+fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, String> {
+    let mut claimed_crtcs: HashSet<crtc::Handle> = HashSet::new();
+    let mut claimed_planes: HashSet<plane::Handle> = HashSet::new();
+    let mut out = Vec::with_capacity(connectors.len());
+
+    for cand in connectors {
+        let Some(&crtc) = cand
+            .candidate_crtcs
+            .iter()
+            .find(|c| !claimed_crtcs.contains(c))
+        else {
+            return Err(cand.connector_name.clone());
+        };
+        let Some(&(plane, _)) = cand
+            .candidate_planes
+            .iter()
+            .find(|(p, drivable)| !claimed_planes.contains(p) && drivable.contains(&crtc))
+        else {
+            return Err(cand.connector_name.clone());
+        };
+        claimed_crtcs.insert(crtc);
+        claimed_planes.insert(plane);
+        out.push(Assignment {
+            connector: cand.connector,
+            connector_name: cand.connector_name.clone(),
+            encoder: cand.encoder,
+            crtc,
+            plane,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Enumerate every connected connector with usable modes and assign each
+/// one a CRTC and primary plane. Greedy first-fit; see `assign_outputs`.
+///
+/// # Errors
+/// - underlying DRM ioctls fail (resource handles, properties, etc.)
+/// - a connector has no usable encoder, no candidate CRTC, or no usable
+///   modes
+/// - greedy assignment cannot place every connector (returns the stranded
+///   connector's name in the error message)
+/// - no connector is connected at all (typical when running without
+///   `vng --graphics`)
+///
+/// # Panics
+/// Panics only on internal invariant violations: a connector tracked in
+/// `connector_infos` must always be present when its assignment is finalized,
+/// and the picked mode must always be one of the connector's local modes.
+pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     let resources = device.resource_handles()?;
 
-    let mut connected: Option<connector::Info> = None;
+    // Pre-collect primary planes with their possible-CRTC sets.
+    // TODO(phase-6.10.x): on real hardware (Intel/AMD) primary planes are
+    // shared across CRTCs and the greedy first-fit below can strand a
+    // connector even though a valid assignment exists. virtio-gpu pairs
+    // each plane 1:1 with a CRTC so greedy is correct for current scope.
+    let mut primary_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)> = Vec::new();
+    for handle in device.plane_handles()? {
+        let info = device.get_plane(handle)?;
+        let props = device.get_properties(handle)?;
+        let map = props.as_hashmap(device)?;
+        let Some(type_info) = map.get("type") else {
+            continue;
+        };
+        let raw = props
+            .iter()
+            .find(|(h, _)| **h == type_info.handle())
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        if raw != PlaneType::Primary as u64 {
+            continue;
+        }
+        let drivable: HashSet<crtc::Handle> = resources
+            .filter_crtcs(info.possible_crtcs())
+            .into_iter()
+            .collect();
+        primary_planes.push((handle, drivable));
+    }
+
+    // Build candidates for every connected connector with usable modes.
+    let mut candidates: Vec<ConnectorCandidate> = Vec::new();
+    let mut connector_infos: HashMap<connector::Handle, connector::Info> = HashMap::new();
     for &handle in resources.connectors() {
         let info = device.get_connector(handle, false)?;
-        if info.state() == connector::State::Connected && !info.modes().is_empty() {
-            connected = Some(info);
-            break;
+        if info.state() != connector::State::Connected || info.modes().is_empty() {
+            continue;
         }
+        let connector_name = format!("{info}");
+        let encoder_handle = info
+            .current_encoder()
+            .or_else(|| info.encoders().first().copied())
+            .ok_or_else(|| {
+                io::Error::other(format!("connector {connector_name} has no usable encoder"))
+            })?;
+        let encoder_info = device.get_encoder(encoder_handle)?;
+        let mut candidate_crtcs: Vec<crtc::Handle> =
+            resources.filter_crtcs(encoder_info.possible_crtcs());
+        // If the encoder is already bound to a CRTC, prefer it first.
+        if let Some(current) = encoder_info.crtc() {
+            if let Some(idx) = candidate_crtcs.iter().position(|c| *c == current) {
+                candidate_crtcs.swap(0, idx);
+            } else {
+                candidate_crtcs.insert(0, current);
+            }
+        }
+        if candidate_crtcs.is_empty() {
+            return Err(io::Error::other(format!(
+                "encoder for connector {connector_name} has no possible CRTC",
+            )));
+        }
+        let candidate_crtc_set: HashSet<crtc::Handle> = candidate_crtcs.iter().copied().collect();
+        let candidate_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)> = primary_planes
+            .iter()
+            .filter(|(_, drivable)| drivable.iter().any(|c| candidate_crtc_set.contains(c)))
+            .cloned()
+            .collect();
+
+        candidates.push(ConnectorCandidate {
+            connector: handle,
+            connector_name,
+            encoder: encoder_handle,
+            candidate_crtcs,
+            candidate_planes,
+        });
+        connector_infos.insert(handle, info);
     }
-    let connector_info = connected.ok_or_else(|| {
-        io::Error::other(
+
+    if candidates.is_empty() {
+        return Err(io::Error::other(
             "no connected output — vng with --graphics required for modeset path; \
              headless mode does not exercise this",
-        )
-    })?;
-    let connector_name = format!("{connector_info}");
+        ));
+    }
 
+    let assignments = assign_outputs(&candidates).map_err(|name| {
+        io::Error::other(format!(
+            "connector {name} could not be placed (no unclaimed CRTC/plane)",
+        ))
+    })?;
+
+    let mut outputs = Vec::with_capacity(assignments.len());
+    for asg in assignments {
+        let connector_info = connector_infos
+            .remove(&asg.connector)
+            .expect("connector_info recorded for every candidate");
+        outputs.push(finalize_output(device, asg, &connector_info)?);
+    }
+
+    Ok(outputs)
+}
+
+fn finalize_output(
+    device: &Device,
+    asg: Assignment,
+    connector_info: &connector::Info,
+) -> io::Result<Output> {
     let local_modes: Vec<Mode> = connector_info.modes().iter().map(local_mode_from).collect();
     let picked = pick_mode(&local_modes)
         .ok_or_else(|| {
             io::Error::other(format!(
-                "connector {connector_name} reports no usable modes",
+                "connector {} reports no usable modes",
+                asg.connector_name
             ))
         })?
         .clone();
@@ -117,35 +296,15 @@ pub fn discover_output(device: &Device) -> io::Result<Output> {
         .expect("picked mode is from local_modes");
     let drm_mode = connector_info.modes()[picked_idx];
 
-    let encoder_handle = connector_info
-        .current_encoder()
-        .or_else(|| connector_info.encoders().first().copied())
-        .ok_or_else(|| {
-            io::Error::other(format!("connector {connector_name} has no usable encoder",))
-        })?;
-    let encoder = device.get_encoder(encoder_handle)?;
-    let crtc = encoder
-        .crtc()
-        .or_else(|| {
-            resources
-                .filter_crtcs(encoder.possible_crtcs())
-                .into_iter()
-                .next()
-        })
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "encoder for connector {connector_name} has no possible CRTC",
-            ))
-        })?;
-
-    let plane = pick_primary_plane(device, &resources, crtc)?;
-    let plane_props_map = PropMap::for_object(device, plane)?;
+    let plane_props_map = PropMap::for_object(device, asg.plane)?;
     let plane_fb_id_prop = plane_props_map.id("FB_ID")?;
     let plane_crtc_id_prop = plane_props_map.id("CRTC_ID")?;
 
     log::info!(
-        "yserver: connector={connector_name} crtc={crtc:?} plane={plane:?} \
-         mode={} ({}x{}@{}{})",
+        "yserver: connector={} crtc={:?} plane={:?} mode={} ({}x{}@{}{})",
+        asg.connector_name,
+        asg.crtc,
+        asg.plane,
         picked.name,
         picked.width,
         picked.height,
@@ -154,10 +313,10 @@ pub fn discover_output(device: &Device) -> io::Result<Output> {
     );
 
     Ok(Output {
-        connector: connector_info.handle(),
-        connector_name,
-        crtc,
-        plane,
+        connector: asg.connector,
+        connector_name: asg.connector_name,
+        crtc: asg.crtc,
+        plane: asg.plane,
         mode: drm_mode,
         picked,
         plane_fb_id_prop,
@@ -165,36 +324,14 @@ pub fn discover_output(device: &Device) -> io::Result<Output> {
     })
 }
 
-fn pick_primary_plane(
-    device: &Device,
-    resources: &drm::control::ResourceHandles,
-    crtc: crtc::Handle,
-) -> io::Result<plane::Handle> {
-    for handle in device.plane_handles()? {
-        let info = device.get_plane(handle)?;
-        if !resources
-            .filter_crtcs(info.possible_crtcs())
-            .contains(&crtc)
-        {
-            continue;
-        }
-        let props = device.get_properties(handle)?;
-        let map = props.as_hashmap(device)?;
-        let Some(type_info) = map.get("type") else {
-            continue;
-        };
-        let raw = props
-            .iter()
-            .find(|(h, _)| **h == type_info.handle())
-            .map(|(_, v)| *v)
-            .unwrap_or(0);
-        if raw == PlaneType::Primary as u64 {
-            return Ok(handle);
-        }
-    }
-    Err(io::Error::other(format!(
-        "no primary plane available for CRTC {crtc:?}",
-    )))
+pub fn discover_output(device: &Device) -> io::Result<Output> {
+    let outs = discover_outputs(device)?;
+    outs.into_iter().next().ok_or_else(|| {
+        io::Error::other(
+            "no connected output — vng with --graphics required for modeset path; \
+             headless mode does not exercise this",
+        )
+    })
 }
 
 pub fn dump_properties(device: &Device, output: &Output) -> io::Result<()> {
@@ -384,5 +521,89 @@ mod tests {
     #[test]
     fn empty_list_returns_none() {
         assert!(pick_mode(&[]).is_none());
+    }
+
+    use drm::control::from_u32;
+
+    fn ch(n: u32) -> connector::Handle {
+        from_u32(n).expect("non-zero raw handle")
+    }
+    fn eh(n: u32) -> encoder::Handle {
+        from_u32(n).expect("non-zero raw handle")
+    }
+    fn rh(n: u32) -> crtc::Handle {
+        from_u32(n).expect("non-zero raw handle")
+    }
+    fn ph(n: u32) -> plane::Handle {
+        from_u32(n).expect("non-zero raw handle")
+    }
+
+    fn cand(
+        idx: u32,
+        name: &str,
+        crtcs: Vec<crtc::Handle>,
+        planes: Vec<(plane::Handle, &[crtc::Handle])>,
+    ) -> ConnectorCandidate {
+        ConnectorCandidate {
+            connector: ch(idx),
+            connector_name: name.into(),
+            encoder: eh(idx),
+            candidate_crtcs: crtcs,
+            candidate_planes: planes
+                .into_iter()
+                .map(|(p, cs)| (p, cs.iter().copied().collect()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn assigns_two_connectors_with_disjoint_crtcs_in_input_order() {
+        let c0 = rh(10);
+        let c1 = rh(11);
+        let p0 = ph(20);
+        let p1 = ph(21);
+        let cands = vec![
+            cand(1, "HDMI-1", vec![c0], vec![(p0, &[c0])]),
+            cand(2, "HDMI-2", vec![c1], vec![(p1, &[c1])]),
+        ];
+        let asg = assign_outputs(&cands).expect("assignment succeeds");
+        assert_eq!(asg.len(), 2);
+        assert_eq!(asg[0].connector_name, "HDMI-1");
+        assert_eq!(asg[0].crtc, c0);
+        assert_eq!(asg[0].plane, p0);
+        assert_eq!(asg[1].connector_name, "HDMI-2");
+        assert_eq!(asg[1].crtc, c1);
+        assert_eq!(asg[1].plane, p1);
+    }
+
+    #[test]
+    fn errors_when_connector_has_no_candidate_crtcs() {
+        let cands = vec![cand(1, "HDMI-stranded", vec![], vec![])];
+        let err = assign_outputs(&cands).expect_err("must error");
+        assert_eq!(err, "HDMI-stranded");
+    }
+
+    #[test]
+    fn errors_on_second_connector_when_one_crtc_shared() {
+        let c0 = rh(10);
+        let p0 = ph(20);
+        let p1 = ph(21);
+        let cands = vec![
+            cand(1, "HDMI-A", vec![c0], vec![(p0, &[c0])]),
+            cand(2, "HDMI-B", vec![c0], vec![(p1, &[c0])]),
+        ];
+        let err = assign_outputs(&cands).expect_err("must error");
+        assert_eq!(err, "HDMI-B");
+    }
+
+    #[test]
+    fn errors_when_no_plane_can_drive_candidate_crtcs() {
+        let c0 = rh(10);
+        let c_other = rh(99);
+        let p0 = ph(20);
+        // plane only drives c_other, which is not a candidate.
+        let cands = vec![cand(1, "HDMI-NoPlane", vec![c0], vec![(p0, &[c_other])])];
+        let err = assign_outputs(&cands).expect_err("must error");
+        assert_eq!(err, "HDMI-NoPlane");
     }
 }
