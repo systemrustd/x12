@@ -145,64 +145,88 @@ Host (`:0`, X.Org Foundation): every test passes — e.g. `fill`
 160/160 vs ynest 30/30 because we advertise 3 picture formats and
 the host advertises 15.
 
-## Xlib4 – Xlib17 baselines (2026-05-07)
+## Xlib4 – Xlib17 baselines
 
-First scoped run of the remaining Xlib scenarios after the panic
-fixes (`b1e0716` BadWindow/BadDrawable on stale IDs) and the
-attribute-defaults fix (`29cf445` bit_gravity = ForgetGravity,
-backing_pixel = 0). Per-scenario overall timeout 240s; no per-test
-timeout. Cases that hang ynest steal the remaining wall-clock budget
-for that scenario, so partial results are common.
+### 2026-05-07 (post-`9bcb9b0`, ROOT_WINDOW protected from DestroyWindow)
 
-| scenario | cases-ran | tests | PASS | FAIL | UNRES | UNTST | UNSUP | note |
-|----------|----------:|------:|-----:|-----:|------:|------:|------:|------|
-| Xlib4    |        10 |   175 |   34 |  120 |     1 |     8 |     4 | XDestroyWindow case 6 (Expose-after-destroy) hangs the rest |
-| Xlib5    |         1 |    13 |    0 |    0 |     0 |     0 |     0 | first case hangs |
-| Xlib6    |         5 |    42 |    4 |   10 |     0 |    25 |     0 | |
-| Xlib7    |         6 |    45 |    6 |    9 |     0 |     3 |    14 | |
-| Xlib8    |         1 |    25 |    0 |    0 |     0 |     0 |     0 | first case hangs |
-| Xlib9    |         1 |    11 |    0 |    0 |     0 |     0 |     0 | first case hangs |
-| Xlib10   |         4 |    16 |    0 |    4 |     0 |     4 |     0 | |
-| Xlib11   |         1 |    12 |    0 |    0 |     0 |     0 |     0 | first case hangs |
-| Xlib12   |        21 |   106 |   59 |    7 |     0 |     8 |     2 | mostly client-side event-queue helpers |
-| Xlib13   |         1 |    29 |    0 |    0 |     0 |     0 |     0 | first case hangs |
-| Xlib14   |         5 |     5 |    1 |    3 |     0 |     0 |     0 | |
-| Xlib15   |         6 |    11 |    5 |    0 |     0 |     5 |     0 | |
-| Xlib16   |        30 |   105 |   82 |    0 |     0 |    22 |     1 | Xrm — almost entirely client-side string mgmt |
-| Xlib17   |         2 |     2 |    0 |    0 |     1 |     0 |     0 | |
-| **sum**  |           |       |  191 |  153 |     2 |    75 |    21 | |
+The original "first case hangs" pattern in seven of fourteen scenarios
+turned out to be a single root cause: xts Xlib4 sends
+`XDestroyWindow(root)` and our `destroy_window_inner` deleted root
+from the resources table — so every subsequent client got
+`BadWindow` on root queries. Fix is one early-return in
+`destroy_window_inner`. Single-ynest sweep below uses the same
+`tools/xts-xlib-sweep.sh` runner with no per-scenario restart.
 
-Across the full xts battery measured so far on this branch:
-Xproto 337 + Xlib3 110 + Xlib4–17 191 + ShapeExt 11 = **649 PASS**
+| scenario | cases | tests | PASS | FAIL | UNRES | UNTST | UNSUP | Δ vs pre-fix PASS |
+|----------|------:|------:|-----:|-----:|------:|------:|------:|:------------------|
+| Xlib4    |    29 |   324 |   61 |  225 |     5 |    17 |    11 | 34 → 61 (and now runs all 29 cases) |
+| Xlib5    |    15 |    84 |   48 |   26 |     3 |     5 |     2 | 0 → 48 |
+| Xlib6    |     8 |    50 |    4 |   17 |     0 |    29 |     0 | 4 → 4 |
+| Xlib7    |    58 |   172 |   81 |   31 |     2 |    13 |    45 | 6 → 81 |
+| Xlib8    |    29 |   165 |   19 |  100 |    14 |    22 |    10 | 0 → 19 |
+| Xlib9    |    46 |  1472 |  218 |  607 |   388 |    33 |    23 | 0 → 218 |
+| Xlib10   |    23 |    95 |   10 |   43 |     5 |    36 |     1 | 0 → 10 |
+| Xlib11   |    33 |   195 |   22 |  100 |     2 |     4 |    24 | 0 → 22 |
+| Xlib12   |    25 |   130 |   81 |   14 |     4 |    13 |     2 | 59 → 81 |
+| Xlib13   |    32 |   269 |   37 |  183 |    34 |     9 |     3 | 0 → 37 |
+| Xlib14   |    45 |    58 |   19 |   34 |     0 |     5 |     0 | 1 → 19 |
+| Xlib15   |    45 |   159 |  122 |    4 |     0 |    33 |     0 | 5 → 122 |
+| Xlib16   |    30 |   105 |   82 |    0 |     0 |    22 |     1 | 82 → 82 |
+| Xlib17   |    55 |   131 |   85 |   12 |     9 |    19 |     0 | 0 → 85 |
+| **sum**  |       |       |**889** | 1396 |   466 |   260 |   122 | **191 → 889** |
+
+Total xts coverage on master:
+Xproto 337 + Xlib3 110 + Xlib4–17 889 + ShapeExt 11 = **1347 PASS**
 (plus XI + XIproto suites complete cleanly with all UNTST due to
 0-device advertisement).
 
-### Top blockers driving FAIL/hang
+### Top blockers driving the remaining FAIL
 
-These show up across many Xlib scenarios — fixing one likely lifts
-several test cases at once:
+The "first-case hang" class is gone. The residual ~1.4k FAIL across
+Xlib4-17 falls into a few buckets:
 
-1. **Hangs in `exposecheck()`.** Several scenarios stall on the
-   first case because the test issues a structural change
-   (Destroy/Resize/Map) and waits for an `Expose` that ynest doesn't
-   generate. Need a proper expose-region tracker that fires on
-   uncovered areas after Destroy/Resize/Map/Configure.
-2. **`ChangeWindowAttributes` doesn't persist most fields.** The
+1. **`ChangeWindowAttributes` doesn't persist most fields.** The
    `Window` struct stores background-pixel / background-pixmap /
    override-redirect / cursor; CW value-mask bits for bit-gravity,
    win-gravity, backing-store, backing-planes, backing-pixel,
    save-under, colormap, do-not-propagate-mask are accepted but
    discarded. Tests that set then read fail with "got default,
    expected <set value>".
-3. **Missing protocol errors on bad inputs.** `did not generate
+2. **Missing protocol errors on bad inputs.** `did not generate
    BadAccess / BadColor / BadCursor / BadMatch / BadPixmap /
    BadValue / BadWindow` is a recurring `REPORT:` line. Many
    handlers blindly succeed. Adding spec-required error returns
    would lift FAIL → PASS without functional changes.
-4. **Pixel-mismatch in image / fill / area tests.** "A total of
+3. **Pixel-mismatch in image / fill / area tests.** "A total of
    N out of 9000 pixels were bad" appears across the geometry
    tests — likely backing-pixel default propagation, plus Expose
    mishandling, plus border-pixel defaults.
+4. **Expose-region tracking gaps.** Xlib9's 388 UNRES is mostly
+   tests that issue a structural change (Destroy/Resize/Map/
+   Configure) and time-out waiting for an `Expose` covering the
+   newly-uncovered area. Need a proper expose-region tracker that
+   fires on those transitions.
+
+### Pre-fix snapshot (kept for context — single-ynest, no root
+protection, no XKB minor 15)
+
+| scenario | cases-ran | tests | PASS | note |
+|----------|----------:|------:|-----:|------|
+| Xlib4    |        10 |   175 |   34 | XDestroyWindow case 6 (Expose-after-destroy) hangs the rest |
+| Xlib5    |         1 |    13 |    0 | first case hangs |
+| Xlib6    |         5 |    42 |    4 | |
+| Xlib7    |         6 |    45 |    6 | |
+| Xlib8    |         1 |    25 |    0 | first case hangs |
+| Xlib9    |         1 |    11 |    0 | first case hangs |
+| Xlib10   |         4 |    16 |    0 | |
+| Xlib11   |         1 |    12 |    0 | first case hangs |
+| Xlib12   |        21 |   106 |   59 | mostly client-side event-queue helpers |
+| Xlib13   |         1 |    29 |    0 | first case hangs |
+| Xlib14   |         5 |     5 |    1 | |
+| Xlib15   |         6 |    11 |    5 | |
+| Xlib16   |        30 |   105 |   82 | Xrm — almost entirely client-side string mgmt |
+| Xlib17   |         2 |     2 |    0 | |
+| **sum**  |           |       |  191 | |
 
 ### How to reproduce
 
