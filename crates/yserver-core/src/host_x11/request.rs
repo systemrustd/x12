@@ -908,6 +908,7 @@ impl HostX11Backend {
             host_xid,
             host_parent,
         );
+        self.host_drawable_depths.insert(host_xid, visual.depth());
         Ok(WindowHandle::from_raw_panicking(host_xid))
     }
 
@@ -919,7 +920,9 @@ impl HostX11Backend {
         write_u16(&mut out, 2);
         write_u32(&mut out, host_xid);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        self.host_drawable_depths.remove(&host_xid);
+        Ok(())
     }
 
     #[allow(
@@ -1202,6 +1205,7 @@ impl HostX11Backend {
         write_u16(&mut out, height);
         self.stream.write_all(&out)?;
         self.stream.flush()?;
+        self.host_drawable_depths.insert(host_xid, depth);
         Ok(PixmapHandle::from_raw_panicking(host_xid))
     }
 
@@ -1213,7 +1217,9 @@ impl HostX11Backend {
         write_u16(&mut out, 2);
         write_u32(&mut out, host_xid);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        self.host_drawable_depths.remove(&host_xid);
+        Ok(())
     }
 
     pub fn create_cursor(
@@ -1641,6 +1647,7 @@ impl HostX11Backend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let gc = self.pick_gc(dst_host_xid)?;
         self.advance_sequence();
         let mut out = Vec::new();
         out.push(62); // CopyArea opcode
@@ -1648,7 +1655,7 @@ impl HostX11Backend {
         write_u16(&mut out, 7); // length: 7 units = 28 bytes
         write_u32(&mut out, src_host_xid);
         write_u32(&mut out, dst_host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         write_i16(&mut out, src_x);
         write_i16(&mut out, src_y);
         write_i16(&mut out, dst_x);
@@ -1672,6 +1679,7 @@ impl HostX11Backend {
         height: u16,
         plane: u32,
     ) -> io::Result<()> {
+        let gc = self.pick_gc(dst_host_xid)?;
         self.advance_sequence();
         let mut out = Vec::new();
         out.push(63); // CopyPlane opcode
@@ -1679,7 +1687,7 @@ impl HostX11Backend {
         write_u16(&mut out, 8); // length: 8 units = 32 bytes
         write_u32(&mut out, src_host_xid);
         write_u32(&mut out, dst_host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         write_i16(&mut out, src_x);
         write_i16(&mut out, src_y);
         write_i16(&mut out, dst_x);
@@ -1724,6 +1732,83 @@ impl HostX11Backend {
             Ok(reply) => Ok(Some(reply)),
             Err(_) => Ok(None),
         }
+    }
+
+    /// Pick a host GC whose root+depth match destination `host_xid`. For
+    /// untracked or depth-24 drawables, returns the default `gc_id`
+    /// (which is depth-24). Otherwise creates and caches a per-depth GC.
+    /// Using the depth-24 `gc_id` against e.g. a depth-32 ARGB pixmap
+    /// would BadMatch on the host and silently drop the request — see
+    /// the depth-32 functest probe in xts bucket 1.
+    fn pick_gc(&mut self, host_xid: u32) -> io::Result<u32> {
+        let depth = self
+            .host_drawable_depths
+            .get(&host_xid)
+            .copied()
+            .unwrap_or(24);
+        if depth == 24 {
+            return Ok(self.gc_id);
+        }
+        self.ensure_gc_for_depth(depth, host_xid)
+    }
+
+    /// As `pick_gc`, but also ensures the picked GC's foreground is `fg`.
+    /// For depth-24 the cached `change_foreground` fast path is used; for
+    /// other depths we always emit a ChangeGC since we don't cache per-
+    /// depth-GC foreground state (depth-32 fills are rare in practice).
+    fn pick_gc_with_foreground(&mut self, host_xid: u32, fg: u32) -> io::Result<u32> {
+        let depth = self
+            .host_drawable_depths
+            .get(&host_xid)
+            .copied()
+            .unwrap_or(24);
+        if depth == 24 {
+            if self.current_foreground != fg {
+                self.change_foreground(fg)?;
+            }
+            return Ok(self.gc_id);
+        }
+        let gc = self.ensure_gc_for_depth(depth, host_xid)?;
+        self.write_gc_foreground(gc, fg)?;
+        Ok(gc)
+    }
+
+    fn write_gc_foreground(&mut self, gc: u32, fg: u32) -> io::Result<()> {
+        self.advance_sequence();
+        let mut out = Vec::with_capacity(16);
+        out.push(56); // ChangeGC opcode
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, gc);
+        write_u32(&mut out, 1 << 2); // GC value-mask: foreground
+        write_u32(&mut out, fg);
+        self.stream.write_all(&out)
+    }
+
+    /// As `pick_gc_with_foreground`, but also pushes background (used by
+    /// the ImageText{8,16} path which needs both colours).
+    fn pick_gc_with_colors(&mut self, host_xid: u32, fg: u32, bg: u32) -> io::Result<u32> {
+        let depth = self
+            .host_drawable_depths
+            .get(&host_xid)
+            .copied()
+            .unwrap_or(24);
+        if depth == 24 {
+            self.change_colors(fg, bg)?;
+            return Ok(self.gc_id);
+        }
+        let gc = self.ensure_gc_for_depth(depth, host_xid)?;
+        self.advance_sequence();
+        let mut out = Vec::with_capacity(20);
+        out.push(56);
+        out.push(0);
+        write_u16(&mut out, 5);
+        write_u32(&mut out, gc);
+        write_u32(&mut out, (1 << 2) | (1 << 3));
+        write_u32(&mut out, fg);
+        write_u32(&mut out, bg);
+        self.stream.write_all(&out)?;
+        Ok(gc)
     }
 
     /// Returns a host GC bound to a drawable of the given depth, creating
@@ -1854,9 +1939,7 @@ impl HostX11Backend {
         if rectangles.is_empty() {
             return Ok(());
         }
-        if self.current_foreground != foreground {
-            self.change_foreground(foreground)?;
-        }
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 3 + u16::try_from(rectangles.len() / 4).map_err(|_| {
             io::Error::new(
@@ -1870,7 +1953,7 @@ impl HostX11Backend {
         out.push(0);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(rectangles);
         self.stream.write_all(&out)?;
         self.stream.flush()
@@ -1903,9 +1986,7 @@ impl HostX11Backend {
         if points.is_empty() {
             return Ok(());
         }
-        if self.current_foreground != foreground {
-            self.change_foreground(foreground)?;
-        }
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 3 + u16::try_from(points.len() / 4).map_err(|_| {
             io::Error::new(
@@ -1919,7 +2000,7 @@ impl HostX11Backend {
         out.push(coordinate_mode);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(points);
         self.stream.write_all(&out)?;
         self.stream.flush()
@@ -1936,7 +2017,7 @@ impl HostX11Backend {
         if body.len() < 12 {
             return Ok(());
         }
-        self.change_colors(foreground, background)?;
+        let gc = self.pick_gc_with_colors(host_xid, foreground, background)?;
 
         let text = &body[12..];
         let length_units = 4 + u16::try_from(text.len() / 4)
@@ -1947,7 +2028,7 @@ impl HostX11Backend {
         out.push(text_len);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(&body[8..12]);
         out.extend_from_slice(text);
         self.stream.write_all(&out)?;
@@ -1965,7 +2046,7 @@ impl HostX11Backend {
         if body.len() < 12 {
             return Ok(());
         }
-        self.change_colors(foreground, background)?;
+        let gc = self.pick_gc_with_colors(host_xid, foreground, background)?;
 
         let text = &body[12..];
         let length_units = 4 + u16::try_from(text.len() / 4)
@@ -1976,7 +2057,7 @@ impl HostX11Backend {
         out.push(text_len);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(&body[8..12]);
         out.extend_from_slice(text);
         self.stream.write_all(&out)?;
@@ -1987,7 +2068,7 @@ impl HostX11Backend {
         if body.len() < 12 {
             return Ok(());
         }
-        self.change_foreground(foreground)?;
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 1 + u16::try_from(body.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
@@ -1997,7 +2078,7 @@ impl HostX11Backend {
         out.push(0);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(&body[8..]);
         self.stream.write_all(&out)?;
         self.stream.flush()
@@ -2007,7 +2088,7 @@ impl HostX11Backend {
         if body.len() < 12 {
             return Ok(());
         }
-        self.change_foreground(foreground)?;
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 1 + u16::try_from(body.len() / 4)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
@@ -2017,7 +2098,7 @@ impl HostX11Backend {
         out.push(0);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(&body[8..]);
         self.stream.write_all(&out)?;
         self.stream.flush()
@@ -2033,9 +2114,7 @@ impl HostX11Backend {
         if points.is_empty() {
             return Ok(());
         }
-        if self.current_foreground != foreground {
-            self.change_foreground(foreground)?;
-        }
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 3 + u16::try_from(points.len() / 4).map_err(|_| {
             io::Error::new(
@@ -2049,7 +2128,7 @@ impl HostX11Backend {
         out.push(coordinate_mode);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(points);
         self.stream.write_all(&out)?;
         self.stream.flush()
@@ -2065,9 +2144,7 @@ impl HostX11Backend {
         if points.len() < 4 {
             return Ok(());
         }
-        if self.current_foreground != foreground {
-            self.change_foreground(foreground)?;
-        }
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         // FillPoly opcode 69: drawable, gc, shape(1), coord-mode(1), pad(2), points...
         // length = 4 (header words) + npoints
@@ -2083,7 +2160,7 @@ impl HostX11Backend {
         out.push(0); // unused
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.push(0); // shape = Complex
         out.push(coord_mode);
         write_u16(&mut out, 0); // pad
@@ -2102,9 +2179,7 @@ impl HostX11Backend {
         if arcs.is_empty() {
             return Ok(());
         }
-        if self.current_foreground != foreground {
-            self.change_foreground(foreground)?;
-        }
+        let gc = self.pick_gc_with_foreground(host_xid, foreground)?;
 
         let length_units = 3 + u16::try_from(arcs.len() / 4).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "too many arcs for one X11 request")
@@ -2115,7 +2190,7 @@ impl HostX11Backend {
         out.push(0);
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_xid);
-        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, gc);
         out.extend_from_slice(arcs);
         self.stream.write_all(&out)?;
         self.stream.flush()

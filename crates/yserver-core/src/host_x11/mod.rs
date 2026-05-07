@@ -217,6 +217,13 @@ pub struct HostX11Backend {
     // alpha masks for RENDER) would BadMatch. We lazily create one GC per
     // depth using the target drawable as the screen-and-depth reference.
     depth_gcs: HashMap<u8, u32>,
+    // Depth of every host drawable we own, populated at create_pixmap and
+    // create_subwindow time. Drain on free_pixmap / destroy_subwindow so
+    // it doesn't grow unbounded across xts cycles. Read by draw helpers
+    // to pick a GC with a matching depth — using the depth-24 `gc_id`
+    // against a depth-32 destination would BadMatch on the host and
+    // silently drop the request (xts bucket 1 root cause).
+    host_drawable_depths: HashMap<u32, u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +369,7 @@ impl HostX11Backend {
             host_event_masks: HashMap::new(),
             xid_map,
             depth_gcs: HashMap::new(),
+            host_drawable_depths: HashMap::new(),
             root_visual_xid: setup.root_visual,
             argb_visual_xid: setup.argb_visual,
             argb_colormap_xid: None,
@@ -1367,6 +1375,7 @@ mod tests {
             host_event_masks: HashMap::new(),
             xid_map: HostXidMap::new(),
             depth_gcs: HashMap::new(),
+            host_drawable_depths: HashMap::new(),
         }
     }
 

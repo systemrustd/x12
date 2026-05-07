@@ -285,15 +285,51 @@ Top buckets (rough estimate of distinct affected tests in parens):
    tests, ~3000 raw `REPORT` lines). xts's `functest()` (in
    `xts5/lib/gc/function.mc`) sets up a source/dest drawable pair,
    fills the dest, runs `XCopyArea(src, dst, ...)`, then walks the
-   dest looking for any non-zero pixel. Our basic round-trip works
-   (`XCreatePixmap → XFillRectangle → XGetImage` returns the right
-   pixel — see `/tmp/draw_test.c`-style probe), but the xts-specific
-   setup-pair pattern leaves the destination black on ynest only.
-   "No pixel set in drawable" / "Nothing was drawn with a gc function
-   of GXcopy" / "Setup error in functest" all chain from the same
-   root. Investigation needed — likely a specific drawable/visual
-   combination we don't pass through correctly. Fixing this single
-   bug would likely lift the largest single chunk of the suite.
+   dest looking for any non-zero pixel; "Nothing was drawn with a gc
+   function of GXcopy" / "No pixel set in drawable" / "Setup error in
+   functest" all cascade from one root.
+   **Investigated 2026-05-07** (branch `xts-bucket1-depth-correct-gc`,
+   commit `b5c6463`) — actual root cause is *not* the drawing path
+   itself. xts's `resetvinf(VI_WIN_PIX)` iterates every advertised
+   visual, including the depth-32 ARGB visual. ynest creates the
+   corresponding depth-32 client window as a depth-32 *sub-window*
+   on the host's depth-24 root. On a non-composited host x.org,
+   `XGetImage` against a depth-32 sub-window alpha-strips
+   fully-transparent pixels — `XSetForeground(W_FG=1) →
+   XFillRectangle → XGetImage` returns 0 (alpha=0 in `0x00000001`
+   shows through to parent) where xts expects 1. The
+   `CHECKPASS(2*nvinf())` accounting demands *both* visuals pass, so
+   the depth-32 iteration alone fails the test. The depth-32 GC
+   fix on this branch is verified-correct (depth-32 *pixmap* fills
+   now deposit pixels — was silently zero before) but doesn't move
+   the xts numbers because xts hits the *window* path. Two ways to
+   close the bucket:
+   (a) **Don't advertise the depth-32 ARGB visual** when running
+       under a non-composited host. Cheap, immediate; breaks future
+       picom-on-ynest support and ARGB cursor pipeline.
+   (b) **Redirect depth-32 client windows through depth-32 backing
+       pixmaps** on the host instead of forwarding as sub-windows;
+       blit pixmap → host-visible drawable on Expose / damage. Days
+       of work; a real fix that preserves ARGB. The depth-32 GC fix
+       in `b5c6463` is half-blocking infrastructure for this — it
+       makes depth-32 pixmap fills / copies actually work.
+
+   **Tried and rejected: COMPOSITE redirect (2026-05-07).** Sending
+   `Composite::RedirectWindow(host_xid, Automatic)` on every depth-32
+   sub-window causes the host server to allocate off-screen storage,
+   but `XGetImage` on the redirected window only ~75 % of the time
+   reads the off-screen pixels with alpha intact — the other 25 % it
+   returns the alpha-flattened on-screen buffer (verified with a C
+   smoke that creates+fills+reads a depth-32 window 20 times under
+   ynest: 15 / 20 returned `0x00000001`, 5 / 20 returned `0x00000000`;
+   xts numbers stayed flat across the whole battery, confirming the
+   non-determinism). Reading via `XCompositeNameWindowPixmap` on the
+   redirected window was strictly worse (0 / 5 returned the right
+   pixel). Moving on: option (a) is the small immediate fix, option
+   (b) is the real one. Branch `xts-bucket1-depth-correct-gc` keeps
+   the depth-correct-GC fix in `b5c6463` (still correct on its own
+   merits) and drops the COMPOSITE-redirect attempt.
+
 2. **Per-opcode value validation** (≈500 tests, ~559 missing
    `BadValue`/`BadMatch` errors). Today
    `request_lengths::invalid_value_mask` checks which BITS of a
