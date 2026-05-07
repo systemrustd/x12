@@ -435,6 +435,286 @@ pub fn invalid_value_mask(opcode: u8, body: &[u8]) -> Option<u32> {
     }
 }
 
+/// Walk a value-list for a request whose header carries a value-mask:
+/// for each bit set in `mask`, locate the corresponding 4-byte entry
+/// at `values_start + n*4` (n = ordinal of this bit among set bits)
+/// and call `validate_bit`. Returns the first `Some(bad_value)` from
+/// the validator, or `None` if every set bit's value passes.
+///
+/// `validate_bit` receives `(bit_index, value_u32)`; bit indexes refer
+/// to the spec-defined CW/GC/KB constants and are 0-based.
+fn validate_value_list<F>(
+    body: &[u8],
+    values_start: usize,
+    mask: u32,
+    validate_bit: F,
+) -> Option<u32>
+where
+    F: Fn(u32, u32) -> Option<u32>,
+{
+    let mut idx = 0usize;
+    for bit in 0..32 {
+        if mask & (1 << bit) == 0 {
+            continue;
+        }
+        let off = values_start + idx * 4;
+        if body.len() < off + 4 {
+            return None;
+        }
+        let v = read_u32_le(&body[off..off + 4]);
+        if let Some(bad) = validate_bit(bit, v) {
+            return Some(bad);
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// CW (CreateWindow / ChangeWindowAttributes) per-bit value validator.
+/// Reference: X11 protocol §11 (Window Attributes).
+fn cw_validate_bit(bit: u32, v: u32) -> Option<u32> {
+    let bad = |x: u32| Some(x);
+    match bit {
+        // bit_gravity ∈ Forget(0)..Static(10)
+        4 if v > 10 => bad(v),
+        // win_gravity ∈ Unmap(0)..Static(10)
+        5 if v > 10 => bad(v),
+        // backing_store ∈ {NotUseful=0, WhenMapped=1, Always=2}
+        6 if v > 2 => bad(v),
+        // override_redirect: BOOL
+        9 if v > 1 => bad(v),
+        // save_under: BOOL
+        10 if v > 1 => bad(v),
+        // event_mask: 25 bits (KeyPress..OwnerGrabButton)
+        11 if v & !0x01ff_ffff != 0 => bad(v),
+        // do_not_propagate_mask: subset of pointer/keyboard events.
+        // Bits: KeyPress(0), KeyRelease(1), ButtonPress(2),
+        // ButtonRelease(3), PointerMotion(6), Button1..5Motion(8..12),
+        // ButtonMotion(13). Mask = 0x0000_3F4F.
+        12 if v & !0x0000_3F4F != 0 => bad(v),
+        _ => None,
+    }
+}
+
+/// GC (CreateGC / ChangeGC) per-bit value validator.
+/// Reference: X11 protocol §7 (Graphics Context).
+fn gc_validate_bit(bit: u32, v: u32) -> Option<u32> {
+    let bad = |x: u32| Some(x);
+    match bit {
+        // function ∈ Clear(0)..Set(15)
+        0 if v > 15 => bad(v),
+        // line_style ∈ {Solid=0, OnOffDash=1, DoubleDash=2}
+        5 if v > 2 => bad(v),
+        // cap_style ∈ {NotLast=0, Butt=1, Round=2, Projecting=3}
+        6 if v > 3 => bad(v),
+        // join_style ∈ {Miter=0, Round=1, Bevel=2}
+        7 if v > 2 => bad(v),
+        // fill_style ∈ {Solid=0, Tiled=1, Stippled=2, OpaqueStippled=3}
+        8 if v > 3 => bad(v),
+        // fill_rule ∈ {EvenOdd=0, Winding=1}
+        9 if v > 1 => bad(v),
+        // subwindow_mode ∈ {ClipByChildren=0, IncludeInferiors=1}
+        15 if v > 1 => bad(v),
+        // graphics_exposures: BOOL
+        16 if v > 1 => bad(v),
+        // arc_mode ∈ {Chord=0, PieSlice=1}
+        22 if v > 1 => bad(v),
+        _ => None,
+    }
+}
+
+/// ConfigureWindow per-bit value validator. Only stack_mode (bit 6)
+/// has a fixed range; the geometry/sibling values are validated in
+/// the dedicated handler.
+fn cfg_validate_bit(bit: u32, v: u32) -> Option<u32> {
+    match bit {
+        // stack_mode ∈ {Above=0, Below=1, TopIf=2, BottomIf=3, Opposite=4}
+        6 if v > 4 => Some(v),
+        _ => None,
+    }
+}
+
+/// ChangeKeyboardControl per-bit value validator. Percent fields use
+/// INT8 wire encoding with the actual value in the low byte; we treat
+/// the entry as i32 and require either -1 or [0,100].
+fn kb_validate_bit(bit: u32, v: u32) -> Option<u32> {
+    let bad = |x: u32| Some(x);
+    // INT8/INT16 fields ride in the low byte/word of the 4-byte entry,
+    // sign-extended. Cast through the smaller type to recover the sign.
+    let as_i8 = (v & 0xff) as i8;
+    let as_i16 = (v & 0xffff) as i16;
+    match bit {
+        // key_click_percent (INT8): -1 (default) or [0,100]
+        0 if !(as_i8 == -1 || (0..=100).contains(&as_i8)) => bad(v),
+        // bell_percent: same range as above
+        1 if !(as_i8 == -1 || (0..=100).contains(&as_i8)) => bad(v),
+        // bell_pitch (INT16, Hz): -1 or non-negative
+        2 if as_i16 < -1 => bad(v),
+        // bell_duration (INT16, ms): -1 or non-negative
+        3 if as_i16 < -1 => bad(v),
+        // led_mode ∈ {Off=0, On=1}
+        5 if v > 1 => bad(v),
+        // auto_repeat_mode ∈ {Off=0, On=1, Default=2}
+        7 if v > 2 => bad(v),
+        _ => None,
+    }
+}
+
+/// Per-opcode value-range validation for fixed-position scalar fields
+/// (Group A) and value-list walking (Group B). Returns `Some(bad_value)`
+/// if any field is out of range; the caller must respond `BadValue`.
+///
+/// Run this *after* `invalid_value_mask` so that mask bits are clean
+/// before we trust value-list payloads.
+#[must_use]
+pub fn invalid_value(opcode: u8, header_data: u8, body: &[u8]) -> Option<u32> {
+    fn bad_bool(b: u8) -> Option<u32> {
+        if b > 1 { Some(u32::from(b)) } else { None }
+    }
+    fn check_byte_range(body: &[u8], off: usize, max_inclusive: u8) -> Option<u32> {
+        if body.len() <= off {
+            return None;
+        }
+        let v = body[off];
+        if v > max_inclusive {
+            Some(u32::from(v))
+        } else {
+            None
+        }
+    }
+    match opcode {
+        // GrabPointer: header.data=owner_events; body[6]=pointer_mode,
+        // body[7]=keyboard_mode (Sync=0, Async=1).
+        26 => bad_bool(header_data)
+            .or_else(|| check_byte_range(body, 6, 1))
+            .or_else(|| check_byte_range(body, 7, 1)),
+        // GrabButton: GrabPointer fields + body[16]=button (0=AnyButton, 1..=5).
+        28 => bad_bool(header_data)
+            .or_else(|| check_byte_range(body, 6, 1))
+            .or_else(|| check_byte_range(body, 7, 1))
+            .or_else(|| check_byte_range(body, 16, 5)),
+        // GrabKeyboard: header.data=owner_events;
+        // body[8]=pointer_mode, body[9]=keyboard_mode.
+        31 => bad_bool(header_data)
+            .or_else(|| check_byte_range(body, 8, 1))
+            .or_else(|| check_byte_range(body, 9, 1)),
+        // GrabKey: header.data=owner_events;
+        // body[7]=pointer_mode, body[8]=keyboard_mode.
+        33 => bad_bool(header_data)
+            .or_else(|| check_byte_range(body, 7, 1))
+            .or_else(|| check_byte_range(body, 8, 1)),
+        // CopyPlane: body[24..28]=bit_plane, must have exactly one bit set.
+        63 => {
+            if body.len() < 28 {
+                return None;
+            }
+            let plane = read_u32_le(&body[24..28]);
+            if plane.count_ones() == 1 {
+                None
+            } else {
+                Some(plane)
+            }
+        }
+        // CreateWindow: mask u32 @ body[24..28], values @ body[28].
+        1 if body.len() >= 28 => {
+            let mask = read_u32_le(&body[24..28]);
+            validate_value_list(body, 28, mask, cw_validate_bit)
+        }
+        // ChangeWindowAttributes: mask u32 @ body[4..8], values @ body[8].
+        2 if body.len() >= 8 => {
+            let mask = read_u32_le(&body[4..8]);
+            validate_value_list(body, 8, mask, cw_validate_bit)
+        }
+        // CreateGC: mask u32 @ body[8..12], values @ body[12].
+        55 if body.len() >= 12 => {
+            let mask = read_u32_le(&body[8..12]);
+            validate_value_list(body, 12, mask, gc_validate_bit)
+        }
+        // ChangeGC: mask u32 @ body[4..8], values @ body[8].
+        56 if body.len() >= 8 => {
+            let mask = read_u32_le(&body[4..8]);
+            validate_value_list(body, 8, mask, gc_validate_bit)
+        }
+        // ChangeKeyboardControl: mask u32 @ body[0..4], values @ body[4].
+        102 if body.len() >= 4 => {
+            let mask = read_u32_le(&body[0..4]);
+            validate_value_list(body, 4, mask, kb_validate_bit)
+        }
+        // ChangePointerControl: fixed body. No mask. Conditional checks:
+        // do_accel/do_threshold are bool; if do_accel is set, accel
+        // numerator/denominator must satisfy ≥-1 and denominator ≠ 0;
+        // if do_threshold, threshold must be ≥-1.
+        105 if body.len() >= 8 => {
+            let num = i16::from_le_bytes([body[0], body[1]]);
+            let den = i16::from_le_bytes([body[2], body[3]]);
+            let thr = i16::from_le_bytes([body[4], body[5]]);
+            let do_accel = body[6];
+            let do_thr = body[7];
+            if do_accel > 1 {
+                return Some(u32::from(do_accel));
+            }
+            if do_thr > 1 {
+                return Some(u32::from(do_thr));
+            }
+            if do_accel == 1 {
+                if num < -1 {
+                    return Some(num as u32);
+                }
+                if den < -1 {
+                    return Some(den as u32);
+                }
+                if den == 0 {
+                    return Some(0);
+                }
+            }
+            if do_thr == 1 && thr < -1 {
+                return Some(thr as u32);
+            }
+            None
+        }
+        // ChangeSaveSet: header.data = mode ∈ {Insert=0, Delete=1}.
+        6 if header_data > 1 => Some(u32::from(header_data)),
+        // ConfigureWindow: mask u16 @ body[4..6], values @ body[8].
+        // Only stack_mode (bit 6) has a fixed range we enforce here.
+        12 if body.len() >= 6 => {
+            let mask = u32::from(read_u16_le(&body[4..6]));
+            validate_value_list(body, 8, mask, cfg_validate_bit)
+        }
+        // CirculateWindow: header.data = direction ∈ {RaiseLowest=0, LowerHighest=1}.
+        13 if header_data > 1 => Some(u32::from(header_data)),
+        // SendEvent: header.data = propagate (BOOL).
+        25 if header_data > 1 => Some(u32::from(header_data)),
+        // AllowEvents: header.data = mode (CARD8) ∈ {0..=7}
+        // (AsyncPointer..ReplayKeyboard, AsyncBoth, SyncBoth).
+        35 if header_data > 7 => Some(u32::from(header_data)),
+        // CreateColormap: header.data = alloc ∈ {None=0, All=1}.
+        78 if header_data > 1 => Some(u32::from(header_data)),
+        // Bell: header.data = percent (INT8) ∈ [-100, 100].
+        104 => {
+            let p = header_data as i8;
+            if (-100..=100).contains(&p) {
+                None
+            } else {
+                Some(u32::from(header_data))
+            }
+        }
+        // SetScreenSaver: body[4] = prefer_blanking, body[5] = allow_exposures
+        // both ∈ {No=0, Yes=1, Default=2}.
+        107 if body.len() >= 6 => {
+            if body[4] > 2 {
+                return Some(u32::from(body[4]));
+            }
+            if body[5] > 2 {
+                return Some(u32::from(body[5]));
+            }
+            None
+        }
+        // ForceScreenSaver: header.data = mode ∈ {Reset=0, Activate=1}.
+        115 if header_data > 1 => Some(u32::from(header_data)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod exact_tests {
     use super::*;
@@ -534,5 +814,364 @@ mod tests {
     #[test]
     fn send_event_is_fixed_11() {
         assert_eq!(core_request_length(25), Some(LenSpec::Fixed(11)));
+    }
+}
+
+#[cfg(test)]
+mod value_range_tests {
+    use super::invalid_value;
+
+    fn body_with(byte_at: &[(usize, u8)]) -> Vec<u8> {
+        let max_off = byte_at.iter().map(|(o, _)| *o).max().unwrap_or(0);
+        let mut v = vec![0u8; max_off + 1];
+        for (o, b) in byte_at {
+            v[*o] = *b;
+        }
+        v
+    }
+
+    #[test]
+    fn grab_pointer_owner_events_bool() {
+        // header.data=2 → bad bool.
+        let body = vec![0u8; 20];
+        assert_eq!(invalid_value(26, 2, &body), Some(2));
+        assert_eq!(invalid_value(26, 1, &body), None);
+        assert_eq!(invalid_value(26, 0, &body), None);
+    }
+
+    #[test]
+    fn grab_pointer_modes() {
+        // body[6]=pointer_mode, body[7]=keyboard_mode (Sync=0, Async=1).
+        let body = body_with(&[(6, 2)]);
+        assert_eq!(invalid_value(26, 0, &body), Some(2));
+        let body = body_with(&[(7, 5)]);
+        assert_eq!(invalid_value(26, 0, &body), Some(5));
+        let body = body_with(&[(6, 1), (7, 0)]);
+        assert_eq!(invalid_value(26, 0, &body), None);
+    }
+
+    #[test]
+    fn grab_button_button_range() {
+        // body[16]=button: 0=AnyButton, 1..=5 valid; 6 invalid.
+        let body = body_with(&[(16, 6)]);
+        assert_eq!(invalid_value(28, 0, &body), Some(6));
+        let body = body_with(&[(16, 5)]);
+        assert_eq!(invalid_value(28, 0, &body), None);
+        let body = body_with(&[(16, 0)]);
+        assert_eq!(invalid_value(28, 0, &body), None);
+    }
+
+    #[test]
+    fn grab_keyboard_modes() {
+        // body[8]=pointer_mode, body[9]=keyboard_mode.
+        let body = body_with(&[(8, 3)]);
+        assert_eq!(invalid_value(31, 0, &body), Some(3));
+        let body = body_with(&[(9, 7)]);
+        assert_eq!(invalid_value(31, 0, &body), Some(7));
+    }
+
+    #[test]
+    fn grab_key_modes() {
+        // body[7]=pointer_mode, body[8]=keyboard_mode.
+        let body = body_with(&[(7, 4)]);
+        assert_eq!(invalid_value(33, 0, &body), Some(4));
+        let body = body_with(&[(8, 9)]);
+        assert_eq!(invalid_value(33, 0, &body), Some(9));
+        let body = vec![0u8; 12];
+        assert_eq!(invalid_value(33, 0, &body), None);
+    }
+
+    #[test]
+    fn copy_plane_bit_plane_must_be_single_bit() {
+        // body[24..28] = bit_plane (LE u32). 0x10 = single bit → ok.
+        let mut body = vec![0u8; 28];
+        body[24] = 0x10;
+        assert_eq!(invalid_value(63, 0, &body), None);
+        // Zero: zero bits → bad.
+        let body = vec![0u8; 28];
+        assert_eq!(invalid_value(63, 0, &body), Some(0));
+        // Two bits set → bad.
+        let mut body = vec![0u8; 28];
+        body[24] = 0b0000_0011;
+        assert_eq!(invalid_value(63, 0, &body), Some(3));
+    }
+
+    #[test]
+    fn unmodelled_opcode_returns_none() {
+        // GetGeometry (14) — not a value-bearing op.
+        assert_eq!(invalid_value(14, 0, &[0u8; 4]), None);
+    }
+
+    // ── Group B: value-list walking ───────────────────────────────
+
+    fn cw_body(mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut b = vec![0u8; 8 + values.len() * 4];
+        b[4..8].copy_from_slice(&mask.to_le_bytes());
+        for (i, v) in values.iter().enumerate() {
+            b[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn cwa_bit_gravity_out_of_range() {
+        // CWBitGravity = bit 4. Static = 10 (max). 11 → BadValue.
+        let body = cw_body(1 << 4, &[11]);
+        assert_eq!(invalid_value(2, 0, &body), Some(11));
+        let body = cw_body(1 << 4, &[10]);
+        assert_eq!(invalid_value(2, 0, &body), None);
+    }
+
+    #[test]
+    fn cwa_backing_store_out_of_range() {
+        // CWBackingStore = bit 6. Allowed: 0,1,2.
+        let body = cw_body(1 << 6, &[3]);
+        assert_eq!(invalid_value(2, 0, &body), Some(3));
+        let body = cw_body(1 << 6, &[2]);
+        assert_eq!(invalid_value(2, 0, &body), None);
+    }
+
+    #[test]
+    fn cwa_override_redirect_bool() {
+        // CWOverrideRedirect = bit 9.
+        let body = cw_body(1 << 9, &[2]);
+        assert_eq!(invalid_value(2, 0, &body), Some(2));
+        let body = cw_body(1 << 9, &[1]);
+        assert_eq!(invalid_value(2, 0, &body), None);
+    }
+
+    #[test]
+    fn cwa_event_mask_unused_bits() {
+        // CWEventMask = bit 11. Bit 25+ is reserved.
+        let body = cw_body(1 << 11, &[1u32 << 25]);
+        assert_eq!(invalid_value(2, 0, &body), Some(1 << 25));
+        let body = cw_body(1 << 11, &[0x01ff_ffff]);
+        assert_eq!(invalid_value(2, 0, &body), None);
+    }
+
+    #[test]
+    fn cwa_multiple_values_first_bad_wins() {
+        // Set bits 4 (BitGravity=ok) and 6 (BackingStore=bad). Walking
+        // in bit order, the bad value at bit 6 should be reported.
+        let body = cw_body((1 << 4) | (1 << 6), &[5, 7]);
+        assert_eq!(invalid_value(2, 0, &body), Some(7));
+    }
+
+    #[test]
+    fn create_window_value_list_validated() {
+        // CreateWindow: mask at body[24..28], values at body[28].
+        let mut body = vec![0u8; 28 + 4];
+        let mask = 1u32 << 4; // BitGravity
+        body[24..28].copy_from_slice(&mask.to_le_bytes());
+        body[28..32].copy_from_slice(&15u32.to_le_bytes());
+        assert_eq!(invalid_value(1, 0, &body), Some(15));
+    }
+
+    fn gc_body(mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut b = vec![0u8; 8 + values.len() * 4];
+        b[4..8].copy_from_slice(&mask.to_le_bytes());
+        for (i, v) in values.iter().enumerate() {
+            b[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn gc_function_out_of_range() {
+        // GCFunction = bit 0. Set(=15) is max.
+        let body = gc_body(1 << 0, &[16]);
+        assert_eq!(invalid_value(56, 0, &body), Some(16));
+        let body = gc_body(1 << 0, &[15]);
+        assert_eq!(invalid_value(56, 0, &body), None);
+    }
+
+    #[test]
+    fn gc_line_cap_join_styles() {
+        // line_style (bit 5) ∈ {0,1,2}
+        let body = gc_body(1 << 5, &[3]);
+        assert_eq!(invalid_value(56, 0, &body), Some(3));
+        // cap_style (bit 6) ∈ {0,1,2,3}
+        let body = gc_body(1 << 6, &[4]);
+        assert_eq!(invalid_value(56, 0, &body), Some(4));
+        // join_style (bit 7) ∈ {0,1,2}
+        let body = gc_body(1 << 7, &[3]);
+        assert_eq!(invalid_value(56, 0, &body), Some(3));
+        // valid combos pass.
+        let body = gc_body((1 << 5) | (1 << 6) | (1 << 7), &[2, 3, 2]);
+        assert_eq!(invalid_value(56, 0, &body), None);
+    }
+
+    #[test]
+    fn gc_subwindow_mode_and_arc_mode_bool() {
+        let body = gc_body(1 << 15, &[2]);
+        assert_eq!(invalid_value(56, 0, &body), Some(2));
+        let body = gc_body(1 << 22, &[2]);
+        assert_eq!(invalid_value(56, 0, &body), Some(2));
+    }
+
+    #[test]
+    fn create_gc_value_list_validated() {
+        // CreateGC: mask at body[8..12], values at body[12].
+        let mut body = vec![0u8; 12 + 4];
+        let mask = 1u32 << 5; // LineStyle
+        body[8..12].copy_from_slice(&mask.to_le_bytes());
+        body[12..16].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(invalid_value(55, 0, &body), Some(5));
+    }
+
+    fn kb_body(mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut b = vec![0u8; 4 + values.len() * 4];
+        b[0..4].copy_from_slice(&mask.to_le_bytes());
+        for (i, v) in values.iter().enumerate() {
+            b[4 + i * 4..8 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn kb_percent_range() {
+        // key_click_percent (bit 0) ∈ {-1, 0..=100}
+        let body = kb_body(1 << 0, &[101u32]);
+        assert_eq!(invalid_value(102, 0, &body), Some(101));
+        // -1 (sign-extended) acceptable; encode as u32::from((-1i8) as u8).
+        let body = kb_body(1 << 0, &[u32::from((-1i8) as u8)]);
+        assert_eq!(invalid_value(102, 0, &body), None);
+        // 100 (max) acceptable.
+        let body = kb_body(1 << 0, &[100]);
+        assert_eq!(invalid_value(102, 0, &body), None);
+        // -2 invalid.
+        let body = kb_body(1 << 0, &[u32::from((-2i8) as u8)]);
+        assert!(invalid_value(102, 0, &body).is_some());
+    }
+
+    #[test]
+    fn kb_auto_repeat_mode() {
+        // bit 7: ∈ {0,1,2}
+        let body = kb_body(1 << 7, &[3]);
+        assert_eq!(invalid_value(102, 0, &body), Some(3));
+        let body = kb_body(1 << 7, &[2]);
+        assert_eq!(invalid_value(102, 0, &body), None);
+    }
+
+    #[test]
+    fn pointer_control_denominator_zero() {
+        // do_accel=1, denom=0 → BadValue 0.
+        let mut body = vec![0u8; 8];
+        body[2..4].copy_from_slice(&0i16.to_le_bytes()); // denom
+        body[6] = 1; // do_accel
+        assert_eq!(invalid_value(105, 0, &body), Some(0));
+    }
+
+    #[test]
+    fn pointer_control_bool_validation() {
+        let mut body = vec![0u8; 8];
+        body[6] = 2; // do_accel out of range
+        assert_eq!(invalid_value(105, 0, &body), Some(2));
+        let mut body = vec![0u8; 8];
+        body[7] = 5; // do_threshold out of range
+        assert_eq!(invalid_value(105, 0, &body), Some(5));
+    }
+
+    #[test]
+    fn pointer_control_threshold_minus_two_bad() {
+        let mut body = vec![0u8; 8];
+        body[4..6].copy_from_slice(&(-2i16).to_le_bytes());
+        body[7] = 1; // do_threshold
+        // -2 cast to u32 via `as u32` sign-extends → 0xFFFFFFFE.
+        assert_eq!(invalid_value(105, 0, &body), Some((-2i32) as u32));
+    }
+
+    #[test]
+    fn pointer_control_default_bytes_pass() {
+        // All zeros: do_accel=0, do_threshold=0 → no checks.
+        let body = vec![0u8; 8];
+        assert_eq!(invalid_value(105, 0, &body), None);
+    }
+
+    // ── Group C: header.data scalars + ConfigureWindow stack_mode ──
+
+    #[test]
+    fn change_save_set_mode() {
+        // ChangeSaveSet (6): header.data ∈ {0,1}.
+        assert_eq!(invalid_value(6, 2, &[]), Some(2));
+        assert_eq!(invalid_value(6, 0, &[]), None);
+        assert_eq!(invalid_value(6, 1, &[]), None);
+    }
+
+    #[test]
+    fn configure_window_stack_mode() {
+        // ConfigureWindow (12): u16 mask at body[4..6], values at body[8].
+        // bit 6 = stack_mode ∈ {0..=4}.
+        let mut body = vec![0u8; 8 + 4];
+        body[4..6].copy_from_slice(&(1u16 << 6).to_le_bytes());
+        body[8..12].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(invalid_value(12, 0, &body), Some(5));
+        body[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(invalid_value(12, 0, &body), None);
+    }
+
+    #[test]
+    fn circulate_window_direction() {
+        // CirculateWindow (13): header.data ∈ {0,1}.
+        assert_eq!(invalid_value(13, 2, &[]), Some(2));
+        assert_eq!(invalid_value(13, 1, &[]), None);
+    }
+
+    #[test]
+    fn send_event_propagate() {
+        // SendEvent (25): header.data is BOOL.
+        assert_eq!(invalid_value(25, 2, &[0u8; 40]), Some(2));
+        assert_eq!(invalid_value(25, 1, &[0u8; 40]), None);
+    }
+
+    #[test]
+    fn allow_events_mode() {
+        // AllowEvents (35): header.data ∈ {0..=7}.
+        assert_eq!(invalid_value(35, 8, &[]), Some(8));
+        assert_eq!(invalid_value(35, 7, &[]), None);
+    }
+
+    #[test]
+    fn create_colormap_alloc() {
+        // CreateColormap (78): header.data ∈ {0,1}.
+        assert_eq!(invalid_value(78, 2, &[]), Some(2));
+        assert_eq!(invalid_value(78, 0, &[]), None);
+    }
+
+    #[test]
+    fn bell_percent_range() {
+        // Bell (104): header.data is INT8 ∈ [-100, 100].
+        assert_eq!(invalid_value(104, 50, &[]), None);
+        assert_eq!(invalid_value(104, 100, &[]), None);
+        assert_eq!(invalid_value(104, 101, &[]), Some(101));
+        // -100 (signed) encoded as 156 unsigned.
+        assert_eq!(invalid_value(104, (-100i8) as u8, &[]), None);
+        // -101 invalid.
+        assert_eq!(
+            invalid_value(104, (-101i8) as u8, &[]),
+            Some(u32::from((-101i8) as u8))
+        );
+    }
+
+    #[test]
+    fn set_screen_saver_blanking_and_exposures() {
+        // SetScreenSaver (107): body[4]=prefer_blanking, body[5]=allow_exposures.
+        let mut body = vec![0u8; 8];
+        body[4] = 3;
+        assert_eq!(invalid_value(107, 0, &body), Some(3));
+        let mut body = vec![0u8; 8];
+        body[5] = 5;
+        assert_eq!(invalid_value(107, 0, &body), Some(5));
+        let mut body = vec![0u8; 8];
+        body[4] = 2;
+        body[5] = 2;
+        assert_eq!(invalid_value(107, 0, &body), None);
+    }
+
+    #[test]
+    fn force_screen_saver_mode() {
+        // ForceScreenSaver (115): header.data ∈ {0,1}.
+        assert_eq!(invalid_value(115, 2, &[]), Some(2));
+        assert_eq!(invalid_value(115, 0, &[]), None);
     }
 }

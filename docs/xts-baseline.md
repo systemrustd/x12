@@ -193,6 +193,46 @@ from the resources table — so every subsequent client got
 
 Total xts coverage on master:
 Xproto 337 + Xlib3 110 + Xlib4–17 889 + ShapeExt 11 = **1347 PASS**
+
+### 2026-05-07 (post-bucket2: per-opcode value validation, branch `xts-bucket2-value-validation`)
+
+Three commits added per-opcode value-range validation in
+`request_lengths::invalid_value`, called right after the existing
+value-mask gate. Group A: fixed-position scalar fields (Grab*
+modes/owner_events bool, CopyPlane single-bit). Group B: CW/GC
+value-list walking, ChangeKeyboardControl per-bit validators, and
+ChangePointerControl conditional checks. Group C: residual
+header.data scalar enums and bools (ChangeSaveSet, ConfigureWindow
+stack_mode, CirculateWindow, SendEvent propagate, AllowEvents,
+CreateColormap, Bell, SetScreenSaver, ForceScreenSaver).
+
+| scenario | PASS | FAIL | UNRES | UNTST | UNSUP | Δ vs pre-bucket2 |
+|----------|-----:|-----:|------:|------:|------:|:------------------|
+| Xlib4    |   83 |  203 |     5 |    17 |    11 | 61 → 83 (+22) |
+| Xlib5    |   51 |   26 |     0 |     5 |     2 | 48 → 51 (+3) |
+| Xlib6    |    4 |   17 |     0 |    29 |     0 | flat |
+| Xlib7    |   82 |   30 |     2 |    13 |    45 | 81 → 82 (+1) |
+| Xlib8    |   46 |   73 |    14 |    22 |    10 | 19 → 46 (+27) |
+| Xlib9    |  219 |  606 |   388 |    33 |    23 | 218 → 219 (+1) |
+| Xlib10   |   14 |   39 |     5 |    36 |     1 | 10 → 14 (+4) |
+| Xlib11   |   22 |  100 |     2 |     4 |    24 | flat |
+| Xlib12   |   81 |   14 |     4 |    13 |     2 | flat (Xlib12 still hits 240s timeout in case 7 `XEventsQueued` purpose 2; pre-existing, ~45 s on either side) |
+| Xlib13   |   62 |  158 |    34 |     9 |     3 | 49 → 62 (+13) |
+| Xlib14   |   19 |   34 |     0 |     5 |     0 | flat |
+| Xlib15   |  122 |    4 |     0 |    33 |     0 | flat |
+| Xlib16   |   82 |    0 |     0 |    22 |     1 | flat |
+| Xlib17   |   85 |   12 |     9 |    19 |     0 | flat (case 53 XWriteBitmapFile flake oscillates between NORESULT and 1 PASS / 4 FAIL across runs) |
+| **sum**  |**972** | 1316 |   463 |   260 |   122 | **889 → 972 (+83)** |
+
+No FAIL regressions. Each of A/B/C was verified with its own
+`tools/xts-xlib-sweep.sh :99` run.
+
+Total xts coverage on master + bucket2 branch:
+Xproto 337 + Xlib3 110 + Xlib4–17 972 + ShapeExt 11 = **1430 PASS**.
+
+Bucket (2) closed; the next quick-win is bucket (3) — CW field
+persistence (the CW value bits we now validate are still discarded
+on read-back via `GetWindowAttributes`).
 (plus XI + XIproto suites complete cleanly with all UNTST due to
 0-device advertisement).
 

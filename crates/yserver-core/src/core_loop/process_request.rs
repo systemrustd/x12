@@ -155,6 +155,18 @@ pub fn process_request(
             header.opcode,
         );
     }
+    // Per-opcode scalar value-range validation (Group A: fixed-position
+    // fields like grab modes, owner_events bool, CopyPlane single-bit).
+    if let Some(bad) = x11::request_lengths::invalid_value(header.opcode, header.data, body) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            bad,
+            header.opcode,
+        );
+    }
     match header.opcode {
         // ── log-only no-ops (no reply, no state mutation) ──
         36 => log_void(client_id, sequence, "GrabServer"),
