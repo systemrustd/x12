@@ -4557,15 +4557,19 @@ fn handle_get_geometry(
         .resources
         .window(drawable)
         .map(window_geometry)
-        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry))
-        .unwrap_or_else(|| {
-            window_geometry(
-                state
-                    .resources
-                    .window(ROOT_WINDOW)
-                    .expect("root window exists"),
-            )
-        });
+        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry));
+    let Some(geometry) = geometry else {
+        // Spec: BadDrawable on unknown drawable. xts probes
+        // destroyed/stale IDs and expects the protocol error.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_DRAWABLE,
+            drawable.0,
+            14,
+        );
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -4583,11 +4587,9 @@ fn handle_query_tree(
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryTree", client_id.0, sequence.0);
     let window = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
-    let window_state = state
-        .resources
-        .window(window)
-        .or_else(|| state.resources.window(ROOT_WINDOW))
-        .expect("root window exists");
+    let Some(window_state) = state.resources.window(window) else {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, window.0, 15);
+    };
     let parent = window_state.parent;
     let children = window_state.children.clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -5154,11 +5156,13 @@ fn handle_get_window_attributes(
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetWindowAttributes", client_id.0, sequence.0);
     let id = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
-    let target = if state.resources.window(id).is_some() {
-        id
-    } else {
-        ROOT_WINDOW
-    };
+    // Spec: BadWindow on unknown window ID. Don't silently fall back to
+    // ROOT_WINDOW — xts probes stale/destroyed XIDs and expects the
+    // protocol error.
+    if state.resources.window(id).is_none() {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, id.0, 3);
+    }
+    let target = id;
     let your_event_mask = state
         .clients
         .get(&client_id.0)
