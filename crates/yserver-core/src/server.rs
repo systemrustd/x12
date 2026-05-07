@@ -1773,9 +1773,7 @@ mod tests {
                     border_width: 0,
                     class: 1,
                     visual: crate::resources::ROOT_VISUAL,
-                    background_pixel: None,
-                    event_mask: None,
-                    override_redirect: None,
+                    ..Default::default()
                 },
             );
             s.resources.create_window(
@@ -1791,9 +1789,7 @@ mod tests {
                     border_width: 0,
                     class: 1,
                     visual: crate::resources::ROOT_VISUAL,
-                    background_pixel: None,
-                    event_mask: None,
-                    override_redirect: None,
+                    ..Default::default()
                 },
             );
             let _ = s.resources.map_window(grab_window);
@@ -2028,9 +2024,7 @@ mod tests {
                     border_width: 0,
                     class: 1,
                     visual: crate::resources::ROOT_VISUAL,
-                    background_pixel: None,
-                    event_mask: None,
-                    override_redirect: None,
+                    ..Default::default()
                 },
             );
             let _ = s.resources.map_window(ResourceId(0x0010_0002));
@@ -2301,9 +2295,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: crate::resources::ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let _ = state.resources.map_window(child);
@@ -2353,9 +2345,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: crate::resources::ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let _ = state.resources.map_window(child);
@@ -2399,9 +2389,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: crate::resources::ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let _ = state.resources.map_window(child);
@@ -2450,9 +2438,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: crate::resources::ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let _ = state.resources.map_window(child);

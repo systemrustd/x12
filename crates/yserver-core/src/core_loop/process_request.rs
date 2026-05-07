@@ -37,7 +37,7 @@ use crate::{
         pointer_fanout::pointer_event_fanout_to_state,
     },
     properties,
-    resources::{MapState, Pixmap, ROOT_COLORMAP, ROOT_WINDOW, Window},
+    resources::{MapState, Pixmap, ROOT_WINDOW, Window},
     server::ServerState,
 };
 
@@ -5302,27 +5302,22 @@ fn window_attributes(
     your_event_mask: u32,
 ) -> x11::WindowAttributes {
     let window = window.expect("root window exists");
-    // X11 protocol defaults for unset attributes — see "Window Attributes"
-    // in the core spec. The Window struct doesn't yet store
-    // bit_gravity / backing-store / backing-planes / backing-pixel /
-    // save-under / colormap / do-not-propagate-mask, so we surface the
-    // spec defaults here. ChangeWindowAttributes accepts the value-
-    // mask but doesn't persist these fields yet — separate task.
     x11::WindowAttributes {
         visual: window.visual,
         class: window.class.protocol_value(),
-        bit_gravity: 0, // ForgetGravity (default)
-        win_gravity: 1, // NorthWestGravity (default)
-        backing_planes: u32::MAX,
-        backing_pixel: 0,
-        save_under: false,
+        bit_gravity: window.bit_gravity,
+        win_gravity: window.win_gravity,
+        backing_store: window.backing_store,
+        backing_planes: window.backing_planes,
+        backing_pixel: window.backing_pixel,
+        save_under: window.save_under,
         map_is_installed: true,
         map_state: window.map_state.protocol_value(),
         override_redirect: window.override_redirect,
-        colormap: ROOT_COLORMAP,
+        colormap: window.colormap,
         all_event_masks,
         your_event_mask,
-        do_not_propagate_mask: 0,
+        do_not_propagate_mask: window.do_not_propagate_mask,
     }
 }
 

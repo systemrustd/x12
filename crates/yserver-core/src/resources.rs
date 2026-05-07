@@ -196,6 +196,14 @@ impl ResourceTable {
                 background_pixmap_host_xid: None,
                 border_pixmap_host_xid: None,
                 override_redirect: false,
+                bit_gravity: 0,
+                win_gravity: 1,
+                backing_store: 0,
+                backing_planes: u32::MAX,
+                backing_pixel: 0,
+                save_under: false,
+                do_not_propagate_mask: 0,
+                colormap: ROOT_COLORMAP,
                 cursor: None,
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
@@ -376,6 +384,19 @@ impl ResourceTable {
             background_pixmap_host_xid: None,
             border_pixmap_host_xid: None,
             override_redirect: request.override_redirect.unwrap_or(false),
+            bit_gravity: request.bit_gravity.unwrap_or(0),
+            win_gravity: request.win_gravity.unwrap_or(1),
+            backing_store: request.backing_store.unwrap_or(0),
+            backing_planes: request.backing_planes.unwrap_or(u32::MAX),
+            backing_pixel: request.backing_pixel.unwrap_or(0),
+            save_under: request.save_under.unwrap_or(false),
+            do_not_propagate_mask: request.do_not_propagate_mask.unwrap_or(0),
+            // CopyFromParent (CW value 0 → Some(None)) or unset → inherit
+            // parent's colormap; explicit XID → take it.
+            colormap: match request.colormap {
+                Some(Some(id)) => id,
+                Some(None) | None => parent.map_or(ROOT_COLORMAP, |p| p.colormap),
+            },
             cursor: None,
             owner,
             properties: HashMap::new(),
@@ -460,6 +481,24 @@ impl ResourceTable {
             } else {
                 None
             };
+        // Resolve `CWColormap = CopyFromParent` (XID 0) against the parent
+        // colormap *before* the borrow below.
+        let resolved_colormap: Option<ResourceId> = match request.colormap {
+            Some(Some(id)) => Some(id),
+            Some(None) => {
+                let parent_id = self
+                    .windows
+                    .get(&request.window.0)
+                    .map(|w| w.parent)
+                    .unwrap_or(ROOT_WINDOW);
+                Some(
+                    self.windows
+                        .get(&parent_id.0)
+                        .map_or(ROOT_COLORMAP, |p| p.colormap),
+                )
+            }
+            None => None,
+        };
 
         if let Some(window) = self.windows.get_mut(&request.window.0) {
             if let Some(bg_pixmap) = request.background_pixmap {
@@ -478,6 +517,33 @@ impl ResourceTable {
             }
             if let Some(background_pixel) = request.background_pixel {
                 window.background_pixel = background_pixel;
+            }
+            if let Some(v) = request.bit_gravity {
+                window.bit_gravity = v;
+            }
+            if let Some(v) = request.win_gravity {
+                window.win_gravity = v;
+            }
+            if let Some(v) = request.backing_store {
+                window.backing_store = v;
+            }
+            if let Some(v) = request.backing_planes {
+                window.backing_planes = v;
+            }
+            if let Some(v) = request.backing_pixel {
+                window.backing_pixel = v;
+            }
+            if let Some(v) = request.override_redirect {
+                window.override_redirect = v;
+            }
+            if let Some(v) = request.save_under {
+                window.save_under = v;
+            }
+            if let Some(v) = request.do_not_propagate_mask {
+                window.do_not_propagate_mask = v;
+            }
+            if let Some(cm) = resolved_colormap {
+                window.colormap = cm;
             }
             if let Some(cursor) = request.cursor {
                 window.cursor = Some(cursor);
@@ -1944,6 +2010,14 @@ pub struct Window {
     /// `background_pixmap_host_xid`, retained for the same reason.
     pub border_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
     pub override_redirect: bool,
+    pub bit_gravity: u8,
+    pub win_gravity: u8,
+    pub backing_store: u8,
+    pub backing_planes: u32,
+    pub backing_pixel: u32,
+    pub save_under: bool,
+    pub do_not_propagate_mask: u16,
+    pub colormap: ResourceId,
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
@@ -1973,6 +2047,14 @@ impl Window {
             background_pixmap_host_xid: None,
             border_pixmap_host_xid: None,
             override_redirect: false,
+            bit_gravity: 0,
+            win_gravity: 1,
+            backing_store: 0,
+            backing_planes: u32::MAX,
+            backing_pixel: 0,
+            save_under: false,
+            do_not_propagate_mask: 0,
+            colormap: ROOT_COLORMAP,
             cursor: None,
             owner: SERVER_OWNER,
             properties: HashMap::new(),
@@ -2169,7 +2251,7 @@ pub struct Cursor {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+    use yserver_protocol::x11::{ChangeWindowAttributesRequest, ClientId, CreateWindowRequest};
 
     fn make_window(table: &mut ResourceTable, id: u32) {
         table.create_window(
@@ -2185,9 +2267,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
     }
@@ -2212,9 +2292,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
     }
@@ -2260,6 +2338,60 @@ mod tests {
                 .map(|g| g.host_glyphset_xid.as_raw()),
             Some(0xabc)
         );
+    }
+
+    #[test]
+    fn cw_fields_persist_through_create_and_change() {
+        // Bucket 3: validate that the new Window struct fields round-trip
+        // through CreateWindow + ChangeWindowAttributes + GetWindowAttributes.
+        let mut table = ResourceTable::new();
+        let win = ResourceId(0xa00);
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: win,
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: ROOT_VISUAL,
+                bit_gravity: Some(7),
+                win_gravity: Some(8),
+                backing_store: Some(2),
+                backing_planes: Some(0xdead_beef),
+                backing_pixel: Some(0x1234_5678),
+                save_under: Some(true),
+                do_not_propagate_mask: Some(0x0040), // PointerMotion
+                ..Default::default()
+            },
+        );
+        let w = table.window(win).expect("window");
+        assert_eq!(w.bit_gravity, 7);
+        assert_eq!(w.win_gravity, 8);
+        assert_eq!(w.backing_store, 2);
+        assert_eq!(w.backing_planes, 0xdead_beef);
+        assert_eq!(w.backing_pixel, 0x1234_5678);
+        assert!(w.save_under);
+        assert_eq!(w.do_not_propagate_mask, 0x0040);
+        // Default colormap inherits from parent (root → ROOT_COLORMAP).
+        assert_eq!(w.colormap, ROOT_COLORMAP);
+
+        // Mutate via ChangeWindowAttributes.
+        let _ = table.change_window_attributes(ChangeWindowAttributesRequest {
+            window: win,
+            bit_gravity: Some(3),
+            backing_store: Some(1),
+            save_under: Some(false),
+            do_not_propagate_mask: Some(0x0004), // ButtonPress
+            ..Default::default()
+        });
+        let w = table.window(win).expect("window");
+        assert_eq!(w.bit_gravity, 3);
+        assert_eq!(w.win_gravity, 8); // untouched
+        assert_eq!(w.backing_store, 1);
+        assert!(!w.save_under);
+        assert_eq!(w.do_not_propagate_mask, 0x0004);
     }
 
     #[test]
@@ -3141,9 +3273,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ARGB_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         t.create_window(
@@ -3159,9 +3289,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ResourceId(0), // CopyFromParent
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let child = t.window(ResourceId(0x300)).expect("child created");
@@ -3185,9 +3313,7 @@ mod tests {
                 border_width: 1,
                 class: 1,
                 visual: ResourceId(0),
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -3212,9 +3338,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ResourceId(0),
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         let w = t.window(ResourceId(0x200)).expect("created");

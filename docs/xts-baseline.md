@@ -230,9 +230,39 @@ No FAIL regressions. Each of A/B/C was verified with its own
 Total xts coverage on master + bucket2 branch:
 Xproto 337 + Xlib3 110 + Xlib4–17 972 + ShapeExt 11 = **1430 PASS**.
 
-Bucket (2) closed; the next quick-win is bucket (3) — CW field
-persistence (the CW value bits we now validate are still discarded
-on read-back via `GetWindowAttributes`).
+### 2026-05-07 (post-bucket3: CW field persistence, branch `xts-bucket3-cw-persistence`)
+
+Extends the `Window` struct + `CreateWindowRequest` /
+`ChangeWindowAttributesRequest` parsers to persist all CW value-list
+bits the spec requires `GetWindowAttributes` to surface:
+`bit_gravity`, `win_gravity`, `backing_store`, `backing_planes`,
+`backing_pixel`, `save_under`, `colormap`, `do_not_propagate_mask`.
+The `backing_store` byte is also wired into the `data` slot of the
+GetWindowAttributes reply (was previously hard-coded zero). The
+hard-coded defaults in `process_request::window_attributes` are
+gone — now read from the Window struct.
+
+| scenario | PASS | FAIL | UNRES | UNTST | UNSUP | Δ vs bucket 2 |
+|----------|-----:|-----:|------:|------:|------:|:--------------|
+| Xlib4    |   89 |  197 |     5 |    17 |    11 | 83 → 89 (+6) |
+| Xlib5    |   52 |   25 |     0 |     5 |     2 | 51 → 52 (+1) |
+| Xlib7    |   82 |   31 |     1 |    13 |    45 | flat (PASS unchanged; one Xlib7 case shifted UNRES → FAIL) |
+| Xlib11   |   23 |   99 |     2 |     4 |    24 | 22 → 23 (+1) |
+| (others) | flat | — | — | — | — | unchanged |
+| **sum**  |**980** | 1309 |   462 |   260 |   122 | **972 → 980 (+8)** |
+
+Smaller delta than bucket 2 because most XChangeWindowAttributes test
+purposes also exercise other features we don't implement yet —
+ParentRelative bg-pixmap inheritance, ColormapNotify event generation,
+border-tile-origin re-rendering, pixel-correctness in tiled fills —
+so persistence alone unblocks only the purposes that *only* tested
+the round-trip. The persistence itself works (verified by
+`cw_fields_persist_through_create_and_change` unit test); other
+buckets unblock the rest.
+
+Total xts coverage on master + bucket3 branch:
+Xproto 337 + Xlib3 110 + Xlib4–17 980 + ShapeExt 11 = **1438 PASS**.
+
 (plus XI + XIproto suites complete cleanly with all UNTST due to
 0-device advertisement).
 
@@ -317,11 +347,20 @@ Top buckets (rough estimate of distinct affected tests in parens):
    change and time-out waiting for an `Expose` covering the
    newly-uncovered area. Multi-day — needs a real region tracker;
    probably the largest scope item remaining.
-
-Quick-win order (by tests-per-hour-of-work, declining):
-**(2) value validation** → **(3) CW persistence** → **(5) more
-depths** → **(1) drawing-setup investigation** → **(6) expose
-tracking**.
+7. **Xlib12 per-connection setup/teardown latency** (single
+   scenario, currently truncated by the 240 s sweep budget at
+   case 7 / `XEventsQueued` purpose 2). The Xlib12 cases
+   (XPeekEvent, XEventsQueued, XIfEvent, XMaskEvent, XNextEvent,
+   XPutBackEvent, …) implement "verify that blocking did not
+   occur" by forking a child watchdog per call, which tears down
+   and re-opens the X connection. We pay the connection-setup
+   cost ~70 times in the scenario; if our setup or close-path
+   round-trip is even ~500 ms slower than host x.org, the wall
+   time blows past 240 s and the rest of the scenario gets cut
+   off. The cases that *do* run all PASS — this is throughput,
+   not correctness. Profile a single XOpenDisplay/XCloseDisplay
+   round-trip against host x.org to find the offender; likely a
+   pending-event drain or final flush we hold for too long.
 
 Bucket (1) is the biggest payoff if it turns out to be a single
 small bug, but the investigation is open-ended. Buckets (2) and

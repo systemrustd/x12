@@ -163,7 +163,7 @@ pub struct CrossingEvent {
     pub mode: u8,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CreateWindowRequest {
     pub depth: u8,
     pub window: ResourceId,
@@ -176,16 +176,35 @@ pub struct CreateWindowRequest {
     pub class: u16,
     pub visual: ResourceId,
     pub background_pixel: Option<u32>,
-    pub event_mask: Option<u32>,
+    pub bit_gravity: Option<u8>,
+    pub win_gravity: Option<u8>,
+    pub backing_store: Option<u8>,
+    pub backing_planes: Option<u32>,
+    pub backing_pixel: Option<u32>,
     pub override_redirect: Option<bool>,
+    pub save_under: Option<bool>,
+    pub event_mask: Option<u32>,
+    pub do_not_propagate_mask: Option<u16>,
+    /// `Some(None)` = explicit `CopyFromParent` (XID 0); `Some(Some(_))` =
+    /// concrete colormap; `None` = bit not set.
+    pub colormap: Option<Option<ResourceId>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ChangeWindowAttributesRequest {
     pub window: ResourceId,
     pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
+    pub bit_gravity: Option<u8>,
+    pub win_gravity: Option<u8>,
+    pub backing_store: Option<u8>,
+    pub backing_planes: Option<u32>,
+    pub backing_pixel: Option<u32>,
+    pub override_redirect: Option<bool>,
+    pub save_under: Option<bool>,
     pub event_mask: Option<u32>,
+    pub do_not_propagate_mask: Option<u16>,
+    pub colormap: Option<Option<ResourceId>>,
     pub cursor: Option<ResourceId>,
 }
 
@@ -484,6 +503,7 @@ pub struct WindowAttributes {
     pub class: u16,
     pub bit_gravity: u8,
     pub win_gravity: u8,
+    pub backing_store: u8,
     pub backing_planes: u32,
     pub backing_pixel: u32,
     pub save_under: bool,
@@ -812,8 +832,18 @@ pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowReque
         class: read_u16_le(body.get(18..20)?),
         visual: ResourceId(read_u32_le(body.get(20..24)?)),
         background_pixel: values.value(1),
+        bit_gravity: values.value(4).map(|v| v as u8),
+        win_gravity: values.value(5).map(|v| v as u8),
+        backing_store: values.value(6).map(|v| v as u8),
+        backing_planes: values.value(7),
+        backing_pixel: values.value(8),
+        override_redirect: values.value(9).map(|v| v != 0),
+        save_under: values.value(10).map(|v| v != 0),
         event_mask: values.value(11),
-        override_redirect: values.value(9).map(|value| value != 0),
+        do_not_propagate_mask: values.value(12).map(|v| v as u16),
+        colormap: values
+            .value(13)
+            .map(|v| if v == 0 { None } else { Some(ResourceId(v)) }),
     })
 }
 
@@ -824,7 +854,18 @@ pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttri
         window: ResourceId(read_u32_le(body.get(0..4)?)),
         background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
+        bit_gravity: values.value(4).map(|v| v as u8),
+        win_gravity: values.value(5).map(|v| v as u8),
+        backing_store: values.value(6).map(|v| v as u8),
+        backing_planes: values.value(7),
+        backing_pixel: values.value(8),
+        override_redirect: values.value(9).map(|v| v != 0),
+        save_under: values.value(10).map(|v| v != 0),
         event_mask: values.value(11),
+        do_not_propagate_mask: values.value(12).map(|v| v as u16),
+        colormap: values
+            .value(13)
+            .map(|v| if v == 0 { None } else { Some(ResourceId(v)) }),
         cursor: values.value(14).map(ResourceId),
     })
 }
@@ -1515,7 +1556,9 @@ pub fn write_get_window_attributes_reply(
     sequence: SequenceNumber,
     attributes: WindowAttributes,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(byte_order, sequence, 0, 3);
+    // GetWindowAttributes reply: the `data` byte after the response code
+    // is `backing_store` per X protocol §10.
+    let mut reply = fixed_reply(byte_order, sequence, attributes.backing_store, 3);
     write_u32(byte_order, &mut reply, attributes.visual.0);
     write_u16(byte_order, &mut reply, attributes.class);
     reply.push(attributes.bit_gravity);

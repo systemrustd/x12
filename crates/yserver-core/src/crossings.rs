@@ -230,9 +230,7 @@ mod tests {
                 border_width: 0,
                 class: 1,
                 visual: ROOT_VISUAL,
-                background_pixel: None,
-                event_mask: None,
-                override_redirect: None,
+                ..Default::default()
             },
         );
         rid
