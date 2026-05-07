@@ -653,6 +653,7 @@ fn handle_render_request(
                         client: client_id,
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
+                        kind: crate::resources::PictureKind::Drawable,
                     },
                 );
             }
@@ -720,6 +721,17 @@ fn handle_render_request(
             let Some(req) = x11::render_composite_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            if dst_picture_is_sourceless(state, req.dst) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.dst.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
@@ -745,7 +757,10 @@ fn handle_render_request(
                 );
             }
         }
-        10 => {
+        10..=13 => {
+            // Trapezoids (10), Triangles (11), TriStrip (12), TriFan (13).
+            // All four share the same fixed prefix; the variable body
+            // layout differs and is handled by the backend.
             if body.len() < 20 {
                 return Ok(RequestOutcome::Handled);
             }
@@ -755,7 +770,18 @@ fn handle_render_request(
             let ynest_mask_format = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
             let src_x = i16::from_le_bytes([body[16], body[17]]);
             let src_y = i16::from_le_bytes([body[18], body[19]]);
-            let traps = &body[20..];
+            let primitives = &body[20..];
+            if dst_picture_is_sourceless(state, dst) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    dst.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let host_src = state
                 .resources
                 .picture(src)
@@ -772,18 +798,34 @@ fn handle_render_request(
             if let (Some(host_src), Some(host_dst), Some(host_mask_fmt)) =
                 (host_src, host_dst, host_mask_format)
             {
-                let _ = backend.render_trapezoids(
-                    origin,
-                    op,
-                    host_src,
-                    host_dst,
-                    host_mask_fmt,
-                    src_x,
-                    src_y,
-                    traps,
-                    0,
-                    0,
-                );
+                if minor == 10 {
+                    let _ = backend.render_trapezoids(
+                        origin,
+                        op,
+                        host_src,
+                        host_dst,
+                        host_mask_fmt,
+                        src_x,
+                        src_y,
+                        primitives,
+                        0,
+                        0,
+                    );
+                } else {
+                    let _ = backend.render_triangles_op(
+                        origin,
+                        minor,
+                        op,
+                        host_src,
+                        host_dst,
+                        host_mask_fmt,
+                        src_x,
+                        src_y,
+                        primitives,
+                        0,
+                        0,
+                    );
+                }
             }
         }
         17 => {
@@ -847,6 +889,17 @@ fn handle_render_request(
             let Some(req) = x11::render_composite_glyphs_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            if dst_picture_is_sourceless(state, req.dst) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.dst.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
@@ -877,6 +930,17 @@ fn handle_render_request(
             let Some(req) = x11::render_fill_rectangles_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            if dst_picture_is_sourceless(state, req.dst) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.dst.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let host_dst = state
                 .resources
                 .picture(req.dst)
@@ -960,6 +1024,7 @@ fn handle_render_request(
                         client: client_id,
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
+                        kind: crate::resources::PictureKind::Sourceless,
                     },
                 );
             }
@@ -980,6 +1045,7 @@ fn handle_render_request(
                         client: client_id,
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
+                        kind: crate::resources::PictureKind::Sourceless,
                     },
                 );
             }
@@ -1000,6 +1066,7 @@ fn handle_render_request(
                         client: client_id,
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
+                        kind: crate::resources::PictureKind::Sourceless,
                     },
                 );
             }
@@ -4132,14 +4199,37 @@ fn emit_x11_error(
     bad_value: u32,
     major_opcode: u8,
 ) -> io::Result<RequestOutcome> {
+    emit_x11_error_with_minor(state, client_id, sequence, code, bad_value, 0, major_opcode)
+}
+
+/// True if the picture exists and was created from a SolidFill /
+/// LinearGradient / RadialGradient / ConicalGradient — i.e. has no
+/// underlying drawable, so cannot be a Composite/Trapezoids/Triangles/
+/// FillRectangles/CompositeGlyphs destination. Unknown picture ids
+/// return false (caller falls through to existing missing-id handling).
+fn dst_picture_is_sourceless(state: &ServerState, dst: ResourceId) -> bool {
+    state
+        .resources
+        .picture(dst)
+        .is_some_and(|p| matches!(p.kind, crate::resources::PictureKind::Sourceless))
+}
+
+fn emit_x11_error_with_minor(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    code: u8,
+    bad_value: u32,
+    minor_opcode: u16,
+    major_opcode: u8,
+) -> io::Result<RequestOutcome> {
     debug!(
-        "emit_x11_error: client={} seq={} code={} bad_value=0x{:x} major_opcode={}",
-        client_id.0, sequence.0, code, bad_value, major_opcode
+        "emit_x11_error: client={} seq={} code={} bad_value=0x{:x} minor={} major_opcode={}",
+        client_id.0, sequence.0, code, bad_value, minor_opcode, major_opcode
     );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    let _byte_order = client.byte_order;
     let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     x11::write_error(
@@ -4148,7 +4238,7 @@ fn emit_x11_error(
         sequence,
         code,
         bad_value,
-        0,
+        minor_opcode,
         major_opcode,
     )?;
     Ok(write_to_client(client, client_id, &buf))
@@ -4588,7 +4678,14 @@ fn handle_query_tree(
     debug!("client {} #{} QueryTree", client_id.0, sequence.0);
     let window = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
     let Some(window_state) = state.resources.window(window) else {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, window.0, 15);
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            window.0,
+            15,
+        );
     };
     let parent = window_state.parent;
     let children = window_state.children.clone();
@@ -5202,8 +5299,8 @@ fn window_attributes(
     x11::WindowAttributes {
         visual: window.visual,
         class: window.class.protocol_value(),
-        bit_gravity: 0,        // ForgetGravity (default)
-        win_gravity: 1,        // NorthWestGravity (default)
+        bit_gravity: 0, // ForgetGravity (default)
+        win_gravity: 1, // NorthWestGravity (default)
         backing_planes: u32::MAX,
         backing_pixel: 0,
         save_under: false,

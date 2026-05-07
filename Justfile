@@ -193,9 +193,11 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
             wait $yserver_pid'
 
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
-# `tests` is a comma-separated list; default excludes the slow repeat /
-# cacomposite tests. Set timeout=N to extend the per-test cap.
-rendercheck-ynest display="99" geometry="1024x768" timeout="90" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,gradients,triangles,bug7366":
+# `tests` is a comma-separated list. Default budget is 600s/test —
+# `composite` / `cacomposite` / `repeat` are intrinsically slow
+# (massive operator × format × source enumeration). Set timeout=N to
+# override.
+rendercheck-ynest display="99" geometry="1024x768" timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin ynest
     DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > /tmp/ynest-rc.log 2>&1 & \
         pid=$!; \

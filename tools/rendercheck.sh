@@ -13,18 +13,27 @@
 #   tools/rendercheck.sh :99
 #   tools/rendercheck.sh :99 60 fill,dcoords,blend
 #
-# The default test list excludes `repeat` (which runs every operator
-# against every format and routinely takes >120s even on the host) and
-# `cacomposite` (component-alpha composite — same shape, slow). Pass an
-# explicit TESTS list to include them.
+# Default per-test timeout is 600s: rendercheck 1.6 has ~3-4× more
+# composite cases than 1.5 and the `composite` / `cacomposite` tests
+# walk operator × format × source enumerations that take several
+# minutes wall-time. Override with the second arg if you want a
+# tighter budget.
 set -euo pipefail
 
 DISPLAY_ARG=${1:?DISPLAY argument required (e.g. :99)}
-TIMEOUT=${2:-90}
-TESTS=${3:-fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,gradients,triangles,bug7366}
+TIMEOUT=${2:-600}
+TESTS=${3:-fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366}
 
-if ! command -v rendercheck >/dev/null 2>&1; then
-    echo "error: rendercheck not on PATH (pacman -S rendercheck)" >&2
+# rendercheck 1.5 (current AUR / Arch package) has a bug in the
+# triangles test that mis-grades Disjoint/Conjoint operator cases —
+# both Xwayland and ynest "fail" the same 144 cases under 1.5 even
+# though the actual rendering is correct. Upstream commit 3d7add9
+# fixes the test. To run against an upstream build, set
+# `RENDERCHECK_BIN=/path/to/rendercheck-1.6`.
+RENDERCHECK="${RENDERCHECK_BIN:-rendercheck}"
+
+if ! command -v "$RENDERCHECK" >/dev/null 2>&1 && ! [ -x "$RENDERCHECK" ]; then
+    echo "error: rendercheck not on PATH (pacman -S rendercheck) and \$RENDERCHECK_BIN not set" >&2
     exit 1
 fi
 
@@ -41,7 +50,7 @@ printf "%-14s %8s %8s %s\n" "----" "----" "-----" "------"
 IFS=',' read -ra test_list <<< "$TESTS"
 for t in "${test_list[@]}"; do
     out=$(DISPLAY="$DISPLAY_ARG" timeout "$TIMEOUT" \
-        rendercheck -t "$t" --minimalrendering 2>&1) || rc=$?
+        "$RENDERCHECK" -t "$t" --minimalrendering 2>&1) || rc=$?
     rc=${rc:-0}
     summary=$(echo "$out" | grep -E "tests passed of [0-9]+" | tail -1 || true)
     if [[ -z "$summary" ]]; then

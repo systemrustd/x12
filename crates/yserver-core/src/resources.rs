@@ -132,11 +132,25 @@ pub enum ReparentWindowError {
     BadMatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PictureKind {
+    /// Backed by a real drawable (window or pixmap) — valid as a
+    /// Composite/Trapezoids/Triangles/FillRectangles/CompositeGlyphs
+    /// destination.
+    Drawable,
+    /// Backed by a 1x1 SolidFill / LinearGradient / RadialGradient /
+    /// ConicalGradient. Has no underlying drawable, so cannot be
+    /// used as a destination — RENDER opcodes that try must raise
+    /// `BadDrawable`.
+    Sourceless,
+}
+
 #[derive(Debug)]
 pub struct PictureState {
     pub client: ClientId,
     pub host_picture_xid: crate::backend::PictureHandle,
     pub host_owned_pixmap: Option<crate::backend::PixmapHandle>,
+    pub kind: PictureKind,
 }
 
 #[derive(Debug)]

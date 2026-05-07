@@ -111,39 +111,55 @@ screen-saver state, error-code edge cases, etc.
 
 ## rendercheck (RENDER smoke suite)
 
-`rendercheck` (Arch package: `rendercheck`) is a separate suite for
-the X RENDER extension. Wired up via `tools/rendercheck.sh` and the
-`just rendercheck-ynest` recipe.
+`rendercheck` (Arch package: `rendercheck`, AUR has 1.6 prebuilt) is
+a separate suite for the X RENDER extension. Wired up via
+`tools/rendercheck.sh` and the `just rendercheck-ynest` recipe.
+`tools/rendercheck.sh` honours `RENDERCHECK_BIN=/path/to/rendercheck`
+to point at a non-system build.
 
-Default test list excludes `repeat` and `cacomposite` — both run every
-operator against every format and exceed the per-test cap on ynest
-because some operator paths hang (suspected: ynest's RENDER-via-host
-forwarding doesn't terminate on a few op/format combinations, needs
-a proper investigation).
+**Use rendercheck ≥ 1.6.** 1.5 (still in some distros) has a bug in
+the triangles test that mis-grades the Disjoint/Conjoint operator
+expectations — both Xwayland and ynest "fail" the same 144 triangle
+cases under 1.5 even though the rendered output is correct. Upstream
+commit `3d7add9 triangles: Fix tests for conjoint and disjoint ops`
+fixes the test.
 
-Baseline 2026-05-07 (xts-followups merged to master, ynest on :99,
-60s per-test timeout):
+### Baseline 2026-05-07 (rendercheck 1.6, ynest on :99, 600 s per test)
 
-| test       | pass | total | status |
-|------------|-----:|------:|--------|
-| fill       |   30 |    30 | OK     |
-| dcoords    |    2 |     2 | OK     |
-| scoords    |    1 |     1 | OK     |
-| mcoords    |    1 |     1 | OK     |
-| tscoords   |    2 |     2 | OK     |
-| tmcoords   |    2 |     2 | OK     |
-| blend      |    4 |     4 | OK     |
-| triangles  |  174 |   456 | FAIL — 282 ops produce dst=white where xts expects dst=black; suspect `Composite` operator dispatch on triangle paths |
-| bug7366    |    1 |     1 | OK     |
-| composite  |    — |     — | TIMEOUT @ 120s — investigate |
-| gradients  |    — |     — | TIMEOUT @ 120s — investigate |
-| repeat     |    — |     — | TIMEOUT (excluded by default) |
-| cacomposite|    — |     — | TIMEOUT (excluded by default) |
-| **total**  |  217 |   499 | (excludes timeouts) |
+| test        | pass | total | status |
+|-------------|-----:|------:|--------|
+| fill        |   48 |    48 | OK |
+| dcoords     |    2 |     2 | OK |
+| scoords     |    1 |     1 | OK |
+| mcoords     |    1 |     1 | OK |
+| tscoords    |    2 |     2 | OK |
+| tmcoords    |    2 |     2 | OK |
+| blend       |    4 |     4 | OK |
+| composite   |    4 |     4 | OK |
+| cacomposite |    4 |     4 | OK |
+| gradients   | 3649 |  3649 | OK |
+| repeat      |  304 |   304 | OK |
+| triangles   |  456 |   456 | OK |
+| bug7366     |    1 |     1 | OK |
+| **total**   | 4478 |  4478 | **100 % PASS** |
 
-Host (`:0`, X.Org Foundation): every test passes — e.g. `fill`
-160/160 vs ynest 30/30 because we advertise 3 picture formats and
-the host advertises 15.
+### How we got here, in this branch
+
+1. `d0c63ec docs+tools(rendercheck)` — bumped per-test budget so
+   `composite` / `gradients` / `repeat` / `cacomposite` actually
+   complete (they were timing out at 90–120 s, not hung). Re-baselined
+   at 2809/3092 (90.8 %) with 1.5.
+2. `96cc0aa feat(render): forward Triangles/TriStrip/TriFan` — added
+   dispatch for RENDER minors 11–13 (mirror of 10 Trapezoids), so
+   triangle paint operations actually reach the host. Got the suite
+   to 4469/4470 under 1.6 and to host-parity at 95.3 % under 1.5
+   (with the residual being the 1.5 test bug).
+3. Final commit (this one) — `PictureKind::Sourceless` flag on
+   `PictureState`, set on `CreateSolidFill`/`CreateLinearGradient`/
+   `CreateRadialGradient`. Composite/Trapezoids/Triangles/
+   FillRectangles/CompositeGlyphs now synthesise `BadDrawable` when
+   the dst picture is sourceless, fixing
+   `gradients::render_to_gradient_test`. 1.6 budget bumped to 600 s.
 
 ## Xlib4 – Xlib17 baselines
 

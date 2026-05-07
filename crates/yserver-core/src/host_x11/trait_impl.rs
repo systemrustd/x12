@@ -894,6 +894,37 @@ impl Backend for HostX11Backend {
         })
     }
 
+    fn render_triangles_op(
+        &mut self,
+        origin: Option<OriginContext>,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        host_mask_format: u32,
+        src_x: i16,
+        src_y: i16,
+        primitives: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        self.with_active_origin(origin, |this| {
+            HostX11Backend::render_triangles_op(
+                this,
+                minor,
+                op,
+                host_src,
+                host_dst,
+                host_mask_format,
+                src_x,
+                src_y,
+                primitives,
+                x_off,
+                y_off,
+            )
+        })
+    }
+
     fn render_create_solid_fill(
         &mut self,
         origin: Option<OriginContext>,

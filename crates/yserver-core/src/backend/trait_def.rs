@@ -609,6 +609,28 @@ pub trait Backend: Send {
         y_off: i16,
     ) -> io::Result<()>;
 
+    /// RENDER `Triangles` (minor 11), `TriStrip` (12), `TriFan` (13).
+    /// `primitives` is the wire body after the fixed prefix:
+    /// 24-byte `XTriangle`s for minor 11, packed `XPointFixed`s
+    /// (8 bytes each) for 12 and 13.
+    #[allow(clippy::too_many_arguments)]
+    fn render_triangles_op(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _minor: u8,
+        _op: u8,
+        _host_src: u32,
+        _host_dst: u32,
+        _host_mask_format: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _primitives: &[u8],
+        _x_off: i16,
+        _y_off: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn render_create_solid_fill(
         &mut self,
         origin: Option<OriginContext>,

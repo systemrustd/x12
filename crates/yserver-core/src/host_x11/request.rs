@@ -656,6 +656,88 @@ impl HostX11Backend {
         self.stream.flush()
     }
 
+    /// Forward RENDER::Triangles (minor=11), TriStrip (12), TriFan (13)
+    /// verbatim to the host. Per-point FIXED-point coords have
+    /// `x_off`/`y_off` (in pixels) added so child-window pictures land
+    /// at the right offset on the shared host top-level. For top-level
+    /// pictures the offsets are 0 and this is a straight passthrough.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_triangles_op(
+        &mut self,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        host_mask_format: u32,
+        src_x: i16,
+        src_y: i16,
+        primitives: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+
+        // Per-element size: 24 bytes for Triangles (3 XPointFixed),
+        // 8 bytes for TriStrip / TriFan (single XPointFixed).
+        let elem_size = match minor {
+            11 => 24,
+            12 | 13 => 8,
+            _ => return Ok(()),
+        };
+        if !primitives.len().is_multiple_of(elem_size) {
+            return Ok(());
+        }
+
+        // header(4) + op_pad(4) + src(4) + dst(4) + mask_format(4)
+        // + src_xy(4) = 24 bytes = 6 units.
+        let length_units = 6u16 + ((primitives.len() / 4) as u16);
+        self.advance_sequence();
+        let mut out = Vec::with_capacity(24 + primitives.len());
+        out.push(opcode);
+        out.push(minor);
+        write_u16(&mut out, length_units);
+        out.push(op);
+        out.extend_from_slice(&[0, 0, 0]); // pad
+        write_u32(&mut out, host_src);
+        write_u32(&mut out, host_dst);
+        write_u32(&mut out, host_mask_format);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+
+        // FIXED is i32 with 16 bits of fraction; integer offset is
+        // shifted left by 16 before adding.
+        let dx = (i32::from(x_off)) << 16;
+        let dy = (i32::from(y_off)) << 16;
+        // X offsets within each element (every PointFixed starts on an
+        // 8-byte boundary; X is the first i32, Y the second).
+        let (x_offs, y_offs): (&[usize], &[usize]) = match minor {
+            11 => (&[0, 8, 16], &[4, 12, 20]),
+            12 | 13 => (&[0], &[4]),
+            _ => unreachable!(),
+        };
+        for elem in primitives.chunks_exact(elem_size) {
+            let mut e = vec![0u8; elem_size];
+            e.copy_from_slice(elem);
+            let patch = |buf: &mut [u8], off: usize, delta: i32| {
+                let v = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                    .wrapping_add(delta);
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            for &xo in x_offs {
+                patch(&mut e, xo, dx);
+            }
+            for &yo in y_offs {
+                patch(&mut e, yo, dy);
+            }
+            out.extend_from_slice(&e);
+        }
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     pub fn render_query_version(&mut self) -> io::Result<(u32, u32)> {
         let Some(r) = self.render.as_ref() else {
             return Ok((0, 0));
@@ -2259,9 +2341,7 @@ mod tests {
         // and 13 (`GetIndicatorMap`) was load-bearing for `xset q`,
         // GTK keyboard layout queries, and any libxkbcommon
         // configuration probe.
-        for minor in [
-            0, 4, 6, 8, 10, 12, 13, 15, 16, 17, 19, 21, 22, 23, 24, 101,
-        ] {
+        for minor in [0, 4, 6, 8, 10, 12, 13, 15, 16, 17, 19, 21, 22, 23, 24, 101] {
             assert!(
                 xkb_minor_has_reply(minor),
                 "minor {minor} must wait for reply"
