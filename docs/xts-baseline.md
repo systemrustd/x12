@@ -144,3 +144,73 @@ Baseline 2026-05-07 (xts-followups merged to master, ynest on :99,
 Host (`:0`, X.Org Foundation): every test passes — e.g. `fill`
 160/160 vs ynest 30/30 because we advertise 3 picture formats and
 the host advertises 15.
+
+## Xlib4 – Xlib17 baselines (2026-05-07)
+
+First scoped run of the remaining Xlib scenarios after the panic
+fixes (`b1e0716` BadWindow/BadDrawable on stale IDs) and the
+attribute-defaults fix (`29cf445` bit_gravity = ForgetGravity,
+backing_pixel = 0). Per-scenario overall timeout 240s; no per-test
+timeout. Cases that hang ynest steal the remaining wall-clock budget
+for that scenario, so partial results are common.
+
+| scenario | cases-ran | tests | PASS | FAIL | UNRES | UNTST | UNSUP | note |
+|----------|----------:|------:|-----:|-----:|------:|------:|------:|------|
+| Xlib4    |        10 |   175 |   34 |  120 |     1 |     8 |     4 | XDestroyWindow case 6 (Expose-after-destroy) hangs the rest |
+| Xlib5    |         1 |    13 |    0 |    0 |     0 |     0 |     0 | first case hangs |
+| Xlib6    |         5 |    42 |    4 |   10 |     0 |    25 |     0 | |
+| Xlib7    |         6 |    45 |    6 |    9 |     0 |     3 |    14 | |
+| Xlib8    |         1 |    25 |    0 |    0 |     0 |     0 |     0 | first case hangs |
+| Xlib9    |         1 |    11 |    0 |    0 |     0 |     0 |     0 | first case hangs |
+| Xlib10   |         4 |    16 |    0 |    4 |     0 |     4 |     0 | |
+| Xlib11   |         1 |    12 |    0 |    0 |     0 |     0 |     0 | first case hangs |
+| Xlib12   |        21 |   106 |   59 |    7 |     0 |     8 |     2 | mostly client-side event-queue helpers |
+| Xlib13   |         1 |    29 |    0 |    0 |     0 |     0 |     0 | first case hangs |
+| Xlib14   |         5 |     5 |    1 |    3 |     0 |     0 |     0 | |
+| Xlib15   |         6 |    11 |    5 |    0 |     0 |     5 |     0 | |
+| Xlib16   |        30 |   105 |   82 |    0 |     0 |    22 |     1 | Xrm — almost entirely client-side string mgmt |
+| Xlib17   |         2 |     2 |    0 |    0 |     1 |     0 |     0 | |
+| **sum**  |           |       |  191 |  153 |     2 |    75 |    21 | |
+
+Across the full xts battery measured so far on this branch:
+Xproto 337 + Xlib3 110 + Xlib4–17 191 + ShapeExt 11 = **649 PASS**
+(plus XI + XIproto suites complete cleanly with all UNTST due to
+0-device advertisement).
+
+### Top blockers driving FAIL/hang
+
+These show up across many Xlib scenarios — fixing one likely lifts
+several test cases at once:
+
+1. **Hangs in `exposecheck()`.** Several scenarios stall on the
+   first case because the test issues a structural change
+   (Destroy/Resize/Map) and waits for an `Expose` that ynest doesn't
+   generate. Need a proper expose-region tracker that fires on
+   uncovered areas after Destroy/Resize/Map/Configure.
+2. **`ChangeWindowAttributes` doesn't persist most fields.** The
+   `Window` struct stores background-pixel / background-pixmap /
+   override-redirect / cursor; CW value-mask bits for bit-gravity,
+   win-gravity, backing-store, backing-planes, backing-pixel,
+   save-under, colormap, do-not-propagate-mask are accepted but
+   discarded. Tests that set then read fail with "got default,
+   expected <set value>".
+3. **Missing protocol errors on bad inputs.** `did not generate
+   BadAccess / BadColor / BadCursor / BadMatch / BadPixmap /
+   BadValue / BadWindow` is a recurring `REPORT:` line. Many
+   handlers blindly succeed. Adding spec-required error returns
+   would lift FAIL → PASS without functional changes.
+4. **Pixel-mismatch in image / fill / area tests.** "A total of
+   N out of 9000 pixels were bad" appears across the geometry
+   tests — likely backing-pixel default propagation, plus Expose
+   mishandling, plus border-pixel defaults.
+
+### How to reproduce
+
+```sh
+just xts-ynest scenario=Xlib4   # any Xlib<N>
+```
+
+For a multi-scenario sweep, the throwaway `tools/` script
+`tools/xts-xlib-sweep.sh` (used to generate this baseline) drives each
+scenario with a 240s overall budget
+
