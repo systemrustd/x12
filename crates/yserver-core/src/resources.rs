@@ -789,7 +789,7 @@ impl ResourceTable {
                 .is_some_and(|p| p.map_state == MapState::Viewable),
             None => false,
         };
-        if let Some(window) = self.windows.get_mut(&id.0) {
+        let was_unmapped = if let Some(window) = self.windows.get_mut(&id.0) {
             let was_unmapped = window.map_state == MapState::Unmapped;
             window.map_state = if parent_viewable {
                 MapState::Viewable
@@ -798,7 +798,48 @@ impl ResourceTable {
             };
             was_unmapped
         } else {
-            false
+            return false;
+        };
+        // If we just transitioned to Viewable, promote any descendant
+        // that was Unviewable (i.e. mapped before its ancestor became
+        // viewable — e.g. xclock's child window after the WM frame
+        // reparent: child was MapSubwindows'd while parent was unmapped,
+        // staying Unviewable; mapping the parent must propagate down or
+        // Expose-fanout silently skips it because of the Viewable filter).
+        if parent_viewable {
+            self.promote_unviewable_descendants(id);
+        }
+        was_unmapped
+    }
+
+    fn promote_unviewable_descendants(&mut self, root: ResourceId) {
+        let children: Vec<ResourceId> = self
+            .windows
+            .get(&root.0)
+            .map(|w| w.children.clone())
+            .unwrap_or_default();
+        for child in children {
+            let promoted = if let Some(w) = self.windows.get_mut(&child.0) {
+                if w.map_state == MapState::Unviewable {
+                    w.map_state = MapState::Viewable;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            // Only recurse into descendants whose own state allows
+            // visibility (Viewable now, or already Viewable). Stopping
+            // at Unmapped descendants matches X11's "first Unmapped
+            // ancestor halts the cascade" semantics.
+            let should_recurse = self
+                .windows
+                .get(&child.0)
+                .is_some_and(|w| w.map_state == MapState::Viewable);
+            if promoted || should_recurse {
+                self.promote_unviewable_descendants(child);
+            }
         }
     }
 

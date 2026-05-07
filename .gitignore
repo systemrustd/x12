@@ -24,3 +24,4 @@ opencode.json
 .DS_Store
 Thumbs.db
 .claude/
+.codex-review-*

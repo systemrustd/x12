@@ -646,6 +646,8 @@ pub struct KmsBackend {
     current_function: GcFunction,
     current_foreground: u32,
     current_background: u32,
+    current_fill: FillState,
+    current_clip: ClipState,
 
     // RENDER picture tracking
     pictures: HashMap<u32, PictureState>,
@@ -1149,6 +1151,8 @@ impl KmsBackend {
             current_function: GcFunction::Copy,
             current_foreground: 0,
             current_background: 0x00ff_ffff,
+            current_fill: FillState::Solid,
+            current_clip: ClipState::None,
             pictures: HashMap::new(),
             picture_rescued_images: HashMap::new(),
             glyphsets: HashMap::new(),
@@ -1299,6 +1303,185 @@ impl KmsBackend {
             Some(w.image.borrow().0.as_ptr())
         } else {
             self.pixmaps.get(&host_xid).map(|p| p.image.0.as_ptr())
+        }
+    }
+
+    /// Decode the wire-packed clip rectangle list (`Vec<u8>` of i16 x, i16
+    /// y, u16 w, u16 h tuples) into `Rectangle16`s in dst-coords (i.e. with
+    /// the GC clip-origin already added). Returns `None` if the current GC
+    /// clip is `None` or `Pixmap` (latter not yet enforced).
+    fn current_clip_rects_in_dst_space(&self) -> Option<Vec<Rectangle16>> {
+        let ClipState::Rectangles { origin, rects } = &self.current_clip else {
+            return None;
+        };
+        let bytes = &rects.rectangles;
+        let mut out = Vec::with_capacity(bytes.len() / 8);
+        for chunk in bytes.chunks_exact(8) {
+            let cx = i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + origin.0 as i32;
+            let cy = i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + origin.1 as i32;
+            let cw = u16::from_le_bytes([chunk[4], chunk[5]]) as i32;
+            let ch = u16::from_le_bytes([chunk[6], chunk[7]]) as i32;
+            if cw <= 0 || ch <= 0 {
+                continue;
+            }
+            out.push(Rectangle16 {
+                x: cx.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                y: cy.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                width: cw.min(u16::MAX as i32) as u16,
+                height: ch.min(u16::MAX as i32) as u16,
+            });
+        }
+        Some(out)
+    }
+
+    /// Intersect each rect in `rects` against the current GC clip. Returns
+    /// the original list when no clip is active. For `ClipState::Pixmap` we
+    /// pass through untouched (TODO: rasterise the mask).
+    fn intersect_with_current_clip(&self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
+        let Some(clip_rects) = self.current_clip_rects_in_dst_space() else {
+            return rects.to_vec();
+        };
+        let mut out = Vec::with_capacity(rects.len());
+        for r in rects {
+            let rx0 = r.x as i32;
+            let ry0 = r.y as i32;
+            let rx1 = rx0 + r.width as i32;
+            let ry1 = ry0 + r.height as i32;
+            for c in &clip_rects {
+                let cx0 = c.x as i32;
+                let cy0 = c.y as i32;
+                let cx1 = cx0 + c.width as i32;
+                let cy1 = cy0 + c.height as i32;
+                let ix0 = rx0.max(cx0);
+                let iy0 = ry0.max(cy0);
+                let ix1 = rx1.min(cx1);
+                let iy1 = ry1.min(cy1);
+                if ix0 < ix1 && iy0 < iy1 {
+                    out.push(Rectangle16 {
+                        x: ix0 as i16,
+                        y: iy0 as i16,
+                        width: (ix1 - ix0) as u16,
+                        height: (iy1 - iy0) as u16,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Fill `rects` on `dst_xid`, honoring `self.current_fill`. For
+    /// `Solid`, paints with `fg`. For `Tiled`, repeats the tile pixmap
+    /// (offset by the GC's tile origin). e16 paints popup backgrounds via
+    /// Tiled — the menu chrome+text lives in the tile pixmap and the
+    /// destination pixmap (the window's bg-pixmap) is filled by tiling
+    /// it, so honoring this is required for any visible popup.
+    /// `Stippled`/`OpaqueStippled` fall through to solid for now (no real
+    /// client driving that path on KMS yet).
+    fn fill_rects_honoring_fill_state(&mut self, dst_xid: u32, fg: u32, rects: &[Rectangle16]) {
+        let function = self.current_function;
+        let fill = self.current_fill.clone();
+        let clipped = self.intersect_with_current_clip(rects);
+        if clipped.is_empty() {
+            return;
+        }
+        let rects = clipped.as_slice();
+        match fill {
+            FillState::Tiled { pixmap, origin } => {
+                let tile_xid = pixmap.as_raw();
+                if tile_xid == dst_xid {
+                    log::debug!(
+                        "fill_rects_honoring_fill_state: tile == dst (0x{tile_xid:x}); falling back to solid"
+                    );
+                    self.with_image_mut(dst_xid, |dst| {
+                        fill_rects_with_gc_function(dst, function, fg, rects);
+                    });
+                    return;
+                }
+                // Tiled fill is composited with Operation::Src, which
+                // matches GcFunction::Copy. Other GC functions (Xor, And,
+                // …) would need bespoke handling per-pixel against the
+                // tile; no observed client combines Tiled fill with
+                // non-Copy. Fall back to solid (which honours
+                // GcFunction) and warn so we notice if it shows up.
+                if !matches!(function, GcFunction::Copy) {
+                    log::debug!(
+                        "fill_rects_honoring_fill_state: Tiled+{:?} not implemented; falling back to solid",
+                        function
+                    );
+                    self.with_image_mut(dst_xid, |dst| {
+                        fill_rects_with_gc_function(dst, function, fg, rects);
+                    });
+                    return;
+                }
+                let Some(tile_ptr) = self.image_ptr_for_xid(tile_xid) else {
+                    log::debug!(
+                        "fill_rects_honoring_fill_state: tile 0x{tile_xid:x} missing; falling back to solid"
+                    );
+                    self.with_image_mut(dst_xid, |dst| {
+                        fill_rects_with_gc_function(dst, function, fg, rects);
+                    });
+                    return;
+                };
+                // Tile pixman image lives in self.pixmaps/self.windows; the
+                // raw pointer remains valid for the duration of this call
+                // because we don't mutate either map between here and the
+                // composite calls.
+                // SAFETY: tile_ptr is non-null (Some above) and points at a
+                // pixman_image_t whose backing buffer outlives this call.
+                unsafe {
+                    pixman::ffi::pixman_image_set_repeat(tile_ptr, Repeat::Normal.into());
+                }
+                let (ox, oy) = (origin.0 as i32, origin.1 as i32);
+                let dst_dims = self
+                    .drawable_geometry(dst_xid)
+                    .map(|g| (g.width as i32, g.height as i32));
+                self.with_image_mut(dst_xid, |dst| {
+                    let (dw, dh) =
+                        dst_dims.unwrap_or((dst.0.width() as i32, dst.0.height() as i32));
+                    for r in rects {
+                        let dx = r.x as i32;
+                        let dy = r.y as i32;
+                        let dx0 = dx.max(0);
+                        let dy0 = dy.max(0);
+                        let dx1 = (dx + r.width as i32).min(dw);
+                        let dy1 = (dy + r.height as i32).min(dh);
+                        let w = dx1 - dx0;
+                        let h = dy1 - dy0;
+                        if w <= 0 || h <= 0 {
+                            continue;
+                        }
+                        // Source coords are dst coords minus tile origin; pixman's
+                        // REPEAT_NORMAL handles the modulo against the tile size.
+                        let sx = dx0 - ox;
+                        let sy = dy0 - oy;
+                        composite32(
+                            Operation::Src as u32,
+                            tile_ptr,
+                            std::ptr::null_mut(),
+                            dst,
+                            sx,
+                            sy,
+                            0,
+                            0,
+                            dx0,
+                            dy0,
+                            w,
+                            h,
+                        );
+                    }
+                });
+                // Reset repeat so subsequent uses of this pixmap (e.g. as a
+                // CopyArea source) don't see sticky tile-mode behaviour.
+                // SAFETY: same as above.
+                unsafe {
+                    pixman::ffi::pixman_image_set_repeat(tile_ptr, Repeat::None.into());
+                }
+            }
+            FillState::Solid | FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
+                self.with_image_mut(dst_xid, |dst| {
+                    fill_rects_with_gc_function(dst, function, fg, rects);
+                });
+            }
         }
     }
 
@@ -2279,6 +2462,18 @@ impl KmsBackend {
                 }
             }
 
+            // Pre-compute clipped sub-rects so the closure below doesn't
+            // need to re-borrow self.
+            let glyph_dst_rect = Rectangle16 {
+                x: g.dst_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                y: g.dst_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                width: g.w as u16,
+                height: g.h as u16,
+            };
+            let sub_rects = self.intersect_with_current_clip(&[glyph_dst_rect]);
+            if sub_rects.is_empty() {
+                continue;
+            }
             self.with_image_mut(host_xid, |dst| {
                 let dst_w = dst.0.width() as i32;
                 let dst_h = dst.0.height() as i32;
@@ -2293,15 +2488,19 @@ impl KmsBackend {
                 {
                     return;
                 }
-                dst.0.composite32(
-                    Operation::Over,
-                    &color_img,
-                    Some(&glyph_img),
-                    (0, 0),
-                    (0, 0),
-                    (g.dst_x, g.dst_y),
-                    (g.w as i32, g.h as i32),
-                );
+                for r in &sub_rects {
+                    let mask_x = r.x as i32 - g.dst_x;
+                    let mask_y = r.y as i32 - g.dst_y;
+                    dst.0.composite32(
+                        Operation::Over,
+                        &color_img,
+                        Some(&glyph_img),
+                        (0, 0),
+                        (mask_x, mask_y),
+                        (r.x as i32, r.y as i32),
+                        (r.width as i32, r.height as i32),
+                    );
+                }
             });
         }
         Ok(())
@@ -2983,28 +3182,49 @@ impl Backend for KmsBackend {
     }
 
     fn clear_clip_rectangles(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+        self.current_clip = ClipState::None;
         Ok(())
     }
 
     fn set_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _clip: Option<ClipRectangles>,
+        clip: Option<ClipRectangles>,
     ) -> io::Result<()> {
+        self.current_clip = match clip {
+            Some(c) => ClipState::Rectangles {
+                origin: (c.x_origin, c.y_origin),
+                rects: c,
+            },
+            None => ClipState::None,
+        };
         Ok(())
     }
 
     fn set_clip_pixmap(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pixmap: u32,
-        _clip_x_origin: i16,
-        _clip_y_origin: i16,
+        host_pixmap: u32,
+        clip_x_origin: i16,
+        clip_y_origin: i16,
     ) -> io::Result<()> {
+        // Pixmap clip-masks aren't enforced yet — the rasteriser only knows
+        // how to intersect rect lists. Store the state so future work can pick
+        // it up; right now this means a pixmap-mask GC clip is silently
+        // ignored (matches pre-fix behaviour for that specific shape).
+        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
+            self.current_clip = ClipState::None;
+            return Ok(());
+        };
+        self.current_clip = ClipState::Pixmap {
+            origin: (clip_x_origin, clip_y_origin),
+            pixmap: handle,
+        };
         Ok(())
     }
 
     fn set_gc_fill_solid(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+        self.current_fill = FillState::Solid;
         Ok(())
     }
 
@@ -3021,16 +3241,18 @@ impl Backend for KmsBackend {
     fn apply_clip_state(
         &mut self,
         _origin: Option<OriginContext>,
-        _clip: &ClipState,
+        clip: &ClipState,
     ) -> io::Result<()> {
+        self.current_clip = clip.clone();
         Ok(())
     }
 
     fn apply_fill_state(
         &mut self,
         _origin: Option<OriginContext>,
-        _fill: &FillState,
+        fill: &FillState,
     ) -> io::Result<()> {
+        self.current_fill = fill.clone();
         Ok(())
     }
 
@@ -3063,24 +3285,85 @@ impl Backend for KmsBackend {
         let Some(src_ptr) = self.image_ptr_for_xid(src_host_xid) else {
             return Ok(());
         };
+        let dst_rect = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        // Self-copy (xterm scrollback, etc.) needs a single composite32 —
+        // pixman handles intra-buffer overlap correctly for one call but
+        // not across multiple independent sub-rect calls (an earlier
+        // sub-rect's write would land in a later sub-rect's read region).
+        // Honor the clip via pixman_image_set_clip_region32 instead of
+        // sub-rect emission for this case.
+        let self_copy = src_host_xid == dst_host_xid;
+        if self_copy {
+            let clip_rects = self.current_clip_rects_in_dst_space();
+            self.with_image_mut(dst_host_xid, |dst| {
+                if let Some(ref rects) = clip_rects {
+                    use pixman::{Box32, Region32};
+                    let boxes: Vec<Box32> = rects
+                        .iter()
+                        .map(|c| Box32 {
+                            x1: c.x as i32,
+                            y1: c.y as i32,
+                            x2: c.x as i32 + c.width as i32,
+                            y2: c.y as i32 + c.height as i32,
+                        })
+                        .collect();
+                    let region = Region32::init_rects(&boxes);
+                    let _ = dst.0.set_clip_region32(Some(&region));
+                }
+                composite32(
+                    Operation::Src as u32,
+                    src_ptr,
+                    std::ptr::null_mut(),
+                    dst,
+                    src_x as i32,
+                    src_y as i32,
+                    0,
+                    0,
+                    dst_x as i32,
+                    dst_y as i32,
+                    width as i32,
+                    height as i32,
+                );
+                if clip_rects.is_some() {
+                    let _ = dst.0.set_clip_region32(None);
+                }
+            });
+            return Ok(());
+        }
+        // Distinct src/dst: intersect with current clip and emit one
+        // composite32 per surviving sub-rect with src coords shifted by
+        // the same amount the dst was clipped.
+        let sub_rects = self.intersect_with_current_clip(&[dst_rect]);
+        if sub_rects.is_empty() {
+            return Ok(());
+        }
         // src_ptr lives for as long as src_host_xid stays in self.windows/pixmaps;
         // we don't mutate either map in this method, so the pointer is valid for
         // the duration of the composite32 call below.
         self.with_image_mut(dst_host_xid, |dst| {
-            composite32(
-                Operation::Src as u32,
-                src_ptr,
-                std::ptr::null_mut(),
-                dst,
-                src_x as i32,
-                src_y as i32,
-                0,
-                0,
-                dst_x as i32,
-                dst_y as i32,
-                width as i32,
-                height as i32,
-            );
+            for r in &sub_rects {
+                let dx_shift = r.x as i32 - dst_x as i32;
+                let dy_shift = r.y as i32 - dst_y as i32;
+                composite32(
+                    Operation::Src as u32,
+                    src_ptr,
+                    std::ptr::null_mut(),
+                    dst,
+                    src_x as i32 + dx_shift,
+                    src_y as i32 + dy_shift,
+                    0,
+                    0,
+                    r.x as i32,
+                    r.y as i32,
+                    r.width as i32,
+                    r.height as i32,
+                );
+            }
         });
         Ok(())
     }
@@ -3138,6 +3421,8 @@ impl Backend for KmsBackend {
         let function = self.current_function;
         let foreground = self.current_foreground;
         let background = self.current_background;
+        let foreground_rects = self.intersect_with_current_clip(&foreground_rects);
+        let background_rects = self.intersect_with_current_clip(&background_rects);
         self.with_image_mut(dst_host_xid, |dst| {
             fill_rects_with_gc_function(dst, function, background, &background_rects);
             fill_rects_with_gc_function(dst, function, foreground, &foreground_rects);
@@ -3156,11 +3441,30 @@ impl Backend for KmsBackend {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
+        // Pre-compute current GC clip in dst coords. None = unclipped.
+        // Captured before the geom borrow below so the per-pixel test
+        // doesn't need to re-borrow self mid-loop.
+        let clip_rects = self.current_clip_rects_in_dst_space();
         let Some(geom) = self.drawable_geometry(host_xid) else {
             return Ok(());
         };
         let img_w = geom.width;
         let img_h = geom.height;
+        let in_clip = |x: i32, y: i32| -> bool {
+            let Some(ref rects) = clip_rects else {
+                return true;
+            };
+            for c in rects {
+                let cx0 = c.x as i32;
+                let cy0 = c.y as i32;
+                let cx1 = cx0 + c.width as i32;
+                let cy1 = cy0 + c.height as i32;
+                if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 {
+                    return true;
+                }
+            }
+            false
+        };
 
         match depth {
             24 | 32 => {
@@ -3175,6 +3479,9 @@ impl Backend for KmsBackend {
                     for col in 0..width as isize {
                         let dx = dst_x as isize + col;
                         if dx < 0 || dx >= img_w as isize {
+                            continue;
+                        }
+                        if !in_clip(dx as i32, dy as i32) {
                             continue;
                         }
                         let src_offset = ((row * width as isize + col) * 4) as usize;
@@ -3213,6 +3520,9 @@ impl Backend for KmsBackend {
                     for col in 0..width as isize {
                         let dx = dst_x as isize + col;
                         if dx < 0 || dx >= img_w as isize {
+                            continue;
+                        }
+                        if !in_clip(dx as i32, dy as i32) {
                             continue;
                         }
                         let src_offset = row as usize * src_row_stride + col as usize;
@@ -3372,6 +3682,7 @@ impl Backend for KmsBackend {
             prev = Some((xi, yi));
         }
         let function = self.current_function;
+        let rects = self.intersect_with_current_clip(&rects);
         self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
             fill_rects_with_gc_function(img, function, foreground, &clipped);
@@ -3402,6 +3713,7 @@ impl Backend for KmsBackend {
             bresenham_segment(x1 as i32, y1 as i32, x2 as i32, y2 as i32, &mut rects);
         }
         let function = self.current_function;
+        let rects = self.intersect_with_current_clip(&rects);
         self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
             fill_rects_with_gc_function(img, function, foreground, &clipped);
@@ -3457,6 +3769,7 @@ impl Backend for KmsBackend {
             });
         }
         let function = self.current_function;
+        let rects = self.intersect_with_current_clip(&rects);
         self.with_image_mut(host_xid, |img| {
             fill_rects_with_gc_function(img, function, foreground, &rects);
         });
@@ -3483,74 +3796,77 @@ impl Backend for KmsBackend {
         //     row's left/right edges otherwise (the side outlines).
         // This produces a closed 1-pixel outline.
         let function = self.current_function;
-        self.with_image_mut(host_xid, |img| {
-            let iw = img.0.width() as i32;
-            let ih = img.0.height() as i32;
-            let mut rects: Vec<Rectangle16> = Vec::new();
-            for chunk in arcs.chunks_exact(12) {
-                let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-                let ay = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
-                let aw = u16::from_le_bytes([chunk[4], chunk[5]]) as i32;
-                let ah = u16::from_le_bytes([chunk[6], chunk[7]]) as i32;
-                if aw <= 0 || ah <= 0 {
-                    continue;
-                }
-                let cx = ax as f64 + (aw as f64) * 0.5;
-                let cy = ay as f64 + (ah as f64) * 0.5;
-                let rx = (aw as f64) * 0.5;
-                let ry = (ah as f64) * 0.5;
-
-                let row_at = |py: i32| -> Option<(i32, i32)> {
-                    let dy = (py as f64 + 0.5 - cy) / ry;
-                    if dy.abs() > 1.0 {
-                        return None;
-                    }
-                    let dx = (1.0 - dy * dy).sqrt() * rx;
-                    let x0 = (cx - dx).floor() as i32;
-                    let x1 = (cx + dx).ceil() as i32;
-                    Some((x0, x1))
-                };
-
-                let mut prev: Option<(i32, i32)> = None;
-                for py in ay..ay + ah {
-                    let Some((x0, x1)) = row_at(py) else {
-                        prev = None;
-                        continue;
-                    };
-                    let next = row_at(py + 1);
-                    let cap = prev.is_none() || next.is_none();
-                    if cap {
-                        // Full horizontal span (top or bottom of curve).
-                        rects.push(Rectangle16 {
-                            x: x0 as i16,
-                            y: py as i16,
-                            width: (x1 - x0 + 1) as u16,
-                            height: 1,
-                        });
-                    } else {
-                        // Side connectors: left edge and right edge runs
-                        // bridging this row's edge to the previous row's.
-                        let (px0, px1) = prev.unwrap();
-                        let l_lo = px0.min(x0);
-                        let l_hi = px0.max(x0);
-                        rects.push(Rectangle16 {
-                            x: l_lo as i16,
-                            y: py as i16,
-                            width: (l_hi - l_lo + 1) as u16,
-                            height: 1,
-                        });
-                        let r_lo = px1.min(x1);
-                        let r_hi = px1.max(x1);
-                        rects.push(Rectangle16 {
-                            x: r_lo as i16,
-                            y: py as i16,
-                            width: (r_hi - r_lo + 1) as u16,
-                            height: 1,
-                        });
-                    }
-                    prev = Some((x0, x1));
-                }
+        let (iw, ih) = self
+            .drawable_geometry(host_xid)
+            .map(|g| (g.width as i32, g.height as i32))
+            .unwrap_or((0, 0));
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        for chunk in arcs.chunks_exact(12) {
+            let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            let ay = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
+            let aw = u16::from_le_bytes([chunk[4], chunk[5]]) as i32;
+            let ah = u16::from_le_bytes([chunk[6], chunk[7]]) as i32;
+            if aw <= 0 || ah <= 0 {
+                continue;
             }
+            let cx = ax as f64 + (aw as f64) * 0.5;
+            let cy = ay as f64 + (ah as f64) * 0.5;
+            let rx = (aw as f64) * 0.5;
+            let ry = (ah as f64) * 0.5;
+
+            let row_at = |py: i32| -> Option<(i32, i32)> {
+                let dy = (py as f64 + 0.5 - cy) / ry;
+                if dy.abs() > 1.0 {
+                    return None;
+                }
+                let dx = (1.0 - dy * dy).sqrt() * rx;
+                let x0 = (cx - dx).floor() as i32;
+                let x1 = (cx + dx).ceil() as i32;
+                Some((x0, x1))
+            };
+
+            let mut prev: Option<(i32, i32)> = None;
+            for py in ay..ay + ah {
+                let Some((x0, x1)) = row_at(py) else {
+                    prev = None;
+                    continue;
+                };
+                let next = row_at(py + 1);
+                let cap = prev.is_none() || next.is_none();
+                if cap {
+                    // Full horizontal span (top or bottom of curve).
+                    rects.push(Rectangle16 {
+                        x: x0 as i16,
+                        y: py as i16,
+                        width: (x1 - x0 + 1) as u16,
+                        height: 1,
+                    });
+                } else {
+                    // Side connectors: left edge and right edge runs
+                    // bridging this row's edge to the previous row's.
+                    let (px0, px1) = prev.unwrap();
+                    let l_lo = px0.min(x0);
+                    let l_hi = px0.max(x0);
+                    rects.push(Rectangle16 {
+                        x: l_lo as i16,
+                        y: py as i16,
+                        width: (l_hi - l_lo + 1) as u16,
+                        height: 1,
+                    });
+                    let r_lo = px1.min(x1);
+                    let r_hi = px1.max(x1);
+                    rects.push(Rectangle16 {
+                        x: r_lo as i16,
+                        y: py as i16,
+                        width: (r_hi - r_lo + 1) as u16,
+                        height: 1,
+                    });
+                }
+                prev = Some((x0, x1));
+            }
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, iw, ih);
             fill_rects_with_gc_function(img, function, foreground, &clipped);
         });
@@ -3580,6 +3896,7 @@ impl Backend for KmsBackend {
             });
         }
         let function = self.current_function;
+        let rects = self.intersect_with_current_clip(&rects);
         self.with_image_mut(host_xid, |img| {
             fill_rects_with_gc_function(img, function, foreground, &rects);
         });
@@ -3602,10 +3919,7 @@ impl Backend for KmsBackend {
             offset += 8;
             rects.push(r);
         }
-        let function = self.current_function;
-        self.with_image_mut(host_xid, |img| {
-            fill_rects_with_gc_function(img, function, foreground, &rects);
-        });
+        self.fill_rects_honoring_fill_state(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -3621,48 +3935,49 @@ impl Backend for KmsBackend {
         // We treat any arc with |angle2| >= 360*64 as a full ellipse and fill it
         // with a scanline approach. Partial arcs fall back to filling the full
         // ellipse for now; xeyes uses full circles so this is sufficient.
-        let function = self.current_function;
-        self.with_image_mut(host_xid, |img| {
-            let img_w = img.0.width() as i32;
-            let img_h = img.0.height() as i32;
-            let mut rects: Vec<Rectangle16> = Vec::new();
-            for chunk in arcs.chunks_exact(12) {
-                let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-                let ay = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
-                let aw = u16::from_le_bytes([chunk[4], chunk[5]]) as i32;
-                let ah = u16::from_le_bytes([chunk[6], chunk[7]]) as i32;
-                if aw <= 0 || ah <= 0 {
+        let dst_dims = self
+            .drawable_geometry(host_xid)
+            .map(|g| (g.width as i32, g.height as i32))
+            .unwrap_or((0, 0));
+        let img_w = dst_dims.0;
+        let img_h = dst_dims.1;
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        for chunk in arcs.chunks_exact(12) {
+            let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            let ay = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
+            let aw = u16::from_le_bytes([chunk[4], chunk[5]]) as i32;
+            let ah = u16::from_le_bytes([chunk[6], chunk[7]]) as i32;
+            if aw <= 0 || ah <= 0 {
+                continue;
+            }
+            let cx = ax as f64 + (aw as f64) * 0.5;
+            let cy = ay as f64 + (ah as f64) * 0.5;
+            let rx = (aw as f64) * 0.5;
+            let ry = (ah as f64) * 0.5;
+            let y_start = ay.max(0);
+            let y_end = (ay + ah).min(img_h);
+            for py in y_start..y_end {
+                let dy = (py as f64 + 0.5 - cy) / ry;
+                if dy.abs() > 1.0 {
                     continue;
                 }
-                let cx = ax as f64 + (aw as f64) * 0.5;
-                let cy = ay as f64 + (ah as f64) * 0.5;
-                let rx = (aw as f64) * 0.5;
-                let ry = (ah as f64) * 0.5;
-                let y_start = ay.max(0);
-                let y_end = (ay + ah).min(img_h);
-                for py in y_start..y_end {
-                    let dy = (py as f64 + 0.5 - cy) / ry;
-                    if dy.abs() > 1.0 {
-                        continue;
-                    }
-                    let dx = (1.0 - dy * dy).sqrt() * rx;
-                    let x0 = (cx - dx).floor().max(0.0) as i32;
-                    let x1 = (cx + dx).ceil().min(img_w as f64) as i32;
-                    if x1 <= x0 {
-                        continue;
-                    }
-                    rects.push(Rectangle16 {
-                        x: x0 as i16,
-                        y: py as i16,
-                        width: (x1 - x0) as u16,
-                        height: 1,
-                    });
+                let dx = (1.0 - dy * dy).sqrt() * rx;
+                let x0 = (cx - dx).floor().max(0.0) as i32;
+                let x1 = (cx + dx).ceil().min(img_w as f64) as i32;
+                if x1 <= x0 {
+                    continue;
                 }
+                rects.push(Rectangle16 {
+                    x: x0 as i16,
+                    y: py as i16,
+                    width: (x1 - x0) as u16,
+                    height: 1,
+                });
             }
-            if !rects.is_empty() {
-                fill_rects_with_gc_function(img, function, foreground, &rects);
-            }
-        });
+        }
+        if !rects.is_empty() {
+            self.fill_rects_honoring_fill_state(host_xid, foreground, &rects);
+        }
         Ok(())
     }
 
@@ -3694,11 +4009,12 @@ impl Backend for KmsBackend {
         }
         let mut rects: Vec<Rectangle16> = Vec::new();
         scanline_fill_polygon(&verts, &mut rects);
-        let function = self.current_function;
-        self.with_image_mut(host_xid, |img| {
-            let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            fill_rects_with_gc_function(img, function, foreground, &clipped);
-        });
+        let dst_dims = self
+            .drawable_geometry(host_xid)
+            .map(|g| (g.width as i32, g.height as i32))
+            .unwrap_or((0, 0));
+        let clipped = clip_rects_to_image(&rects, dst_dims.0, dst_dims.1);
+        self.fill_rects_honoring_fill_state(host_xid, foreground, &clipped);
         Ok(())
     }
 
@@ -3885,9 +4201,12 @@ impl Backend for KmsBackend {
                 height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
             };
             let function = self.current_function;
-            self.with_image_mut(host_xid, |img| {
-                fill_rects_with_gc_function(img, function, background, &[rect]);
-            });
+            let bg_rects = self.intersect_with_current_clip(&[rect]);
+            if !bg_rects.is_empty() {
+                self.with_image_mut(host_xid, |img| {
+                    fill_rects_with_gc_function(img, function, background, &bg_rects);
+                });
+            }
         }
 
         // Render the string (clamp to available body bytes)
@@ -3942,9 +4261,12 @@ impl Backend for KmsBackend {
                 height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
             };
             let function = self.current_function;
-            self.with_image_mut(host_xid, |img| {
-                fill_rects_with_gc_function(img, function, background, &[rect]);
-            });
+            let bg_rects = self.intersect_with_current_clip(&[rect]);
+            if !bg_rects.is_empty() {
+                self.with_image_mut(host_xid, |img| {
+                    fill_rects_with_gc_function(img, function, background, &bg_rects);
+                });
+            }
         }
 
         self.render_text_chars(host_xid, foreground, x, y, &chars)
@@ -4489,13 +4811,100 @@ impl Backend for KmsBackend {
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_dst: u32,
-        _op: u8,
-        _color: [u8; 8],
-        _rects: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        host_dst: u32,
+        op: u8,
+        color: [u8; 8],
+        rects: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
+        // Resolve the destination picture to its backing drawable + clip.
+        // Solid / gradient pictures aren't valid RENDER fill destinations,
+        // so bail quietly in those cases.
+        let (dst_drawable_xid, picture_clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
+            _ => return Ok(()),
+        };
+
+        let pixman_color = pixman::ffi::pixman_color_t {
+            red: u16::from_le_bytes([color[0], color[1]]),
+            green: u16::from_le_bytes([color[2], color[3]]),
+            blue: u16::from_le_bytes([color[4], color[5]]),
+            alpha: u16::from_le_bytes([color[6], color[7]]),
+        };
+
+        let mut decoded: Vec<Rectangle16> = Vec::with_capacity(rects.len() / 8);
+        for chunk in rects.chunks_exact(8) {
+            let rx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(x_off);
+            let ry = i16::from_le_bytes([chunk[2], chunk[3]]).saturating_add(y_off);
+            let rw = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let rh = u16::from_le_bytes([chunk[6], chunk[7]]);
+            if rw > 0 && rh > 0 {
+                decoded.push(Rectangle16 {
+                    x: rx,
+                    y: ry,
+                    width: rw,
+                    height: rh,
+                });
+            }
+        }
+        if decoded.is_empty() {
+            return Ok(());
+        }
+
+        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true)
+            .map_err(|_| io::Error::other("pixman color image"))?;
+        let _ = color_img.fill_rectangles(
+            Operation::Src,
+            pixman_color,
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        );
+        color_img.set_repeat(Repeat::Normal);
+
+        // RENDER op codes share their numeric values with pixman's
+        // pixman_op_t (Clear=0, Src=1, …, Over=3, …).
+        let pixman_op = op as u32;
+        let color_ptr = color_img.as_ptr();
+        self.with_image_mut(dst_drawable_xid, |dst| {
+            if let Some(ref rects) = picture_clip {
+                use pixman::{Box32, Region32};
+                let boxes: Vec<Box32> = rects
+                    .iter()
+                    .map(|cr| Box32 {
+                        x1: cr.x as i32,
+                        y1: cr.y as i32,
+                        x2: cr.x as i32 + cr.width as i32,
+                        y2: cr.y as i32 + cr.height as i32,
+                    })
+                    .collect();
+                let region = Region32::init_rects(&boxes);
+                let _ = dst.0.set_clip_region32(Some(&region));
+            }
+            for r in &decoded {
+                composite32(
+                    pixman_op,
+                    color_ptr,
+                    std::ptr::null_mut(),
+                    dst,
+                    0,
+                    0,
+                    0,
+                    0,
+                    r.x as i32,
+                    r.y as i32,
+                    r.width as i32,
+                    r.height as i32,
+                );
+            }
+            if picture_clip.is_some() {
+                let _ = dst.0.set_clip_region32(None);
+            }
+        });
         Ok(())
     }
 
@@ -4869,19 +5278,21 @@ impl Backend for KmsBackend {
     ) -> io::Result<()> {
         // Wire body (passed through from nested.rs): picture(4) +
         // clip_x_origin(INT16) + clip_y_origin(INT16) + N × [x y w h].
-        // The picture XID has already been resolved to host_pic; we just
-        // skip past it. Origin offset is stored but not applied — xclock
-        // sets it to (0,0) and that's all we currently exercise.
+        // Pre-shift each rectangle by the clip-origin so the stored list
+        // is already in dst-coords; the clip-region path doesn't track
+        // origin separately.
         if body.len() < 8 {
             return Ok(());
         }
-        let _x_origin = i16::from_le_bytes([body[4], body[5]]);
-        let _y_origin = i16::from_le_bytes([body[6], body[7]]);
+        let x_origin = i16::from_le_bytes([body[4], body[5]]) as i32;
+        let y_origin = i16::from_le_bytes([body[6], body[7]]) as i32;
         let rects_data = &body[8..];
         let mut rects = Vec::with_capacity(rects_data.len() / 8);
         for chunk in rects_data.chunks_exact(8) {
-            let x = i16::from_le_bytes([chunk[0], chunk[1]]);
-            let y = i16::from_le_bytes([chunk[2], chunk[3]]);
+            let x = (i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + x_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let y = (i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + y_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let w = u16::from_le_bytes([chunk[4], chunk[5]]);
             let h = u16::from_le_bytes([chunk[6], chunk[7]]);
             rects.push(Rectangle16 {
@@ -4901,9 +5312,55 @@ impl Backend for KmsBackend {
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        // Wire body (picture XID already stripped at the dispatcher layer):
+        //   nbytes(2) + pad(2) + filter_name(nbytes) + pad-to-4 + values(N × INT32 fixed)
+        // We only act on the filter name; convolution-kernel values aren't
+        // exercised by any client we care about today (xclock / fvwm /
+        // GTK use named filters only).
+        if body.len() < 4 {
+            return Ok(());
+        }
+        let nbytes = u16::from_le_bytes([body[0], body[1]]) as usize;
+        if body.len() < 4 + nbytes {
+            return Ok(());
+        }
+        let name = std::str::from_utf8(&body[4..4 + nbytes]).unwrap_or("");
+        let filter = match name {
+            "nearest" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_NEAREST,
+            "bilinear" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_BILINEAR,
+            "fast" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_FAST,
+            "good" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_GOOD,
+            "best" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_BEST,
+            "convolution" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_CONVOLUTION,
+            other => {
+                log::debug!("render_set_picture_filter: unknown filter {other:?}");
+                return Ok(());
+            }
+        };
+        // Resolve the picture's underlying pixman image. SolidFill /
+        // Gradient pictures own their image directly; Drawable pictures
+        // delegate to their backing window/pixmap.
+        let img_ptr = match self.pictures.get(&host_pic) {
+            Some(PictureState::Drawable { host_xid, .. }) => self.image_ptr_for_xid(*host_xid),
+            Some(PictureState::SolidFill { image, .. }) => Some(image.borrow().0.as_ptr()),
+            Some(PictureState::Gradient { image, .. }) => Some(image.0.as_ptr()),
+            None => None,
+        };
+        let Some(ptr) = img_ptr else {
+            log::debug!("render_set_picture_filter: picture 0x{host_pic:x} has no backing image");
+            return Ok(());
+        };
+        // SAFETY: `ptr` is a valid `*mut pixman_image_t` for the lifetime
+        // of the picture entry; we don't mutate `self.pictures` /
+        // `self.windows` / `self.pixmaps` between resolving the pointer
+        // and using it. Filter parameters left null since we don't
+        // accept convolution kernels yet.
+        unsafe {
+            pixman::ffi::pixman_image_set_filter(ptr, filter, std::ptr::null(), 0);
+        }
         Ok(())
     }
 
@@ -5394,7 +5851,7 @@ mod tests {
 
     use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
     use yserver_core::{
-        backend::{Backend, GcFunction},
+        backend::{Backend, ClipState, FillState, GcFunction},
         host_x11::HostXidMap,
     };
     use yserver_protocol::x11::ResourceId;
@@ -5488,6 +5945,8 @@ mod tests {
             current_function: GcFunction::Copy,
             current_foreground: 0,
             current_background: 0x00ff_ffff,
+            current_fill: FillState::Solid,
+            current_clip: ClipState::None,
             pictures: HashMap::new(),
             picture_rescued_images: HashMap::new(),
             glyphsets: HashMap::new(),

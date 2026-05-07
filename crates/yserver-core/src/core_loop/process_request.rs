@@ -5072,7 +5072,10 @@ fn handle_map_window(
             let _dropped = emit_expose_subtree_to_state(state, window);
         }
     }
-    debug!("client {} #{} MapWindow", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} MapWindow 0x{:x}",
+        client_id.0, sequence.0, window.0
+    );
     Ok(RequestOutcome::Handled)
 }
 

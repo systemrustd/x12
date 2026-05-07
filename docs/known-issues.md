@@ -63,73 +63,6 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
-- [ ] **yserver/KMS: fvwm3 menus render with no text.**
-      Surfaced during Phase J yserver+fvwm3 smoke. fvwm3 opens its
-      font (`-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso10646-1`)
-      and `QueryFont`s it, but issues **zero** `ImageText` /
-      `PolyText` / RENDER text-drawing requests — popups draw the
-      background rectangles only, no menu items. Same fvwm3 in ynest
-      works correctly (text comes from the host X server's font).
-      First fix attempt: `core_loop::process_request::handle_open_font`
-      now synthesizes the standard XLFD property set (FONT, FOUNDRY,
-      FAMILY_NAME, …, CHARSET_ENCODING — 15 properties / 120 bytes)
-      when the backend returns empty `metrics.properties`. Confirmed
-      the synthesis runs (debug log:
-      `synthesized 120 property bytes (15 props), 95 char_infos`),
-      but fvwm3 still skips text drawing — so the gating check is
-      something other than missing properties. Suspects:
-        - char_info widths returned by `compute_char_info` for the
-          freetype-loaded font may have a sign/bit issue that fvwm3
-          interprets as "zero-width font, unusable"
-        - char range we report (`min_char_or_byte2 = 0x20`,
-          `max_char_or_byte2 = 0x7E`) may be too narrow for fvwm3's
-          ISO10646 expectation — fvwm3 asked for an iso10646-1
-          font but we report it as essentially ASCII-only
-        - fvwm3 may probe the font via `QueryTextExtents` and fall
-          through if the answer is zero
-      Next debug step: log the full `FontMetrics` we install for the
-      KMS path and run xterm under yserver — xterm renders text
-      correctly, so its QueryFont reply path is fine; diff what
-      changes between xterm's font query and fvwm3's font query.
-- [x] **xterm stops receiving KeyPress after focus/state-changing
-      interaction (WM-independent, backend-independent — likely a
-      regression from the single-threaded core refactor).**
-      Confirmed gone after the BE-client / xproto / Xlib3 cleanup
-      pass (master `3ee8530` and earlier in that session). Verified
-      by user 2026-05-06 against ynest + e16 + xterm on native Linux.
-      Original report kept below for archaeology.
-
-      Surfaced during Phase J smoke. Triggers we'd reproduced:
-        - **ynest + wmaker**: type `ls` Enter four times in xterm.
-          The 4th invocation reliably leaves xterm unresponsive to
-          subsequent keystrokes. Typing once worked at first, so
-          the trigger is cumulative.
-        - **ynest + fvwm3**: works indefinitely until you *resize*
-          the xterm window. The redraw at the new size completes
-          correctly, and then xterm stops receiving keystrokes —
-          same symptom.
-        - **yserver (KMS) + e16**: also reproduces the same xterm
-          KeyPress drop after some interaction. User reports this
-          as a regression — pre-refactor xterm typing worked
-          indefinitely on this backend.
-      Strace on the hung xterm shows it's healthy: still in `poll()`
-      on its X11 socket (fd 3) and PTY (fd 4), and **does** receive
-      MotionNotify events when the mouse moves over it, so ynest is
-      delivering events to xterm. KeyPress events specifically are
-      missing. Our `set_focused_window` trace shows focused_window
-      is correctly set to xterm's main window with KeyPress in its
-      event_masks at the time keys stop arriving.
-      Suspect: a state-change in `state.active_keyboard_grab` or
-      `state.pointer_grab` that redirects KeyPress somewhere other
-      than `current_focus`'s subscribers. Once the WM does any
-      non-trivial focus dance (wmaker's 21 passive `GrabKey`
-      activations during typing; fvwm3's grab/ungrab during resize),
-      our grab-release condition can leave a grab stuck because the
-      release fires only on KeyRelease of the *exact* triggering
-      keycode — if the user never types that key again, the grab
-      sticks forever and keys keep funneling to grab_window
-      (typically the WM frame, which has no KeyPress mask in its
-      `event_masks` and just drops them).
 - [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
       Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
       smoke. After fixing two prerequisite routing bugs (the
@@ -154,31 +87,9 @@ once the underlying patterns are understood.
       single-threaded core — same-shaped event flow worked
       immediately for xterm, xclock, xeyes, and for gtk3-demo's main
       list-row clicks.
-- [x] ~~**xeyes doesn't track cursor.**~~ Fixed: xeyes selects
-      `XI_RawMotion` (XI2 event type 17) on root, which our
-      `pointer_event_fanout` was not synthesizing —
-      pre-fix only synthesized `XI_Motion` (type 6). Initial
-      "GenericEvent dropped" theory was wrong; the dispatcher does
-      drop GenericEvents, but ynest never asks the host to send
-      them so no XI2 events arrive from the host in the first
-      place. Real fix: synthesize `XI_RawMotion` (and
-      `XI_RawButtonPress` / `XI_RawButtonRelease`) alongside the
-      existing `XI_Motion` / `XI_ButtonPress` / `XI_ButtonRelease`
-      synthesis in `server.rs::pointer_event_fanout`. Raw events
-      include X+Y valuators with FP3232 root coords.
 
 ## Drawing / rendering artifacts
 
-- [x] **wmaker icon-edge clamped to 800×600 with larger geometries.**
-      Two stale-screen-size sources fed clients the wrong dimensions
-      regardless of `--geometry` / actual scanout: the connection-setup
-      `Screen` reply hardcoded `width_px=800, height_px=600` (which
-      `DisplayWidth/Height` reads — wmaker icon placement), and
-      `ResourceTable::new()` initialised the root window to 800×600
-      (which `GetGeometry(root)` returns — e16 virtual-desktop layout).
-      Fixed by sourcing both from the requested geometry; mm computed
-      at 96 DPI from the actual pixel size. Verified visually on
-      wmaker, fvwm3, e16.
 - [ ] **Per-client GC mirroring** (Phase 3.7 task #26). The shared
       host GC creates subtle bugs when GC state leaks between clients.
       Phase 3.7's fill-style fix needed careful "reset to Solid after
@@ -192,6 +103,32 @@ once the underlying patterns are understood.
       off-screen / fully behind another) is the proper fix and is
       deferred. Re-open if a real validation scenario demonstrates a
       backing-store gap.
+- [ ] **KMS: `render_set_picture_filter` is not picture-local.** The
+      filter is set on the picture's *backing pixman image* via
+      `pixman_image_set_filter`. If two RENDER pictures wrap the same
+      drawable (a common GTK pattern: client creates a Picture for
+      drawing and another for compositing onto the same window), the
+      latter SetPictureFilter wins for both and any composite using
+      either picture sees the wrong filter. Real fix: track
+      `filter: pixman_filter_t` on `PictureState::Drawable`, apply
+      around each composite call (set → composite → restore), same
+      shape as the existing per-picture clip path in `render_composite`
+      / `render_fill_rectangles`. Touches every RENDER op call site.
+- [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
+      promoted by the map_window viewable cascade.** After commit
+      `304858f` (`fix(resources): propagate Viewable down through
+      Unviewable descendants on map`), mapping a window correctly
+      flips deep descendants from `Unviewable` to `Viewable`.
+      `handle_map_window` already calls
+      `emit_expose_subtree_to_state` which walks descendants, so
+      that path is fine. But `handle_map_subwindows` only emits
+      MapNotify+Expose for the children it directly maps, not for
+      their grandchildren that may have just been promoted by the
+      cascade. Edge case (most clients only have one level of
+      MapSubwindows children) but spec-incorrect. Fix: in
+      `handle_map_subwindows`, after the per-child loop call
+      `emit_expose_subtree_to_state` on each child whose viewability
+      transitioned. ~10 LoC.
 - [ ] **Damage accumulation on RENDER drawing ops.** Phase 3.5's
       first-cut `accumulate_damage` covers core drawing only.
       RENDER-driven damage (composite, fill rectangles, glyphs) is
@@ -199,43 +136,6 @@ once the underlying patterns are understood.
       screen recorder) drives the path.
 
 ## wmaker on KMS
-
-- [x] **Window Maker reparents but never `MapWindow`s its own frame.**
-      Fixed by `911fa38`. `KmsBackend::get_image` was returning raw
-      pixel bytes instead of a complete X11 wire reply, so wmaker's
-      first GetImage during MapRequest handling produced what looked
-      like a malformed error reply (byte 0 = pixel byte ≈ 0 → wmaker
-      treated it as Error). wmaker's catchXError logged "internal X
-      error: 0" and short-circuited the rest of the frame
-      installation, leaving the frame and client unmapped. Fix:
-      prepend the standard 32-byte X11 reply header in
-      `get_image`, matching what `nested.rs:7744` expects (it
-      patches sequence + visual into bytes 2..4 / 8..12 there).
-- [x] **wmaker appicon clipped diagonally.** Fixed by `93742cc`.
-      Root cause was depth-1 PutImage being a no-op, so wmaker's
-      icon shape masks (24×24 ZPixmap d1 via MIT-SHM) never reached
-      our pixmaps. Implementing the depth-1 path (row-wise memcpy —
-      X11 and pixman both use 32-bit-aligned MSB-first scanlines)
-      restored the appicon.
-- [ ] **e16 widget clicks don't activate.** Enlightenment 16 comes
-      up on KMS, the right-click-desktop menu opens, the post-startup
-      "Menu generation complete" dialog renders with an OK button,
-      and the settings menu opens — but clicks on any of those
-      widgets (OK, menu items, settings buttons) don't activate
-      anything. Click delivery does happen (we deliver ButtonPress
-      via e16's passive-grab on `button=AnyButton
-      modifiers=AnyModifier`, e16 calls `AllowEvents` and redraws),
-      but the action behind the widget doesn't fire.
-
-      Likely root cause: e16 uses Sync-mode passive grabs and
-      depends on a particular event-replay sequence (frozen pointer
-      event → AllowEvents(ReplayPointer) → server replays the press
-      to the actual subwindow target). Our `pointer_grab` machinery
-      stores `frozen_pointer_event` when `pointer_mode == 0` (Sync)
-      but doesn't have a full replay path on AllowEvents. e16
-      visually works otherwise — drag, resize, switch workspaces,
-      menu navigation via Alt+arrows function — so xterm under e16
-      is usable, just menu/dialog clicks aren't.
 
 - [ ] **wmaker title-bar close/minimize button glyphs missing.**
       Same general area as the appicon (CWBackPixmap-driven small
@@ -307,66 +207,6 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
-- [x] **GC `function` not honoured.** Fixed in Phase 6.5 Step 2
-      (`6972c39`). `apply_draw_state` now captures `state.function` and
-      every client-draw primitive routes through
-      `fill_rects_with_gc_function` which maps `GcFunction::Copy →
-      pixman SRC` and `GcFunction::Xor →` per-pixel bitwise XOR. (Pixman
-      `PIXMAN_OP_XOR` is Porter-Duff and produces zero for opaque
-      pixels — not what X11 GXxor wants — so the Xor path uses raw
-      pixel manipulation.) Other GcFunction variants log-and-fall-back
-      to Src.
-- [x] **xterm glyph baseline / placement.** Fixed in Phase 6.5 Step 3
-      (`993c437`). The 1×1 solid-colour source image in
-      `render_text_string` was created with `REPEAT_NONE` (pixman
-      default), so every source read outside pixel (0,0) returned
-      transparent — Operation::Over was a no-op for all glyph columns
-      except the leftmost, producing scattered dots. Fix:
-      `color_img.set_repeat(Repeat::Normal)`.
-- [x] **fvwm3 modules wedge.** Fixed in Phase 6.5 Step 1A (`e19ca7c`)
-      via `KmsBackend::render_opcode() → Some(133)`. The original
-      "synthesise ConfigureNotify from configure_subwindow" hypothesis
-      was incorrect: nested.rs already synthesises ConfigureNotify
-      backend-agnostically. Real cause was that without RENDER fvwm3
-      uses a two-level frame hierarchy that places the client at
-      parent-relative `(0,0)`, which traps FvwmPager's "have I been
-      placed?" loop forever. Trace-diff in
-      `docs/superpowers/notes/2026-05-04-phase6-5-fvwm3-trace.md`.
-- [x] **`Opcode 58` (SetDashes), `Opcode 81` (InstallColormap)
-      unsupported.** Still logged as `unsupported opcode N` (cosmetic).
-      Both intentionally left as-is in 6.5 — dashes fall back to
-      solid (visually fine), InstallColormap is a no-op on TrueColor.
-- [ ] **`RENDER::CompositeGlyphs8` is a no-op stub on KMS.** Visible:
-      fvwm3 panel labels (FvwmPager desktop names, FvwmIconMan window
-      titles, FvwmButtons text) render as solid-colour rectangles with
-      no glyphs; fvwm3's window-list popup shows rows but each row's
-      title is empty. Implementation outline: glyphset registry +
-      `AddGlyphs` decode (per-glyph bitmap into a HashMap on
-      `KmsBackend`) + `render_composite_glyphs` walking the glyph
-      stream and compositing each glyph alpha mask onto the dst image
-      with `Operation::Over` (mirroring the existing
-      `render_text_string` path for core text). Phase 6.6.
-- [ ] **`RENDER::Composite` is a no-op stub on KMS.** Off-screen-
-      buffer-to-window blits via the generic Composite call drop
-      silently. Visible: fvwm3 popup chrome shows garbage where
-      double-buffered widgets blit their content. Implementation:
-      look up src + dst pictures, call `dst.0.composite32(...)` with
-      the appropriate Operation. Bounded scope (~50 LoC) once the
-      picture-state model from 6.5 Step 1B is in place. Phase 6.6.
-- [ ] **Window drag does not work under fvwm3/KMS.** Click-and-drag
-      on a fvwm-framed window does not move the window; click/focus/
-      keyboard input all work. Most likely a pointer-grab / motion-
-      routing gap surfaced by KmsBackend's pointer pump (the host
-      backend gets grab semantics for free from the host X server).
-      Investigate: does KmsBackend deliver MotionNotify while a
-      ButtonPress grab is active? Does the grab path correctly route
-      events to the grabbing client? Phase 6.6.
-- [ ] **xterm text corrupts after scrolling on KMS.** After running
-      a command that scrolls the buffer (e.g. `ls`), some glyphs
-      appear doubled / overlapped. Probably a CopyArea-within-window
-      stride/clip issue surfaced when xterm scrolls its content via
-      CopyArea. Pre-existing scrollback issue (already tracked under
-      "WM-specific behaviour") may be related. Phase 6.6.
 - [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
       treat any arc as a full ellipse regardless of `angle1`/`angle2`.
       Fine for xeyes (full circles) but anything that draws actual
@@ -379,48 +219,10 @@ that the host hides for us.
       partial arcs. Once angle clipping is in, the outline algorithm
       needs the same treatment plus proper arc endpoints (so a
       half-arc outline doesn't close itself across the chord).
-- [ ] **Pixman `fill_rectangles` segfaults on partly-out-of-bounds
-      rects.** `clip_rects_to_image` works around it for `poly_line`,
-      `poly_segment`, `poly_arc`, `poly_fill_arc`. Other call sites
-      (`fill_rectangle`, `poly_fill_rectangle`, `image_text8`'s
-      background rect, …) currently rely on either pre-clamping or on
-      the rect being in-bounds by construction. Audit them all and
-      either route through the helper or guarantee bounds. Investigate
-      *why* pixman segfaults — our build / version may be misbehaving
-      and an upgrade could let us drop the workaround.
-- [ ] **Host (GTK) cursor and guest cursor drift.** virtio-tablet gives
-      libinput absolute positions, but the host's QEMU GTK window also
-      shows its own cursor at a different spot — they diverge after a
-      few movements because libinput rescales by device range and we
-      rescale to scanout. Either lock the GTK cursor to the guest
-      cursor (so user only sees one) or pass through *true* host
-      coordinates and skip the libinput rescale.
-- [ ] **`list_fonts_proxy` returns empty list.** We synthesise a valid
-      32-byte "no fonts" reply so font-querying clients (xclock) don't
-      block, but real font enumeration is missing.  XListFonts /
-      XListFontsWithInfo against a real font path would let the host
-      pretend to have e.g. the standard `*-fixed-*` set. Cosmetic —
-      every client we tested falls back to the built-in font and
-      proceeds.
 - [ ] **`poly_line` thick lines.** GC `line_width` ignored; we always
       rasterise as 1-pixel Bresenham. Most clients use line_width=0
       (server-discretion thin) but anything wanting a 3- or 5-px line
       would render too thin.
-- [ ] **fvwm3 modules wedge on missing ConfigureNotify.** fvwm3 itself
-      starts and reparents client windows correctly (SubstructureRedirect
-      / MapRequest forwarding works), but at least one module
-      (FvwmIconMan / FvwmPager / FvwmButtons depending on config) goes
-      into a tight `ConfigureWindow → ChangeWindowAttributes →
-      GetInputFocus` busy loop reconfiguring the same panel windows to
-      `(-1, -1)` and back. The pattern matches "module configured a
-      window and is waiting for a ConfigureNotify before continuing,
-      never gets one, retries". Likely fix: have
-      `KmsBackend::configure_subwindow` synthesize a ConfigureNotify to
-      StructureNotify-subscribed clients (and SubstructureNotify-
-      subscribed parents) the way the host backend gets via the host X
-      server. Reference: x11trace of fvwm3 under Xephyr at
-      `Xephyr-fvwm3.log` shows 25× ConfigureNotify, 24× MapNotify, 21×
-      ReparentNotify, 16× CreateNotify delivered during fvwm startup.
 - [ ] **Opcode 58 (SetDashes) unsupported.** Logged as
       `unsupported opcode 58` from fvwm modules; means dashed lines
       aren't honoured.  Cosmetic — dashes fall back to solid.
@@ -430,11 +232,6 @@ that the host hides for us.
 
 ## WM-specific behaviour
 
-- [ ] **xterm scrollback misbehaviour.** `seq 1 200` scrolls forward
-      cleanly but scrollback via scrollbar / mouse wheel / PageUp /
-      Shift+PageUp doesn't behave correctly. No unsupported opcodes
-      in the trace; likely a coord/grab/clip subtlety. Phase 1
-      follow-up, parked since the rest of xterm works.
 - [ ] **e16 popup rounded corners.** Cosmetic — popup outer shape is
       Set+Intersect rectangular bounding; rounded look comes from
       bg-pixmap content, with small black pixels at the very corners
@@ -453,11 +250,6 @@ that the host hides for us.
       draws frame decorations into 1×1 sub-windows of the frame and
       that drawing path doesn't reach the host (same family as the
       old wmaker chrome bugs).
-- [ ] **e16 intermittent popup mapping.** Largely subsumed by the
-      Phase 3.7 fixes — the "first desktop never works,
-      second always does" symptom was the
-      `POINTER_EVENT_MASK` regression. Re-evaluate after a wmaker /
-      fvwm3 / e16 smoke cycle on current master to confirm.
 
 ## Extension polish
 
@@ -474,22 +266,6 @@ that the host hides for us.
 
 ## Validation surface
 
-- [x] **xts XI / XIproto reply-required-handler hang** (resolved
-      2026-05-07, commit `d00191a`). 22 XI 1.x minors (2, 3, 5, 7,
-      9–13, 20, 22, 24, 26–30, 33–36, 39) now emit a 32-byte zero-fill
-      stub reply, so xts no longer blocks in `_XReply` on
-      `XListInputDevices` / `XOpenDevice`. Both suites complete and
-      produce a baseline. Most tests are UNTESTED because
-      `ListInputDevices` advertises 0 devices (preconditions unmet) —
-      getting actual PASSes is a separate task: surface real
-      pointer/keyboard with valid class info and wire `XOpenDevice` /
-      `GrabDevice` / event paths to per-device state.
-- [ ] **XTEST extension in ynest.** Implementing `XTestFakeKeyEvent` /
-      `XTestFakeButtonEvent` (extension major 138, opcodes 2 and 3)
-      would let `xdotool key`/`xdotool click` drive ynest in headless
-      smoke tests. ~50–100 LoC. Today the bwrap-sandbox X test runs
-      can only validate visual rendering and client connect, not
-      input event delivery.
 - [ ] **gtk3-demo / gtk4 demo runs in this dev environment.**
       gtk-demo (gtk4) starts then exits silently on the host's `:0`
       regardless of whether it's run nested under ynest or directly.
