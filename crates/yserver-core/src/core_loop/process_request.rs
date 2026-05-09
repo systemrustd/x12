@@ -566,21 +566,45 @@ fn destroy_window_subtree(
         });
     }
     let bg_pixmap_xids = state.resources.collect_bg_pixmap_host_xids(root);
-    // Phase 4.2.4 design §3.3.2 teardown rules. Drain queued
-    // PresentPixmap requests for every destroyed window — no
-    // IdleNotify/CompleteNotify because the window is gone, but the
-    // attached idle-fence/idle-syncobj semaphores need their wait
-    // chains released. Phase 4.2.4 first cut just drains; the
-    // semaphore-signal step lands when KMS submission is wired.
+    // Per design §3.3.2 teardown rules: drain every queued
+    // PresentPixmap for the destroyed window and *signal* each
+    // frame's idle fence / idle-syncobj. Without this, Mesa's WSI
+    // thread (or any client waiting on the fence) is stuck forever
+    // because the IdleNotify the signal would normally accompany
+    // never fires — the window is gone before the frame would have
+    // landed.
     for window in &order {
         let drained = state.present_scheduler.drain_window(*window);
-        if !drained.is_empty() {
-            log::debug!(
-                "PRESENT teardown: drained {} queued frame(s) from destroyed window 0x{:x}",
-                drained.len(),
-                window.0
-            );
+        if drained.is_empty() {
+            continue;
         }
+        for frame in &drained {
+            match frame.idle {
+                crate::present_scheduler::PresentSync::Binary { fence: 0 } => {}
+                crate::present_scheduler::PresentSync::Binary { fence } => {
+                    if let Err(e) = backend.dri3_trigger_fence(fence) {
+                        log::warn!(
+                            "PRESENT teardown: trigger idle fence 0x{:x} failed: {e}",
+                            fence
+                        );
+                    }
+                }
+                crate::present_scheduler::PresentSync::Timeline { syncobj: 0, .. } => {}
+                crate::present_scheduler::PresentSync::Timeline { syncobj, value } => {
+                    if let Err(e) = backend.dri3_signal_syncobj(syncobj, value) {
+                        log::warn!(
+                            "PRESENT teardown: signal idle syncobj 0x{:x}@{value} failed: {e}",
+                            syncobj
+                        );
+                    }
+                }
+            }
+        }
+        log::debug!(
+            "PRESENT teardown: drained {} queued frame(s) from destroyed window 0x{:x}",
+            drained.len(),
+            window.0
+        );
     }
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
@@ -1608,14 +1632,34 @@ fn handle_sync_request(
             }
         }
         x11sync::TRIGGER_FENCE => {
-            if let Some(fence) = x11sync::parse_resource(body)
-                && let Some(f) = state.sync_fences.get_mut(&fence)
-            {
-                f.triggered = true;
+            if let Some(fence) = x11sync::parse_resource(body) {
+                if let Some(f) = state.sync_fences.get_mut(&fence) {
+                    f.triggered = true;
+                }
                 debug!(
                     "client {} #{} SYNC::TriggerFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
                 );
+                // Wake any pending Await whose list contains this
+                // fence. We don't actually unblock the client's
+                // request stream (see SyncPendingAwait doc-comment)
+                // but we do log the satisfaction so test harnesses
+                // can assert sequencing.
+                let mut satisfied: Vec<crate::server::SyncPendingAwait> = Vec::new();
+                state.sync_pending_awaits.retain(|a| {
+                    if a.fences.contains(&fence) {
+                        satisfied.push(a.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for a in &satisfied {
+                    debug!(
+                        "SYNC::AwaitSatisfied client={} seq={} on fence=0x{:x}",
+                        a.client.0, a.sequence.0, fence
+                    );
+                }
             }
         }
         x11sync::RESET_FENCE => {
@@ -1635,20 +1679,46 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::AWAIT_FENCE => {
-            // Phase 4.2.2 stub: returns immediately. Real blocking
-            // implementation requires per-client wait queues hooked
-            // into the core loop's event scheduler. The two-client
-            // smoke from §5.2 still works because TriggerFence
-            // updates state synchronously and the second client
-            // observes the triggered bit on the next QueryFence /
-            // AwaitFence dispatch.
+            // Spec: server must defer further processing of this
+            // client's requests until *any* fence in the list is
+            // triggered. We don't actually suspend the request
+            // stream (real blocking needs core-loop integration —
+            // see SyncPendingAwait doc-comment), but we *do*
+            //
+            // 1. Short-circuit when at least one fence is already
+            //    triggered: the await is trivially satisfied, log
+            //    it and move on. No state change.
+            // 2. Otherwise record the await on `sync_pending_awaits`
+            //    so a later TriggerFence on any of these fences
+            //    fires an `AwaitSatisfied` log line — useful for
+            //    tests that need to assert sequencing.
             if let Some(fences) = x11sync::parse_await_fence(body) {
-                debug!(
-                    "client {} #{} SYNC::AwaitFence n={} (non-blocking stub)",
-                    client_id.0,
-                    sequence.0,
-                    fences.len()
-                );
+                let any_triggered = fences
+                    .iter()
+                    .any(|f| state.sync_fences.get(f).is_some_and(|s| s.triggered));
+                if any_triggered {
+                    debug!(
+                        "client {} #{} SYNC::AwaitFence n={} -> already triggered",
+                        client_id.0,
+                        sequence.0,
+                        fences.len()
+                    );
+                } else {
+                    state
+                        .sync_pending_awaits
+                        .push(crate::server::SyncPendingAwait {
+                            client: client_id,
+                            sequence,
+                            fences: fences.clone(),
+                        });
+                    debug!(
+                        "client {} #{} SYNC::AwaitFence n={} -> pending (request stream NOT \
+                         suspended — known gap)",
+                        client_id.0,
+                        sequence.0,
+                        fences.len()
+                    );
+                }
             }
         }
         x11sync::SET_PRIORITY => {
@@ -3347,9 +3417,16 @@ fn handle_present_request(
                 const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
                 req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
             };
-            // PresentScheduler enqueue. choose_path with flip_path=false
-            // (Phase 4.2.3) always returns Copy so this is the only
-            // branch wired for now.
+            // Run the path selector with real inputs from the live
+            // pixmap / window state. `flip_path` short-circuits to
+            // Copy when false (which is what the KmsBackend currently
+            // reports — the VkDeviceMemory→DRM-GEM bridge that would
+            // make alien-BO Flip work hasn't landed). When that
+            // bridge arrives the dispatcher will pick Flip or
+            // DirectScanout naturally; today the selector still runs
+            // and Copy still wins. The synchronous `copy_area` above
+            // is what produced the visible pixels regardless of path.
+            let path = present_path_for(state, &req, &caps);
             state
                 .present_scheduler
                 .enqueue(crate::present_scheduler::QueuedPresent {
@@ -3366,7 +3443,7 @@ fn handle_present_request(
                     idle: crate::present_scheduler::PresentSync::Binary {
                         fence: req.idle_fence,
                     },
-                    path: crate::present_scheduler::PresentPath::Copy,
+                    path,
                     valid_region: req.valid,
                     update_region: req.update,
                 });
@@ -3510,7 +3587,7 @@ fn handle_present_request(
                         syncobj: req.release_syncobj,
                         value: req.release_value,
                     },
-                    path: crate::present_scheduler::PresentPath::Copy,
+                    path: present_path_for_synced(state, &req, &caps),
                     valid_region: req.valid,
                     update_region: req.update,
                 });
@@ -3555,6 +3632,90 @@ fn handle_present_request(
 /// Fan out `CompleteNotify { mode: Copy }` and `IdleNotify` to every
 /// `present_event_selections` entry that subscribed to the window
 /// with the matching event-mask bit. Phase 4.2.3 design §3.3.2.
+/// Pick the Present path for a `PresentPixmap` request. Calls the
+/// real `choose_path` selector with whatever inputs we can plumb
+/// from live state. `caps.flip_path == false` short-circuits to
+/// `PresentPath::Copy` regardless of the rest — which is what
+/// KmsBackend reports today (the alien-BO → DRM-GEM bridge that
+/// would make Flip / DirectScanout viable isn't wired). The
+/// selector still runs so the architecture is correct: when the
+/// bridge lands, `flip_path` flips to `true` and the rest of the
+/// inputs become load-bearing.
+fn present_path_for(
+    state: &ServerState,
+    req: &yserver_protocol::x11::present::PixmapRequest,
+    caps: &crate::backend::PresentCaps,
+) -> crate::present_scheduler::PresentPath {
+    let inputs = build_path_selector_inputs(
+        state,
+        req.window,
+        req.pixmap,
+        req.options,
+        req.valid,
+        req.update,
+    );
+    crate::present_scheduler::choose_path(&inputs, caps.flip_path, || None)
+}
+
+/// `PresentPixmapSynced` (v1.4) variant. Same selector, same inputs.
+fn present_path_for_synced(
+    state: &ServerState,
+    req: &yserver_protocol::x11::present::PixmapSyncedRequest,
+    caps: &crate::backend::PresentCaps,
+) -> crate::present_scheduler::PresentPath {
+    let inputs = build_path_selector_inputs(
+        state,
+        req.window,
+        req.pixmap,
+        req.options,
+        req.valid,
+        req.update,
+    );
+    crate::present_scheduler::choose_path(&inputs, caps.flip_path, || None)
+}
+
+/// Common assembly of `PathSelectorInputs` from live server state.
+/// Pixmap format/modifier and the output's scanout-compat set are
+/// stubbed to defaults: tracking imported-pixmap dma-buf metadata
+/// + plumbing the kernel's scanout-compat probe through the
+/// Backend trait is real work the alien-BO bridge will do.
+fn build_path_selector_inputs<'a>(
+    state: &ServerState,
+    window: u32,
+    pixmap: u32,
+    options: u32,
+    valid_region: u32,
+    update_region: u32,
+) -> crate::present_scheduler::PathSelectorInputs<'a> {
+    let (pixmap_w, pixmap_h) = state
+        .resources
+        .pixmap(ResourceId(pixmap))
+        .map_or((0, 0), |p| (p.width, p.height));
+    let (window_w, window_h) = state
+        .resources
+        .window(ResourceId(window))
+        .map_or((0, 0), |w| (w.width, w.height));
+    // Output dims from RandrState's aggregated screen extent.
+    let output_w = state.randr.screen_width;
+    let output_h = state.randr.screen_height;
+    let window_covers_output = window_w == output_w && window_h == output_h;
+    crate::present_scheduler::PathSelectorInputs {
+        options,
+        valid_region,
+        update_region,
+        pixmap_w,
+        pixmap_h,
+        pixmap_format: 0,
+        pixmap_modifier: 0,
+        window_w,
+        window_h,
+        window_covers_output,
+        output_w,
+        output_h,
+        output_scanout_format_set: &[],
+    }
+}
+
 fn fire_present_completion_events(
     state: &mut ServerState,
     byte_order: yserver_protocol::x11::ClientByteOrder,

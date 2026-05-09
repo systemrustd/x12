@@ -152,6 +152,12 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .sync_alarms
         .retain(|_, alarm| alarm.owner != client_id);
     state
+        .sync_fences
+        .retain(|_, fence| fence.owner != client_id);
+    state.sync_pending_awaits.retain(|a| a.client != client_id);
+    state.glx_contexts.retain(|_, c| c.owner != client_id);
+    state.glx_drawables.retain(|_, d| d.owner != client_id);
+    state
         .damage_objects
         .retain(|_, damage| damage.owner != client_id && !dead_windows.contains(&damage.drawable));
     state

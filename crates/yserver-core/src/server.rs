@@ -228,6 +228,27 @@ pub struct ServerState {
     /// GLX drawables (windows, pixmaps, pbuffers) — keyed by the GLX
     /// drawable XID the client chose at create-time.
     pub glx_drawables: HashMap<u32, GlxDrawable>,
+    /// Outstanding `XSync::AwaitFence` requests waiting on at least
+    /// one fence in the list to transition to triggered. Per the
+    /// spec the server must defer further processing of the
+    /// blocked client's requests until *any* of the listed fences
+    /// triggers; **we don't suspend the client's request stream**
+    /// (that requires deeper core-loop integration), so this map
+    /// only records the await for telemetry + a corresponding
+    /// `TriggerFence`-time `AwaitSatisfied` debug log. Real
+    /// blocking is left as a known gap — see followup §5 in
+    /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
+    pub sync_pending_awaits: Vec<SyncPendingAwait>,
+}
+
+/// One outstanding `XSync::AwaitFence` request that hasn't been
+/// satisfied yet. Stored on `ServerState` until any fence in
+/// `fences` triggers.
+#[derive(Clone, Debug)]
+pub struct SyncPendingAwait {
+    pub client: ClientId,
+    pub sequence: SequenceNumber,
+    pub fences: Vec<u32>,
 }
 
 /// GLX context resource. We never run server-side GL — direct-
@@ -299,6 +320,7 @@ impl ServerState {
             glx_contexts: HashMap::new(),
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
+            sync_pending_awaits: Vec::new(),
         }
     }
 
