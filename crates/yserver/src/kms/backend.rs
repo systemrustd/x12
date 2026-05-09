@@ -2911,14 +2911,19 @@ impl KmsBackend {
                     let src_row = data.as_ptr().add(src_row_byte_start);
                     match depth {
                         1 => {
-                            // X11 ZPixmap depth-1: bits packed MSB-first
-                            // per byte, scanlines padded to 32 bits.
-                            // Unpack each bit into a byte (0xFF / 0x00)
-                            // for the R8 mirror.
+                            // X11 ZPixmap depth-1: bits packed per the
+                            // server's advertised bitmap_format_bit_order,
+                            // scanlines padded to 32 bits. Setup advertises
+                            // LSBFirst (= setup.byte_order for the LE
+                            // clients we accept) — pixel 0 is bit 0 (LSB)
+                            // of byte 0. Unpack each bit into a byte
+                            // (0xFF / 0x00) for the R8 mirror. (Was
+                            // MSB-first; that mismatch produced an
+                            // every-8-pixel sawtooth on shape masks.)
                             for col in 0..plan.extent_w as usize {
                                 let bit_index = plan.src_x as usize + col;
                                 let byte = *src_row.add(bit_index >> 3);
-                                let bit = (byte >> (7 - (bit_index & 7))) & 1;
+                                let bit = (byte >> (bit_index & 7)) & 1;
                                 *dst_row.add(col) = if bit != 0 { 0xFF } else { 0x00 };
                             }
                         }
