@@ -950,7 +950,140 @@ Goal: modern GLX/EGL/Vulkan direct-rendering paths and host buffer
 sharing. Validate real GPU-accelerated clients. (MIT-SHM landed in
 Phase 3.5.)
 
-Not started.
+### Phase 4.1 — Vulkan compositor on KMS (in progress, branch `accel`)
+
+Replace the pixman CPU compositor in `crates/yserver/src/kms/` with a
+Vulkan compositor built on a per-window-texture scene graph. Spec:
+[`2026-05-07-phase4-1-vulkan-compositor-design.md`](superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md).
+Plan:
+[`2026-05-08-phase4-1-vulkan-compositor.md`](superpowers/plans/2026-05-08-phase4-1-vulkan-compositor.md).
+
+#### Landed (branch `accel`)
+
+- [x] **Sub-phase 4.1.1 — Vulkan plumbing, idle.** Workspace deps
+      (`ash`, `gpu-allocator`, `gbm`, `thiserror`); `kms/vk/` module
+      tree; `VkContext` (instance + physical device picker + logical
+      device + debug messenger + drop order); wired into
+      `KmsBackend::open_with_commit` as best-effort init (logs warning
+      and falls back to pixman-only if no ICD). `just yserver-venus`
+      recipe added; verified `vulkan initialised on physical device
+      Virtio-GPU Venus (AMD Radeon 680M (RADV REMBRANDT))` under Venus
+      passthrough; rendercheck `fill` 48/48 + `blend` 4/4 confirm
+      pixman path unaffected. Validation layer + device-extension
+      list both filtered to what the picked device actually supports.
+
+- [x] **Sub-phase 4.1.2 — Vulkan-fed scanout (Tasks 2.1–2.8).**
+      End-to-end Vulkan-fed atomic-fence scanout, opt-in via
+      `YSERVER_VK_SCANOUT=pixman_shadow`. Default `Pixman` mode keeps
+      the existing dumb-buffer path unchanged — parity bar (xts5,
+      rendercheck) holds because no rendering code path was modified.
+
+      Architecture: **Vulkan-first allocation** (originally GBM-first
+      per the spec; pivoted because Polaris/RADV gfx8 lacks
+      `VK_EXT_image_drm_format_modifier` and Mesa Venus can't
+      dma-buf-import guest-allocated GBM bos via virtgpu cross-driver
+      handle translation). Each `ScanoutBo` allocates a `VkImage`
+      with `TILING_LINEAR` + `VkExportMemoryAllocateInfo(DMA_BUF)`,
+      exports the bound memory via `vkGetMemoryFdKHR`, imports as a
+      DRM GEM via `PRIME_FD_TO_HANDLE`, and registers as a DRM
+      framebuffer with plain `add_fb2` (no MODIFIERS flag).
+
+      Per-bo state machine: `Free → Recording → Submitted → Pending →
+      OnScreen → Retiring → Free`. Atomic-commit explicit-fence flips
+      via `submit_flip_with_fences` (IN_FENCE_FD plane property +
+      OUT_FENCE_PTR CRTC property). Pageflip-complete events advance
+      bo state; per-output skip when the previous flip is still
+      pending (avoids -EBUSY thrash). Drain on shutdown via
+      `ScanoutBoPool::drain_all_pending` (`vkDeviceWaitIdle` + close
+      fence fds).
+
+      Verified:
+      - **Mesa Venus / RADV REMBRANDT** (vng harness): pool allocates
+        cleanly, `present_frame_via_vulkan` runs end-to-end, atomic
+        explicit-fence flips, pageflip-completes cycle bos through
+        the state machine.
+      - **Bare-metal AMD Radeon RX 580 (Polaris)**: dual-monitor
+        5120×1440 setup, Vulkan-fed scanout active, cursor moves at
+        vsync, no fallback warnings, kernel retires every flip
+        (`pageflip-complete: first event` logged for both outputs).
+      - **xts5 / rendercheck** in default Pixman mode: 100% pass on
+        the smoke subset (fill 48/48, blend 4/4, bug7366 1/1) — Phase
+        4.1 work is purely additive, parity bar unaffected.
+
+      66 host-side unit tests covering bo state machine + 6-frame
+      fence-cycle integration test (`scanout::tests::six_frames_cycle_through_pool_without_leaking_fences`).
+
+- [x] **Sub-phase 4.1.3 — Per-window VkImage mirrors + scene-graph
+      composite.** Architectural checkpoint per the plan: pixman
+      scanout replaced by a Vulkan composite pass that walks the
+      window tree and draws one textured quad per visible drawable
+      sampling its `vk_mirror`. PixmanShadow bridge mode deleted;
+      only `Pixman` (legacy fallback) and `VkComposite` (active)
+      modes remain.
+
+      Architecture:
+
+      - **Per-drawable mirror.** Every `WindowState` / `PixmapState`
+        / `CursorState` holds an `Option<DrawableImage>` containing
+        a `VkImage` + `VkImageView`. Created at CreateWindow /
+        CreatePixmap / cursor-create; reallocated on
+        ConfigureWindow resize.
+      - **Damage-driven upload (`MirrorUploader`).** Every
+        `with_image_mut` site marks the mirror fully damaged.
+        Pre-composite each frame, a single CB batches one
+        `vkCmdCopyBufferToImage` per dirty mirror from the host
+        pixman buffer into the mirror image (one submit + one
+        `vkQueueWaitIdle` per frame, growable host-visible staging
+        buffer).
+      - **Composite pipeline (`pipeline.rs`).** GLSL textured-quad
+        shaders compiled to SPIR-V at build time via `glslc`
+        (build.rs); single graphics pipeline with src-over blend
+        and dynamic viewport+scissor; 1024-set descriptor pool
+        reset per frame.
+      - **Composite pass
+        (`compositor::record_and_present_composite`).** Scans bg
+        pixmap (per-output slice of a virtual-screen-sized
+        wallpaper), walks the window tree depth-first stacking
+        order back-to-front emitting per-window quads, appends a
+        cursor quad with src-over alpha. AABB cull skips windows
+        whose absolute rect is entirely outside the output.
+        UNDEFINED → COLOR_ATTACHMENT_OPTIMAL barrier, dynamic
+        rendering with `loadOp=CLEAR` (bg color), per-draw
+        bind+push+draw, end_rendering, COLOR_ATTACHMENT_OPTIMAL →
+        GENERAL barrier, atomic flip with explicit IN_FENCE_FD /
+        OUT_FENCE_PTR (same fence handshake as PixmanShadow).
+
+      Verified bare-metal AMD Radeon RX 580 (Polaris) dual-monitor
+      5120×1440 under wmaker + xterm: VkComposite enabled, both
+      outputs paint cleanly, cursor tracks at vsync, mirror upload
+      pipe runs without warnings, no fallback to pixman path.
+
+      **Deferred** (not blockers for 4.1.4):
+
+      - **Scissor on `frame_damage`** (plan 3.4 step 3). Requires
+        per-frame damage tracking + bo-content preservation across
+        the rotating 3-bo pool; without it scissor restricts writes
+        but leaves stale bytes outside.
+      - **Occlusion cull** (design §"Frame composite pass" step 3).
+        AABB cull suffices for current draw counts.
+      - **Lavapipe integration test** (plan 3.5). Pure-logic
+        precedent (2.7) doesn't compose with `DrawableImage`'s real
+        VkContext requirement; bare-metal smoke is the load-bearing
+        verification.
+      - **SHAPE clipping** beyond the empty-region skip.
+      - **`bg_pixmap_image` rescued path** (no mirror today; falls
+        back to bg color).
+      - **xts5 / rendercheck full sweep** (plan 3.6 parity gate).
+        Run when the user does the next bare-metal validation.
+
+#### Known orthogonal issues (not Phase 4.1)
+
+- fvwm3/xterm/xclock client visibility on bare-metal silence: clients
+  connect, do setup, but windows don't render. Same fvwm3 binary +
+  config works under ynest and yserver-in-vng. Almost certainly
+  environment-specific yserver-core protocol issue (font matching,
+  color allocation, multi-monitor RandR) unrelated to scanout. To
+  triage post-4.1.
 
 ## Phase 5 — Full desktop sessions
 

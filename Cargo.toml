@@ -30,6 +30,8 @@ nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "s
 signal-hook = "0.4"
 crossbeam-channel = "0.5"
 mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
-pixman = "0.2"
 freetype-rs = "0.38"
 xkbcommon = "0.9"
+ash = "0.38"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+thiserror = "2"

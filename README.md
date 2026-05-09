@@ -23,9 +23,12 @@ DAMAGE, COMPOSITE, SYNC, Present, MIT-SHM, XTEST.
 
 `yserver` (standalone DRM/KMS) runs the same WM matrix end-to-end on
 bare DRM/KMS — boots in `virtme-ng`, sets a mode on virtio-gpu,
-drives input via libinput, and renders via pixman + freetype. e16
-and Window Maker work; fvwm3 boots but its core-font menu rendering
-has a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
+drives input via libinput, and renders via Vulkan (lavapipe in the
+vng dev loop; Venus passthrough or any native ICD on real hardware),
+with freetype-driven glyph rasterization into an `R8_UNORM` atlas.
+The pixman rendering backend has been retired entirely. e16 and
+Window Maker work; fvwm3 boots but its core-font menu rendering has
+a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
 
 See [`docs/test-status.md`](docs/test-status.md) for the latest xts5
 + rendercheck pass numbers, [`docs/status.md`](docs/status.md) for

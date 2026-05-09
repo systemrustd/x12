@@ -54,17 +54,26 @@ impl Device {
     }
 
     fn enable_atomic_capabilities(&self) -> io::Result<()> {
-        for cap in [ClientCapability::UniversalPlanes, ClientCapability::Atomic] {
-            self.set_client_capability(cap, true).map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "DRM driver does not support {cap:?} — virtio-gpu in modern kernels \
-                         supports both atomic and universal planes; check kernel and \
-                         qemu-desktop versions: {err}"
-                    ),
-                )
-            })?;
+        // Both UniversalPlanes and Atomic are *opt-ins to fd visibility*
+        // — drivers that have inherently-universal-only planes (e.g.
+        // Asahi's apple_drm) reject the cap-set with EOPNOTSUPP even
+        // though atomic state is still honoured at the ioctl level.
+        // Warn but continue on either; an actually-non-atomic driver
+        // will fail downstream at the first atomic_commit, which is
+        // where we'd want the diagnostic anyway.
+        if let Err(err) = self.set_client_capability(ClientCapability::UniversalPlanes, true) {
+            log::warn!(
+                "DRM_CLIENT_CAP_UNIVERSAL_PLANES rejected ({err}); driver is presumably \
+                 universal-only — continuing"
+            );
+        }
+        if let Err(err) = self.set_client_capability(ClientCapability::Atomic, true) {
+            log::warn!(
+                "DRM_CLIENT_CAP_ATOMIC rejected ({err}); the driver may still honour \
+                 atomic_commit ioctls without the explicit opt-in (Asahi apple_drm) — \
+                 continuing. If subsequent atomic_commit calls fail, the driver is \
+                 genuinely non-atomic and yserver/KMS won't work on this kernel."
+            );
         }
         Ok(())
     }

@@ -39,8 +39,12 @@ fi
 
 # xts-report consumes the journal. The previous run may have already
 # generated `summary`; either way, regenerate.
-report_bin="$XTS_DIR/build/xts5/src/bin/reports/xts-report"
-"$report_bin" -d2 -f "$result_dir/journal" > "$result_dir/summary" 2>/dev/null || true
+report_bin=$(find "$XTS_DIR" -path '*/bin/reports/xts-report' -executable 2>/dev/null | head -1)
+if [[ -z "$report_bin" ]]; then
+    echo "warning: xts-report binary not found under $XTS_DIR" >&2
+else
+    "$report_bin" -d2 -f "$result_dir/journal" > "$result_dir/summary" 2>/dev/null || true
+fi
 
 echo
 echo "==== Result directory ===="

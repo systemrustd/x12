@@ -55,7 +55,7 @@ yserver-multihead:
             target/debug/yserver &\
             yserver_pid=$!;\
             sleep 2;\
-            DISPLAY=:7 wmaker > wmaker.log 2>&1 &\
+            DISPLAY=:7 fvwm3 > fvwm3.log 2>&1 &\
             sleep 2;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
@@ -146,6 +146,15 @@ yserver-debug:
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c 'RUST_LOG=debug RUST_BACKTRACE=1 target/debug/yserver'
 
+# Phase 4.1: yserver under virtio-gpu Venus passthrough.
+# Exposes a real Vulkan device inside the guest. Requires
+# `vulkan-virtio` on the host (Venus ICD).
+yserver-venus mode="1024x768" log="info":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c 'RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver'
+
 # Run yserver headless + wait 8 s + start xterm inside the guest.
 # Use to smoke-test the xterm path without needing two terminals.
 yserver-xterm:
@@ -201,7 +210,7 @@ vulkan-check-venus:
 yserver-fvwm3-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci,edid=on,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
@@ -214,7 +223,7 @@ yserver-fvwm3-xterm mode="1024x768" log="trace":
 yserver-e16-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci,edid=on,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
@@ -227,7 +236,7 @@ yserver-e16-xterm mode="1024x768" log="trace":
 yserver-wmaker-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci,edid=on,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
@@ -236,6 +245,46 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
             sleep 2;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
+
+# Run yserver directly on bare-metal hardware (no vng), capture its log,
+# and bring up fvwm3 + xterm against it. Intended for TTY2 use while
+# another graphical session (GNOME/Xorg) holds the user's main display
+# on a different VT — yserver acquires DRM master on whichever
+# /dev/dri/cardN matches its discovery.
+#
+# Defaults: PixmanShadow scanout (Vulkan-fed flip path) + debug-level
+# logging. Switch back to the existing pixman+dumb-buffer path with
+# `scanout=pixman`.  Lower log volume with `log=info`.
+#
+# Closing xterm terminates the recipe; yserver is then SIGTERMed and
+# the DRM master is released cleanly.
+yserver-fvwm3-xterm-hw scanout="vk_composite" log="info":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 fvwm3 > /tmp/fvwm3-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: /tmp/yserver-hw.log";\
+        echo "fvwm3 log:   /tmp/fvwm3-hw.log"'
+
+yserver-wmaker-xterm-hw scanout="vk_composite" log="info":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 wmaker > /tmp/wmaker-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: /tmp/yserver-hw.log";\
+        echo "wmaker log:   /tmp/wmaker-hw.log"'
 
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
 # `tests` is a comma-separated list. Default budget is 600s/test —

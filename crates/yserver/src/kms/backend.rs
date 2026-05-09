@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, io, sync::Arc};
 
-use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
+use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
 use yserver_core::{
     backend::{
         AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle, GcFunction,
@@ -44,267 +44,130 @@ unsafe impl Send for XkbKeymap {}
 pub struct XkbState(pub xkbcommon::xkb::State);
 unsafe impl Send for XkbState {}
 
-/// Newtype wrapper around pixman::Image.
-/// SAFETY: All access is on the single-threaded core thread.
-/// The main thread owns scanout; window/pixmap images are only touched
-/// on the main thread.
-pub struct PixmanImage(pub Image<'static, 'static>);
-
-unsafe impl Send for PixmanImage {}
-
-impl PixmanImage {
-    /// Create a blank Pixman image with the given format and dimensions.
-    pub fn new(format: FormatCode, width: u16, height: u16, clear: bool) -> io::Result<Self> {
-        Image::new(format, width as usize, height as usize, clear)
-            .map(Self)
-            .map_err(|_| io::Error::other("pixman image creation failed"))
-    }
-
-    /// Create a Pixman image wrapping an external buffer (for scanout).
-    ///
-    /// # Safety
-    /// Caller guarantees the buffer outlives the image and is valid for the
-    /// given dimensions and rowstride. The buffer must remain valid for the
-    /// lifetime of the returned `PixmanImage`.
-    pub unsafe fn from_buffer(
-        format: FormatCode,
-        width: u16,
-        height: u16,
-        bits: *mut u32,
-        rowstride_bytes: usize,
-        clear: bool,
-    ) -> io::Result<Self> {
-        unsafe {
-            Image::from_raw_mut(
-                format,
-                width as usize,
-                height as usize,
-                bits,
-                rowstride_bytes,
-                clear,
-            )
-        }
-        .map(Self)
-        .map_err(|_| io::Error::other("pixman image creation from buffer failed"))
-    }
-
-    pub fn width(&self) -> usize {
-        self.0.width()
-    }
-
-    pub fn height(&self) -> usize {
-        self.0.height()
-    }
-
-    pub fn stride(&self) -> usize {
-        self.0.stride()
-    }
-
-    /// Returns the raw pixel buffer pointer.
-    ///
-    /// # Safety
-    /// The returned pointer is valid for the lifetime of the image. The
-    /// caller must ensure no aliasing mutable access (e.g. via another
-    /// `&mut PixmanImage` or another raw pointer obtained the same way).
-    /// The buffer's element type depends on the image's `FormatCode` —
-    /// dereferencing as `u32` is only correct for 32-bit-per-pixel
-    /// formats (`A8R8G8B8`, `X8R8G8B8`). For sub-32bpp formats (`A8`,
-    /// `A1`) cast the returned pointer to `*mut u8` and use the byte
-    /// stride from `stride()`.
-    pub unsafe fn data(&self) -> *mut u32 {
-        // SAFETY: forwarded contract — caller guarantees serialized access.
-        unsafe { self.0.data() }
-    }
-
-    /// Raw `*mut pixman_image_t` for the FFI helpers below. Call sites
-    /// should use `composite32` / `composite_trapezoids` rather than
-    /// invoking `pixman::ffi::*` directly.
-    fn ffi_ptr(&self) -> *mut pixman::ffi::pixman_image_t {
-        self.0.as_ptr()
-    }
+/// Owning snapshot of a drawable's mirror pixels, produced by
+/// [`KmsBackend::read_mirror_pixels`]. Tightly packed (no row pad),
+/// `bytes_per_pixel` ∈ {1, 4} matching the mirror's Vulkan format
+/// (`R8_UNORM` for depth 1/8, `B8G8R8A8_UNORM` for depth 24/32).
+struct MirrorReadback {
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+    bytes: Vec<u8>,
 }
 
-/// Composite using `pixman_image_composite32`.
-///
-/// `dst` is borrowed mutably; `src_ptr` and `mask_ptr` (null for "no mask")
-/// are passed raw because typical call sites hold those images via
-/// `HashMap` lookups whose lifetimes don't compose cleanly with a `&mut
-/// PixmanImage` borrow on the destination.
-///
-/// **Aliasing.** Pixman supports `src` and `dst` referring to the same
-/// image *when the source/destination rectangles do not overlap* (this is
-/// the path used by `copy_area` for in-window scroll). Aliasing with
-/// arbitrary clipping or compositor masks is undefined, so callers that
-/// could hit that case (e.g. RENDER `Composite`) should pre-check and
-/// skip. This wrapper does not enforce a generic alias guard.
-///
-/// `src_ptr` may not be null; `mask_ptr` may be null to disable masking.
-///
-/// `op` is the raw pixman / X-RENDER operator code (`Operation::Src as
-/// u32`, or a wire `PictOp` value forwarded by RENDER); they share the
-/// same numeric encoding.
-fn composite32(
-    op: u32,
-    src_ptr: *mut pixman::ffi::pixman_image_t,
-    mask_ptr: *mut pixman::ffi::pixman_image_t,
-    dst: &mut PixmanImage,
+/// Axis-aligned overlap test for two rects of the same size in
+/// the same coordinate space. `vkCmdCopyImage` is UB when src and
+/// dst rects on the same image overlap; the
+/// [`KmsBackend::try_vk_copy_area`] path uses this to decide
+/// whether to take the same-image fast path or fall back to
+/// pixman (the staging-image path is a 4.1.4.2 follow-up).
+fn rects_overlap_axis_aligned(
     src_x: i32,
     src_y: i32,
-    mask_x: i32,
-    mask_y: i32,
     dst_x: i32,
     dst_y: i32,
     width: i32,
     height: i32,
-) {
-    if src_ptr.is_null() {
-        log::warn!("composite32: src is null, skipping");
-        return;
-    }
-    let dst_ptr = dst.ffi_ptr();
-    // SAFETY: src_ptr is non-null and dst_ptr is non-null (borrowed
-    // through &mut PixmanImage from a live image). mask_ptr is null or a
-    // valid pixman_image_t pointer obtained the same way. dst is uniquely
-    // borrowed; pixman does not retain the pointers after return. Caller
-    // is responsible for any composite-specific aliasing constraints (see
-    // the doc comment).
-    unsafe {
-        pixman::ffi::pixman_image_composite32(
-            op, src_ptr, mask_ptr, dst_ptr, src_x, src_y, mask_x, mask_y, dst_x, dst_y, width,
-            height,
+) -> bool {
+    let sx0 = src_x;
+    let sy0 = src_y;
+    let sx1 = src_x.saturating_add(width);
+    let sy1 = src_y.saturating_add(height);
+    let dx0 = dst_x;
+    let dy0 = dst_y;
+    let dx1 = dst_x.saturating_add(width);
+    let dy1 = dst_y.saturating_add(height);
+    sx0 < dx1 && dx0 < sx1 && sy0 < dy1 && dy0 < sy1
+}
+
+/// Translate a list of GC-clipped dst sub-rects into
+/// `VkImageCopy` regions. Each sub-rect's src offset shifts by
+/// the same amount the dst was clipped (mirrors the existing
+/// pixman per-sub-rect path). Sub-rects clipped to either image's
+/// extent.
+fn build_image_copy_regions(
+    sub_rects: &[Rectangle16],
+    orig_src_x: i16,
+    orig_src_y: i16,
+    orig_dst_x: i16,
+    orig_dst_y: i16,
+    src_extent: ash::vk::Extent2D,
+    dst_extent: ash::vk::Extent2D,
+) -> Vec<ash::vk::ImageCopy> {
+    let mut out = Vec::with_capacity(sub_rects.len());
+    let subresource = ash::vk::ImageSubresourceLayers::default()
+        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    for r in sub_rects {
+        let dx_shift = i32::from(r.x) - i32::from(orig_dst_x);
+        let dy_shift = i32::from(r.y) - i32::from(orig_dst_y);
+        let src_off_x = i32::from(orig_src_x) + dx_shift;
+        let src_off_y = i32::from(orig_src_y) + dy_shift;
+        let dst_off_x = i32::from(r.x);
+        let dst_off_y = i32::from(r.y);
+
+        // Clip widths/heights to fit both src and dst extents.
+        let max_w_src = i32::try_from(src_extent.width).unwrap_or(i32::MAX) - src_off_x.max(0);
+        let max_h_src = i32::try_from(src_extent.height).unwrap_or(i32::MAX) - src_off_y.max(0);
+        let max_w_dst = i32::try_from(dst_extent.width).unwrap_or(i32::MAX) - dst_off_x.max(0);
+        let max_h_dst = i32::try_from(dst_extent.height).unwrap_or(i32::MAX) - dst_off_y.max(0);
+
+        let req_w = i32::from(r.width);
+        let req_h = i32::from(r.height);
+        let w = req_w.min(max_w_src).min(max_w_dst);
+        let h = req_h.min(max_h_src).min(max_h_dst);
+        if w <= 0 || h <= 0 || src_off_x < 0 || src_off_y < 0 || dst_off_x < 0 || dst_off_y < 0 {
+            continue;
+        }
+        out.push(
+            ash::vk::ImageCopy::default()
+                .src_subresource(subresource)
+                .src_offset(ash::vk::Offset3D {
+                    x: src_off_x,
+                    y: src_off_y,
+                    z: 0,
+                })
+                .dst_subresource(subresource)
+                .dst_offset(ash::vk::Offset3D {
+                    x: dst_off_x,
+                    y: dst_off_y,
+                    z: 0,
+                })
+                .extent(ash::vk::Extent3D {
+                    width: w as u32,
+                    height: h as u32,
+                    depth: 1,
+                }),
         );
     }
+    out
 }
 
-/// Composite a slice of trapezoids using `pixman_composite_trapezoids`.
-///
-/// Same aliasing contract as `composite32` — pixman's behaviour is only
-/// well-defined when `src_ptr` and `dst` differ; for trapezoid composites
-/// the typical use is a solid-fill source against a window destination,
-/// so they shouldn't share a backing image. The wrapper does not enforce
-/// a generic alias guard. `traps` is borrowed for the duration of the
-/// call.
-fn composite_trapezoids(
-    op: u32,
-    src_ptr: *mut pixman::ffi::pixman_image_t,
-    dst: &mut PixmanImage,
-    mask_format: pixman::ffi::pixman_format_code_t,
-    x_src: i32,
-    y_src: i32,
-    x_dst: i32,
-    y_dst: i32,
-    traps: &[pixman::ffi::pixman_trapezoid_t],
-) {
-    if src_ptr.is_null() {
-        log::warn!("composite_trapezoids: src is null, skipping");
-        return;
-    }
-    if traps.is_empty() {
-        return;
-    }
-    let dst_ptr = dst.ffi_ptr();
-    // SAFETY: src_ptr is non-null and points at a live pixman_image_t
-    // owned by some PixmanImage. dst_ptr comes from a uniquely-borrowed
-    // PixmanImage. `traps` is a Rust slice with valid len/ptr. Caller is
-    // responsible for any aliasing constraints (see the doc comment).
-    unsafe {
-        pixman::ffi::pixman_composite_trapezoids(
-            op,
-            src_ptr,
-            dst_ptr,
-            mask_format,
-            x_src,
-            y_src,
-            x_dst,
-            y_dst,
-            traps.len() as std::os::raw::c_int,
-            traps.as_ptr(),
-        );
-    }
-}
-
-/// Composite a triangle list onto `dst` using pixman. `pixman_triangle_t`
-/// is layout-identical to RENDER's `XTriangle` (three `XPointFixed`s),
-/// and pixman uses the same operator numbers as RENDER.
-fn composite_triangles(
-    op: u32,
-    src_ptr: *mut pixman::ffi::pixman_image_t,
-    dst: &mut PixmanImage,
-    mask_format: pixman::ffi::pixman_format_code_t,
-    x_src: i32,
-    y_src: i32,
-    x_dst: i32,
-    y_dst: i32,
-    tris: &[pixman::ffi::pixman_triangle_t],
-) {
-    if src_ptr.is_null() {
-        log::warn!("composite_triangles: src is null, skipping");
-        return;
-    }
-    if tris.is_empty() {
-        return;
-    }
-    let dst_ptr = dst.ffi_ptr();
-    // SAFETY: same contract as composite_trapezoids — see that function.
-    unsafe {
-        pixman::ffi::pixman_composite_triangles(
-            op,
-            src_ptr,
-            dst_ptr,
-            mask_format,
-            x_src,
-            y_src,
-            x_dst,
-            y_dst,
-            tris.len() as std::os::raw::c_int,
-            tris.as_ptr(),
-        );
-    }
-}
-
-/// Geometry + raw pixel pointer for a window or pixmap drawable.
-///
-/// `data_ptr` is a byte-granularity pointer; cast to `*mut u32` for 32bpp
-/// formats (`A8R8G8B8`, `X8R8G8B8`) or use as-is for sub-32bpp formats
-/// (`A8`). `stride_bytes` is the per-row stride in **bytes** as reported
-/// by pixman (which may pad rows for alignment).
-///
-/// The lifetime parameter ties the pointer to a `&self` borrow on
-/// `KmsBackend`: while a `DrawableGeometry` is live, no `&mut`
-/// modification of `self.windows` / `self.pixmaps` can occur, so the
-/// pointer remains valid for in-bounds reads and writes.
-struct DrawableGeometry<'a> {
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    data_ptr: *mut u8,
-    _phantom: std::marker::PhantomData<&'a ()>,
-}
-
-fn read_drawable_pixel_for_plane(
-    geom: &DrawableGeometry<'_>,
-    depth: u8,
-    x: usize,
-    y: usize,
-) -> u32 {
-    if x >= geom.width || y >= geom.height {
+fn read_mirror_pixel_for_plane(rb: &MirrorReadback, depth: u8, x: usize, y: usize) -> u32 {
+    let w = rb.width as usize;
+    let h = rb.height as usize;
+    if x >= w || y >= h {
         return 0;
     }
-    // SAFETY: Bounds are checked above and data_ptr/stride_bytes come from a
-    // live pixman image borrowed through drawable_geometry.
-    unsafe {
-        match depth {
-            1 => {
-                let byte = *geom.data_ptr.add(y * geom.stride_bytes + x / 8);
-                u32::from((byte & (0x80 >> (x % 8))) != 0)
-            }
-            8 => u32::from(*geom.data_ptr.add(y * geom.stride_bytes + x)),
-            _ => {
-                let words = geom.data_ptr.cast::<u32>();
-                let stride_words = geom.stride_bytes / 4;
-                *words.add(y * stride_words + x)
-            }
+    let idx = y * w + x;
+    match (depth, rb.bytes_per_pixel) {
+        // Depth-1 sources land in `R8_UNORM` with one byte per pixel
+        // (0xFF or 0x00 — see the depth-1 branch of `try_vk_put_image`).
+        // Any non-zero counts as set.
+        (1, 1) => u32::from(rb.bytes[idx] != 0),
+        (8, 1) => u32::from(rb.bytes[idx]),
+        // BGRA mirror in memory order [B, G, R, A] reads as the same
+        // little-endian u32 word that the legacy pixman path returned.
+        (24 | 32, 4) => {
+            let off = idx * 4;
+            u32::from_le_bytes([
+                rb.bytes[off],
+                rb.bytes[off + 1],
+                rb.bytes[off + 2],
+                rb.bytes[off + 3],
+            ])
         }
+        _ => 0,
     }
 }
 
@@ -407,104 +270,186 @@ fn clip_rects_to_image(rects: &[Rectangle16], iw: i32, ih: i32) -> Vec<Rectangle
     out
 }
 
-fn color_from_u32(pixel: u32) -> Color {
-    let r = ((pixel >> 16) & 0xFF) as u16;
-    let g = ((pixel >> 8) & 0xFF) as u16;
-    let b = (pixel & 0xFF) as u16;
-    Color::new(r << 8, g << 8, b << 8, 0xFFFF)
+/// Resolved RENDER picture for the 4.1.4.6 Vulkan path. Either a
+/// drawable mirror, a 1×1 SolidFill colour (already premul), or
+/// "no picture" (only valid for the mask slot — collapses to the
+/// backend-shared white-mask scratch in the recorder).
+#[derive(Debug, Clone, Copy)]
+enum RenderPic {
+    Drawable(u32),
+    Solid([f32; 4]),
+    Gradient(u32),
+    None,
 }
 
-/// Apply X11 GC `function` to a set of rectangles on `img`.
-///
-/// `GcFunction::Copy` maps to `PIXMAN_OP_SRC` (fast path).
-/// `GcFunction::Xor` requires manual pixel manipulation: pixman's Porter-Duff
-/// `PIXMAN_OP_XOR` is `src*(1-dst.a) + dst*(1-src.a)` which gives zero for
-/// fully opaque images — NOT the bitwise XOR that X11 GXxor specifies.
-/// All other GcFunction variants fall back to `Src` with a debug log.
-fn fill_rects_with_gc_function(
-    img: &mut PixmanImage,
-    function: GcFunction,
-    foreground_rgb: u32,
-    rects: &[Rectangle16],
-) {
-    if matches!(function, GcFunction::Xor) {
-        // Bitwise XOR over the RGB channels (X byte is preserved).
-        // This fast path is only correct for 32bpp images (4 bytes/pixel)
-        // where stride_words == width.  For A8 or A1 images the stride is
-        // smaller than width * 4, so `ptr.add(y * stride_words + x)` would
-        // walk past the allocation and SIGSEGV.  Guard: stride (bytes) must
-        // equal width × 4.
-        let stride_bytes = img.0.stride();
-        let iw = img.0.width();
-        let ih = img.0.height();
-        if stride_bytes == iw * 4 {
-            let xor_mask = foreground_rgb & 0x00FF_FFFF;
-            let stride_words = stride_bytes / 4; // == iw for 32bpp
-            // SAFETY: PixmanImage::data() is unsafe; we hold an exclusive &mut
-            // reference to img so no other live references to the pixel buffer
-            // exist. stride_words == iw, so ptr.add(y * iw + x) with x < iw
-            // and y < ih is always within the ih * iw allocation.
-            let ptr = unsafe { img.0.data() };
-            for r in rects {
-                let x0 = (r.x as i32).max(0) as usize;
-                let y0 = (r.y as i32).max(0) as usize;
-                let x1 = (r.x as i32 + r.width as i32).min(iw as i32).max(0) as usize;
-                let y1 = (r.y as i32 + r.height as i32).min(ih as i32).max(0) as usize;
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        unsafe {
-                            let p = ptr.add(y * stride_words + x);
-                            let old = *p;
-                            *p = (old & 0xFF00_0000) | ((old ^ xor_mask) & 0x00FF_FFFF);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        // Non-32bpp image: fall through to the pixman path below (treated as Src).
-        log::debug!(
-            "GcFunction::Xor on non-32bpp image (stride={stride_bytes}, width={iw}); falling back to Src"
-        );
-    }
-    let op = match function {
-        GcFunction::Copy => Operation::Src,
-        other => {
-            log::debug!(
-                "GC function {:?} not implemented, falling back to Copy",
-                other
-            );
-            Operation::Src
-        }
-    };
-    let color = color_from_u32(foreground_rgb);
-    // Clip rectangles to image bounds. pixman SHOULD do this internally but
-    // crashes on rects that extend past the image (seen with wmaker drawing
-    // rect (4,58,6,59) onto a 64×64 pixmap — y+h=117 > image height).
-    let iw = img.0.width() as i32;
-    let ih = img.0.height() as i32;
-    let clipped: Vec<Rectangle16> = rects
-        .iter()
-        .filter_map(|r| {
-            let x0 = (r.x as i32).max(0);
-            let y0 = (r.y as i32).max(0);
-            let x1 = (r.x as i32).saturating_add(r.width as i32).min(iw);
-            let y1 = (r.y as i32).saturating_add(r.height as i32).min(ih);
-            if x1 <= x0 || y1 <= y0 {
-                return None;
-            }
-            Some(Rectangle16 {
-                x: x0 as i16,
-                y: y0 as i16,
-                width: (x1 - x0) as u16,
-                height: (y1 - y0) as u16,
-            })
-        })
-        .collect();
-    if !clipped.is_empty() {
-        let _ = img.0.fill_rectangles(op, color, &clipped);
+/// Resolve a RENDER picture into a [`RenderPic`] for the Vulkan
+/// composite path. `component_alpha` is supported on the mask side
+/// via the dual-source-blend pipeline (see `render.frag.glsl`
+/// `COMPONENT_ALPHA = 1`); the caller picks up the mask picture's
+/// `component_alpha` flag separately. `alpha_map` is still
+/// unsupported — falls back to pixman.
+fn resolve_render_pic(picture: Option<&PictureState>) -> Option<RenderPic> {
+    match picture {
+        Some(PictureState::Drawable {
+            host_xid,
+            alpha_map: None,
+            ..
+        }) => Some(RenderPic::Drawable(*host_xid)),
+        Some(PictureState::SolidFill { premul, .. }) => Some(RenderPic::Solid(*premul)),
+        // Gradients carry their host_xid in `RenderPic::Gradient` so
+        // the Vk path can look up the `GradientPicture` from
+        // `self.pictures`. We can't store a borrowed reference here
+        // because `RenderPic` outlives the `pictures.get(&xid)` borrow.
+        _ => None,
     }
 }
+
+/// Resolve a `RenderPic` plus its picture XID. Used by the gradient
+/// branch which needs to look the picture back up after dropping the
+/// pictures borrow.
+fn resolve_render_pic_with_gradient_xid(
+    pictures: &HashMap<u32, PictureState>,
+    pic_xid: u32,
+) -> Option<RenderPic> {
+    match pictures.get(&pic_xid) {
+        Some(PictureState::Gradient { .. }) => Some(RenderPic::Gradient(pic_xid)),
+        other => resolve_render_pic(other),
+    }
+}
+
+/// Translate a [`Repeat`] enum value to the integer constant the
+/// `render.frag.glsl` shader expects (matches the protocol numbering;
+/// see `render_pipeline::REPEAT_*`).
+fn repeat_to_shader_const(repeat: Repeat) -> i32 {
+    use crate::kms::vk::render_pipeline::{REPEAT_NONE, REPEAT_NORMAL, REPEAT_PAD, REPEAT_REFLECT};
+    match repeat {
+        Repeat::None => REPEAT_NONE,
+        Repeat::Normal => REPEAT_NORMAL,
+        Repeat::Pad => REPEAT_PAD,
+        Repeat::Reflect => REPEAT_REFLECT,
+    }
+}
+
+/// Convert an X11 RENDER pixman 3×3 transform (16.16 fixed-point) into
+/// the affine 2×3 form the `render.frag.glsl` shader uses. RENDER's
+/// transform maps the *destination*-relative source coordinate to the
+/// pre-sample source pixel:
+///
+/// ```text
+///   src_pixel = M * (src_origin + dst_offset, 1)
+/// ```
+///
+/// We assume affine — the bottom row is `[0, 0, 1]`. Real X11 clients
+/// use affine transforms in practice; projective transforms (the rare
+/// case) round-trip through the affine portion only and produce wrong
+/// pixels at the perspective-divide corners. That trade-off is
+/// documented in `feedback_phase4_1_4_decisions.md` § component-alpha
+/// and matches the per-family-port strict-acceptance relaxation.
+/// Compose two affine 2×3 transforms. The result satisfies
+/// `compose(A, B) * v == A * (B * v)` when `v` is `(x, y, 1)`.
+fn compose_affines(
+    a: crate::kms::vk::ops::render::AffineXform,
+    b: crate::kms::vk::ops::render::AffineXform,
+) -> crate::kms::vk::ops::render::AffineXform {
+    use crate::kms::vk::ops::render::AffineXform;
+    // a.row0 = (a00, a01, a02), a.row1 = (a10, a11, a12). Bottom row
+    // implicit `[0, 0, 1]`. Same for b.
+    let a00 = a.row0[0];
+    let a01 = a.row0[1];
+    let a02 = a.row0[2];
+    let a10 = a.row1[0];
+    let a11 = a.row1[1];
+    let a12 = a.row1[2];
+    let b00 = b.row0[0];
+    let b01 = b.row0[1];
+    let b02 = b.row0[2];
+    let b10 = b.row1[0];
+    let b11 = b.row1[1];
+    let b12 = b.row1[2];
+    AffineXform {
+        row0: [
+            a00 * b00 + a01 * b10,
+            a00 * b01 + a01 * b11,
+            a00 * b02 + a01 * b12 + a02,
+            0.0,
+        ],
+        row1: [
+            a10 * b00 + a11 * b10,
+            a10 * b01 + a11 * b11,
+            a10 * b02 + a11 * b12 + a12,
+            0.0,
+        ],
+    }
+}
+
+fn pixman_transform_to_affine(
+    transform: Option<&PictTransform>,
+    _src_extent: ash::vk::Extent2D,
+) -> crate::kms::vk::ops::render::AffineXform {
+    use crate::kms::vk::ops::render::AffineXform;
+    let Some(t) = transform else {
+        return AffineXform::IDENTITY;
+    };
+    // pixman_transform stores 9 fixed-point i32 values in row-major
+    // order. matrix[row][col] in 16.16 fixed point.
+    let m = t.matrix;
+    let to_f = |v: i32| (v as f32) / 65536.0;
+    let mut a = to_f(m[0][0]);
+    let mut b = to_f(m[0][1]);
+    let mut tx = to_f(m[0][2]);
+    let mut c = to_f(m[1][0]);
+    let mut d = to_f(m[1][1]);
+    let mut ty = to_f(m[1][2]);
+    // Constant-divisor projective transforms (matrix row 2 = `[0, 0, w]`
+    // with w ≠ 1) collapse to a uniform 1/w scale on the affine portion.
+    // Rendercheck's tscoords/tmcoords cases use this form to scale a 5×5
+    // src 8×; pixman handles it the same way. Non-constant projective
+    // transforms (m[2][0] or m[2][1] non-zero) genuinely vary per-pixel
+    // and we don't model them — the affine portion is used as-is, which
+    // matches the strict-acceptance relaxation in
+    // `feedback_phase4_1_4_decisions.md`.
+    let m20 = to_f(m[2][0]);
+    let m21 = to_f(m[2][1]);
+    let m22 = to_f(m[2][2]);
+    if m20 == 0.0 && m21 == 0.0 && m22 != 0.0 && m22 != 1.0 {
+        let inv = 1.0 / m22;
+        a *= inv;
+        b *= inv;
+        tx *= inv;
+        c *= inv;
+        d *= inv;
+        ty *= inv;
+    }
+    AffineXform {
+        row0: [a, b, tx, 0.0],
+        row1: [c, d, ty, 0.0],
+    }
+}
+
+/// One glyph's CPU-side rasterisation result, ready for either the
+/// pixman compositor or the Phase 4.1.4.5 Vulkan text-run path.
+/// `pixels` is row-major, tightly packed (w × h alpha bytes), the
+/// FreeType `BITMAP_GRAY` layout.
+struct RenderedGlyph {
+    dst_x: i32,
+    dst_y: i32,
+    w: usize,
+    h: usize,
+    pixels: Vec<u8>,
+    /// X11 character advance from the font's char_info_cache.
+    /// Currently only used by callers' pen tracking (which lives
+    /// outside this struct); kept here for future per-glyph
+    /// kerning if it lands.
+    #[allow(dead_code)]
+    advance: i32,
+    /// Unicode codepoint — used as part of the glyph atlas key.
+    codepoint: u32,
+}
+
+// `fill_rects_with_gc_function` (pixman per-pixel GC-function fill)
+// deleted in 4.1.5. Every callsite now routes through
+// `KmsBackend::try_vk_fill_with_function`, which uses the
+// `LogicFillPipelineCache` for non-Copy functions.
 
 /// Parse a packed pair of i16 values (2 bytes each) from a byte slice.
 fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
@@ -514,31 +459,6 @@ fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
     let x = i16::from_le_bytes([data[offset], data[offset + 1]]);
     let y = i16::from_le_bytes([data[offset + 2], data[offset + 3]]);
     Some((x, y))
-}
-
-/// Build a pixman clip region from a window's `shape_bounding` rect list,
-/// translated by `(x, y)` (the window's origin in destination coords).
-/// Returns `None` if `rects` is `None` or empty (caller is responsible for
-/// the "explicitly empty shape" skip; this helper just builds the region).
-fn build_shape_clip(
-    rects: Option<&Vec<xfixes::RegionRect>>,
-    x: i32,
-    y: i32,
-) -> Option<pixman::Region32> {
-    let rects = rects?;
-    if rects.is_empty() {
-        return None;
-    }
-    let boxes: Vec<pixman::Box32> = rects
-        .iter()
-        .map(|r| pixman::Box32 {
-            x1: x + i32::from(r.x),
-            y1: y + i32::from(r.y),
-            x2: x + i32::from(r.x) + i32::from(r.width),
-            y2: y + i32::from(r.y) + i32::from(r.height),
-        })
-        .collect();
-    Some(pixman::Region32::init_rects(&boxes))
 }
 
 /// Parse a packed rectangle (x:i16, y:i16, w:u16, h:u16) from a byte slice.
@@ -629,6 +549,86 @@ pub struct KmsBackend {
     // libinput
     input_ctx: Option<crate::input::SendContext>,
 
+    // Vulkan context (Phase 4.1.1: initialised but idle; pixman still
+    // owns drawing). Held as an Arc so future scene-graph code can
+    // share it across helpers without threading lifetime parameters.
+    // Optional only so unit tests in `mod tests` can construct a
+    // KmsBackend without a real Vulkan device — production paths
+    // always set it via `KmsBackend::open_with_commit`.
+    #[allow(dead_code)]
+    pub(crate) vk: Option<Arc<crate::kms::vk::device::VkContext>>,
+
+    // One scanout-bo pool per output (parallel to `outputs`). `None`
+    // entries mean "fall back to the dumb-buffer scanout for this
+    // output" — happens when Vulkan-first allocation fails for that
+    // output's dimensions.
+    pub(crate) scanout_pools: Vec<Option<crate::kms::vk::scanout::ScanoutBoPool>>,
+
+    // Graphics pipeline used by the per-window composite pass
+    // (sub-phase 4.1.3.4). Built once at backend init; reused every
+    // frame. `None` when Vulkan didn't come up.
+    #[allow(dead_code)]
+    pub(crate) compositor_pipeline: Option<crate::kms::vk::pipeline::CompositorPipeline>,
+
+    // Drawing-op command pool (sub-phase 4.1.4). Separate from
+    // `MirrorUploader`'s transfer pool — drawing ops emit graphics
+    // workload (begin_rendering / clear_attachments / draws), the
+    // uploader emits transfer workload. Sharing pools risks
+    // lifetime tangles when both run in the same frame. `None`
+    // when Vulkan didn't come up.
+    pub(crate) ops_command_pool: Option<crate::kms::vk::ops::OpsCommandPool>,
+
+    // Per-backend host-mapped staging buffer used by image-transfer
+    // ops (PutImage / GetImage / MIT-SHM PutImage / MIT-SHM GetImage /
+    // MitShmCreatePixmap). Reused across ops, grows on demand. `None`
+    // when Vulkan didn't come up.
+    pub(crate) ops_staging: Option<crate::kms::vk::ops::OpsStaging>,
+
+    // Glyph atlas + text-render pipeline (sub-phase 4.1.4.5). The
+    // atlas owns the shared R8 image; the pipeline binds it via a
+    // single combined-image-sampler descriptor. Both `None` when
+    // Vulkan didn't come up. Initialised eagerly alongside
+    // `compositor_pipeline`.
+    pub(crate) glyph_atlas: Option<crate::kms::vk::glyph::GlyphAtlas>,
+    pub(crate) text_pipeline: Option<crate::kms::vk::text_pipeline::TextPipeline>,
+
+    // RENDER `Composite` + `FillRectangles` pipeline cache + solid
+    // colour scratch images (sub-phase 4.1.4.6). All `None` when
+    // Vulkan didn't come up.
+    //
+    // `solid_src_image` / `solid_mask_image`: 1×1 BGRA scratches
+    // rewritten via `cmd_clear_color_image` per call when the
+    // corresponding picture is a `SolidFill`. `white_mask_image`:
+    // 1×1 BGRA pre-cleared to opaque white at backend init, used
+    // as the mask binding for `Composite` calls without a mask
+    // (the multiplication by `mask.a == 1.0` is a no-op).
+    pub(crate) render_pipelines: Option<crate::kms::vk::render_pipeline::RenderPipelineCache>,
+    pub(crate) solid_src_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
+    pub(crate) solid_mask_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
+    pub(crate) white_mask_image: Option<crate::kms::vk::render_pipeline::SolidColorImage>,
+    /// CPU-rasterised mask scratch for ops without a per-X-resource
+    /// mask source (Trapezoids, Triangles). One R8 image, grow-on-
+    /// demand. Phase 4.1.4.7.
+    pub(crate) mask_scratch: Option<crate::kms::vk::mask_scratch::MaskScratch>,
+    /// BGRA staging image for same-target overlap copies (xterm
+    /// scrollback) and similar src/dst aliasing. Grow-on-demand.
+    pub(crate) copy_scratch: Option<crate::kms::vk::copy_scratch::CopyScratch>,
+    /// Sampleable dst-pixel readback scratch for Disjoint/Conjoint
+    /// RENDER ops (per-format, grow-on-demand). The shader's manual
+    /// blend (`render.frag.glsl` `MODE=1`) needs to read the existing
+    /// dst pixel; this scratch is the copy target.
+    pub(crate) dst_readback: Option<crate::kms::vk::dst_readback::DstReadback>,
+    /// Per-`GcFunction` solid-fill pipelines (Xor / And / Or /
+    /// Invert / Set / etc.; 16 X11 GcFunctions → 16 `VkLogicOp`s).
+    /// Built lazily on first use of each function.
+    pub(crate) logic_fill_pipelines:
+        Option<crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache>,
+
+    // Diagnostic: per-output flag set the first time a
+    // pageflip-complete event arrives. Lets us see in the log
+    // whether the kernel ever told us the very first flip latched.
+    pub(crate) first_pageflip_logged: Vec<bool>,
+
     // Fonts (freetype)
     font_loader: FontLoader,
     fonts: HashMap<u32, FontState>,
@@ -639,8 +639,6 @@ pub struct KmsBackend {
     // Background state (root)
     bg_pixel: Option<u32>,
     bg_pixmap: Option<PixmapHandle>,
-    // Rescued image from bg_pixmap after the client frees it (Esetroot pattern).
-    bg_pixmap_image: Option<PixmanImage>,
 
     // Software cursor
     cursor_x: f32,
@@ -691,9 +689,11 @@ pub struct KmsBackend {
     // RENDER picture tracking
     pictures: HashMap<u32, PictureState>,
 
-    // Images rescued from freed pixmaps still referenced by live pictures.
-    // Keyed by picture host_xid. Cleaned up by render_free_picture.
-    picture_rescued_images: HashMap<u32, PixmanImage>,
+    // Vk mirrors rescued from freed pixmaps still referenced by live
+    // pictures. Keyed by picture host_xid. Cleaned up by
+    // render_free_picture (drops the DrawableImage, which releases its
+    // VkImage and allocation).
+    picture_rescued_images: HashMap<u32, crate::kms::vk::target::DrawableImage>,
 
     // RENDER glyphset tracking
     glyphsets: HashMap<u32, GlyphSetState>,
@@ -721,22 +721,25 @@ enum PictureState {
         clip_x: i16,
         clip_y: i16,
         component_alpha: bool,
-        transform: Option<pixman::ffi::pixman_transform_t>,
+        transform: Option<PictTransform>,
         graphics_exposure: bool,
         subwindow_mode: u8,
         poly_edge: u8,
         poly_mode: u8,
     },
-    /// 1×1 solid colour image (CreateSolidFill). Used as composite source.
+    /// CreateSolidFill source: a single premultiplied BGRA colour
+    /// the Vk render pipeline reads from a uniform / 1×1 sampler
+    /// scratch as needed. Stored already-premultiplied so the
+    /// recorder doesn't redo the conversion on every draw.
     SolidFill {
-        image: RefCell<PixmanImage>,
+        premul: [f32; 4],
         repeat: Repeat,
         component_alpha: bool,
     },
     Gradient {
-        image: PixmanImage,
+        gradient: crate::kms::vk::gradient::GradientPicture,
         repeat: Repeat,
-        transform: Option<pixman::ffi::pixman_transform_t>,
+        transform: Option<PictTransform>,
     },
 }
 
@@ -790,9 +793,18 @@ pub(super) struct GlyphSetState {
 }
 
 struct CursorState {
-    image: PixmanImage,
+    /// Cursor extent in pixels. Mirrors `vk_mirror`'s extent when the
+    /// mirror is present; stored separately so the composite scene
+    /// builder can size the cursor quad without a Vk borrow.
+    extent: ash::vk::Extent2D,
     hot_x: u16,
     hot_y: u16,
+    /// Vulkan-side cursor image. Same Option semantics as
+    /// [`WindowState::vk_mirror`] / [`PixmapState::vk_mirror`].
+    /// Built and populated at cursor-create time via
+    /// [`KmsBackend::upload_bgra_to_mirror`]; sampled by the
+    /// composite pass's final cursor quad (Phase 4.1.3.4).
+    vk_mirror: Option<crate::kms::vk::target::DrawableImage>,
 }
 
 struct WindowState {
@@ -808,7 +820,6 @@ struct WindowState {
     children: Vec<u32>,
     bg_pixel: Option<u32>,
     bg_pixmap: Option<PixmapHandle>,
-    image: RefCell<PixmanImage>,
     #[allow(dead_code)]
     depth: u8,
     #[allow(dead_code)]
@@ -819,6 +830,12 @@ struct WindowState {
     /// XID, falling back to whatever cursor was last installed for the
     /// root container.
     cursor: u32,
+    /// Vulkan-side image for this window. `None` when Vulkan isn't
+    /// up or mirror allocation failed; in that case the window
+    /// won't render content under the composite pass. Created at
+    /// `create_subwindow` time and bg-pixel-filled if applicable;
+    /// reallocated on resize.
+    vk_mirror: Option<crate::kms::vk::target::DrawableImage>,
 }
 
 struct FontState {
@@ -832,9 +849,15 @@ struct FontState {
 struct PixmapState {
     #[allow(dead_code)]
     handle: u32,
-    image: PixmanImage,
+    width: u16,
+    height: u16,
     #[allow(dead_code)]
     depth: u8,
+    /// Vulkan-side image for this pixmap. Same Option semantics as
+    /// [`WindowState::vk_mirror`]. Created at `create_pixmap` time;
+    /// rescued on `free_pixmap` when a live picture still references
+    /// it (see [`KmsBackend::free_pixmap`]).
+    vk_mirror: Option<crate::kms::vk::target::DrawableImage>,
 }
 
 /// Resolves X11 font names (aliases like `fixed`, XLFDs like
@@ -1158,6 +1181,296 @@ impl KmsBackend {
         let mut xid_map: HostXidMap = HashMap::new();
         xid_map.insert(0x0000_0001u32, ResourceId(0x0000_0100));
 
+        // Phase 4.1.1: Vulkan is brought up alongside pixman but doesn't
+        // drive any rendering yet. If no ICD is available (e.g. virtio-
+        // gpu-pci without VK_ICD_FILENAMES pointing at lavapipe), keep
+        // running on the pixman path so the existing recipe matrix
+        // stays usable. 4.1.2+ will harden this once Vulkan is
+        // load-bearing.
+        let vk = match crate::kms::vk::device::VkContext::new() {
+            Ok(ctx) => {
+                let device_name = unsafe {
+                    ctx.instance
+                        .get_physical_device_properties(ctx.physical_device)
+                }
+                .device_name_as_c_str()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+                log::info!("vulkan initialised on physical device {device_name}");
+                Some(ctx)
+            }
+            Err(e) => {
+                log::warn!("vulkan init failed, continuing on pixman-only path: {e}");
+                None
+            }
+        };
+
+        // Per-output scanout pools. Vulkan-first: each bo is a
+        // VkImage (TILING_LINEAR) exported as a dma-buf and imported
+        // as a DRM framebuffer. Best-effort: any failure here falls
+        // back to None (existing dumb-buffer path stays intact for
+        // that output). 3 bos per pool per design §2.
+        let scanout_pools: Vec<Option<crate::kms::vk::scanout::ScanoutBoPool>> =
+            if let Some(vkctx) = vk.as_ref() {
+                layouts
+                    .iter()
+                    .map(|l| {
+                        match crate::kms::vk::scanout::ScanoutBoPool::allocate(
+                            Arc::clone(vkctx),
+                            Arc::clone(&device),
+                            u32::from(l.width),
+                            u32::from(l.height),
+                            3,
+                        ) {
+                            Ok(pool) => {
+                                if let Some(first) = pool.bos.first() {
+                                    log::info!(
+                                        "scanout pool: 3x{}x{} bos for output {} (pitch {})",
+                                        l.width,
+                                        l.height,
+                                        l.output.connector_name,
+                                        first.pitch
+                                    );
+                                }
+                                Some(pool)
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "scanout pool: allocation failed for output {}: {e} \
+                                     — falling back to dumb-buffer scanout for this output",
+                                    l.output.connector_name
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            } else {
+                std::iter::repeat_with(|| None)
+                    .take(layouts.len())
+                    .collect()
+            };
+        let layouts_len = layouts.len();
+
+        // Compositor pipeline (Phase 4.1.3.4): graphics pipeline +
+        // sampler + descriptor set layout for the textured-quad
+        // composite. Color format must match the scanout bos —
+        // those are `B8G8R8A8_UNORM` (per `vk/scanout.rs`'s
+        // `allocate_vk_scanout_image`).
+        let compositor_pipeline = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::pipeline::CompositorPipeline::new(
+                Arc::clone(vkctx),
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!(
+                        "compositor pipeline init failed: {e} — Vulkan composite path will \
+                         remain disabled; falls back to pixman composite"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Drawing-op command pool (Phase 4.1.4): graphics CBs for
+        // direct-to-mirror writes (`PolyFillRectangle`, `ClearArea`,
+        // …). RAII wrapper destroys the pool on shutdown.
+        let ops_command_pool = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(vkctx)) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!(
+                        "ops command pool init failed: {e:?} — Phase 4.1.4 ops will fall back \
+                         to the pixman path"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Image-transfer staging buffer (Phase 4.1.4.3). 1 MiB starter
+        // covers most PutImage requests; grows on demand. None when
+        // Vulkan didn't come up.
+        let ops_staging =
+            vk.as_ref().and_then(|vkctx| {
+                match crate::kms::vk::ops::OpsStaging::new(Arc::clone(vkctx), 1024 * 1024) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        log::warn!(
+                            "ops staging buffer init failed: {e:?} — Phase 4.1.4.3 image ops \
+                         will fall back to the pixman path"
+                        );
+                        None
+                    }
+                }
+            });
+
+        // Glyph atlas (Phase 4.1.4.5). 4096² R8 fixed allocation.
+        let glyph_atlas =
+            vk.as_ref().and_then(|vkctx| {
+                match crate::kms::vk::glyph::GlyphAtlas::new(Arc::clone(vkctx)) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        log::warn!(
+                            "glyph atlas init failed: {e:?} — Phase 4.1.4.5 text ops will \
+                         fall back to the pixman path"
+                        );
+                        None
+                    }
+                }
+            });
+
+        // Text pipeline (Phase 4.1.4.5). Built once for the
+        // mirror's `B8G8R8A8_UNORM` format; binds the atlas at
+        // construction.
+        let text_pipeline = match (vk.as_ref(), glyph_atlas.as_ref()) {
+            (Some(vkctx), Some(atlas)) => {
+                match crate::kms::vk::text_pipeline::TextPipeline::new(
+                    Arc::clone(vkctx),
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                    atlas,
+                ) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        log::warn!(
+                            "text pipeline init failed: {e:?} — Phase 4.1.4.5 text ops \
+                             will fall back to the pixman path"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // RENDER `Composite` pipeline cache (Phase 4.1.4.6
+        // commit 1). Pipelines compile lazily on first use of
+        // each PictOp; the cache spans the rest of the session.
+        let render_pipelines = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::render_pipeline::RenderPipelineCache::new(Arc::clone(vkctx)) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!(
+                        "render pipeline cache init failed: {e:?} — Phase 4.1.4.6 RENDER \
+                         ops will fall back to the pixman path"
+                    );
+                    None
+                }
+            }
+        });
+
+        // 1×1 BGRA8 scratch for `SolidFill` source / `render_fill_rectangles`
+        // colour. `cmd_clear_color_image` rewrites it inside each
+        // composite CB before sampling.
+        let solid_src_image =
+            vk.as_ref().and_then(
+                |vkctx| match crate::kms::vk::render_pipeline::SolidColorImage::new(Arc::clone(
+                    vkctx,
+                )) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        log::warn!(
+                            "solid colour image init failed: {e:?} — Phase 4.1.4.6 SolidFill \
+                         RENDER ops will fall back to the pixman path"
+                        );
+                        None
+                    }
+                },
+            );
+
+        // Second 1×1 BGRA8 scratch for `SolidFill` mask. Same shape
+        // as `solid_src_image`; cleared per-call to the mask
+        // picture's colour.
+        let solid_mask_image =
+            vk.as_ref().and_then(
+                |vkctx| match crate::kms::vk::render_pipeline::SolidColorImage::new(Arc::clone(
+                    vkctx,
+                )) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        log::warn!("solid mask scratch init failed: {e:?}");
+                        None
+                    }
+                },
+            );
+
+        // 1×1 BGRA8 mask cleared once to opaque white at backend
+        // init. Bound as `mask_tex` for Composite calls without a
+        // mask — `mask.a == 1.0` makes the multiplication a no-op
+        // and keeps the shader / descriptor layout uniform.
+        let white_mask_image = match (vk.as_ref(), ops_command_pool.as_ref()) {
+            (Some(vkctx), Some(pool)) => {
+                match crate::kms::vk::render_pipeline::SolidColorImage::new(Arc::clone(vkctx)) {
+                    Ok(mut s) => {
+                        let pool_handle = pool.handle();
+                        match crate::kms::vk::ops::run_one_shot_op(vkctx, pool_handle, |vk, cb| {
+                            crate::kms::vk::render_pipeline::record_solid_color_clear(
+                                vk,
+                                cb,
+                                &mut s,
+                                [1.0, 1.0, 1.0, 1.0],
+                            );
+                            Ok(())
+                        }) {
+                            Ok(()) => Some(s),
+                            Err(e) => {
+                                log::warn!("white mask scratch clear failed: {e:?}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("white mask scratch init failed: {e:?}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let mask_scratch = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::mask_scratch::MaskScratch::new(Arc::clone(vkctx)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("vk mask scratch init failed: {e:?} — render_trapezoids/triangles will be no-op");
+                    None
+                }
+            }
+        });
+
+        let copy_scratch = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::copy_scratch::CopyScratch::new(Arc::clone(vkctx)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!(
+                        "vk copy scratch init failed: {e:?} — same-target CopyArea overlap dropped"
+                    );
+                    None
+                }
+            }
+        });
+
+        let dst_readback = vk
+            .as_ref()
+            .map(|vkctx| crate::kms::vk::dst_readback::DstReadback::new(Arc::clone(vkctx)));
+
+        let logic_fill_pipelines = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache::new(
+                Arc::clone(vkctx),
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::warn!(
+                        "vk logic-fill pipeline cache init failed: {e:?} — non-Copy GC \
+                         function fills dropped"
+                    );
+                    None
+                }
+            }
+        });
+
         let mut me = Self {
             device,
             outputs: layouts,
@@ -1173,12 +1486,27 @@ impl KmsBackend {
             xkb_keymap,
             xkb_state,
             input_ctx,
+            vk,
+            first_pageflip_logged: vec![false; layouts_len],
+            scanout_pools,
+            compositor_pipeline,
+            ops_command_pool,
+            ops_staging,
+            glyph_atlas,
+            text_pipeline,
+            render_pipelines,
+            solid_src_image,
+            solid_mask_image,
+            white_mask_image,
+            mask_scratch,
+            copy_scratch,
+            dst_readback,
+            logic_fill_pipelines,
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
             pixmaps: HashMap::new(),
             bg_pixel: None,
             bg_pixmap: None,
-            bg_pixmap_image: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
             cursors: HashMap::new(),
@@ -1219,95 +1547,421 @@ impl KmsBackend {
     /// during early startup (and after that, until fvwm sets a root
     /// cursor). 16×16, 2-pixel-thick black X with a 1-pixel white halo
     /// for visibility on dark backgrounds. Hotspot at the center.
+    #[allow(dead_code)] // associated-impl shim isn't strictly needed, kept for future use
+    fn _placeholder(&self) {}
+}
+
+/// Advance every bo in a [`ScanoutBoPool`] one step on
+/// pageflip-complete (per design §2 transition table):
+///
+/// - `Retiring → Free` (release fence is signalled by the kernel
+///   issuing the new pageflip-complete; we close the fd).
+/// - `OnScreen → Retiring` (its successor just landed on screen).
+/// - `Pending → OnScreen` (the freshly-flipped bo is now scanning).
+///
+/// Order matters: snapshot phases first to drive transitions, so
+/// each bo gets exactly one state change per event regardless of
+/// iteration order.
+fn advance_pool_on_pageflip_complete(pool: &mut crate::kms::vk::scanout::ScanoutBoPool) {
+    use crate::kms::vk::scanout::BoPhase;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let phases: Vec<BoPhase> = pool.bos.iter().map(|b| b.state.phase).collect();
+    for (i, phase) in phases.into_iter().enumerate() {
+        match phase {
+            BoPhase::Retiring => {
+                if let Some(fd) = pool.bos[i].state.transition_to_free_after_retire() {
+                    // SAFETY: the fd was inserted by the
+                    // Submitted→Pending transition; we're the only
+                    // owner. Reconstructing as OwnedFd lets Drop
+                    // close it.
+                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+            }
+            BoPhase::OnScreen => pool.bos[i].state.transition_to_retiring(),
+            BoPhase::Pending => pool.bos[i].state.transition_to_on_screen(),
+            _ => {}
+        }
+    }
+}
+
+impl KmsBackend {
     fn install_default_cursor(&mut self) {
-        let w = 16u16;
-        let h = 16u16;
-        let img = match PixmanImage::new(FormatCode::A8R8G8B8, w, h, true) {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-        let stride_words = img.0.stride() / 4;
-        // SAFETY: img is a freshly-allocated 32bpp pixman image we
-        // uniquely own; bounds: y in 0..h and x in 0..w stay within
-        // the allocation of size h * stride_words u32s.
-        let ptr = unsafe { img.0.data() };
-        let last = (w as i32) - 1;
-        for y in 0..h as i32 {
-            for x in 0..w as i32 {
-                // Distance to either diagonal of the 16x16 box.
+        let w: u16 = 16;
+        let h: u16 = 16;
+        // Build the cursor pattern straight to a tightly-packed BGRA
+        // byte buffer (the layout `B8G8R8A8_UNORM` reads). No pixman
+        // detour — the mirror is the canonical store.
+        let mut packed = vec![0u8; w as usize * h as usize * 4];
+        let last = i32::from(w) - 1;
+        for y in 0..i32::from(h) {
+            for x in 0..i32::from(w) {
+                // Distance to either diagonal of the 16×16 box.
                 let d1 = (x - y).abs();
                 let d2 = (x + y - last).abs();
                 let dist = d1.min(d2);
-                let pixel: u32 = match dist {
-                    0 => 0xFF00_0000, // black core
-                    1 => 0xFFFF_FFFF, // white halo
-                    _ => 0x0000_0000, // transparent
+                let bgra: [u8; 4] = match dist {
+                    0 => [0x00, 0x00, 0x00, 0xFF], // black core, opaque
+                    1 => [0xFF, 0xFF, 0xFF, 0xFF], // white halo, opaque
+                    _ => [0x00, 0x00, 0x00, 0x00], // transparent
                 };
-                unsafe {
-                    *ptr.add(y as usize * stride_words + x as usize) = pixel;
-                }
+                let off = (y as usize * w as usize + x as usize) * 4;
+                packed[off..off + 4].copy_from_slice(&bgra);
             }
         }
         let xid = self.next_host_xid();
+        let mut vk_mirror = self.allocate_cursor_mirror(u32::from(w), u32::from(h));
+        if let Some(mirror) = vk_mirror.as_mut()
+            && let Err(e) = self.upload_bgra_to_mirror(mirror, &packed)
+        {
+            log::warn!("install_default_cursor: mirror upload failed: {e:?}");
+        }
         self.cursors.insert(
             xid,
             CursorState {
-                image: img,
+                extent: ash::vk::Extent2D {
+                    width: u32::from(w),
+                    height: u32::from(h),
+                },
                 hot_x: w / 2,
                 hot_y: h / 2,
+                vk_mirror,
             },
         );
         self.active_cursor = Some(xid);
     }
 
-    /// Borrow a drawable's Pixman image and pass it to a closure.
-    #[allow(dead_code)]
-    fn with_image<F, R>(&self, host_xid: u32, f: F) -> Option<R>
-    where
-        F: FnOnce(&PixmanImage) -> R,
-    {
-        if let Some(w) = self.windows.get(&host_xid) {
-            let img = w.image.borrow();
-            Some(f(&img))
-        } else {
-            self.pixmaps.get(&host_xid).map(|p| f(&p.image))
+    /// Upload tightly-packed BGRA bytes into the full extent of
+    /// `mirror`. Used by cursor create/update paths that build cursor
+    /// pixels host-side (no source `DrawableImage` to copy from).
+    ///
+    /// Pixman's `A8R8G8B8` LE memory order is `[B, G, R, A]`, which
+    /// matches `B8G8R8A8_UNORM` on the GPU exactly — so callers that
+    /// pass a pixman-image's raw bytes do not need any byte
+    /// permutation.
+    ///
+    /// The caller passes a `&mut DrawableImage` directly (typically
+    /// the freshly-allocated one from `allocate_cursor_mirror`,
+    /// before it lands in `self.cursors`), so this method does not
+    /// alias any HashMap borrow of `self`.
+    fn upload_bgra_to_mirror(
+        &mut self,
+        mirror: &mut crate::kms::vk::target::DrawableImage,
+        pixels: &[u8],
+    ) -> Result<(), ash::vk::Result> {
+        use crate::kms::vk::ops::run_one_shot_op;
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let staging = self
+            .ops_staging
+            .as_mut()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let needed = pixels.len() as u64;
+        if needed == 0 {
+            return Ok(());
         }
+        staging.ensure(needed)?;
+        let staging_buffer = staging.buffer();
+        let staging_ptr = staging.mapped_ptr();
+        // SAFETY: `staging_ptr` is a host-mapped, write-combine pointer
+        // into a buffer we just grew to `needed` bytes; `pixels.as_ptr()`
+        // is valid for `pixels.len()`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging_ptr, pixels.len());
+        }
+        let extent = mirror.extent;
+        run_one_shot_op(&vk_arc, pool_handle, |_vk, cb| {
+            mirror.record_upload_rect(
+                cb,
+                staging_buffer,
+                0,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                },
+            );
+            Ok(())
+        })
     }
 
-    /// Resolve a drawable XID to its geometry (width, height, byte
-    /// stride, and a raw byte pointer to its pixel buffer). Returns
-    /// `None` if no window or pixmap matches.
+    /// Read the full mirror of a window or pixmap drawable back to
+    /// host memory via `vkCmdCopyImageToBuffer`. Used by `copy_plane`
+    /// (the last remaining pixman-source read) and any future code
+    /// that needs to peek at GPU-canonical pixels.
     ///
-    /// The returned geometry borrows from `self`; while it is live, no
-    /// modification of `self.windows` / `self.pixmaps` is allowed, which
-    /// guarantees the data pointer stays valid for reads and writes.
-    /// The pointer itself is only valid in `unsafe` blocks; callers must
-    /// stay within `[0, height) × [0, width)` and respect the format's
-    /// bytes-per-pixel.
-    fn drawable_geometry(&self, host_xid: u32) -> Option<DrawableGeometry<'_>> {
-        if let Some(w) = self.windows.get(&host_xid) {
-            let img = w.image.borrow();
-            // SAFETY: img is borrowed from a live RefCell on self.windows;
-            // the returned pointer aliases the same buffer that future
-            // pixman ops may also write through, so callers must serialise
-            // their use behind `&mut self` paths.
-            Some(DrawableGeometry {
-                width: img.width(),
-                height: img.height(),
-                stride_bytes: img.stride(),
-                data_ptr: unsafe { img.data() } as *mut u8,
-                _phantom: std::marker::PhantomData,
-            })
+    /// The returned [`MirrorReadback`] holds tightly-packed bytes in
+    /// the mirror's native format (`R8_UNORM` for depth 1/8,
+    /// `B8G8R8A8_UNORM` for depth 24/32). Returns `None` if the
+    /// drawable is unknown, has no mirror, has zero extent, or the
+    /// staging buffer cannot be grown to fit.
+    fn read_mirror_pixels(&mut self, host_xid: u32) -> Option<MirrorReadback> {
+        use crate::kms::vk::ops::{image as vk_image, run_one_shot_op};
+
+        let vk_arc = self.vk.as_ref().cloned()?;
+        let pool_handle = self.ops_command_pool.as_ref().map(|p| p.handle())?;
+        self.ops_staging.as_ref()?;
+
+        // Snapshot extent + bpp without holding a mut borrow on self.
+        let (mirror_w, mirror_h, mirror_bpp) = {
+            let mirror = if let Some(w) = self.windows.get(&host_xid) {
+                w.vk_mirror.as_ref()
+            } else if let Some(p) = self.pixmaps.get(&host_xid) {
+                p.vk_mirror.as_ref()
+            } else {
+                None
+            };
+            let mirror = mirror?;
+            (
+                mirror.extent.width,
+                mirror.extent.height,
+                mirror.bytes_per_pixel(),
+            )
+        };
+        if mirror_w == 0 || mirror_h == 0 {
+            return None;
+        }
+        let total_bytes = u64::from(mirror_w) * u64::from(mirror_h) * u64::from(mirror_bpp);
+
+        if let Err(e) = self
+            .ops_staging
+            .as_mut()
+            .expect("checked is_none above")
+            .ensure(total_bytes)
+        {
+            log::warn!("read_mirror_pixels: staging grow failed for {total_bytes} bytes: {e:?}");
+            return None;
+        }
+
+        let regions = [ash::vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(ash::vk::Extent3D {
+                width: mirror_w,
+                height: mirror_h,
+                depth: 1,
+            })];
+
+        let staging_buffer = self.ops_staging.as_ref().expect("present").buffer();
+        let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
+            p.vk_mirror.as_mut()
         } else {
-            // SAFETY: as above, but borrowing directly (no RefCell on
-            // PixmapState).
-            self.pixmaps.get(&host_xid).map(|p| DrawableGeometry {
-                width: p.image.width(),
-                height: p.image.height(),
-                stride_bytes: p.image.stride(),
-                data_ptr: unsafe { p.image.data() } as *mut u8,
-                _phantom: std::marker::PhantomData,
-            })
+            None
+        };
+        let mirror = mirror?;
+
+        if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_image::record_get_image(vk, cb, mirror, staging_buffer, &regions)
+        }) {
+            log::warn!("read_mirror_pixels: record_get_image failed: {e:?}");
+            return None;
+        }
+
+        let total_bytes_usize = total_bytes as usize;
+        let mut bytes = vec![0u8; total_bytes_usize];
+        // SAFETY: `staging.ensure(total_bytes)` succeeded, and the
+        // submit above was waited on inside `run_one_shot_op`, so the
+        // staging buffer's host-mapped range now contains the readback.
+        unsafe {
+            let staging_ptr = self.ops_staging.as_ref().expect("present").mapped_ptr();
+            std::ptr::copy_nonoverlapping(staging_ptr, bytes.as_mut_ptr(), total_bytes_usize);
+        }
+
+        Some(MirrorReadback {
+            width: mirror_w,
+            height: mirror_h,
+            bytes_per_pixel: mirror_bpp,
+            bytes,
+        })
+    }
+
+    /// Solid-fill the entire extent of `mirror` with the X11 colour
+    /// pixel `fg` (0xRRGGBB or 0xAARRGGBB; alpha defaulted to opaque
+    /// for windows). Used at create-time / resize-time to apply a
+    /// window's `bg_pixel` to a freshly allocated mirror — the
+    /// `MirrorUploader` pump that used to handle this is gone.
+    fn fill_mirror_solid(
+        &mut self,
+        mirror: &mut crate::kms::vk::target::DrawableImage,
+        fg: u32,
+    ) -> Result<(), ash::vk::Result> {
+        use crate::kms::vk::ops::{fill, run_one_shot_op};
+        let vk_arc = self
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let pool_handle = self
+            .ops_command_pool
+            .as_ref()
+            .map(|p| p.handle())
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let extent = mirror.extent;
+        let color = [
+            ((fg >> 16) & 0xFF) as f32 / 255.0,
+            ((fg >> 8) & 0xFF) as f32 / 255.0,
+            (fg & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+        let rects = [ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        }];
+        let scissor = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
+        })
+    }
+
+    /// Allocate a cursor mirror sized for `src` and `vkCmdCopyImage`
+    /// the rescued source into it. Returns `None` if mirror
+    /// allocation or the copy fails — caller falls through to a
+    /// `None` `vk_mirror` (cursor still inserted, but won't render
+    /// pixels until next DefineCursor).
+    fn copy_drawable_to_new_cursor_mirror(
+        &mut self,
+        src: &mut crate::kms::vk::target::DrawableImage,
+    ) -> Option<crate::kms::vk::target::DrawableImage> {
+        use crate::kms::vk::ops::{copy as vk_copy, run_one_shot_op};
+
+        let cw = src.extent.width;
+        let ch = src.extent.height;
+        let mut cm = self.allocate_cursor_mirror(cw, ch)?;
+
+        let vk_arc = self.vk.as_ref().cloned()?;
+        let pool_handle = self.ops_command_pool.as_ref()?.handle();
+        let regions = [ash::vk::ImageCopy::default()
+            .src_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .src_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .dst_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(ash::vk::Extent3D {
+                width: cw,
+                height: ch,
+                depth: 1,
+            })];
+
+        if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_copy::record_copy_area_distinct(vk, cb, src, &mut cm, &regions)
+        }) {
+            log::warn!("copy_drawable_to_new_cursor_mirror: copy failed: {e:?}");
+            return None;
+        }
+        Some(cm)
+    }
+
+    /// Live-pixmap variant of [`copy_drawable_to_new_cursor_mirror`]:
+    /// the source mirror lives in `self.pixmaps[host_xid]`, the
+    /// destination is owned by the caller. Disjoint mut borrows on
+    /// `self.pixmaps` and `cm` keep the borrow checker happy.
+    fn copy_pixmap_mirror_to_cursor(
+        &mut self,
+        host_xid: u32,
+        cm: &mut crate::kms::vk::target::DrawableImage,
+        cw: u32,
+        ch: u32,
+    ) -> Result<(), ash::vk::Result> {
+        use crate::kms::vk::ops::{copy as vk_copy, run_one_shot_op};
+
+        let vk_arc = self
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let pool_handle = self
+            .ops_command_pool
+            .as_ref()
+            .map(|p| p.handle())
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let regions = [ash::vk::ImageCopy::default()
+            .src_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .src_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .dst_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(ash::vk::Extent3D {
+                width: cw,
+                height: ch,
+                depth: 1,
+            })];
+        let src = self
+            .pixmaps
+            .get_mut(&host_xid)
+            .and_then(|p| p.vk_mirror.as_mut())
+            .ok_or(ash::vk::Result::ERROR_UNKNOWN)?;
+        run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_copy::record_copy_area_distinct(vk, cb, src, cm, &regions)
+        })
+    }
+
+    /// Allocate a Vulkan mirror sized for a cursor pixmap. Cursors
+    /// always carry alpha (RenderCreateCursor delivers `A8R8G8B8`),
+    /// so the mirror format is `B8G8R8A8_UNORM` regardless of depth
+    /// — handled identically to a depth-32 pixmap.
+    fn allocate_cursor_mirror(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::kms::vk::target::DrawableImage> {
+        let vkctx = self.vk.as_ref()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match crate::kms::vk::target::DrawableImage::new_server_owned_pixmap(
+            std::sync::Arc::clone(vkctx),
+            width,
+            height,
+            32,
+        ) {
+            Ok(mut img) => {
+                if let Some(pool) = self.ops_command_pool.as_ref()
+                    && let Err(e) = img.initialize_clear(pool.handle())
+                {
+                    log::warn!("cursor mirror initialize_clear failed: {e:?}");
+                }
+                // Cursor mirror is fully dirty at creation so the
+                // first composite pass has it populated before
+                // sampling.
+                img.mark_full_damage();
+                Some(img)
+            }
+            Err(e) => {
+                log::warn!(
+                    "DrawableImage::new_server_owned_pixmap (cursor {width}x{height}): {e} — \
+                     cursor will not render under VkComposite"
+                );
+                None
+            }
         }
     }
 
@@ -1318,32 +1972,23 @@ impl KmsBackend {
             .or_else(|| self.pixmaps.get(&host_xid).map(|p| p.depth))
     }
 
-    /// Mutably borrow a drawable's Pixman image and pass it to a closure.
-    fn with_image_mut<F, R>(&mut self, host_xid: u32, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut PixmanImage) -> R,
-    {
+    /// Width × height for a window or pixmap drawable, in pixels.
+    /// Reads from the recorded `WindowState` / `PixmapState`
+    /// dimensions — no pixman buffer involved.
+    fn drawable_dims(&self, host_xid: u32) -> Option<(u32, u32)> {
         if let Some(w) = self.windows.get(&host_xid) {
-            let mut img = w.image.borrow_mut();
-            Some(f(&mut img))
-        } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
-            Some(f(&mut p.image))
+            Some((u32::from(w.width), u32::from(w.height)))
         } else {
-            None
+            self.pixmaps
+                .get(&host_xid)
+                .map(|p| (u32::from(p.width), u32::from(p.height)))
         }
     }
 
-    // Return a raw pixman pointer for a window or pixmap drawable.
-    // The pointer is valid as long as the drawable is not removed from
-    // self.windows / self.pixmaps. Caller must not call any method that could
-    // remove the drawable while holding the pointer.
-    fn image_ptr_for_xid(&self, host_xid: u32) -> Option<*mut pixman::ffi::pixman_image_t> {
-        if let Some(w) = self.windows.get(&host_xid) {
-            Some(w.image.borrow().0.as_ptr())
-        } else {
-            self.pixmaps.get(&host_xid).map(|p| p.image.0.as_ptr())
-        }
-    }
+    // `with_image_mut` and `image_ptr_for_xid` deleted in 4.1.5.
+    // Drawing ops now record into Vk command buffers directly; no
+    // helper is needed to grab a pixman pointer or mark the mirror
+    // for upload.
 
     /// Decode the wire-packed clip rectangle list (`Vec<u8>` of i16 x, i16
     /// y, u16 w, u16 h tuples) into `Rectangle16`s in dst-coords (i.e. with
@@ -1429,97 +2074,2690 @@ impl KmsBackend {
                 let tile_xid = pixmap.as_raw();
                 if tile_xid == dst_xid {
                     log::debug!(
-                        "fill_rects_honoring_fill_state: tile == dst (0x{tile_xid:x}); falling back to solid"
+                        "fill_rects_honoring_fill_state: tile == dst (0x{tile_xid:x}); \
+                         degenerating to solid"
                     );
-                    self.with_image_mut(dst_xid, |dst| {
-                        fill_rects_with_gc_function(dst, function, fg, rects);
-                    });
+                    self.try_vk_fill_with_function(dst_xid, function, fg, rects);
                     return;
                 }
                 // Tiled fill is composited with Operation::Src, which
-                // matches GcFunction::Copy. Other GC functions (Xor, And,
-                // …) would need bespoke handling per-pixel against the
-                // tile; no observed client combines Tiled fill with
-                // non-Copy. Fall back to solid (which honours
-                // GcFunction) and warn so we notice if it shows up.
+                // matches GcFunction::Copy. Other GC functions (Xor /
+                // etc.) on a tiled fill aren't covered by any current
+                // client; degenerate to a solid logic-op fill so the
+                // function is honoured.
                 if !matches!(function, GcFunction::Copy) {
                     log::debug!(
-                        "fill_rects_honoring_fill_state: Tiled+{:?} not implemented; falling back to solid",
-                        function
+                        "fill_rects_honoring_fill_state: Tiled+{function:?} not implemented; \
+                         degenerating to solid logic-op fill"
                     );
-                    self.with_image_mut(dst_xid, |dst| {
-                        fill_rects_with_gc_function(dst, function, fg, rects);
-                    });
+                    self.try_vk_fill_with_function(dst_xid, function, fg, rects);
                     return;
                 }
-                let Some(tile_ptr) = self.image_ptr_for_xid(tile_xid) else {
-                    log::debug!(
-                        "fill_rects_honoring_fill_state: tile 0x{tile_xid:x} missing; falling back to solid"
+                if !self.try_vk_tiled_fill(dst_xid, tile_xid, origin.0, origin.1, rects) {
+                    log::warn!(
+                        "fill_rects_honoring_fill_state: tile fill on 0x{dst_xid:x} from \
+                         tile 0x{tile_xid:x} failed; rect dropped"
                     );
-                    self.with_image_mut(dst_xid, |dst| {
-                        fill_rects_with_gc_function(dst, function, fg, rects);
-                    });
-                    return;
-                };
-                // Tile pixman image lives in self.pixmaps/self.windows; the
-                // raw pointer remains valid for the duration of this call
-                // because we don't mutate either map between here and the
-                // composite calls.
-                // SAFETY: tile_ptr is non-null (Some above) and points at a
-                // pixman_image_t whose backing buffer outlives this call.
-                unsafe {
-                    pixman::ffi::pixman_image_set_repeat(tile_ptr, Repeat::Normal.into());
-                }
-                let (ox, oy) = (origin.0 as i32, origin.1 as i32);
-                let dst_dims = self
-                    .drawable_geometry(dst_xid)
-                    .map(|g| (g.width as i32, g.height as i32));
-                self.with_image_mut(dst_xid, |dst| {
-                    let (dw, dh) =
-                        dst_dims.unwrap_or((dst.0.width() as i32, dst.0.height() as i32));
-                    for r in rects {
-                        let dx = r.x as i32;
-                        let dy = r.y as i32;
-                        let dx0 = dx.max(0);
-                        let dy0 = dy.max(0);
-                        let dx1 = (dx + r.width as i32).min(dw);
-                        let dy1 = (dy + r.height as i32).min(dh);
-                        let w = dx1 - dx0;
-                        let h = dy1 - dy0;
-                        if w <= 0 || h <= 0 {
-                            continue;
-                        }
-                        // Source coords are dst coords minus tile origin; pixman's
-                        // REPEAT_NORMAL handles the modulo against the tile size.
-                        let sx = dx0 - ox;
-                        let sy = dy0 - oy;
-                        composite32(
-                            Operation::Src as u32,
-                            tile_ptr,
-                            std::ptr::null_mut(),
-                            dst,
-                            sx,
-                            sy,
-                            0,
-                            0,
-                            dx0,
-                            dy0,
-                            w,
-                            h,
-                        );
-                    }
-                });
-                // Reset repeat so subsequent uses of this pixmap (e.g. as a
-                // CopyArea source) don't see sticky tile-mode behaviour.
-                // SAFETY: same as above.
-                unsafe {
-                    pixman::ffi::pixman_image_set_repeat(tile_ptr, Repeat::None.into());
                 }
             }
             FillState::Solid | FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
-                self.with_image_mut(dst_xid, |dst| {
-                    fill_rects_with_gc_function(dst, function, fg, rects);
-                });
+                // Stipple cases share this arm — proper stipple
+                // support is task #4.1.4.8 territory; until then
+                // they fall through as solid (matches the pre-
+                // pixman-removal behaviour).
+                self.try_vk_fill_with_function(dst_xid, function, fg, rects);
+            }
+        }
+    }
+
+    /// Phase 4.1.5 prep: tile fill via `try_vk_render_composite`.
+    /// Tile pixmap supplies the source colours; `Repeat::Normal`
+    /// makes it wrap. Per-rect source origin `(rect_dst_x - ox,
+    /// rect_dst_y - oy)` so that the shader's `src_origin +
+    /// dst_offset` lands on the right tile pixel.
+    fn try_vk_tiled_fill(
+        &mut self,
+        dst_xid: u32,
+        tile_xid: u32,
+        ox: i16,
+        oy: i16,
+        rects: &[Rectangle16],
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        if tile_xid == dst_xid {
+            return false; // self-tile would alias src and dst
+        }
+        // Tile must have a Vk mirror to be sampleable.
+        let tile_format = if let Some(w) = self.windows.get(&tile_xid) {
+            w.vk_mirror.as_ref().map(|m| m.format)
+        } else if let Some(p) = self.pixmaps.get(&tile_xid) {
+            p.vk_mirror.as_ref().map(|m| m.format)
+        } else {
+            None
+        };
+        if tile_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            return false;
+        }
+        // Build CompositeRects in dst space; the shader's
+        // `(src_origin + dst_offset)` lands on the right tile pixel
+        // when `src_origin = rect_dst - tile_origin`.
+        let composite_rects: Vec<crate::kms::vk::ops::render::CompositeRect> = rects
+            .iter()
+            .map(|r| crate::kms::vk::ops::render::CompositeRect {
+                src_x: i32::from(r.x) - i32::from(ox),
+                src_y: i32::from(r.y) - i32::from(oy),
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: i32::from(r.x),
+                dst_y: i32::from(r.y),
+                width: u32::from(r.width),
+                height: u32::from(r.height),
+            })
+            .collect();
+        // Use a coarse scissor that covers all rects.
+        let mut x0 = i32::MAX;
+        let mut y0 = i32::MAX;
+        let mut x1 = i32::MIN;
+        let mut y1 = i32::MIN;
+        for r in rects {
+            x0 = x0.min(i32::from(r.x));
+            y0 = y0.min(i32::from(r.y));
+            x1 = x1.max(i32::from(r.x) + i32::from(r.width));
+            y1 = y1.max(i32::from(r.y) + i32::from(r.height));
+        }
+        if x1 <= x0 || y1 <= y0 {
+            return true;
+        }
+        let scissor = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: x0.max(0),
+                y: y0.max(0),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::try_from((x1 - x0.max(0)).max(0)).unwrap_or(0),
+                height: u32::try_from((y1 - y0.max(0)).max(0)).unwrap_or(0),
+            },
+        };
+        // Op `Src` (1) — tile fill replaces the destination.
+        const OP_SRC: u8 = 1;
+        self.try_vk_render_composite(
+            OP_SRC,
+            RenderPic::Drawable(tile_xid),
+            RenderPic::None,
+            dst_xid,
+            &composite_rects,
+            scissor,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Sub-phase 4.1.4.4 helper. Solid-fill `rects` on `dst_xid`,
+    /// honouring the current GC `function`, with the Vulkan
+    /// fast-fill path when `function == Copy` and the target has
+    /// a mirror. Used by the stroke-style poly ops (`PolyLine`,
+    /// `PolySegment`, `PolyPoint`, `PolyArc`, `PolyRectangle`),
+    /// where every rasterised rect is in the GC's single
+    /// foreground colour. This is the same routing
+    /// `fill_rects_honoring_fill_state` does for the
+    /// `FillState::Solid` arm — split out because stroke ops
+    /// always treat the request as "Solid foreground" regardless
+    /// of GC `fill_style`, while filled ops respect it.
+    fn fill_rects_solid_with_gc_function(&mut self, dst_xid: u32, fg: u32, rects: &[Rectangle16]) {
+        if rects.is_empty() {
+            return;
+        }
+        let function = self.current_function;
+        // Phase 4.1.5: Vk-only. `try_vk_fill_with_function` picks
+        // the Copy fast path or the per-`VkLogicOp` pipeline.
+        self.try_vk_fill_with_function(dst_xid, function, fg, rects);
+    }
+
+    /// Vulkan-direct `CopyArea` via `vkCmdCopyImage`. Returns
+    /// `true` iff the Vulkan path wrote and the caller can return;
+    /// `false` means the caller falls back to pixman.
+    ///
+    /// Conditions for the Vulkan path: both drawables have
+    /// mirrors, mirrors share the same Vulkan format,
+    /// same-target draws don't overlap (overlap → staging-image
+    /// path is 4.1.4.2 follow-up territory).
+    #[allow(clippy::too_many_arguments)]
+    fn try_vk_copy_area(
+        &mut self,
+        src_xid: u32,
+        dst_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> bool {
+        use crate::kms::vk::ops::{copy, run_one_shot_op};
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+
+        // GC clip the dst rect into a sub-rect list. Each
+        // surviving sub-rect's src offset shifts by the same
+        // amount the dst was clipped (mirrors the existing pixman
+        // path).
+        let dst_rect = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        let sub_rects = self.intersect_with_current_clip(&[dst_rect]);
+        if sub_rects.is_empty() {
+            // Fully clipped — nothing to draw, but the request is
+            // "handled" successfully.
+            return true;
+        }
+
+        let same_target = src_xid == dst_xid;
+        if same_target {
+            let overlapping = rects_overlap_axis_aligned(
+                i32::from(src_x),
+                i32::from(src_y),
+                i32::from(dst_x),
+                i32::from(dst_y),
+                i32::from(width),
+                i32::from(height),
+            );
+
+            // Resolve the mirror; we need a single &mut to it.
+            let Some(mirror) = self
+                .windows
+                .get_mut(&src_xid)
+                .and_then(|w| w.vk_mirror.as_mut())
+                .or_else(|| {
+                    self.pixmaps
+                        .get_mut(&src_xid)
+                        .and_then(|p| p.vk_mirror.as_mut())
+                })
+            else {
+                return false;
+            };
+            let regions = build_image_copy_regions(
+                &sub_rects,
+                src_x,
+                src_y,
+                dst_x,
+                dst_y,
+                mirror.extent,
+                mirror.extent,
+            );
+            if regions.is_empty() {
+                return true;
+            }
+
+            if overlapping {
+                // Overlap: round-trip through `copy_scratch`. Sized
+                // to the source-rect bbox so the scratch is just big
+                // enough to hold the in-flight copy.
+                let Some(scratch) = self.copy_scratch.as_mut() else {
+                    return false;
+                };
+                if let Err(e) = scratch.ensure_size(u32::from(width), u32::from(height)) {
+                    log::warn!("vk copy: scratch resize failed: {e:?}");
+                    return false;
+                }
+                let bbox_origin = (i32::from(src_x), i32::from(src_y));
+                return match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+                    copy::record_copy_area_same_overlap(
+                        vk,
+                        cb,
+                        mirror,
+                        scratch,
+                        &regions,
+                        bbox_origin,
+                    )
+                }) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!(
+                            "vk copy: same-image overlap record failed on xid {src_xid:#x}: \
+                             {e:?}"
+                        );
+                        false
+                    }
+                };
+            }
+
+            return match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+                copy::record_copy_area_same(vk, cb, mirror, &regions)
+            }) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("vk copy: same-image record failed on xid {src_xid:#x}: {e:?}");
+                    false
+                }
+            };
+        }
+
+        // Distinct src/dst. Determine which HashMap each lives
+        // in. Bail to pixman fallback if either is missing or if
+        // their mirrors disagree on format.
+        enum Map {
+            Window,
+            Pixmap,
+            None,
+        }
+        let src_map = if self.windows.contains_key(&src_xid) {
+            Map::Window
+        } else if self.pixmaps.contains_key(&src_xid) {
+            Map::Pixmap
+        } else {
+            Map::None
+        };
+        let dst_map = if self.windows.contains_key(&dst_xid) {
+            Map::Window
+        } else if self.pixmaps.contains_key(&dst_xid) {
+            Map::Pixmap
+        } else {
+            Map::None
+        };
+
+        let (src_mirror, dst_mirror): (
+            &mut crate::kms::vk::target::DrawableImage,
+            &mut crate::kms::vk::target::DrawableImage,
+        ) = match (src_map, dst_map) {
+            (Map::Window, Map::Window) => {
+                let [s_state, d_state] = self.windows.get_disjoint_mut([&src_xid, &dst_xid]);
+                let (Some(s), Some(d)) = (s_state, d_state) else {
+                    return false;
+                };
+                let (Some(s_m), Some(d_m)) = (s.vk_mirror.as_mut(), d.vk_mirror.as_mut()) else {
+                    return false;
+                };
+                (s_m, d_m)
+            }
+            (Map::Pixmap, Map::Pixmap) => {
+                let [s_state, d_state] = self.pixmaps.get_disjoint_mut([&src_xid, &dst_xid]);
+                let (Some(s), Some(d)) = (s_state, d_state) else {
+                    return false;
+                };
+                let (Some(s_m), Some(d_m)) = (s.vk_mirror.as_mut(), d.vk_mirror.as_mut()) else {
+                    return false;
+                };
+                (s_m, d_m)
+            }
+            (Map::Window, Map::Pixmap) => {
+                let s = self
+                    .windows
+                    .get_mut(&src_xid)
+                    .and_then(|w| w.vk_mirror.as_mut());
+                let d = self
+                    .pixmaps
+                    .get_mut(&dst_xid)
+                    .and_then(|p| p.vk_mirror.as_mut());
+                let (Some(s), Some(d)) = (s, d) else {
+                    return false;
+                };
+                (s, d)
+            }
+            (Map::Pixmap, Map::Window) => {
+                let s = self
+                    .pixmaps
+                    .get_mut(&src_xid)
+                    .and_then(|p| p.vk_mirror.as_mut());
+                let d = self
+                    .windows
+                    .get_mut(&dst_xid)
+                    .and_then(|w| w.vk_mirror.as_mut());
+                let (Some(s), Some(d)) = (s, d) else {
+                    return false;
+                };
+                (s, d)
+            }
+            _ => return false,
+        };
+
+        if src_mirror.format != dst_mirror.format {
+            // vkCmdCopyImage requires matching formats; format
+            // conversion needs a shader (out of scope for 4.1.4.2).
+            return false;
+        }
+
+        let regions = build_image_copy_regions(
+            &sub_rects,
+            src_x,
+            src_y,
+            dst_x,
+            dst_y,
+            src_mirror.extent,
+            dst_mirror.extent,
+        );
+        if regions.is_empty() {
+            return true;
+        }
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            copy::record_copy_area_distinct(vk, cb, src_mirror, dst_mirror, &regions)
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk copy: distinct-image record failed (src={src_xid:#x} dst={dst_xid:#x}): \
+                     {e:?} — falling back to pixman"
+                );
+                false
+            }
+        }
+    }
+
+    /// Fill `rects` on `dst_xid`'s mirror in solid `fg` color via
+    /// `vk::ops::fill::record_fill_rectangles`. Returns `true` iff
+    /// the Vulkan path actually wrote — caller falls back to
+    /// pixman on `false`. `fg` is an X11 24-bit `0xRRGGBB` pixel.
+    /// Solid-fill `rects` honouring the GC `function`. For `Copy`
+    /// (the common case) routes through the existing `cmd_clear_
+    /// attachments` fast path. For every other GC function (Xor,
+    /// And, Or, Invert, Set, etc.) it draws a quad through the
+    /// per-function `LogicFillPipelineCache` so the destination
+    /// pixels go through the matching `VkLogicOp`.
+    ///
+    /// Returns `true` iff the operation took. Mirror-missing /
+    /// pipeline-cache-missing return `false` (op silently dropped —
+    /// the mid-port directive forbids a pixman fallback).
+    fn try_vk_fill_with_function(
+        &mut self,
+        dst_xid: u32,
+        function: GcFunction,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        if matches!(function, GcFunction::Copy) {
+            return self.try_vk_solid_fill(dst_xid, fg, rects);
+        }
+        if matches!(function, GcFunction::NoOp) {
+            return true;
+        }
+
+        use crate::kms::vk::ops::{fill, run_one_shot_op};
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+
+        let pipeline = match self.logic_fill_pipelines.as_mut() {
+            Some(cache) => match cache.get(function) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("vk logic-fill: pipeline build failed for {function:?}: {e:?}");
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        let pipeline_layout = self
+            .logic_fill_pipelines
+            .as_ref()
+            .expect("checked above")
+            .pipeline_layout();
+
+        let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(mirror) = mirror else {
+            return false;
+        };
+
+        let extent_w = mirror.extent.width;
+        let extent_h = mirror.extent.height;
+        let color = [
+            ((fg >> 16) & 0xFF) as f32 / 255.0,
+            ((fg >> 8) & 0xFF) as f32 / 255.0,
+            (fg & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+
+        let vk_rects: Vec<ash::vk::Rect2D> = rects
+            .iter()
+            .filter_map(|r| {
+                let x0 = i32::from(r.x).max(0);
+                let y0 = i32::from(r.y).max(0);
+                let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(extent_w as i32);
+                let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(extent_h as i32);
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                Some(ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: x0, y: y0 },
+                    extent: ash::vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                })
+            })
+            .collect();
+        if vk_rects.is_empty() {
+            return true;
+        }
+        let scissor = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: mirror.extent,
+        };
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            fill::record_logic_fill(
+                vk,
+                cb,
+                mirror,
+                pipeline,
+                pipeline_layout,
+                color,
+                &vk_rects,
+                scissor,
+            )
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk logic-fill: record failed on xid {dst_xid:#x} ({function:?}): {e:?}"
+                );
+                false
+            }
+        }
+    }
+
+    fn try_vk_solid_fill(&mut self, dst_xid: u32, fg: u32, rects: &[Rectangle16]) -> bool {
+        use crate::kms::vk::ops::{fill, run_one_shot_op};
+        if rects.is_empty() {
+            return false;
+        }
+        // Snapshot the &Arc<VkContext> + pool handle (Copy) so the
+        // borrow on `self.vk` / `self.ops_command_pool` ends before
+        // we mut-borrow the mirror.
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+
+        // Pull the mirror reference. Returns &mut DrawableImage.
+        let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(mirror) = mirror else {
+            return false;
+        };
+
+        let extent_w = mirror.extent.width;
+        let extent_h = mirror.extent.height;
+        let color = [
+            ((fg >> 16) & 0xFF) as f32 / 255.0,
+            ((fg >> 8) & 0xFF) as f32 / 255.0,
+            (fg & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+
+        // Convert request rects to vk::Rect2D, clamping to the
+        // mirror extent so cmd_clear_attachments doesn't see
+        // negative offsets or sizes that exceed the render area.
+        let vk_rects: Vec<ash::vk::Rect2D> = rects
+            .iter()
+            .filter_map(|r| {
+                let x0 = i32::from(r.x).max(0);
+                let y0 = i32::from(r.y).max(0);
+                let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(extent_w as i32);
+                let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(extent_h as i32);
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                Some(ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: x0, y: y0 },
+                    extent: ash::vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                })
+            })
+            .collect();
+        if vk_rects.is_empty() {
+            return false;
+        }
+
+        let scissor = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: mirror.extent,
+        };
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            fill::record_fill_rectangles(vk, cb, mirror, color, &vk_rects, scissor)
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk fill: record_fill_rectangles failed on xid {dst_xid:#x}: {e:?} — \
+                     falling back to pixman this op"
+                );
+                false
+            }
+        }
+    }
+
+    /// PutImage Vulkan-direct path (sub-phase 4.1.4.3). Memcpy the
+    /// X11-format pixel data into the host-visible staging buffer
+    /// (with the same byte permutation the pixman path applies — see
+    /// `put_image` depth-24/32 arm), record one
+    /// `vkCmdCopyBufferToImage` per surviving GC-clipped sub-rect,
+    /// submit + wait. Returns `false` (so caller falls back to pixman)
+    /// when:
+    ///
+    /// - Vulkan or the staging buffer / op pool didn't come up.
+    /// - The drawable has no `vk_mirror` (window/pixmap not GPU-backed).
+    /// - The depth doesn't match the mirror's bytes-per-pixel
+    ///   (e.g. depth-1 PutImage into an R8 mirror — bit-packing
+    ///   differs; pixman stays correct for those).
+    /// - A Vulkan API call fails mid-record.
+    fn try_vk_put_image(
+        &mut self,
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        data: &[u8],
+    ) -> bool {
+        use crate::kms::vk::ops::{image as vk_image, run_one_shot_op};
+
+        if width == 0 || height == 0 {
+            return false;
+        }
+
+        // Map X11 source depth to mirror bytes-per-pixel. depth-1
+        // unpacks 1 bit/pixel from the wire to 1 byte/pixel R8 in
+        // the staging buffer. depth-4 / depth-15 / depth-16 are
+        // not in scope today (no matching mirror format).
+        let src_bpp: usize = match depth {
+            1 | 8 => 1,
+            24 | 32 => 4,
+            _ => return false,
+        };
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.ops_staging.is_none() {
+            return false;
+        }
+
+        // GC clip is in dst space. MIT-SHM PutImage clears the clip
+        // before calling backend.put_image, so this returns the input
+        // unchanged for that path; core PutImage applies the GC's
+        // clip rectangles.
+        let dst_rect = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        let sub_rects = self.intersect_with_current_clip(&[dst_rect]);
+        if sub_rects.is_empty() {
+            // Fully clipped — nothing to draw, but the request is
+            // "handled" so don't fall back to pixman.
+            return true;
+        }
+
+        // Borrow the mirror to read its extent + format.
+        let (mirror_w, mirror_h, mirror_bpp) = {
+            let mirror = if let Some(w) = self.windows.get(&host_xid) {
+                w.vk_mirror.as_ref()
+            } else if let Some(p) = self.pixmaps.get(&host_xid) {
+                p.vk_mirror.as_ref()
+            } else {
+                None
+            };
+            let Some(mirror) = mirror else {
+                return false;
+            };
+            (
+                mirror.extent.width,
+                mirror.extent.height,
+                mirror.bytes_per_pixel() as usize,
+            )
+        };
+        if mirror_bpp != src_bpp {
+            return false;
+        }
+
+        // Source row stride in `data` (X11 ZPixmap on the wire).
+        //   depth-1: bits packed MSB-first per byte, scanline padded
+        //            to 32 bits → `((w + 31) / 32) * 4` bytes.
+        //   depth-8: 1 byte/pixel, scanline padded to 32 bits.
+        //   depth-24/32: 4 bytes/pixel, no extra row pad.
+        let src_row_stride: usize = match depth {
+            1 => width.div_ceil(32) as usize * 4,
+            8 => (width as usize + 3) & !3,
+            24 | 32 => width as usize * 4,
+            _ => unreachable!(),
+        };
+
+        // Per-sub-rect plan: clip each sub-rect to mirror extent and
+        // to the original PutImage rect (so pixels outside the source
+        // are skipped), compute staging offset + image offset.
+        let mirror_w_i = i32::try_from(mirror_w).unwrap_or(i32::MAX);
+        let mirror_h_i = i32::try_from(mirror_h).unwrap_or(i32::MAX);
+        let orig_x0 = i32::from(dst_x);
+        let orig_y0 = i32::from(dst_y);
+        let orig_x1 = orig_x0 + i32::from(width);
+        let orig_y1 = orig_y0 + i32::from(height);
+
+        struct PutPlan {
+            staging_offset: u64,
+            image_x: i32,
+            image_y: i32,
+            extent_w: u32,
+            extent_h: u32,
+            src_x: u32,
+            src_y: u32,
+        }
+
+        let mut plans: Vec<PutPlan> = Vec::with_capacity(sub_rects.len());
+        let mut total_bytes: u64 = 0;
+        for sub in &sub_rects {
+            let sub_x0 = i32::from(sub.x);
+            let sub_y0 = i32::from(sub.y);
+            let sub_x1 = sub_x0.saturating_add(i32::from(sub.width));
+            let sub_y1 = sub_y0.saturating_add(i32::from(sub.height));
+
+            let x0 = sub_x0.max(orig_x0).max(0);
+            let y0 = sub_y0.max(orig_y0).max(0);
+            let x1 = sub_x1.min(orig_x1).min(mirror_w_i);
+            let y1 = sub_y1.min(orig_y1).min(mirror_h_i);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let w = (x1 - x0) as u32;
+            let h = (y1 - y0) as u32;
+            let bytes = u64::from(w) * u64::from(h) * src_bpp as u64;
+            plans.push(PutPlan {
+                staging_offset: total_bytes,
+                image_x: x0,
+                image_y: y0,
+                extent_w: w,
+                extent_h: h,
+                src_x: (x0 - orig_x0) as u32,
+                src_y: (y0 - orig_y0) as u32,
+            });
+            total_bytes += bytes;
+        }
+        if plans.is_empty() {
+            return true;
+        }
+
+        if let Err(e) = self
+            .ops_staging
+            .as_mut()
+            .expect("checked is_none above")
+            .ensure(total_bytes)
+        {
+            log::warn!(
+                "vk put_image: staging grow failed for {total_bytes} bytes: {e:?} — \
+                 falling back to pixman"
+            );
+            return false;
+        }
+
+        // Memcpy host → staging with byte permutation matching the
+        // pixman path's pixel formula. For depth-24/32 the pixman
+        // arm reads `r=data[0], g=data[1], b=data[2], a=data[3]` and
+        // writes the u32 `(a<<24)|(r<<16)|(g<<8)|b`, which lays down
+        // memory bytes `[b, g, r, a]` in a u32 LE word — exactly
+        // what `B8G8R8A8_UNORM` reads as `(B, G, R, A)`.
+        // For depth-8 the pixman path is a per-byte copy; mirror is
+        // R8, same byte-per-pixel layout.
+        let staging_ptr = self.ops_staging.as_ref().unwrap().mapped_ptr();
+        for plan in &plans {
+            let row_dst_bytes = plan.extent_w as usize * src_bpp;
+            for row in 0..plan.extent_h {
+                let host_row = (plan.src_y + row) as usize;
+                let src_row_byte_start = host_row * src_row_stride;
+                if src_row_byte_start + src_row_stride > data.len() {
+                    // Truncated source — zero-fill the staging row.
+                    unsafe {
+                        let dst = staging_ptr
+                            .add(plan.staging_offset as usize + row as usize * row_dst_bytes);
+                        std::ptr::write_bytes(dst, 0, row_dst_bytes);
+                    }
+                    continue;
+                }
+                unsafe {
+                    let dst_row = staging_ptr
+                        .add(plan.staging_offset as usize + row as usize * row_dst_bytes);
+                    let src_row = data.as_ptr().add(src_row_byte_start);
+                    match depth {
+                        1 => {
+                            // X11 ZPixmap depth-1: bits packed MSB-first
+                            // per byte, scanlines padded to 32 bits.
+                            // Unpack each bit into a byte (0xFF / 0x00)
+                            // for the R8 mirror.
+                            for col in 0..plan.extent_w as usize {
+                                let bit_index = plan.src_x as usize + col;
+                                let byte = *src_row.add(bit_index >> 3);
+                                let bit = (byte >> (7 - (bit_index & 7))) & 1;
+                                *dst_row.add(col) = if bit != 0 { 0xFF } else { 0x00 };
+                            }
+                        }
+                        8 => {
+                            let src = src_row.add(plan.src_x as usize);
+                            std::ptr::copy_nonoverlapping(src, dst_row, row_dst_bytes);
+                        }
+                        24 | 32 => {
+                            // 4 bpp with byte permutation. src bytes
+                            // are conventionally [r, g, b, a]; we emit
+                            // [b, g, r, a] (or [b, g, r, 0xFF] for
+                            // depth==24) to match the
+                            // `B8G8R8A8_UNORM` mirror's memory order.
+                            let src = src_row.add(plan.src_x as usize * 4);
+                            for col in 0..plan.extent_w as usize {
+                                let s = src.add(col * 4);
+                                let d = dst_row.add(col * 4);
+                                let r = *s;
+                                let g = *s.add(1);
+                                let b = *s.add(2);
+                                let a = if depth == 32 { *s.add(3) } else { 0xFFu8 };
+                                *d = b;
+                                *d.add(1) = g;
+                                *d.add(2) = r;
+                                *d.add(3) = a;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+
+        // Build BufferImageCopy regions.
+        let regions: Vec<ash::vk::BufferImageCopy> = plans
+            .iter()
+            .map(|p| {
+                ash::vk::BufferImageCopy::default()
+                    .buffer_offset(p.staging_offset)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        ash::vk::ImageSubresourceLayers::default()
+                            .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_offset(ash::vk::Offset3D {
+                        x: p.image_x,
+                        y: p.image_y,
+                        z: 0,
+                    })
+                    .image_extent(ash::vk::Extent3D {
+                        width: p.extent_w,
+                        height: p.extent_h,
+                        depth: 1,
+                    })
+            })
+            .collect();
+
+        // Reborrow the mirror mutably for the recording.
+        let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(mirror) = mirror else {
+            return false;
+        };
+        let staging_buffer = self.ops_staging.as_ref().expect("checked above").buffer();
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_image::record_put_image(vk, cb, mirror, staging_buffer, &regions)
+        }) {
+            Ok(()) => {
+                // The Vk-direct write made the mirror current; we
+                // do NOT mark damage here. Damage tells
+                // `MirrorUploader` to upload pixman → mirror at the
+                // next composite frame, which would *clobber* the
+                // bytes we just wrote with whatever (stale) pixman
+                // contents. The original 4.1.4.3 commit incorrectly
+                // marked damage with the inverted reasoning.
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "vk put_image: record failed on xid {host_xid:#x}: {e:?} — \
+                     falling back to pixman"
+                );
+                false
+            }
+        }
+    }
+
+    /// GetImage Vulkan-direct readback (sub-phase 4.1.4.3). Records
+    /// `vkCmdCopyImageToBuffer` from the mirror into the host-visible
+    /// staging buffer, waits, and writes the pixel bytes (with the
+    /// same byte ordering the pixman path emits) into the caller's
+    /// reply Vec. The 32-byte X11 GetImage reply header is emitted by
+    /// the trait impl; this returns just the pixel payload.
+    ///
+    /// Returns `None` when the path is unavailable (no Vulkan, no
+    /// staging, no mirror, depth/format mismatch). Caller falls back
+    /// to the pixman read in that case.
+    fn try_vk_get_image_pixels(
+        &mut self,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        depth: u8,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        use crate::kms::vk::ops::{image as vk_image, run_one_shot_op};
+
+        if width == 0 || height == 0 {
+            return false;
+        }
+
+        // Match the depth → mirror format mapping from put_image. For
+        // the depths we don't accelerate (1, 4, 15, 16) the trait
+        // impl's pixman zero-fill path is preserved.
+        let bpp: usize = match depth {
+            8 => 1,
+            24 | 32 => 4,
+            _ => return false,
+        };
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.ops_staging.is_none() {
+            return false;
+        }
+
+        let (mirror_w, mirror_h, mirror_bpp) = {
+            let mirror = if let Some(w) = self.windows.get(&host_xid) {
+                w.vk_mirror.as_ref()
+            } else if let Some(p) = self.pixmaps.get(&host_xid) {
+                p.vk_mirror.as_ref()
+            } else {
+                None
+            };
+            let Some(mirror) = mirror else {
+                return false;
+            };
+            (
+                mirror.extent.width,
+                mirror.extent.height,
+                mirror.bytes_per_pixel() as usize,
+            )
+        };
+        if mirror_bpp != bpp {
+            return false;
+        }
+
+        // Reply rows are padded to a 4-byte boundary per X11 ZPixmap.
+        let row_data_bytes = width as usize * bpp;
+        let row_stride_bytes = (row_data_bytes + 3) & !3;
+        let row_pad_bytes = row_stride_bytes - row_data_bytes;
+
+        // Clip the read rect to the mirror extent. Out-of-range cells
+        // are zero-filled in the output (matching the pixman path).
+        let mirror_w_i = i32::try_from(mirror_w).unwrap_or(i32::MAX);
+        let mirror_h_i = i32::try_from(mirror_h).unwrap_or(i32::MAX);
+        let orig_x0 = i32::from(x);
+        let orig_y0 = i32::from(y);
+        let orig_x1 = orig_x0 + i32::from(width);
+        let orig_y1 = orig_y0 + i32::from(height);
+        let read_x0 = orig_x0.max(0);
+        let read_y0 = orig_y0.max(0);
+        let read_x1 = orig_x1.min(mirror_w_i);
+        let read_y1 = orig_y1.min(mirror_h_i);
+        let has_read = read_x1 > read_x0 && read_y1 > read_y0;
+
+        let read_w = if has_read {
+            (read_x1 - read_x0) as u32
+        } else {
+            0
+        };
+        let read_h = if has_read {
+            (read_y1 - read_y0) as u32
+        } else {
+            0
+        };
+        let read_bytes = u64::from(read_w) * u64::from(read_h) * bpp as u64;
+
+        if has_read {
+            if let Err(e) = self
+                .ops_staging
+                .as_mut()
+                .expect("checked above")
+                .ensure(read_bytes)
+            {
+                log::warn!(
+                    "vk get_image: staging grow failed for {read_bytes} bytes: \
+                     {e:?} — falling back to pixman"
+                );
+                return false;
+            }
+
+            let regions = [ash::vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    ash::vk::ImageSubresourceLayers::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(ash::vk::Offset3D {
+                    x: read_x0,
+                    y: read_y0,
+                    z: 0,
+                })
+                .image_extent(ash::vk::Extent3D {
+                    width: read_w,
+                    height: read_h,
+                    depth: 1,
+                })];
+
+            let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
+                w.vk_mirror.as_mut()
+            } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
+                p.vk_mirror.as_mut()
+            } else {
+                None
+            };
+            let Some(mirror) = mirror else {
+                return false;
+            };
+            let staging_buffer = self.ops_staging.as_ref().expect("checked above").buffer();
+            match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+                vk_image::record_get_image(vk, cb, mirror, staging_buffer, &regions)
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!(
+                        "vk get_image: record failed on xid {host_xid:#x}: {e:?} — \
+                         falling back to pixman"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // Walk the requested rect row by row, copying from the staging
+        // buffer where the row/column intersects the mirror, and
+        // emitting zeros where it doesn't. Mirror's BGRA8 memory bytes
+        // are the same as pixman's `0xAARRGGBB` LE u32 storage, so a
+        // straight memcpy yields identical wire bytes for depth-24/32.
+        // Depth-8 is single-byte memcpy.
+        let staging_ptr = self.ops_staging.as_ref().unwrap().mapped_ptr() as *const u8;
+        for row in 0..i32::from(height) {
+            let dy = orig_y0 + row;
+            for col in 0..i32::from(width) {
+                let dx = orig_x0 + col;
+                if has_read && dx >= read_x0 && dx < read_x1 && dy >= read_y0 && dy < read_y1 {
+                    let staging_row = (dy - read_y0) as usize;
+                    let staging_col = (dx - read_x0) as usize;
+                    let staging_off = staging_row * (read_w as usize * bpp) + staging_col * bpp;
+                    unsafe {
+                        let src = staging_ptr.add(staging_off);
+                        let mut buf = [0u8; 4];
+                        std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), bpp);
+                        out.extend_from_slice(&buf[..bpp]);
+                    }
+                } else {
+                    out.extend(std::iter::repeat_n(0u8, bpp));
+                }
+            }
+            if row_pad_bytes > 0 {
+                out.extend(std::iter::repeat_n(0u8, row_pad_bytes));
+            }
+        }
+
+        true
+    }
+
+    /// Sub-phase 4.1.4.5 helper. Intern each rendered glyph in the
+    /// shared atlas and dispatch a single text-pipeline draw onto
+    /// the target's mirror. Returns `true` when the path took (the
+    /// caller should `return Ok(())`); `false` means the caller
+    /// falls back to the existing pixman compositing path.
+    ///
+    /// All-or-nothing: any glyph that fails to intern (atlas full,
+    /// API failure) makes the whole run fall back. Partial Vulkan
+    /// and partial pixman would double-draw glyphs; the caller's
+    /// pixman path already handles the whole run correctly.
+    fn try_vk_text_run(
+        &mut self,
+        host_xid: u32,
+        font_xid: u32,
+        foreground: u32,
+        rendered: &[RenderedGlyph],
+    ) -> bool {
+        use crate::kms::vk::{
+            glyph::GlyphKey,
+            ops::{run_one_shot_op, text as vk_text},
+        };
+
+        if rendered.is_empty() {
+            return true;
+        }
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.glyph_atlas.is_none() || self.text_pipeline.is_none() {
+            return false;
+        }
+
+        // Mirror format check before spending atlas slots on a
+        // run that can't use them.
+        let mirror_format = if let Some(w) = self.windows.get(&host_xid) {
+            w.vk_mirror.as_ref().map(|m| m.format)
+        } else if let Some(p) = self.pixmaps.get(&host_xid) {
+            p.vk_mirror.as_ref().map(|m| m.format)
+        } else {
+            None
+        };
+        let Some(mirror_format) = mirror_format else {
+            return false;
+        };
+        if mirror_format != ash::vk::Format::B8G8R8A8_UNORM {
+            return false;
+        }
+
+        // Intern glyphs first. Each call may run a one-shot
+        // upload CB; that's fine — happens before we record the
+        // text run, so atlas is fully populated by the time the
+        // text-run CB executes.
+        let mut glyphs_to_draw: Vec<vk_text::TextGlyph> = Vec::with_capacity(rendered.len());
+        for g in rendered {
+            let key = GlyphKey {
+                font_xid,
+                codepoint: g.codepoint,
+            };
+            let atlas = self.glyph_atlas.as_mut().expect("checked above");
+            let Some(entry) =
+                atlas.intern(key, g.w as u32, g.h as u32, 0, 0, &g.pixels, pool_handle)
+            else {
+                // Atlas full or upload failed — abort the run.
+                return false;
+            };
+            glyphs_to_draw.push(vk_text::TextGlyph {
+                entry,
+                dst_x: g.dst_x,
+                dst_y: g.dst_y,
+            });
+        }
+
+        let foreground_rgba = [
+            ((foreground >> 16) & 0xFF) as f32 / 255.0,
+            ((foreground >> 8) & 0xFF) as f32 / 255.0,
+            (foreground & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+
+        // Pull mut refs after the atlas borrow ends. The atlas
+        // and the pipeline are immutable for the recording step;
+        // the mirror is &mut.
+        let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(mirror) = mirror else {
+            return false;
+        };
+        let atlas = self.glyph_atlas.as_ref().expect("checked above");
+        let pipeline = self.text_pipeline.as_ref().expect("checked above");
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_text::record_text_run(
+                vk,
+                cb,
+                mirror,
+                atlas,
+                pipeline,
+                &glyphs_to_draw,
+                foreground_rgba,
+            )
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk text_run: record failed on xid {host_xid:#x}: {e:?} — falling back to \
+                     pixman"
+                );
+                false
+            }
+        }
+    }
+
+    /// Phase 4.1.4.7 trapezoid wire-decoder + Vk dispatch. Returns
+    /// `true` when the Vulkan path took.
+    fn try_vk_render_trapezoids_path(
+        &mut self,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        traps: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> bool {
+        use crate::kms::vk::ops::traps as vk_traps;
+
+        let n_traps = traps.len() / 40;
+        if n_traps == 0 {
+            return true;
+        }
+        let mut decoded: Vec<vk_traps::Trapezoid> = Vec::with_capacity(n_traps);
+        for chunk in traps.chunks_exact(40) {
+            let read_i32 = |o: usize| -> i32 {
+                i32::from_le_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]])
+            };
+            decoded.push(vk_traps::Trapezoid {
+                top: read_i32(0),
+                bottom: read_i32(4),
+                left_p1: (read_i32(8), read_i32(12)),
+                left_p2: (read_i32(16), read_i32(20)),
+                right_p1: (read_i32(24), read_i32(28)),
+                right_p2: (read_i32(32), read_i32(36)),
+            });
+        }
+        // Apply (x_off, y_off) in fixed-point units.
+        let dx = i32::from(x_off) << 16;
+        let dy = i32::from(y_off) << 16;
+        if dx != 0 || dy != 0 {
+            for t in &mut decoded {
+                t.top = t.top.wrapping_add(dy);
+                t.bottom = t.bottom.wrapping_add(dy);
+                t.left_p1.0 = t.left_p1.0.wrapping_add(dx);
+                t.left_p1.1 = t.left_p1.1.wrapping_add(dy);
+                t.left_p2.0 = t.left_p2.0.wrapping_add(dx);
+                t.left_p2.1 = t.left_p2.1.wrapping_add(dy);
+                t.right_p1.0 = t.right_p1.0.wrapping_add(dx);
+                t.right_p1.1 = t.right_p1.1.wrapping_add(dy);
+                t.right_p2.0 = t.right_p2.0.wrapping_add(dx);
+                t.right_p2.1 = t.right_p2.1.wrapping_add(dy);
+            }
+        }
+
+        let Some((bx, by, bx1, by1)) = vk_traps::trapezoid_bbox(&decoded) else {
+            return true; // empty / degenerate
+        };
+        // Clamp to non-negative — Vulkan dst-coords are unsigned.
+        let bx = bx.max(0);
+        let by = by.max(0);
+        if bx1 <= bx || by1 <= by {
+            return true;
+        }
+        let bw = (bx1 - bx) as u32;
+        let bh = (by1 - by) as u32;
+        let mask = vk_traps::rasterize_trapezoids(&decoded, bx, by, bw, bh);
+        self.try_vk_render_traps_or_tris(op, host_src, host_dst, &mask, bx, by, bw, bh)
+    }
+
+    /// Phase 4.1.4.7 triangle wire-decoder + Vk dispatch. Mirrors
+    /// the trapezoid path but for triangle / tristrip / trifan.
+    #[allow(clippy::too_many_arguments)]
+    fn try_vk_render_triangles_path(
+        &mut self,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        primitives: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> bool {
+        use crate::kms::vk::ops::traps as vk_traps;
+
+        let read_point = |off: usize, chunk: &[u8]| -> (i32, i32) {
+            let x =
+                i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+            let y = i32::from_le_bytes([
+                chunk[off + 4],
+                chunk[off + 5],
+                chunk[off + 6],
+                chunk[off + 7],
+            ]);
+            (x, y)
+        };
+
+        let mut tris: Vec<vk_traps::Triangle> = match minor {
+            11 => {
+                if !primitives.len().is_multiple_of(24) {
+                    return false;
+                }
+                primitives
+                    .chunks_exact(24)
+                    .map(|c| vk_traps::Triangle {
+                        p1: read_point(0, c),
+                        p2: read_point(8, c),
+                        p3: read_point(16, c),
+                    })
+                    .collect()
+            }
+            12 => {
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return false;
+                }
+                let pts: Vec<(i32, i32)> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (0..pts.len() - 2)
+                    .map(|i| vk_traps::Triangle {
+                        p1: pts[i],
+                        p2: pts[i + 1],
+                        p3: pts[i + 2],
+                    })
+                    .collect()
+            }
+            13 => {
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return false;
+                }
+                let pts: Vec<(i32, i32)> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (1..pts.len() - 1)
+                    .map(|i| vk_traps::Triangle {
+                        p1: pts[0],
+                        p2: pts[i],
+                        p3: pts[i + 1],
+                    })
+                    .collect()
+            }
+            _ => return false,
+        };
+        if tris.is_empty() {
+            return true;
+        }
+        let dx = i32::from(x_off) << 16;
+        let dy = i32::from(y_off) << 16;
+        if dx != 0 || dy != 0 {
+            for t in &mut tris {
+                t.p1.0 = t.p1.0.wrapping_add(dx);
+                t.p1.1 = t.p1.1.wrapping_add(dy);
+                t.p2.0 = t.p2.0.wrapping_add(dx);
+                t.p2.1 = t.p2.1.wrapping_add(dy);
+                t.p3.0 = t.p3.0.wrapping_add(dx);
+                t.p3.1 = t.p3.1.wrapping_add(dy);
+            }
+        }
+
+        let Some((bx, by, bx1, by1)) = vk_traps::triangle_bbox(&tris) else {
+            return true;
+        };
+        let bx = bx.max(0);
+        let by = by.max(0);
+        if bx1 <= bx || by1 <= by {
+            return true;
+        }
+        let bw = (bx1 - bx) as u32;
+        let bh = (by1 - by) as u32;
+        let mask = vk_traps::rasterize_triangles(&tris, bx, by, bw, bh);
+        self.try_vk_render_traps_or_tris(op, host_src, host_dst, &mask, bx, by, bw, bh)
+    }
+
+    /// Sub-phase 4.1.4.7 helper. Vulkan-direct RENDER `Trapezoids`
+    /// / `Triangles` via CPU rasterisation. The R8 mask is uploaded
+    /// to [`MaskScratch`](crate::kms::vk::mask_scratch::MaskScratch);
+    /// the composite path then reads `src.color * mask.alpha` exactly
+    /// like a normal Composite call with an A8 mask.
+    ///
+    /// Source resolution mirrors [`Self::try_vk_render_composite`]:
+    /// `SolidFill` clears a 1×1 scratch with the picture colour,
+    /// `Drawable` samples the drawable's mirror (with the same
+    /// alpha-vs-no-alpha view selection rules), `Gradient` samples
+    /// the pre-evaluated gradient image and inherits its
+    /// axis-projection transform.
+    ///
+    /// Returns `true` if the Vulkan path took (or trivially had no
+    /// pixels to draw); `false` means the caller should treat the
+    /// request as unhandled.
+    #[allow(clippy::too_many_arguments)]
+    fn try_vk_render_traps_or_tris(
+        &mut self,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        coverage_mask: &[u8], // already CPU-rasterised
+        bbox_x: i32,
+        bbox_y: i32,
+        bbox_w: u32,
+        bbox_h: u32,
+    ) -> bool {
+        use crate::kms::vk::{
+            ops::{render as vk_render, run_one_shot_op},
+            render_pipeline::{StdPictOp, record_solid_color_clear},
+        };
+
+        if bbox_w == 0 || bbox_h == 0 || coverage_mask.is_empty() {
+            return true;
+        }
+
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            return false;
+        };
+
+        let Some(src) = resolve_render_pic(self.pictures.get(&host_src)) else {
+            return false;
+        };
+
+        let (dst_xid, picture_clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
+            _ => return false,
+        };
+
+        // Self-composite (src aliases dst) needs a staging copy —
+        // out of scope for this path.
+        let src_xid_if_drawable = match src {
+            RenderPic::Drawable(xid) => Some(xid),
+            _ => None,
+        };
+        if src_xid_if_drawable == Some(dst_xid) {
+            return false;
+        }
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.render_pipelines.is_none()
+            || self.solid_src_image.is_none()
+            || self.mask_scratch.is_none()
+            || self.white_mask_image.is_none()
+        {
+            return false;
+        }
+        let (dst_format, dst_extent, dst_depth, drawable_size) =
+            if let Some(w) = self.windows.get(&dst_xid) {
+                (
+                    w.vk_mirror.as_ref().map(|m| m.format),
+                    w.vk_mirror.as_ref().map(|m| m.extent),
+                    w.depth,
+                    Some((u32::from(w.width), u32::from(w.height))),
+                )
+            } else if let Some(p) = self.pixmaps.get(&dst_xid) {
+                (
+                    p.vk_mirror.as_ref().map(|m| m.format),
+                    p.vk_mirror.as_ref().map(|m| m.extent),
+                    p.depth,
+                    Some((u32::from(p.width), u32::from(p.height))),
+                )
+            } else {
+                (None, None, 0, None)
+            };
+        let dst_format = match dst_format {
+            Some(f @ (ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM)) => f,
+            _ => return false,
+        };
+        let Some(dst_extent) = dst_extent else {
+            return false;
+        };
+        let Some((drawable_w, drawable_h)) = drawable_size else {
+            return false;
+        };
+        let dst_has_alpha = dst_format == ash::vk::Format::R8_UNORM || dst_depth == 32;
+        let needs_dst_readback = std_op.needs_dst_readback();
+        if needs_dst_readback && self.dst_readback.is_none() {
+            return false;
+        }
+
+        // Drawable src must have a sampleable mirror in a known
+        // format. Matches the gating in try_vk_render_composite.
+        if let Some(xid) = src_xid_if_drawable
+            && !self.ensure_drawable_mirror_sampleable(xid)
+        {
+            return false;
+        }
+        if let Some(xid) = src_xid_if_drawable {
+            let f = if let Some(w) = self.windows.get(&xid) {
+                w.vk_mirror.as_ref().map(|m| m.format)
+            } else if let Some(p) = self.pixmaps.get(&xid) {
+                p.vk_mirror.as_ref().map(|m| m.format)
+            } else {
+                None
+            };
+            if !matches!(
+                f,
+                Some(ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM)
+            ) {
+                return false;
+            }
+        }
+
+        // Upload CPU-rasterised mask first — independent of the
+        // composite recording. Resizes the scratch on demand.
+        if let Err(e) = self
+            .mask_scratch
+            .as_mut()
+            .expect("checked above")
+            .upload_r8(pool_handle, bbox_w, bbox_h, coverage_mask)
+        {
+            log::warn!("vk render_traps: mask upload failed: {e:?}");
+            return false;
+        }
+
+        // Pipeline + scissor. render_traps doesn't compute via the
+        // component-alpha path (its mask is the CPU-rasterised
+        // coverage, not a client picture), so component_alpha=false.
+        let pipeline = match self.render_pipelines.as_mut().expect("checked above").get(
+            std_op,
+            dst_format,
+            dst_has_alpha,
+            false,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("vk render_traps: pipeline build failed: {e:?}");
+                return false;
+            }
+        };
+        let pipeline_layout = self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .pipeline_layout();
+        if let Err(e) = self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .reset_descriptors()
+        {
+            log::warn!("vk render_traps: descriptor pool reset failed: {e:?}");
+            return false;
+        }
+
+        let solid_src_view = self
+            .solid_src_image
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let mask_view = self
+            .mask_scratch
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let mask_extent = self.mask_scratch.as_ref().expect("checked above").extent();
+
+        // Resolve src view + extent + (optional) clear colour.
+        // Tracks any per-source affine the picture itself induces
+        // (gradient axis projection); the user-transform composition
+        // path in try_vk_render_composite isn't reachable here yet
+        // because the trapezoid/triangle paths don't carry one.
+        let mut src_clear_color: Option<[f32; 4]> = None;
+        let src_view;
+        let src_extent;
+        let src_picture_xform: Option<vk_render::AffineXform>;
+        match src {
+            RenderPic::Drawable(xid) => {
+                let (m_format, extent, depth) = {
+                    let (m, depth) = if let Some(w) = self.windows.get(&xid) {
+                        (w.vk_mirror.as_ref(), w.depth)
+                    } else if let Some(p) = self.pixmaps.get(&xid) {
+                        (p.vk_mirror.as_ref(), p.depth)
+                    } else {
+                        (None, 0)
+                    };
+                    let Some(m) = m else { return false };
+                    (m.format, m.extent, depth)
+                };
+                let view = if m_format == ash::vk::Format::R8_UNORM {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if depth == 24 {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if let Some(w) = self.windows.get(&xid) {
+                    w.vk_mirror.as_ref().expect("checked above").vk_image_view
+                } else {
+                    self.pixmaps
+                        .get(&xid)
+                        .and_then(|p| p.vk_mirror.as_ref())
+                        .expect("checked above")
+                        .vk_image_view
+                };
+                src_view = view;
+                src_extent = extent;
+                src_picture_xform = None;
+            }
+            RenderPic::Solid(color) => {
+                src_view = solid_src_view;
+                src_extent = ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                };
+                src_clear_color = Some(color);
+                src_picture_xform = None;
+            }
+            RenderPic::Gradient(xid) => {
+                let Some(PictureState::Gradient { gradient, .. }) = self.pictures.get(&xid) else {
+                    return false;
+                };
+                src_view = gradient.image_view();
+                src_extent = gradient.extent();
+                src_picture_xform = Some(gradient.axis_projection);
+            }
+            RenderPic::None => return false,
+        }
+
+        // Disjoint/Conjoint ops reach this path too (e.g. rendercheck's
+        // `Conjoint*` triangles cases). For those the shader reads dst
+        // via binding 2; ensure the dst-readback scratch is sized for
+        // the dst mirror and snapshot dst into it inside the CB.
+        // Standard ops bind the white-mask scratch as a placeholder.
+        let white_mask_view = self
+            .white_mask_image
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let dst_readback_view = if needs_dst_readback {
+            let scratch = self.dst_readback.as_mut().expect("checked above");
+            if let Err(e) = scratch.ensure(dst_format, dst_extent.width, dst_extent.height) {
+                log::warn!("vk render_traps: dst readback ensure failed: {e:?}");
+                return false;
+            }
+            match scratch.view(dst_format, dst_has_alpha) {
+                Ok(Some(v)) => v,
+                Ok(None) => return false,
+                Err(e) => {
+                    log::warn!("vk render_traps: dst readback view build failed: {e:?}");
+                    return false;
+                }
+            }
+        } else {
+            white_mask_view
+        };
+        let descriptor_set = match self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .allocate_descriptor_for_views(src_view, mask_view, dst_readback_view)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("vk render_traps: descriptor alloc failed: {e:?}");
+                return false;
+            }
+        };
+
+        // Pixman's `zero_src_has_no_effect` table inverted: ops where
+        // mask=0 still affects dst (e.g. Clear, Src, In, InReverse,
+        // Out, AtopReverse, Saturate, plus every Disjoint/Conjoint
+        // variant — pixman's table doesn't list those, so they fall
+        // into the default-FALSE arm) must composite across the
+        // entire destination, not just the trapezoid bbox. The
+        // mask scratch sits at offset (bbox_x, bbox_y) within the
+        // destination; outside that window REPEAT_NONE returns 0,
+        // and the operator math then yields the right outside-bbox
+        // result (Clear → 0, Src → 0, etc.). See xserver
+        // `fb/fbtrap.c` → `pixman/pixman-trap.c::get_trap_extents`.
+        let needs_full_dst = matches!(op, 0 | 1 | 5 | 6 | 7 | 10 | 13 | 16..=27 | 32..=43);
+        let (render_dst_x, render_dst_y, render_w, render_h, mask_off_x, mask_off_y) =
+            if needs_full_dst {
+                (0, 0, drawable_w, drawable_h, -bbox_x, -bbox_y)
+            } else {
+                (bbox_x, bbox_y, bbox_w, bbox_h, 0, 0)
+            };
+
+        // Build the scissor + composite rect.
+        let scissor = match self.build_render_composite_inputs(
+            &picture_clip,
+            0,
+            0,
+            0,
+            0,
+            render_dst_x as i16,
+            render_dst_y as i16,
+            render_w.try_into().unwrap_or(u16::MAX),
+            render_h.try_into().unwrap_or(u16::MAX),
+        ) {
+            Some((_, scissor)) => scissor,
+            None => return true, // clipped out completely
+        };
+        let rects = vec![vk_render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: mask_off_x,
+            mask_y: mask_off_y,
+            dst_x: render_dst_x,
+            dst_y: render_dst_y,
+            width: render_w,
+            height: render_h,
+        }];
+        let attrs = vk_render::CompositeAttrs {
+            src_extent,
+            mask_extent,
+            // Synthetic 1×1 sources tile trivially; real Drawable /
+            // Gradient sources sample within their extent and the
+            // bounding box keeps us in-range, so Normal is a safe
+            // default.
+            src_repeat: 1,
+            // Mask scratch is sized exactly to the trapezoid bbox.
+            // Sampling outside that window with REPEAT_NONE returns 0,
+            // which is what we want for the full-dst path's
+            // outside-bbox pixels (mask=0 makes the operator yield
+            // the right zero / dst-preserved result).
+            mask_repeat: 0,
+            src_xform: src_picture_xform.unwrap_or(vk_render::AffineXform::IDENTITY),
+            mask_xform: vk_render::AffineXform::IDENTITY,
+        };
+
+        let dst_mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(dst_mirror) = dst_mirror else {
+            return false;
+        };
+        let solid_src_image = self.solid_src_image.as_mut().expect("checked above");
+        let dst_readback = if needs_dst_readback {
+            Some(self.dst_readback.as_mut().expect("checked above"))
+        } else {
+            None
+        };
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            if let Some(color) = src_clear_color {
+                record_solid_color_clear(vk, cb, solid_src_image, color);
+            }
+            // Disjoint/Conjoint: snapshot dst into the readback scratch
+            // so the shader can sample it at binding 2. Mirrors the
+            // sequencing in try_vk_render_composite.
+            if let Some(rb) = dst_readback {
+                rb.record_copy_from(
+                    cb,
+                    dst_mirror.vk_image,
+                    dst_mirror.current_layout(),
+                    dst_format,
+                    dst_mirror.extent,
+                );
+            }
+            vk_render::record_render_composite(
+                vk,
+                cb,
+                dst_mirror,
+                pipeline,
+                pipeline_layout,
+                descriptor_set,
+                &attrs,
+                &rects,
+                scissor,
+            )
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("vk render_traps: record failed on dst xid {dst_xid:#x}: {e:?}");
+                false
+            }
+        }
+    }
+
+    /// Sub-phase 4.1.4.7 helper. Vulkan-direct RENDER `CompositeGlyphs`.
+    ///
+    /// Only the rendercheck-relevant case is supported: SolidFill src
+    /// and drawable dst, glyphsets in `A8` or `A1` format. Glyphs intern
+    /// into the shared 4.1.4.5 atlas (same key namespace as text runs —
+    /// `(font_xid = gs_xid, codepoint = glyph_id)`); A1 bitmaps are
+    /// expanded to A8 host-side because the atlas is `R8_UNORM`.
+    ///
+    /// Op is ignored — the text pipeline always premul-srcover blends.
+    /// rendercheck's CompositeGlyphs cases use `Over`, which matches
+    /// the pipeline's blend state. Other ops fall through to pixman.
+    #[allow(clippy::too_many_arguments)]
+    fn try_vk_render_composite_glyphs(
+        &mut self,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> bool {
+        use crate::kms::vk::{
+            glyph::GlyphKey,
+            ops::{run_one_shot_op, text as vk_text},
+        };
+
+        // PictOp `Over` (3) is the natural fit for the text pipeline's
+        // pre-mul srcover blend state. `Src` (1) overrides dst rather
+        // than blending — incorrect if the run overlaps existing
+        // pixels. Conservative: only handle `Over`.
+        if op != 3 {
+            return false;
+        }
+
+        // SolidFill src only.
+        let foreground_premul = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { premul, .. }) => *premul,
+            _ => return false,
+        };
+
+        let (dst_xid, _clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
+            _ => return false,
+        };
+
+        if !self.glyphsets.contains_key(&host_gs) {
+            return false;
+        }
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.glyph_atlas.is_none() || self.text_pipeline.is_none() {
+            return false;
+        }
+
+        // Mirror format check — atlas + text pipeline target BGRA.
+        let mirror_format = if let Some(w) = self.windows.get(&dst_xid) {
+            w.vk_mirror.as_ref().map(|m| m.format)
+        } else if let Some(p) = self.pixmaps.get(&dst_xid) {
+            p.vk_mirror.as_ref().map(|m| m.format)
+        } else {
+            None
+        };
+        if mirror_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            return false;
+        }
+
+        // Walk the items list (same parser as `composite_glyphs_onto`)
+        // to build a `Vec<TextGlyph>`. Any unsupported glyph format
+        // makes us bail to pixman so the run renders consistently.
+        let id_size: usize = match minor {
+            23 => 1,
+            24 => 2,
+            _ => 4,
+        };
+        let mut pen_x = i32::from(src_x) + i32::from(x_off);
+        let mut pen_y = i32::from(src_y) + i32::from(y_off);
+        let mut pos: usize = 0;
+        let mut active_gs_xid = host_gs;
+        let mut glyphs_to_draw: Vec<vk_text::TextGlyph> = Vec::new();
+        // Throwaway A8 buffer for A1→A8 expansion; reused per glyph.
+        let mut a8_scratch: Vec<u8> = Vec::new();
+
+        while pos + 8 <= items.len() {
+            let count = items[pos] as usize;
+            if count == 255 {
+                if pos + 8 <= items.len() {
+                    let new_xid = u32::from_le_bytes([
+                        items[pos + 4],
+                        items[pos + 5],
+                        items[pos + 6],
+                        items[pos + 7],
+                    ]);
+                    if new_xid != 0 && self.glyphsets.contains_key(&new_xid) {
+                        active_gs_xid = new_xid;
+                    }
+                }
+                pos += 8;
+                continue;
+            }
+            let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]) as i32;
+            let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]) as i32;
+            pen_x += dx;
+            pen_y += dy;
+
+            let payload_start = pos + 8;
+            let payload_bytes = count * id_size;
+            let padded = (payload_bytes + 3) & !3;
+            if payload_start + padded > items.len() {
+                break;
+            }
+
+            let Some(active_gs) = self.glyphsets.get(&active_gs_xid) else {
+                pos += 8 + padded;
+                continue;
+            };
+            let active_gs_xid_for_key = active_gs_xid;
+
+            for i in 0..count {
+                let id_off = payload_start + i * id_size;
+                let glyph_id: u32 = match id_size {
+                    1 => u32::from(items[id_off]),
+                    2 => u32::from(u16::from_le_bytes([items[id_off], items[id_off + 1]])),
+                    _ => u32::from_le_bytes([
+                        items[id_off],
+                        items[id_off + 1],
+                        items[id_off + 2],
+                        items[id_off + 3],
+                    ]),
+                };
+                let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
+                    continue;
+                };
+
+                let gw = glyph.width as u32;
+                let gh = glyph.height as u32;
+                let dst_x = pen_x - i32::from(glyph.x);
+                let dst_y = pen_y - i32::from(glyph.y);
+
+                if gw > 0 && gh > 0 {
+                    let pixels: &[u8] = match glyph.format {
+                        GlyphSetFormat::A8 => &glyph.pixels,
+                        GlyphSetFormat::A1 => {
+                            // Wire A1: rows MSB-first, 32-bit padded.
+                            // Expand into row-major A8 (0 or 255).
+                            let wire_stride = (gw as usize).div_ceil(32) * 4;
+                            a8_scratch.clear();
+                            a8_scratch.resize((gw * gh) as usize, 0);
+                            for row in 0..(gh as usize) {
+                                let src_off = row * wire_stride;
+                                if src_off + wire_stride > glyph.pixels.len() {
+                                    break;
+                                }
+                                for col in 0..(gw as usize) {
+                                    let byte = glyph.pixels[src_off + col / 8];
+                                    // X11 A1 is LSB-first within each byte (per
+                                    // glyph protocol; differs from pixman's wire
+                                    // format which is MSB. The existing pixman
+                                    // path relies on pixman_image_create A1, which
+                                    // accepts MSB-first — but `parse_add_glyphs`
+                                    // strips no bit-ordering, so we read the
+                                    // wire as-is). Use MSB-first: bit `7-(col%8)`.
+                                    let bit = (byte >> (7 - (col & 7))) & 1;
+                                    a8_scratch[row * (gw as usize) + col] =
+                                        if bit != 0 { 0xFF } else { 0 };
+                                }
+                            }
+                            &a8_scratch
+                        }
+                        GlyphSetFormat::Other => {
+                            return false;
+                        }
+                    };
+
+                    let key = GlyphKey {
+                        font_xid: active_gs_xid_for_key,
+                        codepoint: glyph_id,
+                    };
+                    let atlas = self.glyph_atlas.as_mut().expect("checked above");
+                    let Some(entry) = atlas.intern(key, gw, gh, 0, 0, pixels, pool_handle) else {
+                        // Atlas full or upload failed — fall back.
+                        return false;
+                    };
+                    glyphs_to_draw.push(vk_text::TextGlyph {
+                        entry,
+                        dst_x,
+                        dst_y,
+                    });
+                }
+
+                pen_x += i32::from(glyph.x_off);
+                pen_y += i32::from(glyph.y_off);
+            }
+
+            pos += 8 + padded;
+        }
+
+        if glyphs_to_draw.is_empty() {
+            return true;
+        }
+
+        // Pull the mirror + atlas + pipeline references for recording.
+        let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(mirror) = mirror else {
+            return false;
+        };
+        let atlas = self.glyph_atlas.as_ref().expect("checked above");
+        let pipeline = self.text_pipeline.as_ref().expect("checked above");
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_text::record_text_run(
+                vk,
+                cb,
+                mirror,
+                atlas,
+                pipeline,
+                &glyphs_to_draw,
+                foreground_premul,
+            )
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk render_composite_glyphs: record failed on dst xid {dst_xid:#x}: {e:?} \
+                     — falling back to pixman"
+                );
+                false
+            }
+        }
+    }
+
+    /// Sub-phase 4.1.4.6 helper. Confirms the drawable has a
+    /// `vk_mirror` whose layout is sampleable. The transitional
+    /// version of this also flushed pixman → mirror inline, but
+    /// once new mirrors are cleared on creation and PutImage
+    /// covers every depth (incl. R8 / depth-1), there's no
+    /// situation where the mirror lags pixman — every Vk write
+    /// goes straight to the mirror, and pixman fall-through paths
+    /// (still around for unported ops) call `mark_full_damage`
+    /// which `MirrorUploader` syncs on the next composite frame.
+    /// Until then, sampling a never-touched mirror after a
+    /// pixman-only write returns the cleared zero contents — that
+    /// only matters for the very first frame after creation, and
+    /// real clients don't `RenderComposite` on a zero-content
+    /// drawable.
+    fn ensure_drawable_mirror_sampleable(&self, host_xid: u32) -> bool {
+        let m = if let Some(w) = self.windows.get(&host_xid) {
+            w.vk_mirror.as_ref()
+        } else if let Some(p) = self.pixmaps.get(&host_xid) {
+            p.vk_mirror.as_ref()
+        } else {
+            None
+        };
+        m.is_some()
+    }
+
+    /// Sub-phase 4.1.4.6 helper. Build the per-rect plan + scissor
+    /// for `try_vk_render_composite`. Returns `None` if all rects
+    /// fall outside the clip (caller treats that as success — no
+    /// pixels to draw — and returns `Ok(())` from the trait
+    /// method). Otherwise returns the survivors plus a single
+    /// scissor rectangle that bounds the picture clip; the
+    /// per-pipeline blend handles the actual rect masking through
+    /// the draw quad geometry.
+    #[allow(clippy::too_many_arguments)]
+    fn build_render_composite_inputs(
+        &self,
+        clip: &Option<Vec<Rectangle16>>,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> Option<(
+        Vec<crate::kms::vk::ops::render::CompositeRect>,
+        ash::vk::Rect2D,
+    )> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // Compute scissor as the union of the picture clip's
+        // rectangles, or the unit-screen if no clip is set. This
+        // is coarse — the right thing is one scissor *change* per
+        // sub-rect, but the parent plan accepts that as a 4.1.4.8
+        // tightening.
+        let scissor = match clip {
+            Some(rects) if !rects.is_empty() => {
+                let mut x0 = i32::MAX;
+                let mut y0 = i32::MAX;
+                let mut x1 = i32::MIN;
+                let mut y1 = i32::MIN;
+                for r in rects {
+                    let rx0 = i32::from(r.x);
+                    let ry0 = i32::from(r.y);
+                    let rx1 = rx0 + i32::from(r.width);
+                    let ry1 = ry0 + i32::from(r.height);
+                    x0 = x0.min(rx0);
+                    y0 = y0.min(ry0);
+                    x1 = x1.max(rx1);
+                    y1 = y1.max(ry1);
+                }
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                let x0 = x0.max(0);
+                let y0 = y0.max(0);
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: x0, y: y0 },
+                    extent: ash::vk::Extent2D {
+                        width: u32::try_from((x1 - x0).max(0)).unwrap_or(0),
+                        height: u32::try_from((y1 - y0).max(0)).unwrap_or(0),
+                    },
+                }
+            }
+            _ => ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::MAX,
+                    height: u32::MAX,
+                },
+            },
+        };
+        let rects = vec![crate::kms::vk::ops::render::CompositeRect {
+            src_x: i32::from(src_x),
+            src_y: i32::from(src_y),
+            mask_x: i32::from(mask_x),
+            mask_y: i32::from(mask_y),
+            dst_x: i32::from(dst_x),
+            dst_y: i32::from(dst_y),
+            width: u32::from(width),
+            height: u32::from(height),
+        }];
+        Some((rects, scissor))
+    }
+
+    /// Sub-phase 4.1.4.6 helper. Vulkan-direct RENDER `Composite`.
+    ///
+    /// `op` is one of the 13 standard PictOps. `src` and `mask`
+    /// pictures resolve via [`RenderPic`] to either a Drawable
+    /// mirror, a `SolidFill` colour, or (for mask only) the
+    /// `RenderPic::None` sentinel which the recorder handles by
+    /// binding the backend-shared white-mask scratch.
+    ///
+    /// Out of scope: transform, `component_alpha`, `alpha_map`,
+    /// non-`None` repeat. Caller pre-flights those and falls
+    /// through to pixman.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn try_vk_render_composite(
+        &mut self,
+        op: u8,
+        src: RenderPic,
+        mask: RenderPic,
+        dst_xid: u32,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        scissor: ash::vk::Rect2D,
+        src_repeat: Repeat,
+        mask_repeat: Repeat,
+        src_xform: Option<PictTransform>,
+        mask_xform: Option<PictTransform>,
+        mask_component_alpha: bool,
+    ) -> bool {
+        use crate::kms::vk::{
+            ops::{render as vk_render, run_one_shot_op},
+            render_pipeline::{StdPictOp, record_solid_color_clear},
+        };
+
+        if rects.is_empty() {
+            return true;
+        }
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            return false;
+        };
+
+        // Self-composite (src or mask aliases dst) needs a staging
+        // image; not supported in this commit.
+        let src_xid_if_drawable = match src {
+            RenderPic::Drawable(xid) => Some(xid),
+            _ => None,
+        };
+        let mask_xid_if_drawable = match mask {
+            RenderPic::Drawable(xid) => Some(xid),
+            _ => None,
+        };
+        if src_xid_if_drawable == Some(dst_xid) || mask_xid_if_drawable == Some(dst_xid) {
+            return false;
+        }
+
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+        if self.render_pipelines.is_none()
+            || self.solid_src_image.is_none()
+            || self.solid_mask_image.is_none()
+            || self.white_mask_image.is_none()
+        {
+            return false;
+        }
+        let needs_dst_readback = std_op.needs_dst_readback();
+        if needs_dst_readback && self.dst_readback.is_none() {
+            return false;
+        }
+
+        // Dst format check. B8G8R8A8 covers depth-24/32 mirrors; R8
+        // covers depth-1/8 (a8 picture) — the pipeline cache builds
+        // a parallel family for that attachment format.
+        let (dst_format, dst_extent, dst_depth) = {
+            let (m, depth) = if let Some(w) = self.windows.get(&dst_xid) {
+                (w.vk_mirror.as_ref(), w.depth)
+            } else if let Some(p) = self.pixmaps.get(&dst_xid) {
+                (p.vk_mirror.as_ref(), p.depth)
+            } else {
+                (None, 0)
+            };
+            match m {
+                Some(m) => (m.format, m.extent, depth),
+                None => return false,
+            }
+        };
+        if !matches!(
+            dst_format,
+            ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM
+        ) {
+            return false;
+        }
+        // R8 attachments are alpha-only (a8 pictures) so the
+        // attachment alpha is always meaningful; for BGRA, alpha
+        // is meaningful only on depth-32 (a8r8g8b8).
+        let dst_has_alpha = dst_format == ash::vk::Format::R8_UNORM || dst_depth == 32;
+        // Synchronous pixman→mirror flush for any Drawable src/mask
+        // that has unflushed pixman damage or is still in
+        // `UNDEFINED` layout. Without this the Vk Composite would
+        // sample stale frame bytes (mirror behind pixman) or
+        // undefined contents (mirror never written). Per the
+        // family-port directive we don't gate on stale-mirror —
+        // we flush.
+        if let Some(xid) = src_xid_if_drawable
+            && !self.ensure_drawable_mirror_sampleable(xid)
+        {
+            return false;
+        }
+        if let Some(xid) = mask_xid_if_drawable
+            && !self.ensure_drawable_mirror_sampleable(xid)
+        {
+            return false;
+        }
+        // Drawable src must be `B8G8R8A8_UNORM` (depth-24/32) or
+        // `R8_UNORM` (a8 picture). For R8 src we bind a swizzled
+        // view (a = R, rgb = 0) so the shader sees a (0, 0, 0, alpha)
+        // sample — matching the X RENDER convention that components
+        // missing from the picture format default to 0 (rgb) and the
+        // alpha default lives in the stored byte.
+        if let Some(xid) = src_xid_if_drawable {
+            let f = if let Some(w) = self.windows.get(&xid) {
+                w.vk_mirror.as_ref().map(|m| m.format)
+            } else if let Some(p) = self.pixmaps.get(&xid) {
+                p.vk_mirror.as_ref().map(|m| m.format)
+            } else {
+                None
+            };
+            if !matches!(
+                f,
+                Some(ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM)
+            ) {
+                return false;
+            }
+        }
+
+        // Resolve & build pipeline.
+        let pipeline = match self.render_pipelines.as_mut().expect("checked above").get(
+            std_op,
+            dst_format,
+            dst_has_alpha,
+            mask_component_alpha,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "vk render_composite: pipeline build failed for op {op}: {e:?} — \
+                     falling back to pixman"
+                );
+                return false;
+            }
+        };
+        let pipeline_layout = self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .pipeline_layout();
+
+        if let Err(e) = self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .reset_descriptors()
+        {
+            log::warn!("vk render_composite: descriptor pool reset failed: {e:?}");
+            return false;
+        }
+
+        let solid_src_view = self
+            .solid_src_image
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let solid_mask_view = self
+            .solid_mask_image
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let white_mask_view = self
+            .white_mask_image
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+
+        // Resolve src view + extent + (optional) clear colour. Track
+        // any per-source affine that the picture itself induces (e.g.
+        // a gradient's axis projection) so we can compose it onto the
+        // user transform later.
+        let mut src_clear_color: Option<[f32; 4]> = None;
+        let src_view;
+        let src_extent;
+        let src_picture_xform: Option<crate::kms::vk::ops::render::AffineXform>;
+        let mut src_is_synthetic_1x1 = false;
+        match src {
+            RenderPic::Drawable(xid) => {
+                let (m_format, extent, depth) = {
+                    let (m, depth) = if let Some(w) = self.windows.get(&xid) {
+                        (w.vk_mirror.as_ref(), w.depth)
+                    } else if let Some(p) = self.pixmaps.get(&xid) {
+                        (p.vk_mirror.as_ref(), p.depth)
+                    } else {
+                        (None, 0)
+                    };
+                    let Some(m) = m else { return false };
+                    (m.format, m.extent, depth)
+                };
+                // Per X RENDER, missing components default — alpha is 1
+                // when the picture format has no alpha mask. Pick a
+                // swizzled view that enforces this at sample time:
+                //   * R8 mirror (depth 1/8, a8 picture) → mask view
+                //     (a = R) so shader sees (0, 0, 0, alpha).
+                //   * BGRA mirror with depth 24 (r8g8b8 picture) →
+                //     no-alpha view (a = ONE) so the alpha byte
+                //     stored in the mirror is ignored.
+                //   * BGRA mirror with depth 32 (a8r8g8b8) → regular
+                //     view; alpha byte is meaningful.
+                let view = if m_format == ash::vk::Format::R8_UNORM {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if depth == 24 {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if let Some(w) = self.windows.get(&xid) {
+                    w.vk_mirror.as_ref().expect("checked above").vk_image_view
+                } else {
+                    self.pixmaps
+                        .get(&xid)
+                        .and_then(|p| p.vk_mirror.as_ref())
+                        .expect("checked above")
+                        .vk_image_view
+                };
+                src_view = view;
+                src_extent = extent;
+                src_picture_xform = None;
+            }
+            RenderPic::Solid(color) => {
+                src_view = solid_src_view;
+                src_extent = ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                };
+                src_clear_color = Some(color);
+                src_picture_xform = None;
+                src_is_synthetic_1x1 = true;
+            }
+            RenderPic::Gradient(xid) => {
+                let Some(PictureState::Gradient { gradient, .. }) = self.pictures.get(&xid) else {
+                    return false;
+                };
+                src_view = gradient.image_view();
+                src_extent = gradient.extent();
+                src_picture_xform = Some(gradient.axis_projection);
+            }
+            RenderPic::None => return false,
+        }
+
+        // Resolve mask view + extent + (optional) clear colour.
+        // For the no-mask case bind the white scratch.
+        let mut mask_clear_color: Option<[f32; 4]> = None;
+        let mask_view;
+        let mask_extent;
+        let mask_picture_xform: Option<crate::kms::vk::ops::render::AffineXform>;
+        let mut mask_is_synthetic_1x1 = false;
+        match mask {
+            RenderPic::Drawable(xid) => {
+                // Resolve mask format. R8 mirror → swizzle (a = R)
+                // for the alpha-only mask. BGRA mirror with depth 24
+                // (no alpha mask in the picture format) → swizzle
+                // (a = ONE) so a depth-24 RGB picture used as a mask
+                // gives mask.a = 1 per X RENDER's "alpha defaults
+                // to 1" rule. BGRA mirror with depth 32 → regular
+                // view (alpha is meaningful).
+                let (m_format, depth) = {
+                    let (m, depth) = if let Some(w) = self.windows.get(&xid) {
+                        (w.vk_mirror.as_ref(), w.depth)
+                    } else if let Some(p) = self.pixmaps.get(&xid) {
+                        (p.vk_mirror.as_ref(), p.depth)
+                    } else {
+                        (None, 0)
+                    };
+                    let Some(m) = m else { return false };
+                    mask_extent = m.extent;
+                    (m.format, depth)
+                };
+                if m_format != ash::vk::Format::B8G8R8A8_UNORM
+                    && m_format != ash::vk::Format::R8_UNORM
+                {
+                    return false;
+                }
+                let view = if m_format == ash::vk::Format::R8_UNORM {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.mask_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if depth == 24 {
+                    let v = if let Some(w) = self.windows.get_mut(&xid) {
+                        w.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else if let Some(p) = self.pixmaps.get_mut(&xid) {
+                        p.vk_mirror
+                            .as_mut()
+                            .map(|m| m.no_alpha_src_image_view())
+                            .transpose()
+                    } else {
+                        Ok(None)
+                    };
+                    match v {
+                        Ok(Some(v)) => v,
+                        _ => return false,
+                    }
+                } else if let Some(w) = self.windows.get(&xid) {
+                    w.vk_mirror.as_ref().expect("checked above").vk_image_view
+                } else {
+                    self.pixmaps
+                        .get(&xid)
+                        .and_then(|p| p.vk_mirror.as_ref())
+                        .expect("checked above")
+                        .vk_image_view
+                };
+                mask_view = view;
+                mask_picture_xform = None;
+            }
+            RenderPic::Solid(color) => {
+                mask_view = solid_mask_view;
+                mask_extent = ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                };
+                mask_clear_color = Some(color);
+                mask_picture_xform = None;
+                mask_is_synthetic_1x1 = true;
+            }
+            RenderPic::Gradient(xid) => {
+                let Some(PictureState::Gradient { gradient, .. }) = self.pictures.get(&xid) else {
+                    return false;
+                };
+                mask_view = gradient.image_view();
+                mask_extent = gradient.extent();
+                mask_picture_xform = Some(gradient.axis_projection);
+            }
+            RenderPic::None => {
+                mask_view = white_mask_view;
+                mask_extent = ash::vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                };
+                mask_picture_xform = None;
+                mask_is_synthetic_1x1 = true;
+            }
+        }
+
+        // For Disjoint/Conjoint ops the shader reads the dst pixel
+        // through binding 2; we copy dst → scratch inside the CB
+        // below and bind the scratch's sampleable view here. For
+        // standard ops the binding is unused — bind the white-mask
+        // scratch to satisfy the descriptor layout.
+        let dst_readback_view = if needs_dst_readback {
+            let scratch = self.dst_readback.as_mut().expect("checked above");
+            if let Err(e) = scratch.ensure(dst_format, dst_extent.width, dst_extent.height) {
+                log::warn!("vk render_composite: dst readback ensure failed: {e:?}");
+                return false;
+            }
+            match scratch.view(dst_format, dst_has_alpha) {
+                Ok(Some(v)) => v,
+                Ok(None) => return false,
+                Err(e) => {
+                    log::warn!("vk render_composite: dst readback view build failed: {e:?}");
+                    return false;
+                }
+            }
+        } else {
+            white_mask_view
+        };
+
+        let descriptor_set = match self
+            .render_pipelines
+            .as_ref()
+            .expect("checked above")
+            .allocate_descriptor_for_views(src_view, mask_view, dst_readback_view)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("vk render_composite: descriptor alloc failed: {e:?}");
+                return false;
+            }
+        };
+
+        // Pull mut refs. Split-borrow on disjoint fields lets us
+        // hand all of these into the closure simultaneously.
+        let dst_mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            w.vk_mirror.as_mut()
+        } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
+            p.vk_mirror.as_mut()
+        } else {
+            None
+        };
+        let Some(dst_mirror) = dst_mirror else {
+            return false;
+        };
+        let solid_src_image = self.solid_src_image.as_mut().expect("checked above");
+        let solid_mask_image = self.solid_mask_image.as_mut().expect("checked above");
+        let dst_readback = if needs_dst_readback {
+            Some(self.dst_readback.as_mut().expect("checked above"))
+        } else {
+            None
+        };
+
+        // Compose the user (picture) transform with the picture's
+        // intrinsic transform if any (gradients carry an axis
+        // projection). Order: applied dst → user → intrinsic →
+        // src-pixel. The shader's affine is `src = M * (origin +
+        // dst_offset, 1)`, so when we have an intrinsic `I` and a
+        // user `U`, the combined matrix is `I * U`.
+        let user_src_xform = pixman_transform_to_affine(src_xform.as_ref(), src_extent);
+        let user_mask_xform = pixman_transform_to_affine(mask_xform.as_ref(), mask_extent);
+        let combined_src_xform = match src_picture_xform {
+            Some(intrinsic) => compose_affines(intrinsic, user_src_xform),
+            None => user_src_xform,
+        };
+        let combined_mask_xform = match mask_picture_xform {
+            Some(intrinsic) => compose_affines(intrinsic, user_mask_xform),
+            None => user_mask_xform,
+        };
+
+        // Synthetic 1×1 scratches (Solid src/mask, no-mask white) need
+        // PAD: the single texel is meant to cover the whole rect, and
+        // REPEAT_NONE would zero every dst pixel beyond uv 1. For
+        // gradients the LUT has dimension 1 in the cross-axis but the
+        // axis_projection maps freely along the gradient axis — the
+        // user-specified repeat governs how out-of-range t values are
+        // sampled (clients pass NORMAL/PAD/REFLECT for tiling/
+        // mirroring/clamping behaviour). Honour the user repeat in the
+        // shader; the LUT covers t ∈ [0, 1] which is what apply_repeat
+        // expects.
+        let effective_src_repeat = if src_is_synthetic_1x1 {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        } else {
+            repeat_to_shader_const(src_repeat)
+        };
+        let effective_mask_repeat = if mask_is_synthetic_1x1 {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        } else {
+            repeat_to_shader_const(mask_repeat)
+        };
+
+        let attrs = vk_render::CompositeAttrs {
+            src_extent,
+            mask_extent,
+            src_repeat: effective_src_repeat,
+            mask_repeat: effective_mask_repeat,
+            src_xform: combined_src_xform,
+            mask_xform: combined_mask_xform,
+        };
+
+        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            if let Some(c) = src_clear_color {
+                record_solid_color_clear(vk, cb, solid_src_image, c);
+            }
+            if let Some(c) = mask_clear_color {
+                record_solid_color_clear(vk, cb, solid_mask_image, c);
+            }
+            // Disjoint/Conjoint: snapshot dst into the readback
+            // scratch, then restore dst to its current layout so
+            // record_render_composite can transition it normally.
+            if let Some(rb) = dst_readback {
+                rb.record_copy_from(
+                    cb,
+                    dst_mirror.vk_image,
+                    dst_mirror.current_layout(),
+                    dst_format,
+                    dst_mirror.extent,
+                );
+            }
+            vk_render::record_render_composite(
+                vk,
+                cb,
+                dst_mirror,
+                pipeline,
+                pipeline_layout,
+                descriptor_set,
+                &attrs,
+                rects,
+                scissor,
+            )
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk render_composite: record failed on dst xid {dst_xid:#x}: \
+                     {e:?} — falling back to pixman"
+                );
+                false
             }
         }
     }
@@ -2012,7 +5250,88 @@ impl KmsBackend {
     /// onto it (translated into per-output scanout coordinates), draw the
     /// software cursor, and submit the flip. Called by the epoll loop on
     /// page-flip completion or on a timer.
+    /// Allocate a per-window VkImage mirror if Vulkan is up. Best-
+    /// effort: any failure logs and returns `None` so the window
+    /// itself stays alive (drawing falls back to pixman-only for
+    /// that window through 4.1.3-4.1.5; the user-visible effect is
+    /// the same as today's PixmanShadow path).
+    fn allocate_window_mirror(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> Option<crate::kms::vk::target::DrawableImage> {
+        let vkctx = self.vk.as_ref()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match crate::kms::vk::target::DrawableImage::new_server_owned_window(
+            std::sync::Arc::clone(vkctx),
+            u32::from(width),
+            u32::from(height),
+        ) {
+            Ok(mut img) => {
+                if let Some(pool) = self.ops_command_pool.as_ref()
+                    && let Err(e) = img.initialize_clear(pool.handle())
+                {
+                    log::warn!("window mirror initialize_clear failed: {e:?}");
+                }
+                Some(img)
+            }
+            Err(e) => {
+                log::warn!(
+                    "DrawableImage::new_server_owned_window({width}x{height}): {e} — \
+                     window will run pixman-only"
+                );
+                None
+            }
+        }
+    }
+
+    /// Allocate a per-pixmap VkImage mirror. Same Option semantics
+    /// as [`Self::allocate_window_mirror`].
+    fn allocate_pixmap_mirror(
+        &self,
+        width: u32,
+        height: u32,
+        depth: u8,
+    ) -> Option<crate::kms::vk::target::DrawableImage> {
+        let vkctx = self.vk.as_ref()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match crate::kms::vk::target::DrawableImage::new_server_owned_pixmap(
+            std::sync::Arc::clone(vkctx),
+            width,
+            height,
+            depth,
+        ) {
+            Ok(mut img) => {
+                if let Some(pool) = self.ops_command_pool.as_ref()
+                    && let Err(e) = img.initialize_clear(pool.handle())
+                {
+                    log::warn!("pixmap mirror initialize_clear failed: {e:?}");
+                }
+                Some(img)
+            }
+            Err(e) => {
+                log::warn!(
+                    "DrawableImage::new_server_owned_pixmap({width}x{height} d{depth}): \
+                     {e} — pixmap will run pixman-only"
+                );
+                None
+            }
+        }
+    }
+
+    // `run_mirror_uploads_for_frame` (the pixman → mirror pump)
+    // deleted in 4.1.5. Mirrors are now the canonical store; nothing
+    // pumps into them from the host.
+
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
+        // Phase 4.1.5: pixman no longer feeds the mirrors; drawing
+        // ops fill them directly through Vk. The pre-composite
+        // upload pass is gone.
+
         let top_levels: Vec<u32> = self.top_level_order.clone();
 
         // Pre-filter visible top-levels per output (spec §2.5: avoid
@@ -2033,111 +5352,268 @@ impl KmsBackend {
         #[allow(clippy::needless_range_loop)] // index needed to split &mut/& borrows on self
         for layout_idx in 0..self.outputs.len() {
             let visible = &visible_per_output[layout_idx];
-            // Acquire swapchain buffer; if none available, skip this output
-            // for this frame.
-            let Some(buf_idx) = self.outputs[layout_idx].swapchain.acquire_idx() else {
+
+            // Skip any output whose previous atomic flip hasn't yet
+            // completed (no pageflip-complete event for it yet).
+            // Submitting a new flip on a CRTC that already has one
+            // pending returns -EBUSY from the kernel, and on the
+            // PixmanShadow path that cascades into bo state drift —
+            // the next pageflip-complete arrives for the *old* flip
+            // (different bo), so our state machine and the kernel's
+            // view of "what's on screen" diverge. Better to skip the
+            // frame; the next pageflip-complete will retrigger
+            // composite_and_flip and we'll catch up cleanly.
+            let vk_flip_pending = self
+                .scanout_pools
+                .get(layout_idx)
+                .and_then(|p| p.as_ref())
+                .map(|p| {
+                    p.bos.iter().any(|b| {
+                        matches!(
+                            b.state.phase,
+                            crate::kms::vk::scanout::BoPhase::Submitted
+                                | crate::kms::vk::scanout::BoPhase::Pending
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            let dumb_flip_pending = self.outputs[layout_idx].swapchain.submitted_idx().is_some();
+            if vk_flip_pending || dumb_flip_pending {
                 continue;
-            };
+            }
 
-            // Wrap the swapchain buffer as a transient PixmanImage. SAFETY:
-            // the buffer is owned by the swapchain and outlives this image.
-            let mut scanout = {
-                let buf = self.outputs[layout_idx].swapchain.buffer_mut(buf_idx);
-                let w = buf.width();
-                let h = buf.height();
-                let stride_bytes = buf.stride() as usize;
-                let pixels = buf.pixels_mut().as_mut_ptr();
-                unsafe {
-                    PixmanImage::from_buffer(
-                        FormatCode::X8R8G8B8,
-                        w,
-                        h,
-                        pixels,
-                        stride_bytes,
-                        false,
-                    )?
-                }
-            };
-
-            self.paint_output(&mut scanout, layout_idx, visible);
-
-            // Drop scanout (releases mutable borrow on the swapchain buffer)
-            // before page-flip submit.
-            drop(scanout);
-
-            let fb_id = self.outputs[layout_idx].swapchain.buffer(buf_idx).fb_id();
-            drm::page_flip::submit_flip(&self.device, &self.outputs[layout_idx].output, fb_id)?;
-            self.outputs[layout_idx]
-                .swapchain
-                .submit(buf_idx)
-                .map_err(|e| io::Error::other(format!("swapchain.submit: {e}")))?;
+            // Phase 4.1.5: Vk composite is the sole path. If a free
+            // bo isn't available the frame is skipped — no pixman
+            // fallback. The next pageflip-complete event will retrigger
+            // composite_and_flip.
+            if !self.try_vulkan_composite_flip(layout_idx, visible) {
+                log::trace!(
+                    "vk composite: deferring frame on output {} until a Free bo is available",
+                    self.outputs[layout_idx].output.connector_name
+                );
+            }
         }
 
         Ok(())
+    }
+
+    /// VkComposite path (sub-phase 4.1.3.4): build a
+    /// [`CompositeScene`] from the window tree, pick a Free
+    /// `ScanoutBo`, record the per-window quad-draw composite pass,
+    /// submit, atomic-flip with explicit fences. Returns `true` iff
+    /// the composite + flip actually happened — caller falls back to
+    /// the pixman path on `false`.
+    fn try_vulkan_composite_flip(&mut self, layout_idx: usize, visible: &[u32]) -> bool {
+        use crate::kms::vk::{compositor, scanout::BoPhase};
+
+        let Some(vkctx) = self.vk.as_ref() else {
+            return false;
+        };
+        let Some(pipeline) = self.compositor_pipeline.as_ref() else {
+            return false;
+        };
+        let Some(pool) = self.scanout_pools.get(layout_idx).and_then(|p| p.as_ref()) else {
+            return false;
+        };
+        let Some(bo_idx) = pool.bos.iter().position(|b| b.state.phase == BoPhase::Free) else {
+            log::warn!(
+                "vk composite: no Free bo in pool for output {} — falling back to pixman",
+                self.outputs[layout_idx].output.connector_name
+            );
+            return false;
+        };
+
+        let scene = self.build_composite_scene(layout_idx, visible);
+
+        // Re-borrow pool mutably to advance bo state.
+        let Some(pool_mut) = self
+            .scanout_pools
+            .get_mut(layout_idx)
+            .and_then(|p| p.as_mut())
+        else {
+            return false;
+        };
+        let bo = &mut pool_mut.bos[bo_idx];
+        match compositor::record_and_present_composite(
+            vkctx,
+            &self.device,
+            &self.outputs[layout_idx].output,
+            bo,
+            pipeline,
+            &scene,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!(
+                    "vk composite: record_and_present_composite failed on output {}: {e} \
+                     — falling back to pixman this frame",
+                    self.outputs[layout_idx].output.connector_name
+                );
+                false
+            }
+        }
+    }
+
+    /// Walk the window tree (in stacking order, depth-first
+    /// back-to-front) and build a flat list of quads to draw,
+    /// translated into per-output scanout coordinates. Cursor +
+    /// bg_pixmap are deferred to follow-up sub-tasks; for 4.1.3.4's
+    /// first commit, only the bg color clear + window mirrors are
+    /// rendered. Visible regression: no cursor, no wallpaper —
+    /// follow-up commits add them back.
+    fn build_composite_scene(
+        &self,
+        layout_idx: usize,
+        visible: &[u32],
+    ) -> crate::kms::vk::compositor::CompositeScene {
+        use crate::kms::vk::compositor::{CompositeDraw, CompositeScene};
+
+        let layout_x = self.outputs[layout_idx].x;
+        let layout_y = self.outputs[layout_idx].y;
+
+        // Background clear color: bg_pixel (X11 0xRRGGBB) → linear
+        // [r, g, b, a]. Falls back to mid-grey so unset roots stand
+        // out, mirroring `paint_output`'s default.
+        let bg = self.bg_pixel.unwrap_or(0x0050_5050);
+        let bg_color = [
+            ((bg >> 16) & 0xFF) as f32 / 255.0,
+            ((bg >> 8) & 0xFF) as f32 / 255.0,
+            (bg & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+
+        let mut draws: Vec<CompositeDraw> = Vec::new();
+        let output_w = i32::from(self.outputs[layout_idx].width);
+        let output_h = i32::from(self.outputs[layout_idx].height);
+
+        // Background pixmap (e.g. Esetroot wallpaper) draws first
+        // so windows paint on top. The pixmap is sized to the
+        // virtual-screen extent (fb_w × fb_h); each output samples
+        // the slice that corresponds to its layout offset. If the
+        // client frees the pixmap (Esetroot pattern), the mirror
+        // disappears with it; the rescue path will move with the
+        // picture_rescued_images cleanup.
+        if let Some(pm) = self.bg_pixmap
+            && let Some(pm_state) = self.pixmaps.get(&pm.as_raw())
+            && let Some(mirror) = pm_state.vk_mirror.as_ref()
+        {
+            let layout_w = self.outputs[layout_idx].width;
+            let layout_h = self.outputs[layout_idx].height;
+            let pm_w = mirror.extent.width as f32;
+            let pm_h = mirror.extent.height as f32;
+            if pm_w > 0.0 && pm_h > 0.0 {
+                draws.push(CompositeDraw {
+                    image_view: mirror.vk_image_view,
+                    dst_origin: [0.0, 0.0],
+                    dst_size: [f32::from(layout_w), f32::from(layout_h)],
+                    src_origin: [layout_x as f32 / pm_w, layout_y as f32 / pm_h],
+                    src_size: [f32::from(layout_w) / pm_w, f32::from(layout_h) / pm_h],
+                    use_src_alpha: false,
+                });
+            }
+        }
+
+        for &top in visible {
+            self.walk_subtree_into_draws(top, -layout_x, -layout_y, output_w, output_h, &mut draws);
+        }
+
+        // Cursor draws above all windows. Pixman implicitly clipped
+        // off-screen writes, so multi-output cursor crossing edges
+        // showed its visible portion on each scanout. Vulkan
+        // viewport+scissor implicitly clips the same way, so a
+        // straight quad at scanout-relative coords reproduces it.
+        if let Some(cursor_xid) = self.effective_cursor()
+            && let Some(cs) = self.cursors.get(&cursor_xid)
+            && let Some(mirror) = cs.vk_mirror.as_ref()
+        {
+            let cw = cs.extent.width as f32;
+            let ch = cs.extent.height as f32;
+            let cx = self.cursor_x as i32 - i32::from(cs.hot_x) - layout_x;
+            let cy = self.cursor_y as i32 - i32::from(cs.hot_y) - layout_y;
+            draws.push(CompositeDraw {
+                image_view: mirror.vk_image_view,
+                dst_origin: [cx as f32, cy as f32],
+                dst_size: [cw, ch],
+                src_origin: [0.0, 0.0],
+                src_size: [1.0, 1.0],
+                use_src_alpha: true,
+            });
+        }
+
+        CompositeScene { bg_color, draws }
+    }
+
+    /// Push quads for `window` and (recursively, in stacking order)
+    /// each of its mapped descendants. Translation by `(ox, oy)` is
+    /// applied at the top-level so children's parent-relative
+    /// coordinates accumulate through the recursion without each
+    /// frame computing absolute origins via `absolute_origin`.
+    ///
+    /// `output_w`/`output_h` carry the destination scanout extent —
+    /// any window whose absolute rect doesn't intersect
+    /// `[0, output_w) × [0, output_h)` is skipped (AABB cull,
+    /// design §"Frame composite pass" step 2). Recursion into
+    /// children continues regardless: in current X11/pixman
+    /// semantics a child can overflow its parent's bounding box, so
+    /// a culled parent doesn't necessarily imply culled descendants.
+    fn walk_subtree_into_draws(
+        &self,
+        window_id: u32,
+        ox: i32,
+        oy: i32,
+        output_w: i32,
+        output_h: i32,
+        out: &mut Vec<crate::kms::vk::compositor::CompositeDraw>,
+    ) {
+        use crate::kms::vk::compositor::CompositeDraw;
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        if !window.mapped {
+            return;
+        }
+        // Skip windows with an explicitly-empty SHAPE region (rare).
+        if self
+            .shape_bounding
+            .get(&window_id)
+            .is_some_and(|r| r.is_empty())
+        {
+            return;
+        }
+        let abs_x = i32::from(window.x) + ox;
+        let abs_y = i32::from(window.y) + oy;
+        let w = i32::from(window.width);
+        let h = i32::from(window.height);
+
+        // AABB cull: skip the push when the window's absolute rect
+        // lies entirely outside the output. Children still recurse.
+        let on_screen = w > 0
+            && h > 0
+            && abs_x + w > 0
+            && abs_y + h > 0
+            && abs_x < output_w
+            && abs_y < output_h;
+
+        if on_screen && let Some(mirror) = window.vk_mirror.as_ref() {
+            out.push(CompositeDraw {
+                image_view: mirror.vk_image_view,
+                dst_origin: [abs_x as f32, abs_y as f32],
+                dst_size: [w as f32, h as f32],
+                src_origin: [0.0, 0.0],
+                src_size: [1.0, 1.0],
+                use_src_alpha: false,
+            });
+        }
+        // Children draw above their parent in stacking order.
+        for &child_id in &window.children {
+            self.walk_subtree_into_draws(child_id, abs_x, abs_y, output_w, output_h, out);
+        }
     }
 
     /// Paint a single output's scanout image. Translates virtual-screen
     /// coordinates by `(-layout.x, -layout.y)` so layout `(layout.x,
     /// layout.y)` lands at scanout `(0, 0)`. Pixman implicitly clips writes
     /// outside the destination image.
-    fn paint_output(&self, scanout: &mut PixmanImage, layout_idx: usize, visible: &[u32]) {
-        let layout_x = self.outputs[layout_idx].x;
-        let layout_y = self.outputs[layout_idx].y;
-        let layout_w = self.outputs[layout_idx].width;
-        let layout_h = self.outputs[layout_idx].height;
-
-        // Fill root background; fall back to mid-grey so client windows stand out.
-        {
-            let bg_color = self
-                .bg_pixel
-                .map(color_from_u32)
-                .unwrap_or_else(|| Color::new(0x5050, 0x5050, 0x5050, 0xffff));
-            let root_rect = Rectangle16 {
-                x: 0,
-                y: 0,
-                width: layout_w,
-                height: layout_h,
-            };
-            let _ = scanout
-                .0
-                .fill_rectangles(Operation::Src, bg_color, &[root_rect]);
-        }
-
-        // Overlay background pixmap if set (e.g. from Esetroot / fvwm-root).
-        // The pixmap is sized to the virtual-screen extent (fb_w/fb_h); use
-        // pixman's source offset so the pixmap pixel at (layout_x, layout_y)
-        // lands at scanout (0, 0). composite32 src_x/src_y are documented as
-        // source-image offsets by pixman_image_composite32.
-        if let Some(pm) = self.bg_pixmap {
-            let bg_img: Option<&PixmanImage> = self
-                .pixmaps
-                .get(&pm.as_raw())
-                .map(|p| &p.image)
-                .or(self.bg_pixmap_image.as_ref());
-            if let Some(img) = bg_img {
-                scanout.0.composite32(
-                    Operation::Src,
-                    &img.0,
-                    None,
-                    (layout_x, layout_y),
-                    (0, 0),
-                    (0, 0),
-                    (i32::from(layout_w), i32::from(layout_h)),
-                );
-            }
-        }
-
-        // Composite each visible top-level in stacking order, translated into
-        // scanout coordinates.
-        for &window_id in visible {
-            self.composite_window_into_offset(scanout, window_id, -layout_x, -layout_y);
-        }
-
-        // Draw the software cursor onto the scanout, translated by the
-        // layout offset.
-        self.draw_cursor_onto_offset(scanout, layout_x, layout_y);
-    }
-
     /// Return whether the (mapped) top-level window's bounding box overlaps
     /// `rect` in virtual-screen coordinates. Used by the per-output painter
     /// to skip whole off-screen subtrees.
@@ -2160,117 +5636,6 @@ impl KmsBackend {
         let bx2 = rect.x.saturating_add(rect.w);
         let by2 = rect.y.saturating_add(rect.h);
         wx < bx2 && rect.x < wx2 && wy < by2 && rect.y < wy2
-    }
-
-    /// Top-level entry point used by the per-output painter. Applies an
-    /// `(ox, oy)` translation to the top-level window's `(x, y)`, so child
-    /// recursion (which works in parent-relative coordinates) doesn't need
-    /// to know about the layout offset.
-    fn composite_window_into_offset(
-        &self,
-        parent_img: &mut PixmanImage,
-        window_id: u32,
-        ox: i32,
-        oy: i32,
-    ) {
-        let Some(window) = self.windows.get(&window_id) else {
-            return;
-        };
-        if !window.mapped {
-            return;
-        }
-
-        // Composite children into this window's image first (parent-relative;
-        // no offset translation needed for descendants).
-        let children: Vec<u32> = window.children.clone();
-        for &child_id in &children {
-            let child_target = &mut window.image.borrow_mut();
-            self.composite_window_into(child_target, child_id);
-        }
-
-        let window = &self.windows[&window_id];
-        let x = i32::from(window.x) + ox;
-        let y = i32::from(window.y) + oy;
-        let w = i32::from(window.width);
-        let h = i32::from(window.height);
-
-        if self
-            .shape_bounding
-            .get(&window_id)
-            .is_some_and(|r| r.is_empty())
-        {
-            return;
-        }
-        let shape_clip = build_shape_clip(self.shape_bounding.get(&window_id), x, y);
-        if let Some(ref region) = shape_clip {
-            let _ = parent_img.0.set_clip_region32(Some(region));
-        }
-        let src_img = window.image.borrow();
-        parent_img.0.composite32(
-            Operation::Over,
-            &src_img.0,
-            None,
-            (0, 0),
-            (0, 0),
-            (x, y),
-            (w, h),
-        );
-        if shape_clip.is_some() {
-            let _ = parent_img.0.set_clip_region32(None);
-        }
-    }
-
-    /// Recursively composite a window and its children into the target image.
-    /// Children are composited into the window's own image first (natural clipping),
-    /// then the window is composited onto the target.
-    fn composite_window_into(&self, parent_img: &mut PixmanImage, window_id: u32) {
-        let Some(window) = self.windows.get(&window_id) else {
-            return;
-        };
-        if !window.mapped {
-            return;
-        }
-
-        // Composite children into this window's image first
-        let children: Vec<u32> = window.children.clone();
-        for &child_id in &children {
-            let child_target = &mut window.image.borrow_mut();
-            self.composite_window_into(child_target, child_id);
-        }
-
-        // Now composite the window (with its children painted) onto the parent
-        let window = &self.windows[&window_id];
-        let x = i32::from(window.x);
-        let y = i32::from(window.y);
-        let w = i32::from(window.width);
-        let h = i32::from(window.height);
-
-        // Skip compositing if shape is explicitly empty.
-        if self
-            .shape_bounding
-            .get(&window_id)
-            .is_some_and(|r| r.is_empty())
-        {
-            return;
-        }
-
-        let shape_clip = build_shape_clip(self.shape_bounding.get(&window_id), x, y);
-        if let Some(ref region) = shape_clip {
-            let _ = parent_img.0.set_clip_region32(Some(region));
-        }
-        let src_img = window.image.borrow();
-        parent_img.0.composite32(
-            Operation::Over,
-            &src_img.0,
-            None,
-            (0, 0),
-            (0, 0),
-            (x, y),
-            (w, h),
-        );
-        if shape_clip.is_some() {
-            let _ = parent_img.0.set_clip_region32(None);
-        }
     }
 
     /// Resolve the effective cursor for the window currently under the
@@ -2341,37 +5706,6 @@ impl KmsBackend {
         (ox, oy)
     }
 
-    /// Draw the cursor onto the scanout image, alpha-composited at the
-    /// hotspot-adjusted position. The visible cursor is whatever the
-    /// window under the pointer (or its closest non-None ancestor) has
-    /// set via DefineCursor.
-    /// Draw the cursor onto the scanout image, translated by `(-layout_x,
-    /// -layout_y)` so virtual-screen cursor coordinates land in scanout
-    /// coordinates. Pixman implicitly clips writes that fall outside the
-    /// destination, so cursors that straddle output boundaries draw their
-    /// visible portion on each scanout.
-    fn draw_cursor_onto_offset(&self, scanout: &mut PixmanImage, layout_x: i32, layout_y: i32) {
-        let Some(cursor_xid) = self.effective_cursor() else {
-            return;
-        };
-        let Some(cs) = self.cursors.get(&cursor_xid) else {
-            return;
-        };
-        let x = self.cursor_x as i32 - i32::from(cs.hot_x) - layout_x;
-        let y = self.cursor_y as i32 - i32::from(cs.hot_y) - layout_y;
-        let w = cs.image.0.width() as i32;
-        let h = cs.image.0.height() as i32;
-        scanout.0.composite32(
-            Operation::Over,
-            &cs.image.0,
-            None,
-            (0, 0),
-            (0, 0),
-            (x, y),
-            (w, h),
-        );
-    }
-
     /// Render a string of character bytes onto a drawable using the current font.
     /// Each byte is treated as a character index into the loaded font.
     fn render_text_string(
@@ -2401,16 +5735,6 @@ impl KmsBackend {
         // Phase 1: render all glyphs into owned pixel buffers while holding
         // the RefCell borrow.  We must drop the borrow before phase 2 so that
         // with_image_mut (which requires &mut self) can be called.
-        struct RenderedGlyph {
-            dst_x: i32,
-            dst_y: i32,
-            w: usize,
-            h: usize,
-            pixels: Vec<u8>, // row-major, w*h bytes
-            #[allow(dead_code)]
-            advance: i32,
-        }
-
         let mut rendered: Vec<RenderedGlyph> = Vec::new();
         let mut cursor_x = x;
 
@@ -2456,92 +5780,18 @@ impl KmsBackend {
                         h,
                         pixels,
                         advance: ci.character_width as i32,
+                        codepoint: ch as u32,
                     });
                 }
                 cursor_x += ci.character_width as i32;
             }
         } // RefCell borrow released here
 
-        // Phase 2: composite each glyph onto the destination drawable.
-        let fg_color = color_from_u32(foreground);
-        for g in &rendered {
-            let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true)
-                .map_err(|_| io::Error::other("pixman color image"))?;
-            let _ = color_img.fill_rectangles(
-                Operation::Src,
-                fg_color,
-                &[Rectangle16 {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                }],
-            );
-            // The 1×1 solid-colour source must tile across the full glyph
-            // width/height.  Without REPEAT_NORMAL, pixman returns transparent
-            // black for any source read outside (0, 0), making Operation::Over
-            // a no-op for every column except the leftmost — producing scattered
-            // dots (only pixels where glyph-col=0 has non-zero alpha are drawn).
-            color_img.set_repeat(Repeat::Normal);
-
-            // A8 image: pixman allocates with 4-byte row stride so we must
-            // write byte-by-byte using the actual stride, not width.
-            let glyph_img = Image::new(FormatCode::A8, g.w, g.h, true)
-                .map_err(|_| io::Error::other("pixman glyph image"))?;
-            let stride_bytes = glyph_img.stride();
-            // SAFETY: gdata points into the pixman-allocated buffer for
-            // glyph_img which lives for this block.  We write only within
-            // [0, (h-1)*stride_bytes + (w-1)] which is inside the allocation.
-            let gdata = unsafe { glyph_img.data() } as *mut u8;
-            for row in 0..g.h {
-                for col in 0..g.w {
-                    unsafe {
-                        *gdata.add(row * stride_bytes + col) = g.pixels[row * g.w + col];
-                    }
-                }
-            }
-
-            // Pre-compute clipped sub-rects so the closure below doesn't
-            // need to re-borrow self.
-            let glyph_dst_rect = Rectangle16 {
-                x: g.dst_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                y: g.dst_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                width: g.w as u16,
-                height: g.h as u16,
-            };
-            let sub_rects = self.intersect_with_current_clip(&[glyph_dst_rect]);
-            if sub_rects.is_empty() {
-                continue;
-            }
-            self.with_image_mut(host_xid, |dst| {
-                let dst_w = dst.0.width() as i32;
-                let dst_h = dst.0.height() as i32;
-                // Skip glyphs that fall entirely outside the destination.
-                // Some clients send extreme negative coords during probes;
-                // pixman's composite32 has historically struggled with very
-                // large negative offsets in our build, so guard explicitly.
-                if g.dst_x + (g.w as i32) <= 0
-                    || g.dst_y + (g.h as i32) <= 0
-                    || g.dst_x >= dst_w
-                    || g.dst_y >= dst_h
-                {
-                    return;
-                }
-                for r in &sub_rects {
-                    let mask_x = r.x as i32 - g.dst_x;
-                    let mask_y = r.y as i32 - g.dst_y;
-                    dst.0.composite32(
-                        Operation::Over,
-                        &color_img,
-                        Some(&glyph_img),
-                        (0, 0),
-                        (mask_x, mask_y),
-                        (r.x as i32, r.y as i32),
-                        (r.width as i32, r.height as i32),
-                    );
-                }
-            });
-        }
+        // Phase 4.1.5: Vulkan-only text path. Each glyph is interned
+        // in the shared atlas; a text-pipeline draw quads them onto
+        // the target's mirror with src-over blending. Atlas full or
+        // missing mirror silently drops the run.
+        self.try_vk_text_run(host_xid, font_xid, foreground, &rendered);
         Ok(())
     }
 
@@ -2604,23 +5854,69 @@ impl KmsBackend {
         self.device.as_fd().as_raw_fd()
     }
 
-    /// Drain pending page-flip events, acquire the next swapchain buffer,
-    /// composite all windows onto it, draw the cursor, and submit a new flip.
+    /// Drain pending page-flip events, advance per-output state, and
+    /// kick off the next composite. Each pageflip-complete corresponds
+    /// to either a Vulkan-fed flip (advance the [`ScanoutBoPool`] state
+    /// machine: `Retiring → Free`, `OnScreen → Retiring`, `Pending →
+    /// OnScreen`) or a dumb-buffer flip (advance the legacy
+    /// `Swapchain::complete`). We disambiguate by checking whether the
+    /// pool currently has a `Pending` bo.
     pub fn drain_page_flips_and_composite(&mut self) -> io::Result<()> {
         use ::drm::control::crtc;
         let mut flipped: Vec<crtc::Handle> = Vec::new();
         drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
 
+        // Diagnostic: log the very first pageflip-complete per output.
+        // If we never see this for an output, the kernel never told us
+        // its flip latched — typical cause: IN_FENCE_FD never signals
+        // because the GPU semaphore is stuck.
+        for c in &flipped {
+            if let Some(idx) = self.outputs.iter().position(|o| &o.output.crtc == c)
+                && !self.first_pageflip_logged[idx]
+            {
+                log::info!(
+                    "pageflip-complete: first event on output {} (CRTC {c:?})",
+                    self.outputs[idx].output.connector_name
+                );
+                self.first_pageflip_logged[idx] = true;
+            }
+        }
+
         for c in flipped {
-            if let Some(layout) = self.outputs.iter_mut().find(|o| o.output.crtc == c) {
+            let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == c) else {
+                log::warn!("page-flip event for unknown CRTC {c:?}");
+                continue;
+            };
+
+            // Vulkan-fed flip identification: the pool has a `Pending`
+            // bo iff we submitted via the Vulkan path for this output.
+            let was_vk_flip = self
+                .scanout_pools
+                .get(output_idx)
+                .and_then(|p| p.as_ref())
+                .map(|p| {
+                    p.bos
+                        .iter()
+                        .any(|b| b.state.phase == crate::kms::vk::scanout::BoPhase::Pending)
+                })
+                .unwrap_or(false);
+
+            if was_vk_flip {
+                if let Some(pool) = self
+                    .scanout_pools
+                    .get_mut(output_idx)
+                    .and_then(|p| p.as_mut())
+                {
+                    advance_pool_on_pageflip_complete(pool);
+                }
+            } else {
+                let layout = &mut self.outputs[output_idx];
                 if let Some(idx) = layout.swapchain.submitted_idx() {
                     layout
                         .swapchain
                         .complete(idx)
                         .map_err(|e| io::Error::other(format!("swapchain.complete: {e}")))?;
                 }
-            } else {
-                log::warn!("page-flip event for unknown CRTC {c:?}");
             }
         }
         // Always composite on flip completion (self-driving at vsync)
@@ -2630,7 +5926,19 @@ impl KmsBackend {
     /// Disable each DRM output (CRTC + plane) for clean shutdown.
     /// Logs any per-output error and returns the last one so callers
     /// still see a failure, while attempting to tear down everything.
-    pub fn disable_output(&self) -> io::Result<()> {
+    pub fn disable_output(&mut self) -> io::Result<()> {
+        // Drain in-flight scanout-bo state first: vkDeviceWaitIdle +
+        // close any held fence fds. Without this, mid-flight Vulkan
+        // submits could race the DRM disable_output ioctl and leak
+        // fds. No-op when no Vulkan-fed pool exists for an output.
+        if let Some(vk) = self.vk.as_ref() {
+            for pool in &mut self.scanout_pools {
+                if let Some(p) = pool.as_mut() {
+                    p.drain_all_pending(vk);
+                }
+            }
+        }
+
         let mut last_err: Option<io::Error> = None;
         for layout in &self.outputs {
             if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
@@ -2795,24 +6103,6 @@ impl Backend for KmsBackend {
         _background_pixmap: Option<u32>,
     ) -> io::Result<WindowHandle> {
         let host_xid = self.next_host_xid();
-        // Pre-fill the window image with its background pixel so clients
-        // that expect the X server to auto-clear (e.g. xclock drawing black
-        // tick marks on a "white" background) see the right backdrop.
-        let mut img = PixmanImage::new(FormatCode::X8R8G8B8, width, height, true)?;
-        if let Some(pixel) = background_pixel {
-            let color = color_from_u32(pixel);
-            let _ = img.0.fill_rectangles(
-                Operation::Src,
-                color,
-                &[Rectangle16 {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                }],
-            );
-        }
-        let image = RefCell::new(img);
         let depth = match visual {
             HostSubwindowVisual::CopyFromParent => 24,
             HostSubwindowVisual::Explicit { depth, .. } => depth,
@@ -2821,6 +6111,17 @@ impl Backend for KmsBackend {
             HostSubwindowVisual::CopyFromParent => 0,
             HostSubwindowVisual::Explicit { visual_xid, .. } => visual_xid,
         };
+        // Allocate the mirror (`initialize_clear` leaves it
+        // transparent black, layout SHADER_READ_ONLY_OPTIMAL). If the
+        // client requested a `background_pixel`, paint it onto the
+        // mirror so xclock-style apps that expect the server to
+        // auto-clear see the right backdrop.
+        let mut vk_mirror = self.allocate_window_mirror(width, height);
+        if let (Some(mirror), Some(pixel)) = (vk_mirror.as_mut(), background_pixel)
+            && let Err(e) = self.fill_mirror_solid(mirror, pixel)
+        {
+            log::warn!("create_subwindow: bg_pixel fill failed: {e:?}");
+        }
         self.windows.insert(
             host_xid,
             WindowState {
@@ -2837,9 +6138,9 @@ impl Backend for KmsBackend {
                 bg_pixel: background_pixel,
                 bg_pixmap: None,
                 cursor: 0,
-                image,
                 depth,
                 visual: visual_xid,
+                vk_mirror,
             },
         );
         let parent_raw = host_parent.as_raw();
@@ -2925,7 +6226,10 @@ impl Backend for KmsBackend {
             .windows
             .get(&host_xid)
             .is_some_and(|_w| config.width.is_some() || config.height.is_some());
-        if let Some(window) = self.windows.get_mut(&host_xid) {
+        // Apply scalar updates first; capture the resize dims so the
+        // mirror reallocation below can run without holding a &mut
+        // borrow on `windows` (allocate_window_mirror takes &self).
+        let resize_dims = if let Some(window) = self.windows.get_mut(&host_xid) {
             if let Some(w) = config.width {
                 window.width = w;
             }
@@ -2942,22 +6246,27 @@ impl Backend for KmsBackend {
                 window.border_width = bw;
             }
             if resized {
-                let (w, h) = (window.width, window.height);
-                let mut img = PixmanImage::new(FormatCode::X8R8G8B8, w, h, true)?;
-                if let Some(pixel) = window.bg_pixel {
-                    let color = color_from_u32(pixel);
-                    let _ = img.0.fill_rectangles(
-                        Operation::Src,
-                        color,
-                        &[Rectangle16 {
-                            x: 0,
-                            y: 0,
-                            width: w,
-                            height: h,
-                        }],
-                    );
-                }
-                window.image = RefCell::new(img);
+                Some((window.width, window.height, window.bg_pixel))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((w, h, bg_pixel)) = resize_dims {
+            // On shrink, the old VkImage is freed; on grow, a fresh
+            // larger one is allocated. Allocation is best-effort —
+            // failure leaves vk_mirror=None for this window and the
+            // composite pass simply skips it until the next resize
+            // succeeds.
+            let mut new_mirror = self.allocate_window_mirror(w, h);
+            if let (Some(mirror), Some(pixel)) = (new_mirror.as_mut(), bg_pixel)
+                && let Err(e) = self.fill_mirror_solid(mirror, pixel)
+            {
+                log::warn!("configure_window: bg_pixel fill on resize failed: {e:?}");
+            }
+            if let Some(window) = self.windows.get_mut(&host_xid) {
+                window.vk_mirror = new_mirror;
             }
         }
         // Apply X11 stack_mode + sibling: restack the window in its
@@ -3085,20 +6394,20 @@ impl Backend for KmsBackend {
         height: u16,
     ) -> io::Result<PixmapHandle> {
         let host_xid = self.next_host_xid();
-        let format = match depth {
-            1 => FormatCode::A1,
-            8 => FormatCode::A8,
-            24 => FormatCode::X8R8G8B8,
-            32 => FormatCode::A8R8G8B8,
-            _ => FormatCode::X8R8G8B8,
-        };
-        let image = PixmanImage::new(format, width, height, true)?;
+        let mut vk_mirror = self.allocate_pixmap_mirror(u32::from(width), u32::from(height), depth);
+        // Mark fresh pixmap mirror fully dirty (see CreateWindow for
+        // rationale).
+        if let Some(m) = vk_mirror.as_mut() {
+            m.mark_full_damage();
+        }
         self.pixmaps.insert(
             host_xid,
             PixmapState {
                 handle: host_xid,
-                image,
+                width,
+                height,
                 depth,
+                vk_mirror,
             },
         );
         PixmapHandle::from_raw(host_xid)
@@ -3107,29 +6416,24 @@ impl Backend for KmsBackend {
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         if let Some(ps) = self.pixmaps.remove(&host_xid) {
-            let mut image = Some(ps.image);
-
-            // Rescue into bg_pixmap_image if this is the root wallpaper pixmap.
-            // Esetroot frees its pixmap after setting the root background, expecting
-            // the server to keep the image alive via reference counting.
-            if self.bg_pixmap.map(|h| h.as_raw()) == Some(host_xid)
-                && let Some(img) = image.take()
-            {
-                self.bg_pixmap_image = Some(img);
-            }
-
-            // Rescue into picture_rescued_images for any picture still referencing
-            // this pixmap (e.g. fvwm frees cursor source pixmap before CreateCursor).
-            if image.is_some() {
+            // Rescue the vk_mirror for any picture still referencing
+            // this pixmap (e.g. fvwm frees the cursor source pixmap
+            // before CreateCursor). The mirror keeps the GPU image
+            // alive on the rescue map; whoever consumes the rescue
+            // (currently render_create_cursor) drops it.
+            if let Some(mirror) = ps.vk_mirror {
+                let mut mirror = Some(mirror);
                 for (&pic_xid, pic) in &self.pictures {
                     if let PictureState::Drawable { host_xid: xid, .. } = pic
                         && *xid == host_xid
-                        && let Some(img) = image.take()
+                        && let Some(m) = mirror.take()
                     {
-                        self.picture_rescued_images.insert(pic_xid, img);
+                        self.picture_rescued_images.insert(pic_xid, m);
                         break;
                     }
                 }
+                // If no picture referenced the pixmap, `mirror` drops
+                // here (Drop releases the VkImage/allocation).
             }
         }
         Ok(())
@@ -3216,7 +6520,6 @@ impl Backend for KmsBackend {
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
         self.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
-        self.bg_pixmap_image = None; // cleared; rescue fills it if the pixmap is later freed
         Ok(())
     }
 
@@ -3321,89 +6624,25 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let Some(src_ptr) = self.image_ptr_for_xid(src_host_xid) else {
+        if width == 0 || height == 0 {
             return Ok(());
-        };
-        let dst_rect = Rectangle16 {
-            x: dst_x,
-            y: dst_y,
+        }
+        // Phase 4.1.5: Vulkan-only. `try_vk_copy_area` handles
+        // distinct src/dst, same-target non-overlapping, and
+        // same-target overlapping (via the BGRA `copy_scratch`).
+        // Format mismatch (R8↔BGRA) silently skips — those would
+        // need a sample-and-store shader; deferred. Mirror missing
+        // also skips.
+        self.try_vk_copy_area(
+            src_host_xid,
+            dst_host_xid,
+            src_x,
+            src_y,
+            dst_x,
+            dst_y,
             width,
             height,
-        };
-        // Self-copy (xterm scrollback, etc.) needs a single composite32 —
-        // pixman handles intra-buffer overlap correctly for one call but
-        // not across multiple independent sub-rect calls (an earlier
-        // sub-rect's write would land in a later sub-rect's read region).
-        // Honor the clip via pixman_image_set_clip_region32 instead of
-        // sub-rect emission for this case.
-        let self_copy = src_host_xid == dst_host_xid;
-        if self_copy {
-            let clip_rects = self.current_clip_rects_in_dst_space();
-            self.with_image_mut(dst_host_xid, |dst| {
-                if let Some(ref rects) = clip_rects {
-                    use pixman::{Box32, Region32};
-                    let boxes: Vec<Box32> = rects
-                        .iter()
-                        .map(|c| Box32 {
-                            x1: c.x as i32,
-                            y1: c.y as i32,
-                            x2: c.x as i32 + c.width as i32,
-                            y2: c.y as i32 + c.height as i32,
-                        })
-                        .collect();
-                    let region = Region32::init_rects(&boxes);
-                    let _ = dst.0.set_clip_region32(Some(&region));
-                }
-                composite32(
-                    Operation::Src as u32,
-                    src_ptr,
-                    std::ptr::null_mut(),
-                    dst,
-                    src_x as i32,
-                    src_y as i32,
-                    0,
-                    0,
-                    dst_x as i32,
-                    dst_y as i32,
-                    width as i32,
-                    height as i32,
-                );
-                if clip_rects.is_some() {
-                    let _ = dst.0.set_clip_region32(None);
-                }
-            });
-            return Ok(());
-        }
-        // Distinct src/dst: intersect with current clip and emit one
-        // composite32 per surviving sub-rect with src coords shifted by
-        // the same amount the dst was clipped.
-        let sub_rects = self.intersect_with_current_clip(&[dst_rect]);
-        if sub_rects.is_empty() {
-            return Ok(());
-        }
-        // src_ptr lives for as long as src_host_xid stays in self.windows/pixmaps;
-        // we don't mutate either map in this method, so the pointer is valid for
-        // the duration of the composite32 call below.
-        self.with_image_mut(dst_host_xid, |dst| {
-            for r in &sub_rects {
-                let dx_shift = r.x as i32 - dst_x as i32;
-                let dy_shift = r.y as i32 - dst_y as i32;
-                composite32(
-                    Operation::Src as u32,
-                    src_ptr,
-                    std::ptr::null_mut(),
-                    dst,
-                    src_x as i32 + dx_shift,
-                    src_y as i32 + dy_shift,
-                    0,
-                    0,
-                    r.x as i32,
-                    r.y as i32,
-                    r.width as i32,
-                    r.height as i32,
-                );
-            }
-        });
+        );
         Ok(())
     }
 
@@ -3423,7 +6662,7 @@ impl Backend for KmsBackend {
         let Some(src_depth) = self.drawable_depth(src_host_xid) else {
             return Ok(());
         };
-        let Some(src_geom) = self.drawable_geometry(src_host_xid) else {
+        let Some(src_readback) = self.read_mirror_pixels(src_host_xid) else {
             return Ok(());
         };
 
@@ -3442,7 +6681,7 @@ impl Backend for KmsBackend {
                     continue;
                 }
                 let pixel =
-                    read_drawable_pixel_for_plane(&src_geom, src_depth, sx as usize, sy as usize);
+                    read_mirror_pixel_for_plane(&src_readback, src_depth, sx as usize, sy as usize);
                 let rect = Rectangle16 {
                     x: dx,
                     y: dy,
@@ -3462,10 +6701,12 @@ impl Backend for KmsBackend {
         let background = self.current_background;
         let foreground_rects = self.intersect_with_current_clip(&foreground_rects);
         let background_rects = self.intersect_with_current_clip(&background_rects);
-        self.with_image_mut(dst_host_xid, |dst| {
-            fill_rects_with_gc_function(dst, function, background, &background_rects);
-            fill_rects_with_gc_function(dst, function, foreground, &foreground_rects);
-        });
+        // Bg first, then fg (matches the previous pixman ordering so
+        // overlap behaviour is preserved). The Vk path now honours
+        // every GC function via `try_vk_fill_with_function` (Copy
+        // fast path or per-`VkLogicOp` pipeline).
+        self.try_vk_fill_with_function(dst_host_xid, function, background, &background_rects);
+        self.try_vk_fill_with_function(dst_host_xid, function, foreground, &foreground_rects);
         Ok(())
     }
 
@@ -3480,151 +6721,12 @@ impl Backend for KmsBackend {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
-        // Pre-compute current GC clip in dst coords. None = unclipped.
-        // Captured before the geom borrow below so the per-pixel test
-        // doesn't need to re-borrow self mid-loop.
-        let clip_rects = self.current_clip_rects_in_dst_space();
-        let Some(geom) = self.drawable_geometry(host_xid) else {
-            return Ok(());
-        };
-        let img_w = geom.width;
-        let img_h = geom.height;
-        let in_clip = |x: i32, y: i32| -> bool {
-            let Some(ref rects) = clip_rects else {
-                return true;
-            };
-            for c in rects {
-                let cx0 = c.x as i32;
-                let cy0 = c.y as i32;
-                let cx1 = cx0 + c.width as i32;
-                let cy1 = cy0 + c.height as i32;
-                if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 {
-                    return true;
-                }
-            }
-            false
-        };
-
-        match depth {
-            24 | 32 => {
-                // X8R8G8B8 / A8R8G8B8 — 4 bytes per pixel.
-                let stride_words = geom.stride_bytes / 4;
-                let dst_words = geom.data_ptr as *mut u32;
-                for row in 0..height as isize {
-                    let dy = dst_y as isize + row;
-                    if dy < 0 || dy >= img_h as isize {
-                        continue;
-                    }
-                    for col in 0..width as isize {
-                        let dx = dst_x as isize + col;
-                        if dx < 0 || dx >= img_w as isize {
-                            continue;
-                        }
-                        if !in_clip(dx as i32, dy as i32) {
-                            continue;
-                        }
-                        let src_offset = ((row * width as isize + col) * 4) as usize;
-                        if src_offset + 3 >= data.len() {
-                            continue;
-                        }
-                        let r = data[src_offset] as u32;
-                        let g = data[src_offset + 1] as u32;
-                        let b = data[src_offset + 2] as u32;
-                        let a = if depth == 32 {
-                            data[src_offset + 3] as u32
-                        } else {
-                            0xFF
-                        };
-                        let pixel = (a << 24) | (r << 16) | (g << 8) | b;
-                        // SAFETY: bounds-checked above against geom.width/height;
-                        // dy*stride_words+dx fits in the buffer of size
-                        // height*stride_words u32s. geom borrows self so the
-                        // pointer is valid for the duration of this loop.
-                        unsafe {
-                            *dst_words.add(dy as usize * stride_words + dx as usize) = pixel;
-                        }
-                    }
-                }
-            }
-            8 => {
-                // A8 — 1 byte per pixel. Rows in X11 ZPixmap are padded to
-                // 4-byte boundaries; pixman picks its own dst stride.
-                let src_row_stride = (width as usize + 3) & !3;
-                let dst_stride_bytes = geom.stride_bytes;
-                for row in 0..height as isize {
-                    let dy = dst_y as isize + row;
-                    if dy < 0 || dy >= img_h as isize {
-                        continue;
-                    }
-                    for col in 0..width as isize {
-                        let dx = dst_x as isize + col;
-                        if dx < 0 || dx >= img_w as isize {
-                            continue;
-                        }
-                        if !in_clip(dx as i32, dy as i32) {
-                            continue;
-                        }
-                        let src_offset = row as usize * src_row_stride + col as usize;
-                        if src_offset >= data.len() {
-                            continue;
-                        }
-                        // SAFETY: bounds-checked against geom.width/height;
-                        // dy*stride_bytes+dx fits within the per-row stride
-                        // chosen by pixman.
-                        unsafe {
-                            *geom
-                                .data_ptr
-                                .add(dy as usize * dst_stride_bytes + dx as usize) =
-                                data[src_offset];
-                        }
-                    }
-                }
-            }
-            1 => {
-                // Depth-1 PutImage targets an A1 (1 bpp) pixmap. wmaker
-                // uses these as icon shape masks via MIT-SHM —
-                // skipping the upload leaves the masks all-zero so
-                // RENDER composites against them produce empty/clipped
-                // output (visible as the wmaker appicon and title-bar
-                // close/minimize buttons rendering only partially).
-                //
-                // X11 ZPixmap depth-1: bits packed MSB-first per byte,
-                // each scanline padded to a 32-bit boundary. Pixman A1
-                // uses the same convention (machine-native u32, MSB
-                // bit = leftmost pixel within each byte on
-                // little-endian). Row strides therefore match for
-                // common widths and we can memcpy row-by-row.
-                let src_row_bytes = (width as usize).div_ceil(32) * 4;
-                let dst_stride_bytes = geom.stride_bytes;
-                let copy_bytes = src_row_bytes.min(dst_stride_bytes);
-                for row in 0..height as isize {
-                    let dy = dst_y as isize + row;
-                    if dy < 0 || dy >= img_h as isize {
-                        continue;
-                    }
-                    let src_row_off = row as usize * src_row_bytes;
-                    if src_row_off + copy_bytes > data.len() {
-                        continue;
-                    }
-                    let dst_row_off = dy as usize * dst_stride_bytes;
-                    // SAFETY: dst row bounds checked above (dy in
-                    // 0..img_h, dst_stride_bytes covers the row).
-                    // Source range checked against data.len(). Row
-                    // strides match (both X11 ZPixmap d1 and pixman
-                    // A1 use 32-bit-aligned scanlines).
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr().add(src_row_off),
-                            (geom.data_ptr).add(dst_row_off),
-                            copy_bytes,
-                        );
-                    }
-                }
-            }
-            _ => {
-                // Unsupported depth — skip.
-            }
-        }
+        // Phase 4.1.5: Vulkan-only. `try_vk_put_image` covers
+        // depth-1 / depth-8 / depth-24 / depth-32. Depth-15 / depth-16
+        // pixmaps don't have a matching mirror format and silently
+        // skip — these depths aren't used by any current X11 client
+        // we run.
+        self.try_vk_put_image(host_xid, depth, width, height, dst_x, dst_y, data);
         Ok(())
     }
 
@@ -3640,13 +6742,10 @@ impl Backend for KmsBackend {
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
         let depth = self.drawable_depth(host_xid).unwrap_or(24);
-        let Some(geom) = self.drawable_geometry(host_xid) else {
-            return Ok(None);
-        };
-        // bits_per_pixel for a ZPixmap reply: depth-1 packs to 1 bpp,
-        // depth-4 to 4 bpp, depth-8 to 8 bpp, depth-15/16 to 16 bpp,
-        // depth-24/32 both to 32 bpp (32 bpp = X8R8G8B8 / A8R8G8B8).
-        // Each scanline is padded to 4 bytes (scanline_pad = 32).
+
+        // X11 GetImage reply header (32 bytes). bpp + row stride match
+        // the legacy pixman path so the Vulkan and pixman branches
+        // emit identically-shaped replies.
         let bpp = match depth {
             1 => 1u32,
             4 => 4,
@@ -3657,14 +6756,6 @@ impl Backend for KmsBackend {
         };
         let row_bytes = (((width as u32) * bpp).div_ceil(32) * 4) as usize;
         let pixel_bytes = row_bytes * (height as usize);
-        // X11 GetImage reply: 32-byte fixed header followed by the
-        // pixel payload (already 4-byte-aligned for ZPixmap). The
-        // header is partly populated by nested.rs (sequence at bytes
-        // 2..4 and visual at 8..12 are patched there); we populate
-        // everything else: byte 0 = 1 (Reply), byte 1 = depth, bytes
-        // 4..8 = length in 4-byte units. Without byte 0 = 1, callers
-        // like wmaker treat byte 0 = first pixel as an error reply,
-        // abort, and leave windows unmapped.
         let mut result = Vec::with_capacity(32 + pixel_bytes);
         let reply_length_units = (pixel_bytes / 4) as u32;
         result.push(1); // 0: Reply
@@ -3675,60 +6766,14 @@ impl Backend for KmsBackend {
         result.extend_from_slice(&[0u8; 20]); // 12..32: padding
         debug_assert_eq!(result.len(), 32);
 
-        // Row-by-row copy. We have real read paths for 8 bpp (depth 8)
-        // and 32 bpp (depth 24/32). Other depths (1, 4, 15, 16) emit
-        // a correctly-sized row of zeros so the wire stream stays
-        // aligned even if the data is wrong — better than scrambling
-        // it with mismatched per-pixel byte counts.
-        let row_data_bytes = (((width as u32) * bpp).div_ceil(8)) as usize;
-        let row_pad_bytes = row_bytes - row_data_bytes;
-        for row in 0..height as isize {
-            let dy = y as isize + row;
-            if dy < 0 || dy >= geom.height as isize {
-                result.resize(result.len() + row_bytes, 0);
-                continue;
-            }
-            let row_ptr = unsafe { geom.data_ptr.add(dy as usize * geom.stride_bytes) };
-            match bpp {
-                32 => {
-                    for col in 0..width as isize {
-                        let dx = x as isize + col;
-                        if dx >= 0 && dx < geom.width as isize {
-                            // SAFETY: bounds-checked against geom.width/height;
-                            // geom borrows self so the pointer is valid.
-                            let pixel: u32 = unsafe {
-                                std::ptr::read_unaligned(
-                                    row_ptr.add((dx as usize) * 4) as *const u32
-                                )
-                            };
-                            result.extend_from_slice(&pixel.to_le_bytes());
-                        } else {
-                            result.extend_from_slice(&[0u8; 4]);
-                        }
-                    }
-                }
-                8 => {
-                    for col in 0..width as isize {
-                        let dx = x as isize + col;
-                        if dx >= 0 && dx < geom.width as isize {
-                            let byte: u8 = unsafe { *row_ptr.add(dx as usize) };
-                            result.push(byte);
-                        } else {
-                            result.push(0);
-                        }
-                    }
-                }
-                _ => {
-                    // No real read path for this depth; emit a full
-                    // row's worth of zeros (data + pad together) and
-                    // skip the per-row pad below.
-                    result.extend(std::iter::repeat_n(0u8, row_bytes));
-                    continue;
-                }
-            }
-            if row_pad_bytes > 0 {
-                result.extend(std::iter::repeat_n(0u8, row_pad_bytes));
-            }
+        // Phase 4.1.5: Vulkan-only readback. Returns true with
+        // pixel bytes pushed into `result`. On failure the request
+        // returns a zero-filled payload so the X11 reply stream
+        // stays aligned — clients see all-zero pixels for unknown
+        // formats (was previously the case for depths 1/4/15/16
+        // anyway, even on the pixman path).
+        if !self.try_vk_get_image_pixels(host_xid, x, y, width, height, depth, &mut result) {
+            result.resize(32 + pixel_bytes, 0);
         }
         Ok(Some(result))
     }
@@ -3766,12 +6811,11 @@ impl Backend for KmsBackend {
             }
             prev = Some((xi, yi));
         }
-        let function = self.current_function;
         let rects = self.intersect_with_current_clip(&rects);
-        self.with_image_mut(host_xid, |img| {
-            let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            fill_rects_with_gc_function(img, function, foreground, &clipped);
-        });
+        // Phase 4.1.4.4: route through the shared solid-fill helper
+        // so `Copy` strokes hit `try_vk_solid_fill`. `Xor` etc. fall
+        // through to the pixman path inside the helper.
+        self.fill_rects_solid_with_gc_function(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -3797,12 +6841,9 @@ impl Backend for KmsBackend {
             offset += 8;
             bresenham_segment(x1 as i32, y1 as i32, x2 as i32, y2 as i32, &mut rects);
         }
-        let function = self.current_function;
         let rects = self.intersect_with_current_clip(&rects);
-        self.with_image_mut(host_xid, |img| {
-            let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            fill_rects_with_gc_function(img, function, foreground, &clipped);
-        });
+        // Phase 4.1.4.4: see `poly_line`.
+        self.fill_rects_solid_with_gc_function(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -3853,11 +6894,9 @@ impl Backend for KmsBackend {
                 height: r.height,
             });
         }
-        let function = self.current_function;
         let rects = self.intersect_with_current_clip(&rects);
-        self.with_image_mut(host_xid, |img| {
-            fill_rects_with_gc_function(img, function, foreground, &rects);
-        });
+        // Phase 4.1.4.4: see `poly_line`.
+        self.fill_rects_solid_with_gc_function(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -3880,11 +6919,6 @@ impl Backend for KmsBackend {
         //   - segments connecting the prev row's left/right edges to this
         //     row's left/right edges otherwise (the side outlines).
         // This produces a closed 1-pixel outline.
-        let function = self.current_function;
-        let (iw, ih) = self
-            .drawable_geometry(host_xid)
-            .map(|g| (g.width as i32, g.height as i32))
-            .unwrap_or((0, 0));
         let mut rects: Vec<Rectangle16> = Vec::new();
         for chunk in arcs.chunks_exact(12) {
             let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
@@ -3951,10 +6985,8 @@ impl Backend for KmsBackend {
             }
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.with_image_mut(host_xid, |img| {
-            let clipped = clip_rects_to_image(&rects, iw, ih);
-            fill_rects_with_gc_function(img, function, foreground, &clipped);
-        });
+        // Phase 4.1.4.4: see `poly_line`.
+        self.fill_rects_solid_with_gc_function(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -3980,11 +7012,9 @@ impl Backend for KmsBackend {
                 height: 1,
             });
         }
-        let function = self.current_function;
         let rects = self.intersect_with_current_clip(&rects);
-        self.with_image_mut(host_xid, |img| {
-            fill_rects_with_gc_function(img, function, foreground, &rects);
-        });
+        // Phase 4.1.4.4: see `poly_line`.
+        self.fill_rects_solid_with_gc_function(host_xid, foreground, &rects);
         Ok(())
     }
 
@@ -4020,12 +7050,9 @@ impl Backend for KmsBackend {
         // We treat any arc with |angle2| >= 360*64 as a full ellipse and fill it
         // with a scanline approach. Partial arcs fall back to filling the full
         // ellipse for now; xeyes uses full circles so this is sufficient.
-        let dst_dims = self
-            .drawable_geometry(host_xid)
-            .map(|g| (g.width as i32, g.height as i32))
-            .unwrap_or((0, 0));
-        let img_w = dst_dims.0;
-        let img_h = dst_dims.1;
+        let dst_dims = self.drawable_dims(host_xid).unwrap_or((0, 0));
+        let img_w = dst_dims.0 as i32;
+        let img_h = dst_dims.1 as i32;
         let mut rects: Vec<Rectangle16> = Vec::new();
         for chunk in arcs.chunks_exact(12) {
             let ax = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
@@ -4094,11 +7121,8 @@ impl Backend for KmsBackend {
         }
         let mut rects: Vec<Rectangle16> = Vec::new();
         scanline_fill_polygon(&verts, &mut rects);
-        let dst_dims = self
-            .drawable_geometry(host_xid)
-            .map(|g| (g.width as i32, g.height as i32))
-            .unwrap_or((0, 0));
-        let clipped = clip_rects_to_image(&rects, dst_dims.0, dst_dims.1);
+        let dst_dims = self.drawable_dims(host_xid).unwrap_or((0, 0));
+        let clipped = clip_rects_to_image(&rects, dst_dims.0 as i32, dst_dims.1 as i32);
         self.fill_rects_honoring_fill_state(host_xid, foreground, &clipped);
         Ok(())
     }
@@ -4120,9 +7144,7 @@ impl Backend for KmsBackend {
             height,
         };
         let function = self.current_function;
-        self.with_image_mut(host_xid, |img| {
-            fill_rects_with_gc_function(img, function, foreground, &[rect]);
-        });
+        self.try_vk_fill_with_function(host_xid, function, foreground, &[rect]);
         Ok(())
     }
 
@@ -4288,9 +7310,7 @@ impl Backend for KmsBackend {
             let function = self.current_function;
             let bg_rects = self.intersect_with_current_clip(&[rect]);
             if !bg_rects.is_empty() {
-                self.with_image_mut(host_xid, |img| {
-                    fill_rects_with_gc_function(img, function, background, &bg_rects);
-                });
+                self.try_vk_fill_with_function(host_xid, function, background, &bg_rects);
             }
         }
 
@@ -4348,9 +7368,7 @@ impl Backend for KmsBackend {
             let function = self.current_function;
             let bg_rects = self.intersect_with_current_clip(&[rect]);
             if !bg_rects.is_empty() {
-                self.with_image_mut(host_xid, |img| {
-                    fill_rects_with_gc_function(img, function, background, &bg_rects);
-                });
+                self.try_vk_fill_with_function(host_xid, function, background, &bg_rects);
             }
         }
 
@@ -4415,18 +7433,8 @@ impl Backend for KmsBackend {
                     };
                     match self.pictures.get_mut(&host_pic) {
                         Some(PictureState::Drawable { repeat: r, .. }) => *r = repeat,
-                        Some(PictureState::SolidFill {
-                            image, repeat: r, ..
-                        }) => {
-                            *r = repeat;
-                            image.borrow_mut().0.set_repeat(repeat);
-                        }
-                        Some(PictureState::Gradient {
-                            image, repeat: r, ..
-                        }) => {
-                            *r = repeat;
-                            image.0.set_repeat(repeat);
-                        }
+                        Some(PictureState::SolidFill { repeat: r, .. }) => *r = repeat,
+                        Some(PictureState::Gradient { repeat: r, .. }) => *r = repeat,
                         None => {}
                     }
                 }
@@ -4479,8 +7487,8 @@ impl Backend for KmsBackend {
                             vec![Rectangle16 {
                                 x: 0,
                                 y: 0,
-                                width: px.image.width().min(u16::MAX as usize) as u16,
-                                height: px.image.height().min(u16::MAX as usize) as u16,
+                                width: px.width,
+                                height: px.height,
                             }]
                         })
                     };
@@ -4625,78 +7633,41 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let pixman_op = op as u32;
-
-        // Extract src raw pointer while pictures is immutably borrowed.
-        // Also capture the underlying drawable xid (if any) to guard against self-composite.
-        let (src_ptr, src_drawable_xid, src_repeat, src_transform): (
-            *mut pixman::ffi::pixman_image_t,
-            Option<u32>,
-            Repeat,
-            Option<pixman::ffi::pixman_transform_t>,
-        ) = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image, repeat, .. }) => {
-                (image.borrow().0.as_ptr(), None, *repeat, None)
-            }
+        // Extract picture-level repeat + transform attributes. The
+        // shader handles all repeat modes + the affine portion of
+        // any transform; SolidFill / Drawable / Gradient sources are
+        // resolved by `resolve_render_pic_with_gradient_xid`.
+        let (src_repeat, src_transform) = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { repeat, .. }) => (*repeat, None),
             Some(PictureState::Gradient {
-                image,
-                repeat,
-                transform,
-            }) => (image.0.as_ptr(), None, *repeat, *transform),
+                repeat, transform, ..
+            }) => (*repeat, *transform),
             Some(PictureState::Drawable {
-                host_xid,
-                repeat,
-                transform,
-                ..
-            }) => {
-                let xid = *host_xid;
-                match self.image_ptr_for_xid(xid) {
-                    Some(ptr) => (ptr, Some(xid), *repeat, *transform),
-                    None => {
-                        log::debug!("render_composite: src drawable 0x{xid:x} has no image");
-                        return Ok(());
-                    }
-                }
-            }
+                repeat, transform, ..
+            }) => (*repeat, *transform),
             None => {
                 log::debug!("render_composite: host_src 0x{host_src:x} not found");
                 return Ok(());
             }
         };
-
-        // Extract mask raw pointer (null_mut if no mask).
-        let (mask_ptr, mask_drawable_xid, mask_repeat, mask_transform): (
-            *mut pixman::ffi::pixman_image_t,
-            Option<u32>,
-            Repeat,
-            Option<pixman::ffi::pixman_transform_t>,
-        ) = if host_mask == 0 {
-            (std::ptr::null_mut(), None, Repeat::None, None)
+        let (mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
+            (Repeat::None, None, false)
         } else {
             match self.pictures.get(&host_mask) {
-                Some(PictureState::SolidFill { image, repeat, .. }) => {
-                    (image.borrow().0.as_ptr(), None, *repeat, None)
-                }
-                Some(PictureState::Gradient {
-                    image,
+                Some(PictureState::SolidFill {
                     repeat,
-                    transform,
-                }) => (image.0.as_ptr(), None, *repeat, *transform),
-                Some(PictureState::Drawable {
-                    host_xid,
-                    repeat,
-                    transform,
+                    component_alpha,
                     ..
-                }) => {
-                    let xid = *host_xid;
-                    match self.image_ptr_for_xid(xid) {
-                        Some(ptr) => (ptr, Some(xid), *repeat, *transform),
-                        None => {
-                            log::debug!("render_composite: mask drawable 0x{xid:x} has no image");
-                            return Ok(());
-                        }
-                    }
-                }
+                }) => (*repeat, None, *component_alpha),
+                Some(PictureState::Gradient {
+                    repeat, transform, ..
+                }) => (*repeat, *transform, false),
+                Some(PictureState::Drawable {
+                    repeat,
+                    transform,
+                    component_alpha,
+                    ..
+                }) => (*repeat, *transform, *component_alpha),
                 None => {
                     log::debug!("render_composite: host_mask 0x{host_mask:x} not found");
                     return Ok(());
@@ -4712,75 +7683,37 @@ impl Backend for KmsBackend {
             }
         };
 
-        // Guard: pixman_image_composite32 is undefined behaviour if src or mask alias dst.
-        // This can happen when two RENDER pictures share the same underlying drawable xid.
-        if src_drawable_xid == Some(dst_xid) {
-            log::debug!(
-                "render_composite: src and dst are the same drawable 0x{dst_xid:x}; skipping self-composite"
-            );
-            return Ok(());
-        }
-        if mask_drawable_xid == Some(dst_xid) {
-            log::debug!(
-                "render_composite: mask and dst are the same drawable 0x{dst_xid:x}; skipping"
-            );
-            return Ok(());
-        }
-
-        unsafe {
-            pixman::ffi::pixman_image_set_repeat(src_ptr, src_repeat.into());
-            pixman::ffi::pixman_image_set_transform(
-                src_ptr,
-                src_transform
-                    .as_ref()
-                    .map_or(std::ptr::null(), |t| t as *const _),
-            );
-            if !mask_ptr.is_null() {
-                pixman::ffi::pixman_image_set_repeat(mask_ptr, mask_repeat.into());
-                pixman::ffi::pixman_image_set_transform(
-                    mask_ptr,
-                    mask_transform
-                        .as_ref()
-                        .map_or(std::ptr::null(), |t| t as *const _),
-                );
+        // Phase 4.1.5: Vulkan-only Composite path. The shader covers
+        // affine transforms + all four repeat modes; SolidFill /
+        // Drawable / Gradient sources resolve through
+        // `resolve_render_pic_with_gradient_xid`. Unsupported cases
+        // (component_alpha, alpha_map, depth-1 src, etc.) silently
+        // skip — `feedback_no_gating_during_family_port.md` accepts
+        // visual regressions for those during the family port.
+        if let Some(src_pic) = resolve_render_pic_with_gradient_xid(&self.pictures, host_src)
+            && let Some(mask_pic) = if host_mask == 0 {
+                Some(RenderPic::None)
+            } else {
+                resolve_render_pic_with_gradient_xid(&self.pictures, host_mask)
             }
-        }
-
-        self.with_image_mut(dst_xid, |dst| {
-            if let Some(ref rects) = clip {
-                use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects
-                    .iter()
-                    .map(|r| Box32 {
-                        x1: r.x as i32,
-                        y1: r.y as i32,
-                        x2: r.x as i32 + r.width as i32,
-                        y2: r.y as i32 + r.height as i32,
-                    })
-                    .collect();
-                let region = Region32::init_rects(&boxes);
-                let _ = dst.0.set_clip_region32(Some(&region));
-            }
-            // src_ptr and mask_ptr are guaranteed distinct from dst by the
-            // aliasing guards above (different drawable XIDs).
-            composite32(
-                pixman_op,
-                src_ptr,
-                mask_ptr,
-                dst,
-                src_x as i32,
-                src_y as i32,
-                mask_x as i32,
-                mask_y as i32,
-                dst_x as i32,
-                dst_y as i32,
-                width as i32,
-                height as i32,
+            && let Some((rects, scissor)) = self.build_render_composite_inputs(
+                &clip, src_x, src_y, mask_x, mask_y, dst_x, dst_y, width, height,
+            )
+        {
+            self.try_vk_render_composite(
+                op,
+                src_pic,
+                mask_pic,
+                dst_xid,
+                &rects,
+                scissor,
+                src_repeat,
+                mask_repeat,
+                src_transform,
+                mask_transform,
+                mask_component_alpha,
             );
-            if clip.is_some() {
-                let _ = dst.0.set_clip_region32(None);
-            }
-        });
+        }
 
         Ok(())
     }
@@ -4789,7 +7722,7 @@ impl Backend for KmsBackend {
         &mut self,
         _origin: Option<OriginContext>,
         minor: u8,
-        _op: u8,
+        op: u8,
         host_src: u32,
         host_dst: u32,
         _mask_fmt: u32,
@@ -4800,96 +7733,11 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<()> {
-        // Resolve src picture — must be SolidFill (Drawable fallback: opaque black).
-        let src_img = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image, .. }) => {
-                // Clone the colour so we can drop the pictures borrow.
-                let argb = unsafe { *image.borrow().0.data() };
-                let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
-                let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
-                let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
-                let g = (((argb >> 8) & 0xFF) as u16) * 0x101;
-                let b = ((argb & 0xFF) as u16) * 0x101;
-                let _ = img.0.fill_rectangles(
-                    Operation::Src,
-                    Color::new(r, g, b, a),
-                    &[Rectangle16 {
-                        x: 0,
-                        y: 0,
-                        width: 1,
-                        height: 1,
-                    }],
-                );
-                img.0.set_repeat(Repeat::Normal);
-                img
-            }
-            _ => {
-                log::debug!(
-                    "render_composite_glyphs: host_src 0x{host_src:x} is not SolidFill; using black"
-                );
-                let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
-                let _ = img.0.fill_rectangles(
-                    Operation::Src,
-                    Color::new(0, 0, 0, 0xFFFF),
-                    &[Rectangle16 {
-                        x: 0,
-                        y: 0,
-                        width: 1,
-                        height: 1,
-                    }],
-                );
-                img.0.set_repeat(Repeat::Normal);
-                img
-            }
-        };
-
-        let (dst_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
-            _ => return Ok(()),
-        };
-
-        if !self.glyphsets.contains_key(&host_gs) {
-            return Ok(());
-        }
-        let pen_x = src_x as i32 + x_off as i32;
-        let pen_y = src_y as i32 + y_off as i32;
-
-        // SAFETY: glyphsets and the pixmap image data (dst) live in disjoint
-        // fields of KmsBackend. No glyphset is freed during this closure because
-        // KmsBackend is !Sync and this method holds &mut self.
-        let glyphsets_ptr: *const HashMap<u32, GlyphSetState> = &self.glyphsets;
-
-        self.with_image_mut(dst_xid, |dst| {
-            if let Some(ref rects) = clip {
-                use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects
-                    .iter()
-                    .map(|r| Box32 {
-                        x1: r.x as i32,
-                        y1: r.y as i32,
-                        x2: r.x as i32 + r.width as i32,
-                        y2: r.y as i32 + r.height as i32,
-                    })
-                    .collect();
-                let region = Region32::init_rects(&boxes);
-                let _ = dst.0.set_clip_region32(Some(&region));
-            }
-            let glyphsets_ref = unsafe { &*glyphsets_ptr };
-            composite_glyphs_onto(
-                glyphsets_ref,
-                host_gs,
-                &src_img,
-                dst,
-                minor,
-                pen_x,
-                pen_y,
-                items,
-            );
-            if clip.is_some() {
-                let _ = dst.0.set_clip_region32(None);
-            }
-        });
-
+        // Phase 4.1.5: Vulkan-only. Atlas miss / non-`Over` op /
+        // non-SolidFill src silently skip the run.
+        self.try_vk_render_composite_glyphs(
+            minor, op, host_src, host_dst, host_gs, src_x, src_y, items, x_off, y_off,
+        );
         Ok(())
     }
 
@@ -4911,13 +7759,6 @@ impl Backend for KmsBackend {
             _ => return Ok(()),
         };
 
-        let pixman_color = pixman::ffi::pixman_color_t {
-            red: u16::from_le_bytes([color[0], color[1]]),
-            green: u16::from_le_bytes([color[2], color[3]]),
-            blue: u16::from_le_bytes([color[4], color[5]]),
-            alpha: u16::from_le_bytes([color[6], color[7]]),
-        };
-
         let mut decoded: Vec<Rectangle16> = Vec::with_capacity(rects.len() / 8);
         for chunk in rects.chunks_exact(8) {
             let rx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(x_off);
@@ -4937,59 +7778,48 @@ impl Backend for KmsBackend {
             return Ok(());
         }
 
-        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true)
-            .map_err(|_| io::Error::other("pixman color image"))?;
-        let _ = color_img.fill_rectangles(
-            Operation::Src,
-            pixman_color,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        color_img.set_repeat(Repeat::Normal);
-
-        // RENDER op codes share their numeric values with pixman's
-        // pixman_op_t (Clear=0, Src=1, …, Over=3, …).
-        let pixman_op = op as u32;
-        let color_ptr = color_img.as_ptr();
-        self.with_image_mut(dst_drawable_xid, |dst| {
-            if let Some(ref rects) = picture_clip {
-                use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects
-                    .iter()
-                    .map(|cr| Box32 {
-                        x1: cr.x as i32,
-                        y1: cr.y as i32,
-                        x2: cr.x as i32 + cr.width as i32,
-                        y2: cr.y as i32 + cr.height as i32,
-                    })
-                    .collect();
-                let region = Region32::init_rects(&boxes);
-                let _ = dst.0.set_clip_region32(Some(&region));
-            }
-            for r in &decoded {
-                composite32(
-                    pixman_op,
-                    color_ptr,
-                    std::ptr::null_mut(),
-                    dst,
-                    0,
-                    0,
-                    0,
-                    0,
-                    r.x as i32,
-                    r.y as i32,
-                    r.width as i32,
-                    r.height as i32,
-                );
-            }
-            if picture_clip.is_some() {
-                let _ = dst.0.set_clip_region32(None);
-            }
-        });
+        // Phase 4.1.5: Vulkan-only. Solid src + no mask + per-op
+        // blend covers every standard PictOp; out-of-format dst
+        // silently skips.
+        // X RENDER XRenderColor is already premultiplied on the wire
+        // (see rendercheck main.c:337-345). Pass through unchanged.
+        let color_premul = {
+            let r = u16::from_le_bytes([color[0], color[1]]) as f32 / 65535.0;
+            let g = u16::from_le_bytes([color[2], color[3]]) as f32 / 65535.0;
+            let b = u16::from_le_bytes([color[4], color[5]]) as f32 / 65535.0;
+            let a = u16::from_le_bytes([color[6], color[7]]) as f32 / 65535.0;
+            [r, g, b, a]
+        };
+        if let Some((_, scissor)) =
+            self.build_render_composite_inputs(&picture_clip, 0, 0, 0, 0, 0, 0, 1, 1)
+        {
+            let composite_rects: Vec<crate::kms::vk::ops::render::CompositeRect> = decoded
+                .iter()
+                .map(|r| crate::kms::vk::ops::render::CompositeRect {
+                    src_x: 0,
+                    src_y: 0,
+                    mask_x: 0,
+                    mask_y: 0,
+                    dst_x: i32::from(r.x),
+                    dst_y: i32::from(r.y),
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                })
+                .collect();
+            self.try_vk_render_composite(
+                op,
+                RenderPic::Solid(color_premul),
+                RenderPic::None,
+                dst_drawable_xid,
+                &composite_rects,
+                scissor,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            );
+        }
         Ok(())
     }
 
@@ -5009,116 +7839,17 @@ impl Backend for KmsBackend {
         if !traps.len().is_multiple_of(40) || traps.is_empty() {
             return Ok(());
         }
-
-        // Translate X RENDER op code to pixman op. X RENDER and pixman share
-        // the same numeric values (0=Clear, 1=Src, 2=Dst, 3=Over, …).
-        let pixman_op = op as u32;
-
-        // Decode the trap wire bytes element-by-element to avoid alignment UB.
-        // Each trap is 40 bytes: top(4), bottom(4), left.p1.x(4), left.p1.y(4),
-        // left.p2.x(4), left.p2.y(4), right.p1.x(4), right.p1.y(4),
-        // right.p2.x(4), right.p2.y(4).
-        let n_traps = traps.len() / 40;
-        let mut trap_vec: Vec<pixman::ffi::pixman_trapezoid_t> = Vec::with_capacity(n_traps);
-        for chunk in traps.chunks_exact(40) {
-            let t = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let b = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-            let lp1x = i32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
-            let lp1y = i32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]);
-            let lp2x = i32::from_le_bytes([chunk[16], chunk[17], chunk[18], chunk[19]]);
-            let lp2y = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
-            let rp1x = i32::from_le_bytes([chunk[24], chunk[25], chunk[26], chunk[27]]);
-            let rp1y = i32::from_le_bytes([chunk[28], chunk[29], chunk[30], chunk[31]]);
-            let rp2x = i32::from_le_bytes([chunk[32], chunk[33], chunk[34], chunk[35]]);
-            let rp2y = i32::from_le_bytes([chunk[36], chunk[37], chunk[38], chunk[39]]);
-            trap_vec.push(pixman::ffi::pixman_trapezoid_t {
-                top: t,
-                bottom: b,
-                left: pixman::ffi::pixman_line_fixed_t {
-                    p1: pixman::ffi::pixman_point_fixed_t { x: lp1x, y: lp1y },
-                    p2: pixman::ffi::pixman_point_fixed_t { x: lp2x, y: lp2y },
-                },
-                right: pixman::ffi::pixman_line_fixed_t {
-                    p1: pixman::ffi::pixman_point_fixed_t { x: rp1x, y: rp1y },
-                    p2: pixman::ffi::pixman_point_fixed_t { x: rp2x, y: rp2y },
-                },
-            });
-        }
-
-        // Look up source picture — must be SolidFill. Borrow and get raw ptr.
-        let src_ptr = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image, .. }) => image.borrow().0.as_ptr(),
-            _ => {
-                log::debug!(
-                    "render_trapezoids: host_src 0x{:x} is not a SolidFill picture; skipping",
-                    host_src
-                );
-                return Ok(());
-            }
-        };
-
-        // Look up destination picture — must be Drawable. Extract host_xid
-        // and any clip info, then release the pictures borrow before we
-        // mutably borrow the drawable image below.
-        let (drawable_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
-            _ => {
-                log::debug!(
-                    "render_trapezoids: host_dst 0x{:x} is not a Drawable picture; skipping",
-                    host_dst
-                );
-                return Ok(());
-            }
-        };
-
-        // Apply clip if set, composite traps, then clear clip.
-        // We need to borrow the dst image mutably; use with_image_mut.
-        // src_ptr is valid for the duration of this call because self.pictures
-        // is not modified between obtaining src_ptr and the composite call.
-        self.with_image_mut(drawable_xid, |dst| {
-            // SAFETY: dst.0.as_ptr() returns a valid *mut pixman_image_t that
-            // pixman allocated and that we own (inside RefCell<PixmanImage>).
-            // src_ptr was obtained from another PixmanImage we also own and
-            // that outlives this call (src and dst are different pictures by
-            // checked contract). trap_vec is a Vec we own. n_traps matches
-            // trap_vec.len().
-            // Apply clip region if present.
-            if let Some(ref rects) = clip {
-                use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects
-                    .iter()
-                    .map(|r| Box32 {
-                        x1: r.x as i32,
-                        y1: r.y as i32,
-                        x2: r.x as i32 + r.width as i32,
-                        y2: r.y as i32 + r.height as i32,
-                    })
-                    .collect();
-                let region = Region32::init_rects(boxes.as_slice());
-                let _ = dst.0.set_clip_region32(Some(&region));
-            }
-
-            // PIXMAN_a8 as mask-format gives 256-level AA for trap
-            // coverage — correct for all common RENDER use cases.
-            composite_trapezoids(
-                pixman_op,
-                src_ptr,
-                dst,
-                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                src_x as i32,
-                src_y as i32,
-                x_off as i32,
-                y_off as i32,
-                &trap_vec,
+        let _ = (src_x, src_y);
+        // Phase 4.1.5: Vulkan-only. CPU rasterises traps into the
+        // R8 mask scratch; the existing Composite pipeline blends the
+        // source through the mask. Supports SolidFill, Drawable, and
+        // Gradient sources (pixman fallback no longer exists, so a
+        // false return drops the request silently — log to surface it).
+        if !self.try_vk_render_trapezoids_path(op, host_src, host_dst, traps, x_off, y_off) {
+            log::debug!(
+                "render_trapezoids: vk path declined op={op} src={host_src:#x} dst={host_dst:#x}"
             );
-
-            // Clear clip after composite to avoid stale clip affecting
-            // subsequent operations on this image.
-            if clip.is_some() {
-                let _ = dst.0.set_clip_region32(None);
-            }
-        });
-
+        }
         Ok(())
     }
 
@@ -5137,193 +7868,17 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<()> {
-        // Decode the per-minor primitive array into a flat triangle list.
-        // pixman_triangle_t is layout-identical to RENDER's XTriangle, and
-        // XPointFixed is two consecutive i32 fixed-point coords (X then Y).
-        let read_point = |off: usize, chunk: &[u8]| pixman::ffi::pixman_point_fixed_t {
-            x: i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]),
-            y: i32::from_le_bytes([
-                chunk[off + 4],
-                chunk[off + 5],
-                chunk[off + 6],
-                chunk[off + 7],
-            ]),
-        };
-        let mk_tri = |a: pixman::ffi::pixman_point_fixed_t,
-                      b: pixman::ffi::pixman_point_fixed_t,
-                      c: pixman::ffi::pixman_point_fixed_t| {
-            pixman::ffi::pixman_triangle_t {
-                p1: a,
-                p2: b,
-                p3: c,
-            }
-        };
-
-        let mut tris: Vec<pixman::ffi::pixman_triangle_t> = match minor {
-            11 => {
-                // Triangles: array of XTriangle (24 B = 3 XPointFixed each).
-                if !primitives.len().is_multiple_of(24) {
-                    return Ok(());
-                }
-                primitives
-                    .chunks_exact(24)
-                    .map(|c| mk_tri(read_point(0, c), read_point(8, c), read_point(16, c)))
-                    .collect()
-            }
-            12 => {
-                // TriStrip: N points → N-2 triangles
-                // (p0,p1,p2), (p1,p2,p3), (p2,p3,p4), ...
-                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(());
-                }
-                let pts: Vec<pixman::ffi::pixman_point_fixed_t> = primitives
-                    .chunks_exact(8)
-                    .map(|c| read_point(0, c))
-                    .collect();
-                (0..pts.len() - 2)
-                    .map(|i| mk_tri(pts[i], pts[i + 1], pts[i + 2]))
-                    .collect()
-            }
-            13 => {
-                // TriFan: N points → N-2 triangles fanned from p0
-                // (p0,p1,p2), (p0,p2,p3), (p0,p3,p4), ...
-                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(());
-                }
-                let pts: Vec<pixman::ffi::pixman_point_fixed_t> = primitives
-                    .chunks_exact(8)
-                    .map(|c| read_point(0, c))
-                    .collect();
-                (1..pts.len() - 1)
-                    .map(|i| mk_tri(pts[0], pts[i], pts[i + 1]))
-                    .collect()
-            }
-            _ => return Ok(()),
-        };
-        if tris.is_empty() {
-            return Ok(());
-        }
-        // Apply the per-call (x_off, y_off) pixel offset onto every
-        // FIXED-point coord. (Identical pattern to render_trapezoids.)
-        let dx = i32::from(x_off) << 16;
-        let dy = i32::from(y_off) << 16;
-        if dx != 0 || dy != 0 {
-            for t in &mut tris {
-                t.p1.x = t.p1.x.wrapping_add(dx);
-                t.p1.y = t.p1.y.wrapping_add(dy);
-                t.p2.x = t.p2.x.wrapping_add(dx);
-                t.p2.y = t.p2.y.wrapping_add(dy);
-                t.p3.x = t.p3.x.wrapping_add(dx);
-                t.p3.y = t.p3.y.wrapping_add(dy);
-            }
-        }
-
-        let pixman_op = u32::from(op);
-
-        // Resolve the source picture into a pixman_image_t pointer.
-        // RENDER triangle ops accept any source picture — SolidFill,
-        // Gradient, or another drawable (rendercheck uses 1×1 pixmap
-        // sources). Same shape as render_composite.
-        let (src_ptr, src_drawable_xid, src_repeat, src_transform): (
-            *mut pixman::ffi::pixman_image_t,
-            Option<u32>,
-            Repeat,
-            Option<pixman::ffi::pixman_transform_t>,
-        ) = match self.pictures.get(&host_src) {
-            Some(PictureState::SolidFill { image, repeat, .. }) => {
-                (image.borrow().0.as_ptr(), None, *repeat, None)
-            }
-            Some(PictureState::Gradient {
-                image,
-                repeat,
-                transform,
-            }) => (image.0.as_ptr(), None, *repeat, *transform),
-            Some(PictureState::Drawable {
-                host_xid,
-                repeat,
-                transform,
-                ..
-            }) => {
-                let xid = *host_xid;
-                match self.image_ptr_for_xid(xid) {
-                    Some(ptr) => (ptr, Some(xid), *repeat, *transform),
-                    None => {
-                        log::debug!(
-                            "render_triangles_op: src drawable 0x{xid:x} has no image; skipping"
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-            None => {
-                log::debug!("render_triangles_op: host_src 0x{host_src:x} not found; skipping");
-                return Ok(());
-            }
-        };
-
-        let (drawable_xid, clip) = match self.pictures.get(&host_dst) {
-            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
-            _ => {
-                log::debug!(
-                    "render_triangles_op: host_dst 0x{host_dst:x} is not a Drawable picture; skipping"
-                );
-                return Ok(());
-            }
-        };
-
-        // Same anti-self-composite guard render_composite uses: pixman
-        // is undefined if src aliases dst.
-        if src_drawable_xid == Some(drawable_xid) {
+        let _ = (src_x, src_y);
+        // Phase 4.1.5: Vulkan-only. CPU triangle rasteriser fills
+        // an R8 coverage mask, then Composite blends src through it.
+        // Supports SolidFill, Drawable, and Gradient sources.
+        if !self
+            .try_vk_render_triangles_path(minor, op, host_src, host_dst, primitives, x_off, y_off)
+        {
             log::debug!(
-                "render_triangles_op: src and dst are the same drawable 0x{drawable_xid:x}; skipping"
-            );
-            return Ok(());
-        }
-
-        // Apply repeat/transform to source — same as render_composite.
-        unsafe {
-            pixman::ffi::pixman_image_set_repeat(src_ptr, src_repeat.into());
-            pixman::ffi::pixman_image_set_transform(
-                src_ptr,
-                src_transform
-                    .as_ref()
-                    .map_or(std::ptr::null(), |t| t as *const _),
+                "render_triangles_op: vk path declined minor={minor} op={op} src={host_src:#x} dst={host_dst:#x}"
             );
         }
-
-        self.with_image_mut(drawable_xid, |dst| {
-            if let Some(ref rects) = clip {
-                use pixman::{Box32, Region32};
-                let boxes: Vec<Box32> = rects
-                    .iter()
-                    .map(|r| Box32 {
-                        x1: i32::from(r.x),
-                        y1: i32::from(r.y),
-                        x2: i32::from(r.x) + i32::from(r.width),
-                        y2: i32::from(r.y) + i32::from(r.height),
-                    })
-                    .collect();
-                let region = Region32::init_rects(boxes.as_slice());
-                let _ = dst.0.set_clip_region32(Some(&region));
-            }
-
-            composite_triangles(
-                pixman_op,
-                src_ptr,
-                dst,
-                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                i32::from(src_x),
-                i32::from(src_y),
-                0,
-                0,
-                &tris,
-            );
-
-            if clip.is_some() {
-                let _ = dst.0.set_clip_region32(None);
-            }
-        });
-
         Ok(())
     }
 
@@ -5332,33 +7887,24 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
-        // X RENDER CreateSolidFill color: 16-bit per channel, little-endian.
+        // X RENDER CreateSolidFill color: 16-bit per channel, little-endian,
+        // already premultiplied on the wire (see rendercheck main.c:337-345).
         // Byte layout: red[0..2], green[2..4], blue[4..6], alpha[6..8].
-        let r = u16::from_le_bytes([color[0], color[1]]);
-        let g = u16::from_le_bytes([color[2], color[3]]);
-        let b = u16::from_le_bytes([color[4], color[5]]);
-        let a = u16::from_le_bytes([color[6], color[7]]);
-        let pixman_color = Color::new(r, g, b, a);
-
-        // Create a 1×1 A8R8G8B8 image, fill it, and set repeat so it tiles.
-        let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
-        let _ = img.0.fill_rectangles(
-            Operation::Src,
-            pixman_color,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        img.0.set_repeat(Repeat::Normal);
+        let r16 = u16::from_le_bytes([color[0], color[1]]);
+        let g16 = u16::from_le_bytes([color[2], color[3]]);
+        let b16 = u16::from_le_bytes([color[4], color[5]]);
+        let a16 = u16::from_le_bytes([color[6], color[7]]);
+        let r = f32::from(r16) / 65535.0;
+        let g = f32::from(g16) / 65535.0;
+        let b = f32::from(b16) / 65535.0;
+        let a = f32::from(a16) / 65535.0;
+        let premul = [r, g, b, a];
 
         let picture_xid = self.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::SolidFill {
-                image: RefCell::new(img),
+                premul,
                 repeat: Repeat::Normal,
                 component_alpha: false,
             },
@@ -5371,6 +7917,8 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        use crate::kms::vk::gradient::{GradientPicture, Stop};
+
         if body.len() < 24 {
             return Ok(None);
         }
@@ -5384,7 +7932,7 @@ impl Backend for KmsBackend {
         if body.len() < color_base + n_stops * 8 {
             return Ok(None);
         }
-        let mut stops = Vec::with_capacity(n_stops);
+        let mut stops: Vec<Stop> = Vec::with_capacity(n_stops);
         for i in 0..n_stops {
             let pos = i32::from_le_bytes(
                 body[pos_base + i * 4..pos_base + i * 4 + 4]
@@ -5396,34 +7944,28 @@ impl Backend for KmsBackend {
             let g = u16::from_le_bytes(body[cb + 2..cb + 4].try_into().unwrap());
             let b = u16::from_le_bytes(body[cb + 4..cb + 6].try_into().unwrap());
             let a = u16::from_le_bytes(body[cb + 6..cb + 8].try_into().unwrap());
-            stops.push(pixman::ffi::pixman_gradient_stop_t {
-                x: pos,
-                color: pixman::ffi::pixman_color_t {
-                    red: r,
-                    green: g,
-                    blue: b,
-                    alpha: a,
-                },
-            });
+            stops.push(Stop { pos, r, g, b, a });
         }
-        let p1 = pixman::ffi::pixman_point_fixed_t { x: p1x, y: p1y };
-        let p2 = pixman::ffi::pixman_point_fixed_t { x: p2x, y: p2y };
-        let raw = unsafe {
-            pixman::ffi::pixman_image_create_linear_gradient(
-                &p1,
-                &p2,
-                stops.as_ptr(),
-                stops.len() as i32,
-            )
-        };
-        if raw.is_null() {
+        let Some(vkctx) = self.vk.as_ref().cloned() else {
+            log::debug!("render_create_linear_gradient: vulkan unavailable; cannot create");
             return Ok(None);
-        }
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Ok(None);
+        };
+        let gradient =
+            match GradientPicture::new_linear(vkctx, pool_handle, (p1x, p1y), (p2x, p2y), &stops) {
+                Ok(g) => g,
+                Err(e) => {
+                    log::warn!("render_create_linear_gradient: vk init failed: {e:?}");
+                    return Ok(None);
+                }
+            };
         let picture_xid = self.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::Gradient {
-                image: PixmanImage(unsafe { Image::from_ptr(raw) }),
+                gradient,
                 repeat: Repeat::None,
                 transform: None,
             },
@@ -5439,6 +7981,8 @@ impl Backend for KmsBackend {
         if body.len() < 32 {
             return Ok(None);
         }
+        use crate::kms::vk::gradient::{GradientPicture, Stop};
+
         let icx = i32::from_le_bytes(body[4..8].try_into().unwrap());
         let icy = i32::from_le_bytes(body[8..12].try_into().unwrap());
         let ocx = i32::from_le_bytes(body[12..16].try_into().unwrap());
@@ -5451,7 +7995,7 @@ impl Backend for KmsBackend {
         if body.len() < color_base + n_stops * 8 {
             return Ok(None);
         }
-        let mut stops = Vec::with_capacity(n_stops);
+        let mut stops: Vec<Stop> = Vec::with_capacity(n_stops);
         for i in 0..n_stops {
             let pos = i32::from_le_bytes(
                 body[pos_base + i * 4..pos_base + i * 4 + 4]
@@ -5463,36 +8007,32 @@ impl Backend for KmsBackend {
             let g = u16::from_le_bytes(body[cb + 2..cb + 4].try_into().unwrap());
             let b = u16::from_le_bytes(body[cb + 4..cb + 6].try_into().unwrap());
             let a = u16::from_le_bytes(body[cb + 6..cb + 8].try_into().unwrap());
-            stops.push(pixman::ffi::pixman_gradient_stop_t {
-                x: pos,
-                color: pixman::ffi::pixman_color_t {
-                    red: r,
-                    green: g,
-                    blue: b,
-                    alpha: a,
-                },
-            });
+            stops.push(Stop { pos, r, g, b, a });
         }
-        let inner = pixman::ffi::pixman_point_fixed_t { x: icx, y: icy };
-        let outer = pixman::ffi::pixman_point_fixed_t { x: ocx, y: ocy };
-        let raw = unsafe {
-            pixman::ffi::pixman_image_create_radial_gradient(
-                &inner,
-                &outer,
-                ir,
-                or_,
-                stops.as_ptr(),
-                stops.len() as i32,
-            )
-        };
-        if raw.is_null() {
+        let Some(vkctx) = self.vk.as_ref().cloned() else {
             return Ok(None);
-        }
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Ok(None);
+        };
+        let gradient = match GradientPicture::new_radial(
+            vkctx,
+            pool_handle,
+            (icx, icy, ir),
+            (ocx, ocy, or_),
+            &stops,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!("render_create_radial_gradient: vk init failed: {e:?}");
+                return Ok(None);
+            }
+        };
         let picture_xid = self.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::Gradient {
-                image: PixmanImage(unsafe { Image::from_ptr(raw) }),
+                gradient,
                 repeat: Repeat::None,
                 transform: None,
             },
@@ -5519,41 +8059,80 @@ impl Backend for KmsBackend {
             }
         };
 
-        // fvwm pattern: CreatePixmap → PutImage → CreatePicture → FreePixmap → CreateCursor.
-        // The pixmap may already be freed; fall back to the rescued image saved by free_pixmap.
-        let cursor_img = if let Some(pm) = self.pixmaps.get(&host_xid) {
-            let w = pm.image.0.width() as u16;
-            let h = pm.image.0.height() as u16;
-            let mut img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true)?;
-            img.0.composite32(
-                Operation::Src,
-                &pm.image.0,
-                None,
-                (0, 0),
-                (0, 0),
-                (0, 0),
-                (w as i32, h as i32),
+        // fvwm pattern: CreatePixmap → PutImage → CreatePicture →
+        // FreePixmap → CreateCursor. By the time CreateCursor lands,
+        // the pixmap may already be freed; in that case `free_pixmap`
+        // moved its `vk_mirror` into `picture_rescued_images`.
+        //
+        // Two source-shape cases, deliberately handled separately:
+        //   1. Live pixmap: we need a `&mut DrawableImage` pointing
+        //      into `self.pixmaps`. Disjoint borrows let us do the
+        //      copy without taking ownership.
+        //   2. Rescued mirror: owned locally; consumed by the copy
+        //      and dropped (with its VkImage) afterwards.
+        //
+        // Both cases produce the cursor mirror via vkCmdCopyImage —
+        // no pixman path either way.
+        let id = self.next_host_xid();
+
+        if let Some(rescued) = self.picture_rescued_images.remove(&pic_xid) {
+            log::debug!("render_create_cursor: using rescued mirror for pic {pic_xid}");
+            let mut src = rescued;
+            let cw = src.extent.width;
+            let ch = src.extent.height;
+            let vk_mirror = self.copy_drawable_to_new_cursor_mirror(&mut src);
+            // `src` drops here, releasing the rescued mirror's VkImage.
+            self.cursors.insert(
+                id,
+                CursorState {
+                    extent: ash::vk::Extent2D {
+                        width: cw,
+                        height: ch,
+                    },
+                    hot_x: x,
+                    hot_y: y,
+                    vk_mirror,
+                },
             );
-            img
-        } else if let Some(rescued) = self.picture_rescued_images.remove(&pic_xid) {
-            log::debug!("render_create_cursor: using rescued image for pic {pic_xid}");
-            rescued
+        } else if let Some(pm) = self.pixmaps.get(&host_xid) {
+            let Some((cw, ch)) = pm
+                .vk_mirror
+                .as_ref()
+                .map(|m| (m.extent.width, m.extent.height))
+            else {
+                log::debug!(
+                    "render_create_cursor: pixmap host_xid={host_xid} has no mirror for pic {pic_xid}"
+                );
+                return Ok(None);
+            };
+            // Allocate the cursor mirror first (immutable self.vk
+            // borrow), then re-borrow self.pixmaps mutably for the
+            // src side of the copy — disjoint fields, two `&mut`s OK.
+            let Some(mut cursor_mirror) = self.allocate_cursor_mirror(cw, ch) else {
+                return Ok(None);
+            };
+            if let Err(e) = self.copy_pixmap_mirror_to_cursor(host_xid, &mut cursor_mirror, cw, ch)
+            {
+                log::warn!("render_create_cursor: mirror copy failed: {e:?}");
+            }
+            self.cursors.insert(
+                id,
+                CursorState {
+                    extent: ash::vk::Extent2D {
+                        width: cw,
+                        height: ch,
+                    },
+                    hot_x: x,
+                    hot_y: y,
+                    vk_mirror: Some(cursor_mirror),
+                },
+            );
         } else {
             log::debug!(
                 "render_create_cursor: pixmap host_xid={host_xid} not found for pic {pic_xid}"
             );
             return Ok(None);
-        };
-
-        let id = self.next_host_xid();
-        self.cursors.insert(
-            id,
-            CursorState {
-                image: cursor_img,
-                hot_x: x,
-                hot_y: y,
-            },
-        );
+        }
 
         CursorHandle::from_raw(id)
             .map(Some)
@@ -5602,55 +8181,13 @@ impl Backend for KmsBackend {
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        host_pic: u32,
-        body: &[u8],
+        _host_pic: u32,
+        _body: &[u8],
     ) -> io::Result<()> {
-        // Wire body (picture XID already stripped at the dispatcher layer):
-        //   nbytes(2) + pad(2) + filter_name(nbytes) + pad-to-4 + values(N × INT32 fixed)
-        // We only act on the filter name; convolution-kernel values aren't
-        // exercised by any client we care about today (xclock / fvwm /
-        // GTK use named filters only).
-        if body.len() < 4 {
-            return Ok(());
-        }
-        let nbytes = u16::from_le_bytes([body[0], body[1]]) as usize;
-        if body.len() < 4 + nbytes {
-            return Ok(());
-        }
-        let name = std::str::from_utf8(&body[4..4 + nbytes]).unwrap_or("");
-        let filter = match name {
-            "nearest" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_NEAREST,
-            "bilinear" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_BILINEAR,
-            "fast" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_FAST,
-            "good" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_GOOD,
-            "best" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_BEST,
-            "convolution" => pixman::ffi::pixman_filter_t_PIXMAN_FILTER_CONVOLUTION,
-            other => {
-                log::debug!("render_set_picture_filter: unknown filter {other:?}");
-                return Ok(());
-            }
-        };
-        // Resolve the picture's underlying pixman image. SolidFill /
-        // Gradient pictures own their image directly; Drawable pictures
-        // delegate to their backing window/pixmap.
-        let img_ptr = match self.pictures.get(&host_pic) {
-            Some(PictureState::Drawable { host_xid, .. }) => self.image_ptr_for_xid(*host_xid),
-            Some(PictureState::SolidFill { image, .. }) => Some(image.borrow().0.as_ptr()),
-            Some(PictureState::Gradient { image, .. }) => Some(image.0.as_ptr()),
-            None => None,
-        };
-        let Some(ptr) = img_ptr else {
-            log::debug!("render_set_picture_filter: picture 0x{host_pic:x} has no backing image");
-            return Ok(());
-        };
-        // SAFETY: `ptr` is a valid `*mut pixman_image_t` for the lifetime
-        // of the picture entry; we don't mutate `self.pictures` /
-        // `self.windows` / `self.pixmaps` between resolving the pointer
-        // and using it. Filter parameters left null since we don't
-        // accept convolution kernels yet.
-        unsafe {
-            pixman::ffi::pixman_image_set_filter(ptr, filter, std::ptr::null(), 0);
-        }
+        // No-op: with pixman gone the filter selection had no effect
+        // outside the pixman image. The Vk Composite shader uses a
+        // fixed sampler (`LINEAR`); per-picture filter selection is
+        // a 4.1.4.6 follow-up (multiple samplers per filter mode).
         Ok(())
     }
 
@@ -5671,7 +8208,7 @@ impl Backend for KmsBackend {
         let transform = if matrix == [[0x10000, 0, 0], [0, 0x10000, 0], [0, 0, 0x10000]] {
             None
         } else {
-            Some(pixman::ffi::pixman_transform_t { matrix })
+            Some(PictTransform { matrix })
         };
         match self.pictures.get_mut(&host_pic) {
             Some(PictureState::Drawable { transform: t, .. })
@@ -5950,205 +8487,22 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
     }
 }
 
-/// Composite a CompositeGlyphs item stream from `gs` using `src` as the colour
-/// source onto `dst`. `minor` = 23/24/25 → id_size 1/2/4.
-/// `pen_x`/`pen_y` are the starting pen position (already offset by src_x+x_off
-/// and src_y+y_off at the call site in `render_composite_glyphs`).
-pub(super) fn composite_glyphs_onto(
-    glyphsets: &HashMap<u32, GlyphSetState>,
-    gs_xid: u32,
-    src: &PixmanImage,
-    dst: &mut PixmanImage,
-    minor: u8,
-    pen_x: i32,
-    pen_y: i32,
-    items: &[u8],
-) {
-    let id_size = match minor {
-        23 => 1usize,
-        24 => 2,
-        _ => 4,
-    };
-
-    // Read the solid colour from `src` (1×1 REPEAT_NORMAL image).
-    // SAFETY: src is a 1×1 pixman image we own; data() returns a valid pointer.
-    let argb: u32 = unsafe { *src.0.data() };
-    let a = (((argb >> 24) & 0xFF) as u16) * 0x101;
-    let r = (((argb >> 16) & 0xFF) as u16) * 0x101;
-    let g = (((argb >> 8) & 0xFF) as u16) * 0x101;
-    let b = ((argb & 0xFF) as u16) * 0x101;
-    let pen_color = Color::new(r, g, b, a);
-
-    let dst_w = dst.0.width() as i32;
-    let dst_h = dst.0.height() as i32;
-    let mut pen_x = pen_x;
-    let mut pen_y = pen_y;
-    let mut pos = 0usize;
-    let mut active_gs_xid = gs_xid;
-
-    // Build once: the 1×1 tiling source image is the same colour for every glyph.
-    let Ok(mut color_img) = Image::new(FormatCode::A8R8G8B8, 1, 1, true) else {
-        return;
-    };
-    let _ = color_img.fill_rectangles(
-        Operation::Src,
-        pen_color,
-        &[Rectangle16 {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        }],
-    );
-    color_img.set_repeat(Repeat::Normal);
-
-    while pos + 8 <= items.len() {
-        let count = items[pos] as usize;
-        if count == 255 {
-            // Glyphset-switch sentinel: 8 bytes (count, pad×3, new_gs_xid×4).
-            if pos + 8 <= items.len() {
-                let new_xid = u32::from_le_bytes([
-                    items[pos + 4],
-                    items[pos + 5],
-                    items[pos + 6],
-                    items[pos + 7],
-                ]);
-                if new_xid != 0 && glyphsets.contains_key(&new_xid) {
-                    active_gs_xid = new_xid;
-                }
-            }
-            pos += 8;
-            continue;
-        }
-        let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]) as i32;
-        let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]) as i32;
-        pen_x += dx;
-        pen_y += dy;
-
-        let payload_start = pos + 8;
-        let payload_bytes = count * id_size;
-        let padded = (payload_bytes + 3) & !3;
-        if payload_start + padded > items.len() {
-            break;
-        }
-
-        let Some(active_gs) = glyphsets.get(&active_gs_xid) else {
-            pos += 8 + padded;
-            continue;
-        };
-
-        for i in 0..count {
-            let id_off = payload_start + i * id_size;
-            let glyph_id: u32 = match id_size {
-                1 => items[id_off] as u32,
-                2 => u16::from_le_bytes([items[id_off], items[id_off + 1]]) as u32,
-                _ => u32::from_le_bytes([
-                    items[id_off],
-                    items[id_off + 1],
-                    items[id_off + 2],
-                    items[id_off + 3],
-                ]),
-            };
-
-            let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
-                continue;
-            };
-            let gw = glyph.width as usize;
-            let gh = glyph.height as usize;
-            // pen_x - glyph.x: wire x is -bitmap_left (see X RENDER spec §4.6).
-            let dst_x = pen_x - glyph.x as i32;
-            let dst_y = pen_y - glyph.y as i32;
-
-            if dst_x + gw as i32 <= 0 || dst_y + gh as i32 <= 0 || dst_x >= dst_w || dst_y >= dst_h
-            {
-                pen_x += glyph.x_off as i32;
-                pen_y += i32::from(glyph.y_off);
-                continue;
-            }
-
-            let glyph_img = match glyph.format {
-                GlyphSetFormat::A8 => {
-                    let Ok(img) = Image::new(FormatCode::A8, gw, gh, true) else {
-                        pen_x += glyph.x_off as i32;
-                        pen_y += i32::from(glyph.y_off);
-                        continue;
-                    };
-                    let stride_bytes = img.stride();
-                    // SAFETY: img is freshly allocated; we write within its bounds.
-                    let gdata = unsafe { img.data() }.cast::<u8>();
-                    for row in 0..gh {
-                        for col in 0..gw {
-                            unsafe {
-                                *gdata.add(row * stride_bytes + col) = glyph.pixels[row * gw + col];
-                            }
-                        }
-                    }
-                    img
-                }
-                GlyphSetFormat::A1 => {
-                    let Ok(img) = Image::new(FormatCode::A1, gw, gh, true) else {
-                        pen_x += i32::from(glyph.x_off);
-                        pen_y += i32::from(glyph.y_off);
-                        continue;
-                    };
-                    // Wire A1 rows are 32-bit padded MSB-first — same as pixman A1.
-                    let wire_stride = gw.div_ceil(32) * 4;
-                    let img_stride = img.stride();
-                    // SAFETY: img is freshly allocated; pixel data fits in its bounds.
-                    let gdata = unsafe { img.data() }.cast::<u8>();
-                    for row in 0..gh {
-                        let src_off = row * wire_stride;
-                        let dst_off = row * img_stride;
-                        let copy_len = wire_stride
-                            .min(img_stride)
-                            .min(glyph.pixels.len().saturating_sub(src_off));
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                glyph.pixels.as_ptr().add(src_off),
-                                gdata.add(dst_off),
-                                copy_len,
-                            );
-                        }
-                    }
-                    img
-                }
-                GlyphSetFormat::Other => {
-                    pen_x += i32::from(glyph.x_off);
-                    pen_y += i32::from(glyph.y_off);
-                    continue;
-                }
-            };
-
-            dst.0.composite32(
-                Operation::Over,
-                &color_img,
-                Some(&glyph_img),
-                (0, 0),
-                (0, 0),
-                (dst_x, dst_y),
-                (gw as i32, gh as i32),
-            );
-
-            pen_x += glyph.x_off as i32;
-            pen_y += i32::from(glyph.y_off);
-        }
-
-        pos += 8 + padded;
-    }
-}
+// `composite_glyphs_onto` (pixman CompositeGlyphs path) deleted in
+// 4.1.5. The Vk path in `try_vk_render_composite_glyphs` (using the
+// 4.1.4.5 atlas + text pipeline) is the sole CompositeGlyphs path.
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, sync::Arc};
 
-    use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
+    use super::{Rectangle16, Repeat};
     use yserver_core::{
         backend::{Backend, ClipState, FillState, GcFunction},
         host_x11::HostXidMap,
     };
     use yserver_protocol::x11::ResourceId;
 
-    use super::{KmsBackend, PixmanImage, WindowState, fill_rects_with_gc_function};
+    use super::{KmsBackend, WindowState};
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -6220,12 +8574,27 @@ mod tests {
             xkb_keymap: super::XkbKeymap(keymap),
             xkb_state,
             input_ctx: None,
+            vk: None,
+            first_pageflip_logged: vec![false; 1],
+            scanout_pools: Vec::new(),
+            compositor_pipeline: None,
+            ops_command_pool: None,
+            ops_staging: None,
+            glyph_atlas: None,
+            text_pipeline: None,
+            render_pipelines: None,
+            solid_src_image: None,
+            solid_mask_image: None,
+            white_mask_image: None,
+            mask_scratch: None,
+            copy_scratch: None,
+            dst_readback: None,
+            logic_fill_pipelines: None,
             font_loader: super::FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
             pixmaps: HashMap::new(),
             bg_pixel: None,
             bg_pixmap: None,
-            bg_pixmap_image: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
             cursors: HashMap::new(),
@@ -6262,140 +8631,18 @@ mod tests {
             children: Vec::new(),
             bg_pixel: None,
             bg_pixmap: None,
-            image: RefCell::new(
-                PixmanImage::new(FormatCode::X8R8G8B8, width, height, true).unwrap(),
-            ),
             depth: 24,
             visual: 0,
             cursor: 0,
+            vk_mirror: None,
         }
     }
 
-    /// Fill a PixmanImage with a solid 24-bit colour (X8R8G8B8 format).
-    fn fill_image(img: &mut PixmanImage, pixel: u32) {
-        let color = super::color_from_u32(pixel);
-        let w = img.0.width() as u16;
-        let h = img.0.height() as u16;
-        let _ = img.0.fill_rectangles(
-            Operation::Src,
-            color,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
-            }],
-        );
-    }
-
-    /// Read the packed X8R8G8B8 pixel at (x, y) from a PixmanImage.
-    fn read_pixel(img: &PixmanImage, x: usize, y: usize) -> u32 {
-        let stride_words = img.0.stride() / 4;
-        // SAFETY: x, y are within the image bounds (caller's responsibility).
-        unsafe { *img.0.data().add(y * stride_words + x) }
-    }
-
-    fn has_nonzero_pixel(img: &PixmanImage) -> bool {
-        (0..img.0.height())
-            .any(|y| (0..img.0.width()).any(|x| read_pixel(img, x, y) & 0x00ff_ffff != 0))
-    }
-
-    #[test]
-    fn copy_plane_depth1_substitutes_foreground_background() {
-        let mut b = make_test_backend();
-
-        let src_img = PixmanImage::new(FormatCode::A1, 2, 2, true).unwrap();
-        let src_stride = src_img.0.stride();
-        // SAFETY: src_img is freshly allocated. A1 pixels are MSB-first in
-        // each row byte; set row0=[1,0], row1=[0,1].
-        let src_data = unsafe { src_img.0.data() }.cast::<u8>();
-        unsafe {
-            *src_data.add(0) = 0b1000_0000;
-            *src_data.add(src_stride) = 0b0100_0000;
-        }
-        let src_xid = 0x0040_1000;
-        b.pixmaps.insert(
-            src_xid,
-            super::PixmapState {
-                handle: src_xid,
-                image: src_img,
-                depth: 1,
-            },
-        );
-
-        let dst_xid = 0x0040_1001;
-        b.pixmaps.insert(
-            dst_xid,
-            super::PixmapState {
-                handle: dst_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 2, 2, true).unwrap(),
-                depth: 32,
-            },
-        );
-        b.current_function = GcFunction::Copy;
-        b.current_foreground = 0x00ff_0000;
-        b.current_background = 0x0000_00ff;
-
-        b.copy_plane(None, src_xid, dst_xid, 0, 0, 0, 0, 2, 2, 1)
-            .unwrap();
-
-        let dst = &b.pixmaps.get(&dst_xid).unwrap().image;
-        assert_eq!(read_pixel(dst, 0, 0) & 0x00ff_ffff, 0x00ff_0000);
-        assert_eq!(read_pixel(dst, 1, 0) & 0x00ff_ffff, 0x0000_00ff);
-        assert_eq!(read_pixel(dst, 0, 1) & 0x00ff_ffff, 0x0000_00ff);
-        assert_eq!(read_pixel(dst, 1, 1) & 0x00ff_ffff, 0x00ff_0000);
-    }
-
-    #[test]
-    fn poly_text16_renders_char2b_text() {
-        let mut b = make_test_backend();
-        let (font, _) = b.open_font(None, "fixed").unwrap();
-        b.current_font = Some(font.as_raw());
-        let dst_xid = 0x0040_2000;
-        b.pixmaps.insert(
-            dst_xid,
-            super::PixmapState {
-                handle: dst_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 24, true).unwrap(),
-                depth: 32,
-            },
-        );
-
-        let mut body = vec![0u8; 12];
-        body[8..10].copy_from_slice(&2i16.to_le_bytes());
-        body[10..12].copy_from_slice(&16i16.to_le_bytes());
-        body.extend_from_slice(&[1, 0, 0, 0x41]);
-
-        b.poly_text16(None, dst_xid, 0x00ff_ffff, &body).unwrap();
-
-        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
-    }
-
-    #[test]
-    fn image_text16_draws_background_and_char2b_text() {
-        let mut b = make_test_backend();
-        let (font, _) = b.open_font(None, "fixed").unwrap();
-        b.current_font = Some(font.as_raw());
-        let dst_xid = 0x0040_2001;
-        b.pixmaps.insert(
-            dst_xid,
-            super::PixmapState {
-                handle: dst_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 24, true).unwrap(),
-                depth: 32,
-            },
-        );
-
-        let mut body = vec![0u8; 12];
-        body[8..10].copy_from_slice(&0i16.to_le_bytes());
-        body[10..12].copy_from_slice(&16i16.to_le_bytes());
-        body.extend_from_slice(&[0, 0x41]);
-
-        b.image_text16(None, dst_xid, 0x00ff_ffff, 0x0000_00ff, 1, &body)
-            .unwrap();
-
-        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
-    }
+    // pixman test helpers and gated drawing-op tests removed in
+    // 4.1.5: their target paths (`copy_plane`, `poly_text16`,
+    // `image_text16`, `fill_rects_with_gc_function`,
+    // `composite_glyphs_onto`) are all Vk-only now and exercised
+    // by rendercheck under the lavapipe smoke harness.
 
     #[test]
     fn change_picture_cprepeat_updates_drawable_repeat() {
@@ -6406,8 +8653,10 @@ mod tests {
             pixmap_xid,
             super::PixmapState {
                 handle: pixmap_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                width: 4,
+                height: 4,
                 depth: 32,
+                vk_mirror: None,
             },
         );
         b.pictures
@@ -6436,8 +8685,10 @@ mod tests {
             pixmap_xid,
             super::PixmapState {
                 handle: pixmap_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                width: 4,
+                height: 4,
                 depth: 32,
+                vk_mirror: None,
             },
         );
         b.pictures
@@ -6463,63 +8714,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn linear_gradient_composite_produces_nonzero_pixels() {
-        let mut b = make_test_backend();
-        let mut body = Vec::new();
-        body.extend_from_slice(&0x0010_0000u32.to_le_bytes());
-        body.extend_from_slice(&0i32.to_le_bytes());
-        body.extend_from_slice(&0i32.to_le_bytes());
-        body.extend_from_slice(&(64i32 << 16).to_le_bytes());
-        body.extend_from_slice(&0i32.to_le_bytes());
-        body.extend_from_slice(&2u32.to_le_bytes());
-        body.extend_from_slice(&0i32.to_le_bytes());
-        body.extend_from_slice(&(1i32 << 16).to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes());
-        body.extend_from_slice(&0xffffu16.to_le_bytes());
-        body.extend_from_slice(&0xffffu16.to_le_bytes());
-        body.extend_from_slice(&0xffffu16.to_le_bytes());
-        body.extend_from_slice(&0xffffu16.to_le_bytes());
-        body.extend_from_slice(&0xffffu16.to_le_bytes());
-
-        let grad = b
-            .render_create_linear_gradient(None, &body)
-            .unwrap()
-            .expect("gradient picture");
-        let dst_xid = 0x0040_4000;
-        let dst_pic = 0x0040_4001;
-        b.pixmaps.insert(
-            dst_xid,
-            super::PixmapState {
-                handle: dst_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 64, 1, true).unwrap(),
-                depth: 32,
-            },
-        );
-        b.pictures
-            .insert(dst_pic, super::default_drawable_picture(dst_xid));
-
-        b.render_composite(
-            None,
-            Operation::Src as u8,
-            grad.as_raw(),
-            0,
-            dst_pic,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            64,
-            1,
-        )
-        .unwrap();
-
-        assert!(has_nonzero_pixel(&b.pixmaps.get(&dst_xid).unwrap().image));
-    }
+    // `linear_gradient_composite_produces_nonzero_pixels` removed:
+    // gradient pictures now require a Vulkan context for creation
+    // (`GradientPicture::new_linear`), which the unit-test backend
+    // doesn't provide. The Vk gradient path is exercised by the
+    // rendercheck `gradients` suite under `just yserver-venus`.
 
     #[test]
     fn set_picture_transform_stores_non_identity_matrix() {
@@ -6530,8 +8729,10 @@ mod tests {
             pixmap_xid,
             super::PixmapState {
                 handle: pixmap_xid,
-                image: PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap(),
+                width: 4,
+                height: 4,
                 depth: 32,
+                vk_mirror: None,
             },
         );
         b.pictures
@@ -6612,446 +8813,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn paint_output_offsets_window_into_scanout() {
-        // Simulate a second-of-two-output layout positioned at virtual x=1024,
-        // and assert paint_output translates a top-level window at virtual
-        // (2000, 100) so it lands at (2000-1024, 100) = (976, 100) on the
-        // scanout. Skips paint when no window intersects the bbox.
-        let mut b = make_test_backend();
-        b.outputs[0].x = 1024;
-        b.outputs[0].y = 0;
-        b.outputs[0].width = 1024;
-        b.outputs[0].height = 768;
-        b.fb_w = 1024 + 1024;
-        b.fb_h = 768;
+    // `paint_output_offsets_window_into_scanout` removed in 4.1.5:
+    // the legacy pixman scanout path it tested no longer exists.
+    // Layout-offset behaviour is now exercised by `compositor.rs`'s
+    // composite-scene assembly under the lavapipe smoke harness.
 
-        // A 100x100 window at virtual (2000, 100) filled red.
-        let xid = b.next_host_xid;
-        b.next_host_xid += 1;
-        let mut win = make_test_window(2000, 100, 100, 100, true);
-        fill_image(win.image.get_mut(), 0x00ff_0000);
-        b.windows.insert(xid, win);
-        b.top_level_order.push(xid);
-
-        // Scanout sized to layout dimensions.
-        let mut scanout = PixmanImage::new(FormatCode::X8R8G8B8, 1024, 768, true).unwrap();
-        b.paint_output(&mut scanout, 0, &[xid]);
-
-        // Window pixel at virtual (2000, 100) should land at scanout (976, 100).
-        assert_eq!(read_pixel(&scanout, 976, 100) & 0x00ff_ffff, 0x00ff_0000);
-        // The pixel at scanout (0, 0) is bg only — definitely not the window red.
-        assert_ne!(read_pixel(&scanout, 0, 0) & 0x00ff_ffff, 0x00ff_0000);
-
-        // Empty visible list (window pre-filtered out) must not panic and must
-        // not stamp the window onto the scanout.
-        let mut scanout2 = PixmanImage::new(FormatCode::X8R8G8B8, 1024, 768, true).unwrap();
-        b.paint_output(&mut scanout2, 0, &[]);
-        assert_ne!(read_pixel(&scanout2, 976, 100) & 0x00ff_ffff, 0x00ff_0000);
-    }
-
-    // ---------------------------------------------------------------------------
-    // GcFunction::Copy: fill_rects_with_gc_function must overwrite the destination
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn fill_rects_copy_overwrites_destination() {
-        let mut img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
-        fill_image(&mut img, 0x00ff_ffff); // white
-        let rect = Rectangle16 {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4,
-        };
-        fill_rects_with_gc_function(&mut img, GcFunction::Copy, 0x00ff_00ff, &[rect]);
-        let pixel = read_pixel(&img, 1, 1);
-        assert_eq!(
-            pixel & 0x00ff_ffff,
-            0x00ff_00ff,
-            "Copy should overwrite with magenta"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // GcFunction::Xor: must produce bitwise XOR of destination and foreground.
-    //
-    // NOTE: KmsBackend requires DRM hardware and cannot be constructed in a unit
-    // test.  This test verifies XOR semantics at the PixmanImage level by calling
-    // fill_rects_with_gc_function() directly — the same helper invoked by every
-    // client-draw primitive (poly_segment, poly_line, fill_rectangle, …).
-    //
-    // NOTE: pixman's Porter-Duff PIXMAN_OP_XOR produces zero for fully-opaque
-    // images (src*(1-dst.a) + dst*(1-src.a) = 0 when both alphas are 1).
-    // fill_rects_with_gc_function implements GcFunction::Xor as a manual bitwise
-    // XOR over the RGB channels to match X11 GXxor semantics.
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn poly_segment_xor_inverts_destination_pixels() {
-        // Create a 16×16 image pre-filled with white (0x00FFFFFF).
-        let mut img = PixmanImage::new(FormatCode::X8R8G8B8, 16, 16, true).unwrap();
-        fill_image(&mut img, 0x00ff_ffff); // white
-
-        // Draw a horizontal line at y=8 with magenta (0x00FF00FF) using XOR.
-        let row: Vec<Rectangle16> = (0..16_i16)
-            .map(|x| Rectangle16 {
-                x,
-                y: 8,
-                width: 1,
-                height: 1,
-            })
-            .collect();
-        fill_rects_with_gc_function(&mut img, GcFunction::Xor, 0x00ff_00ff, &row);
-
-        // White (0xFFFFFF) XOR magenta (0xFF00FF) = green (0x00FF00).
-        let pixel = read_pixel(&img, 8, 8);
-        assert_eq!(
-            pixel & 0x00ff_ffff,
-            0x0000_ff00,
-            "expected green (0x00FF00), got 0x{:08x}",
-            pixel
-        );
-
-        // Pixels outside the drawn row must remain white.
-        let untouched = read_pixel(&img, 8, 0);
-        assert_eq!(
-            untouched & 0x00ff_ffff,
-            0x00ff_ffff,
-            "pixel at (8,0) should be untouched white"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Glyph rendering: verify freetype GRAY mode + pixman A8 stride handling.
-    //
-    // This test does NOT require DRM hardware.  It loads a font via freetype,
-    // renders a single glyph, and composites it onto a white pixman image using
-    // exactly the same path as render_text_string.
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn glyph_render_gray_pixels_land_on_correct_rows() {
-        // ------------------------------------------------------------------
-        // 1. Load font and render glyph 'A'.
-        // ------------------------------------------------------------------
-        let lib = freetype::Library::init().expect("freetype init");
-        let candidates = [
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-        ];
-        let face = candidates
-            .iter()
-            .find_map(|p| lib.new_face(p, 0).ok())
-            .expect("DejaVuSansMono.ttf not found — install dejavu fonts");
-        let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
-        let _ = face.load_char('A' as usize, freetype::face::LoadFlag::RENDER);
-        let glyph = face.glyph();
-        let bitmap = glyph.bitmap();
-
-        // Must be GRAY (8bpp) — not MONO.  RENDER flag on an outline font
-        // always produces GRAY; MONO would indicate an embedded bitmap strike.
-        let pm = bitmap.pixel_mode().expect("pixel_mode");
-        assert_eq!(
-            pm,
-            freetype::bitmap::PixelMode::Gray,
-            "expected GRAY pixel mode, got {:?}",
-            pm
-        );
-
-        let w = bitmap.width() as usize;
-        let h = bitmap.rows() as usize;
-        let pitch = bitmap.pitch();
-        let buf = bitmap.buffer();
-
-        assert!(w > 0 && h > 0, "glyph 'A' should have non-empty bitmap");
-        // For GRAY the pitch in bytes >= width in pixels.
-        assert!(pitch >= 0, "expected positive (downward) pitch");
-        assert!(pitch as usize >= w, "pitch should be >= width for GRAY");
-
-        // ------------------------------------------------------------------
-        // 2. Copy glyph pixels into a flat Vec (same logic as render_text_string).
-        // ------------------------------------------------------------------
-        let mut pixels = vec![0u8; w * h];
-        for row in 0..h {
-            let src = if pitch >= 0 {
-                row * pitch as usize
-            } else {
-                (h - 1 - row) * (pitch as isize).unsigned_abs()
-            };
-            pixels[row * w..row * w + w].copy_from_slice(&buf[src..src + w]);
-        }
-
-        // At least some pixels must be non-zero (the glyph is not blank).
-        let has_nonzero = pixels.iter().any(|&b| b > 0);
-        assert!(
-            has_nonzero,
-            "glyph pixels should contain non-zero alpha values"
-        );
-
-        // ------------------------------------------------------------------
-        // 3. Write into a pixman A8 image using stride (same as phase 2).
-        // ------------------------------------------------------------------
-        let glyph_img = Image::new(FormatCode::A8, w, h, true).expect("pixman A8 image");
-        let stride_bytes = glyph_img.stride();
-        // stride_bytes must be >= w (pixman pads A8 rows to 4-byte alignment).
-        assert!(stride_bytes >= w, "pixman A8 stride must be >= width");
-
-        let gdata = unsafe { glyph_img.data() } as *mut u8;
-        for row in 0..h {
-            for col in 0..w {
-                unsafe {
-                    *gdata.add(row * stride_bytes + col) = pixels[row * w + col];
-                }
-            }
-        }
-
-        // Verify that the A8 image contains non-zero bytes in its first row.
-        let first_row_nonzero = (0..w).any(|col| unsafe { *gdata.add(col) > 0 });
-        assert!(
-            first_row_nonzero,
-            "A8 image first row should have non-zero alpha"
-        );
-
-        // ------------------------------------------------------------------
-        // 4. Composite onto a white X8R8G8B8 image and verify pixels changed.
-        //
-        // We use bitmap_top to position the glyph correctly: the baseline is
-        // at y = bitmap_top (so the glyph top is at row 0, baseline at
-        // bitmap_top). With a foreground of black (0x000000) on white
-        // (0xFFFFFF), composited pixels should be darker than 0xFFFFFF.
-        // ------------------------------------------------------------------
-        let baseline_y = glyph.bitmap_top(); // rows from top to baseline
-        let img_h = (baseline_y + 4).max(h as i32 + 4) as u16;
-        let img_w = (w + 4) as u16;
-        let mut dst =
-            PixmanImage::new(FormatCode::X8R8G8B8, img_w, img_h, true).expect("dst image");
-        fill_image(&mut dst, 0x00ff_ffff); // white
-
-        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).expect("color image");
-        let black = Color::new(0, 0, 0, 0xffff);
-        let _ = color_img.fill_rectangles(
-            Operation::Src,
-            black,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        // Must tile across the glyph — same fix as render_text_string.
-        color_img.set_repeat(Repeat::Normal);
-
-        // dst_y = baseline_y - bitmap_top = 0 (glyph top lands on row 0).
-        let dst_y = baseline_y - glyph.bitmap_top();
-        dst.0.composite32(
-            Operation::Over,
-            &color_img,
-            Some(&glyph_img),
-            (0, 0),
-            (0, 0),
-            (0, dst_y),
-            (w as i32, h as i32),
-        );
-
-        // The destination should no longer be all-white: the composited 'A'
-        // glyph (black foreground) should have darkened some pixels.
-        let any_changed = (0..img_w as usize).any(|x| {
-            (0..img_h as usize).any(|y| read_pixel(&dst, x, y) & 0x00ff_ffff != 0x00ff_ffff)
-        });
-        assert!(
-            any_changed,
-            "composite should darken some white pixels with black 'A'"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // RENDER picture + trapezoid tests.
-    //
-    // KmsBackend requires DRM hardware so we cannot instantiate it here.
-    // Instead we exercise the same Pixman logic that render_trapezoids uses,
-    // calling pixman_composite_trapezoids directly with a solid-fill 1×1 source
-    // image and an A8R8G8B8 destination.
-    // ---------------------------------------------------------------------------
-
-    /// Encode one X RENDER Trapezoid (40 bytes, little-endian 16.16 fixed).
-    #[allow(clippy::too_many_arguments)]
-    fn encode_trap(
-        top: i32,
-        bottom: i32,
-        lp1x: i32,
-        lp1y: i32,
-        lp2x: i32,
-        lp2y: i32,
-        rp1x: i32,
-        rp1y: i32,
-        rp2x: i32,
-        rp2y: i32,
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40);
-        for v in [top, bottom, lp1x, lp1y, lp2x, lp2y, rp1x, rp1y, rp2x, rp2y] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        buf
-    }
-
-    /// Decode the wire bytes for one trap into a pixman_trapezoid_t.
-    fn decode_trap(bytes: &[u8]) -> pixman::ffi::pixman_trapezoid_t {
-        assert_eq!(bytes.len(), 40);
-        let i32_at = |off: usize| {
-            i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-        };
-        pixman::ffi::pixman_trapezoid_t {
-            top: i32_at(0),
-            bottom: i32_at(4),
-            left: pixman::ffi::pixman_line_fixed_t {
-                p1: pixman::ffi::pixman_point_fixed_t {
-                    x: i32_at(8),
-                    y: i32_at(12),
-                },
-                p2: pixman::ffi::pixman_point_fixed_t {
-                    x: i32_at(16),
-                    y: i32_at(20),
-                },
-            },
-            right: pixman::ffi::pixman_line_fixed_t {
-                p1: pixman::ffi::pixman_point_fixed_t {
-                    x: i32_at(24),
-                    y: i32_at(28),
-                },
-                p2: pixman::ffi::pixman_point_fixed_t {
-                    x: i32_at(32),
-                    y: i32_at(36),
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn render_trapezoids_over_produces_nonzero_alpha_in_dst() {
-        // Destination: 8×8 A8R8G8B8, cleared to transparent black.
-        let dst_img = PixmanImage::new(FormatCode::A8R8G8B8, 8, 8, true).unwrap();
-
-        // Source: 1×1 solid red (fully opaque), with REPEAT_NORMAL so it tiles.
-        let mut src_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let red = Color::new(0xFFFF, 0x0000, 0x0000, 0xFFFF);
-        let _ = src_img.fill_rectangles(
-            Operation::Src,
-            red,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        src_img.set_repeat(Repeat::Normal);
-
-        // A rectangle trap covering pixels (1,1)–(6,6).
-        // In 16.16 fixed: pixel N → N << 16.
-        let left_x = 1i32 << 16;
-        let right_x = 6i32 << 16;
-        let top_y = 1i32 << 16;
-        let bot_y = 6i32 << 16;
-        let wire = encode_trap(
-            top_y, bot_y, left_x, top_y, left_x, bot_y, // left edge: vertical at x=1
-            right_x, top_y, right_x, bot_y, // right edge: vertical at x=6
-        );
-        let trap_struct = decode_trap(&wire);
-
-        // SAFETY: both images are valid, non-overlapping pixman images owned by
-        // this stack frame.  trap_struct is POD constructed above.
-        unsafe {
-            pixman::ffi::pixman_composite_trapezoids(
-                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
-                src_img.as_ptr(),
-                dst_img.0.as_ptr(),
-                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                0,
-                0, // src_x, src_y
-                0,
-                0, // dst_x, dst_y
-                1,
-                &trap_struct,
-            );
-        }
-
-        // Center pixel (3,3) must have nonzero alpha after the composite.
-        let stride_words = dst_img.0.stride() / 4;
-        let pixel = unsafe { *dst_img.0.data().add(3 * stride_words + 3) };
-        let alpha = (pixel >> 24) & 0xFF;
-        assert!(
-            alpha > 0,
-            "center pixel at (3,3) should have nonzero alpha after trap composite; got 0x{:08x}",
-            pixel
-        );
-
-        // And pixels outside the trap (e.g. (0,0)) must remain transparent.
-        let corner = unsafe { *dst_img.0.data().add(0) };
-        assert_eq!(
-            (corner >> 24) & 0xFF,
-            0,
-            "pixel at (0,0) outside trap should remain transparent; got 0x{:08x}",
-            corner
-        );
-    }
-
-    #[test]
-    fn render_trapezoids_center_pixel_carries_source_color() {
-        // Destination: 8×8 A8R8G8B8, cleared to transparent black.
-        let dst_img = PixmanImage::new(FormatCode::A8R8G8B8, 8, 8, true).unwrap();
-
-        // Source: solid green (0x00FF00), fully opaque.
-        let mut src_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let green = Color::new(0x0000, 0xFFFF, 0x0000, 0xFFFF);
-        let _ = src_img.fill_rectangles(
-            Operation::Src,
-            green,
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        src_img.set_repeat(Repeat::Normal);
-
-        // Rectangular trap covering the full image interior (1,1)–(6,6).
-        let l = 1i32 << 16;
-        let r = 6i32 << 16;
-        let t = 1i32 << 16;
-        let b = 6i32 << 16;
-        let trap_struct = decode_trap(&encode_trap(t, b, l, t, l, b, r, t, r, b));
-
-        unsafe {
-            pixman::ffi::pixman_composite_trapezoids(
-                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
-                src_img.as_ptr(),
-                dst_img.0.as_ptr(),
-                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
-                0,
-                0,
-                0,
-                0,
-                1,
-                &trap_struct,
-            );
-        }
-
-        // Center pixel (3,3): alpha must be 0xFF and RGB must be pure green.
-        let stride_words = dst_img.0.stride() / 4;
-        let pixel = unsafe { *dst_img.0.data().add(3 * stride_words + 3) };
-        let a = (pixel >> 24) & 0xFF;
-        let r_ch = (pixel >> 16) & 0xFF;
-        let g_ch = (pixel >> 8) & 0xFF;
-        let b_ch = pixel & 0xFF;
-        assert_eq!(a, 0xFF, "center alpha should be fully opaque");
-        assert_eq!(r_ch, 0x00, "center red channel should be 0");
-        assert_eq!(g_ch, 0xFF, "center green channel should be 0xFF");
-        assert_eq!(b_ch, 0x00, "center blue channel should be 0");
-    }
+    // RENDER trapezoid tests removed in 4.1.5 — they exercised
+    // `pixman_composite_trapezoids` directly. The Vk path is
+    // `try_vk_render_trapezoids` (CPU-rasterised mask + Vk composite),
+    // exercised by rendercheck under the lavapipe smoke harness.
 
     #[test]
     fn add_glyphs_stores_pixel_data_correctly() {
@@ -7112,387 +8882,9 @@ mod tests {
         assert_eq!(g1.pixels, vec![0x55, 0x66, 0x77, 0x88]);
     }
 
-    #[test]
-    fn composite_glyphs_single_run_places_glyph_on_dst() {
-        // Set up: 1×1 opaque-red solid colour source, 8×8 white destination.
-        // Glyph: 2×2 fully-opaque A8 (all 0xFF), stored at id=1 in a GlyphSetState.
-        // CompositeGlyphs8 item stream: one run of 1 glyph at dx=2, dy=3.
-        // Expected: after composite, pixel at (2 - glyph.x, 3 - glyph.y) is red.
-
-        // Build glyphset with a 2×2 all-opaque A8 glyph (id=1, x=-1, y=-1).
-        let mut gs = super::GlyphSetState {
-            format: super::GlyphSetFormat::A8,
-            glyphs: std::collections::HashMap::new(),
-        };
-        gs.glyphs.insert(
-            1,
-            super::StoredGlyph {
-                width: 2,
-                height: 2,
-                x: -1,
-                y: -1,
-                x_off: 3,
-                y_off: 0,
-                pixels: vec![0xFF; 4],
-                format: super::GlyphSetFormat::A8,
-            },
-        );
-
-        // Red solid-fill source (A8R8G8B8 = 0xFFFF0000).
-        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let _ = src_img.0.fill_rectangles(
-            Operation::Src,
-            Color::new(0xFFFF, 0, 0, 0xFFFF),
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        src_img.0.set_repeat(Repeat::Normal);
-
-        // White destination.
-        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 8, 8, true).unwrap();
-        fill_image(&mut dst_img, 0x00FF_FFFF);
-
-        // Build a CompositeGlyphs8 item stream: one run with count=1, dx=2, dy=3, id=1.
-        let mut items = Vec::new();
-        items.push(1u8); // count
-        items.extend_from_slice(&[0, 0, 0]); // pad
-        items.extend_from_slice(&2i16.to_le_bytes()); // dx
-        items.extend_from_slice(&3i16.to_le_bytes()); // dy
-        items.push(1u8); // glyph id (8-bit for minor=23)
-        items.extend_from_slice(&[0, 0, 0]); // pad to 4-byte boundary
-
-        let gs_xid = 1u32;
-        let mut glyphsets = std::collections::HashMap::new();
-        glyphsets.insert(gs_xid, gs);
-        super::composite_glyphs_onto(
-            &glyphsets,
-            gs_xid,
-            &src_img,
-            &mut dst_img,
-            /*minor=*/ 23,
-            /*pen_x=*/ 0,
-            /*pen_y=*/ 0,
-            &items,
-        );
-
-        // Pen after dx/dy = (0+2, 0+3) = (2, 3).
-        // Draw at (pen_x - glyph.x, pen_y - glyph.y) = (2-(-1), 3-(-1)) = (3, 4).
-        let p = read_pixel(&dst_img, 3, 4);
-        assert_ne!(
-            p & 0x00FF_0000,
-            0,
-            "pixel (3,4) should have red channel; got 0x{:08x}",
-            p
-        );
-        assert_eq!(
-            p & 0x0000_FFFF,
-            0,
-            "pixel (3,4) should have no blue/green; got 0x{:08x}",
-            p
-        );
-    }
-
-    #[test]
-    fn composite_glyphs_multi_run_advances_pen() {
-        // Two runs: first places glyph id=1 (x_off=5), second places glyph id=2.
-        // After first run pen advances by x_off=5.
-        let mut gs = super::GlyphSetState {
-            format: super::GlyphSetFormat::A8,
-            glyphs: std::collections::HashMap::new(),
-        };
-        gs.glyphs.insert(
-            1,
-            super::StoredGlyph {
-                width: 1,
-                height: 1,
-                x: 0,
-                y: 0,
-                x_off: 5,
-                y_off: 0,
-                pixels: vec![0xFF],
-                format: super::GlyphSetFormat::A8,
-            },
-        );
-        gs.glyphs.insert(
-            2,
-            super::StoredGlyph {
-                width: 1,
-                height: 1,
-                x: 0,
-                y: 0,
-                x_off: 3,
-                y_off: 0,
-                pixels: vec![0xFF],
-                format: super::GlyphSetFormat::A8,
-            },
-        );
-
-        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let _ = src_img.0.fill_rectangles(
-            Operation::Src,
-            Color::new(0, 0, 0xFFFF, 0xFFFF),
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        src_img.0.set_repeat(Repeat::Normal);
-
-        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 20, 4, true).unwrap();
-        fill_image(&mut dst_img, 0x00FF_FFFF);
-
-        // Run 1: count=1, dx=2, dy=1, id=1
-        // Run 2: count=1, dx=3, dy=0, id=2
-        let mut items = Vec::new();
-        items.push(1u8);
-        items.extend_from_slice(&[0, 0, 0]);
-        items.extend_from_slice(&2i16.to_le_bytes());
-        items.extend_from_slice(&1i16.to_le_bytes());
-        items.push(1u8);
-        items.extend_from_slice(&[0, 0, 0]);
-        items.push(1u8);
-        items.extend_from_slice(&[0, 0, 0]);
-        items.extend_from_slice(&3i16.to_le_bytes());
-        items.extend_from_slice(&0i16.to_le_bytes());
-        items.push(2u8);
-        items.extend_from_slice(&[0, 0, 0]);
-
-        let gs_xid = 1u32;
-        let mut glyphsets = std::collections::HashMap::new();
-        glyphsets.insert(gs_xid, gs);
-        super::composite_glyphs_onto(&glyphsets, gs_xid, &src_img, &mut dst_img, 23, 0, 0, &items);
-
-        // Glyph 1 at pen (2,1): draw at (2,1). After glyph, pen_x += x_off=5 → pen_x=7.
-        // Glyph 2 at pen (7+3=10, 1+0=1): draw at (10,1).
-        let p1 = read_pixel(&dst_img, 2, 1);
-        let p2 = read_pixel(&dst_img, 10, 1);
-        assert_ne!(
-            p1 & 0x0000_FFFF,
-            0,
-            "glyph1 pixel (2,1) should have blue; got 0x{:08x}",
-            p1
-        );
-        assert_ne!(
-            p2 & 0x0000_FFFF,
-            0,
-            "glyph2 pixel (10,1) should have blue; got 0x{:08x}",
-            p2
-        );
-    }
-
-    #[test]
-    fn render_composite_solid_fill_onto_drawable() {
-        // Simulate: composite a 1×1 red SolidFill picture onto a 4×4 white drawable.
-        // The SolidFill image is a 1×1 REPEAT_NORMAL red pixel.
-        // We call pixman_image_composite32 directly (same path as the impl will use).
-
-        let mut src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let _ = src_img.0.fill_rectangles(
-            Operation::Src,
-            Color::new(0xFFFF, 0, 0, 0xFFFF), // opaque red
-            &[Rectangle16 {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }],
-        );
-        src_img.0.set_repeat(Repeat::Normal);
-
-        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
-        fill_image(&mut dst_img, 0x00FF_FFFF); // white
-
-        let src_ptr = src_img.0.as_ptr();
-        let dst_ptr = dst_img.0.as_ptr();
-
-        unsafe {
-            pixman::ffi::pixman_image_composite32(
-                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
-                src_ptr,
-                std::ptr::null_mut(),
-                dst_ptr,
-                0,
-                0,
-                0,
-                0,
-                1,
-                1, // dst at (1,1)
-                2,
-                2, // 2×2 region
-            );
-        }
-
-        let p = read_pixel(&dst_img, 1, 1);
-        assert_ne!(
-            p & 0x00FF_0000,
-            0,
-            "pixel (1,1) should have red; got 0x{:08x}",
-            p
-        );
-        assert_eq!(
-            p & 0x0000_FFFF,
-            0,
-            "pixel (1,1) should have no blue/green; got 0x{:08x}",
-            p
-        );
-    }
-
-    #[test]
-    fn composite_glyphs_sentinel_does_not_panic() {
-        // A sentinel-only item stream (count=255 + 4-byte gs XID) should be a no-op.
-        let gs = super::GlyphSetState {
-            format: super::GlyphSetFormat::A8,
-            glyphs: std::collections::HashMap::new(),
-        };
-        let src_img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
-        let mut dst_img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
-        fill_image(&mut dst_img, 0x00FF_FFFF);
-        let gs_xid = 1u32;
-        let mut glyphsets = std::collections::HashMap::new();
-        glyphsets.insert(gs_xid, gs);
-        let items = vec![255u8, 0, 0, 0, 0x99, 0, 0, 0]; // sentinel + fake gs xid
-        // Should not panic:
-        super::composite_glyphs_onto(&glyphsets, gs_xid, &src_img, &mut dst_img, 23, 0, 0, &items);
-        // Mask off the X/A channel — X8R8G8B8 may store 0xFF in the top byte.
-        assert_eq!(
-            read_pixel(&dst_img, 0, 0) & 0x00FF_FFFF,
-            0x00FF_FFFF,
-            "sentinel must not modify dst"
-        );
-    }
-
-    #[test]
-    fn render_create_cursor_stores_image_and_hotspot() {
-        use super::*;
-
-        // KmsBackend::new requires live DRM hardware and cannot be constructed in unit tests.
-        // This test exercises the same data-flow logic (picture→pixmap→cursor image copy)
-        // that render_create_cursor uses, with an explicit pixel-content assertion.
-
-        let mut pixmap_img = PixmanImage::new(FormatCode::A8R8G8B8, 4, 4, true).unwrap();
-        let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
-        let full = Rectangle16 {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4,
-        };
-        pixmap_img
-            .0
-            .fill_rectangles(Operation::Src, red, &[full])
-            .unwrap();
-
-        let pixmap_xid: u32 = 10;
-        let picture_xid: u32 = 20;
-        let cursor_xid: u32 = 30;
-
-        let mut cursors: HashMap<u32, CursorState> = HashMap::new();
-        let mut pictures: HashMap<u32, PictureState> = HashMap::new();
-        let mut pixmaps: HashMap<u32, PixmapState> = HashMap::new();
-
-        pixmaps.insert(
-            pixmap_xid,
-            PixmapState {
-                handle: pixmap_xid,
-                image: pixmap_img,
-                depth: 32,
-            },
-        );
-        pictures.insert(picture_xid, default_drawable_picture(pixmap_xid));
-
-        let hot_x: u16 = 1;
-        let hot_y: u16 = 2;
-
-        let (w, h) = {
-            let pm = pixmaps.get(&pixmap_xid).unwrap();
-            (pm.image.0.width() as u16, pm.image.0.height() as u16)
-        };
-        let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, w, h, true).unwrap();
-        {
-            let pm = pixmaps.get(&pixmap_xid).unwrap();
-            cursor_img.0.composite32(
-                Operation::Src,
-                &pm.image.0,
-                None,
-                (0, 0),
-                (0, 0),
-                (0, 0),
-                (w as i32, h as i32),
-            );
-        }
-        cursors.insert(
-            cursor_xid,
-            CursorState {
-                image: cursor_img,
-                hot_x,
-                hot_y,
-            },
-        );
-
-        let cs = cursors.get(&cursor_xid).unwrap();
-        assert_eq!(cs.hot_x, hot_x);
-        assert_eq!(cs.hot_y, hot_y);
-        assert_eq!(cs.image.0.width() as u16, 4);
-        assert_eq!(cs.image.0.height() as u16, 4);
-
-        // Verify the composite actually copied the red fill into the cursor image.
-        // A8R8G8B8 in memory: alpha=0xFF, R=0xFF, G=0x00, B=0x00 → 0xFFFF0000.
-        // SAFETY: cursor_img was just created and no other reference to it exists.
-        let pixel = unsafe { *cs.image.0.data().add(0) };
-        assert_eq!(
-            pixel & 0x00FF_0000,
-            0x00FF_0000,
-            "red channel should be set"
-        );
-    }
-
-    #[test]
-    fn draw_cursor_onto_composites_at_hotspot_adjusted_position() {
-        use super::*;
-
-        // 2×2 all-red ARGB cursor image.
-        let mut cursor_img = PixmanImage::new(FormatCode::A8R8G8B8, 2, 2, true).unwrap();
-        let red = Color::new(0xFFFF, 0xFFFF, 0x0000, 0x0000);
-        let full = Rectangle16 {
-            x: 0,
-            y: 0,
-            width: 2,
-            height: 2,
-        };
-        cursor_img
-            .0
-            .fill_rectangles(Operation::Src, red, &[full])
-            .unwrap();
-
-        // 10×10 black destination.
-        let mut dst = PixmanImage::new(FormatCode::A8R8G8B8, 10, 10, true).unwrap();
-
-        // Cursor position (5,5) with hotspot (1,1) → image top-left lands at (4,4).
-        let x = 5_i32 - 1;
-        let y = 5_i32 - 1;
-        dst.0.composite32(
-            Operation::Over,
-            &cursor_img.0,
-            None,
-            (0, 0),
-            (0, 0),
-            (x, y),
-            (2, 2),
-        );
-
-        let pixel = read_pixel(&dst, x as usize, y as usize);
-        assert_eq!(
-            pixel & 0x00FF_0000,
-            0x00FF_0000,
-            "red channel at (4,4) should be 0xFF after composite"
-        );
-    }
+    // composite_glyphs_* tests removed in 4.1.5 — pixman path gone.
+    // The Vk path is exercised by rendercheck under the lavapipe smoke
+    // harness, which has Vulkan available.
 
     #[test]
     fn parse_xlfd_extracts_family_style_pixelsize() {

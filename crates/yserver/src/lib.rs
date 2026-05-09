@@ -41,17 +41,37 @@ pub fn run() -> io::Result<()> {
     let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
-    fs::create_dir_all(&socket_dir)?;
+    fs::create_dir_all(&socket_dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("create_dir_all({}): {e}", socket_dir.display()),
+        )
+    })?;
     let socket_path = socket_dir.join(format!("X{DISPLAY}"));
     match fs::remove_file(&socket_path) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!("remove_file({}): {err}", socket_path.display()),
+            ));
+        }
     }
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("UnixListener::bind({}): {e}", socket_path.display()),
+        )
+    })?;
     // X clients connect as the invoking user; the socket needs world write
     // (connect() on AF_UNIX requires `w`). Xorg sets 0777 on /tmp/.X11-unix/X*.
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777)).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("set_permissions({}, 0o777): {e}", socket_path.display()),
+        )
+    })?;
     log::info!("yserver: listening on unix socket DISPLAY=:{DISPLAY}");
 
     // Initial composite+flip so the screen has a known frame before any

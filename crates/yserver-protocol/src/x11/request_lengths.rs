@@ -677,7 +677,7 @@ pub fn invalid_value(opcode: u8, header_data: u8, body: &[u8]) -> Option<u32> {
         // ConfigureWindow: mask u16 @ body[4..6], values @ body[8].
         // Only stack_mode (bit 6) has a fixed range we enforce here.
         12 if body.len() >= 6 => {
-            let mask = u32::from(read_u16_le(&body[4..6]));
+            let mask = read_u16_le(&body[4..6]);
             validate_value_list(body, 8, mask, cfg_validate_bit)
         }
         // CirculateWindow: header.data = direction ∈ {RaiseLowest=0, LowerHighest=1}.

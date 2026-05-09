@@ -25,3 +25,11 @@ opencode.json
 Thumbs.db
 .claude/
 .codex-review-*
+
+# Screenshots / phone photos casually dropped in the repo root for
+# debugging — don't commit them.
+PXL_*
+*.jpg
+*.jpeg
+*.png
+*.heic

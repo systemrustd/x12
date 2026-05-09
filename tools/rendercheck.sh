@@ -50,7 +50,10 @@ printf "%-14s %8s %8s %s\n" "----" "----" "-----" "------"
 IFS=',' read -ra test_list <<< "$TESTS"
 for t in "${test_list[@]}"; do
     out=$(DISPLAY="$DISPLAY_ARG" timeout "$TIMEOUT" \
-        "$RENDERCHECK" -t "$t" --minimalrendering 2>&1) || rc=$?
+        "$RENDERCHECK" -v -t "$t" --minimalrendering 2>&1) || rc=$?
+    LOG_DIR="/home/jos/Projects/yserver/target/rc-logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    echo "$out" > "$LOG_DIR/rc-$t.log" 2>/dev/null || true
     rc=${rc:-0}
     summary=$(echo "$out" | grep -E "tests passed of [0-9]+" | tail -1 || true)
     if [[ -z "$summary" ]]; then

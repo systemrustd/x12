@@ -17,9 +17,48 @@ use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, crtc, framebuffer,
 };
 
-use crate::drm::{Device, modeset::Output};
+use crate::drm::{
+    Device,
+    modeset::{Output, PropMap},
+};
 
 pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle) -> io::Result<()> {
+    submit_flip_inner(device, output, fb_id, None, None)
+}
+
+/// Atomic commit + explicit-fence flip (Phase 4.1.2.5). Used by the
+/// Vulkan-fed scanout path: pass the SYNC_FD payload exported from
+/// the bo's signalSemaphore as `in_fence_fd` so KMS waits for GPU
+/// before scanning out, and pass `out_fence_holder` so the kernel
+/// allocates a release fence we can wait on for retire.
+///
+/// The kernel takes ownership of `in_fence_fd` on a successful
+/// commit (rc=0). On `-EBUSY` (or any other error) the caller still
+/// owns the fd and must close it. `out_fence_holder` is written with
+/// the new fence fd that the caller owns.
+pub fn submit_flip_with_fences(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    in_fence_fd: i32,
+    out_fence_holder: &mut i32,
+) -> io::Result<()> {
+    submit_flip_inner(
+        device,
+        output,
+        fb_id,
+        Some(in_fence_fd),
+        Some(out_fence_holder),
+    )
+}
+
+fn submit_flip_inner(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    in_fence_fd: Option<i32>,
+    out_fence_holder: Option<&mut i32>,
+) -> io::Result<()> {
     let mut req = AtomicModeReq::new();
     req.add_raw_property(
         output.plane.into(),
@@ -31,6 +70,24 @@ pub fn submit_flip(device: &Device, output: &Output, fb_id: framebuffer::Handle)
         output.plane_crtc_id_prop,
         u64::from(u32::from(output.crtc)),
     );
+
+    if let Some(fd) = in_fence_fd {
+        // IN_FENCE_FD is a plane property. Its value is the fence fd
+        // (sign-extended to u64; -1 means "no fence", which differs
+        // from "absent").
+        let plane_props = PropMap::for_object(device, output.plane)?;
+        let prop = plane_props.id("IN_FENCE_FD")?;
+        req.add_raw_property(output.plane.into(), prop, fd as i64 as u64);
+    }
+    if let Some(holder) = out_fence_holder {
+        // OUT_FENCE_PTR is a CRTC property. Its value is a userspace
+        // pointer (cast to u64) where the kernel writes the freshly
+        // allocated fence fd on a successful commit.
+        let crtc_props = PropMap::for_object(device, output.crtc)?;
+        let prop = crtc_props.id("OUT_FENCE_PTR")?;
+        let ptr_value = (holder as *mut i32) as usize as u64;
+        req.add_raw_property(output.crtc.into(), prop, ptr_value);
+    }
 
     device.atomic_commit(
         AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,

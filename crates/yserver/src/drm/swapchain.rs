@@ -88,6 +88,24 @@ impl SwapState {
         self.states[idx] = BufferState::Scanout;
         Ok(())
     }
+
+    /// Release a previously-acquired buffer back to `Free` without
+    /// going through submit/complete. Used by the PixmanShadow scanout
+    /// path in [`crate::kms::backend::KmsBackend`]: pixman paints
+    /// into the dumb buffer as a transient destination, the result is
+    /// uploaded into a `ScanoutBo` `VkImage`, and the dumb buffer is
+    /// not actually flipped — so it should return to the free pool
+    /// immediately, not stay parked in `Acquired`.
+    pub fn release_acquired(&mut self, idx: usize) -> Result<(), &'static str> {
+        if idx >= self.states.len() {
+            return Err("buffer index out of range");
+        }
+        if self.states[idx] != BufferState::Acquired {
+            return Err("release_acquired called on non-Acquired buffer");
+        }
+        self.states[idx] = BufferState::Free;
+        Ok(())
+    }
 }
 
 pub struct Swapchain {
@@ -135,6 +153,10 @@ impl Swapchain {
 
     pub fn complete(&mut self, idx: usize) -> Result<(), &'static str> {
         self.state.complete(idx)
+    }
+
+    pub fn release_acquired(&mut self, idx: usize) -> Result<(), &'static str> {
+        self.state.release_acquired(idx)
     }
 
     pub fn submitted_idx(&self) -> Option<usize> {

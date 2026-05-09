@@ -47,6 +47,19 @@ yserver/KMS: not yet measured (xts requires a host X server; would
 need a `vng`-internal xts harness or building xts inside the vng
 guest).
 
+## yserver / KMS — Phase 4.1 parity baseline (master, 2026-05-08)
+
+Captured on a separate machine ahead of the Phase 4.1 Vulkan rewrite,
+to anchor the parity bar (design §4: ±5 PASS on xts5,
+match-or-beat on rendercheck) for sub-phase 4.1.5's final gate.
+
+| scenario  | PASS | total | source |
+|-----------|-----:|------:|--------|
+| Xproto    |  358 |   389 | external run, 2026-05-08 |
+
+Additional scenarios + rendercheck numbers will land here as they
+arrive.
+
 ## rendercheck — last full run 2026-05-07 (rendercheck 1.6, ynest, 600 s/test)
 
 | test        | pass | total |
