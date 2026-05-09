@@ -173,6 +173,22 @@ impl VkContext {
             .dynamic_rendering(true)
             .synchronization2(true);
 
+        // `scalarBlockLayout` lets push-constant (and uniform/storage)
+        // blocks use scalar packing rather than std140/std430's
+        // 16-byte vec4 alignment, so a `vec4` after a stretch of
+        // `vec2` fields lands directly after them — matching what
+        // a `#[repr(C)]` Rust struct produces with no padding. This
+        // sidesteps the alignment-mismatch bug class that produced
+        // green text in `TextPushConsts` (vec4 expected at offset
+        // 48 by std430, sat at offset 40 in Rust). The shaders that
+        // rely on this declare `layout(scalar)` on the
+        // `push_constant` block; the legacy `LogicFillPushConsts`
+        // pad and the natural alignment of `RenderPushConsts` /
+        // `CompositePushConsts` keep std430 layout intact and stay
+        // compatible.
+        let mut features12 =
+            vk::PhysicalDeviceVulkan12Features::default().scalar_block_layout(true);
+
         // `logicOp` enables the per-attachment logical-op state used
         // by the Phase 4.1.5 GC-function fill path (Xor / And / Or
         // / Invert / etc. — all 16 X11 GcFunction variants map 1:1
@@ -189,6 +205,7 @@ impl VkContext {
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&device_extensions)
             .enabled_features(&enabled_features)
+            .push_next(&mut features12)
             .push_next(&mut features13);
 
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {

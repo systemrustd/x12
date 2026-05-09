@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_EXT_scalar_block_layout : require
+
 // Per-glyph quad vertex shader (sub-phase 4.1.4.5). Driven by
 // gl_VertexIndex from a 4-vertex `vkCmdDraw(4, 1, ...)` per glyph
 // with TRIANGLE_STRIP topology — no vertex buffer is bound. Push
@@ -9,8 +11,12 @@
 //
 // NDC convention matches `composite.vert.glsl`: y increases
 // downward; pixel `(0, 0)` lands at NDC `(-1, -1)` (top-left).
+//
+// `layout(scalar)` packs the block without std140/std430 vec4
+// alignment so the offsets match the host `TextPushConsts`
+// `repr(C)` struct directly — no 16-byte pad before `foreground`.
 
-layout(push_constant) uniform PushConsts {
+layout(scalar, push_constant) uniform PushConsts {
     vec2 dst_origin;
     vec2 dst_size;
     vec2 viewport;

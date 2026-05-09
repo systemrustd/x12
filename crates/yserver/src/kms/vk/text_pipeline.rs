@@ -37,14 +37,16 @@ use super::{device::VkContext, glyph::GlyphAtlas};
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
-/// Push constants for the glyph quad shader. 64 bytes — five
-/// `vec2` (40 bytes), eight padding bytes, then a `vec4` for the
-/// foreground colour. The padding is mandatory: GLSL `std430` (the
-/// default for `push_constant` blocks without an explicit layout
-/// qualifier) aligns `vec4` members to 16 bytes, so the shader
-/// reads `foreground` from offset 48. Without the pad, Rust packs
-/// it at offset 40 and the shader reads `foreground.rg` from what
-/// were our `b, a` fields — black text comes out green.
+/// Push constants for the glyph quad shader. 56 bytes — five
+/// `vec2` followed by a `vec4`. The shader's `push_constant` block
+/// is declared `layout(scalar)` (via `GL_EXT_scalar_block_layout`,
+/// enabled at device init by `scalarBlockLayout`), so the GLSL
+/// offsets match `repr(C)` directly without std430's 16-byte
+/// `vec4` padding rule. If the shader's layout qualifier is ever
+/// reverted to plain std430, `foreground` at offset 40 would no
+/// longer line up with what the shader reads at offset 48 and
+/// black text turns green; the `offset_of!` assert below catches
+/// any Rust-side regression.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TextPushConsts {
@@ -53,7 +55,6 @@ pub struct TextPushConsts {
     pub viewport: [f32; 2],
     pub src_origin: [f32; 2],
     pub src_size: [f32; 2],
-    _pad_to_vec4_alignment: [f32; 2],
     /// RGB foreground, alpha set to 1.0 by the caller.
     pub foreground: [f32; 4],
 }
@@ -73,15 +74,14 @@ impl TextPushConsts {
             viewport,
             src_origin,
             src_size,
-            _pad_to_vec4_alignment: [0.0, 0.0],
             foreground,
         }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `repr(C)` with `f32` fields, padding initialised
-        // by the constructor. Any byte pattern is a valid `f32`;
-        // round-tripping through `&[u8]` is safe.
+        // SAFETY: `repr(C)` with `f32` fields, no padding (asserted
+        // below). Any byte pattern is a valid `f32`; round-tripping
+        // through `&[u8]` is safe.
         unsafe {
             std::slice::from_raw_parts(
                 std::ptr::from_ref::<Self>(self).cast::<u8>(),
@@ -91,9 +91,8 @@ impl TextPushConsts {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<TextPushConsts>() == 64);
-// Foreground must land at offset 48 (16-byte aligned) — std430.
-const _: () = assert!(std::mem::offset_of!(TextPushConsts, foreground) == 48);
+const _: () = assert!(std::mem::size_of::<TextPushConsts>() == 56);
+const _: () = assert!(std::mem::offset_of!(TextPushConsts, foreground) == 40);
 
 pub struct TextPipeline {
     vk: Arc<VkContext>,
