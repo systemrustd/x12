@@ -414,6 +414,20 @@ impl Backend for RecordingBackend {
         Ok(CursorHandle::from_raw_panicking(xid))
     }
 
+    fn create_glyph_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _source_font: FontHandle,
+        _mask_font: Option<FontHandle>,
+        _source_char: u16,
+        _mask_char: u16,
+        _fore: (u16, u16, u16),
+        _back: (u16, u16, u16),
+    ) -> io::Result<CursorHandle> {
+        let xid = self.allocate_handle();
+        Ok(CursorHandle::from_raw_panicking(xid))
+    }
+
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,

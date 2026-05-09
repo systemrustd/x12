@@ -288,7 +288,7 @@ pub fn process_request(
         99 => handle_list_extensions(state, backend, client_id, sequence),
         // ── cursor creation ──
         93 => handle_create_cursor(state, backend, origin, client_id, sequence, body),
-        94 => handle_create_glyph_cursor(state, client_id, sequence, body),
+        94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, body),
         13 => handle_circulate_window(state, client_id, sequence, header, body),
@@ -7070,11 +7070,15 @@ fn handle_create_cursor(
 
 fn handle_create_glyph_cursor(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    if let Some(cursor) = x11::create_glyph_cursor_id(body) {
+    if body.len() >= 28
+        && let Some(cursor) = x11::create_glyph_cursor_id(body)
+    {
         let new_id = cursor.0;
         let validation_failed = {
             let handle = state.clients.get(&client_id.0).expect("client registered");
@@ -7096,7 +7100,54 @@ fn handle_create_glyph_cursor(
                 94,
             );
         }
+
+        let source_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+        let mask_id = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+        let source_char = u16::from_le_bytes([body[12], body[13]]);
+        let mask_char = u16::from_le_bytes([body[14], body[15]]);
+        let fore = (
+            u16::from_le_bytes([body[16], body[17]]),
+            u16::from_le_bytes([body[18], body[19]]),
+            u16::from_le_bytes([body[20], body[21]]),
+        );
+        let back = (
+            u16::from_le_bytes([body[22], body[23]]),
+            u16::from_le_bytes([body[24], body[25]]),
+            u16::from_le_bytes([body[26], body[27]]),
+        );
+
+        let src_host = state.resources.font(source_id).map(|f| f.host_xid);
+        let mask_host = if mask_id.0 == 0 {
+            None
+        } else {
+            state.resources.font(mask_id).map(|f| f.host_xid)
+        };
+
         state.resources.create_glyph_cursor(client_id, cursor);
+        if let Some(src_host) = src_host {
+            match backend.create_glyph_cursor(
+                origin,
+                src_host,
+                mask_host,
+                source_char,
+                mask_char,
+                fore,
+                back,
+            ) {
+                Ok(handle) => {
+                    state.resources.set_cursor_host_xid(cursor, handle);
+                }
+                Err(err) => {
+                    log::warn!("client {} CreateGlyphCursor failed: {err}", client_id.0);
+                }
+            }
+        } else {
+            log::warn!(
+                "client {} CreateGlyphCursor: source font 0x{:x} unknown",
+                client_id.0,
+                source_id.0
+            );
+        }
     }
     debug!("client {} #{} CreateGlyphCursor", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)

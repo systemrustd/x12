@@ -364,6 +364,27 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Create a cursor from two glyph indices in two fonts (X11 core
+    /// `CreateGlyphCursor`, opcode 94). The protocol does not carry an
+    /// explicit hotspot — the backend computes one from the source
+    /// glyph's metrics (origin point of the source glyph in the
+    /// rendered cursor pixmap).
+    ///
+    /// `mask_font` is `None` when the wire request had `mask = None`,
+    /// in which case the source glyph doubles as the mask: cursor
+    /// pixel is visible iff the source bit is set, and visible pixels
+    /// always carry `fore`.
+    fn create_glyph_cursor(
+        &mut self,
+        origin: Option<OriginContext>,
+        source_font: FontHandle,
+        mask_font: Option<FontHandle>,
+        source_char: u16,
+        mask_char: u16,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<CursorHandle>;
+
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,

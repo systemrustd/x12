@@ -7065,6 +7065,179 @@ impl Backend for KmsBackend {
         Ok(cursor_handle)
     }
 
+    fn create_glyph_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        source_font: FontHandle,
+        mask_font: Option<FontHandle>,
+        source_char: u16,
+        mask_char: u16,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<CursorHandle> {
+        // Rasterize the source glyph (and optional mask glyph) into a
+        // BGRA cursor image. Glyphs are aligned at their FreeType
+        // origins; the cursor pixmap extent is the union of both
+        // glyphs' bounding boxes, and the hotspot is the source glyph
+        // origin in pixmap coords (matches Xorg's AllocGlyphCursor in
+        // dix/cursor.c).
+        //
+        // X11 pixel rule:
+        //   mask given     → visible iff mask bit set; visible pixels
+        //                    carry `fore` if source bit set else `back`.
+        //   no mask (None) → source doubles as mask: visible iff source
+        //                    bit set; visible pixels always carry `fore`.
+        let host_xid = self.next_host_xid();
+        let cursor_handle = CursorHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other("failed to create cursor handle"))?;
+
+        // Render one glyph: returns (pixels[w*h], w, h, bitmap_left,
+        // bitmap_top). FreeType invalidates the previous glyph's bitmap
+        // on the next load_char, so we copy into an owned Vec eagerly.
+        // Empty glyphs (e.g. SPACE) return a 1x1 zero buffer so the
+        // bbox math still has something to work with.
+        let rasterize =
+            |this: &Self, font_xid: u32, ch: u16| -> Option<(Vec<u8>, i32, i32, i32, i32)> {
+                let fs = this.fonts.get(&font_xid)?;
+                let face = fs.face.borrow();
+                let _ = face
+                    .0
+                    .load_char(ch as usize, freetype::face::LoadFlag::RENDER);
+                let glyph = face.0.glyph();
+                let bitmap = glyph.bitmap();
+                let w = bitmap.width();
+                let h = bitmap.rows();
+                if w <= 0 || h <= 0 {
+                    return Some((vec![0u8], 1, 1, glyph.bitmap_left(), glyph.bitmap_top()));
+                }
+                let stride = bitmap.pitch();
+                let buf = bitmap.buffer();
+                let wu = w as usize;
+                let hu = h as usize;
+                let mut pixels = vec![0u8; wu * hu];
+                for row in 0..hu {
+                    let src_off = if stride >= 0 {
+                        row * stride as usize
+                    } else {
+                        (hu - 1 - row) * (stride as isize).unsigned_abs()
+                    };
+                    pixels[row * wu..row * wu + wu].copy_from_slice(&buf[src_off..src_off + wu]);
+                }
+                Some((pixels, w, h, glyph.bitmap_left(), glyph.bitmap_top()))
+            };
+
+        let src_xid = source_font.as_raw();
+        let Some((src_pix, src_w, src_h, src_lsb, src_top)) = rasterize(self, src_xid, source_char)
+        else {
+            log::warn!("create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible");
+            self.cursors.insert(
+                host_xid,
+                CursorState {
+                    extent: ash::vk::Extent2D::default(),
+                    hot_x: 0,
+                    hot_y: 0,
+                    vk_mirror: None,
+                },
+            );
+            return Ok(cursor_handle);
+        };
+
+        let mask_data = mask_font.and_then(|mf| rasterize(self, mf.as_raw(), mask_char));
+
+        // Union bbox in glyph-origin coords (positive y up). `top` and
+        // `bottom` are non-negative extents above/below baseline; `left`
+        // is signed (can be negative for italic-style glyphs).
+        let (left, right, top, bottom) = match &mask_data {
+            Some((_, mw, mh, ml, mt)) => (
+                src_lsb.min(*ml),
+                (src_lsb + src_w).max(ml + mw),
+                src_top.max(*mt),
+                (src_h - src_top).max(mh - mt),
+            ),
+            None => (src_lsb, src_lsb + src_w, src_top, src_h - src_top),
+        };
+        let pixmap_w = (right - left).max(1) as u32;
+        let pixmap_h = (top + bottom).max(1) as u32;
+
+        // Hotspot = source glyph origin point in pixmap coords (top-left
+        // origin, y down).
+        let hot_x = (-left).clamp(0, i32::from(u16::MAX)) as u16;
+        let hot_y = top.clamp(0, i32::from(u16::MAX)) as u16;
+
+        let fr = (fore.0 >> 8) as u8;
+        let fg = (fore.1 >> 8) as u8;
+        let fb = (fore.2 >> 8) as u8;
+        let br = (back.0 >> 8) as u8;
+        let bg = (back.1 >> 8) as u8;
+        let bb = (back.2 >> 8) as u8;
+
+        let read_bit = |pixels: &[u8], w: i32, h: i32, x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return false;
+            }
+            pixels[(y * w + x) as usize] > 0
+        };
+
+        // Glyph G top-left in pixmap coords: (G.lsb - left, top - G.top).
+        let src_off_x = src_lsb - left;
+        let src_off_y = top - src_top;
+        let mask_off = mask_data
+            .as_ref()
+            .map(|(_, _, _, ml, mt)| (*ml - left, top - *mt));
+
+        let pixel_count = (pixmap_w as usize) * (pixmap_h as usize);
+        let mut argb = vec![0u8; pixel_count * 4];
+        for y in 0..pixmap_h as i32 {
+            for x in 0..pixmap_w as i32 {
+                let src_set = read_bit(&src_pix, src_w, src_h, x - src_off_x, y - src_off_y);
+                let visible = match (&mask_data, mask_off) {
+                    (Some((mp, mw, mh, _, _)), Some((moff_x, moff_y))) => {
+                        read_bit(mp, *mw, *mh, x - moff_x, y - moff_y)
+                    }
+                    _ => src_set,
+                };
+                if !visible {
+                    continue;
+                }
+                let off = ((y as u32 * pixmap_w + x as u32) * 4) as usize;
+                if src_set {
+                    argb[off] = fb;
+                    argb[off + 1] = fg;
+                    argb[off + 2] = fr;
+                } else {
+                    argb[off] = bb;
+                    argb[off + 1] = bg;
+                    argb[off + 2] = br;
+                }
+                argb[off + 3] = 0xFF;
+            }
+        }
+
+        let extent = ash::vk::Extent2D {
+            width: pixmap_w,
+            height: pixmap_h,
+        };
+        let vk_mirror = if let Some(mut mirror) = self.allocate_cursor_mirror(pixmap_w, pixmap_h) {
+            if let Err(e) = self.upload_bgra_to_mirror(&mut mirror, &argb) {
+                log::warn!("create_glyph_cursor: upload_bgra_to_mirror failed: {e:?}");
+            }
+            Some(mirror)
+        } else {
+            None
+        };
+
+        self.cursors.insert(
+            host_xid,
+            CursorState {
+                extent,
+                hot_x,
+                hot_y,
+                vk_mirror,
+            },
+        );
+        Ok(cursor_handle)
+    }
+
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,

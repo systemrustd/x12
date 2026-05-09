@@ -370,6 +370,29 @@ impl Backend for HostX11Backend {
         self.with_active_origin(origin, |this| HostX11Backend::free_cursor(this, host_xid))
     }
 
+    fn create_glyph_cursor(
+        &mut self,
+        origin: Option<OriginContext>,
+        source_font: FontHandle,
+        mask_font: Option<FontHandle>,
+        source_char: u16,
+        mask_char: u16,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<CursorHandle> {
+        self.with_active_origin(origin, |this| {
+            HostX11Backend::create_glyph_cursor(
+                this,
+                source_font,
+                mask_font,
+                source_char,
+                mask_char,
+                fore,
+                back,
+            )
+        })
+    }
+
     fn define_cursor(
         &mut self,
         origin: Option<OriginContext>,

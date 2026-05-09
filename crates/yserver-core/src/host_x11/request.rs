@@ -1253,6 +1253,37 @@ impl HostX11Backend {
         Ok(CursorHandle::from_raw_panicking(cursor_xid))
     }
 
+    pub fn create_glyph_cursor(
+        &mut self,
+        source_font: FontHandle,
+        mask_font: Option<FontHandle>,
+        source_char: u16,
+        mask_char: u16,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<CursorHandle> {
+        let cursor_xid = self.next_xid();
+        self.advance_sequence();
+        let mut buf = Vec::with_capacity(32);
+        buf.push(94u8); // CreateGlyphCursor
+        buf.push(0u8);
+        write_u16(&mut buf, 8u16);
+        write_u32(&mut buf, cursor_xid);
+        write_u32(&mut buf, source_font.as_raw());
+        write_u32(&mut buf, mask_font.map(|h| h.as_raw()).unwrap_or(0));
+        write_u16(&mut buf, source_char);
+        write_u16(&mut buf, mask_char);
+        write_u16(&mut buf, fore.0);
+        write_u16(&mut buf, fore.1);
+        write_u16(&mut buf, fore.2);
+        write_u16(&mut buf, back.0);
+        write_u16(&mut buf, back.1);
+        write_u16(&mut buf, back.2);
+        self.stream.write_all(&buf)?;
+        self.stream.flush()?;
+        Ok(CursorHandle::from_raw_panicking(cursor_xid))
+    }
+
     pub fn render_create_cursor(
         &mut self,
         host_src_pic: PictureHandle,
