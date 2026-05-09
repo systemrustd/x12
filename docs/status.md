@@ -3019,3 +3019,103 @@ pre-Phase-6.10. Single output `ynest-0 connected primary 1024x768+0+0
 - xrandr-driven layout reconfigure.
 - Bare-metal multi-output validation (Phase 6.10 is virtio-gpu-scoped;
   bare-metal is informational follow-up only).
+
+## Phase 6.11 — Bare-metal session polish (in progress)
+
+Started 2026-05-09 against real DP-attached AMD (bee, Beelink APU)
+and an Intel iGPU laptop (fuji). Phase 6.10 closed the multi-monitor
+RANDR shape on virtio-gpu; this slice focuses on the rough edges that
+only surface when yserver is launched from a real TTY login on bare
+hardware. No spec/plan doc — small, opportunistic fixes driven by
+each `just yserver-…-hw` smoke.
+
+### Landed
+
+- **Console TTY takeover (commit `f4b4539`).** Ported the relevant
+  half of `xf86OpenConsole` from `xserver/hw/xfree86/os-support/linux/lnx_init.c`:
+  `KDSKBMODE = K_OFF` (with `K_RAW` fallback), `KDSETMODE =
+  KD_GRAPHICS`, raw termios for the lifetime of the server. RAII
+  guard restores all three on graceful exit / panic / signalfd
+  shutdown. Skipped silently when the controlling TTY isn't a Linux
+  VC (pty under SSH, graphical terminal emulator). Linux-only —
+  `crates/yserver/src/lib.rs::run` panics at startup on other
+  targets, which is honest about the existing DRM/KMS/libinput
+  dependencies. Fixes: physical Ctrl-C inside an xterm killing the
+  entire bare-HW session because the kernel keyboard layer was
+  generating SIGINT on the controlling TTY in parallel with the
+  evdev path. Confirmed working on AMD APU (bee) and Intel iGPU
+  (fuji).
+
+- **Real font catalog from fontconfig (commit `abcb9e6`).** Replaced
+  the 20-entry hand-written `CURATED_XLFDS` and the terminator-only
+  `list_fonts_with_info_proxy` stub with a real
+  `build_font_catalog(&fc)` that calls `fontconfig::list_fonts` at
+  `FontLoader` init and synthesises one XLFD per
+  (face × pixel-size × charset) combination. Charsets limited to
+  `iso8859-1` + `iso10646-1` (universal subset every scalable font
+  satisfies through FreeType — locale-specific charsets stay absent
+  rather than stubbed). `list_fonts_proxy` now glob-matches the
+  catalog through `xlfd_pattern_matches` (case-insensitive shell-
+  glob with `*` spanning dashes); `list_fonts_with_info_proxy` opens
+  each match through `FontLoader::open_font` and emits real
+  FreeType-derived metrics via a new sibling protocol helper
+  `write_list_fonts_with_info_reply`. Mirrors `write_query_font_reply`
+  field-for-field, so the LFWI metrics agree with later QueryFont
+  metrics on the same XLFD. Unblocks xclock and any other Xt-based
+  client whose `XCreateFontSet` was previously aborting with
+  "Unable to load any usable fontset". Aliases `fixed`, `cursor`,
+  `nil2` are kept as catalog entries — the loader handles them
+  directly without an XLFD parse pass.
+
+  ListFonts and ListFontsWithInfo handlers also gained pattern +
+  reply-count debug logging so the next round of font diagnosis
+  doesn't have to guess at what clients are asking for.
+
+- **Diagnostic logging for cursor install path (commit `3577d6d`).**
+  `handle_change_window_attributes` logs `CWA cursor: window 0xW ←
+  cursor 0xC` whenever a client passes the `CWCursor` value-mask
+  bit; `KmsBackend::define_cursor` logs the install with `(UNKNOWN)`
+  flags on either xid that isn't tracked. Added to triage a
+  reported "cursor stays as default arrow" regression on bare HW
+  — used to narrow whether the failure is no-DefineCursor-issued,
+  xid-mismatch, or render-side. Not a fix.
+
+- **Justfile cleanup (commits `1a5c235`, `860b967`).** Dropped
+  dead `scanout` parameter and `YSERVER_VK_SCANOUT={{scanout}}`
+  plumbing — the env var stopped being consulted in `51739cc`
+  ("retire legacy pixman scanout path") so all `*-hw` recipes were
+  passing it through to no effect. Added `yserver-e16-xterm-hw`
+  matching the existing `-fvwm3-xterm-hw` / `-wmaker-xterm-hw`
+  shape.
+
+### Open issues
+
+- **Cursor stays as default arrow on bare HW** (under triage,
+  diagnostics committed). Cursor moves correctly with the pointer
+  but never switches shape (e.g. xterm I-beam over text). One of:
+  no client is actually issuing `DefineCursor` for the windows
+  involved; core forwards the request but the backend sees an
+  unknown cursor xid; or selection works and the bug is in the
+  rescued-mirror copy in `render_create_cursor` (every cursor
+  rendering the same pixmap content). Next bare-HW run with the
+  3577d6d log lines will distinguish them.
+
+- **xeyes-on-e16 window drag is sluggish on bare HW** — captured in
+  [`known-issues.md`](known-issues.md) under the KMS section.
+  Compositor saturates vblank but only ~20 ConfigureWindow/s reach
+  the WM despite continuous pointer motion; needs targeted timing
+  instrumentation on (libinput motion → MotionNotify dispatched)
+  and (composite start → flip submitted) to distinguish input-
+  delivery rate, e16 throttling, or per-frame compositor wall-time.
+
+- **xclock "Missing charsets in String to FontSet conversion"
+  warning at startup.** Benign and matches stock Xorg behaviour
+  without CJK bitmap fonts installed — libXt walks the locale's
+  full charset wishlist (jisx*/gb2312*/ksc*/big5*/various
+  iso8859-N) and warns for those it can't load, then proceeds with
+  whatever it found (iso8859-1 + iso10646-1 in our case). Fix
+  would be to probe each font's `FcCharSet` in `build_font_catalog`
+  and emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
+  installed; deferred because it only matters for clients
+  rendering CJK text and most desktops don't have CJK bitmap fonts
+  anyway.
