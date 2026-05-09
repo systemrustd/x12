@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, io, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+};
 
 use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
 use yserver_core::{
@@ -884,19 +889,30 @@ struct PixmapState {
 /// Resolves X11 font names (aliases like `fixed`, XLFDs like
 /// `-adobe-helvetica-bold-r-*-*-12-*-...`, or family names) to a filesystem
 /// path via fontconfig, then opens the file with FreeType.
+///
+/// `catalog` is the list of XLFDs we advertise via ListFonts /
+/// ListFontsWithInfo. It is built once at init time by enumerating
+/// fontconfig's installed-font set and synthesising one XLFD per
+/// (face × pixel-size × charset) combination. Every entry resolves
+/// back through `open_font`, so the LFWI metrics path can return real
+/// FreeType metrics for any name we hand out.
 struct FontLoader {
     library: freetype::Library,
     fc: fontconfig::Fontconfig,
+    catalog: Vec<String>,
 }
 
 impl FontLoader {
     fn new() -> io::Result<Self> {
         let fc = fontconfig::Fontconfig::new()
             .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
+        let catalog = build_font_catalog(&fc);
+        log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
         Ok(Self {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
             fc,
+            catalog,
         })
     }
 
@@ -6006,6 +6022,154 @@ impl KmsBackend {
     }
 }
 
+/// XLFD glob match per X11 ListFonts semantics: `*` matches zero or more
+/// characters (including `-`), `?` matches exactly one. Comparison is
+/// ASCII case-insensitive — clients legitimately mix case (`-R-` for
+/// roman slant against our lowercase `-r-` names).
+fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let s = name.as_bytes();
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_si: usize = 0;
+    while si < s.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&s[si])) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// Map a fontconfig integer `weight` (`FC_WEIGHT_*`) to the X11 XLFD
+/// weight name. Buckets follow the canonical fontconfig→XLFD mapping
+/// used by Xft and traditional X font path synthesis.
+fn xlfd_weight(w: i32) -> &'static str {
+    match w {
+        ..=49 => "thin",
+        50..=74 => "light",
+        75..=89 => "book",
+        90..=139 => "medium",
+        140..=189 => "demibold",
+        190..=209 => "bold",
+        _ => "black",
+    }
+}
+
+/// Map a fontconfig integer `slant` to the single-letter XLFD slant.
+fn xlfd_slant(s: i32) -> &'static str {
+    match s {
+        100 => "i", // italic
+        110 => "o", // oblique
+        _ => "r",   // roman
+    }
+}
+
+/// Map a fontconfig integer `spacing` to the single-letter XLFD spacing.
+fn xlfd_spacing(s: i32) -> &'static str {
+    match s {
+        100 => "m", // monospaced
+        110 => "c", // charcell
+        _ => "p",   // proportional
+    }
+}
+
+/// Make a fontconfig string safe to drop into a single XLFD field:
+/// dashes are field separators in XLFDs, so any embedded `-` is
+/// replaced with a space. XLFD is case-insensitive but conventionally
+/// lowercase.
+fn sanitize_xlfd_field(s: &str) -> String {
+    s.replace('-', " ").to_lowercase()
+}
+
+/// Enumerate the installed font set via fontconfig and synthesise one
+/// XLFD per (face × pixel-size × charset) combination. Every entry is
+/// a real font that `FontLoader::open_font` can resolve back to a
+/// `FreeType::Face` — there are no stub XLFDs.
+///
+/// Charsets are limited to `iso8859-1` and `iso10646-1` because those
+/// two are the universal subset every scalable font supports through
+/// FreeType's char-by-char lookup. Locale-specific charsets (jisx*,
+/// gb2312*, ksc*) need real fonts on disk to satisfy properly; rather
+/// than stub them, we let libXt warn "Missing charset X" and proceed
+/// with the iso* coverage that's guaranteed real.
+fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
+    // Pixel sizes that scalable fonts can satisfy and that Xt clients
+    // commonly request. Pointsize is `pixel * 10` (X11 convention:
+    // pointsize is decipoints).
+    const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
+    const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
+
+    let pat = fontconfig::Pattern::new(fc);
+    let mut objs = fontconfig::ObjectSet::new(fc);
+    objs.add(fontconfig::FC_FAMILY);
+    objs.add(fontconfig::FC_FOUNDRY);
+    objs.add(fontconfig::FC_WEIGHT);
+    objs.add(fontconfig::FC_SLANT);
+    objs.add(fontconfig::FC_SPACING);
+    let set = fontconfig::list_fonts(&pat, Some(&objs));
+
+    // Aliases the loader handles directly without an XLFD parse pass.
+    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+    let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
+
+    for font in set.iter() {
+        let Some(family) = font.get_string(fontconfig::FC_FAMILY) else {
+            continue;
+        };
+        let foundry = font.get_string(fontconfig::FC_FOUNDRY).unwrap_or("misc");
+        let weight = font.get_int(fontconfig::FC_WEIGHT).unwrap_or(80);
+        let slant = font.get_int(fontconfig::FC_SLANT).unwrap_or(0);
+        let spacing = font.get_int(fontconfig::FC_SPACING).unwrap_or(0);
+
+        let key = (
+            family.to_lowercase(),
+            foundry.to_lowercase(),
+            weight,
+            slant,
+            spacing,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let foundry_x = sanitize_xlfd_field(foundry);
+        let family_x = sanitize_xlfd_field(family);
+        let weight_x = xlfd_weight(weight);
+        let slant_x = xlfd_slant(slant);
+        let spacing_x = xlfd_spacing(spacing);
+
+        for &px in PIXEL_SIZES {
+            // Average width estimate: ~0.6 × pixel size, in 1/10 px.
+            // Approximation only — clients filter by name pattern, not
+            // by this field, and QueryFont returns the real widths.
+            let avg_width = (px * 6).clamp(1, 999);
+            for &charset in CHARSETS {
+                entries.push(format!(
+                    "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
+                    px * 10,
+                ));
+            }
+        }
+    }
+
+    entries
+}
+
 impl Backend for KmsBackend {
     fn window_id(&self) -> u32 {
         self.window_id
@@ -8627,42 +8791,33 @@ impl Backend for KmsBackend {
         &mut self,
         _origin: Option<OriginContext>,
         max_names: u16,
-        _pattern: &str,
+        pattern: &str,
     ) -> io::Result<Vec<u8>> {
-        // Return a curated set of XLFD names for fonts our loader can open.
-        // Any XLFD that reaches open_font is handled via the fallback font
-        // loader, so the exact XLFD field values only need to be plausible.
-        let all_names: &[&str] = &[
-            "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso10646-1",
-            "-misc-fixed-bold-r-normal--14-130-75-75-c-70-iso10646-1",
-            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
-            "-misc-fixed-medium-r-normal--10-100-75-75-c-60-iso10646-1",
-            "-misc-fixed-medium-r-normal--8-80-75-75-c-50-iso10646-1",
-            "-bitstream-bitstream vera sans mono-medium-r-normal--12-120-75-75-m-70-iso10646-1",
-            "-bitstream-bitstream vera sans-medium-r-normal--12-120-75-75-p-67-iso10646-1",
-            "-adobe-helvetica-medium-r-normal--12-120-75-75-p-67-iso8859-1",
-            "-adobe-courier-medium-r-normal--12-120-75-75-m-70-iso8859-1",
-            "fixed",
-        ];
-        let count = all_names.len().min(max_names as usize);
-        let names = &all_names[..count];
+        let cap = usize::from(max_names);
+        let names: Vec<&str> = self
+            .font_loader
+            .catalog
+            .iter()
+            .map(String::as_str)
+            .filter(|n| xlfd_pattern_matches(pattern, n))
+            .take(cap)
+            .collect();
 
-        // Build the ListFonts wire reply.
         // Layout: 32-byte header + string items, each: 1-byte length + name bytes.
         let mut name_data: Vec<u8> = Vec::new();
-        for &name in names {
-            name_data.push(name.len() as u8);
+        for name in &names {
+            name_data.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
             name_data.extend_from_slice(name.as_bytes());
         }
         let pad = (4 - (name_data.len() % 4)) % 4;
         name_data.resize(name_data.len() + pad, 0);
 
-        let extra_words = (name_data.len() / 4) as u32;
+        let extra_words = u32::try_from(name_data.len() / 4).unwrap_or(0);
         let mut reply = vec![0u8; 32 + name_data.len()];
         reply[0] = 1;
         // bytes [2..4] sequence: rewritten by caller
         reply[4..8].copy_from_slice(&extra_words.to_le_bytes());
-        reply[8..10].copy_from_slice(&(count as u16).to_le_bytes());
+        reply[8..10].copy_from_slice(&u16::try_from(names.len()).unwrap_or(u16::MAX).to_le_bytes());
         reply[32..].copy_from_slice(&name_data);
         Ok(reply)
     }
@@ -8670,16 +8825,60 @@ impl Backend for KmsBackend {
     fn list_fonts_with_info_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _max_names: u16,
-        _pattern: &str,
+        max_names: u16,
+        pattern: &str,
     ) -> io::Result<Vec<Vec<u8>>> {
-        // ListFontsWithInfo sends one reply per font and a final
-        // terminator reply with `name-length == 0` to signal end of list.
-        // Send only the terminator so clients unblock.  Reply size is 60
-        // bytes (32-byte header + 28 bytes of font-info fields, all zero).
-        let mut term = vec![0u8; 60];
-        term[0] = 1; // reply type
-        Ok(vec![term])
+        // For each catalog entry that matches, open the real font and emit
+        // a reply with FreeType-derived metrics. libXt's XCreateFontSet
+        // validates min_bounds/max_bounds/font_ascent against the
+        // candidate before letting it into a fontset; stub bounds get
+        // rejected. This path mirrors what QueryFont returns so the LFWI
+        // metrics agree with later QueryFont metrics on the same XLFD.
+        let cap = usize::from(max_names);
+        let matched: Vec<String> = self
+            .font_loader
+            .catalog
+            .iter()
+            .filter(|n| xlfd_pattern_matches(pattern, n))
+            .take(cap)
+            .cloned()
+            .collect();
+
+        let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
+        for name in matched {
+            match self.font_loader.open_font(&name) {
+                Ok((_face, metrics, _cache)) => entries.push((name, metrics)),
+                Err(err) => {
+                    log::debug!("ListFontsWithInfo: skipping {name:?} — open_font: {err}");
+                }
+            }
+        }
+
+        let total = entries.len();
+        let mut replies: Vec<Vec<u8>> = Vec::with_capacity(total + 1);
+        for (idx, (name, metrics)) in entries.iter().enumerate() {
+            // replies-hint excludes both this reply and the trailing
+            // terminator, per the X11 spec.
+            let remaining = u32::try_from(total - idx - 1).unwrap_or(0);
+            let mut buf = Vec::new();
+            yserver_protocol::x11::write_list_fonts_with_info_reply(
+                &mut buf,
+                yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                yserver_protocol::x11::SequenceNumber(0),
+                metrics,
+                name,
+                remaining,
+            )?;
+            replies.push(buf);
+        }
+        let mut term = Vec::new();
+        yserver_protocol::x11::write_list_fonts_with_info_terminator(
+            &mut term,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            yserver_protocol::x11::SequenceNumber(0),
+        )?;
+        replies.push(term);
+        Ok(replies)
     }
 
     fn get_atom_name(
@@ -9248,6 +9447,97 @@ mod tests {
         let loader = super::FontLoader::new().expect("fontconfig+freetype init");
         let (_face, metrics, _cache) = loader.open_font("fixed").expect("resolve fixed");
         assert!(metrics.font_ascent + metrics.font_descent > 0);
+    }
+
+    #[test]
+    fn xlfd_pattern_matches_charset_filter() {
+        // libXt asks per-charset patterns when assembling a fontset.
+        // A name with the wrong charset must not match.
+        let pat = "-*-*-*-R-*-*-*-120-*-*-*-*-iso8859-1";
+        assert!(super::xlfd_pattern_matches(
+            pat,
+            "-adobe-helvetica-medium-r-normal--12-120-75-75-p-67-iso8859-1",
+        ));
+        assert!(!super::xlfd_pattern_matches(
+            pat,
+            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
+        ));
+    }
+
+    #[test]
+    fn xlfd_pattern_matches_is_case_insensitive() {
+        // xclock sends `-R-` (uppercase) for roman slant; our names use `-r-`.
+        assert!(super::xlfd_pattern_matches(
+            "-*-HELVETICA-*-R-*-*-*-120-*-*-*-*-ISO8859-1",
+            "-adobe-helvetica-medium-r-normal--12-120-75-75-p-67-iso8859-1",
+        ));
+    }
+
+    #[test]
+    fn xlfd_pattern_matches_question_mark_is_single_char() {
+        assert!(super::xlfd_pattern_matches("a?c", "abc"));
+        assert!(!super::xlfd_pattern_matches("a?c", "abbc"));
+        assert!(!super::xlfd_pattern_matches("a?c", "ac"));
+    }
+
+    #[test]
+    fn xlfd_pattern_matches_star_spans_dashes() {
+        // '*' is shell-style glob, not an XLFD-field anchor.
+        assert!(super::xlfd_pattern_matches(
+            "-*-iso8859-1",
+            "-foo-bar-iso8859-1"
+        ));
+    }
+
+    #[test]
+    fn xlfd_weight_buckets() {
+        // Spot-check the FC_WEIGHT_* → XLFD weight bucket boundaries.
+        assert_eq!(super::xlfd_weight(0), "thin");
+        assert_eq!(super::xlfd_weight(50), "light");
+        assert_eq!(super::xlfd_weight(80), "book"); // FC_WEIGHT_REGULAR
+        assert_eq!(super::xlfd_weight(100), "medium"); // FC_WEIGHT_MEDIUM
+        assert_eq!(super::xlfd_weight(180), "demibold"); // FC_WEIGHT_DEMIBOLD
+        assert_eq!(super::xlfd_weight(200), "bold"); // FC_WEIGHT_BOLD
+        assert_eq!(super::xlfd_weight(210), "black"); // FC_WEIGHT_BLACK
+    }
+
+    #[test]
+    fn xlfd_slant_and_spacing_codes() {
+        assert_eq!(super::xlfd_slant(0), "r");
+        assert_eq!(super::xlfd_slant(100), "i");
+        assert_eq!(super::xlfd_slant(110), "o");
+        assert_eq!(super::xlfd_spacing(0), "p");
+        assert_eq!(super::xlfd_spacing(100), "m");
+        assert_eq!(super::xlfd_spacing(110), "c");
+    }
+
+    #[test]
+    fn sanitize_xlfd_field_replaces_dashes_and_lowercases() {
+        // Dashes inside an XLFD field would corrupt field separation.
+        assert_eq!(super::sanitize_xlfd_field("DejaVu Sans"), "dejavu sans");
+        assert_eq!(
+            super::sanitize_xlfd_field("Liberation-Mono"),
+            "liberation mono"
+        );
+    }
+
+    #[test]
+    fn font_catalog_includes_iso8859_1_and_iso10646_1() {
+        // build_font_catalog enumerates real fontconfig faces and emits
+        // XLFDs for both Latin-1 and Unicode charsets; libXt's fontset
+        // assembly needs both.
+        let fc = fontconfig::Fontconfig::new().expect("fontconfig init");
+        let catalog = super::build_font_catalog(&fc);
+        assert!(
+            catalog.iter().any(|x| x.ends_with("-iso8859-1")),
+            "catalog has no iso8859-1 entries"
+        );
+        assert!(
+            catalog.iter().any(|x| x.ends_with("-iso10646-1")),
+            "catalog has no iso10646-1 entries"
+        );
+        // Aliases the loader handles directly.
+        assert!(catalog.iter().any(|x| x == "fixed"));
     }
 
     #[test]

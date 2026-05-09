@@ -8115,16 +8115,30 @@ fn handle_list_fonts(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} ListFonts", client_id.0, sequence.0);
-    if let Some(request) = x11::list_fonts_request(body)
-        && let Ok(mut reply) = backend.list_fonts_proxy(origin, request.max_names, &request.pattern)
-    {
-        rewrite_reply_sequence(&mut reply, sequence);
-        let Some(client) = state.clients.get_mut(&client_id.0) else {
-            return Ok(RequestOutcome::Handled);
-        };
-        let _byte_order = client.byte_order;
-        return Ok(write_to_client(client, client_id, &reply));
+    if let Some(request) = x11::list_fonts_request(body) {
+        debug!(
+            "client {} #{} ListFonts max={} pattern={:?}",
+            client_id.0, sequence.0, request.max_names, request.pattern
+        );
+        if let Ok(mut reply) = backend.list_fonts_proxy(origin, request.max_names, &request.pattern)
+        {
+            let names_returned = u16::from_le_bytes([reply[8], reply[9]]);
+            debug!(
+                "client {} #{} ListFonts → {} names",
+                client_id.0, sequence.0, names_returned
+            );
+            rewrite_reply_sequence(&mut reply, sequence);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let _byte_order = client.byte_order;
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+    } else {
+        debug!(
+            "client {} #{} ListFonts (unparsed)",
+            client_id.0, sequence.0
+        );
     }
     Ok(RequestOutcome::Handled)
 }
@@ -8137,22 +8151,37 @@ fn handle_list_fonts_with_info(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} ListFontsWithInfo", client_id.0, sequence.0);
-    if let Some(request) = x11::list_fonts_request(body)
-        && let Ok(replies) =
+    if let Some(request) = x11::list_fonts_request(body) {
+        debug!(
+            "client {} #{} ListFontsWithInfo max={} pattern={:?}",
+            client_id.0, sequence.0, request.max_names, request.pattern
+        );
+        if let Ok(replies) =
             backend.list_fonts_with_info_proxy(origin, request.max_names, &request.pattern)
-    {
-        for mut reply in replies {
-            rewrite_reply_sequence(&mut reply, sequence);
-            let Some(client) = state.clients.get_mut(&client_id.0) else {
-                return Ok(RequestOutcome::Handled);
-            };
-            let _byte_order = client.byte_order;
-            let outcome = write_to_client(client, client_id, &reply);
-            if matches!(outcome, RequestOutcome::Disconnect(_)) {
-                return Ok(outcome);
+        {
+            debug!(
+                "client {} #{} ListFontsWithInfo → {} replies (incl. terminator)",
+                client_id.0,
+                sequence.0,
+                replies.len()
+            );
+            for mut reply in replies {
+                rewrite_reply_sequence(&mut reply, sequence);
+                let Some(client) = state.clients.get_mut(&client_id.0) else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                let _byte_order = client.byte_order;
+                let outcome = write_to_client(client, client_id, &reply);
+                if matches!(outcome, RequestOutcome::Disconnect(_)) {
+                    return Ok(outcome);
+                }
             }
         }
+    } else {
+        debug!(
+            "client {} #{} ListFontsWithInfo (unparsed)",
+            client_id.0, sequence.0
+        );
     }
     Ok(RequestOutcome::Handled)
 }

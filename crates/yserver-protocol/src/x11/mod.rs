@@ -2269,6 +2269,72 @@ pub fn write_query_font_reply(
     writer.write_all(&reply)
 }
 
+/// Build a single ListFontsWithInfo reply from real font metrics.
+/// Mirrors `write_query_font_reply` field-for-field through the
+/// `font_descent` slot — the only divergence is the trailing
+/// `replies-hint + name` instead of QueryFont's `char-infos count + char-
+/// infos`. `remaining` is the count of further font replies still to
+/// follow (excluding this reply and the terminator), per X11 spec.
+pub fn write_list_fonts_with_info_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    metrics: &FontMetrics,
+    name: &str,
+    remaining: u32,
+) -> io::Result<()> {
+    let nb = name.as_bytes();
+    let nl = nb.len();
+    let pad = (4usize.wrapping_sub(nl)) & 3;
+    let n = metrics.properties.len() / 8;
+    let body_after_header = 28 + 8 * n + nl + pad; // 28 byte LFWI tail + props + name(+pad)
+    let reply_length = u32::try_from(body_after_header / 4).unwrap_or(0);
+
+    let mut reply = fixed_reply(
+        byte_order,
+        sequence,
+        u8::try_from(nl).unwrap_or(u8::MAX),
+        reply_length,
+    );
+    write_full_char_info(&mut reply, &metrics.min_bounds);
+    reply.extend_from_slice(&[0; 4]);
+    write_full_char_info(&mut reply, &metrics.max_bounds);
+    reply.extend_from_slice(&[0; 4]);
+    write_u16(byte_order, &mut reply, metrics.min_char_or_byte2);
+    write_u16(byte_order, &mut reply, metrics.max_char_or_byte2);
+    write_u16(byte_order, &mut reply, metrics.default_char);
+    write_u16(byte_order, &mut reply, u16::try_from(n).unwrap_or(0));
+    reply.push(metrics.draw_direction);
+    reply.push(metrics.min_byte1);
+    reply.push(metrics.max_byte1);
+    reply.push(u8::from(metrics.all_chars_exist));
+    write_i16(byte_order, &mut reply, metrics.font_ascent);
+    write_i16(byte_order, &mut reply, metrics.font_descent);
+    write_u32(byte_order, &mut reply, remaining);
+    reply.extend_from_slice(&metrics.properties[..n * 8]);
+    reply.extend_from_slice(nb);
+    reply.resize(reply.len() + pad, 0);
+    writer.write_all(&reply)
+}
+
+/// LFWI terminator reply (`name_length == 0`). Used to mark end of the
+/// per-font reply stream — mandatory whether or not any matches were
+/// found.
+pub fn write_list_fonts_with_info_terminator(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    // Total reply is 60 bytes: 8-byte standard prefix from fixed_reply +
+    // 52 bytes of zeroed CHARINFO/charset/metric fields (no properties,
+    // no name). reply_length = 7 = (60 - 32) / 4.
+    let reply = fixed_reply(byte_order, sequence, 0, 7);
+    debug_assert_eq!(reply.len(), 8);
+    let padding = [0u8; 52];
+    writer.write_all(&reply)?;
+    writer.write_all(&padding)
+}
+
 pub fn write_query_text_extents_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -2764,6 +2830,96 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_list_fonts_with_info_reply_round_trip() {
+        // Matches the byte layout libXt's xcb_list_fonts_with_info_reply_t
+        // expects. We assert each field's offset explicitly because LFWI
+        // sits in the same wire-format family as QueryFont but with a
+        // name+padding tail instead of charinfo data — easy to get the
+        // tail length wrong.
+        let metrics = FontMetrics {
+            min_bounds: CharInfo {
+                left_side_bearing: 0,
+                right_side_bearing: 6,
+                character_width: 6,
+                ascent: 12,
+                descent: 4,
+                attributes: 0,
+            },
+            max_bounds: CharInfo {
+                left_side_bearing: 0,
+                right_side_bearing: 7,
+                character_width: 7,
+                ascent: 13,
+                descent: 4,
+                attributes: 0,
+            },
+            min_char_or_byte2: 32,
+            max_char_or_byte2: 126,
+            default_char: 32,
+            draw_direction: 0,
+            min_byte1: 0,
+            max_byte1: 0,
+            all_chars_exist: true,
+            font_ascent: 13,
+            font_descent: 4,
+            properties: Vec::new(),
+            char_infos: Vec::new(),
+        };
+        let name = "-fc-dejavu sans mono-medium-r-normal--12-120-75-75-m-72-iso8859-1";
+        let mut buf = Vec::new();
+        write_list_fonts_with_info_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0xabcd),
+            &metrics,
+            name,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(buf[0], 1, "reply type");
+        assert_eq!(buf[1] as usize, name.len(), "name_len");
+        // sequence at [2..4]
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0xabcd);
+        // reply_length: word count after the 32-byte header.
+        let words = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(words as usize * 4 + 32, buf.len());
+        // min_bounds.character_width at [8+4..8+6] = [12..14]
+        assert_eq!(i16::from_le_bytes([buf[12], buf[13]]), 6);
+        // max_bounds.character_width at [24+4..24+6] = [28..30]
+        assert_eq!(i16::from_le_bytes([buf[28], buf[29]]), 7);
+        // all-chars-exist at [51]
+        assert_eq!(buf[51], 1);
+        // font-ascent at [52..54], font-descent at [54..56]
+        assert_eq!(i16::from_le_bytes([buf[52], buf[53]]), 13);
+        assert_eq!(i16::from_le_bytes([buf[54], buf[55]]), 4);
+        // replies-hint at [56..60]
+        assert_eq!(u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]), 7);
+        // Name follows (no FONTPROPs, so it starts at offset 60).
+        assert_eq!(&buf[60..60 + name.len()], name.as_bytes());
+        // Trailing padding is zero.
+        for &b in &buf[60 + name.len()..] {
+            assert_eq!(b, 0, "padding must be zero");
+        }
+    }
+
+    #[test]
+    fn write_list_fonts_with_info_terminator_layout() {
+        let mut buf = Vec::new();
+        write_list_fonts_with_info_terminator(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 60, "fixed 60-byte LFWI terminator");
+        assert_eq!(buf[0], 1, "reply type");
+        assert_eq!(buf[1], 0, "name_len = 0 → terminator");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234);
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 7);
+    }
 
     #[test]
     fn read_request_rejects_zero_length_without_big_requests() {
