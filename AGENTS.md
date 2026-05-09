@@ -23,3 +23,4 @@ focus is on yserver (KMS) now
 - in /home/jos/Projects/xserver/hw/xnest/ you can find the sources to Xnest for reference
 - to test you can run ynest with RUST_LOG=debug, capture its output
 - x11trace is available if you want to trace how Xephyr/Xnest does things, x11trace always needs -n flag
+- `git push` fails inside the sandbox with "Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf" — that file is a symlink owned by `nobody:nobody` and ssh refuses it. Bypass with `GIT_SSH_COMMAND="ssh -F /dev/null" git push ...` (forces ssh to skip the system-wide config and use only `~/.ssh/config`).
