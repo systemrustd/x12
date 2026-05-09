@@ -353,6 +353,18 @@ yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "wmaker log:   wmaker-hw.log"'
 
+yserver-xfce-hw scanout="vk_composite" log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "xfce log:    xfce.log"'
+
 # Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
 # Mesa's loader_dri3 prints every probe step + driver load failure so
 # we can pinpoint why "failed to load driver: radeonsi" fires. Pair

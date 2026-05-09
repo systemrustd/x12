@@ -124,17 +124,25 @@ pub fn encode_query_version_reply(
 }
 
 /// Encode a string-list reply (`QueryServerString` /
-/// `QueryExtensionsString`). Layout per glxproto:
+/// `QueryExtensionsString`). Layout per `glxproto.h`
+/// `xGLXQueryServerStringReply` (sz=32):
 ///
 /// ```text
 /// 1   Reply
 /// 1   pad
 /// 2   sequence
 /// 4   length (4-byte units past the 32-byte header)
-/// 4   string length n (bytes)
-/// 16  pad
+/// 4   pad1                         ← reserved
+/// 4   n        (string byte count, including \0)
+/// 16  pad3..pad6
 /// n   string bytes (null-terminated, padded to 4-byte boundary)
 /// ```
+///
+/// The `pad1` slot is load-bearing: it's where Mesa's xcb stub
+/// expects four bytes of *padding*, not the string length. Putting
+/// `n` at offset 8 instead of 12 is the bug that crashed
+/// libepoxy's `epoxy_glx_version` (`sscanf` of the resulting
+/// "string" returned ret != 2).
 #[must_use]
 pub fn encode_string_reply(
     byte_order: ClientByteOrder,
@@ -150,8 +158,9 @@ pub fn encode_string_reply(
     out.push(0);
     write_u16(byte_order, &mut out, sequence.0);
     write_u32(byte_order, &mut out, length_units);
-    write_u32(byte_order, &mut out, u32::try_from(n).unwrap_or(0));
-    out.extend_from_slice(&[0u8; 20]);
+    out.extend_from_slice(&[0u8; 4]); // pad1
+    write_u32(byte_order, &mut out, u32::try_from(n).unwrap_or(0)); // n
+    out.extend_from_slice(&[0u8; 16]); // pad3..pad6
     debug_assert_eq!(out.len(), 32);
     out.extend_from_slice(bytes);
     out.push(0); // null terminator
@@ -501,16 +510,41 @@ mod tests {
 
     #[test]
     fn string_reply_round_trip() {
+        // n = 7 + 1 = 8 → padded = 8 → length_units = 2.
         let reply =
             encode_string_reply(ClientByteOrder::LittleEndian, SequenceNumber(3), "yserver");
-        // n = 7 + 1 = 8 → padded = 8 → length_units = 2.
         assert_eq!(reply.len(), 32 + 8);
         let length_units = u32::from_le_bytes(reply[4..8].try_into().unwrap());
         assert_eq!(length_units, 2);
-        let n = u32::from_le_bytes(reply[8..12].try_into().unwrap());
-        assert_eq!(n, 8);
+        // Bytes 8..12 are pad1 — MUST be zero, not the string length.
+        // Putting `n` here used to crash libepoxy's epoxy_glx_version
+        // because Mesa reads `n` at offset 12 per glxproto.h
+        // xGLXQueryServerStringReply.
+        assert_eq!(&reply[8..12], &[0u8; 4], "pad1 must be zero");
+        let n = u32::from_le_bytes(reply[12..16].try_into().unwrap());
+        assert_eq!(n, 8, "n at offset 12 (after pad1)");
+        // Bytes 16..32 are pad3..pad6.
+        assert_eq!(&reply[16..32], &[0u8; 16], "pad3..pad6 must be zero");
         assert_eq!(&reply[32..39], b"yserver");
         assert_eq!(reply[39], 0);
+    }
+
+    /// Regression for the libepoxy `epoxy_glx_version` assertion
+    /// failure that crashed xfce4-session: the version reply must
+    /// `sscanf` as `M.N`. With `n` mis-located at offset 8, Mesa's
+    /// xcb stub read the X11 reply length (1) instead of strLen,
+    /// truncating the version string to a single byte.
+    #[test]
+    fn version_reply_parses_as_dotted_number() {
+        let reply = encode_string_reply(ClientByteOrder::LittleEndian, SequenceNumber(1), "1.4");
+        // Header (32) + "1.4\0" (4 bytes, already 4-aligned) = 36.
+        assert_eq!(reply.len(), 36);
+        let length_units = u32::from_le_bytes(reply[4..8].try_into().unwrap());
+        assert_eq!(length_units, 1);
+        let n = u32::from_le_bytes(reply[12..16].try_into().unwrap());
+        assert_eq!(n, 4);
+        assert_eq!(&reply[32..35], b"1.4");
+        assert_eq!(reply[35], 0);
     }
 
     #[test]
