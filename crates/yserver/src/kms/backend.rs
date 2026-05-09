@@ -1035,42 +1035,16 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
     for code in 0x20u32..=0x7E {
         let ch = char::from_u32(code).unwrap();
         let ci = compute_char_info(face, ch);
-        // Update min and max for each metric. Previously this loop
-        // only covered min for some fields and max for others, leaving
-        // min_bounds.right_side_bearing and max_bounds.left_side_bearing
-        // at their i16::MAX / i16::MIN initialization sentinels. fvwm3
-        // and xterm ingest these values as glyph bounds and end up
-        // computing pathological decoration / line widths.
-        if ci.left_side_bearing < min_bounds.left_side_bearing {
-            min_bounds.left_side_bearing = ci.left_side_bearing;
-        }
-        if ci.left_side_bearing > max_bounds.left_side_bearing {
-            max_bounds.left_side_bearing = ci.left_side_bearing;
-        }
-        if ci.right_side_bearing < min_bounds.right_side_bearing {
-            min_bounds.right_side_bearing = ci.right_side_bearing;
-        }
-        if ci.right_side_bearing > max_bounds.right_side_bearing {
-            max_bounds.right_side_bearing = ci.right_side_bearing;
-        }
-        if ci.character_width < min_bounds.character_width {
-            min_bounds.character_width = ci.character_width;
-        }
-        if ci.character_width > max_bounds.character_width {
-            max_bounds.character_width = ci.character_width;
-        }
-        if ci.ascent < min_bounds.ascent {
-            min_bounds.ascent = ci.ascent;
-        }
-        if ci.ascent > max_bounds.ascent {
-            max_bounds.ascent = ci.ascent;
-        }
-        if ci.descent < min_bounds.descent {
-            min_bounds.descent = ci.descent;
-        }
-        if ci.descent > max_bounds.descent {
-            max_bounds.descent = ci.descent;
-        }
+        min_bounds.left_side_bearing = min_bounds.left_side_bearing.min(ci.left_side_bearing);
+        max_bounds.left_side_bearing = max_bounds.left_side_bearing.max(ci.left_side_bearing);
+        min_bounds.right_side_bearing = min_bounds.right_side_bearing.min(ci.right_side_bearing);
+        max_bounds.right_side_bearing = max_bounds.right_side_bearing.max(ci.right_side_bearing);
+        min_bounds.character_width = min_bounds.character_width.min(ci.character_width);
+        max_bounds.character_width = max_bounds.character_width.max(ci.character_width);
+        min_bounds.ascent = min_bounds.ascent.min(ci.ascent);
+        max_bounds.ascent = max_bounds.ascent.max(ci.ascent);
+        min_bounds.descent = min_bounds.descent.min(ci.descent);
+        max_bounds.descent = max_bounds.descent.max(ci.descent);
         char_info_cache.insert(ch, ci);
     }
 

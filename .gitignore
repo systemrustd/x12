@@ -4,6 +4,7 @@ target/
 # Runtime logs (reference traces live under docs/assets/)
 *.log
 !docs/assets/*.log
+*.strace
 
 # Worktrees
 .worktrees/
