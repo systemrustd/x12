@@ -6947,16 +6947,122 @@ impl Backend for KmsBackend {
     fn create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _source_pixmap: PixmapHandle,
-        _mask_pixmap: Option<PixmapHandle>,
-        _fore: (u16, u16, u16),
-        _back: (u16, u16, u16),
-        _hot_x: u16,
-        _hot_y: u16,
+        source_pixmap: PixmapHandle,
+        mask_pixmap: Option<PixmapHandle>,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+        hot_x: u16,
+        hot_y: u16,
     ) -> io::Result<CursorHandle> {
+        // Rasterize the (source, mask, fore, back) tuple into BGRA cursor
+        // pixels. Both pixmaps are depth-1, mirrored as `R8_UNORM` with
+        // 0xFF/0x00 per pixel. X11 semantics: a pixel is visible iff the
+        // mask bit is set (or always, if no mask is given); visible
+        // pixels carry `fore` where the source bit is set, `back`
+        // otherwise. Invisible pixels stay (0, 0, 0, 0) — Vulkan
+        // composite samples premultiplied alpha so transparent.
         let host_xid = self.next_host_xid();
-        CursorHandle::from_raw(host_xid)
-            .ok_or_else(|| io::Error::other("failed to create cursor handle"))
+        let cursor_handle = CursorHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other("failed to create cursor handle"))?;
+
+        let src_xid = source_pixmap.as_raw();
+        let Some(src_rb) = self.read_mirror_pixels(src_xid) else {
+            log::warn!("create_cursor: source pixmap {src_xid} has no mirror; cursor invisible");
+            self.cursors.insert(
+                host_xid,
+                CursorState {
+                    extent: ash::vk::Extent2D::default(),
+                    hot_x,
+                    hot_y,
+                    vk_mirror: None,
+                },
+            );
+            return Ok(cursor_handle);
+        };
+        let w = src_rb.width;
+        let h = src_rb.height;
+
+        // Read mask only if its dims match; otherwise treat as no-mask
+        // (defensive — protocol says a size mismatch is BadMatch, but
+        // the core handler doesn't validate yet).
+        let mask_rb = match mask_pixmap {
+            Some(m) => {
+                let mxid = m.as_raw();
+                let rb = self.read_mirror_pixels(mxid);
+                match rb {
+                    Some(mrb) if mrb.width == w && mrb.height == h => Some(mrb),
+                    Some(mrb) => {
+                        log::warn!(
+                            "create_cursor: mask {mxid} dims {mw}x{mh} \
+                             differ from source {src_xid} dims {w}x{h}; ignoring mask",
+                            mw = mrb.width,
+                            mh = mrb.height,
+                        );
+                        None
+                    }
+                    None => {
+                        log::warn!("create_cursor: mask pixmap {mxid} has no mirror");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let fr = (fore.0 >> 8) as u8;
+        let fg = (fore.1 >> 8) as u8;
+        let fb = (fore.2 >> 8) as u8;
+        let br = (back.0 >> 8) as u8;
+        let bg = (back.1 >> 8) as u8;
+        let bb = (back.2 >> 8) as u8;
+
+        let pixel_count = (w as usize) * (h as usize);
+        let mut argb = vec![0u8; pixel_count * 4];
+        for i in 0..pixel_count {
+            let src_set = src_rb.bytes.get(i).copied().unwrap_or(0) != 0;
+            let visible = match &mask_rb {
+                Some(mb) => mb.bytes.get(i).copied().unwrap_or(0) != 0,
+                None => true,
+            };
+            if !visible {
+                continue;
+            }
+            let off = i * 4;
+            if src_set {
+                argb[off] = fb;
+                argb[off + 1] = fg;
+                argb[off + 2] = fr;
+            } else {
+                argb[off] = bb;
+                argb[off + 1] = bg;
+                argb[off + 2] = br;
+            }
+            argb[off + 3] = 0xFF;
+        }
+
+        let extent = ash::vk::Extent2D {
+            width: w,
+            height: h,
+        };
+        let vk_mirror = if let Some(mut mirror) = self.allocate_cursor_mirror(w, h) {
+            if let Err(e) = self.upload_bgra_to_mirror(&mut mirror, &argb) {
+                log::warn!("create_cursor: upload_bgra_to_mirror failed: {e:?}");
+            }
+            Some(mirror)
+        } else {
+            None
+        };
+
+        self.cursors.insert(
+            host_xid,
+            CursorState {
+                extent,
+                hot_x,
+                hot_y,
+                vk_mirror,
+            },
+        );
+        Ok(cursor_handle)
     }
 
     fn define_cursor(
