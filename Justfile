@@ -308,7 +308,7 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
 #
 # Closing xterm terminates the recipe; yserver is then SIGTERMed and
 # the DRM master is released cleanly.
-yserver-fvwm3-xterm-hw scanout="vk_composite" log="info":
+yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
@@ -322,7 +322,7 @@ yserver-fvwm3-xterm-hw scanout="vk_composite" log="info":
         echo "yserver log: /tmp/yserver-hw.log";\
         echo "fvwm3 log:   /tmp/fvwm3-hw.log"'
 
-yserver-wmaker-xterm-hw scanout="vk_composite" log="info":
+yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\

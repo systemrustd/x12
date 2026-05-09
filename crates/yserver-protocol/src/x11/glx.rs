@@ -349,8 +349,8 @@ mod tests {
             SequenceNumber(2),
             &[cfg_a, cfg_b],
         );
-        // Header (32) + 2 configs × 2 props × 8 bytes/pair = 64 → total 96.
-        assert_eq!(reply.len(), 96);
+        // Header (32) + 2 configs × 2 props × 8 bytes/pair = 32 → total 64.
+        assert_eq!(reply.len(), 64);
         // length field: 2 configs × 2 props × 2 (4-byte units per pair) = 8.
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 8);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 2);
