@@ -337,6 +337,20 @@ yserver-xterm-only-hw log="debug":
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log"'
 
+yserver-e16-xterm-hw log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "e16 log:   e16-hw.log"'
+
 yserver-wmaker-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
