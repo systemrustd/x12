@@ -6970,6 +6970,17 @@ impl Backend for KmsBackend {
         // under the pointer that has a non-None cursor (walking up the
         // parent chain). cursor_host_xid == 0 means "inherit from
         // parent" (X11 `None`).
+        let known = self.windows.contains_key(&host_window_xid);
+        let cursor_known = self.cursors.contains_key(&cursor_host_xid);
+        log::debug!(
+            "define_cursor: window 0x{host_window_xid:x}{} ← cursor 0x{cursor_host_xid:x}{}",
+            if known { "" } else { " (UNKNOWN)" },
+            if cursor_known || cursor_host_xid == 0 {
+                ""
+            } else {
+                " (UNKNOWN)"
+            },
+        );
         if let Some(w) = self.windows.get_mut(&host_window_xid) {
             w.cursor = cursor_host_xid;
         }

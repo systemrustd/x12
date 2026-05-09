@@ -5438,6 +5438,12 @@ fn handle_change_window_attributes(
     let Some(request) = x11::change_window_attributes_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    if let Some(cursor) = request.cursor {
+        debug!(
+            "client {} CWA cursor: window 0x{:x} ← cursor 0x{:x}",
+            client_id.0, request.window.0, cursor.0
+        );
+    }
     if let Some(event_mask) = request.event_mask {
         debug!(
             "client {} attrs window 0x{:x} mask=0x{:x}",
