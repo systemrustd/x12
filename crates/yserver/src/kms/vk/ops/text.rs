@@ -103,20 +103,20 @@ pub fn record_text_run(
             if g.entry.w == 0 || g.entry.h == 0 {
                 continue;
             }
-            let pc = TextPushConsts {
-                dst_origin: [g.dst_x as f32, g.dst_y as f32],
-                dst_size: [g.entry.w as f32, g.entry.h as f32],
-                viewport: [target.extent.width as f32, target.extent.height as f32],
-                src_origin: [
+            let pc = TextPushConsts::new(
+                [g.dst_x as f32, g.dst_y as f32],
+                [g.entry.w as f32, g.entry.h as f32],
+                [target.extent.width as f32, target.extent.height as f32],
+                [
                     g.entry.atlas_x as f32 / atlas_extent.width as f32,
                     g.entry.atlas_y as f32 / atlas_extent.height as f32,
                 ],
-                src_size: [
+                [
                     g.entry.w as f32 / atlas_extent.width as f32,
                     g.entry.h as f32 / atlas_extent.height as f32,
                 ],
                 foreground,
-            };
+            );
             device.cmd_push_constants(
                 cb,
                 pipeline.pipeline_layout,
