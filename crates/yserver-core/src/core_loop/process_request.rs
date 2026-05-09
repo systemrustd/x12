@@ -1806,7 +1806,25 @@ fn handle_shape_request(
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
                     return Ok(RequestOutcome::Handled);
                 }
-                let source = crate::nested::shape_mask_source_rects(state, ResourceId(req.src));
+                // Read the depth-1 mask pixels and YX-band them into
+                // rectangles. Falls back to the source pixmap's
+                // bounding-box rect if the backend can't introspect
+                // (host-X11 proxy mode), preserving the previous
+                // best-effort behaviour for that path.
+                let src_id = ResourceId(req.src);
+                let host_xid = state.resources.pixmap(src_id).and_then(|p| p.host_xid);
+                let banded = if let Some(host) = host_xid {
+                    match backend.read_depth1_pixmap(origin, host.as_raw()) {
+                        Ok(Some((w, h, bytes))) => {
+                            Some(crate::nested::bitmap_to_yx_banded_rects(&bytes, w, h))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let source =
+                    banded.unwrap_or_else(|| crate::nested::shape_mask_source_rects(state, src_id));
                 let source = crate::nested::offset_rects(source, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);

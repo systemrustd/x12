@@ -523,6 +523,20 @@ pub trait Backend: Send {
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>>;
 
+    /// Read a depth-1 pixmap's pixels as a tightly packed `(width,
+    /// height, bytes)` triple where each byte is non-zero for set
+    /// pixels and zero for clear. Used by SHAPE `Mask` to convert a
+    /// mask pixmap into YX-banded rectangles. Default impl returns
+    /// `None` so backends without bitmap-introspection (host-X11
+    /// proxy) can stay best-effort.
+    fn read_depth1_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+    ) -> io::Result<Option<(u32, u32, Vec<u8>)>> {
+        Ok(None)
+    }
+
     fn poly_line(
         &mut self,
         origin: Option<OriginContext>,

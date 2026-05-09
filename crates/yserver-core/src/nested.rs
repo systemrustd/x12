@@ -622,6 +622,74 @@ pub(crate) fn shape_mask_source_rects(
         .unwrap_or_default()
 }
 
+/// Convert a depth-1 bitmap into YX-banded rectangles describing the set
+/// pixels — Xorg's `BitmapToRegion` equivalent. `bytes` is tightly
+/// packed, one byte per pixel (non-zero = set, zero = clear), row-major.
+/// Returned rects are sorted by `y` then `x`, with rectangles in the
+/// same horizontal band sharing identical `y`/`height`.
+///
+/// This is the rect representation X11 SHAPE expects clients to receive
+/// from `GetRectangles` after `Mask` — without it, a mask of a circle
+/// stored as a single bounding-box rect makes e16 fall back to a
+/// recovery path that re-clears the shape.
+#[must_use]
+pub(crate) fn bitmap_to_yx_banded_rects(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<x11xfixes::RegionRect> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || bytes.len() < w.saturating_mul(h) {
+        return Vec::new();
+    }
+
+    // Per-row run-length encode the set pixels.
+    let mut row_runs: Vec<Vec<(u32, u32)>> = Vec::with_capacity(h);
+    for y in 0..h {
+        let row = &bytes[y * w..y * w + w];
+        let mut runs = Vec::new();
+        let mut x = 0;
+        while x < w {
+            if row[x] != 0 {
+                let start = x;
+                while x < w && row[x] != 0 {
+                    x += 1;
+                }
+                runs.push((start as u32, (x - start) as u32));
+            } else {
+                x += 1;
+            }
+        }
+        row_runs.push(runs);
+    }
+
+    // Merge consecutive rows with identical run lists into bands.
+    let mut rects = Vec::new();
+    let mut y = 0usize;
+    while y < h {
+        if row_runs[y].is_empty() {
+            y += 1;
+            continue;
+        }
+        let mut y_end = y + 1;
+        while y_end < h && row_runs[y_end] == row_runs[y] {
+            y_end += 1;
+        }
+        let band_h = (y_end - y) as u16;
+        for &(start, run_w) in &row_runs[y] {
+            rects.push(x11xfixes::RegionRect {
+                x: start as i16,
+                y: y as i16,
+                width: run_w as u16,
+                height: band_h,
+            });
+        }
+        y = y_end;
+    }
+    rects
+}
+
 pub(crate) fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: u8) -> bool {
     server
         .shape_windows

@@ -5666,14 +5666,47 @@ impl KmsBackend {
             && abs_y < output_h;
 
         if on_screen && let Some(mirror) = window.vk_mirror.as_ref() {
-            out.push(CompositeDraw {
-                image_view: mirror.vk_image_view,
-                dst_origin: [abs_x as f32, abs_y as f32],
-                dst_size: [w as f32, h as f32],
-                src_origin: [0.0, 0.0],
-                src_size: [1.0, 1.0],
-                use_src_alpha: false,
-            });
+            // SHAPE bounding region cuts the window's quad. Without a
+            // bounding entry we draw the whole mirror; with one we
+            // emit one quad per visible rect (in window-local coords)
+            // so pixels outside the shape simply aren't drawn —
+            // whatever was behind shows through. Fixes black-corner
+            // artifacts on e16 popups / WM frames whose mirror has
+            // bg-fill content under un-shaped corners.
+            let push_rect = |out: &mut Vec<CompositeDraw>, rx: i32, ry: i32, rw: i32, rh: i32| {
+                if rw <= 0 || rh <= 0 {
+                    return;
+                }
+                let dx0 = abs_x + rx;
+                let dy0 = abs_y + ry;
+                if dx0 + rw <= 0 || dy0 + rh <= 0 || dx0 >= output_w || dy0 >= output_h {
+                    return;
+                }
+                let inv_w = 1.0 / w as f32;
+                let inv_h = 1.0 / h as f32;
+                out.push(CompositeDraw {
+                    image_view: mirror.vk_image_view,
+                    dst_origin: [dx0 as f32, dy0 as f32],
+                    dst_size: [rw as f32, rh as f32],
+                    src_origin: [rx as f32 * inv_w, ry as f32 * inv_h],
+                    src_size: [rw as f32 * inv_w, rh as f32 * inv_h],
+                    use_src_alpha: false,
+                });
+            };
+            match self.shape_bounding.get(&window_id) {
+                None => push_rect(out, 0, 0, w, h),
+                Some(rects) => {
+                    for r in rects {
+                        push_rect(
+                            out,
+                            i32::from(r.x),
+                            i32::from(r.y),
+                            i32::from(r.width),
+                            i32::from(r.height),
+                        );
+                    }
+                }
+            }
         }
         // Children draw above their parent in stacking order.
         for &child_id in &window.children {
@@ -7550,6 +7583,27 @@ impl Backend for KmsBackend {
             result.resize(32 + pixel_bytes, 0);
         }
         Ok(Some(result))
+    }
+
+    fn read_depth1_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<Option<(u32, u32, Vec<u8>)>> {
+        // Depth-1 pixmaps mirror as `R8_UNORM` — 1 byte per pixel,
+        // 0xFF or 0x00. `read_mirror_pixels` returns those bytes
+        // directly; just verify the depth and bytes-per-pixel match
+        // before handing them over.
+        if self.drawable_depth(host_xid) != Some(1) {
+            return Ok(None);
+        }
+        let Some(rb) = self.read_mirror_pixels(host_xid) else {
+            return Ok(None);
+        };
+        if rb.bytes_per_pixel != 1 {
+            return Ok(None);
+        }
+        Ok(Some((rb.width, rb.height, rb.bytes)))
     }
 
     fn poly_line(
