@@ -214,6 +214,42 @@ pub struct ServerState {
     pub present_msc: HashMap<ResourceId, u64>,
     /// MIT-SHM segments — keyed by client-supplied `shmseg` ID.
     pub mit_shm_segments: HashMap<u32, MitShmSegment>,
+    /// GLX context registry. Indirect-rendering clients allocate one
+    /// or more contexts via CreateContext / CreateNewContext /
+    /// CreateContextAttribsARB; MakeCurrent picks one by XID and
+    /// returns a server-issued contextTag the client uses to label
+    /// subsequent rendering requests. Direct clients still go through
+    /// this path to receive a valid contextTag.
+    pub glx_contexts: HashMap<u32, GlxContext>,
+    /// Monotonic counter for GLX `contextTag` values returned by
+    /// `MakeCurrent` / `MakeContextCurrent`. Tag 0 is reserved by the
+    /// protocol to mean "no context current".
+    pub glx_next_context_tag: u32,
+    /// GLX drawables (windows, pixmaps, pbuffers) — keyed by the GLX
+    /// drawable XID the client chose at create-time.
+    pub glx_drawables: HashMap<u32, GlxDrawable>,
+}
+
+/// GLX context resource. We never run server-side GL — direct-
+/// rendering clients use the tag we assign at MakeCurrent to label
+/// rendering requests, but no actual GL state is tracked here.
+#[derive(Clone, Debug)]
+pub struct GlxContext {
+    pub owner: ClientId,
+    pub fbconfig: u32,
+    pub render_type: u32,
+}
+
+/// GLX drawable resource — `CreateGLXWindow` / `CreateGLXPixmap` /
+/// `CreatePbuffer` allocations. Stores the bound X drawable, the
+/// FBConfig the client picked, and the attributes Mesa later reads
+/// back via `GetDrawableAttributes`.
+#[derive(Clone, Debug)]
+pub struct GlxDrawable {
+    pub owner: ClientId,
+    pub x_drawable: u32,
+    pub fbconfig: u32,
+    pub attributes: Vec<(u32, u32)>,
 }
 
 impl ServerState {
@@ -260,6 +296,9 @@ impl ServerState {
             present_event_selections: HashMap::new(),
             present_msc: HashMap::new(),
             mit_shm_segments: HashMap::new(),
+            glx_contexts: HashMap::new(),
+            glx_next_context_tag: 1,
+            glx_drawables: HashMap::new(),
         }
     }
 

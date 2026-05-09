@@ -4231,6 +4231,74 @@ fn handle_dri3_request(
 /// default for OpenGL apps). 4 configs × 25 properties is enough
 /// for Mesa to pick a match for any common glXChooseFBConfig call
 /// without paying for the full ~30-cell sweep the design mentions.
+/// Resolve the attribute list for a `GetDrawableAttributes` reply.
+/// Looks up the GlxDrawable resource by XID; falls back to canonical
+/// defaults when Mesa's `loader_dri3` queries directly against the X
+/// window XID without ever going through `CreateGLXWindow`.
+fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
+    use yserver_protocol::x11::glx as g;
+    // GLX_TEXTURE_TARGET_EXT, GLX_Y_INVERTED_EXT and GLX_FBCONFIG_ID
+    // are the three Mesa actually consults; everything else is
+    // optional decoration. EXT atom values per glxext.h.
+    const GLX_TEXTURE_TARGET_EXT: u32 = 0x20D6;
+    const GLX_TEXTURE_2D_EXT: u32 = 0x20DC;
+    const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
+    let drawable = state.glx_drawables.get(&xid);
+    let fbconfig = drawable.map_or(0, |d| d.fbconfig);
+    let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(8);
+    attribs.push((g::GLX_FBCONFIG_ID, fbconfig));
+    attribs.push((GLX_TEXTURE_TARGET_EXT, GLX_TEXTURE_2D_EXT));
+    attribs.push((GLX_Y_INVERTED_EXT, 0));
+    // GLX_RENDER_TYPE — direct-render clients tag this off the
+    // FBConfig they chose; report RGBA for our synthesized configs.
+    attribs.push((g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT));
+    if let Some(d) = drawable {
+        // Layer in any client-supplied overrides last so they win.
+        for (id, value) in &d.attributes {
+            attribs.retain(|(a, _)| a != id);
+            attribs.push((*id, *value));
+        }
+    }
+    attribs
+}
+
+/// GLX 1.2 visual configs in the legacy untagged form Mesa parses
+/// via `__glXInitializeVisualConfigFromTags(!tagged_only)`. Mirrors
+/// the visuals our setup-reply advertises (ROOT_VISUAL depth-24
+/// TrueColor RGB, ARGB_VISUAL depth-32 TrueColor RGBA), each in
+/// double-buffered and single-buffered flavours.
+fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConfig> {
+    use yserver_protocol::x11::glx::VisualConfig;
+    // X11 visual class 4 == TrueColor, matching the class we put in the
+    // setup-reply visual list.
+    const TRUE_COLOR: u32 = 4;
+    let mut out: Vec<VisualConfig> = Vec::with_capacity(4);
+    for &(visual_id, alpha_bits, rgb_bits) in &[
+        (0x102_u32, 0_u32, 24_u32), // ROOT_VISUAL — TrueColor RGB
+        (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
+    ] {
+        for &double_buffer in &[true, false] {
+            out.push(VisualConfig {
+                visual_id,
+                visual_class: TRUE_COLOR,
+                rgba: true,
+                red_bits: 8,
+                green_bits: 8,
+                blue_bits: 8,
+                alpha_bits,
+                double_buffer,
+                stereo: false,
+                rgb_bits,
+                depth_bits: 24,
+                stencil_bits: 8,
+                aux_buffers: 0,
+                level: 0,
+            });
+        }
+    }
+    out
+}
+
 fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
     let mut out = Vec::with_capacity(4);
@@ -4373,31 +4441,91 @@ fn handle_glx_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11glx::GET_VISUAL_CONFIGS => {
-            // GLX 1.2 GetVisualConfigs uses a different reply shape
-            // (fixed-size xVisualConfig structs, not GetFBConfigs's
-            // attrib/value pair grid). For Phase 4.2 first cut we
-            // reply empty — Mesa falls through to GetFBConfigs which
-            // now returns real data.
-            let reply = x11glx::encode_get_fb_configs_empty_reply(byte_order, sequence);
+            // Synthesise GLX visual configs from the X visuals our
+            // setup-reply advertises. Mesa's `glx_screen_init` calls
+            // `getVisualConfigs` *before* `getFBConfigs` and bails the
+            // entire DRI3 screen creation if we hand back zero
+            // visuals — even though FBConfigs would otherwise carry
+            // the same info. So we always emit at least one visual.
+            let visuals = synthesise_glx_visual_configs();
+            let reply = x11glx::encode_get_visual_configs_reply(byte_order, sequence, &visuals);
+            debug!(
+                "client {} #{} GLX::GetVisualConfigs -> {} visuals",
+                client_id.0,
+                sequence.0,
+                visuals.len(),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             return Ok(write_to_client(client, client_id, &reply));
         }
-        x11glx::CREATE_NEW_CONTEXT
-        | x11glx::CREATE_CONTEXT_ATTRIBS_ARB
-        | x11glx::CREATE_CONTEXT
-        | x11glx::DESTROY_CONTEXT
-        | x11glx::MAKE_CURRENT
-        | x11glx::MAKE_CONTEXT_CURRENT => {
-            // Bookkeeping only — the design specifies we never execute
-            // GL. Phase 4.2.5 first cut just logs; a future commit can
-            // allocate a `GlxContext` resource and track
-            // (context, drawable) pairs per client if any client cares.
-            debug!(
-                "client {} #{} GLX context op minor={}",
-                client_id.0, sequence.0, minor
+        x11glx::CREATE_CONTEXT
+        | x11glx::CREATE_NEW_CONTEXT
+        | x11glx::CREATE_CONTEXT_ATTRIBS_ARB => {
+            // Allocate a GlxContext resource keyed by the client-
+            // chosen XID at body[0..4]. The fbconfig at body[4..8]
+            // and renderType at body[8..12] are recorded for the
+            // eventual MakeCurrent reply but otherwise unused — we
+            // never execute server-side GL.
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            let fbconfig = if body.len() >= 8 {
+                u32::from_le_bytes([body[4], body[5], body[6], body[7]])
+            } else {
+                0
+            };
+            let render_type = if body.len() >= 12 {
+                u32::from_le_bytes([body[8], body[9], body[10], body[11]])
+            } else {
+                0
+            };
+            state.glx_contexts.insert(
+                xid,
+                crate::server::GlxContext {
+                    owner: client_id,
+                    fbconfig,
+                    render_type,
+                },
             );
+            debug!(
+                "client {} #{} GLX::CreateContext xid=0x{:x} fbconfig=0x{:x}",
+                client_id.0, sequence.0, xid, fbconfig
+            );
+        }
+        x11glx::DESTROY_CONTEXT => {
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            state.glx_contexts.remove(&xid);
+            debug!(
+                "client {} #{} GLX::DestroyContext xid=0x{:x}",
+                client_id.0, sequence.0, xid
+            );
+        }
+        x11glx::MAKE_CURRENT | x11glx::MAKE_CONTEXT_CURRENT => {
+            // MakeCurrent is a *round-trip* request — Mesa's
+            // `glXMakeCurrent` blocks on the contextTag in the reply
+            // and labels every subsequent indirect rendering request
+            // with it. Direct-rendering clients only use the tag for
+            // dispatch identification, but the reply is still
+            // mandatory; without it libxcb stalls.
+            let tag = state.glx_next_context_tag;
+            state.glx_next_context_tag = state.glx_next_context_tag.wrapping_add(1).max(1);
+            let reply = x11glx::encode_make_current_reply(byte_order, sequence, tag);
+            debug!(
+                "client {} #{} GLX::MakeCurrent -> contextTag={tag}",
+                client_id.0, sequence.0
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
         }
         x11glx::WAIT_GL | x11glx::WAIT_X => {
             // No-op for direct contexts.
@@ -4407,6 +4535,121 @@ fn handle_glx_request(
                 sequence.0,
                 if minor == x11glx::WAIT_GL { "GL" } else { "X" }
             );
+        }
+        x11glx::CREATE_WINDOW | x11glx::CREATE_PIXMAP | x11glx::CREATE_PBUFFER => {
+            let parsed = x11glx::parse_create_glx_window(body);
+            if let Some(req) = parsed {
+                state.glx_drawables.insert(
+                    req.glx_window,
+                    crate::server::GlxDrawable {
+                        owner: client_id,
+                        x_drawable: req.x_window,
+                        fbconfig: req.fbconfig,
+                        attributes: Vec::new(),
+                    },
+                );
+                debug!(
+                    "client {} #{} GLX::CreateDrawable minor={minor} \
+                     glx_xid=0x{:x} x_drawable=0x{:x} fbconfig=0x{:x}",
+                    client_id.0, sequence.0, req.glx_window, req.x_window, req.fbconfig
+                );
+            } else {
+                debug!(
+                    "client {} #{} GLX::CreateDrawable minor={minor} (parse failed)",
+                    client_id.0, sequence.0
+                );
+            }
+        }
+        x11glx::DELETE_WINDOW | x11glx::DESTROY_PIXMAP | x11glx::DESTROY_PBUFFER => {
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            state.glx_drawables.remove(&xid);
+            debug!(
+                "client {} #{} GLX::DestroyDrawable minor={minor} glx_xid=0x{:x}",
+                client_id.0, sequence.0, xid
+            );
+        }
+        x11glx::CHANGE_DRAWABLE_ATTRIBUTES => {
+            // body: [glx_drawable: u32][num_attribs: u32][attribs * (id, value)]
+            if body.len() >= 8 {
+                let xid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let num_attribs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+                if let Some(drawable) = state.glx_drawables.get_mut(&xid) {
+                    let mut p = 8;
+                    for _ in 0..num_attribs {
+                        if p + 8 > body.len() {
+                            break;
+                        }
+                        let id =
+                            u32::from_le_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+                        let val = u32::from_le_bytes([
+                            body[p + 4],
+                            body[p + 5],
+                            body[p + 6],
+                            body[p + 7],
+                        ]);
+                        drawable.attributes.retain(|(a, _)| *a != id);
+                        drawable.attributes.push((id, val));
+                        p += 8;
+                    }
+                }
+                debug!(
+                    "client {} #{} GLX::ChangeDrawableAttributes glx_xid=0x{:x} n={num_attribs}",
+                    client_id.0, sequence.0, xid
+                );
+            }
+        }
+        x11glx::GET_DRAWABLE_ATTRIBUTES => {
+            // body: [glx_drawable: u32]. Reply with the canonical
+            // attribute set Mesa's loader_dri3 reads — fbconfig binding,
+            // texture target hint, Y orientation. If we never saw a
+            // CreateGLXWindow for this XID (Mesa's `pixmap_from_buffer`
+            // + `glXMakeCurrent(window, ctx)` pattern uses the X window
+            // XID directly without a separate GLXCreateWindow), we
+            // fall through to default attribs keyed off the X drawable.
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            let attribs = drawable_attributes_for(state, xid);
+            let reply =
+                x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &attribs);
+            debug!(
+                "client {} #{} GLX::GetDrawableAttributes glx_xid=0x{:x} -> {} attribs",
+                client_id.0,
+                sequence.0,
+                xid,
+                attribs.len()
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::SWAP_BUFFERS => {
+            // Direct-rendering clients route swaps through DRI3 +
+            // Present, never through indirect GLX SwapBuffers. Indirect
+            // clients hitting this path can't be served (no server-side
+            // GL), but a no-op (rather than an error) keeps silly
+            // clients limping along.
+            debug!(
+                "client {} #{} GLX::SwapBuffers (no-op)",
+                client_id.0, sequence.0
+            );
+        }
+        x11glx::QUERY_CONTEXT => {
+            // Reply with zero attribs — Mesa direct-rendering doesn't
+            // act on what comes back here.
+            let reply = x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &[]);
+            debug!("client {} #{} GLX::QueryContext", client_id.0, sequence.0);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
         }
         x11glx::VENDOR_PRIVATE | x11glx::VENDOR_PRIVATE_WITH_REPLY => {
             // Modern Mesa direct-rendering doesn't go this route.

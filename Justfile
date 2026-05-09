@@ -132,7 +132,7 @@ yserver-debug-ssh mode="1024x768":
 # Tally lands in xts/results/<timestamp>/summary.
 xts-ynest scenario="Xproto" display="99" geometry="1024x768" timeout="600":
     cargo build --release --bin ynest
-    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > /tmp/ynest-xts.log 2>&1 & \
+    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > ynest-xts.log 2>&1 & \
         pid=$!; \
         trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
         sleep 1; \
@@ -171,7 +171,7 @@ yserver-xterm:
 harness-check:
     vng -r {{KERNEL}} --disable-microvm --rw \
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c "Xorg :1 vt1 -logfile /tmp/xorg-test.log & sleep 5 && DISPLAY=:1 xterm"
+        -- bash -c "Xorg :1 vt1 -logfile xorg-test.log & sleep 5 && DISPLAY=:1 xterm"
 
 # Phase 4 spike step 1: Vulkan inside vng with the legacy virtio-gpu-pci
 # device. Expected to find no Vulkan device (the 2D device exposes no GPU
@@ -311,17 +311,17 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
 yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /home/jos/Projects/yserver/yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 strace -f -tt -T -y -s 256 -o /home/jos/Projects/yserver/fvwm3.strace fvwm3 > /home/jos/Projects/yserver/fvwm3-hw.log 2>&1 &\
+        DISPLAY=:7 strace -f -tt -T -y -s 256 -o fvwm3.strace fvwm3 > fvwm3-hw.log 2>&1 &\
         sleep 8;\
         DISPLAY=:7 xterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        echo "yserver log:    /tmp/yserver-hw.log";\
-        echo "fvwm3 log:      /tmp/fvwm3-hw.log";\
-        echo "fvwm3 strace:   /tmp/fvwm3.strace"'
+        echo "yserver log:    yserver-hw.log";\
+        echo "fvwm3 log:      fvwm3-hw.log";\
+        echo "fvwm3 strace:   fvwm3.strace"'
 
 # No-WM hw smoke: just xterm against yserver. Lets us tell whether
 # fvwm3 specifically is the blocker or whether the compositor / input
@@ -331,27 +331,44 @@ yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
 yserver-xterm-only-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 xterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: /tmp/yserver-hw.log"'
+        echo "yserver log: yserver-hw.log"'
 
 yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 wmaker > /tmp/wmaker-hw.log 2>&1 &\
+        DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 xterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: /tmp/yserver-hw.log";\
-        echo "wmaker log:   /tmp/wmaker-hw.log"'
+        echo "yserver log: yserver-hw.log";\
+        echo "wmaker log:   wmaker-hw.log"'
+
+# Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
+# Mesa's loader_dri3 prints every probe step + driver load failure so
+# we can pinpoint why "failed to load driver: radeonsi" fires. Pair
+# with the yserver log to correlate Mesa's expectations against the
+# DRI3 / GLX requests we actually see.
+yserver-glxgears-hw scanout="vk_composite" log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 LIBGL_DEBUG=verbose MESA_DEBUG=1 glxgears > glxgears.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log:  yserver-hw.log";\
+        echo "glxgears log: glxgears.log"'
 
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
 # `tests` is a comma-separated list. Default budget is 600s/test —
@@ -360,7 +377,7 @@ yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
 # override.
 rendercheck-ynest display="99" geometry="1024x768" timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin ynest
-    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > /tmp/ynest-rc.log 2>&1 & \
+    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > ynest-rc.log 2>&1 & \
         pid=$!; \
         trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
         sleep 1; \

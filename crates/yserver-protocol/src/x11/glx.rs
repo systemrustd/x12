@@ -35,8 +35,8 @@ pub const CREATE_CONTEXT: u8 = 3;
 pub const DESTROY_CONTEXT: u8 = 4;
 pub const MAKE_CURRENT: u8 = 5;
 pub const IS_DIRECT: u8 = 6;
-pub const COPY_CONTEXT: u8 = 11;
-pub const SWAP_BUFFERS: u8 = 11; // alias used pre-1.3; clients can use either form
+pub const SWAP_BUFFERS: u8 = 11;
+pub const COPY_CONTEXT: u8 = 12;
 pub const CREATE_NEW_CONTEXT: u8 = 24;
 pub const CREATE_CONTEXT_ATTRIBS_ARB: u8 = 34; // GLX_ARB_create_context
 pub const QUERY_EXTENSIONS_STRING: u8 = 18;
@@ -44,6 +44,18 @@ pub const QUERY_CONTEXT: u8 = 25;
 pub const MAKE_CONTEXT_CURRENT: u8 = 26;
 pub const SET_CLIENT_INFO_ARB: u8 = 33;
 pub const SET_CLIENT_INFO_2_ARB: u8 = 35;
+
+// GLX 1.3 drawable lifecycle (CreateGLXWindow / DestroyGLXWindow /
+// CreateGLXPbuffer / DestroyGLXPbuffer / GetDrawableAttributes /
+// ChangeDrawableAttributes).
+pub const CREATE_PIXMAP: u8 = 22;
+pub const DESTROY_PIXMAP: u8 = 23;
+pub const CREATE_PBUFFER: u8 = 27;
+pub const DESTROY_PBUFFER: u8 = 28;
+pub const GET_DRAWABLE_ATTRIBUTES: u8 = 29;
+pub const CHANGE_DRAWABLE_ATTRIBUTES: u8 = 30;
+pub const CREATE_WINDOW: u8 = 31;
+pub const DELETE_WINDOW: u8 = 32;
 
 pub const MAJOR_VERSION: u32 = 1;
 pub const MINOR_VERSION: u32 = 4;
@@ -278,6 +290,183 @@ pub fn encode_get_fb_configs_empty_reply(
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
+}
+
+/// One GLX 1.2 visual config entry.
+///
+/// `GetVisualConfigs` (opcode 14) returns the legacy untagged layout:
+/// 18 leading `INT32` fields followed by 2*N tagged (attrib, value)
+/// pairs. We emit only the 18 leading fields — `num_properties = 18`.
+/// Mesa's `__glXInitializeVisualConfigFromTags(!tagged_only)` expects
+/// exactly this prefix, in this order.
+#[derive(Clone, Copy, Debug)]
+pub struct VisualConfig {
+    pub visual_id: u32,
+    pub visual_class: u32,
+    pub rgba: bool,
+    pub red_bits: u32,
+    pub green_bits: u32,
+    pub blue_bits: u32,
+    pub alpha_bits: u32,
+    pub double_buffer: bool,
+    pub stereo: bool,
+    pub rgb_bits: u32,
+    pub depth_bits: u32,
+    pub stencil_bits: u32,
+    pub aux_buffers: u32,
+    pub level: u32,
+}
+
+/// Encode a `GetVisualConfigs` reply. Layout per glxproto:
+///
+/// ```text
+/// 1   Reply (=1)
+/// 1   pad
+/// 2   sequence
+/// 4   length (in 4-byte units beyond 32)
+/// 4   numVisuals
+/// 4   numProps  (INT32 count per visual)
+/// 16  pad
+/// numVisuals * numProps INT32 fields
+/// ```
+///
+/// Mesa's `createConfigsFromProperties` rejects `numProps == 0` (and
+/// anything less than `__GLX_MIN_CONFIG_PROPS == 18`), so even an
+/// "empty" client-visible visual list must ship a non-zero numProps;
+/// we just emit zero visuals in that case.
+#[must_use]
+pub fn encode_get_visual_configs_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    visuals: &[VisualConfig],
+) -> Vec<u8> {
+    const PROPS_PER_VISUAL: u32 = 18;
+    let num_visuals = u32::try_from(visuals.len()).unwrap_or(0);
+    let length_units = num_visuals.saturating_mul(PROPS_PER_VISUAL);
+    let mut out = Vec::with_capacity(32 + (length_units as usize) * 4);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length_units);
+    write_u32(byte_order, &mut out, num_visuals);
+    write_u32(byte_order, &mut out, PROPS_PER_VISUAL);
+    out.extend_from_slice(&[0u8; 16]);
+    debug_assert_eq!(out.len(), 32);
+    for v in visuals {
+        write_u32(byte_order, &mut out, v.visual_id);
+        write_u32(byte_order, &mut out, v.visual_class);
+        write_u32(byte_order, &mut out, u32::from(v.rgba));
+        write_u32(byte_order, &mut out, v.red_bits);
+        write_u32(byte_order, &mut out, v.green_bits);
+        write_u32(byte_order, &mut out, v.blue_bits);
+        write_u32(byte_order, &mut out, v.alpha_bits);
+        write_u32(byte_order, &mut out, 0); // accum_red_bits
+        write_u32(byte_order, &mut out, 0); // accum_green_bits
+        write_u32(byte_order, &mut out, 0); // accum_blue_bits
+        write_u32(byte_order, &mut out, 0); // accum_alpha_bits
+        write_u32(byte_order, &mut out, u32::from(v.double_buffer));
+        write_u32(byte_order, &mut out, u32::from(v.stereo));
+        write_u32(byte_order, &mut out, v.rgb_bits);
+        write_u32(byte_order, &mut out, v.depth_bits);
+        write_u32(byte_order, &mut out, v.stencil_bits);
+        write_u32(byte_order, &mut out, v.aux_buffers);
+        write_u32(byte_order, &mut out, v.level);
+    }
+    out
+}
+
+/// Encode a `MakeCurrent` / `MakeContextCurrent` reply. Fixed 32-byte
+/// reply carrying a server-assigned `contextTag` that the client uses
+/// to identify subsequent indirect-rendering requests.
+///
+/// Per `glxproto.h` `xGLXMakeCurrentReply`:
+/// ```text
+/// 1   Reply
+/// 1   pad
+/// 2   sequence
+/// 4   length = 0
+/// 4   contextTag
+/// 20  pad
+/// ```
+#[must_use]
+pub fn encode_make_current_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    context_tag: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, context_tag);
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
+/// Encode a `GetDrawableAttributes` reply. Layout per glxproto:
+///
+/// ```text
+/// 1   Reply
+/// 1   pad
+/// 2   sequence
+/// 4   length = 2 * numAttribs (in 4-byte units)
+/// 4   numAttribs
+/// 20  pad
+/// numAttribs * (CARD32 attrib, CARD32 value) pairs
+/// ```
+///
+/// Mesa's `loader_dri3` reads `GLX_FBCONFIG_ID`, `GLX_TEXTURE_TARGET_EXT`
+/// and `GLX_Y_INVERTED_EXT` to set up swap-chain orientation for
+/// `texture_from_pixmap`. Direct-rendering glxgears doesn't actually
+/// consult any of these for rendering, but it does roundtrip on the
+/// reply, so we ship the canonical defaults.
+#[must_use]
+pub fn encode_get_drawable_attributes_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    attribs: &[(u32, u32)],
+) -> Vec<u8> {
+    let num_attribs = u32::try_from(attribs.len()).unwrap_or(0);
+    let length_units = num_attribs.saturating_mul(2);
+    let mut out = Vec::with_capacity(32 + (length_units as usize) * 4);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length_units);
+    write_u32(byte_order, &mut out, num_attribs);
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
+    for &(attrib, value) in attribs {
+        write_u32(byte_order, &mut out, attrib);
+        write_u32(byte_order, &mut out, value);
+    }
+    out
+}
+
+/// Parse a `CreateGLXWindow` (minor 31) request body — fbconfig +
+/// X drawable + GLX drawable XID + property list.
+#[must_use]
+pub fn parse_create_glx_window(body: &[u8]) -> Option<CreateGlxWindowRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(CreateGlxWindowRequest {
+        screen: read_u32_le(body),
+        fbconfig: read_u32_le(&body[4..]),
+        x_window: read_u32_le(&body[8..]),
+        glx_window: read_u32_le(&body[12..]),
+    })
+}
+
+/// `CreateGLXWindow` request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateGlxWindowRequest {
+    pub screen: u32,
+    pub fbconfig: u32,
+    pub x_window: u32,
+    pub glx_window: u32,
 }
 
 #[cfg(test)]

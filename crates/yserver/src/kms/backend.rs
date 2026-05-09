@@ -1085,7 +1085,22 @@ impl KmsBackend {
         let device = Arc::new(drm::Device::open(device_path)?);
         let render_node_fd = match crate::kms::render_node::open_for_card(&*device) {
             Ok(fd) => {
-                log::info!("DRI3 render node ready (sibling of {device_path})");
+                use std::os::fd::AsRawFd;
+                let raw = fd.as_raw_fd();
+                let link = std::fs::read_link(format!("/proc/self/fd/{raw}")).unwrap_or_default();
+                let stat_minor = std::fs::metadata(&link)
+                    .ok()
+                    .map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        let rdev = m.rdev();
+                        ((rdev >> 8) & 0xff, rdev & 0xff)
+                    })
+                    .map(|(maj, min)| format!("{maj}:{min}"))
+                    .unwrap_or_else(|| "?".into());
+                log::info!(
+                    "DRI3 render node ready (sibling of {device_path}): fd={raw} \
+                     path={link:?} rdev={stat_minor} (render node minor should be >=128)"
+                );
                 Some(fd)
             }
             Err(err) => {
