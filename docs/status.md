@@ -3156,6 +3156,21 @@ each `just yserver-…-hw` smoke.
   **Validated:** confirmed by photo on Intel iGPU laptop (fuji)
   — the cloud popup now shows the smooth rounded outline.
 
+- **Ctrl-Alt-Backspace zap.** Bare-metal escape hatch when
+  something gets stuck. The libinput thread tracks
+  Ctrl/Alt-pressed state off the kernel evdev codes (LEFT or
+  RIGHT) and, on a Backspace press while both are held, drops
+  any pending pointer motion + the Backspace itself and sends
+  `Message::Shutdown` straight into the core message channel —
+  the same code path SIGINT/SIGTERM use, so the existing
+  graceful-shutdown / DRM-master-release / console-restore path
+  runs unchanged. Modifier tracking lives on the libinput
+  thread because the X side may have a grabbing client
+  consuming modifiers or a remapped keymap, and zap needs to
+  fire even when X dispatch is wedged. Tests cover the four
+  branches (zap fires; lone Backspace doesn't; modifier release
+  disarms; right-side modifiers also arm).
+
 ### Follow-ups
 
 Open items moved to [`known-issues.md`](known-issues.md): the

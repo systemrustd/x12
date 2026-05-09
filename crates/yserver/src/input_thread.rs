@@ -30,6 +30,16 @@ use yserver_core::{
 
 use crate::input::{InputEvent, SendContext};
 
+// Linux evdev keycodes (raw, before the X11 +8 translation). Used by
+// the Ctrl-Alt-Backspace zap detector: the Linux scancodes are the
+// unambiguous source of truth — the X side may rewrite the keymap or
+// have a grabbing client consuming modifiers.
+const LINUX_KEY_BACKSPACE: u32 = 14;
+const LINUX_KEY_LEFTCTRL: u32 = 29;
+const LINUX_KEY_LEFTALT: u32 = 56;
+const LINUX_KEY_RIGHTCTRL: u32 = 97;
+const LINUX_KEY_RIGHTALT: u32 = 100;
+
 /// Cursor accumulator + framebuffer dimensions held on the libinput
 /// thread.
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +48,14 @@ pub struct LibinputThreadState {
     cursor_y: f64,
     fb_w: u32,
     fb_h: u32,
+    /// Modifier-key state for the Ctrl+Alt+Backspace "zap" emergency
+    /// shutdown. Tracked on this thread (off the kernel evdev codes)
+    /// rather than on the X side because a grabbing client or a
+    /// remapped keymap could silently consume the modifier press —
+    /// zap needs to fire even when the X dispatch is wedged, since
+    /// that's the most likely reason the user is reaching for it.
+    ctrl_pressed: bool,
+    alt_pressed: bool,
 }
 
 impl LibinputThreadState {
@@ -48,6 +66,40 @@ impl LibinputThreadState {
             cursor_y: f64::from(fb_h) / 2.0,
             fb_w,
             fb_h,
+            ctrl_pressed: false,
+            alt_pressed: false,
+        }
+    }
+
+    /// Update tracked modifier state for `ev` and return `true` iff
+    /// this event is a Backspace key press while both Ctrl and Alt
+    /// are held — the zap shortcut.
+    ///
+    /// Modifier release events update state but never fire the zap;
+    /// non-key events are ignored.
+    fn check_zap(&mut self, ev: &InputEvent) -> bool {
+        match *ev {
+            InputEvent::KeyPress { keycode } => match keycode {
+                LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => {
+                    self.ctrl_pressed = true;
+                    false
+                }
+                LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => {
+                    self.alt_pressed = true;
+                    false
+                }
+                LINUX_KEY_BACKSPACE => self.ctrl_pressed && self.alt_pressed,
+                _ => false,
+            },
+            InputEvent::KeyRelease { keycode } => {
+                match keycode {
+                    LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => self.ctrl_pressed = false,
+                    LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => self.alt_pressed = false,
+                    _ => {}
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -132,6 +184,14 @@ pub fn process_batch(
     time_ms: u32,
 ) -> io::Result<()> {
     for raw in events {
+        if state.check_zap(&raw) {
+            // Drop any pending motion + the Backspace event itself —
+            // the server is shutting down, no client should see them.
+            *pending_motion = None;
+            log::warn!("yserver: Ctrl-Alt-Backspace pressed — requesting shutdown (zap)");
+            sender.send(Message::Shutdown)?;
+            return Ok(());
+        }
         let mapped = state.map(raw, time_ms);
         match mapped {
             HostInputEvent::PointerMotion { .. } => {
@@ -424,6 +484,141 @@ mod tests {
             }) => {}
             other => panic!("second message: {other:?}"),
         }
+        drop(poll);
+    }
+
+    #[test]
+    fn ctrl_alt_backspace_emits_shutdown_and_drops_keypress() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTCTRL,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTALT,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_BACKSPACE,
+                },
+                // Anything after the zap is dropped — the server is
+                // already shutting down. This press must NOT reach
+                // the core.
+                InputEvent::KeyPress {
+                    keycode: 30, /* a */
+                },
+            ],
+            0,
+        )
+        .unwrap();
+
+        let collected: Vec<Message> = rx.try_recv_all().collect();
+        assert!(
+            collected.iter().any(|m| matches!(m, Message::Shutdown)),
+            "expected Shutdown in {collected:?}",
+        );
+        assert!(
+            !collected.iter().any(|m| matches!(
+                m,
+                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && ev.keycode == 14 + 8
+            )),
+            "Backspace keypress must not be forwarded after zap, got {collected:?}",
+        );
+        // Modifier presses before the Backspace landed first; tolerate
+        // those since they were valid client events at the time.
+        drop(poll);
+    }
+
+    #[test]
+    fn backspace_alone_does_not_zap() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [InputEvent::KeyPress {
+                keycode: LINUX_KEY_BACKSPACE,
+            }],
+            0,
+        )
+        .unwrap();
+        let collected: Vec<Message> = rx.try_recv_all().collect();
+        assert!(
+            !collected.iter().any(|m| matches!(m, Message::Shutdown)),
+            "Shutdown must not fire on lone Backspace, got {collected:?}",
+        );
+        drop(poll);
+    }
+
+    #[test]
+    fn modifier_release_disarms_zap() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTCTRL,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTALT,
+                },
+                InputEvent::KeyRelease {
+                    keycode: LINUX_KEY_LEFTCTRL,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_BACKSPACE,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        let collected: Vec<Message> = rx.try_recv_all().collect();
+        assert!(
+            !collected.iter().any(|m| matches!(m, Message::Shutdown)),
+            "Shutdown must not fire after Ctrl release, got {collected:?}",
+        );
+        drop(poll);
+    }
+
+    #[test]
+    fn right_modifiers_also_arm_zap() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_RIGHTCTRL,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_RIGHTALT,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_BACKSPACE,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        let collected: Vec<Message> = rx.try_recv_all().collect();
+        assert!(
+            collected.iter().any(|m| matches!(m, Message::Shutdown)),
+            "right Ctrl + right Alt + Backspace must zap, got {collected:?}",
+        );
         drop(poll);
     }
 }
