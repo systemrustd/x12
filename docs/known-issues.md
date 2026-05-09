@@ -63,6 +63,23 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
+- [ ] **Crossing-event `child` field hard-coded to 0.** `EnterNotify`
+      and `LeaveNotify` always wire `child = 0` —
+      `encode_crossing_event` at
+      `crates/yserver-protocol/src/x11/mod.rs:2621` does
+      `write_u32(order, out, 0); // child — descendant hit-testing
+      not implemented`, and `CrossingEvent` in the same file lacks a
+      `child` field entirely. WMs that select Enter/Leave on the
+      root and gate behavior on `child` (is the pointer over bare
+      root or over a child of root?) can't distinguish, so e16's
+      hover popup over the desktop *also* shows when the cursor
+      moves over xterm and other top-levels. Same bug-class as the
+      old `PointerEvent.child = 0` issue (fixed for ButtonPress via
+      `pointer_propagation_target_by_id`'s `propagation_child`); fix
+      is to add `child` to `CrossingEvent`, compute the topmost
+      descendant of `event` containing the pointer, and thread it
+      through the encoder. Bare-HW e16 surfaced this; observed
+      2026-05-09. (Phase 1/2 follow-up.)
 - [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
       Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
       smoke. After fixing two prerequisite routing bugs (the
