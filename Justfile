@@ -302,16 +302,14 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
 # on a different VT — yserver acquires DRM master on whichever
 # /dev/dri/cardN matches its discovery.
 #
-# Defaults: PixmanShadow scanout (Vulkan-fed flip path) + debug-level
-# logging. Switch back to the existing pixman+dumb-buffer path with
-# `scanout=pixman`.  Lower log volume with `log=info`.
+# Default log level is debug; lower it with `log=info`.
 #
 # Closing xterm terminates the recipe; yserver is then SIGTERMed and
 # the DRM master is released cleanly.
-yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
+yserver-fvwm3-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 strace -f -tt -T -y -s 256 -o fvwm3.strace fvwm3 > fvwm3-hw.log 2>&1 &\
@@ -328,10 +326,10 @@ yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
 # pipeline itself is broken on hw. Without a WM xterm won't get a
 # frame, but it should still render its own content + the cursor
 # should track the mouse.
-yserver-xterm-only-hw scanout="vk_composite" log="debug":
+yserver-xterm-only-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 xterm;\
@@ -339,10 +337,10 @@ yserver-xterm-only-hw scanout="vk_composite" log="debug":
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log"'
 
-yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
+yserver-wmaker-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
@@ -353,10 +351,10 @@ yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "wmaker log:   wmaker-hw.log"'
 
-yserver-xfce-hw scanout="vk_composite" log="debug":
+yserver-xfce-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
@@ -370,10 +368,10 @@ yserver-xfce-hw scanout="vk_composite" log="debug":
 # we can pinpoint why "failed to load driver: radeonsi" fires. Pair
 # with the yserver log to correlate Mesa's expectations against the
 # DRI3 / GLX requests we actually see.
-yserver-glxgears-hw scanout="vk_composite" log="debug":
+yserver-glxgears-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 LIBGL_DEBUG=verbose MESA_DEBUG=1 glxgears > glxgears.log 2>&1;\
