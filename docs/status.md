@@ -3123,6 +3123,39 @@ each `just yserver-…-hw` smoke.
   matching the existing `-fvwm3-xterm-hw` / `-wmaker-xterm-hw`
   shape.
 
+- **e16 popup rendering on bare HW (commits `7ea2f09`, `4e99925`,
+  `c5959af`).** Three coupled changes that together make e16's
+  "thinking cloud" hover popup render correctly:
+
+  - `7ea2f09` adds debug logging for every SHAPE minor opcode
+    (Rectangles / Mask / Combine emit dest, op, kind, src/rects)
+    and for `CWA bg_pixmap` with a None / ParentRelative / pixmap
+    tag. Used to diff our wire trace against an `x11trace` of the
+    same e16 session under Xephyr, which surfaced both follow-up
+    bugs.
+
+  - `4e99925` fixes depth-1 ZPixmap PutImage to unpack bits
+    LSB-first per `bitmap_format_bit_order` advertised at setup
+    (was MSB-first). Mismatch reversed each byte's 8 pixels,
+    producing a per-byte sawtooth on shape masks → triangular
+    spikes around the popup's perimeter.
+
+  - `c5959af` honours the per-window SHAPE bounding region in the
+    composite pass (was always pushing one quad covering the full
+    window mirror, so pixels outside the shape rendered with
+    bg-fill content — typically black) and adds a real
+    `bitmap_to_yx_banded_rects` for SHAPE Mask sources via a new
+    `Backend::read_depth1_pixmap` (KMS impl uses
+    `read_mirror_pixels`; host-X11 stays best-effort). Previously
+    `shape_mask_source_rects` returned the source pixmap's full
+    bounding box, which made e16 see a single rect from
+    GetRectangles where it expected ~7 bands and triggered a
+    spurious `Mask Set src=None` recovery clear that then
+    wiped the shape entirely.
+
+  **Validated:** confirmed by photo on Intel iGPU laptop (fuji)
+  — the cloud popup now shows the smooth rounded outline.
+
 ### Follow-ups
 
 Open items moved to [`known-issues.md`](known-issues.md): the
