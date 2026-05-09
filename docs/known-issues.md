@@ -229,6 +229,20 @@ that the host hides for us.
 - [ ] **Opcode 81 (InstallColormap) unsupported.** fvwm3 calls it once.
       Safe to ignore on a TrueColor backend; could just reply "did it"
       to silence the unsupported-opcode log.
+- [ ] **xeyes-on-e16 window drag is sluggish on bare HW.** Observed
+      on a real DP-attached AMD card via `yserver-e16-...-hw` (KMS).
+      During a drag the dragged frame visibly lags the cursor.
+      `yserver-hw.log` over the drag window shows the compositor
+      saturating vblank (pageflip-complete + composite resubmit
+      pairs back-to-back at ~60 Hz) but only ~20 `ConfigureWindow`/s
+      reaching the WM despite continuous pointer motion — input
+      delivery, e16 throttling, or composite wall-time per frame
+      could each be the bottleneck and the log alone doesn't
+      distinguish them. To diagnose: add timestamped tracing on
+      (libinput motion → MotionNotify dispatched) and (composite
+      start → flip submitted) for one drag, then correlate. The
+      compositor never falls behind vblank in the log, so the most
+      suspicious link is input-event delivery rate.
 
 ## WM-specific behaviour
 
