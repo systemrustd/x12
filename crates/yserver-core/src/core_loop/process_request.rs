@@ -8944,10 +8944,8 @@ fn handle_query_pointer(
         let (origin_x, origin_y) = state.resources.window_absolute_position(queried_window);
         let root_x = pointer.win_x;
         let root_y = pointer.win_y;
-        let win_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x))
-            .unwrap_or(i16::MAX);
-        let win_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
-            .unwrap_or(i16::MAX);
+        let win_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
+        let win_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
         x11::QueryPointerReply {
             root: ROOT_WINDOW,
             child: ROOT_WINDOW,

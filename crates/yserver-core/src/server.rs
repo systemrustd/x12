@@ -228,6 +228,13 @@ pub struct ServerState {
     /// GLX drawables (windows, pixmaps, pbuffers) — keyed by the GLX
     /// drawable XID the client chose at create-time.
     pub glx_drawables: HashMap<u32, GlxDrawable>,
+    /// Server-side key auto-repeat state. Set to `Some` while a key
+    /// is held; cleared on the matching release or replaced when a
+    /// different key is pressed (X11 spec: only the most recently
+    /// pressed key repeats). The core loop's poll uses
+    /// `repeat_state.next_fire` to compute its wake-up timeout so an
+    /// idle server still costs zero CPU.
+    pub repeat_state: Option<KeyRepeatState>,
     /// Outstanding `XSync::AwaitFence` requests waiting on at least
     /// one fence in the list to transition to triggered. Per the
     /// spec the server must defer further processing of the
@@ -239,6 +246,18 @@ pub struct ServerState {
     /// blocking is left as a known gap — see followup §5 in
     /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
     pub sync_pending_awaits: Vec<SyncPendingAwait>,
+}
+
+/// Server-side key auto-repeat. Carries the original `HostKeyEvent`
+/// so synthetic repeat events can re-use its time/state/coord
+/// fields when fan-out runs, plus the `Instant` at which the next
+/// repeat should fire. Per-key delay/rate overrides aren't tracked
+/// today — `core_loop::run` uses the X11 defaults (660 ms initial,
+/// 40 ms period ≈ 25 Hz).
+#[derive(Clone, Copy, Debug)]
+pub struct KeyRepeatState {
+    pub event: crate::host_x11::HostKeyEvent,
+    pub next_fire: std::time::Instant,
 }
 
 /// One outstanding `XSync::AwaitFence` request that hasn't been
@@ -321,6 +340,7 @@ impl ServerState {
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
             sync_pending_awaits: Vec::new(),
+            repeat_state: None,
         }
     }
 

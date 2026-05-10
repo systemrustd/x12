@@ -13,6 +13,7 @@ use std::{
         fd::AsRawFd,
         unix::net::{UnixListener, UnixStream},
     },
+    time::{Duration, Instant},
 };
 
 use log::{error, warn};
@@ -32,8 +33,17 @@ use super::{
 use crate::{
     backend::{Backend, BackendFdKind, HostSocketStatus},
     host_x11::HostEvent,
-    server::ServerState,
+    server::{KeyRepeatState, ServerState},
 };
+
+/// X11 default auto-repeat initial delay before the first synthetic
+/// KeyPress fires. Matches xset's `-r` defaults; not yet pulled from
+/// the XKB Controls block.
+const REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(660);
+
+/// X11 default auto-repeat period (25 Hz = 40 ms between synthetic
+/// KeyPress events while a key is held).
+const REPEAT_PERIOD: Duration = Duration::from_millis(40);
 
 /// Run the core loop until `Message::Shutdown` is observed.
 ///
@@ -83,7 +93,15 @@ pub fn run_core(
 
     let mut events = Events::with_capacity(64);
     loop {
-        poll.poll(&mut events, None)?;
+        // If a key is currently held, wake the loop in time to fire
+        // the next synthetic repeat. `Duration::ZERO` keeps mio
+        // returning immediately when we're already past `next_fire`.
+        let poll_timeout = state.repeat_state.as_ref().map(|r| {
+            r.next_fire
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+        });
+        poll.poll(&mut events, poll_timeout)?;
         for ev in events.iter() {
             match ev.token() {
                 LISTENER_TOKEN => {
@@ -256,6 +274,15 @@ pub fn run_core(
             // Host events (pointer, expose, configure) can change
             // visible state; mark dirty so the KMS gate re-arms. No-op
             // for backends without their own composite loop.
+            backend.mark_dirty();
+        }
+
+        // Auto-repeat: if a key is held and its `next_fire` has
+        // elapsed (either because the poll woke on the timeout, or
+        // because an unrelated event arrived after the deadline),
+        // fan out a synthetic KeyRelease+KeyPress pair.
+        if state.repeat_state.is_some() {
+            fire_pending_repeats(state, backend);
             backend.mark_dirty();
         }
 
@@ -555,7 +582,72 @@ fn handle_setup_allocate(
 }
 
 fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
+    update_repeat_state(state, &ev);
     backend.on_host_input(state, ev);
+}
+
+/// Arm / refresh / clear `state.repeat_state` from an incoming host
+/// input event. X11 spec: only the most recently pressed key
+/// repeats — pressing a different key replaces the armed key;
+/// releasing the armed key clears it; releases of other keys are
+/// ignored. Non-key events don't affect repeat state.
+fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
+    use crate::core_loop::message::HostInputEvent::Key;
+    let Key(key) = ev else {
+        return;
+    };
+    if key.pressed {
+        let synthetic = state
+            .repeat_state
+            .as_ref()
+            .is_some_and(|r| r.event.keycode == key.keycode && r.event.pressed);
+        if synthetic {
+            // This is a repeat we just fired; don't reset the timer.
+            return;
+        }
+        state.repeat_state = Some(KeyRepeatState {
+            event: *key,
+            next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
+        });
+    } else if state
+        .repeat_state
+        .as_ref()
+        .is_some_and(|r| r.event.keycode == key.keycode)
+    {
+        state.repeat_state = None;
+    }
+}
+
+/// Fire any auto-repeat events whose `next_fire` has elapsed. Loops
+/// in case the poll wake was delayed past more than one period
+/// (under load) so we don't drop events. Each fire emits a
+/// KeyRelease + KeyPress pair through the same host-input fan-out
+/// path the original press took, matching classic X11 auto-repeat
+/// (every client handles it without opting into XKB
+/// DetectableAutoRepeat).
+fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
+    let Some(armed) = state.repeat_state else {
+        return;
+    };
+    let now = Instant::now();
+    if now < armed.next_fire {
+        return;
+    }
+    let mut next_fire = armed.next_fire;
+    while now >= next_fire {
+        next_fire += REPEAT_PERIOD;
+    }
+    // Update the timer first so any reentrant arming during fan-out
+    // doesn't double-fire.
+    if let Some(s) = state.repeat_state.as_mut() {
+        s.next_fire = next_fire;
+    }
+    let mut release = armed.event;
+    release.pressed = false;
+    let mut press = armed.event;
+    press.pressed = true;
+    backend.on_host_input(state, HostInputEvent::Key(release));
+    backend.on_host_input(state, HostInputEvent::Key(press));
 }
 
 /// Wire a freshly-completed setup handshake into the core's bookkeeping:
