@@ -246,6 +246,23 @@ that the host hides for us.
 - [ ] **Opcode 81 (InstallColormap) unsupported.** fvwm3 calls it once.
       Safe to ignore on a TrueColor backend; could just reply "did it"
       to silence the unsupported-opcode log.
+- [ ] **Crash before `console::Drop` leaves the host TTY unusable.**
+      yserver's startup grabs the VT with `KDSKBMODE=K_OFF +
+      KD_GRAPHICS` (kernel keystroke→TTY translation suppressed) and
+      relies on the matching restore in `console::Drop` for cleanup.
+      Any abnormal exit that bypasses `Drop` — SEGV/SIGABRT, an
+      unhandled signal whose default action is "terminate"
+      (e.g. SIGUSR1 on a binary without our handler), DPMS-induced
+      power-save with the box still alive, etc. — leaves the kernel
+      in K_OFF on that VT. From then on Ctrl+Alt+Fn does nothing,
+      the VT can't be switched away from, and the screen looks
+      frozen even though the box is responsive over SSH. Recovery
+      from a remote shell: `sudo systemctl restart display-manager`
+      (gdm/sddm/lightdm) — clears the state and gets you back to
+      Wayland/Xorg login. Hardening: install a SIGSEGV/SIGABRT
+      signal handler that explicitly calls the console restore
+      before re-raising, and propagate the K_OFF restore through
+      panic hooks too.
 - [ ] **xeyes-on-e16 window drag is sluggish on bare HW.** Observed
       on a real DP-attached AMD card via `yserver-e16-...-hw` (KMS).
       During a drag the dragged frame visibly lags the cursor.
