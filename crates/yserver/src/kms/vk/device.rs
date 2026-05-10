@@ -62,16 +62,29 @@ impl VkContext {
         // installed) don't ship it; without this guard,
         // `vkCreateInstance` returns `VK_ERROR_LAYER_NOT_PRESENT` and
         // the whole backend falls back to pixman.
+        //
+        // Enable cases:
+        //   - debug build: always try (validation-layer cost is fine).
+        //   - release build with `YSERVER_VK_VALIDATION` set: opt-in
+        //     for diagnosing release-mode-only bugs (e.g. perf-branch
+        //     timeline-semaphore races) without rebuilding debug.
         let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+        let validation_requested =
+            cfg!(debug_assertions) || std::env::var_os("YSERVER_VK_VALIDATION").is_some();
         let validation_available =
-            cfg!(debug_assertions) && validation_layer_present(&entry, validation_layer_name);
+            validation_requested && validation_layer_present(&entry, validation_layer_name);
         let layer_ptrs: Vec<*const c_char> = if validation_available {
             vec![validation_layer_name.as_ptr()]
         } else {
             Vec::new()
         };
-        if cfg!(debug_assertions) && !validation_available {
-            log::debug!("vulkan: validation layer unavailable, continuing without");
+        if validation_requested && !validation_available {
+            log::warn!(
+                "vulkan: validation layer requested but not present (install \
+                 `vulkan-validation-layers` package); continuing without"
+            );
+        } else if validation_available {
+            log::info!("vulkan: validation layer enabled");
         }
 
         let create_info = vk::InstanceCreateInfo::default()
@@ -288,7 +301,12 @@ fn validation_layer_present(entry: &ash::Entry, name: &CStr) -> bool {
 fn create_debug_messenger(
     debug_utils_instance: &ash::ext::debug_utils::Instance,
 ) -> Result<Option<vk::DebugUtilsMessengerEXT>, VkInitError> {
-    if !cfg!(debug_assertions) {
+    // Match the validation-layer enable rule from `VkContext::new`:
+    // debug builds always install the messenger; release builds only
+    // when `YSERVER_VK_VALIDATION` is set. Without the messenger the
+    // validation layer has nowhere to report VUIDs and the layer is
+    // effectively silent.
+    if !cfg!(debug_assertions) && std::env::var_os("YSERVER_VK_VALIDATION").is_none() {
         return Ok(None);
     }
     let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
