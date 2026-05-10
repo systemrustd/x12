@@ -8204,7 +8204,9 @@ impl Backend for KmsBackend {
         foreground: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Body: drawable(4) + gc(4) + x(2) + y(2) + text_items
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM8.
+        // Each TEXTITEM8 is `len(u8) delta(i8) chars(len)` for len in 0..=254,
+        // or `255 font_id(u32 BE)` for a font change. No inter-item padding.
         if body.len() < 12 {
             return Ok(());
         }
@@ -8213,31 +8215,41 @@ impl Backend for KmsBackend {
         let mut items = &body[12..];
         let mut cursor_x = x;
 
-        while !items.is_empty() {
-            let delta = items[0] as usize;
-            items = &items[1..];
-            if delta == 0 {
-                break; // end of items
-            } else if delta == 255 {
-                // Font change: skip 3 pad bytes + 4 byte fontable
-                if items.len() >= 7 {
-                    let font_xid = u32::from_le_bytes([items[3], items[4], items[5], items[6]]);
-                    self.current_font = Some(font_xid);
-                    items = &items[7..];
-                } else {
+        while items.len() >= 2 {
+            let len = items[0];
+            if len == 255 {
+                if items.len() < 5 {
                     break;
                 }
-            } else if delta <= 254 {
-                // String item: delta bytes follow
-                if items.len() >= delta {
-                    let text = &items[..delta];
-                    self.render_text_string(host_xid, foreground, cursor_x, y, text)?;
-                    cursor_x += delta as i32;
-                    items = &items[delta..];
-                } else {
-                    break;
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.current_font = Some(font_xid);
+                items = &items[5..];
+                continue;
+            }
+            let delta = items[1] as i8;
+            let len = len as usize;
+            if items.len() < 2 + len {
+                break;
+            }
+            let text = &items[2..2 + len];
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
+            if !text.is_empty() {
+                self.render_text_string(host_xid, foreground, cursor_x, y, text)?;
+                if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+                    let advance: i32 = text
+                        .iter()
+                        .map(|&b| {
+                            font_state
+                                .char_info_cache
+                                .get(&(b as char))
+                                .map(|ci| ci.character_width as i32)
+                                .unwrap_or(6)
+                        })
+                        .sum();
+                    cursor_x = cursor_x.saturating_add(advance);
                 }
             }
+            items = &items[2 + len..];
         }
         Ok(())
     }
@@ -8249,70 +8261,60 @@ impl Backend for KmsBackend {
         foreground: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Body: drawable(4) + gc(4) + x(2) + y(2) + text_items.
-        // Each item is len(u8), delta(i8), then len CHAR2B values.
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM16.
+        // Each TEXTITEM16 is `len(u8) delta(i8) chars(2*len)` (chars are
+        // CHAR2B, big-endian) for len in 0..=254, or `255 font_id(u32 BE)`
+        // for a font change. No inter-item padding (only trailing request
+        // padding).
         if body.len() < 12 {
             return Ok(());
         }
         let x = i16::from_le_bytes([body[8], body[9]]) as i32;
         let y = i16::from_le_bytes([body[10], body[11]]) as i32;
         let mut cursor_x = x;
-        let mut pos = 12usize;
+        let mut items = &body[12..];
 
-        while pos < body.len() {
-            let len = body[pos] as usize;
-            pos += 1;
-            if len == 0 {
-                break;
-            }
+        while items.len() >= 2 {
+            let len = items[0];
             if len == 255 {
-                if pos + 7 <= body.len() {
-                    let font_xid = u32::from_le_bytes([
-                        body[pos + 3],
-                        body[pos + 4],
-                        body[pos + 5],
-                        body[pos + 6],
-                    ]);
-                    self.current_font = Some(font_xid);
-                    pos += 7;
-                } else {
+                if items.len() < 5 {
                     break;
                 }
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.current_font = Some(font_xid);
+                items = &items[5..];
                 continue;
             }
-            if pos >= body.len() {
+            let delta = items[1] as i8;
+            let len = len as usize;
+            let needed = 2 + 2 * len;
+            if items.len() < needed {
                 break;
             }
-            let delta = body[pos] as i8;
-            pos += 1;
-            cursor_x += i32::from(delta);
-
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
             let mut chars = Vec::with_capacity(len);
-            for _ in 0..len {
-                if pos + 2 > body.len() {
-                    break;
-                }
-                let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
-                pos += 2;
+            for i in 0..len {
+                let codepoint = u16::from_be_bytes([items[2 + 2 * i], items[2 + 2 * i + 1]]) as u32;
                 chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
             }
-            self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
-            if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
-                cursor_x += chars
-                    .iter()
-                    .map(|ch| {
-                        font_state
-                            .char_info_cache
-                            .get(ch)
-                            .map(|ci| ci.character_width as i32)
-                            .unwrap_or(6)
-                    })
-                    .sum::<i32>();
+            if !chars.is_empty() {
+                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+                if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+                    cursor_x = cursor_x.saturating_add(
+                        chars
+                            .iter()
+                            .map(|ch| {
+                                font_state
+                                    .char_info_cache
+                                    .get(ch)
+                                    .map(|ci| ci.character_width as i32)
+                                    .unwrap_or(6)
+                            })
+                            .sum::<i32>(),
+                    );
+                }
             }
-
-            let item_len = 2 + len * 2;
-            let pad = (4 - (item_len % 4)) % 4;
-            pos = pos.saturating_add(pad).min(body.len());
+            items = &items[needed..];
         }
         Ok(())
     }
@@ -10159,5 +10161,83 @@ mod tests {
             backend.screen_dirty,
             "mark_dirty must re-arm the flag for the next composite"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // PolyText{8,16} wire-format parsing — TEXTITEM is `len(u8) delta(i8)
+    // chars(len*itemSize)` for len in 0..=254, or `255 font_id(u32 BE)` for a
+    // font change. Pre-fix code read the first byte as `delta`, dropped the
+    // delta byte, included it as a leading char, and read the font id at the
+    // wrong offset / endianness — visible as bold/colored xterm text doubling
+    // ("create" → "ccrate" with each glyph offset by ~6 px from the SOH char
+    // shifting the cursor on the bold-overdraw pass).
+    // ---------------------------------------------------------------------------
+    fn poly_text_header(x: i16, y: i16) -> Vec<u8> {
+        let mut h = Vec::with_capacity(12);
+        h.extend_from_slice(&0u32.to_le_bytes()); // drawable
+        h.extend_from_slice(&0u32.to_le_bytes()); // gc
+        h.extend_from_slice(&x.to_le_bytes());
+        h.extend_from_slice(&y.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn poly_text8_string_then_font_change_consumes_correct_byte_count() {
+        // Pre-fix this fails because the buggy parser would read the leading
+        // `len=6` byte as `delta`, then misread the trailing 'e' as a new
+        // item, never reaching the font-change marker.
+        let mut b = make_test_backend();
+        let mut body = poly_text_header(0, 0);
+        // String item: len=6, delta=+1 (xterm bold-overdraw pattern), "create"
+        body.push(6);
+        body.push(1);
+        body.extend_from_slice(b"create");
+        // Font change: 0xff, font id 0x12345678 big-endian
+        body.push(0xff);
+        body.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+
+        b.poly_text8(None, 0, 0, &body).unwrap();
+        assert_eq!(b.current_font, Some(0x1234_5678));
+    }
+
+    #[test]
+    fn poly_text8_font_change_uses_big_endian_font_id() {
+        let mut b = make_test_backend();
+        let mut body = poly_text_header(0, 0);
+        body.push(0xff);
+        body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        b.poly_text8(None, 0, 0, &body).unwrap();
+        assert_eq!(b.current_font, Some(0xAABB_CCDD));
+    }
+
+    #[test]
+    fn poly_text8_zero_length_item_consumes_two_bytes_and_continues() {
+        // X11: `len=0` is a delta-only adjustment (still 2 bytes: len + delta).
+        // Pre-fix it terminated the loop, so any subsequent items were dropped.
+        let mut b = make_test_backend();
+        let mut body = poly_text_header(0, 0);
+        body.push(0); // len=0 (delta-only)
+        body.push(7); // delta=+7
+        body.push(0xff);
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        b.poly_text8(None, 0, 0, &body).unwrap();
+        assert_eq!(b.current_font, Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn poly_text16_string_then_font_change_consumes_correct_byte_count() {
+        // PolyText16 chars are 2 bytes each, big-endian (CHAR2B).
+        let mut b = make_test_backend();
+        let mut body = poly_text_header(0, 0);
+        body.push(3); // len=3 (chars)
+        body.push(0); // delta=0
+        body.extend_from_slice(&[0x00, b'A', 0x00, b'B', 0x00, b'C']);
+        body.push(0xff);
+        body.extend_from_slice(&[0xCA, 0xFE, 0xF0, 0x0D]);
+
+        b.poly_text16(None, 0, 0, &body).unwrap();
+        assert_eq!(b.current_font, Some(0xCAFE_F00D));
     }
 }
