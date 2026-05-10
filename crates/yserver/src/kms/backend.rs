@@ -18,7 +18,7 @@ use yserver_core::{
 };
 use yserver_protocol::x11::{
     CharInfo as ProtocolCharInfo, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8,
-    ResourceId, xfixes,
+    RENDER_FMT_ARGB32, ResourceId, xfixes,
 };
 
 use crate::drm;
@@ -807,7 +807,15 @@ fn default_drawable_picture(host_xid: u32) -> PictureState {
 enum GlyphSetFormat {
     A8,
     A1,
-    Other, // ARGB32 etc — not supported for glyph masks yet
+    /// ARGB32 source glyphs (Cairo's default for modern GTK3 themes
+    /// using subpixel / colour-emoji rendering). On `AddGlyphs` we
+    /// extract the alpha channel into a densely-packed A8 buffer and
+    /// store the glyph as if it had been uploaded in A8 format — the
+    /// downstream atlas + text pipeline path is identical from there
+    /// on. Subpixel coverage detail and emoji colour are lost; glyph
+    /// shape is preserved, which is enough for grayscale text.
+    Argb32,
+    Other,
 }
 
 struct StoredGlyph {
@@ -4051,31 +4059,60 @@ impl KmsBackend {
         // than blending — incorrect if the run overlaps existing
         // pixels. Conservative: only handle `Over`.
         if op != 3 {
+            log::debug!("vk text bail: op={op} (only Over=3 supported)");
             return false;
         }
 
         // SolidFill src only.
         let foreground_premul = match self.pictures.get(&host_src) {
             Some(PictureState::SolidFill { premul, .. }) => *premul,
-            _ => return false,
+            Some(other) => {
+                log::debug!(
+                    "vk text bail: src 0x{host_src:x} is {:?}, expected SolidFill",
+                    std::mem::discriminant(other)
+                );
+                return false;
+            }
+            None => {
+                log::debug!("vk text bail: src 0x{host_src:x} not registered");
+                return false;
+            }
         };
 
         let (dst_xid, _clip) = match self.pictures.get(&host_dst) {
             Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
-            _ => return false,
+            Some(other) => {
+                log::debug!(
+                    "vk text bail: dst 0x{host_dst:x} is {:?}, expected Drawable",
+                    std::mem::discriminant(other)
+                );
+                return false;
+            }
+            None => {
+                log::debug!("vk text bail: dst 0x{host_dst:x} not registered");
+                return false;
+            }
         };
 
         if !self.glyphsets.contains_key(&host_gs) {
+            log::debug!("vk text bail: glyphset 0x{host_gs:x} not registered");
             return false;
         }
 
         let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            log::debug!("vk text bail: no Vk context");
             return false;
         };
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            log::debug!("vk text bail: no ops_command_pool");
             return false;
         };
         if self.glyph_atlas.is_none() || self.text_pipeline.is_none() {
+            log::debug!(
+                "vk text bail: atlas_init={} pipeline_init={}",
+                self.glyph_atlas.is_some(),
+                self.text_pipeline.is_some()
+            );
             return false;
         }
 
@@ -4088,6 +4125,10 @@ impl KmsBackend {
             None
         };
         if mirror_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            log::debug!(
+                "vk text bail: dst mirror format {:?} != BGRA (dst_xid=0x{dst_xid:x})",
+                mirror_format
+            );
             return false;
         }
 
@@ -4193,7 +4234,10 @@ impl KmsBackend {
                             }
                             &a8_scratch
                         }
-                        GlyphSetFormat::Other => {
+                        // ARGB32-source glyphs are pre-converted to A8 in
+                        // `parse_add_glyphs`, so the stored format is A8 —
+                        // we should never see ARGB32 here. Be defensive.
+                        GlyphSetFormat::Argb32 | GlyphSetFormat::Other => {
                             return false;
                         }
                     };
@@ -8705,9 +8749,13 @@ impl Backend for KmsBackend {
         let format = match ynest_format {
             RENDER_FMT_A8 => GlyphSetFormat::A8,
             RENDER_FMT_A1 => GlyphSetFormat::A1,
+            RENDER_FMT_ARGB32 => GlyphSetFormat::Argb32,
             _ => GlyphSetFormat::Other,
         };
         let id = self.next_host_xid();
+        log::debug!(
+            "render_create_glyphset: client_format=0x{ynest_format:x} -> {format:?} host_gs=0x{id:x}"
+        );
         self.glyphsets.insert(
             id,
             GlyphSetState {
@@ -8928,34 +8976,47 @@ impl Backend for KmsBackend {
             let a = u16::from_le_bytes([color[6], color[7]]) as f32 / 65535.0;
             [r, g, b, a]
         };
-        if let Some((_, scissor)) =
+        let Some((_, scissor)) =
             self.build_render_composite_inputs(&picture_clip, 0, 0, 0, 0, 0, 0, 1, 1)
-        {
-            let composite_rects: Vec<crate::kms::vk::ops::render::CompositeRect> = decoded
-                .iter()
-                .map(|r| crate::kms::vk::ops::render::CompositeRect {
-                    src_x: 0,
-                    src_y: 0,
-                    mask_x: 0,
-                    mask_y: 0,
-                    dst_x: i32::from(r.x),
-                    dst_y: i32::from(r.y),
-                    width: u32::from(r.width),
-                    height: u32::from(r.height),
-                })
-                .collect();
-            self.try_vk_render_composite(
-                op,
-                RenderPic::Solid(color_premul),
-                RenderPic::None,
-                dst_drawable_xid,
-                &composite_rects,
-                scissor,
-                Repeat::None,
-                Repeat::None,
-                None,
-                None,
-                false,
+        else {
+            log::debug!(
+                "render_fill_rectangles bail: build_inputs returned None \
+                 (dst=0x{host_dst:x} drawable=0x{dst_drawable_xid:x})"
+            );
+            return Ok(());
+        };
+        let composite_rects: Vec<crate::kms::vk::ops::render::CompositeRect> = decoded
+            .iter()
+            .map(|r| crate::kms::vk::ops::render::CompositeRect {
+                src_x: 0,
+                src_y: 0,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: i32::from(r.x),
+                dst_y: i32::from(r.y),
+                width: u32::from(r.width),
+                height: u32::from(r.height),
+            })
+            .collect();
+        let took = self.try_vk_render_composite(
+            op,
+            RenderPic::Solid(color_premul),
+            RenderPic::None,
+            dst_drawable_xid,
+            &composite_rects,
+            scissor,
+            Repeat::None,
+            Repeat::None,
+            None,
+            None,
+            false,
+        );
+        if !took {
+            log::debug!(
+                "render_fill_rectangles bail: try_vk_render_composite returned false \
+                 (op={op} dst_drawable=0x{dst_drawable_xid:x} nrects={} color={:?})",
+                composite_rects.len(),
+                color_premul,
             );
         }
         Ok(())
@@ -9620,7 +9681,17 @@ impl Backend for KmsBackend {
 /// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.
 /// `body_tail` is everything after the 4-byte glyphset XID.
 pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
-    if !matches!(gs.format, GlyphSetFormat::A8 | GlyphSetFormat::A1) {
+    if !matches!(
+        gs.format,
+        GlyphSetFormat::A8 | GlyphSetFormat::A1 | GlyphSetFormat::Argb32
+    ) {
+        log::debug!(
+            "parse_add_glyphs bail: format={:?} (only A8/A1/ARGB32 supported) — {} glyphs lost",
+            gs.format,
+            body_tail
+                .get(..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        );
         return;
     }
     if body_tail.len() < 4 {
@@ -9651,6 +9722,8 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
         let stride = match gs.format {
             GlyphSetFormat::A8 => (w + 3) & !3,
             GlyphSetFormat::A1 => w.div_ceil(32) * 4,
+            // CARD32 per pixel; row size always 4-aligned, no per-row pad.
+            GlyphSetFormat::Argb32 => w * 4,
             GlyphSetFormat::Other => return,
         };
         let nbytes = stride * h;
@@ -9658,16 +9731,32 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
             break;
         }
         let wire = &body_tail[data_off..data_off + nbytes];
-        let pixels = match gs.format {
+        // For ARGB32 we extract the alpha byte from each pixel into a
+        // densely-packed A8 buffer and record the stored glyph as A8.
+        // The downstream atlas + text pipeline path then handles it
+        // identically to a real A8 upload.
+        let (pixels, stored_format) = match gs.format {
             GlyphSetFormat::A8 => {
                 let mut pixels = vec![0u8; w * h];
                 for row in 0..h {
                     pixels[row * w..row * w + w]
                         .copy_from_slice(&wire[row * stride..row * stride + w]);
                 }
-                pixels
+                (pixels, GlyphSetFormat::A8)
             }
-            GlyphSetFormat::A1 => wire.to_vec(),
+            GlyphSetFormat::A1 => (wire.to_vec(), GlyphSetFormat::A1),
+            GlyphSetFormat::Argb32 => {
+                // Pixel bytes per X RENDER ARGB32 = little-endian
+                // CARD32 with alpha-shift=24 → memory order [B, G, R, A].
+                let mut pixels = vec![0u8; w * h];
+                for row in 0..h {
+                    let row_off = row * stride;
+                    for col in 0..w {
+                        pixels[row * w + col] = wire[row_off + col * 4 + 3];
+                    }
+                }
+                (pixels, GlyphSetFormat::A8)
+            }
             GlyphSetFormat::Other => return,
         };
         data_off += nbytes;
@@ -9681,7 +9770,7 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 x_off,
                 y_off,
                 pixels,
-                format: gs.format,
+                format: stored_format,
             },
         );
     }
