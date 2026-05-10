@@ -6049,6 +6049,165 @@ impl KmsBackend {
         self.composite_and_flip()
     }
 
+    /// Diagnostic: dump the current scanout BO contents to a PPM file
+    /// in the process's cwd (`./yserver-scanout-N.ppm`, N
+    /// auto-incremented). Triggered by SIGUSR1. Picks the bo currently
+    /// in `OnScreen` (preferred) or `Pending` / `Submitted` /
+    /// `Recording` (fallbacks) phase — i.e. whatever is closest to
+    /// "what's on the monitor right now".
+    pub fn do_dump_scanout(&mut self) -> io::Result<()> {
+        use crate::kms::vk::{ops::run_one_shot_op, scanout::BoPhase};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(vk) = self.vk.as_ref().cloned() else {
+            return Err(io::Error::other("no vulkan context"));
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Err(io::Error::other("no ops command pool"));
+        };
+
+        // Pick a bo, preferring "currently on screen" over earlier
+        // states. Falls through to recording / submitted (so we can
+        // dump even mid-pageflip-pending).
+        let preferred = [
+            BoPhase::OnScreen,
+            BoPhase::Pending,
+            BoPhase::Submitted,
+            BoPhase::Recording,
+        ];
+        let mut chosen: Option<(usize, usize)> = None;
+        'outer: for phase in preferred {
+            for (pi, pool) in self.scanout_pools.iter().enumerate() {
+                let Some(pool) = pool.as_ref() else {
+                    continue;
+                };
+                if let Some(bi) = pool.bos.iter().position(|b| b.state.phase == phase) {
+                    chosen = Some((pi, bi));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((pool_idx, bo_idx)) = chosen else {
+            return Err(io::Error::other("no non-Free scanout bo found"));
+        };
+
+        let pool = self.scanout_pools[pool_idx].as_mut().unwrap();
+        let bo = &mut pool.bos[bo_idx];
+        let width = bo.width;
+        let height = bo.height;
+        let pitch = bo.pitch;
+        let image = bo.vk_image;
+        let staging_buffer = bo.vk_transfer.staging_buffer;
+        let staging_mapped = bo.vk_transfer.staging_mapped;
+        let staging_size = bo.vk_transfer.staging_size;
+
+        // Record image→staging copy via the chain. Source layout is
+        // `COLOR_ATTACHMENT_OPTIMAL` (composite leaves it there) or
+        // sometimes `PRESENT_SRC_KHR` after a flip — use GENERAL on
+        // the dst side which is permissive enough not to fight either.
+        let ticket = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+            let pre = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(ash::vk::ImageLayout::GENERAL)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
+
+            let region = [ash::vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    ash::vk::ImageSubresourceLayers::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(ash::vk::Offset3D::default())
+                .image_extent(ash::vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            unsafe {
+                vk.device.cmd_copy_image_to_buffer(
+                    cb,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging_buffer,
+                    &region,
+                );
+            }
+
+            let post = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(ash::vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
+            Ok(())
+        })
+        .map_err(|e| io::Error::other(format!("scanout copy submit: {e:?}")))?;
+
+        vk.wait_ticket(ticket, std::time::Duration::MAX)
+            .map_err(|e| io::Error::other(format!("scanout copy wait: {e:?}")))?;
+
+        // Pick a unique filename so successive dumps don't clobber.
+        static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        let path = format!("./yserver-scanout-{n}.ppm");
+
+        let raw =
+            unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), staging_size as usize) };
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
+        let mut row_buf = vec![0u8; (width * 3) as usize];
+        for y in 0..height as usize {
+            let row_start = y * pitch as usize;
+            for x in 0..width as usize {
+                let pi = row_start + x * 4;
+                // BO format is XRGB8888 → memory bytes (LE) BGRX. PPM
+                // wants RGB.
+                let b = raw[pi];
+                let g = raw[pi + 1];
+                let r = raw[pi + 2];
+                let dst = x * 3;
+                row_buf[dst] = r;
+                row_buf[dst + 1] = g;
+                row_buf[dst + 2] = b;
+            }
+            file.write_all(&row_buf)?;
+        }
+        log::info!(
+            "do_dump_scanout: wrote {path} ({width}x{height}, bo phase {:?})",
+            self.scanout_pools[pool_idx].as_ref().unwrap().bos[bo_idx]
+                .state
+                .phase
+        );
+        Ok(())
+    }
+
     /// Disable each DRM output (CRTC + plane) for clean shutdown.
     /// Logs any per-output error and returns the last one so callers
     /// still see a failure, while attempting to tear down everything.
@@ -6652,6 +6811,12 @@ impl Backend for KmsBackend {
             return Ok(());
         }
         self.composite_and_flip()
+    }
+
+    fn dump_scanout(&mut self) {
+        if let Err(e) = self.do_dump_scanout() {
+            log::warn!("dump_scanout: {e}");
+        }
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, yserver_core::backend::BackendFdKind)> {

@@ -239,6 +239,7 @@ pub fn run_core(
                                 backend.mark_dirty();
                             }
                             Message::PageFlipReady => backend.on_page_flip_ready(state),
+                            Message::DumpScanout => backend.dump_scanout(),
                         }
                     }
                 }

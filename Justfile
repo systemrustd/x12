@@ -337,7 +337,7 @@ yserver-xterm-only-hw log="debug":
 yserver-e16-xterm-hw log="debug":
     cargo build --release --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\

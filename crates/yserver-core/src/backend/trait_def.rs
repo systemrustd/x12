@@ -221,6 +221,12 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Dump the current scanout buffer to a file in the process's
+    /// cwd. Diagnostic-only — fired from `Message::DumpScanout`
+    /// (SIGUSR1 on KMS). Default no-op for backends that don't
+    /// drive their own composite.
+    fn dump_scanout(&mut self) {}
+
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived
     /// from `BackendFdKind`.

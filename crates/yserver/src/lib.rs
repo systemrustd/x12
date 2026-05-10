@@ -114,9 +114,11 @@ pub fn run() -> io::Result<()> {
             })?;
     }
 
-    // signalfd → Message::Shutdown bridge. yserver-core deliberately
-    // doesn't depend on nix; a tiny thread wraps the SignalFd read so
-    // run_core only sees the channel-side `Shutdown` message.
+    // signalfd → Message bridge. yserver-core deliberately doesn't
+    // depend on nix; a tiny thread wraps the SignalFd read so run_core
+    // only sees channel-side messages. SIGINT/SIGTERM map to
+    // `Shutdown`; SIGUSR1 maps to `DumpScanout` (diagnostic — backend
+    // dumps the current scanout BO to a file in cwd).
     let signal_sender = sender.clone_handle();
     thread::Builder::new()
         .name("yserver-signalfd".into())
@@ -125,10 +127,16 @@ pub fn run() -> io::Result<()> {
             loop {
                 match signal_fd.read_signal() {
                     Ok(Some(siginfo)) => {
-                        log::info!(
-                            "yserver: received signal {}, requesting shutdown",
-                            siginfo.ssi_signo
-                        );
+                        let signo = siginfo.ssi_signo as i32;
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, dumping scanout");
+                            if signal_sender.send(Message::DumpScanout).is_err() {
+                                return;
+                            }
+                            // Stay alive — SIGUSR1 isn't fatal.
+                            continue;
+                        }
+                        log::info!("yserver: received signal {signo}, requesting shutdown");
                         let _ = signal_sender.send(Message::Shutdown);
                         return;
                     }
@@ -190,6 +198,9 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
+    // SIGUSR1 → diagnostic scanout dump. Blocked so signalfd consumes
+    // it instead of the default-action (which would terminate us).
+    mask.add(Signal::SIGUSR1);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))

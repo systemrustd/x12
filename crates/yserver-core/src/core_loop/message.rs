@@ -56,6 +56,10 @@ pub enum Message {
     PageFlipReady,
     /// signalfd readable.
     Shutdown,
+    /// SIGUSR1 received — the backend should dump the current scanout
+    /// buffer to a file in cwd for offline inspection. Diagnostic-only;
+    /// no-op for backends that don't drive their own composite.
+    DumpScanout,
 }
 
 #[derive(Debug)]
