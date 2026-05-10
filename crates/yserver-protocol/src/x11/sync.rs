@@ -18,11 +18,11 @@ pub const DESTROY_ALARM: u8 = 11;
 pub const SET_PRIORITY: u8 = 12;
 pub const GET_PRIORITY: u8 = 13;
 pub const CREATE_FENCE: u8 = 14;
-pub const DESTROY_FENCE: u8 = 15;
-pub const TRIGGER_FENCE: u8 = 18;
-pub const RESET_FENCE: u8 = 19;
-pub const QUERY_FENCE: u8 = 20;
-pub const AWAIT_FENCE: u8 = 21;
+pub const TRIGGER_FENCE: u8 = 15;
+pub const RESET_FENCE: u8 = 16;
+pub const DESTROY_FENCE: u8 = 17;
+pub const QUERY_FENCE: u8 = 18;
+pub const AWAIT_FENCE: u8 = 19;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateFenceRequest {
@@ -282,5 +282,22 @@ mod tests {
         assert_eq!(reply.len(), 40);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 7);
+    }
+
+    // Canonical SYNC minor-opcode values, sourced from
+    // `/usr/include/X11/extensions/syncproto.h` and the xcbproto
+    // `sync.xml` registry. A prior numbering bug shipped these as
+    // 14/15/18/19/20/21, which made Mesa's `xcb_sync_trigger_fence`
+    // route to our DESTROY_FENCE handler and hung clients in
+    // `xshmfence_await`. Pin against the canonical table so any
+    // future drift is caught at unit-test time.
+    #[test]
+    fn sync_fence_opcodes_match_canonical_table() {
+        assert_eq!(CREATE_FENCE, 14, "X_SyncCreateFence");
+        assert_eq!(TRIGGER_FENCE, 15, "X_SyncTriggerFence");
+        assert_eq!(RESET_FENCE, 16, "X_SyncResetFence");
+        assert_eq!(DESTROY_FENCE, 17, "X_SyncDestroyFence");
+        assert_eq!(QUERY_FENCE, 18, "X_SyncQueryFence");
+        assert_eq!(AWAIT_FENCE, 19, "X_SyncAwaitFence");
     }
 }

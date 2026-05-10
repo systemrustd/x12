@@ -339,7 +339,7 @@ pub fn process_request(
         // ── SHAPE extension dispatcher ──
         141 => handle_shape_request(state, backend, origin, client_id, sequence, header, body),
         // ── SYNC extension dispatcher ──
-        142 => handle_sync_request(state, client_id, sequence, header, body),
+        142 => handle_sync_request(state, backend, client_id, sequence, header, body),
         // ── RANDR extension dispatcher ──
         128 => handle_randr_request(state, client_id, sequence, header, body),
         // ── RENDER extension dispatcher ──
@@ -1483,6 +1483,7 @@ fn handle_randr_request(
 
 fn handle_sync_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -1635,6 +1636,15 @@ fn handle_sync_request(
             if let Some(fence) = x11sync::parse_resource(body) {
                 if let Some(f) = state.sync_fences.get_mut(&fence) {
                     f.triggered = true;
+                }
+                // For DRI3-imported xshmfence-backed fences, the
+                // memory-only `f.triggered=true` above is invisible to
+                // Mesa's local `xshmfence_await`. Forward the trigger
+                // to the backend so it writes the shared 4-byte
+                // counter + futex-wakes any local waiter — Mesa's
+                // `loader_dri3_copy_drawable` blocks on exactly that.
+                if let Err(e) = backend.dri3_trigger_fence(fence) {
+                    log::warn!("SYNC::TriggerFence 0x{fence:x}: backend trigger failed: {e}");
                 }
                 debug!(
                     "client {} #{} SYNC::TriggerFence fence=0x{:x}",
@@ -9783,7 +9793,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 142,
-                data: 20, // QUERY_FENCE
+                data: 18, // QUERY_FENCE
                 length_units: 2,
             },
             &q_body,
@@ -9804,7 +9814,7 @@ mod tests {
             SequenceNumber(2),
             RequestHeader {
                 opcode: 142,
-                data: 18, // TRIGGER_FENCE
+                data: 15, // TRIGGER_FENCE
                 length_units: 2,
             },
             &q_body,
@@ -9820,7 +9830,7 @@ mod tests {
             SequenceNumber(2),
             RequestHeader {
                 opcode: 142,
-                data: 20,
+                data: 18, // QUERY_FENCE
                 length_units: 2,
             },
             &q_body,

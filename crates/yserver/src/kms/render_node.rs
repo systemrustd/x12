@@ -17,26 +17,39 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Open the render node that pairs with `card_fd`. The returned fd is
-/// O_CLOEXEC and owned by the caller.
-pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OwnedFd> {
+/// Resolve the render node sibling of `card_fd`, returning a freshly
+/// opened fd and the filesystem path. The path is retained so callers
+/// (`Backend::dri3_open`) can re-open a new kernel struct file for
+/// each client rather than `dup()`-ing a shared one — libdrm_amdgpu
+/// keeps per-struct-file GEM-handle namespaces, and dup'ing across
+/// clients makes them collide and crash inside `amdgpu_winsys_create`.
+pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
     let fd = card_fd.as_fd();
     let stat = fstat_rdev(fd)?;
     let major = libc_major(stat);
     let minor = libc_minor(stat);
 
     if let Some(path) = render_node_path_via_sysfs((major, minor))? {
-        return open_cloexec(&path);
+        let fd = open_cloexec(&path)?;
+        return Ok((fd, path));
     }
 
     if let Some(path) = render_node_path_via_dev_walk((major, minor))? {
-        return open_cloexec(&path);
+        let fd = open_cloexec(&path)?;
+        return Ok((fd, path));
     }
 
     Err(io::Error::other(format!(
         "no DRM render node found for card with rdev {major}:{minor} \
          (sysfs walk and /dev/dri scan both yielded nothing)"
     )))
+}
+
+/// Resolve a fresh `O_RDWR | O_CLOEXEC` fd for an already-known render
+/// node path. Used by `Backend::dri3_open` so each DRI3 client gets
+/// its own kernel struct file (see `open_for_card` doc).
+pub fn open_fresh(path: &Path) -> io::Result<OwnedFd> {
+    open_cloexec(path)
 }
 
 /// Resolve `(major, minor)` of a card device to the sibling render

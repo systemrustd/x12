@@ -525,13 +525,20 @@ impl OutputLayout {
 pub struct KmsBackend {
     // DRM (Phase 6.1 reuse)
     device: Arc<drm::Device>,
-    /// Render-node fd dup'd per `Backend::dri3_open` call (Phase 4.2,
-    /// Task 6). Sibling of `device` on single-GPU; resolved at backend
-    /// init via sysfs walk (`/sys/dev/char/<major>:<minor>/device/drm`)
+    /// Long-lived render-node fd held by the server (Phase 4.2, Task
+    /// 6). Sibling of `device` on single-GPU; resolved at backend init
+    /// via sysfs walk (`/sys/dev/char/<major>:<minor>/device/drm`)
     /// with a `/dev/dri/renderD*` enumeration fallback. None on the
-    /// `for_tests` path. Wired into `Backend::dri3_open` in Task 7.
+    /// `for_tests` path. Used only as a sentinel for DRI3 availability
+    /// and to keep the device referenced; `Backend::dri3_open` opens a
+    /// **fresh** fd at `render_node_path` per client (libdrm_amdgpu
+    /// state is per-struct-file).
     #[allow(dead_code)]
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
+    /// Filesystem path of the render node held in `render_node_fd`.
+    /// Per-client opens in `Backend::dri3_open` go through this path
+    /// so each client gets its own kernel struct file.
+    pub(crate) render_node_path: Option<std::path::PathBuf>,
     /// XSync `Fence` and DRI3 `Syncobj` resources backed by
     /// `VkSemaphore` (Phase 4.2.2 Tasks 19, 20). Keyed by client XID.
     /// Each entry was imported via `kms::vk::sync::import_sync_file`
@@ -1107,34 +1114,34 @@ impl KmsBackend {
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
         let device = Arc::new(drm::Device::open(device_path)?);
-        let render_node_fd = match crate::kms::render_node::open_for_card(&*device) {
-            Ok(fd) => {
-                use std::os::fd::AsRawFd;
-                let raw = fd.as_raw_fd();
-                let link = std::fs::read_link(format!("/proc/self/fd/{raw}")).unwrap_or_default();
-                let stat_minor = std::fs::metadata(&link)
-                    .ok()
-                    .map(|m| {
-                        use std::os::unix::fs::MetadataExt;
-                        let rdev = m.rdev();
-                        ((rdev >> 8) & 0xff, rdev & 0xff)
-                    })
-                    .map(|(maj, min)| format!("{maj}:{min}"))
-                    .unwrap_or_else(|| "?".into());
-                log::info!(
-                    "DRI3 render node ready (sibling of {device_path}): fd={raw} \
-                     path={link:?} rdev={stat_minor} (render node minor should be >=128)"
-                );
-                Some(fd)
-            }
-            Err(err) => {
-                log::warn!(
-                    "DRI3 render node unavailable: {err}; DRI3 import path will be \
+        let (render_node_fd, render_node_path) =
+            match crate::kms::render_node::open_for_card(&*device) {
+                Ok((fd, path)) => {
+                    use std::os::fd::AsRawFd;
+                    let raw = fd.as_raw_fd();
+                    let stat_minor = std::fs::metadata(&path)
+                        .ok()
+                        .map(|m| {
+                            use std::os::unix::fs::MetadataExt;
+                            let rdev = m.rdev();
+                            ((rdev >> 8) & 0xff, rdev & 0xff)
+                        })
+                        .map(|(maj, min)| format!("{maj}:{min}"))
+                        .unwrap_or_else(|| "?".into());
+                    log::info!(
+                        "DRI3 render node ready (sibling of {device_path}): fd={raw} \
+                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
+                    );
+                    (Some(fd), Some(path))
+                }
+                Err(err) => {
+                    log::warn!(
+                        "DRI3 render node unavailable: {err}; DRI3 import path will be \
                      unavailable but the rest of yserver continues"
-                );
-                None
-            }
-        };
+                    );
+                    (None, None)
+                }
+            };
         let outputs = drm::modeset::discover_outputs(&device)?;
 
         // Horizontal layout in connector order. If anything fails part
@@ -1533,6 +1540,7 @@ impl KmsBackend {
         let mut me = Self {
             device,
             render_node_fd,
+            render_node_path,
             dri3_sync_resources: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             outputs: layouts,
@@ -6391,13 +6399,18 @@ impl Backend for KmsBackend {
     }
 
     fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
-        // Per design §3.2: dup the long-lived render-node fd so each
-        // client gets its own fd. Ownership transfers to the caller.
-        let fd = self.render_node_fd.as_ref().ok_or_else(|| {
+        // Open a fresh fd at the render-node path per client. dup()'ing
+        // a shared long-lived fd would give every client the same
+        // kernel struct file, and libdrm_amdgpu maintains GEM handles
+        // + contexts in per-struct-file state — the first client
+        // populates it, the second crashes in `amdgpu_winsys_create`
+        // hitting leftover handles. Xorg's `glamor_dri3_open_client`
+        // does the same fresh-open dance for the same reason.
+        let path = self.render_node_path.as_deref().ok_or_else(|| {
             io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
         })?;
-        fd.try_clone()
-            .map_err(|e| io::Error::other(format!("dup render-node fd: {e}")))
+        crate::kms::render_node::open_fresh(path)
+            .map_err(|e| io::Error::other(format!("open render-node {}: {e}", path.display())))
     }
 
     fn dri3_import_pixmap(
@@ -9281,21 +9294,41 @@ impl Backend for KmsBackend {
         minor: u8,
         _body: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
-        // XKB minor opcodes per `xkbproto`. The earlier in-tree
-        // routing had 20→GetCompatMap and 24→GetControls swapped
-        // with the actual numbers; xkbproto puts GetControls at 6,
-        // GetMap at 8, GetCompatMap at 10, GetNames at 17,
-        // GetDeviceInfo at 24. Wrong routing → wrong-sized replies
-        // → wezterm/GTK segfaults on first XKB pass.
+        // XKB minor opcodes per `xkbproto` / `xcb/xkb.xml`. Reply
+        // minors get a body; **void** minors must produce no reply
+        // at all — clients that use `_checked` variants call
+        // `xcb_request_check`, which asserts `!reply` and aborts
+        // the client (`xcb_in.c:757` — what we just saw kill
+        // wezterm on `XkbSelectEvents`).
+        //
+        // Reply minors: 0 UseExtension, 4 GetState, 6 GetControls,
+        // 8 GetMap, 10 GetCompatMap, 12 GetIndicatorState,
+        // 13 GetIndicatorMap, 15 GetNamedIndicator, 17 GetNames,
+        // 19 GetGeometry, 21 PerClientFlags, 22 ListComponents,
+        // 23 GetKbdByName, 24 GetDeviceInfo, 101 SetDebuggingFlags.
+        // Void minors: 1 SelectEvents, 3 Bell, 5 LatchLockState,
+        // 7 SetControls, 9 SetMap, 11 SetCompatMap,
+        // 14 SetIndicatorMap, 16 SetNamedIndicator, 18 SetNames,
+        // 20 SetGeometry, 25 SetDeviceInfo.
         use crate::kms::xkb as xkb_replies;
         let reply = match minor {
+            // Reply minors with a real-data path.
             0 => Some(xkb_replies::reply_use_extension()),
             6 => Some(xkb_replies::reply_get_controls(&self.xkb_keymap.0)),
             8 => Some(xkb_replies::reply_get_map(&self.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
             17 => Some(xkb_replies::reply_get_names(&self.xkb_keymap.0)),
             24 => Some(xkb_replies::reply_get_device_info()),
-            _ => Some(xkb_replies::reply_minimal(minor)),
+            // Reply minors we don't model — answer with a minimal
+            // 32-byte zero reply so xcb completes the cookie.
+            4 | 12 | 13 | 15 | 19 | 21 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
+            // Void minors — return None so no reply hits the wire.
+            1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
+            // Unknown minor — be defensive and stay silent.
+            _ => {
+                log::debug!("xkb: unknown minor {minor}, no reply sent");
+                None
+            }
         };
         Ok(reply)
     }
@@ -9631,6 +9664,7 @@ mod tests {
         KmsBackend {
             device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
+            render_node_path: None,
             dri3_sync_resources: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             outputs: vec![super::OutputLayout {

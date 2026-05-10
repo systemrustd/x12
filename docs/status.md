@@ -3273,3 +3273,133 @@ Open in [`known-issues.md`](known-issues.md) under "KMS backend":
 4. If a follow-up wants to retry the per-op-wait-removal idea, do
    it incrementally + with validation enabled + against an
    e16-style real session, not synthetic test suites.
+
+## GLX/DRI3/XKB hardening session (2026-05-10) — wezterm shipped
+
+Branch `fix/sync-fence-opcodes` landed seven fixes that took the
+hw KMS backend from "glxinfo hangs" to "wezterm runs". Each fix
+is grounded in an external source, not reasoning from first
+principles — the recurring theme of the session.
+
+### Fixes (in order of discovery)
+
+1. **SYNC fence opcodes were shifted** (`525529e`). Our constants
+   shipped as `Trigger=18, Reset=19, Destroy=15, Query=20,
+   Await=21`. Canonical (xsyncproto.h + xcb sync.xml):
+   `Trigger=15, Reset=16, Destroy=17, Query=18, Await=19`. Mesa's
+   `xcb_sync_trigger_fence` was routing through our DestroyFence
+   handler — it removed the fence record without triggering it,
+   and Mesa hung in `xshmfence_await`. Regression test pins the
+   constants.
+
+2. **`TriggerFence` didn't propagate to backend** (`c86b1bd`).
+   Even with correct opcodes, the handler only flipped
+   `state.sync_fences[xid].triggered = true`. For DRI3-imported
+   xshmfence-backed fences (Mesa's `FenceFromFD`), Mesa
+   client-side waits on the futex-backed memfd via
+   `xshmfence_await`. Server has to call
+   `backend.dri3_trigger_fence(xid)` (which calls
+   `xshmfence_trigger` → futex wake) for that wait to clear.
+
+3. **DRI3::Open dup'd one server-held fd** (`f0361de`). Caused
+   the second amdgpu client per session to segfault in
+   `amdgpu_winsys_create` — libdrm_amdgpu keeps GEM-handle and
+   context state per kernel struct file, so dup is wrong; every
+   call has to `open()` the render-node path fresh, like
+   `glamor_dri3_open_client`. We now keep
+   `render_node_path: Option<PathBuf>` alongside the long-lived
+   fd and re-open per call.
+
+4. **XKB GetMap/GetNames/GetControls published empty placeholders**
+   (`e49b6e7`). xkbcommon-x11 ran its validation and rejected
+   the keymap (`numGroups=0`, `which=0`, wrong field offsets in
+   GetControls). Rebuilt the three replies against
+   `XKBproto.h` field offsets + xkbcommon's `FAIL_UNLESS` masks
+   (objdump on `libxkbcommon-x11.so.0.13.1`). Two KeyTypes
+   (`ONE_LEVEL`, `TWO_LEVEL`), per-key syms from xkbcommon,
+   modifier-map keyed off level-0 keysyms.
+
+5. **`xcb_xkb_get_device_info_reply_t` is 36 bytes, not 32**
+   (`9682c83`). The C struct embeds `nameLen` (CARD16 at offset
+   32) plus 2 bytes of trailing pad; clients cast the libxcb
+   reply pointer to the struct and read past a 32-byte
+   allocation. Caused OOB reads on the heap, which surfaced as
+   garbage atom values in subsequent `GetAtomName` traffic. Fix:
+   publish 36 bytes with `length=1`, explicit `nameLen=0`.
+
+6. **xcb's `value_list_unpack` leaves absent-bitcase struct fields
+   uninitialized** (`ccf6317`). xkbcommon-x11's `get_names`
+   unconditionally reads `list.{keycodesName, symbolsName,
+   typesName, compatName}` from a stack-local
+   `xcb_xkb_get_names_value_list_t list;` — for `which` bits
+   that aren't set, those fields hold stack garbage, which the
+   atom interner dispatches as `GetAtomName(garbage)` requests.
+   Each `BadAtom` flips the interner's `had_error` flag, and the
+   keymap returns NULL. Fix: set bits
+   `Keycodes|Symbols|Types|Compat (0x35)` on top of the existing
+   `0xAC0`, and prepend four zero ATOMs (16 bytes) to the body
+   so xcb writes zeros, atom-interner short-circuits on `atom ==
+   0`, and the bogus traffic vanishes.
+
+7. **Void XKB requests can't carry a reply** (`967319f`). Our
+   `xkb_proxy` returned a 32-byte minimal reply for every minor
+   we didn't model specifically, including void requests like
+   `SelectEvents`. xcb's `xcb_request_check` asserts
+   `!reply` (`xcb_in.c:757`), aborting wezterm-gui the instant
+   it issues a checked `XkbSelectEvents`. Enumerated void minors
+   per `xkb.xml` (`1, 3, 5, 7, 9, 11, 14, 16, 18, 20, 25`) and
+   return `None` for them; reply minors we don't model still
+   get the 32-byte placeholder.
+
+### Outcomes
+
+- glxinfo / glxgears: ✓ render on hw (fixes 1, 2, 3 sufficient).
+- wezterm: ✓ runs on hw (all seven fixes required).
+- vkcube / vkgears: window opens and survives setup, then hangs
+  in `drmSyncobjTimelineWait` — Mesa-internal, not yserver. The
+  GPU work radv issues just before the first
+  `vkAcquireNextImageKHR` never returns its timeline value. Same
+  symptom regardless of whether the swapchain went down the
+  implicit-sync (`DRI3 FenceFromFD`) or syncobj path. Worth its
+  own debugging session with `RADV_DEBUG=startup,info` against a
+  symbolised libvulkan_radeon.
+- vng-side: a separate yserver crash under vng is still
+  outstanding when running vkcube — out of scope this session.
+
+### What worked
+
+The whole session moved on **external-source grounding** —
+`xsyncproto.h`, `xcb/sync.xml`, `XKBproto.h`,
+`/usr/share/xcb/xkb.xml`, gcc `sizeof()` against the installed
+xcb headers, objdump on `libxkbcommon-x11.so.0.13.1`, and the
+xkbcommon-x11 source pulled from upstream tarball. The
+`feedback_test_vectors_must_be_external` memory paid off
+several times — the first "fixed it, tests pass" XKB attempt
+shipped tests that asserted my own assumptions, and didn't
+actually fix wezterm. The follow-up that read xkbcommon's
+`get_names` source directly identified the real bug
+(unconditional reads of unpopulated struct fields) in one pass.
+
+### New durable lessons (memory)
+
+- `feedback_xcb_extension_reply_traps.md` — the three xcb
+  client-side gotchas (uninit unpack fields, struct size > wire
+  fixed header, void-checked aborts). Applies to any future
+  extension proxy.
+- `feedback_dri3_open_fresh_fd.md` — fresh open, not dup, per
+  DRI3::Open. Cross-references `glamor_dri3_open_client` for
+  authority.
+
+### Real next steps
+
+1. Vulkan WSI hang (`drmSyncobjTimelineWait` after first
+   `vkAcquireNextImageKHR`). Needs `RADV_DEBUG=info,startup`
+   output + a libvulkan_radeon-with-symbols backtrace to pin
+   which radv internal sync is parked. Two distinct fixes
+   prepared on this branch in the lead-up to the XKB path didn't
+   help here, so the wait is on Mesa-side state our DRI3
+   imports haven't satisfied — most likely the buffer's
+   reservation_object having an unresolved write fence from our
+   Vulkan import path.
+2. vng-side server crash on vkcube — separate triage; reproduce
+   under `vng` and capture the panic / coredump.
