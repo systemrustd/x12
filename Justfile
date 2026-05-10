@@ -314,7 +314,7 @@ yserver-fvwm3-xterm-hw log="debug":
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
         sleep 8;\
-        DISPLAY=:7 xterm;\
+        DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
@@ -342,7 +342,7 @@ yserver-e16-xterm-hw log="debug":
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
         sleep 2;\
-        DISPLAY=:7 xterm;\
+        DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log";\
@@ -356,7 +356,7 @@ yserver-wmaker-xterm-hw log="debug":
         sleep 2;\
         DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
-        DISPLAY=:7 xterm;\
+        DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log";\
