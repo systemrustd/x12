@@ -73,8 +73,10 @@ impl RandrState {
             .max()
             .unwrap_or(0);
         let screen_height: u16 = outputs.iter().map(|o| o.height).max().unwrap_or(0);
-        let width_mm = ((u32::from(screen_width) * 254 + 4800) / 9600).max(1);
-        let height_mm = ((u32::from(screen_height) * 254 + 4800) / 9600).max(1);
+        // mm = px * 25.4 / 96; integer form: (px*254 + 480) / 960. Previous
+        // divisor was off by 10× and made GTK auto-scale at extreme factors.
+        let width_mm = ((u32::from(screen_width) * 254 + 480) / 960).max(1);
+        let height_mm = ((u32::from(screen_height) * 254 + 480) / 960).max(1);
 
         // Collect unique modes preserving caller-allocated mode_ids.
         let mut modes: Vec<RandrMode> = Vec::new();
@@ -202,9 +204,9 @@ impl RandrState {
         let _ = config_timestamp; // accepted but not used
         let out = self.outputs.iter().find(|o| o.output_id == output_id)?;
         // Per-output mm derived from this output's pixel dimensions at
-        // 96 DPI (NOT the aggregated screen size).
-        let width_mm = ((u32::from(out.width) * 254 + 4800) / 9600).max(1);
-        let height_mm = ((u32::from(out.height) * 254 + 4800) / 9600).max(1);
+        // 96 DPI. Integer math: mm = (px*254 + 480) / 960.
+        let width_mm = ((u32::from(out.width) * 254 + 480) / 960).max(1);
+        let height_mm = ((u32::from(out.height) * 254 + 480) / 960).max(1);
         Some(OutputInfoReplyData {
             timestamp: self.timestamp,
             crtc: out.crtc_id,
@@ -260,13 +262,13 @@ mod tests {
     #[test]
     fn nested_constructor_dimensions() {
         // 800x600 at 96 DPI:
-        //   width_mm  = (800*254 + 4800) / 9600 = 21
-        //   height_mm = (600*254 + 4800) / 9600 = 16
+        //   width_mm  = (800*254 + 480) / 960 = 212  (real: 800*25.4/96 = 211.67)
+        //   height_mm = (600*254 + 480) / 960 = 159  (real: 600*25.4/96 = 158.75)
         let state = RandrState::nested(42, 800, 600);
         assert_eq!(state.screen_width, 800);
         assert_eq!(state.screen_height, 600);
-        assert_eq!(state.width_mm, 21);
-        assert_eq!(state.height_mm, 16);
+        assert_eq!(state.width_mm, 212);
+        assert_eq!(state.height_mm, 159);
         assert_eq!(state.timestamp, 42);
         assert_eq!(state.config_timestamp, 42);
     }
@@ -334,8 +336,8 @@ mod tests {
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.screen_width, 2304);
         assert_eq!(st.screen_height, 1024);
-        let expect_w = (2304u32 * 254 + 4800) / 9600;
-        let expect_h = (1024u32 * 254 + 4800) / 9600;
+        let expect_w = (2304u32 * 254 + 480) / 960;
+        let expect_h = (1024u32 * 254 + 480) / 960;
         assert_eq!(st.width_mm, expect_w);
         assert_eq!(st.height_mm, expect_h);
     }

@@ -1381,8 +1381,13 @@ fn handle_randr_request(
                 .enumerate()
                 .map(|(i, o)| {
                     let name_atom = state.atoms.intern(&o.name, false).0;
-                    let width_mm = ((u32::from(o.width) * 254 + 4800) / 9600).max(1);
-                    let height_mm = ((u32::from(o.height) * 254 + 4800) / 9600).max(1);
+                    // mm = px * 25.4 / 96, in integer math: (px*254 + 480)/960
+                    // (numerator is mm*10, denominator 96*10). The previous
+                    // 9600 divisor was off by 10× — gave us ~68 mm for a 2560
+                    // px monitor (≈ 956 DPI), triggering 10× GTK auto-scale
+                    // in mate-panel.
+                    let width_mm = ((u32::from(o.width) * 254 + 480) / 960).max(1);
+                    let height_mm = ((u32::from(o.height) * 254 + 480) / 960).max(1);
                     MonitorRow {
                         name_atom,
                         primary: i == 0,
