@@ -9000,11 +9000,14 @@ fn handle_send_event(
     };
     let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
     debug!(
-        "client {} #{} SendEvent type={} dest=0x{:x}",
+        "client {} #{} SendEvent type={} dest=0x{:x} event_mask=0x{:x} propagate={} targets={:?}",
         client_id.0,
         sequence.0,
         req.event[0] & 0x7f,
-        req.destination.0
+        req.destination.0,
+        req.event_mask,
+        req.propagate,
+        targets.iter().map(|c| c.0).collect::<Vec<_>>(),
     );
     Ok(RequestOutcome::Handled)
 }

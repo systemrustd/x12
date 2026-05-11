@@ -5366,7 +5366,7 @@ impl KmsBackend {
                 return;
             }
         };
-        log::trace!("libinput button code=0x{code:x} pressed={pressed} → X11 detail={detail}");
+        log::debug!("libinput button code=0x{code:x} pressed={pressed} → X11 detail={detail}");
         if pressed {
             self.log_hit_test_diagnostic();
         }

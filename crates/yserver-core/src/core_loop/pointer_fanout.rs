@@ -168,7 +168,7 @@ pub fn pointer_event_fanout_to_state(
             event.kind,
             PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
         ) {
-            log::trace!(
+            log::debug!(
                 "pointer_fanout: kind={:?} button={} host_xid=0x{:x} top_level=0x{:x} target=0x{:x} \
                  propagation_window=0x{:x} child=0x{:x} core_targets={:?} root=({},{}) event_xy=({},{})",
                 event.kind,
@@ -206,7 +206,7 @@ pub fn pointer_event_fanout_to_state(
 
     // ── XI2 fanout (always runs, independent of any core grab) ──────
     let Some(top_level_id) = top_level_id else {
-        log::trace!(
+        log::debug!(
             "pointer_fanout: kind={:?} host_xid=0x{:x} not in xid_map — XI2 fanout skipped",
             event.kind,
             event.host_xid,
@@ -228,7 +228,7 @@ pub fn pointer_event_fanout_to_state(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
     ) {
-        log::trace!(
+        log::debug!(
             "pointer_fanout XI2: kind={:?} button={} time={} target=0x{:x} top_level=0x{:x} \
              xi2_targets={:?} xi2_raw_targets={:?} root=({},{}) event_xy=({},{}) state=0x{:x}",
             event.kind,

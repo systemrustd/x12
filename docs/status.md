@@ -3975,3 +3975,114 @@ Tracked for next session.
   bullet now points at the CompositeGlyphs pen fix as the likely
   root cause; needs MATE re-test to confirm. Added e16 pager
   flicker as a separate open item.
+
+## MATE clicks investigation — popup grab semantics (2026-05-11)
+
+Bisect session against `yserver-mate-hw`. After the CompositeGlyphs
+fix, MATE labels render correctly and **hover effects work** (tray
+applets respond to enter/leave). But **clicking panel items does
+nothing** — except the calendar applet "reacted once".
+
+### Click delivery: working
+
+Promoted several pointer-event logs from `trace` to `debug` and
+captured a click session. Each `libinput button` event:
+
+- Reaches yserver from libinput ✓ (`code=0x110 pressed=true → X11
+  detail=1`).
+- Routes through `pointer_event_fanout_to_state` with correct hit
+  target.
+- Is delivered via XI2 to the right client(s). Example:
+  `pointer_fanout XI2: kind=ButtonPress target=0x2200003
+  top_level=0x1000003 xi2_targets=[16, 34] root=(2520,5)
+  event_xy=(149,5)` — mate-panel (client 16) and a tray applet
+  (client 34) both receive the event.
+
+GTK clients use XI2 exclusively for input. Our `xi2_mask_for_client`
+correctly walks the `[2, 1, 0]` device-candidate list and matches
+mate-panel's `XISelectEvents window=0x1000001 deviceid=1
+mask=0x1c01f0` against the dispatched event. No part of the input
+or fanout path is the bug.
+
+### What the calendar click revealed
+
+```
+ButtonPress  target=0x2200003 (calendar applet)   xi2_targets=[16, 34]
+ButtonPress  target=0x2200003                     xi2_targets=[16, 34]
+   ↓ client 43 maps a new top-level 0x2b00003 (calendar popup overlay)
+ButtonPress  target=0x2b00003 root=(0,0)          xi2_targets=[43]
+ButtonPress  target=0x2b00003 root=(31,21)        xi2_targets=[43]   ← clicks now stick here
+ButtonPress  target=0x2b00003 root=(53,19)        xi2_targets=[43]
+…
+```
+
+The first calendar click opens the popup (`client 43` maps
+`0x2b00003`, a full-screen transparent input-shield typical of GTK
+popups). From that moment, `event_xy == root_xy` confirming the
+popup is at `(0, 0)` and covers the whole screen. The popup is the
+topmost mapped window over every `root=(x, y)` we see, so our
+hit-test correctly routes all subsequent clicks to it.
+
+**The popup never unmaps.** `0x2b00003` is `MapWindow`'d once in
+the entire log and we see no matching `UnmapWindow`. GTK's
+convention is that a click *outside* the visible popup widget
+(but inside the shield) should make the popup dismiss itself. That
+dismissal isn't happening on our server.
+
+### Hypothesis: active-pointer-grab semantics missing
+
+The most likely cause is missing or incomplete handling of XInput2
+active grabs around popup lifecycle:
+
+1. GTK opens the popup. It may call `XIGrabDevice` to grab the
+   pointer so it can detect click-outside and dismiss itself.
+   **No `XIGrabDevice` from client 43 appears in the log** — either
+   our server isn't logging it (need to add a debug line in the XI2
+   dispatch arm for opcodes 51/52/54), or GTK is relying on a
+   different mechanism (focus / crossing events with
+   `mode=NotifyGrab`).
+2. With no active grab honored, the popup's "click outside →
+   dismiss" code path may be guarded behind grab events we don't
+   emit. The popup widget sees the ButtonPress arrive on
+   `0x2b00003` but doesn't know it's part of a grab cycle and
+   ignores it.
+
+### Diagnostic surface added on master
+
+Per-event 1-line debug logs (all kept; together they're ~3 lines
+per click — manageable on master at `RUST_LOG=debug`):
+
+- `libinput button code=… pressed=… → X11 detail=…` —
+  `kms/backend.rs::process_pointer_button`.
+- `pointer_fanout: kind=… host_xid=… top_level=… target=…
+  propagation_window=… child=… core_targets=… root=(…,…)
+  event_xy=(…,…)` — fires on ButtonPress / ButtonRelease only.
+- `pointer_fanout XI2: kind=… target=… top_level=…
+  xi2_targets=[…] xi2_raw_targets=[…] root=(…) event_xy=(…)
+  state=…` — fires on ButtonPress / ButtonRelease only.
+- `SendEvent type=… dest=… event_mask=… propagate=…
+  targets=[…]` — now shows resolved target client list, useful
+  for confirming IPC ClientMessage delivery.
+- `log_hit_test_diagnostic` reverted to `trace` — produces 25+
+  lines per click (every top-level + descend) and would drown
+  the log at `debug`.
+
+Together these proved that **all the delivery layers work**; the
+bug is downstream in popup grab/dismissal semantics.
+
+### Real next steps
+
+1. Add a `debug!` line in the XI2 dispatch path for opcodes 51
+   (`XIGrabDevice`), 52 (`XIUngrabDevice`), 54
+   (`XIPassiveGrabDevice`). Re-run, click the calendar, see whether
+   GTK is even attempting an active grab.
+2. If yes: check our implementation of those opcodes — are we
+   honouring the grab when routing subsequent events, generating
+   the `mode=NotifyGrab` crossing events GTK expects?
+3. If no: GTK is relying on a different signal we're not sending.
+   Candidates: `FocusIn`/`FocusOut` on the popup,
+   `EnterNotify`/`LeaveNotify` with `mode=NotifyGrab` when the
+   shield is mapped, or `XISelect` device-changed events.
+4. Cross-check against the gtk3-demo flow: same renderer, did
+   any of its popup menus (e.g. right-click) work? If yes the
+   diff would isolate mate-panel-specific behaviour.
