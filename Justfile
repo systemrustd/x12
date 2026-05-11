@@ -324,6 +324,23 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
+yserver-mate mode="1024x768" log="trace":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c '\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
+            yserver_pid=$!;\
+            sleep 2;\
+            DISPLAY=:7 wmaker > wmaker.log 2>&1 &\
+            sleep 2;\
+            DISPLAY=:7 xterm &\
+            wait $yserver_pid'
+
 # Run yserver directly on bare-metal hardware (no vng), capture its log,
 # and bring up fvwm3 + xterm against it. Intended for TTY2 use while
 # another graphical session (GNOME/Xorg) holds the user's main display
@@ -408,15 +425,13 @@ yserver-mate-hw log="debug":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 marco --display :7 > mate.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 wezterm;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log";\
-        echo "xfce log:    xfce.log"'
-
-# DISPLAY=:7 dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+        echo "mate log:    mate.log"'
 
 # Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
 # Mesa's loader_dri3 prints every probe step + driver load failure so
