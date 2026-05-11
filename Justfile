@@ -277,9 +277,9 @@ yserver-e16-xterm mode="1024x768" log="trace":
         -- bash -c '\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
-            sleep 2;\
+            sleep 3;\
             DISPLAY=:7 e16 > e16.log 2>&1 &\
-            sleep 2;\
+            sleep 3;\
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
