@@ -5233,12 +5233,17 @@ fn handle_xi2_request(
             return Ok(RequestOutcome::Handled);
         }
         45 => {
+            // XIGetClientPointer reply layout (xinput.xml):
+            //   response_type(1) | set:BOOL(1) | sequence(2) | length(4)
+            //   | win:WINDOW(4) | pad(20)
+            // Total = 32 bytes. set=0 (no per-client override), win=None.
+            // Earlier code wrote 34 bytes; xcb misaligned and asserted
+            // !xcb_xlib_threads_sequence_lost in the calling client.
             debug!("client {} #{} XIGetClientPointer", client_id.0, sequence.0);
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            reply.push(1);
-            reply.push(0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
-            reply.extend_from_slice(&[0; 22]);
+            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // win = None
+            reply.extend_from_slice(&[0u8; 20]);
+            debug_assert_eq!(reply.len(), 32);
             buf.extend_from_slice(&reply);
         }
         46 => {

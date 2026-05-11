@@ -4241,3 +4241,58 @@ Validation: `cargo test --workspace` green (272 + 208 + 88 + 9).
 `build_path_selector_inputs` doc warning, untouched). MATE
 re-run pending — would confirm the calendar applet (and other
 GTK popups) dismiss on outside clicks.
+
+## XIGetClientPointer reply was 34 bytes — mate-panel crashes (2026-05-11)
+
+Follow-up after the XI2 grab stubs landed and the user re-tested:
+panel buttons now work, but launching apps via the menu doesn't.
+mate-panel was logging:
+
+```
+mate-panel: xcb_io.c:287: poll_for_event:
+  Assertion `!xcb_xlib_threads_sequence_lost' failed.
+```
+
+Investigation in the fresh `yserver-hw.log` from the re-test:
+
+- 16+ successful `XIGrabDevice → Success (stub)` round-trips
+  from mate-panel during the click session — the panel was
+  driving popups end-to-end without hanging.
+- mate-panel disconnects within 24 lines after **every**
+  call to opcode-45 `XIGetClientPointer`. Same pattern on the
+  replacement mate-panel instances spawned by mate-session,
+  on the tray applets, etc. — 4 calls in the log, 4
+  disconnects within milliseconds.
+
+Root cause: the existing XIGetClientPointer handler
+(`process_request.rs:5235`) writes **34 bytes** instead of 32.
+It pushed 1 byte, 1 byte, a CARD16, then 22 zero bytes — total
+trailer of 26 bytes when the spec says 24. xcb reads exactly
+32 bytes; the two extra bytes shift the next reply/event two
+bytes out of phase, xcb's internal sequence tracker drifts,
+and the assertion fires.
+
+Per `/usr/share/xcb/xinput.xml` the layout is:
+
+```
+response_type(1) | set:BOOL(1) | sequence(2) | length(4)
+| win:WINDOW(4) | pad(20)         total = 32 bytes
+```
+
+Fix in the same handler: emit `set = 0`, `win = 0 (None)`,
+trailing `[0u8; 20]` instead of `[0u8; 22]`, plus a
+`debug_assert_eq!(reply.len(), 32)` so future regressions
+trip in debug builds.
+
+Why it was invisible before today: every X11 client that
+called XIGetClientPointer would hit the same misalignment,
+but most clients earlier in the project's lifetime were
+ones that didn't use it (rendercheck, xts probes, fvwm3,
+wezterm). MATE / GTK3 clients are the first that route popup
+state through `xcb_xinput_xi_get_client_pointer` — and they
+only reached that codepath today, after the XI2 grab stubs
+unblocked them.
+
+Validation: `cargo test --workspace` green
+(272 + 208 + 88 + 9). MATE re-run will confirm the panel
+stops crashing and that app launches go through.
