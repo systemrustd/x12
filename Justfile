@@ -212,6 +212,7 @@ yserver-fvwm3-xterm mode="1024x768" log="trace":
     vng -r {{KERNEL}} --disable-microvm --rw \
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
             sleep 2;\
@@ -257,6 +258,7 @@ yserver-glxgears mode="1024x768" log="info":
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
             export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
             for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
@@ -275,6 +277,7 @@ yserver-e16-xterm mode="1024x768" log="trace":
     vng -r {{KERNEL}} --disable-microvm --rw \
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
             sleep 3;\
@@ -283,11 +286,36 @@ yserver-e16-xterm mode="1024x768" log="trace":
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
+# Bring up yserver + e16 + wezterm under vng. wezterm exercises the
+# GLX → DRI3 → Present path that was the original motivation for the
+# zink override: vng's default Mesa driver is virgl, which rejects
+# wezterm's GL command stream on the host (`vrend_decode_ctx_submit_cmd:
+# Illegal command buffer`). Forcing `MESA_LOADER_DRIVER_OVERRIDE=zink`
+# routes GL through Mesa's zink (GL→Vulkan) which then goes via Venus,
+# bypassing virglrenderer entirely. wezterm under bare-metal works
+# without this override because the bare-metal stack uses radeonsi/anv
+# directly, not virgl.
+yserver-e16-wezterm mode="1024x768" log="info":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c '\
+            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
+            yserver_pid=$!;\
+            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
+            DISPLAY=:7 e16 > e16.log 2>&1 &\
+            sleep 4;\
+            DISPLAY=:7 wezterm &\
+            wait $yserver_pid'
+
 yserver-wmaker-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c '\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
             yserver_pid=$!;\
             sleep 2;\

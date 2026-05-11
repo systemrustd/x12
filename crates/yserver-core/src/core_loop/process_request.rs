@@ -4070,8 +4070,15 @@ fn handle_dri3_request(
                 }
                 Err(err) => {
                     debug!(
-                        "client {} #{} DRI3::PixmapFromBuffer pixmap=0x{:x} -> BadAlloc ({err})",
-                        client_id.0, sequence.0, req.pixmap,
+                        "client {} #{} DRI3::PixmapFromBuffer pixmap=0x{:x} {}x{} stride={} depth={} bpp={} -> BadAlloc ({err})",
+                        client_id.0,
+                        sequence.0,
+                        req.pixmap,
+                        req.width,
+                        req.height,
+                        req.stride,
+                        req.depth,
+                        req.bpp,
                     );
                     return emit_x11_error(
                         state,
@@ -4169,8 +4176,17 @@ fn handle_dri3_request(
                 }
                 Err(err) => {
                     debug!(
-                        "client {} #{} DRI3::PixmapFromBuffers pixmap=0x{:x} -> BadAlloc ({err})",
-                        client_id.0, sequence.0, req.pixmap,
+                        "client {} #{} DRI3::PixmapFromBuffers pixmap=0x{:x} {}x{} stride={} offset={} modifier=0x{:x} depth={} bpp={} -> BadAlloc ({err})",
+                        client_id.0,
+                        sequence.0,
+                        req.pixmap,
+                        req.width,
+                        req.height,
+                        req.strides[0],
+                        req.offsets[0],
+                        req.modifier,
+                        req.depth,
+                        req.bpp,
                     );
                     return emit_x11_error(
                         state,
@@ -4281,14 +4297,20 @@ fn handle_dri3_request(
             let (window_mods, screen_mods) =
                 backend.dri3_supported_modifiers(req.window, req.depth, req.bpp);
             debug!(
-                "client {} #{} DRI3::GetSupportedModifiers w=0x{:x} d={} bpp={} -> {} window mods, {} screen mods",
+                "client {} #{} DRI3::GetSupportedModifiers w=0x{:x} d={} bpp={} -> window={:?} screen={:?}",
                 client_id.0,
                 sequence.0,
                 req.window,
                 req.depth,
                 req.bpp,
-                window_mods.len(),
-                screen_mods.len(),
+                window_mods
+                    .iter()
+                    .map(|m| format!("0x{m:x}"))
+                    .collect::<Vec<_>>(),
+                screen_mods
+                    .iter()
+                    .map(|m| format!("0x{m:x}"))
+                    .collect::<Vec<_>>(),
             );
             let reply = x11dri3::encode_get_supported_modifiers_reply(
                 byte_order,

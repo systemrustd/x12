@@ -3583,3 +3583,115 @@ without a client that exercised the specific path.
   paired Release+Press); fine because classic auto-repeat works
   universally and our key-repeat implementation generates the right
   pairs already.
+
+## vng GL support — use zink, not virgl (2026-05-11)
+
+wezterm worked on bare-metal (radeon + intel iGPU) but rendered as
+a uniform black rectangle under vng. Same symptom for glxgears.
+Vulkan apps (vkcube) worked fine under vng. Investigated the DRI3
+path top-to-bottom; the actual fix is a one-line env-var change.
+
+### Diagnosis
+
+1. **First symptom — `BadAlloc` on DRI3::PixmapFromBuffers.** Mesa
+   error: `dri3_alloc_render_buffer:1691 xcb_dri3_pixmap_from_buffer[s]
+   failed; X error: 11`. Expanded the BadAlloc log in
+   `process_request.rs` to dump the (modifier, stride, offset,
+   width×height, depth, bpp) tuple and the actual modifier values
+   returned from `GetSupportedModifiers`.
+
+2. **Pinned the rejection inside `from_dmabuf`**: `vkCreateImage` with
+   `VkImageDrmFormatModifierExplicitCreateInfoEXT(modifier=LINEAR,
+   row_pitch=3280)` returns
+   `ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`. wezterm
+   client picked LINEAR (the only window-mod we advertise), and
+   `820 × 4 = 3280` is tight — 16-byte aligned, not 256.
+
+3. **Probed RADV's actual requirement** via a one-off in-process
+   sweep (image-create-and-destroy at strides 3280 / 3296 / 3328 /
+   3584 / 4096 with various usage flags). RADV's LINEAR layout for
+   B8G8R8A8 wants **256-byte pitch alignment**. 3328 onward passes
+   with `mem_align=256`; 3280 and 3296 fail. Reduced usage flags
+   don't relax the requirement. Implicit-LINEAR `vkCreateImage`
+   (no modifier chain) accepts stride=3280 but lies — reports
+   `layout.row_pitch=3328` for a BO laid out at 3280, which would
+   produce vertical-smear at sample time (the inverse of the
+   anv 1200→1280 bug `80f5376` fixed). On bare-metal both sides
+   share addrlib so this never fires.
+
+### Built a sw-copy shadow fallback, then reverted it
+
+Implemented a fallback path: on the `INVALID_DRM_FORMAT_MODIFIER_
+PLANE_LAYOUT_EXT` failure for LINEAR, allocate a fresh server-
+owned LINEAR `HOST_VISIBLE` `VkImage` at RADV's preferred pitch,
+mmap the client's dma-buf, and `memcpy` row-by-row with stride
+translation. Bracketed the memcpy with `DMA_BUF_IOCTL_SYNC`
+(`SYNC_START`/`SYNC_END`) for kernel-level GPU→CPU sync. Hook
+in `copy_area` so any pixmap→window blit (Present's main path)
+refreshes the shadow before reading. Cleanup in `free_pixmap`.
+
+The mechanism worked — DRI3::PixmapFromBuffers stopped returning
+BadAlloc, the shadow allocation succeeded, refresh fired on each
+Present. But wezterm's window was uniformly **black** instead of
+showing terminal content. Diagnostic sampled the mmap'd dma-buf
+bytes after `DMA_BUF_IOCTL_SYNC(SYNC_START | READ)` returned 0:
+**all bytes were `0x00000000`** across the entire image. virgl's
+host GPU writes never made it to the guest-visible dma-buf
+mapping at all.
+
+The qemu stderr explained why:
+```
+vrend_check_no_error: context error reported 5 "wezterm-gui" Unknown 1286
+context 5 failed to dispatch DRAW_VBO: 22
+vrend_decode_ctx_submit_cmd: context error reported 5 "wezterm-gui" Illegal command buffer 786440
+```
+
+`virgl_renderer` on the host was rejecting wezterm's GL command
+stream as malformed/unsupported. The dma-buf stayed zero-init
+because the host GPU never actually rendered anything into it.
+That's a virgl_renderer feature-coverage gap, not anything the
+X server can fix from its side.
+
+The shadow path got reverted (git checkout HEAD --) since it
+fixes a symptom (RADV's strict LINEAR pitch) that doesn't apply
+once the real root cause is addressed. ~600 lines net deleted.
+
+### Actual fix: `MESA_LOADER_DRIVER_OVERRIDE=zink`
+
+Mesa in the guest has two GL drivers:
+
+- **virgl** (default): GL → custom wire protocol → host
+  `virgl_renderer` → host GL stack. Has feature gaps; rejects
+  wezterm/glxgears command streams.
+- **zink**: GL → Vulkan (in-guest, by zink's GL state-tracker) →
+  Venus protocol → host Vulkan (RADV/anv/...) → host GPU.
+  Bypasses `virgl_renderer` entirely.
+
+With `MESA_LOADER_DRIVER_OVERRIDE=zink`, wezterm renders correctly
+under vng — text visible, btop runs inside it, regular DRI3
+dmabuf import path (no shadow needed because both sides are now
+Venus → modifier+stride round-trip is consistent). vkcube already
+worked because it was Vulkan all the way. glxgears + vkgears now
+also work under the same recipe.
+
+### Surface left
+
+- **vng recipes** in `Justfile` (`yserver-fvwm3-xterm`,
+  `yserver-glxgears`, `yserver-e16-xterm`, `yserver-wmaker-xterm`)
+  export `MESA_LOADER_DRIVER_OVERRIDE=zink` before launching
+  clients. New recipe `yserver-e16-wezterm` for the canonical
+  vng+wezterm session.
+- **Expanded BadAlloc + GetSupportedModifiers logs** kept on the
+  `process_request.rs` DRI3 path. Useful diagnostic baseline for
+  any future allocator-mismatch issue (modifier list + the full
+  request tuple visible on import failure).
+- **Hw path is untouched.** Preflight + shadow code is gone;
+  `from_dmabuf` and `dri3_import_pixmap` are back to their
+  pre-investigation state. The expanded log lines are
+  diagnostic-only; they don't change behaviour.
+
+### Memory note
+
+`reference_vng_use_zink.md` — recipe + reason. Includes the
+explicit "don't try sw-copy fallback; that was a wrong-layer fix"
+note so future-me doesn't re-walk this road.
