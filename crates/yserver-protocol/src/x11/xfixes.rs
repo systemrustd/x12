@@ -4,6 +4,7 @@ use super::{
 };
 
 pub const QUERY_VERSION: u8 = 0;
+pub const CHANGE_SAVE_SET: u8 = 1;
 pub const SELECT_SELECTION_INPUT: u8 = 2;
 pub const SELECT_CURSOR_INPUT: u8 = 3;
 pub const GET_CURSOR_IMAGE: u8 = 4;
@@ -21,6 +22,9 @@ pub const INVERT_REGION: u8 = 16;
 pub const TRANSLATE_REGION: u8 = 17;
 pub const REGION_EXTENTS: u8 = 18;
 pub const FETCH_REGION: u8 = 19;
+pub const SET_GC_CLIP_REGION: u8 = 20;
+pub const SET_WINDOW_SHAPE_REGION: u8 = 21;
+pub const SET_PICTURE_CLIP_REGION: u8 = 22;
 pub const SET_CURSOR_NAME: u8 = 23;
 pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
@@ -55,6 +59,46 @@ pub struct SelectSelectionInputRequest {
 pub struct SelectCursorInputRequest {
     pub window: u32,
     pub event_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeSaveSetRequest {
+    /// 0 = Insert, 1 = Delete.
+    pub mode: u8,
+    /// 0 = Nearest, 1 = Root.
+    pub target: u8,
+    /// 0 = Map, 1 = Unmap.
+    pub map: u8,
+    pub window: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetGcClipRegionRequest {
+    pub gc: u32,
+    /// 0 = None (clear the clip).
+    pub region: u32,
+    pub x_origin: i16,
+    pub y_origin: i16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetWindowShapeRegionRequest {
+    pub dest: u32,
+    /// 0 = Bounding, 1 = Clip, 2 = Input. Matches `shape::KIND_*`.
+    pub dest_kind: u8,
+    pub x_offset: i16,
+    pub y_offset: i16,
+    /// 0 = None (clear the shape for this kind).
+    pub region: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetPictureClipRegionRequest {
+    pub picture: u32,
+    /// 0 = None (clear the picture clip).
+    pub region: u32,
+    pub x_origin: i16,
+    pub y_origin: i16,
 }
 
 fn read_u16_le(bytes: &[u8]) -> u16 {
@@ -158,7 +202,61 @@ pub fn parse_invert_region(body: &[u8]) -> Option<(u32, RegionRect, u32)> {
     ))
 }
 
-/// Parse XFIXES `ChangeCursorByName` (minor 23). Returns the cursor XID and
+#[must_use]
+pub fn parse_change_save_set(body: &[u8]) -> Option<ChangeSaveSetRequest> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(ChangeSaveSetRequest {
+        mode: body[0],
+        target: body[1],
+        map: body[2],
+        window: read_u32_le(&body[4..]),
+    })
+}
+
+#[must_use]
+pub fn parse_set_gc_clip_region(body: &[u8]) -> Option<SetGcClipRegionRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(SetGcClipRegionRequest {
+        gc: read_u32_le(body),
+        region: read_u32_le(&body[4..]),
+        x_origin: read_i16_le(&body[8..]),
+        y_origin: read_i16_le(&body[10..]),
+    })
+}
+
+#[must_use]
+pub fn parse_set_window_shape_region(body: &[u8]) -> Option<SetWindowShapeRegionRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(SetWindowShapeRegionRequest {
+        dest: read_u32_le(body),
+        dest_kind: body[4],
+        // bytes 5..8 are padding.
+        x_offset: read_i16_le(&body[8..]),
+        y_offset: read_i16_le(&body[10..]),
+        region: read_u32_le(&body[12..]),
+    })
+}
+
+#[must_use]
+pub fn parse_set_picture_clip_region(body: &[u8]) -> Option<SetPictureClipRegionRequest> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(SetPictureClipRegionRequest {
+        picture: read_u32_le(body),
+        region: read_u32_le(&body[4..]),
+        x_origin: read_i16_le(&body[8..]),
+        y_origin: read_i16_le(&body[10..]),
+    })
+}
+
+/// Parse XFIXES `ChangeCursorByName` (minor 27). Returns the cursor XID and
 /// the raw name bytes (no UTF-8 validation, no theme lookup — the caller
 /// forwards the exact bytes to the host).
 #[must_use]
@@ -278,6 +376,7 @@ mod tests {
         // shipped CHANGE_CURSOR_BY_NAME=23, which is actually
         // SetCursorName. Real ChangeCursorByName is opcode 27.
         assert_eq!(QUERY_VERSION, 0);
+        assert_eq!(CHANGE_SAVE_SET, 1);
         assert_eq!(SELECT_SELECTION_INPUT, 2);
         assert_eq!(SELECT_CURSOR_INPUT, 3);
         assert_eq!(GET_CURSOR_IMAGE, 4);
@@ -285,10 +384,75 @@ mod tests {
         assert_eq!(DESTROY_REGION, 10);
         assert_eq!(COPY_REGION, 12);
         assert_eq!(FETCH_REGION, 19);
+        assert_eq!(SET_GC_CLIP_REGION, 20);
+        assert_eq!(SET_WINDOW_SHAPE_REGION, 21);
+        assert_eq!(SET_PICTURE_CLIP_REGION, 22);
         assert_eq!(SET_CURSOR_NAME, 23);
         assert_eq!(CHANGE_CURSOR_BY_NAME, 27);
         assert_eq!(HIDE_CURSOR, 29);
         assert_eq!(SHOW_CURSOR, 30);
+    }
+
+    #[test]
+    fn change_save_set_parses_canonical_layout() {
+        // mode(1) | target(1) | map(1) | pad(1) | window(4)
+        let body = [0u8, 1, 0, 0, 0xef, 0xbe, 0xad, 0xde];
+        let req = parse_change_save_set(&body).unwrap();
+        assert_eq!(req.mode, 0);
+        assert_eq!(req.target, 1);
+        assert_eq!(req.map, 0);
+        assert_eq!(req.window, 0xdead_beef);
+    }
+
+    #[test]
+    fn set_gc_clip_region_parses_canonical_layout() {
+        // gc(4) | region(4) | x_origin(2) | y_origin(2)
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xaa_u32.to_le_bytes());
+        body.extend_from_slice(&0xbb_u32.to_le_bytes());
+        body.extend_from_slice(&(-3_i16).to_le_bytes());
+        body.extend_from_slice(&7_i16.to_le_bytes());
+        let req = parse_set_gc_clip_region(&body).unwrap();
+        assert_eq!(req.gc, 0xaa);
+        assert_eq!(req.region, 0xbb);
+        assert_eq!(req.x_origin, -3);
+        assert_eq!(req.y_origin, 7);
+    }
+
+    #[test]
+    fn set_window_shape_region_parses_canonical_layout() {
+        // dest(4) | kind(1) | pad(3) | x_off(2) | y_off(2) | region(4)
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1234_u32.to_le_bytes());
+        body.push(1); // KIND_CLIP
+        body.extend_from_slice(&[0u8; 3]);
+        body.extend_from_slice(&5_i16.to_le_bytes());
+        body.extend_from_slice(&(-9_i16).to_le_bytes());
+        body.extend_from_slice(&0x5678_u32.to_le_bytes());
+        let req = parse_set_window_shape_region(&body).unwrap();
+        assert_eq!(req.dest, 0x1234);
+        assert_eq!(req.dest_kind, 1);
+        assert_eq!(req.x_offset, 5);
+        assert_eq!(req.y_offset, -9);
+        assert_eq!(req.region, 0x5678);
+    }
+
+    #[test]
+    fn set_picture_clip_region_parses_canonical_layout() {
+        // picture(4) | region(4) | x_origin(2) | y_origin(2)
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xcc_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes()); // None
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        let req = parse_set_picture_clip_region(&body).unwrap();
+        assert_eq!(req.picture, 0xcc);
+        assert_eq!(req.region, 0); // None — caller clears the picture clip.
+    }
+
+    #[test]
+    fn set_gc_clip_region_rejects_short_body() {
+        assert!(parse_set_gc_clip_region(&[0u8; 11]).is_none());
     }
 
     #[test]

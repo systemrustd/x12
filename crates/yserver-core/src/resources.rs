@@ -1390,6 +1390,13 @@ impl ResourceTable {
         gc.clip_rectangles = Some(request.clip);
     }
 
+    pub fn clear_gc_clip(&mut self, gc: ResourceId) {
+        if let Some(g) = self.gcs.get_mut(&gc.0) {
+            g.clip_rectangles = None;
+            g.clip_pixmap = None;
+        }
+    }
+
     pub fn copy_gc(&mut self, src: ResourceId, dst: ResourceId, value_mask: u32) {
         // Snapshot the source GC under the immutable borrow so we can
         // then take a mutable borrow of dst. Cheap because the only

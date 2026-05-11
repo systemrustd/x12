@@ -2267,6 +2267,112 @@ fn handle_xfixes_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
+        x11xfixes::CHANGE_SAVE_SET => {
+            if let Some(req) = x11xfixes::parse_change_save_set(body)
+                && let Some(c) = state.clients.get_mut(&client_id.0)
+            {
+                let win = ResourceId(req.window);
+                match req.mode {
+                    0 => {
+                        c.save_set.insert(win);
+                    }
+                    1 => {
+                        c.save_set.remove(&win);
+                    }
+                    _ => {}
+                }
+                // target (Nearest/Root) and map (Map/Unmap) parameters affect
+                // disconnect-time reparent/remap behaviour; that path is
+                // already deferred from the Phase 2 wrap-up. Ignore for now.
+            }
+        }
+        x11xfixes::SET_GC_CLIP_REGION => {
+            if let Some(req) = x11xfixes::parse_set_gc_clip_region(body) {
+                let gc_id = ResourceId(req.gc);
+                if req.region == 0 {
+                    state.resources.clear_gc_clip(gc_id);
+                } else {
+                    let rects = state
+                        .xfixes_regions
+                        .get(&req.region)
+                        .map(|r| r.rects.clone())
+                        .unwrap_or_default();
+                    let mut rectangles = Vec::with_capacity(rects.len() * 8);
+                    for rect in &rects {
+                        rectangles.extend_from_slice(&rect.x.to_le_bytes());
+                        rectangles.extend_from_slice(&rect.y.to_le_bytes());
+                        rectangles.extend_from_slice(&rect.width.to_le_bytes());
+                        rectangles.extend_from_slice(&rect.height.to_le_bytes());
+                    }
+                    state.resources.set_clip_rectangles(
+                        yserver_protocol::x11::SetClipRectanglesRequest {
+                            gc: gc_id,
+                            clip: yserver_protocol::x11::ClipRectangles {
+                                ordering: 0, // Unsorted; matches xfixes region semantics.
+                                x_origin: req.x_origin,
+                                y_origin: req.y_origin,
+                                rectangles,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        x11xfixes::SET_WINDOW_SHAPE_REGION => {
+            if let Some(req) = x11xfixes::parse_set_window_shape_region(body) {
+                let window = ResourceId(req.dest);
+                if req.region == 0 {
+                    crate::nested::clear_shape_rects(state, window, req.dest_kind);
+                } else {
+                    let rects = state
+                        .xfixes_regions
+                        .get(&req.region)
+                        .map(|r| r.rects.clone())
+                        .unwrap_or_default();
+                    let source = crate::nested::offset_rects(rects, req.x_offset, req.y_offset);
+                    crate::nested::set_shape_rects(state, window, req.dest_kind, source);
+                }
+                mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+            }
+        }
+        x11xfixes::SET_PICTURE_CLIP_REGION => {
+            if let Some(req) = x11xfixes::parse_set_picture_clip_region(body) {
+                let pic_id = ResourceId(req.picture);
+                let host_pic = state
+                    .resources
+                    .picture(pic_id)
+                    .map(|p| p.host_picture_xid.as_raw());
+                if let Some(hp) = host_pic {
+                    if req.region == 0 {
+                        // RENDER CPClipMask = 0x40; value=None clears the clip.
+                        let mut out = Vec::with_capacity(12);
+                        out.extend_from_slice(&req.picture.to_le_bytes());
+                        out.extend_from_slice(&0x40_u32.to_le_bytes());
+                        out.extend_from_slice(&0_u32.to_le_bytes());
+                        let _ = backend.render_change_picture(origin, hp, &out);
+                    } else {
+                        let rects = state
+                            .xfixes_regions
+                            .get(&req.region)
+                            .map(|r| r.rects.clone())
+                            .unwrap_or_default();
+                        // RENDER SetPictureClipRectangles body layout:
+                        // picture(4) | x_origin(2) | y_origin(2) | rects(8*N).
+                        let mut out = Vec::with_capacity(8 + rects.len() * 8);
+                        out.extend_from_slice(&req.picture.to_le_bytes());
+                        out.extend_from_slice(&req.x_origin.to_le_bytes());
+                        out.extend_from_slice(&req.y_origin.to_le_bytes());
+                        for rect in &rects {
+                            out.extend_from_slice(&rect.x.to_le_bytes());
+                            out.extend_from_slice(&rect.y.to_le_bytes());
+                            out.extend_from_slice(&rect.width.to_le_bytes());
+                            out.extend_from_slice(&rect.height.to_le_bytes());
+                        }
+                        let _ = backend.render_set_picture_clip_rectangles(origin, hp, &out);
+                    }
+                }
+            }
+        }
         x11xfixes::CHANGE_CURSOR_BY_NAME => {
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_change_cursor_by_name(body) {
                 let host_cursor = state.resources.cursor_host_xid(ResourceId(cursor_xid));

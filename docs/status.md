@@ -4121,3 +4121,48 @@ Expected payoff:
 A reasonable pick if you want a short, mechanical session that
 makes visible progress without the depth-of-rabbit-hole risk
 inherent in the XI2 grab investigation.
+
+## XFIXES region-set + ChangeSaveSet minors (2026-05-11)
+
+The easy-win side quest above, landed. Four XFIXES minors that
+mate-panel / marco / common GTK widgets were calling and we were
+silently dropping with `XFIXES::unknown` now have real handlers.
+Each reuses an existing rect-list path; no new state, no new sync.
+
+Minors implemented (canonical opcodes per `/usr/share/xcb/xfixes.xml`
+— the easy-win table in the MATE-clicks section had them all
+off-by-one):
+
+| Minor | Op | Path |
+|-------|-----|------|
+| **1**  | `ChangeSaveSet` (XFIXES variant) | reuses `client.save_set` insert/remove from core opcode 6; ignores the extra `target`/`map` parameters (disconnect-time remap is a separate Phase-2 follow-up). |
+| **20** | `SetGCClipRegion` | fetches the region's rect list, packs it into wire bytes, and calls `ResourceTable::set_clip_rectangles`. `region == None` calls a new `clear_gc_clip` helper that nulls both `clip_rectangles` and `clip_pixmap`. |
+| **21** | `SetWindowShapeRegion` | offsets the region rects by `(x_offset, y_offset)`, calls `nested::set_shape_rects` (with op=Set semantics), then `mirror_shape_to_host_state`. `region == None` calls `clear_shape_rects` followed by the same host mirror. |
+| **22** | `SetPictureClipRegion` | with a region, builds a RENDER `SetPictureClipRectangles` body (`picture(4)|x_origin(2)|y_origin(2)|rects(8N)`) and forwards via `backend.render_set_picture_clip_rectangles`. `region == None` forwards a `ChangePicture(CPClipMask=None)` instead — the same wire pattern that already cleared picture clips in the GTK3 / sidebar fix. |
+
+Parsers + opcode constants + five unit tests added in
+`crates/yserver-protocol/src/x11/xfixes.rs`. Dispatch arms added
+in `handle_xfixes_request` in
+`crates/yserver-core/src/core_loop/process_request.rs`. One small
+helper (`ResourceTable::clear_gc_clip`) added in
+`crates/yserver-core/src/resources.rs`.
+
+While in the file, fixed the stale `(minor 23)` doc comment on
+`parse_change_cursor_by_name` — it's minor 27, as the existing
+opcode-table test already pointed out.
+
+Expected payoff (per the side-quest entry): silences the recurring
+`XFIXES::unknown` noise from mate-panel / marco, plausibly fixes
+panel transparent-area click-through via `SetWindowShapeRegion`,
+and unblocks XFIXES-region-based clipping for any widgets we
+haven't tested yet. Does **not** fix the popup-stuck-after-first-
+click bug — that's still the XI2 active-grab investigation.
+
+Validation: `cargo test --workspace` green (272 + 208 + 88 + 9
+tests). `cargo clippy --workspace` clean apart from one pre-
+existing doc-lazy-continuation warning in
+`build_path_selector_inputs` (`aeec25ee`, untouched). No
+interactive smoke yet — each handler is a wire-format proxy of an
+already-working rect-list path, so the unit tests cover the new
+surface and a MATE re-run can confirm the `XFIXES::unknown` lines
+go away.
