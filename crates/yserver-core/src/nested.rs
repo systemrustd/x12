@@ -74,6 +74,8 @@ pub(crate) const GLX_MAJOR_OPCODE: u8 = 148;
 pub(crate) const GLX_FIRST_EVENT: u8 = 97;
 pub(crate) const GLX_FIRST_ERROR: u8 = 161;
 
+pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
     Always,
@@ -228,6 +230,14 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         major_opcode: GLX_MAJOR_OPCODE,
         first_event: GLX_FIRST_EVENT,
         first_error: GLX_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "X-Resource",
+        major_opcode: X_RESOURCE_MAJOR_OPCODE,
+        first_event: 0,
+        first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },

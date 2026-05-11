@@ -24,6 +24,7 @@ pub mod request_swap;
 pub mod shape;
 pub mod sync;
 pub mod wire_swap;
+pub mod x_resource;
 pub mod xfixes;
 pub mod xtest;
 

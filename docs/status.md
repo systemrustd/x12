@@ -3695,3 +3695,27 @@ also work under the same recipe.
 `reference_vng_use_zink.md` — recipe + reason. Includes the
 explicit "don't try sw-copy fallback; that was a wrong-layer fix"
 note so future-me doesn't re-walk this road.
+
+## xfwm4 cleanups — XSync 3.1 + X-Resource stub (2026-05-11)
+
+xfwm4 on hw logged `XSync extension too old (3.0).` and `The
+display does not support the XRes extension.` Neither was fatal,
+xfwm4 just falls back, but both are easy to silence.
+
+- **XSync 3.1.** We were advertising `3.0` from the `Initialize`
+  reply even though all the 3.1 fence requests (opcodes 14–19) are
+  already wired (525529e, the GLX/DRI3 hardening day). One-line
+  bump in `crates/yserver-protocol/src/x11/sync.rs` to set
+  `MINOR_VERSION = 1`. Matches `/usr/share/xcb/sync.xml`.
+
+- **X-Resource extension stub.** New extension at major opcode 149.
+  New protocol module `crates/yserver-protocol/src/x11/x_resource.rs`
+  with version 1.2 constants, opcodes 0–5, and reply encoders that
+  return well-formed but empty/zero counts. Dispatcher arm in
+  `process_request.rs`. Registered in `nested.rs` EXTENSIONS. xfwm4
+  + lxqt-panel + plasma-applet-systemload now see XRes "present"
+  instead of "absent"; tools like `xrestop` will run but display
+  a blank table (no real resource accounting). That's the same
+  observable behaviour as a real X server with XRes builtin but
+  no clients tracked; just without the warning. Canonical layout
+  per `/usr/share/xcb/res.xml`.

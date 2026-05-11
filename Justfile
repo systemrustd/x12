@@ -408,11 +408,15 @@ yserver-mate-hw log="debug":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+        DISPLAY=:7 marco --display :7 > mate.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log";\
         echo "xfce log:    xfce.log"'
+
+# DISPLAY=:7 dbus-run-session mate-session --display :7 > mate.log 2>&1;\
 
 # Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
 # Mesa's loader_dri3 prints every probe step + driver load failure so

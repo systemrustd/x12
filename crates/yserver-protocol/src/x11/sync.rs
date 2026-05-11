@@ -32,7 +32,12 @@ pub struct CreateFenceRequest {
 }
 
 pub const MAJOR_VERSION: u8 = 3;
-pub const MINOR_VERSION: u8 = 0;
+// 3.1 (not 3.0) because we already implement all the fence requests
+// (opcodes 14–19, wired in 525529e for the GLX/DRI3 path). Modern WMs
+// gate their sync-fence frame-timing fast path on `minor >= 1`; xfwm4
+// logs `XSync extension too old (3.0)` and falls back without it.
+// xcb-proto `sync.xml` is at 3.1 — canonical.
+pub const MINOR_VERSION: u8 = 1;
 
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])

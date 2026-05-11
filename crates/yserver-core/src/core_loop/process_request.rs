@@ -358,6 +358,8 @@ pub fn process_request(
         ),
         // ── GLX extension dispatcher ──
         148 => handle_glx_request(state, client_id, sequence, header, body),
+        // ── X-Resource (XRes) extension dispatcher ──
+        149 => handle_x_resource_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -4644,6 +4646,85 @@ fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
         }
     }
     out
+}
+
+/// X-Resource (`Res`) extension — minimal stub. Replies are
+/// well-formed but report zero clients / zero resources / zero
+/// bytes everywhere. Real per-client accounting is out of scope;
+/// the extension exists so xfwm4 and similar WMs that probe via
+/// `XResQueryExtension` + `XResQueryVersion` proceed instead of
+/// logging "the display does not support XRes".
+fn handle_x_resource_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, x_resource as x11xres};
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    let reply = match minor {
+        x11xres::QUERY_VERSION => {
+            let (cmaj, cmin) = x11xres::parse_query_version(body).unwrap_or((0, 0));
+            let major = u16::from(cmaj).min(x11xres::MAJOR_VERSION);
+            let minor_ver = u16::from(cmin).min(x11xres::MINOR_VERSION);
+            debug!(
+                "client {} #{} X-Resource::QueryVersion client={cmaj}.{cmin} -> {major}.{minor_ver}",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_version_reply(byte_order, sequence, major, minor_ver)
+        }
+        x11xres::QUERY_CLIENTS => {
+            debug!(
+                "client {} #{} X-Resource::QueryClients -> 0 clients (stub)",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_clients_empty_reply(byte_order, sequence)
+        }
+        x11xres::QUERY_CLIENT_RESOURCES => {
+            debug!(
+                "client {} #{} X-Resource::QueryClientResources -> 0 types (stub)",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_client_resources_empty_reply(byte_order, sequence)
+        }
+        x11xres::QUERY_CLIENT_PIXMAP_BYTES => {
+            debug!(
+                "client {} #{} X-Resource::QueryClientPixmapBytes -> 0 (stub)",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_client_pixmap_bytes_zero_reply(byte_order, sequence)
+        }
+        x11xres::QUERY_CLIENT_IDS => {
+            debug!(
+                "client {} #{} X-Resource::QueryClientIds -> 0 ids (stub)",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_client_ids_empty_reply(byte_order, sequence)
+        }
+        x11xres::QUERY_RESOURCE_BYTES => {
+            debug!(
+                "client {} #{} X-Resource::QueryResourceBytes -> 0 sizes (stub)",
+                client_id.0, sequence.0
+            );
+            x11xres::encode_query_resource_bytes_empty_reply(byte_order, sequence)
+        }
+        other => {
+            debug!(
+                "client {} #{} X-Resource: unsupported minor opcode {other}",
+                client_id.0, sequence.0
+            );
+            return Ok(RequestOutcome::Handled);
+        }
+    };
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    Ok(write_to_client(client, client_id, &reply))
 }
 
 fn handle_glx_request(
