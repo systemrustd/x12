@@ -1660,7 +1660,20 @@ pub fn write_get_property_reply(
 ) -> io::Result<()> {
     let mut padded = reply.value.to_vec();
     pad_vec4(&mut padded);
-    let length_units = u32::from(checked_units(padded.len())?);
+    // GetProperty's reply `length` field is 32-bit (in 4-byte units). The
+    // pre-BIG-REQUESTS u16 limit on *requests* doesn't apply here. Don't
+    // route through `checked_units` (u16) — capped values like 64 KiB
+    // truncate icons, _NET_WM_ICON, fontset data, etc. Marco's
+    // _NET_WM_ICON GetProperty (~343 KB) used to fail here and leave the
+    // WM hung in _XReply.
+    let length_units = u32::try_from(padded.len() / 4)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "GetProperty reply too large"))?;
+    if !padded.len().is_multiple_of(4) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "GetProperty reply not 4-byte aligned",
+        ));
+    }
     let mut out = fixed_reply(byte_order, sequence, reply.format, length_units);
     write_u32(byte_order, &mut out, reply.r#type.0);
     write_u32(byte_order, &mut out, reply.bytes_after);

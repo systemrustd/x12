@@ -4379,3 +4379,57 @@ when several full-screen clients init simultaneously; deferred.)
 Validation: `cargo test --workspace` green
 (272 + 208 + 88 + 9). MATE re-run will confirm decorations come
 back.
+
+## GetProperty reply length capped at u16 — marco hangs on _NET_WM_ICON (2026-05-11)
+
+Verified the overlay-window fix worked: `MapRequest to WM`
+appears in the fresh log (twice), marco's root event_mask stays
+`0xfa8033` (SubstructureRedirect preserved), no overlay-induced
+clobber.
+
+But the panel still didn't appear, because the next thing that
+happened was:
+
+```
+WARN  yserver_core::core_loop::run] request handler error
+  (client 16 opcode 20): length 343256 is too large
+```
+
+opcode 20 = GetProperty. The reply value was ~343 KB (likely
+`_NET_WM_ICON` from a panel or wnck applet — the icon-image
+property). `write_get_property_reply` in
+`yserver-protocol/src/x11/mod.rs` was routing the reply length
+through `checked_units` (a u16-bounded helper used for BIG-
+REQUESTS *request* length-units), capping the reply at ~256 KB
+(65535 × 4). 343 KB / 4 = 85 814 units overflowed u16, the
+encoder returned `InvalidData`, the request handler logged a
+warning, and **the reply was never sent**. marco's `_XReply`
+blocked forever; mate-panel's MapRequest sat in marco's queue
+unhandled; the panel never reparented or appeared on screen.
+
+X11 reply layout: byte 0 = response_type, byte 1 = data, bytes
+2–3 = sequence (u16), bytes 4–7 = **length** (u32 in 4-byte
+units). So the cap was server-side only, not a wire constraint.
+
+Fix in `write_get_property_reply`:
+
+```rust
+let length_units = u32::try_from(padded.len() / 4)
+    .map_err(|_| io::Error::new(
+        ErrorKind::InvalidData,
+        "GetProperty reply too large",
+    ))?;
+```
+
+plus an explicit 4-byte-alignment check that
+`checked_units` previously rolled in. Other `checked_units`
+call sites stay (atom names, setup reply, XIQueryDevice,
+XIGetSelectedEvents) — those replies are bounded well under
+64 KB so the u16 cap is fine.
+
+This means: with this + the overlay-window fix, marco should
+actually reparent mate-panel and the panel should appear on
+screen. Next session will confirm.
+
+Validation: `cargo test --workspace` green
+(272 + 208 + 88 + 9).
