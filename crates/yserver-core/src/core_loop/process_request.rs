@@ -37,7 +37,7 @@ use crate::{
         pointer_fanout::pointer_event_fanout_to_state,
     },
     properties,
-    resources::{MapState, Pixmap, ROOT_WINDOW, Window},
+    resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
     server::ServerState,
 };
 
@@ -2561,7 +2561,14 @@ fn handle_composite_request(
         }
         x11composite::GET_OVERLAY_WINDOW => {
             let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
-            let overlay = ROOT_WINDOW.0;
+            // Must return a distinct XID, not root. See COMPOSITE_OVERLAY_WINDOW
+            // for why — marco's compositor immediately calls XSelectInput on
+            // this XID and would otherwise wipe its own WM event mask on root.
+            let overlay = COMPOSITE_OVERLAY_WINDOW.0;
+            debug!(
+                "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
+                client_id.0, sequence.0, overlay
+            );
             let reply =
                 x11composite::encode_get_overlay_window_reply(byte_order, sequence, overlay);
             let Some(client) = state.clients.get_mut(&client_id.0) else {

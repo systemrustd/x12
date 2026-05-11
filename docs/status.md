@@ -4296,3 +4296,86 @@ unblocked them.
 Validation: `cargo test --workspace` green
 (272 + 208 + 88 + 9). MATE re-run will confirm the panel
 stops crashing and that app launches go through.
+
+## COMPOSITE GetOverlayWindow returning root broke marco WM (2026-05-11)
+
+After the XIGetClientPointer 32-byte fix, the user re-ran MATE
+and reported "control-center started, but no window decoration,
+marco not started? and after the window was mapped, mouse becomes
+VERY jerky".
+
+Investigation in the new `yserver-hw.log`:
+
+- marco *is* started: claims `WM_S0` at seq #208, `_NET_WM_CM_S0`
+  at #416, runs full WM init.
+- marco's root event-mask history:
+
+| Seq | Mask | Decoded |
+|-----|------|---------|
+| #~213 | `0xfa8033` | Full WM mask incl. **SubstructureRedirect** |
+| **#~407** | **`0x8000`** | **Exposure only — clobbered** |
+
+After #407, `grep "MapRequest to WM"` returns 0 hits for the
+whole 99k-line log. Every `MapWindow` from control-center
+capplets mapped directly, unframed. **`grep "ReparentWindow"`
+shows reparents only from clients 19/29 (mate-panel embedding
+its applets)** — never from client 16 (marco).
+
+Reading marco's `compositor-xrender.c` upstream pinpointed the
+real cause:
+
+```c
+output = XCompositeGetOverlayWindow (xdisplay, xroot);
+XSelectInput (xdisplay, output, ExposureMask);
+return output;
+```
+
+Marco's compositor targets the **overlay** XID, not root. The
+WM event mask on root is never supposed to be touched here.
+But our `COMPOSITE::GetOverlayWindow` handler was:
+
+```rust
+x11composite::GET_OVERLAY_WINDOW => {
+    let overlay = ROOT_WINDOW.0;     // ← returns root!
+    ...
+}
+```
+
+So marco's compositor called `XSelectInput(root, ExposureMask)`
+thinking it was setting the overlay's mask, and silently dropped
+its own SubstructureRedirect on root. After that marco was a
+compositor without WM duties; control-center windows mapped
+naked.
+
+### Fix
+
+- New server-reserved resource `COMPOSITE_OVERLAY_WINDOW =
+  ResourceId(0x103)`, seeded at `ResourceTable::new()` next to
+  the root window — same size, `parent = ROOT_WINDOW`,
+  `override_redirect = true`, `owner = SERVER_OWNER`.
+- `with_geometry` / `with_randr_outputs` / `handle_host_container_resize`
+  all keep the overlay's `width`/`height` tracking root's.
+- `GET_OVERLAY_WINDOW` handler now returns `COMPOSITE_OVERLAY_WINDOW.0`.
+  Added a `debug!` so the call shows up in future logs (it was
+  silent before, which is why the smoking-gun XID never appeared
+  in the prior investigation).
+
+Marco's `XSelectInput(overlay, ExposureMask)` now lands on
+0x103, the per-client mask on the overlay window. Marco's mask
+on root (0xfa8033, with SubstructureRedirect) is untouched.
+MapRequests should flow normally to marco again.
+
+We don't actually composite *through* the overlay — KMS renders
+directly. But the overlay just needs to be a valid window so
+the standard XComposite{GetOverlay,ReleaseOverlay,SelectInput}
+sequence works without side-effects on root. Real compositing
+into the overlay is a separate, larger piece of work and not
+required for marco to function as a WM.
+
+(Re the user's second complaint — mouse jerky under control-center
+load — that's an unrelated single-threaded-core throughput issue
+when several full-screen clients init simultaneously; deferred.)
+
+Validation: `cargo test --workspace` green
+(272 + 208 + 88 + 9). MATE re-run will confirm decorations come
+back.

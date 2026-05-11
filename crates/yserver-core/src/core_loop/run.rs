@@ -383,6 +383,13 @@ pub(crate) fn handle_host_container_resize(
         root.width = ev.width;
         root.height = ev.height;
     }
+    if let Some(overlay) = state
+        .resources
+        .window_mut(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+    {
+        overlay.width = ev.width;
+        overlay.height = ev.height;
+    }
     let width = ev.width;
     let height = ev.height;
     let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);

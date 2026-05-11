@@ -30,6 +30,12 @@ pub struct ClientRemovedResources {
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
+/// Composite overlay window returned by `XCompositeGetOverlayWindow`.
+/// A real, distinct XID is required — marco's compositor calls
+/// `XSelectInput(overlay, ExposureMask)`, which would otherwise clobber
+/// its own WM event mask on root (dropping SubstructureRedirect) if we
+/// returned root here.
+pub const COMPOSITE_OVERLAY_WINDOW: ResourceId = ResourceId(0x103);
 pub const ARGB_VISUAL: ResourceId = ResourceId(0x103);
 pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
 
@@ -196,6 +202,50 @@ impl ResourceTable {
                 background_pixmap_host_xid: None,
                 border_pixmap_host_xid: None,
                 override_redirect: false,
+                bit_gravity: 0,
+                win_gravity: 1,
+                backing_store: 0,
+                backing_planes: u32::MAX,
+                backing_pixel: 0,
+                save_under: false,
+                do_not_propagate_mask: 0,
+                colormap: ROOT_COLORMAP,
+                cursor: None,
+                owner: SERVER_OWNER,
+                properties: HashMap::new(),
+                host_xid: None,
+                composite_named_pixmaps: Vec::new(),
+            },
+        );
+
+        // Composite overlay window. Marco (and other compositors) calls
+        // XCompositeGetOverlayWindow → XSelectInput(overlay, ExposureMask)
+        // during compositor init. The overlay must be a real, distinct
+        // XID — if we hand back root here, the XSelectInput call replaces
+        // the WM's root event mask and drops SubstructureRedirect, after
+        // which marco silently stops acting as a window manager. We don't
+        // composite through it on KMS, but it has to exist as a window so
+        // the standard CWA / Select / Release sequence works.
+        windows.insert(
+            COMPOSITE_OVERLAY_WINDOW.0,
+            Window {
+                id: COMPOSITE_OVERLAY_WINDOW,
+                parent: ROOT_WINDOW,
+                children: Vec::new(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                depth: 24,
+                visual: ROOT_VISUAL,
+                class: WindowClass::InputOutput,
+                map_state: MapState::Viewable,
+                background_pixel: 0,
+                background_pixmap: None,
+                background_pixmap_host_xid: None,
+                border_pixmap_host_xid: None,
+                override_redirect: true,
                 bit_gravity: 0,
                 win_gravity: 1,
                 backing_store: 0,

@@ -16,7 +16,7 @@ use yserver_protocol::x11::{
 
 use crate::{
     randr::{RandrOutput, RandrState},
-    resources::{ROOT_WINDOW, ResourceTable},
+    resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW, ResourceTable},
 };
 
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
@@ -305,6 +305,10 @@ impl ServerState {
             root.width = width;
             root.height = height;
         }
+        if let Some(overlay) = resources.window_mut(COMPOSITE_OVERLAY_WINDOW) {
+            overlay.width = width;
+            overlay.height = height;
+        }
         Self {
             atoms: AtomTable::new(),
             resources,
@@ -357,6 +361,10 @@ impl ServerState {
         if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
             root.width = s.randr.screen_width;
             root.height = s.randr.screen_height;
+        }
+        if let Some(overlay) = s.resources.window_mut(COMPOSITE_OVERLAY_WINDOW) {
+            overlay.width = s.randr.screen_width;
+            overlay.height = s.randr.screen_height;
         }
         s
     }
