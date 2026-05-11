@@ -3845,3 +3845,133 @@ second screen.
   the BIG-REQUESTS unit-count behavior is in `bigreq.xml` /
   `xproto.xml` and the X.org server's `bigreq.c`; we re-derived it
   from log evidence instead of checking the canonical source first.
+
+## gtk3-demo TreeView labels — pen off by xSrc/ySrc (2026-05-11)
+
+Targeted bisect session against `yserver-e16-xterm-hw` + gtk3-demo
+launched from wezterm. The visible bug across MATE, gtk3-demo, and
+xfwm4 was missing / displaced GTK widget text (TreeView row labels
+invisible, "Run" button label below+right of its button). Two
+distinct root causes surfaced; one fixed today.
+
+### Root cause — CompositeGlyphs pen initialised to xSrc/ySrc
+
+`try_vk_render_composite_glyphs` set the dst pen to `src_x + x_off`
+/ `src_y + y_off`. X RENDER protocol semantics:
+
+- `xSrc` / `ySrc` are the **source picture sampling origin** (used
+  when the source is a Drawable / Gradient; no-op for SolidFill).
+- The dst pen starts at (0, 0); the first glyph element's
+  `deltax` / `deltay` sets the **absolute** pen position;
+  subsequent elements accumulate.
+
+GTK conventionally sends `xSrc==first_deltax` and
+`ySrc==first_deltay`. Our impl added them, so every glyph rendered
+at `(2 × xSrc, 2 × ySrc)`. The visual effect was a uniform
+displacement of every glyph by `(xSrc, ySrc)` — invisible in most
+contexts (right-pane title still rendered, just shifted), but
+catastrophic for the gtk3-demo TreeView:
+
+1. `FillRect cyan` at `y=0..21` (selected row bg)
+2. `CompositeGlyphs xSrc=22 ySrc=15 first_delta=(22,15)` — should
+   pen at (22, 15), instead pen at (44, 30). Label image lands at
+   `y=22..29` (inside row 2, not row 1).
+3. `FillRect dark y=21..42` (row 2 bg) — correctly fills row 2,
+   wiping the displaced label that landed there.
+4. Same pattern for every subsequent row.
+
+Result: every row's label vanished into the next row's FillRect.
+The selected row was the only one where the label survived (because
+the cyan FillRect ran before the label) — but it appeared just
+below the cyan bar instead of inside it.
+
+Fix: `crates/yserver/src/kms/backend.rs` `try_vk_render_composite_glyphs`
+initialises `pen_x = x_off`, `pen_y = y_off` (both 0 from the
+dispatcher). `src_x` / `src_y` are now correctly used only for
+source picture sampling — currently a no-op in our SolidFill-only
+glyph path, kept in the function signature for trait parity.
+
+### Diagnosis path — what worked
+
+Standard PPM probes ended up being the right tool but only after a
+detour. Useful steps in order:
+
+1. **`xtrace` against gtk3-demo** showed every CompositeGlyphs +
+   Composite from the client side. Reconstructed the render graph:
+   labels render into ARGB32 pixmap 0x3a (Picture 0x3b), then a
+   single `Composite Over src=0x3b dst=0x34 219×598` blits the
+   pane to the main window backing.
+2. **Bail diagnostics in `try_vk_render_composite`** —
+   one `log::debug!` per silent `return false` site. Surfaced the
+   e16 pager flicker as a separate bug (24 bails on
+   `0x4000ad → 0x4000af 336×48 op=Src` with src pixmap freed). The
+   gtk3-demo labels Composite **didn't bail** — moved the
+   investigation past the Composite into glyph rendering.
+3. **Per-call entry log in `render_composite` and
+   `render_composite_glyphs`** mapped each call to its dst kind /
+   depth / source color. Established: glyph runs onto depth-24
+   pixmaps + windows render correctly; runs onto the depth-32
+   TreeView offscreen pixmap don't.
+4. **PPM probes** of dst mirrors after first / 2nd / 5th / 20th
+   glyph run and after each FillRect into 0x400128. The decisive
+   sequence: `glyph-probe-run01` shows "Application Class" white
+   on cyan; `fill-probe-run03` (immediately after the FillRect for
+   row 2) shows the label is gone (unique_R drops from 154 to 3).
+   That pinpointed the FillRect for row 2 as the eraser — even
+   though geometrically `(0, 21, 219, 21)` shouldn't touch row 1.
+   The "shouldn't" was the clue: the label was actually IN row 2.
+
+### Mechanic that made the bug invisible until this client
+
+The displacement is **uniform** for every CompositeGlyphs. Right-
+pane title, body, tab text, wezterm — all shifted by the same
+`(xSrc, ySrc)`. Users (and we) didn't notice because:
+
+- Text moves DOWN by ySrc within the same pixmap. As long as the
+  shifted text is still within the pixmap and isn't immediately
+  overwritten, it looks "correct enough".
+- TreeView is the unique case where text shifted by exactly one
+  row pitch lands inside the NEXT row's geometry, which is
+  guaranteed to be FillRect-painted. The same effect would also
+  bite list boxes, menus, and any widget where consecutive
+  FillRect-then-CompositeGlyphs operations alternate on stacked
+  rectangles.
+
+### Surface left on master
+
+- **Bail diagnostics in `try_vk_render_composite`** kept. These
+  surfaced the e16 pager flicker root cause (`vk composite bail:
+  src mirror not sampleable`) and are cheap (only fire on error
+  paths). Useful for future "Composite silently does nothing"
+  debugging.
+- **All inline PPM probes and per-call entry logs reverted.**
+  PPM dumps were the right tool for this session but too noisy
+  for routine debug.
+
+### Separate bug — e16 pager flicker (open)
+
+Same investigation surfaced a second bug: 24 + N composite bails
+per session on `src_pic → dst_pic 336×48 op=Src` with both
+`in_windows=false` and `in_pixmaps=false` for the source pixmap.
+e16 pager refreshes follow a "create thumbnail pixmap → Composite
+to pager cell → free pixmap" pattern; the FreePixmap arrives at
+yserver before the Composite is dispatched, so the source mirror
+is gone by the time `try_vk_render_composite` looks it up.
+
+Two reasonable fixes:
+1. Reference-count pixmap mirrors against Pictures + GCs (X11 spec
+   semantics — drawable's lifetime extends until last reference).
+2. Quick: keep the Vk mirror alive for one composite frame after
+   FreePixmap, then drop. Crude but matches the typical "use just
+   after free" pattern.
+
+Tracked for next session.
+
+### Memory updates
+
+- New: `feedback_compositeglyphs_xsrc_not_pen.md` — the protocol
+  lesson. xSrc/ySrc sample the source picture; pen starts at (0, 0).
+- Updated `project_mate_desktop_partial.md` — GTK widget flicker
+  bullet now points at the CompositeGlyphs pen fix as the likely
+  root cause; needs MATE re-test to confirm. Added e16 pager
+  flicker as a separate open item.

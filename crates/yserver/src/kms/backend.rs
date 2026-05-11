@@ -4140,8 +4140,21 @@ impl KmsBackend {
             24 => 2,
             _ => 4,
         };
-        let mut pen_x = i32::from(src_x) + i32::from(x_off);
-        let mut pen_y = i32::from(src_y) + i32::from(y_off);
+        // Per X RENDER protocol, `xSrc`/`ySrc` are the SOURCE picture
+        // sampling origin — not the dst pen. The dst pen starts at
+        // (0, 0); the first glyph-element's `deltax`/`deltay` sets the
+        // absolute pen position, subsequent elements accumulate. Adding
+        // `src_x`/`src_y` to the pen shifts every glyph by (xSrc, ySrc)
+        // because GTK conventionally sets xSrc/ySrc equal to the first
+        // delta (which becomes the desired absolute pen). For the
+        // gtk3-demo TreeView this displaced each row's label into the
+        // NEXT row, which was then erased by the next FillRect for
+        // that row's background (2026-05-11 diagnosis). `x_off`/`y_off`
+        // are dispatcher-supplied padding (always 0 here) and are kept
+        // for parity with the trait signature.
+        let _ = (src_x, src_y);
+        let mut pen_x = i32::from(x_off);
+        let mut pen_y = i32::from(y_off);
         let mut pos: usize = 0;
         let mut active_gs_xid = host_gs;
         let mut glyphs_to_draw: Vec<vk_text::TextGlyph> = Vec::new();
@@ -4448,6 +4461,7 @@ impl KmsBackend {
             return true;
         }
         let Some(std_op) = StdPictOp::from_u8(op) else {
+            log::debug!("vk composite bail: unsupported op={op} (dst=0x{dst_xid:x})");
             return false;
         };
 
@@ -4462,13 +4476,18 @@ impl KmsBackend {
             _ => None,
         };
         if src_xid_if_drawable == Some(dst_xid) || mask_xid_if_drawable == Some(dst_xid) {
+            log::debug!(
+                "vk composite bail: self-composite src/mask aliases dst (dst=0x{dst_xid:x})"
+            );
             return false;
         }
 
         let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            log::debug!("vk composite bail: no Vk context (dst=0x{dst_xid:x})");
             return false;
         };
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            log::debug!("vk composite bail: no ops_command_pool (dst=0x{dst_xid:x})");
             return false;
         };
         if self.render_pipelines.is_none()
@@ -4476,10 +4495,14 @@ impl KmsBackend {
             || self.solid_mask_image.is_none()
             || self.white_mask_image.is_none()
         {
+            log::debug!("vk composite bail: pipelines/solid scratches uninit (dst=0x{dst_xid:x})");
             return false;
         }
         let needs_dst_readback = std_op.needs_dst_readback();
         if needs_dst_readback && self.dst_readback.is_none() {
+            log::debug!(
+                "vk composite bail: op needs dst_readback but readback uninit (dst=0x{dst_xid:x} op={op})"
+            );
             return false;
         }
 
@@ -4496,13 +4519,24 @@ impl KmsBackend {
             };
             match m {
                 Some(m) => (m.format, m.extent, depth),
-                None => return false,
+                None => {
+                    log::debug!(
+                        "vk composite bail: dst mirror missing (dst=0x{dst_xid:x} \
+                         is_window={} is_pixmap={})",
+                        self.windows.contains_key(&dst_xid),
+                        self.pixmaps.contains_key(&dst_xid),
+                    );
+                    return false;
+                }
             }
         };
         if !matches!(
             dst_format,
             ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM
         ) {
+            log::debug!(
+                "vk composite bail: dst mirror format {dst_format:?} not BGRA/R8 (dst=0x{dst_xid:x})"
+            );
             return false;
         }
         // R8 attachments are alpha-only (a8 pictures) so the
@@ -4519,11 +4553,32 @@ impl KmsBackend {
         if let Some(xid) = src_xid_if_drawable
             && !self.ensure_drawable_mirror_sampleable(xid)
         {
+            let in_windows = self.windows.contains_key(&xid);
+            let in_pixmaps = self.pixmaps.contains_key(&xid);
+            let win_mirror = self
+                .windows
+                .get(&xid)
+                .map(|w| w.vk_mirror.is_some())
+                .unwrap_or(false);
+            let pix_mirror = self
+                .pixmaps
+                .get(&xid)
+                .map(|p| p.vk_mirror.is_some())
+                .unwrap_or(false);
+            let pix_depth = self.pixmaps.get(&xid).map(|p| p.depth).unwrap_or(0);
+            log::debug!(
+                "vk composite bail: src mirror not sampleable (src=0x{xid:x} dst=0x{dst_xid:x} \
+                 in_windows={in_windows} in_pixmaps={in_pixmaps} win_mirror={win_mirror} \
+                 pix_mirror={pix_mirror} pix_depth={pix_depth})"
+            );
             return false;
         }
         if let Some(xid) = mask_xid_if_drawable
             && !self.ensure_drawable_mirror_sampleable(xid)
         {
+            log::debug!(
+                "vk composite bail: mask mirror not sampleable (mask=0x{xid:x} dst=0x{dst_xid:x})"
+            );
             return false;
         }
         // Drawable src must be `B8G8R8A8_UNORM` (depth-24/32) or
@@ -4544,6 +4599,9 @@ impl KmsBackend {
                 f,
                 Some(ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::R8_UNORM)
             ) {
+                log::debug!(
+                    "vk composite bail: src mirror format {f:?} not BGRA/R8 (src=0x{xid:x} dst=0x{dst_xid:x})"
+                );
                 return false;
             }
         }
