@@ -134,6 +134,21 @@ pub fn process_request(
         header.length_units,
         body,
     ) {
+        let required =
+            x11::request_lengths::exact_required_length(header.opcode, header.data, body);
+        let preview_len = body.len().min(64);
+        debug!(
+            "exact-length BadLength: client={} seq={} opcode={} header.data={:#x} \
+             length_units={} body.len={} required={:?} body_preview={:02x?}",
+            client_id.0,
+            sequence.0,
+            header.opcode,
+            header.data,
+            header.length_units,
+            body.len(),
+            required,
+            &body[..preview_len],
+        );
         return emit_x11_error(
             state,
             client_id,
@@ -9134,6 +9149,20 @@ fn handle_change_property(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let Some(req) = x11::change_property_request(header.data, body) else {
+        // Diagnostic: dump the request header + body shape that we
+        // rejected as malformed, so we can see what the client sent.
+        let preview_len = body.len().min(64);
+        let body_preview = &body[..preview_len];
+        debug!(
+            "ChangeProperty BadLength (parse-fail): client={} seq={} \
+             header.data={:#x} body.len={} length_units={} preview={:02x?}",
+            client_id.0,
+            sequence.0,
+            header.data,
+            body.len(),
+            header.length_units,
+            body_preview,
+        );
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 18);
     };
     let Some(mode) = properties::ChangeMode::from_protocol(req.mode) else {
@@ -9158,6 +9187,16 @@ fn handle_change_property(
     };
     let expected_bytes = (req.length as usize).checked_mul(format.bytes());
     if expected_bytes != Some(req.data.len()) {
+        debug!(
+            "ChangeProperty BadLength (length mismatch): client={} seq={} \
+             req.length={} format={} expected={:?} got={}",
+            client_id.0,
+            sequence.0,
+            req.length,
+            req.format,
+            expected_bytes,
+            req.data.len(),
+        );
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 18);
     }
     if state.resources.window(req.window).is_none() {

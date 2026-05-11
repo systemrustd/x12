@@ -383,7 +383,18 @@ pub fn validate_exact_request_length(
     length_units: u32,
     body: &[u8],
 ) -> bool {
-    exact_required_length(opcode, header_data, body).is_none_or(|req| length_units == req)
+    let Some(required) = exact_required_length(opcode, header_data, body) else {
+        return true;
+    };
+    // BIG-REQUESTS spends one extra 4-byte unit on the extended length
+    // field, so the wire is `length_units*4 - 8 == body.len()` instead
+    // of the normal `length_units*4 - 4 == body.len()`. Bump `required`
+    // by one unit when BIG-REQUESTS is in use; otherwise mate-panel's
+    // _NET_WM_ICON-style ChangeProperty gets rejected as BadLength.
+    let total_bytes = (length_units as usize).saturating_mul(4);
+    let big_requests = total_bytes.checked_sub(body.len()) == Some(8);
+    let adjusted = if big_requests { required + 1 } else { required };
+    length_units == adjusted
 }
 
 /// For opcodes that carry a value-mask, returns `Some(bad_value)` if
