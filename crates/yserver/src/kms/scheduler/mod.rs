@@ -1,8 +1,8 @@
 //! Frame-ownership and scheduling primitives.
 //!
 //! See `docs/superpowers/specs/2026-05-12-rendering-rearchitecture-hld.md`.
-//! Phase 1 lands the types with minimal behavior; recorders and the
-//! hot-path `vkQueueWaitIdle` calls are unchanged.
+//! Phase 3A introduces batch-owned resource lifetimes (PaintBatch
+//! state machine, BatchUploadArena, per-batch descriptor pools).
 
 use std::sync::Arc;
 
@@ -15,7 +15,8 @@ use self::{
     paint_batch::{BatchError, BatchState, PaintBatch},
 };
 
-// `batch_upload_arena` is added in T2; `batch_descriptor_arena` in T3.
+// `batch_descriptor_arena` is added in T3.
+pub mod batch_upload_arena;
 pub mod composite_pool_ring;
 pub mod damage;
 pub mod in_flight;

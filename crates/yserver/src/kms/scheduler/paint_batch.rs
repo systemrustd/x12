@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::kms::vk::device::VkContext;
+use crate::kms::{scheduler::batch_upload_arena::BatchUploadArena, vk::device::VkContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchState {
@@ -89,6 +89,7 @@ pub struct PaintBatch {
     pool: vk::CommandPool,
     vk: Arc<VkContext>,
     retire_resources: Vec<Box<dyn BatchResource>>,
+    upload_arena: Option<BatchUploadArena>,
 }
 
 impl std::fmt::Debug for PaintBatch {
@@ -114,6 +115,7 @@ impl PaintBatch {
             pool,
             vk,
             retire_resources: Vec::new(),
+            upload_arena: None,
         }
     }
 
@@ -130,13 +132,22 @@ impl PaintBatch {
     }
 
     /// Adopt `resource` for release at `Retired` / `Poisoned`.
-    /// Used by `BatchUploadArena`, per-batch descriptor pool, etc.
+    /// Used by per-batch descriptor pool, etc.
     pub fn adopt(&mut self, resource: Box<dyn BatchResource>) {
         debug_assert!(
             !matches!(self.state, BatchState::Retired | BatchState::Poisoned),
             "PaintBatch::adopt called on terminal batch"
         );
         self.retire_resources.push(resource);
+    }
+
+    /// Mutable reference to the per-batch upload arena, lazy-init
+    /// on first call.
+    pub fn upload_arena_mut(&mut self) -> &mut BatchUploadArena {
+        if self.upload_arena.is_none() {
+            self.upload_arena = Some(BatchUploadArena::new(self.vk.clone()));
+        }
+        self.upload_arena.as_mut().unwrap()
     }
 
     /// Run `record` against the batch's CB. Lazy-allocates and
@@ -363,6 +374,9 @@ impl PaintBatch {
             "retire_now from {:?}",
             self.state
         );
+        if let Some(arena) = self.upload_arena.take() {
+            Box::new(arena).release(&self.vk);
+        }
         for r in self.retire_resources.drain(..) {
             r.release(&self.vk);
         }
@@ -376,6 +390,9 @@ impl PaintBatch {
     fn poison(&mut self) {
         if let Some(cb) = self.cb.take() {
             unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+        }
+        if let Some(arena) = self.upload_arena.take() {
+            Box::new(arena).release(&self.vk);
         }
         for r in self.retire_resources.drain(..) {
             r.release(&self.vk);
