@@ -4,6 +4,7 @@
 //! Phase 1 lands the types with minimal behavior; recorders and the
 //! hot-path `vkQueueWaitIdle` calls are unchanged.
 
+pub mod composite_pool_ring;
 pub mod damage;
 pub mod in_flight;
 pub mod output_frame;
