@@ -44,6 +44,36 @@ cargo test
 
 Use explicit `git add <file>` per file — **do NOT use `git commit -am`** (phase 1's `3184fd9` swept in `docs/status.md`).
 
+**Pedantic clippy: NOT enforced for phase 3.** Run `cargo clippy` without `-W clippy::pedantic`. Don't chase `#[must_use]`, `missing_errors_doc`, `doc_markdown`, etc.
+
+## Plan bugs caught during 3A execution (apply to 3B+ implementations)
+
+Codified after 3A landed; each was a real failure-to-compile or quality issue caught in review:
+
+1. **`#[derive(Debug)]` on any type holding `Arc<VkContext>` will NOT compile.** `VkContext` (in `kms/vk/device.rs`) does not implement `Debug` — its Vulkan handles are opaque. Use a manual `Debug` impl with `finish_non_exhaustive()`, matching the `CompositePoolRing` precedent. Example from `BatchUploadArena`:
+
+   ```rust
+   impl std::fmt::Debug for BatchUploadArena {
+       fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+           f.debug_struct("BatchUploadArena")
+               .field("chunks", &self.chunks.len())
+               .finish_non_exhaustive()
+       }
+   }
+   ```
+
+   The spec's `#[derive(Debug)]` annotations in 3A T1/T2/T3 source listings are wrong; treat them as "needs manual impl."
+
+2. **`unsafe impl Send` requires a `// SAFETY:` comment at the impl site.** The phase-6.8 single-core invariant is documented in `BatchResource`'s trait doc but Rust convention wants the justification at every `unsafe impl` too. Pattern:
+
+   ```rust
+   // SAFETY: The KMS backend's single-threaded-core invariant
+   // (phase 6.8) guarantees these are never moved across threads.
+   unsafe impl Send for ... {}
+   ```
+
+3. **3A T1's `dirty_outputs` local in `composite_and_flip` is dead after T5.** T1 introduces it for `close_and_submit(dirty_outputs)`; T5 replaces that call with `flush_if_needed(VisibleComposite)` which rebuilds the vec internally. T5 must delete the now-unused local — the spec doesn't call it out explicitly. Caught at T5 review.
+
 ## Out of scope (deferred)
 
 - Removing the close-time `vkQueueWaitIdle` — phase 4.
@@ -1552,6 +1582,26 @@ git add crates/yserver/src/kms/backend.rs \
         crates/yserver/src/kms/scheduler/paint_batch.rs
 git commit -m "feat(kms): BatchFlushReason + flush_if_needed + record_paint_op (no call sites)"
 ```
+
+---
+
+# Renderer-disabled design (prerequisite for 3B)
+
+3A landed `flush_if_needed(VisibleComposite)` returning `io::Result<()>` and `composite_and_flip` propagating Vk failures as `io::Error::other(...)`. The trait surface at `crates/yserver-core/src/backend/trait_def.rs` does NOT carry that error — `Backend::on_page_flip_ready` returns `()`. So today's Vk failure path is **caught at the trait boundary and dropped on the floor** (the `on_page_flip_ready` impl in `KmsBackend` calls `composite_and_flip()` and returns `()`).
+
+Phase 3B is where this becomes a real correctness problem: the first time a recorder migrates, a `Poisoned` batch or a wait-failure can produce a real fatal `Err`, and silently dropping it means the next composite tick will try to use abandoned Vulkan handles.
+
+**3B must land a `renderer_failed` strategy before its first recorder migration.** Three options; design discussion will pick one before 3B T1:
+
+**Option A — in-band disabled flag (recommended).** Add `renderer_failed: bool` on `KmsBackend`. Set true on any fatal `flush_if_needed` Err. Gate every paint entry point on it: `record_paint_op`, `flush_if_needed`, `composite_and_flip` early-return `Ok(())` (or a no-op pixman-shadow fallback) when the flag is set. Pros: in-process; no trait churn; survivable for clients that only need the X server's input/wire path. Cons: screen freezes at the last good frame; users may not notice.
+
+**Option B — trait surface propagates error.** Change `Backend::on_page_flip_ready` to return `io::Result<()>`. Core loop terminates on fatal renderer failure. Pros: explicit, no zombie state. Cons: invasive trait change; ynest backend (host-X11) has different failure modes that don't fit a single error type cleanly.
+
+**Option C — panic.** The HLD's `submit_and_wait` doc says device-lost is "not a recoverable state." Crashing the process and relying on an external supervisor (systemd, a session manager) to restart yserver is defensible. Pros: simplest; matches the actual semantic. Cons: aggressive; no graceful X-client disconnect; logs and external state may be inconsistent.
+
+**Recommendation: Option A** for phase 3, with a `log::error!` so a supervisor can pick up the failure from logs and (optionally) restart. Phase 4's timeline-semaphore work can revisit if it changes the failure-mode shape. The fatal `Err` path in `composite_and_flip` keeps the current `return Err(...)` (so anyone calling it directly sees the error), and a thin wrapper in `on_page_flip_ready` sets the flag + logs.
+
+3B T0 owns the implementation: add the flag, gate the three entry points, ensure tests cover both the live and disabled states.
 
 ---
 
