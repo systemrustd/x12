@@ -8028,6 +8028,18 @@ impl Backend for KmsBackend {
         x: i16,
         y: i16,
     ) -> io::Result<()> {
+        // Snapshot pre-change absolute rect for old∪new dirty propagation.
+        // `absolute_origin` needs &self, so we capture before the &mut borrow.
+        let pre_rect = self.windows.get(&host_xid).map(|w| {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            }
+        });
+
         let Some(window) = self.windows.get_mut(&host_xid) else {
             return Ok(());
         };
@@ -8050,6 +8062,25 @@ impl Backend for KmsBackend {
         } else if let Some(parent) = self.windows.get_mut(&new_parent) {
             parent.children.push(host_xid);
         }
+        // Dirty outputs intersecting old ∪ new screen-space rect.
+        // The new absolute position is computed after parent/x/y are updated.
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let pre = pre_rect.unwrap_or(empty);
+        let post = self.windows.get(&host_xid).map_or(empty, |w| {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            }
+        });
+        self.mark_window_dirty_with_old_rect(pre, post);
         Ok(())
     }
 
