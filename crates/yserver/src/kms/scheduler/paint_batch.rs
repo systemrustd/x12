@@ -54,6 +54,55 @@ use crate::kms::{
     vk::device::VkContext,
 };
 
+/// Why a paint batch flush was requested. Passed to
+/// `KmsBackend::flush_if_needed` so phase 4 can distinguish between
+/// "submit + signal" and "submit + wait" flush policies.
+///
+/// Strict reasons (`Readback`, `ExternalSync`, `ProtocolBarrier`) surface
+/// a `Poisoned` or `InvalidState` batch as an error — the caller's
+/// completion guarantee cannot be honoured.  Best-effort reasons
+/// (`VisibleComposite`, `SizeLimit`, `LatencyLimit`, `Shutdown`) swallow
+/// those conditions.
+#[derive(Debug, Clone, Copy)]
+pub enum BatchFlushReason {
+    /// The composite cycle is about to sample mirrors this batch
+    /// wrote. Fires at the top of `composite_and_flip`'s per-output
+    /// loop.
+    VisibleComposite,
+    /// A synchronous-reply request needs CPU-visible pixels.
+    /// GetImage, host-readback, MIT-SHM GetImage.
+    Readback,
+    /// An external sync export is pending. DRI3 Present fence
+    /// handoff, SYNC extension fence trigger.
+    ExternalSync,
+    /// An explicit protocol barrier requested it. (Place-holder for
+    /// future use; X11 doesn't define one directly today.)
+    ProtocolBarrier,
+    /// The batch hit a size/op-count limit. Not load-bearing in
+    /// phase 3 (no limit enforced); reserved for phase 4+.
+    SizeLimit,
+    /// The batch hit a latency limit. Same.
+    LatencyLimit,
+    /// Server shutdown / hot teardown. Forces close before any
+    /// resource is freed by other paths.
+    Shutdown,
+}
+
+impl std::fmt::Display for BatchFlushReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            BatchFlushReason::VisibleComposite => "VisibleComposite",
+            BatchFlushReason::Readback => "Readback",
+            BatchFlushReason::ExternalSync => "ExternalSync",
+            BatchFlushReason::ProtocolBarrier => "ProtocolBarrier",
+            BatchFlushReason::SizeLimit => "SizeLimit",
+            BatchFlushReason::LatencyLimit => "LatencyLimit",
+            BatchFlushReason::Shutdown => "Shutdown",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchState {
     Idle,

@@ -1431,6 +1431,157 @@ impl KmsBackend {
         Some((rb.width, rb.height, rb.bytes))
     }
 
+    /// Flush the current paint batch for `reason`.
+    ///
+    /// Error semantics depend on `reason`:
+    ///
+    /// - `VisibleComposite` / `SizeLimit` / `LatencyLimit` /
+    ///   `Shutdown`: best-effort. A Poisoned batch (recorder
+    ///   failure earlier this cycle) is acceptable — composite
+    ///   will sample whatever mirrors currently hold; the
+    ///   recorder's affected drawables are already marked
+    ///   dirty for the next cycle.
+    /// - `Readback` / `ExternalSync` / `ProtocolBarrier`: the
+    ///   caller's contract requires the batch's work to have
+    ///   COMPLETED before this returns. A Poisoned or
+    ///   InvalidState batch means we cannot promise that; surface
+    ///   the failure so the caller can fail the request (return
+    ///   `BadAlloc`-shaped X error, return zeros from GetImage,
+    ///   etc.).
+    ///
+    /// **Any `Err(vk::Result)` returned here is fatal**: it comes
+    /// from `submit_and_wait`'s path 2 (wait failure ⇒ abandoned
+    /// CB/resources). Callers MUST propagate up to the main loop
+    /// and enter backend teardown / disabled-renderer state;
+    /// continuing to schedule paint work after this is not a
+    /// supported steady state.
+    pub fn flush_if_needed(
+        &mut self,
+        reason: crate::kms::scheduler::paint_batch::BatchFlushReason,
+    ) -> Result<(), ash::vk::Result> {
+        use crate::kms::scheduler::paint_batch::{BatchError, BatchFlushReason};
+        log::trace!("flush_if_needed: reason={reason:?}");
+        let dirty_outputs: Vec<usize> = (0..self.outputs.len())
+            .filter(|&i| self.outputs[i].damage.needs_composite())
+            .collect();
+        let result = self.scheduler.close_and_submit(dirty_outputs);
+        let strict = matches!(
+            reason,
+            BatchFlushReason::Readback
+                | BatchFlushReason::ExternalSync
+                | BatchFlushReason::ProtocolBarrier
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(BatchError::Vk(r)) => Err(r),
+            Err(BatchError::Poisoned) if strict => {
+                log::warn!(
+                    "flush_if_needed({reason:?}): batch was Poisoned; \
+                     caller's completion guarantee cannot be honoured"
+                );
+                Err(ash::vk::Result::ERROR_DEVICE_LOST)
+            }
+            Err(BatchError::InvalidState(s)) if strict => {
+                log::error!(
+                    "flush_if_needed({reason:?}): batch in invalid state {s:?}; \
+                     caller's completion guarantee cannot be honoured"
+                );
+                Err(ash::vk::Result::ERROR_UNKNOWN)
+            }
+            // Best-effort reasons swallow Poisoned / InvalidState.
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Append a paint-recorder op into the current `PaintBatch`'s
+    /// command buffer. Closure receives `(&VkContext, &mut PaintBatch, vk::CommandBuffer)`.
+    ///
+    /// **This is the load-bearing API**, with `&mut PaintBatch`
+    /// exposed so 3C recorders can call `batch.upload_arena_mut()` /
+    /// `batch.descriptor_arena_mut()` / `batch.adopt(resource)` from
+    /// inside the closure. 3B fill/copy recorders ignore the batch
+    /// parameter (use the thin `record_paint_op` shim below).
+    ///
+    /// Landing the wide signature now means 3C does not need to
+    /// refactor the API introduced in 3A.
+    pub fn record_paint_batch_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
+    where
+        F: FnOnce(
+            &crate::kms::vk::device::VkContext,
+            &mut crate::kms::scheduler::paint_batch::PaintBatch,
+            ash::vk::CommandBuffer,
+        ) -> Result<(), ash::vk::Result>,
+    {
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        // open_batch consumes the Arc — clone for the closure
+        // invocation below.
+        let _ = self.scheduler.open_batch(vk_arc.clone(), pool_handle);
+        let batch = self
+            .scheduler
+            .current_paint_batch
+            .as_mut()
+            .expect("open_batch just ran");
+        // We need `&mut PaintBatch` AND the closure has to receive
+        // both `&mut PaintBatch` and the CB. `append`'s F sees only
+        // `(&VkContext, CommandBuffer)`. Inline the equivalent of
+        // `batch.append(record)` so the user closure can take
+        // `batch` too. The CB must come from `batch`'s state
+        // machine — replicate the lazy-open path here.
+        use crate::kms::scheduler::paint_batch::{BatchError, BatchState};
+        match batch.state() {
+            BatchState::Poisoned => return Err(ash::vk::Result::ERROR_DEVICE_LOST),
+            BatchState::Closed | BatchState::Submitted | BatchState::Retired => {
+                log::error!(
+                    "record_paint_batch_op: batch in non-recording state {:?}",
+                    batch.state()
+                );
+                return Err(ash::vk::Result::ERROR_UNKNOWN);
+            }
+            BatchState::Idle => {
+                // The lazy-open path lives on PaintBatch itself —
+                // expose a method that begins recording and returns
+                // the CB, then call into the user closure. See
+                // `PaintBatch::begin_recording_explicit` added in
+                // T1 step 1.
+                if let Err(e) = batch.begin_recording_explicit() {
+                    return Err(match e {
+                        BatchError::Vk(r) => r,
+                        _ => ash::vk::Result::ERROR_UNKNOWN,
+                    });
+                }
+            }
+            BatchState::Recording => {}
+        }
+        let cb = batch.command_buffer().expect("Recording implies cb");
+        // Borrow split: vk_arc was cloned above; pass it by reference.
+        match record(&vk_arc, batch, cb) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                batch.poison_external();
+                Err(e)
+            }
+        }
+    }
+
+    /// Thin shim for recorders that don't need the batch handle
+    /// (fill, copy-distinct, copy-same). Matches the existing
+    /// `run_one_shot_op` closure signature for textual-rewrite
+    /// migration in 3B.
+    pub fn record_paint_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
+    where
+        F: FnOnce(
+            &crate::kms::vk::device::VkContext,
+            ash::vk::CommandBuffer,
+        ) -> Result<(), ash::vk::Result>,
+    {
+        self.record_paint_batch_op(|vk, _batch, cb| record(vk, cb))
+    }
+
     fn open_with_commit(
         device_path: &str,
         commit: fn(
@@ -2045,6 +2196,17 @@ impl KmsBackend {
         if self.ops_staging.is_none() {
             return;
         }
+
+        // Ensure any pending paint batch work is flushed before we read
+        // pixels back to the CPU. In Phase 3A the batch is always Idle so
+        // this is a no-op; it becomes load-bearing once 3B migrates recorders.
+        if let Err(e) =
+            self.flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::Readback)
+        {
+            log::warn!("hw_cursor_refresh: pre-flush failed ({e:?}); skipping cursor update");
+            return;
+        }
+
         let total_bytes = u64::from(cw) * u64::from(ch) * u64::from(bpp);
         if let Err(e) = self
             .ops_staging
@@ -2334,6 +2496,16 @@ impl KmsBackend {
         let vk_arc = self.vk.as_ref().cloned()?;
         let pool_handle = self.ops_command_pool.as_ref().map(|p| p.handle())?;
         self.ops_staging.as_ref()?;
+
+        // Ensure any pending paint batch work is flushed before we read
+        // pixels back to the CPU. In Phase 3A the batch is always Idle so
+        // this is a no-op; it becomes load-bearing once 3B migrates recorders.
+        if let Err(e) =
+            self.flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::Readback)
+        {
+            log::warn!("read_mirror_pixels: pre-flush failed ({e:?}); returning None");
+            return None;
+        }
 
         // Snapshot extent + bpp without holding a mut borrow on self.
         let (mirror_w, mirror_h, mirror_bpp) = {
@@ -3691,6 +3863,81 @@ impl KmsBackend {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CPU-visible / sync-export request handler flush-audit (Phase 3A T5)
+    //
+    // Catalogued 2026-05-13. Every site that needs GPU work to be complete
+    // before CPU reads pixels or before a sync object is exported must call
+    // `flush_if_needed(Readback | ExternalSync)` before its per-op
+    // `run_one_shot_op`. In Phase 3A the batch is always Idle on these paths
+    // (no recorder has been migrated yet), so these flushes are no-ops;
+    // they become load-bearing in 3B/3C/3D when recorders start populating
+    // the batch.
+    //
+    // grep basis:
+    //   rg -n 'record_get_image|read_mirror_pixels|hw_cursor_refresh' kms/backend.rs
+    //   rg -n 'PresentPixmap|present_pixmap|dri3|SyncTriggerFence|sync_trigger' src/
+    //
+    // Site decisions:
+    //
+    //   try_vk_get_image_pixels (line ~3855):
+    //     FLUSH Readback — calls run_one_shot_op(record_get_image). CPU reads
+    //     staging after the op. flush_if_needed(Readback) added before the
+    //     has_read / run_one_shot_op block.  This function returns `bool`; on
+    //     Err, return `false` (existing fallback path, no change in
+    //     behaviour).
+    //
+    //   hw_cursor_refresh (line ~1999):
+    //     FLUSH Readback — calls run_one_shot_op(record_get_image) to read
+    //     the cursor mirror into the dumb-buffer for the HW cursor plane.
+    //     CPU reads staging after the op. flush_if_needed(Readback) added at
+    //     the top of the GPU-readback block, before run_one_shot_op.  On Err,
+    //     return early (matches existing warn-and-return pattern).
+    //
+    //   read_mirror_pixels (line ~2331):
+    //     FLUSH Readback — calls run_one_shot_op(record_get_image) and then
+    //     copies staging bytes to host Vec.  flush_if_needed(Readback) added
+    //     before run_one_shot_op. Returns `Option`; on Err, return None
+    //     (matches existing warn-and-return pattern).
+    //
+    //   create_cursor (line ~8601) calls read_mirror_pixels:
+    //     NOT a separate flush site — read_mirror_pixels already carries the
+    //     flush.
+    //
+    //   copy_plane (line ~9078) calls read_mirror_pixels:
+    //     NOT a separate flush site — read_mirror_pixels already carries the
+    //     flush.
+    //
+    //   read_depth1_pixmap (line ~9210) calls read_mirror_pixels:
+    //     NOT a separate flush site — read_mirror_pixels already carries the
+    //     flush.
+    //
+    //   dri3_trigger_fence (line ~7674):
+    //     SKIP ExternalSync — current impl only signals an xshmfence (futex
+    //     write) or is a no-op for VkSemaphore-backed fences. No GPU work is
+    //     involved and no batch dependency exists; adding a flush here would
+    //     be premature. Revisit in Phase 3B when a real Present fence
+    //     pipeline is wired.
+    //
+    //   dri3_fd_from_fence (line ~7687):
+    //     SKIP ExternalSync — exports an already-created VkSemaphore fd.
+    //     No GPU work runs here; the semaphore is pre-populated on import.
+    //
+    //   dri3_signal_syncobj (line ~7724):
+    //     SKIP ExternalSync — signals a timeline semaphore that was
+    //     imported from a client DRM syncobj. No paint batch work is
+    //     involved.
+    //
+    //   dri3_export_pixmap (line ~7737):
+    //     SKIP ExternalSync — exports a dma-buf fd from an imported
+    //     DrawableImage. No GPU work runs here.
+    //
+    //   PresentPixmap / present_pixmap / SyncTriggerFence:
+    //     Not found as handler entry points in kms/backend.rs. The DRI3
+    //     Present protocol is dispatched via dri3_trigger_fence /
+    //     dri3_signal_syncobj above; no separate PresentPixmap handler exists.
+    // -----------------------------------------------------------------------
+
     /// GetImage Vulkan-direct readback (sub-phase 4.1.4.3). Records
     /// `vkCmdCopyImageToBuffer` from the mirror into the host-visible
     /// staging buffer, waits, and writes the pixel bytes (with the
@@ -3733,6 +3980,16 @@ impl KmsBackend {
             return false;
         };
         if self.ops_staging.is_none() {
+            return false;
+        }
+
+        // Ensure any pending paint batch work is flushed before we read
+        // pixels back to the CPU. In Phase 3A the batch is always Idle so
+        // this is a no-op; it becomes load-bearing once 3B migrates recorders.
+        if let Err(e) =
+            self.flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::Readback)
+        {
+            log::warn!("vk get_image: pre-flush failed ({e:?}); returning zeros");
             return false;
         }
 
@@ -6391,21 +6648,22 @@ impl KmsBackend {
             })
             .collect();
 
-        // Candidate outputs (passed the damage gate). Pass to
-        // close_and_submit as `dirty_outputs` for audit logging
-        // only — the actual phase-4 holder list is built by
-        // `OutputFrame::new` AFTER `try_vulkan_composite_flip`
-        // succeeds (which can still skip a candidate via the
-        // flip-pending / BO-availability gates further down).
-        let dirty_outputs: Vec<usize> = (0..self.outputs.len())
-            .filter(|&i| self.outputs[i].damage.needs_composite())
-            .collect();
-
         // Flush paint BEFORE the per-output composite loop. Until
         // 3B starts migrating recorders, the batch is Idle on every
         // cycle and this is a cheap state transition.
-        if let Err(e) = self.scheduler.close_and_submit(dirty_outputs) {
-            log::warn!("composite cycle: paint batch submit failed: {e}");
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::VisibleComposite)
+        {
+            // Per submit_and_wait's path-2 semantics, this is fatal:
+            // a CB and its resources have been abandoned. Stop
+            // normal rendering.
+            log::error!(
+                "composite cycle: paint batch flush returned fatal {e:?}; \
+                 KMS renderer is in an unrecoverable state"
+            );
+            return Err(std::io::Error::other(format!(
+                "PaintBatch::submit_and_wait failed: {e:?}"
+            )));
         }
 
         // Audit assertion (debug-only): no batch may be open during
