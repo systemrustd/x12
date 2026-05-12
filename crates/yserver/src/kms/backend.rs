@@ -6244,6 +6244,12 @@ impl KmsBackend {
             // view of "what's on screen" diverge. Better to skip the
             // frame; the next pageflip-complete will retrigger
             // composite_and_flip and we'll catch up cleanly.
+            //
+            // Note: post-T7, the per-output `needs_composite()` check
+            // above already returns false when `damage.flip_pending`
+            // is true, so under normal operation this BO-phase check
+            // is a defense-in-depth guard against damage/BoPhase
+            // divergence rather than the primary gate.
             let vk_flip_pending = self
                 .scanout_pools
                 .get(layout_idx)
@@ -11160,21 +11166,18 @@ mod tests {
     }
 
     #[test]
-    fn composite_and_flip_advances_submitted_gen() {
+    fn composite_and_flip_does_not_set_flip_pending_on_no_vk_path() {
+        // The for_tests backend has no VK context, so
+        // try_vulkan_composite_flip returns false and record_submit
+        // is never called. This test guards against the regression
+        // where record_submit is accidentally called outside the
+        // successful-submit branch.
         let mut backend = make_test_backend();
-        let before: Vec<u64> = backend
-            .outputs
-            .iter()
-            .map(|l| l.damage.dirty_gen())
-            .collect();
         backend.composite_and_flip().unwrap();
-        for (i, layout) in backend.outputs.iter().enumerate() {
-            // In the for_tests path there's no real Vulkan path, so
-            // the submit may not occur — but if it did, submitted_gen
-            // catches up to dirty_gen at the time of submit.
+        for layout in &backend.outputs {
             assert!(
-                layout.damage.last_submitted_gen() <= before[i],
-                "submitted_gen never overruns dirty_gen at submit time"
+                !layout.damage.flip_pending(),
+                "no-VK path must not set flip_pending"
             );
         }
     }
