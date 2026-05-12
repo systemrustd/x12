@@ -755,7 +755,6 @@ pub struct KmsBackend {
     /// Frame-ownership and scheduling state. T9 wires composite routing
     /// through here; T7 adds the per-output dirty helpers that make the
     /// idle gate work correctly.
-    #[allow(dead_code)]
     pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
 
     // Fonts (freetype)
@@ -6213,6 +6212,77 @@ impl KmsBackend {
         }
     }
 
+    /// Non-blocking poll of the in-flight queue. Marks GPU- and
+    /// scanout-retirement bits and drains fully-retired frames.
+    /// Called at the top of `composite_and_flip` and from the
+    /// pageflip-complete handler.
+    ///
+    /// Uses index-based access via `InFlight::get_mut` rather than
+    /// `frames_mut()`: the loop body reads `self.vk` and
+    /// `self.scanout_pools`, which can't coexist with a held
+    /// `&mut self.scheduler.in_flight` borrow. The two-pass pattern
+    /// (snapshot via get_mut, compute, write back via get_mut)
+    /// avoids the borrow split.
+    fn poll_in_flight(&mut self) {
+        let n = self.scheduler.in_flight.len();
+        for i in 0..n {
+            // Pass 1: snapshot the polling inputs.
+            let (composite_fence, output_idx, bo_slot, gpu_done, scanout_done) = {
+                let f = self.scheduler.in_flight.get_mut(i).unwrap();
+                (
+                    f.composite_fence,
+                    f.output_idx,
+                    f.bo_slot,
+                    f.gpu_retired,
+                    f.scanout_retired,
+                )
+            };
+
+            // Compute the new bools outside the borrow.
+            //
+            // GPU retirement. Phase 1: null fence is the "already
+            // retired" sentinel (vkQueueWaitIdle inside the submit
+            // path drained the queue). Phase 4 replaces the null
+            // with a real signalled-by-submit fence or timeline
+            // value, and this branch becomes a true non-blocking
+            // status check.
+            let new_gpu = if gpu_done || composite_fence == ash::vk::Fence::null() {
+                // Already retired or null-sentinel: no real fence to check.
+                true
+            } else if let Some(vk) = self.vk.as_ref() {
+                let status = unsafe { vk.device.get_fence_status(composite_fence) };
+                matches!(status, Ok(true))
+            } else {
+                gpu_done
+            };
+
+            // Scanout retirement. The BoPhase machine in `vk/scanout.rs`
+            // transitions the BO to Free on the pageflip-complete event.
+            // A frame whose bo_slot is `None` (no-VK test path) is
+            // trivially scanout-retired.
+            let new_scanout = if scanout_done {
+                true
+            } else {
+                self.scanout_pools
+                    .get(output_idx)
+                    .and_then(|p| p.as_ref())
+                    .and_then(|p| bo_slot.and_then(|s| p.bos.get(s)))
+                    .map(|b| matches!(b.state.phase, crate::kms::vk::scanout::BoPhase::Free))
+                    .unwrap_or(true)
+            };
+
+            // Pass 2: write back.
+            let f = self.scheduler.in_flight.get_mut(i).unwrap();
+            f.gpu_retired = new_gpu;
+            f.scanout_retired = new_scanout;
+        }
+
+        let drained = self.scheduler.in_flight.drain_retired();
+        if drained > 0 {
+            log::trace!("in_flight: drained {} fully-retired frame(s)", drained);
+        }
+    }
+
     /// True iff any output has unpresented damage and no pending flip.
     fn any_output_needs_composite(&self) -> bool {
         self.outputs.iter().any(|l| l.damage.needs_composite())
@@ -6223,6 +6293,11 @@ impl KmsBackend {
         // ops fill them directly through Vk. The pre-composite
         // upload pass is gone.
 
+        // Poll the in-flight queue non-blocking. Marks GPU- and
+        // scanout-retirement bits and drains any fully-retired frames
+        // before we decide whether any output needs compositing.
+        self.poll_in_flight();
+
         // Skip the whole pass when no output has unpresented damage.
         // Producers (request handlers, host input, host-X11 fanout)
         // call `mark_dirty` / `mark_all_outputs_dirty` to bump dirty
@@ -6232,6 +6307,10 @@ impl KmsBackend {
         if !self.any_output_needs_composite() {
             return Ok(());
         }
+
+        // Open a paint batch for this composite cycle. The frame_id is
+        // shared across all outputs composited in this cycle.
+        let frame_id = self.scheduler.open_batch();
 
         let top_levels: Vec<u32> = self.top_level_order.clone();
 
@@ -6307,21 +6386,44 @@ impl KmsBackend {
             // bo isn't available the frame is skipped — no pixman
             // fallback. The next pageflip-complete event will retrigger
             // composite_and_flip.
-            if !self.try_vulkan_composite_flip(layout_idx, visible) {
+            let bo_slot = self.try_vulkan_composite_flip(layout_idx, visible);
+            if bo_slot.is_none() {
                 log::debug!(
                     "composite: deferring frame on output {} until a Free bo is available",
                     self.outputs[layout_idx].output.connector_name
                 );
-            } else {
-                self.outputs[layout_idx].damage.record_submit();
-                log::debug!(
-                    "composite: submitted flip on output {} (visible={}, submitted_gen={})",
-                    self.outputs[layout_idx].output.connector_name,
-                    visible.len(),
-                    self.outputs[layout_idx].damage.last_submitted_gen(),
-                );
+                continue;
             }
+            // record_submit was added in task 7; keep it here.
+            self.outputs[layout_idx].damage.record_submit();
+            log::debug!(
+                "composite: submitted flip on output {} (visible={}, submitted_gen={})",
+                self.outputs[layout_idx].output.connector_name,
+                visible.len(),
+                self.outputs[layout_idx].damage.last_submitted_gen(),
+            );
+
+            // Push an InFlightFrame for this successful submit.
+            // Phase 1: composite_fence is vk::Fence::null() — treated as
+            // "already GPU-retired" in poll_in_flight because
+            // vkQueueWaitIdle inside try_vulkan_composite_flip has already
+            // drained the queue. Phase 4 swaps null for a real fence.
+            let submitted_gen = self.outputs[layout_idx].damage.last_submitted_gen();
+            self.scheduler
+                .in_flight
+                .push(crate::kms::scheduler::in_flight::InFlightFrame {
+                    output_idx: layout_idx,
+                    frame_id,
+                    submitted_gen,
+                    composite_fence: ash::vk::Fence::null(),
+                    bo_slot,
+                    gpu_retired: false,
+                    scanout_retired: false,
+                });
         }
+
+        let _batch = self.scheduler.close_batch();
+        // Phase 1: discard. Phase 2 submits its CB here.
 
         Ok(())
     }
@@ -6329,39 +6431,33 @@ impl KmsBackend {
     /// VkComposite path (sub-phase 4.1.3.4): build a
     /// [`CompositeScene`] from the window tree, pick a Free
     /// `ScanoutBo`, record the per-window quad-draw composite pass,
-    /// submit, atomic-flip with explicit fences. Returns `true` iff
-    /// the composite + flip actually happened — caller falls back to
-    /// the pixman path on `false`.
-    fn try_vulkan_composite_flip(&mut self, layout_idx: usize, visible: &[u32]) -> bool {
+    /// submit, atomic-flip with explicit fences. Returns `Some(bo_idx)`
+    /// with the index of the scanout BO that was used, or `None` if the
+    /// composite + flip did not happen (no free BO, no Vulkan, or error).
+    fn try_vulkan_composite_flip(&mut self, layout_idx: usize, visible: &[u32]) -> Option<usize> {
         use crate::kms::vk::{compositor, scanout::BoPhase};
 
-        let Some(vkctx) = self.vk.as_ref() else {
-            return false;
-        };
-        let Some(pipeline) = self.compositor_pipeline.as_ref() else {
-            return false;
-        };
-        let Some(pool) = self.scanout_pools.get(layout_idx).and_then(|p| p.as_ref()) else {
-            return false;
-        };
+        let vkctx = self.vk.as_ref()?;
+        let pipeline = self.compositor_pipeline.as_ref()?;
+        let pool = self
+            .scanout_pools
+            .get(layout_idx)
+            .and_then(|p| p.as_ref())?;
         let Some(bo_idx) = pool.bos.iter().position(|b| b.state.phase == BoPhase::Free) else {
             log::warn!(
                 "vk composite: no Free bo in pool for output {} — falling back to pixman",
                 self.outputs[layout_idx].output.connector_name
             );
-            return false;
+            return None;
         };
 
         let scene = self.build_composite_scene(layout_idx, visible);
 
         // Re-borrow pool mutably to advance bo state.
-        let Some(pool_mut) = self
+        let pool_mut = self
             .scanout_pools
             .get_mut(layout_idx)
-            .and_then(|p| p.as_mut())
-        else {
-            return false;
-        };
+            .and_then(|p| p.as_mut())?;
         let bo = &mut pool_mut.bos[bo_idx];
         match compositor::record_and_present_composite(
             vkctx,
@@ -6371,14 +6467,14 @@ impl KmsBackend {
             pipeline,
             &scene,
         ) {
-            Ok(()) => true,
+            Ok(()) => Some(bo_idx),
             Err(e) => {
                 log::warn!(
                     "vk composite: record_and_present_composite failed on output {}: {e} \
                      — falling back to pixman this frame",
                     self.outputs[layout_idx].output.connector_name
                 );
-                false
+                None
             }
         }
     }
@@ -6909,6 +7005,11 @@ impl KmsBackend {
             // producer bumps dirty_gen again.
             self.outputs[output_idx].damage.record_present();
         }
+        // Poll in-flight queue after all flip completions are processed.
+        // Pageflip-complete transitions BOs to Free (via
+        // advance_pool_on_pageflip_complete above), so scanout retirement
+        // is now observable.
+        self.poll_in_flight();
         // Always composite on flip completion (self-driving at vsync)
         self.composite_and_flip()
     }
