@@ -1323,41 +1323,68 @@ Add a `poll_in_flight` method on `KmsBackend`. Note the null-fence path: phase 1
     /// scanout-retirement bits and drains fully-retired frames.
     /// Called at the top of `composite_and_flip` and from the
     /// pageflip-complete handler.
+    ///
+    /// Uses index-based access via `InFlight::get_mut` rather than
+    /// `frames_mut()`: the loop body reads `self.vk` and
+    /// `self.scanout_pools`, which can't coexist with a held
+    /// `&mut self.scheduler.in_flight` borrow. The two-pass pattern
+    /// (snapshot via get_mut, compute, write back via get_mut)
+    /// avoids the borrow split.
     fn poll_in_flight(&mut self) {
-        for frame in self.scheduler.in_flight.frames_mut() {
+        let n = self.scheduler.in_flight.len();
+        for i in 0..n {
+            // Pass 1: snapshot the polling inputs.
+            let (composite_fence, output_idx, bo_slot, gpu_done, scanout_done) = {
+                let f = self.scheduler.in_flight.get_mut(i).unwrap();
+                (
+                    f.composite_fence,
+                    f.output_idx,
+                    f.bo_slot,
+                    f.gpu_retired,
+                    f.scanout_retired,
+                )
+            };
+
+            // Compute the new bools outside the borrow.
+            //
             // GPU retirement. Phase 1: null fence is the "already
             // retired" sentinel (vkQueueWaitIdle inside the submit
             // path drained the queue). Phase 4 replaces the null
             // with a real signalled-by-submit fence or timeline
             // value, and this branch becomes a true non-blocking
             // status check.
-            if !frame.gpu_retired {
-                if frame.composite_fence == ash::vk::Fence::null() {
-                    frame.gpu_retired = true;
-                } else if let Some(vk) = self.vk.as_ref() {
-                    let status = unsafe { vk.device.get_fence_status(frame.composite_fence) };
-                    if matches!(status, Ok(true)) {
-                        frame.gpu_retired = true;
-                    }
-                }
-            }
+            let new_gpu = if gpu_done {
+                true
+            } else if composite_fence == ash::vk::Fence::null() {
+                true
+            } else if let Some(vk) = self.vk.as_ref() {
+                let status = unsafe { vk.device.get_fence_status(composite_fence) };
+                matches!(status, Ok(true))
+            } else {
+                gpu_done
+            };
+
             // Scanout retirement. The BoPhase machine in `vk/scanout.rs`
             // transitions the BO to Free on the pageflip-complete event.
             // A frame whose bo_slot is `None` (no-VK test path) is
             // trivially scanout-retired.
-            if !frame.scanout_retired {
-                let retired = self
-                    .scanout_pools
-                    .get(frame.output_idx)
+            let new_scanout = if scanout_done {
+                true
+            } else {
+                self.scanout_pools
+                    .get(output_idx)
                     .and_then(|p| p.as_ref())
-                    .and_then(|p| frame.bo_slot.and_then(|i| p.bos.get(i)))
+                    .and_then(|p| bo_slot.and_then(|s| p.bos.get(s)))
                     .map(|b| matches!(b.state.phase, crate::kms::vk::scanout::BoPhase::Free))
-                    .unwrap_or(true);
-                if retired {
-                    frame.scanout_retired = true;
-                }
-            }
+                    .unwrap_or(true)
+            };
+
+            // Pass 2: write back.
+            let f = self.scheduler.in_flight.get_mut(i).unwrap();
+            f.gpu_retired = new_gpu;
+            f.scanout_retired = new_scanout;
         }
+
         let drained = self.scheduler.in_flight.drain_retired();
         if drained > 0 {
             log::trace!("in_flight: drained {} fully-retired frame(s)", drained);
