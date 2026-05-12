@@ -68,6 +68,16 @@ fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
 
 /// Drop every server-side resource owned by `client_id` and free the
 /// corresponding host objects.
+///
+/// If the client previously set `SetCloseDownMode(RetainPermanent |
+/// RetainTemporary)`, its non-window resources (pixmaps, GCs, fonts,
+/// cursors, pictures, glyphsets) survive with their original `owner:
+/// ClientId` intact and the client_id is recorded in
+/// `state.zombie_clients`. Connection-tied state (event masks, grabs,
+/// selections, extension tables) is always torn down — a retained
+/// client has no socket to receive on. The retained resources stay
+/// findable by ID until either `KillClient(resource_owned_by_this_id)`
+/// or, for RetainTemporary only, `KillClient(AllTemporary)`.
 pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, client_id: ClientId) {
     // Idempotent: a client can be disconnected twice in quick succession
     // (write-side EPIPE from process_request races the reader thread's
@@ -76,7 +86,13 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     if !state.clients.contains_key(&client_id.0) {
         return;
     }
-    log::debug!("process_disconnect: client {}", client_id.0);
+    let close_mode = state.close_down_modes.remove(&client_id.0).unwrap_or(0);
+    let retain = close_mode == 1 || close_mode == 2;
+    log::debug!(
+        "process_disconnect: client {} close_mode={}",
+        client_id.0,
+        close_mode
+    );
     // Send the reader thread (if any) a Shutdown so it exits cleanly
     // before we drop the client entry.
     if let Some(client) = state.clients.get(&client_id.0)
@@ -123,9 +139,17 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     }
     state.drop_window_subscriptions(&all_destroyed);
 
-    let removed = state
-        .resources
-        .remove_non_window_resources_owned_by(client_id);
+    let removed = if retain {
+        // Resources keep their original `owner: ClientId`. Tracking
+        // the client_id in zombie_clients lets KillClient resolve
+        // ownership back to this specific creator.
+        state.zombie_clients.insert(client_id.0, close_mode);
+        crate::resources::ClientRemovedResources::default()
+    } else {
+        state
+            .resources
+            .remove_non_window_resources_owned_by(client_id)
+    };
     state.clients.remove(&client_id.0);
 
     let dead_windows: std::collections::HashSet<ResourceId> =
@@ -160,9 +184,25 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state
         .damage_objects
         .retain(|_, damage| damage.owner != client_id && !dead_windows.contains(&damage.drawable));
+    // L2 plan B.1b: walk redirects owned by the departing client and
+    // tear each one down (the helper handles `Window.redirected_backing`
+    // reset + alias_registry refcount decrement when B.6c lands; for
+    // now it's a logged no-op so the wiring is in place when the
+    // backing-allocation tasks land). Then filter by both ownership
+    // and dead-window so any leftovers caught by the previous rule
+    // are still removed.
+    let owned_redirects: Vec<(ResourceId, bool)> = state
+        .composite_redirects
+        .iter()
+        .filter(|(_, rec)| rec.owner == client_id)
+        .map(|((win, sub), _)| (*win, *sub))
+        .collect();
+    for (window, _subwindows) in &owned_redirects {
+        teardown_redirect_for_window(state, backend, *window);
+    }
     state
         .composite_redirects
-        .retain(|(window, _), _| !dead_windows.contains(window));
+        .retain(|(window, _), rec| rec.owner != client_id && !dead_windows.contains(window));
     state.present_event_selections.retain(|_, selection| {
         selection.owner != client_id && !dead_windows.contains(&selection.window)
     });
@@ -217,5 +257,297 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     }
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
+    }
+}
+
+/// L2 plan B.6c — release the redirect's reason-1 hold on a
+/// window's off-screen backing. Takes `Window.redirected_backing`
+/// off the resource record; asks the backend to decref the
+/// alias-registry entry (and free the underlying pixmap when the
+/// last ref drops). Surviving `NameWindowPixmap` aliases keep the
+/// backing alive until their `FreePixmap` lands.
+///
+/// Shared by both the COMPOSITE `UnredirectWindow` /
+/// `UnredirectSubwindows` dispatch arm in
+/// `crates/yserver-core/src/core_loop/process_request.rs` and the
+/// per-client disconnect cleanup above.
+pub(crate) fn teardown_redirect_for_window(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+) {
+    let Some(backing) = state
+        .resources
+        .window_mut(window)
+        .and_then(|w| w.redirected_backing.take())
+    else {
+        return;
+    };
+    if let Err(err) = backend.release_redirected_backing(None, backing.host_pixmap) {
+        log::warn!(
+            "release_redirected_backing(0x{:x}) failed: {err}",
+            backing.host_pixmap.as_raw()
+        );
+    }
+}
+
+/// Destroy every resource owned by a zombie client — invoked by
+/// `KillClient(AllTemporary)` (for each RetainTemporary zombie) and by
+/// `KillClient(resource_owned_by_a_zombie)`. Mirrors the resource-
+/// destroy half of `process_disconnect`, minus the live-client setup
+/// (there is no `state.clients` entry, no reader thread, no
+/// connection-tied extension state — those were torn down at the
+/// original disconnect). The caller must remove `zombie` from
+/// `state.zombie_clients` after this returns.
+pub fn destroy_zombie_resources(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    zombie: ClientId,
+) {
+    let mut owned_roots: Vec<ResourceId> = Vec::new();
+    state
+        .resources
+        .collect_owned_window_roots(zombie, &mut owned_roots);
+
+    let mut pending: Vec<PendingDestroy> = Vec::new();
+    let mut all_destroyed: Vec<ResourceId> = Vec::new();
+    for root in owned_roots {
+        let mut order: Vec<ResourceId> = Vec::new();
+        collect_destroy_order(&state.resources, root, &mut order);
+        for w in &order {
+            let (parent, was_mapped, host_xid) =
+                state
+                    .resources
+                    .window(*w)
+                    .map_or((ROOT_WINDOW, false, None), |win| {
+                        (
+                            win.parent,
+                            win.map_state != MapState::Unmapped,
+                            win.host_xid,
+                        )
+                    });
+            let on_window = subscribers_by_id(state, *w, 0x0002_0000);
+            let on_parent = subscribers_by_id(state, parent, 0x0008_0000);
+            pending.push(PendingDestroy {
+                window: *w,
+                parent,
+                was_mapped,
+                host_xid,
+                on_window,
+                on_parent,
+            });
+        }
+        let _ = state.resources.destroy_window(root);
+        all_destroyed.extend(order);
+    }
+    state.drop_window_subscriptions(&all_destroyed);
+
+    let removed = state.resources.remove_non_window_resources_owned_by(zombie);
+
+    for entry in pending {
+        if let Some(xid) = entry.host_xid {
+            let _ = backend.destroy_subwindow(None, xid.as_raw());
+            backend.unregister_host_window(xid.as_raw());
+        }
+        fanout_destroy_sequence(state, &entry);
+    }
+    for xid in removed.closed_fonts {
+        let _ = backend.close_font(None, xid);
+    }
+    for xid in removed.freed_pixmaps {
+        let _ = backend.free_pixmap(None, xid);
+    }
+    for (pic_xid, owned_pix) in removed.freed_pictures {
+        let _ = backend.render_free_picture(None, pic_xid);
+        if let Some(pix_xid) = owned_pix {
+            let _ = backend.free_pixmap(None, pix_xid);
+        }
+    }
+    for gs_xid in removed.freed_glyphsets {
+        let _ = backend.render_free_glyphset(None, gs_xid);
+    }
+    for cursor_xid in removed.freed_cursors {
+        let _ = backend.free_cursor(None, cursor_xid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, CreatePixmapRequest, ResourceId};
+
+    use super::{destroy_zombie_resources, process_disconnect};
+    use crate::{
+        backend::recording::RecordingBackend,
+        resources::ROOT_WINDOW,
+        server::{ClientState, CompositeRedirectMode, RedirectRecord, ServerState},
+    };
+
+    fn install_client(state: &mut ServerState, id: u32) {
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: id << 20,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+    }
+
+    #[test]
+    fn disconnect_leaves_other_clients_redirects_intact() {
+        let mut state = ServerState::new();
+        install_client(&mut state, 1);
+        install_client(&mut state, 2);
+        // Client A redirects window W.
+        state.composite_redirects.insert(
+            (ResourceId(0x1234), false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(2));
+        assert!(
+            state
+                .composite_redirects
+                .contains_key(&(ResourceId(0x1234), false))
+        );
+    }
+
+    #[test]
+    fn disconnect_tears_down_owned_redirect() {
+        let mut state = ServerState::new();
+        install_client(&mut state, 1);
+        state.composite_redirects.insert(
+            (ResourceId(0x5678), false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+        assert!(state.composite_redirects.is_empty());
+    }
+
+    #[test]
+    fn disconnect_with_retain_permanent_keeps_pixmap_owned_by_original_client() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0070_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        state.close_down_modes.insert(7, 1);
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        // Pixmap survives, owner field unchanged.
+        assert_eq!(
+            state.resources.resource_owner(ResourceId(0x0070_0001)),
+            Some(ClientId(7)),
+        );
+        // Client is gone from the live map, recorded as zombie with
+        // the original close-down mode (RetainPermanent = 1).
+        assert!(!state.clients.contains_key(&7));
+        assert!(!state.close_down_modes.contains_key(&7));
+        assert_eq!(state.zombie_clients.get(&7).copied(), Some(1));
+    }
+
+    #[test]
+    fn disconnect_with_destroy_default_frees_pixmap() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0070_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(
+            state
+                .resources
+                .resource_owner(ResourceId(0x0070_0001))
+                .is_none()
+        );
+        assert!(!state.zombie_clients.contains_key(&7));
+    }
+
+    #[test]
+    fn destroy_zombie_resources_frees_only_targeted_clients_resources() {
+        // Regression: previously two retained clients (32 and 33) shared
+        // a single retain bucket, so killing one leaked the other's
+        // resources. Now they keep their original owner — killing one
+        // must not touch the other.
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        state.resources.create_pixmap(
+            ClientId(32),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0200_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        state.resources.create_pixmap(
+            ClientId(33),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0210_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        state.zombie_clients.insert(32, 1);
+        state.zombie_clients.insert(33, 1);
+
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(32));
+
+        assert!(
+            state
+                .resources
+                .resource_owner(ResourceId(0x0200_0001))
+                .is_none()
+        );
+        assert_eq!(
+            state.resources.resource_owner(ResourceId(0x0210_0001)),
+            Some(ClientId(33)),
+        );
     }
 }

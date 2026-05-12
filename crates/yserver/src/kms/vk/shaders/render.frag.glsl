@@ -34,6 +34,13 @@ layout(constant_id = 2) const int A8_DST = 0;
 // in MODE=0 (standard ops); MODE=1 with component-alpha is not
 // supported yet (cacomposite).
 layout(constant_id = 3) const int COMPONENT_ALPHA = 0;
+// ALPHA_MODE (L1 plan task A.11): 0 → pass the computed α through to
+// the output (depth-32 ARGB destinations, where α is
+// client-meaningful). 1 → force α = 1.0 in the BGRA output
+// (depth-24 destinations whose α byte is server-owned and must
+// land at 0xFF on every painted pixel). Ignored for `A8_DST = 1`
+// since R8 attachments store the alpha-replicated `.r`.
+layout(constant_id = 4) const int ALPHA_MODE = 0;
 
 layout(push_constant) uniform PushConsts {
     vec2 dst_origin;
@@ -266,6 +273,17 @@ void main() {
         }
     }
     out_color = (A8_DST != 0) ? vec4(c.a) : c;
+    // A.11 originally forced `out_color.a = 1.0` under ALPHA_MODE,
+    // but the fragment α here is also the `src.α` factor the
+    // pipeline's blend stage uses (ONE_MINUS_SRC_ALPHA on the dst
+    // side). Pinning shader α to 1.0 made every transparent source
+    // pixel overwrite the destination as opaque black — observed
+    // as black borders around desktop icons on first MATE/fuji
+    // smoke. The ALPHA_MODE spec-constant is kept declared so the
+    // pipeline cache key + plumbing stay intact; the actual fix
+    // for the depth-24 α-stays-opaque contract on RENDER paths
+    // needs either dual-source blending or a second α-write pass,
+    // tracked as follow-up.
     // Output 1 is consumed by the pipeline's SRC1_* blend factors
     // when COMPONENT_ALPHA = 1 (MODE=0). For an R8 (a8 picture)
     // attachment the blend reads `.r` of output 1, so we replicate

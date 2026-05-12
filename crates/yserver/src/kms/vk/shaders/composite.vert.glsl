@@ -24,16 +24,9 @@ layout(push_constant) uniform PushConsts {
     // Source rect normalised to [0..1] of the bound texture.
     vec2 src_origin;
     vec2 src_size;
-    // 1.0 = use sampled alpha for blending (cursor / alpha
-    // pixmaps); 0.0 = force alpha to 1 (opaque windows). Passed as
-    // float to keep the layout aligned without an explicit padding
-    // word.
-    float use_src_alpha;
-    float _pad;
 } pc;
 
 layout(location = 0) out vec2 v_uv;
-layout(location = 1) out float v_use_alpha;
 
 void main() {
     // gl_VertexIndex 0..3 → quad corners (0,0) (1,0) (0,1) (1,1).
@@ -44,5 +37,4 @@ void main() {
     gl_Position = vec4(ndc, 0.0, 1.0);
 
     v_uv = pc.src_origin + quad * pc.src_size;
-    v_use_alpha = pc.use_src_alpha;
 }

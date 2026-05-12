@@ -155,6 +155,28 @@ pub struct ActivePointerGrab {
     pub time: u32,
 }
 
+/// XComposite redirect mode. L2 task B.1 ships `Manual` only — the
+/// only mode marco / picom use; `Automatic` is rare and rejected
+/// with `BadValue` at the dispatch boundary (see spec open
+/// question #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeRedirectMode {
+    Manual,
+    Automatic,
+}
+
+/// Per-window XComposite redirect record stored in
+/// [`ServerState::composite_redirects`]. The `owner` is the client
+/// that issued the `RedirectWindow` / `RedirectSubwindows` — used
+/// by the dispatch layer for `BadAccess` conflict detection and by
+/// `process_disconnect` to tear down redirects belonging to a
+/// departing client (L2 task B.1b).
+#[derive(Debug, Clone, Copy)]
+pub struct RedirectRecord {
+    pub mode: CompositeRedirectMode,
+    pub owner: ClientId,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -209,7 +231,7 @@ pub struct ServerState {
     /// (Task 19) lives on the KMS backend's `dri3_sync_resources` map.
     pub sync_fences: HashMap<u32, SyncFence>,
     pub damage_objects: HashMap<u32, DamageObject>,
-    pub composite_redirects: HashMap<(ResourceId, bool), u8>,
+    pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     pub present_msc: HashMap<ResourceId, u64>,
     /// MIT-SHM segments — keyed by client-supplied `shmseg` ID.
@@ -235,6 +257,19 @@ pub struct ServerState {
     /// `repeat_state.next_fire` to compute its wake-up timeout so an
     /// idle server still costs zero CPU.
     pub repeat_state: Option<KeyRepeatState>,
+    /// Per-client close-down mode set by `SetCloseDownMode` (opcode 112).
+    /// Absent / 0 = Destroy (default); 1 = RetainPermanent; 2 = RetainTemporary.
+    /// Only non-zero entries are stored. Read at disconnect time to decide
+    /// whether to free or retain the client's resources.
+    pub close_down_modes: HashMap<u32, u8>,
+    /// Clients whose connection has closed but whose resources are
+    /// retained per their final `SetCloseDownMode`. Maps `client_id →
+    /// close_mode` (1 = RetainPermanent, 2 = RetainTemporary). Each
+    /// zombie's resources keep their original `owner: ClientId` so
+    /// `KillClient(resource_id)` can target the exact creator,
+    /// not a shared bucket. `KillClient(AllTemporary)` walks zombies
+    /// with mode 2 and frees their resources.
+    pub zombie_clients: HashMap<u32, u8>,
     /// Outstanding `XSync::AwaitFence` requests waiting on at least
     /// one fence in the list to transition to triggered. Per the
     /// spec the server must defer further processing of the
@@ -345,6 +380,8 @@ impl ServerState {
             glx_drawables: HashMap::new(),
             sync_pending_awaits: Vec::new(),
             repeat_state: None,
+            close_down_modes: HashMap::new(),
+            zombie_clients: HashMap::new(),
         }
     }
 

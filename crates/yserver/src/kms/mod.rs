@@ -3,6 +3,7 @@ pub mod compositor;
 #[cfg(target_os = "linux")]
 pub mod console;
 pub mod cpu_types;
+pub(crate) mod cursor_plane;
 pub mod event;
 pub mod fonts;
 pub mod render;

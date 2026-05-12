@@ -21,8 +21,13 @@ impl DrmDevice for Device {}
 impl drm::control::Device for Device {}
 
 impl Device {
-    #[cfg(test)]
-    pub(crate) fn for_tests() -> io::Result<Self> {
+    /// Construct a stub `Device` backed by `/dev/null` for tests.
+    ///
+    /// The returned device is unable to issue real ioctls; callers
+    /// that exercise actual DRM control paths must use `open`.
+    /// Hidden from rustdoc — for use by test fixtures only.
+    #[doc(hidden)]
+    pub fn for_tests() -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)

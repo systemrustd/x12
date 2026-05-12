@@ -436,6 +436,25 @@ yserver-mate-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "mate log:    mate.log"'
 
+# Release-mode mate with logging turned down to `warn`. Use this to
+# test whether pointer lag under hover is dominated by env_logger /
+# stderr formatting cost (observed at ~5% of CPU under debug+debug
+# build) or by the underlying paint pipeline. If hover responds
+# noticeably faster than `yserver-mate-hw`, logging was the bottleneck.
+yserver-mate-hw-release log="warn":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "mate log:    mate.log"'
+
 # Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
 # Mesa's loader_dri3 prints every probe step + driver load failure so
 # we can pinpoint why "failed to load driver: radeonsi" fires. Pair

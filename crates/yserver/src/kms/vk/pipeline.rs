@@ -12,13 +12,17 @@
 //!
 //! Pipeline shape:
 //!
-//! - One pipeline, one descriptor set layout (single combined image
-//!   sampler at binding 0), one nearest-filter sampler.
+//! - Two pipelines (force-opaque vs alpha-pass-through, picked at
+//!   build time via the frag shader's `SRC_ALPHA_MODE` spec-constant
+//!   — see L1 plan task A.2). Both share one descriptor set layout
+//!   (single combined image sampler at binding 0), one nearest-filter
+//!   sampler, one pipeline layout, and one descriptor pool.
 //! - Vertex stage: 4-vertex `vkCmdDraw(4, 1, ...)` driven by
 //!   `gl_VertexIndex` — no vertex buffer is bound.
-//! - Fragment stage: samples the bound texture; `use_src_alpha`
-//!   push constant decides whether to keep alpha (cursor / alpha
-//!   pixmaps) or force `1.0` (opaque windows).
+//! - Fragment stage: samples the bound texture; the spec-constant
+//!   decides whether to keep alpha (cursor / alpha pixmaps) or force
+//!   `1.0` (force-opaque). The caller picks the variant per draw via
+//!   [`CompositorPipeline::pipeline_for`].
 //! - Color blend state is src-over either way; the alpha override
 //!   in the fragment shader is what differentiates opaque from
 //!   alpha draws.
@@ -41,8 +45,11 @@ const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.ve
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.frag.spv"));
 
 /// Push-constant block matching `composite.vert.glsl`'s `PushConsts`
-/// layout. Total 48 bytes (well under the 128-byte minimum
-/// `maxPushConstantsSize`).
+/// layout. Total 40 bytes (well under the 128-byte minimum
+/// `maxPushConstantsSize`). The old `use_src_alpha`/`_pad` fields
+/// moved to a fragment specialization constant in A.2; the pipeline
+/// variant — opaque vs pass-through — is now a build-time choice
+/// (see [`CompositorPipeline::pipeline_for`]).
 ///
 /// `repr(C)` keeps the field order stable; std140-style alignment
 /// rules govern the GLSL side (vec2 alignment = 8). We use vec2
@@ -56,10 +63,6 @@ pub struct CompositePushConsts {
     pub viewport: [f32; 2],
     pub src_origin: [f32; 2],
     pub src_size: [f32; 2],
-    /// `1.0` to keep sampled alpha; `0.0` to force `1.0` (opaque
-    /// window).
-    pub use_src_alpha: f32,
-    pub _pad: f32,
 }
 
 impl CompositePushConsts {
@@ -79,12 +82,26 @@ impl CompositePushConsts {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<CompositePushConsts>() == 48);
+const _: () = assert!(std::mem::size_of::<CompositePushConsts>() == 40);
 
 /// Built once per backend lifetime; reused for every composite pass.
+///
+/// Two graphics pipelines compile at construction — one per value
+/// of the fragment shader's `SRC_ALPHA_MODE` specialization
+/// constant — and the caller picks per draw via
+/// [`Self::pipeline_for`]. Both pipelines share the same
+/// descriptor-set layout, pipeline layout, sampler, and descriptor
+/// pool.
 pub struct CompositorPipeline {
     vk: Arc<VkContext>,
-    pub pipeline: vk::Pipeline,
+    /// Force-opaque variant (`SRC_ALPHA_MODE = 0`). Window-mirror
+    /// draws bind this until L1 task A.16 flips the dial to
+    /// alpha-pass-through.
+    pub pipeline_opaque: vk::Pipeline,
+    /// Alpha-pass-through variant (`SRC_ALPHA_MODE = 1`). Cursor
+    /// + alpha-pixmap draws bind this today; window-mirror draws
+    /// switch to it post-A.16.
+    pub pipeline_passthrough: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub sampler: vk::Sampler,
@@ -157,7 +174,7 @@ impl CompositorPipeline {
             };
 
         // Pipeline layout: 1 descriptor set + 1 push constant range
-        // (vertex+fragment, 48 bytes).
+        // (vertex+fragment, 40 bytes post-A.2).
         let set_layouts = [descriptor_set_layout];
         let push_const_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
@@ -177,14 +194,14 @@ impl CompositorPipeline {
             }
         };
 
-        // Shader modules (one-shot — destroyed after pipeline is
-        // built; the pipeline retains the compiled code).
-        let vert_module = create_shader_module(device, VERTEX_SPV)?;
-        let frag_module = match create_shader_module(device, FRAGMENT_SPV) {
-            Ok(m) => m,
+        // Build one pipeline per alpha-mode (SRC_ALPHA_MODE = 0
+        // force-opaque, 1 pass-through). On any failure, tear down
+        // everything created so far.
+        let pipeline_opaque = match build_pipeline_variant(device, pipeline_layout, color_format, 0)
+        {
+            Ok(p) => p,
             Err(e) => {
                 unsafe {
-                    device.destroy_shader_module(vert_module, None);
                     device.destroy_pipeline_layout(pipeline_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                     device.destroy_sampler(sampler, None);
@@ -192,102 +209,19 @@ impl CompositorPipeline {
                 return Err(e);
             }
         };
-
-        let entry = c"main";
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vert_module)
-                .name(entry),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module)
-                .name(entry),
-        ];
-
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
-
-        // Viewport + scissor are dynamic (one set per frame
-        // depending on the scanout extent), so the create-info
-        // counts are non-zero but the actual state is filled at
-        // draw time.
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-        // Src-over alpha blending (premultiplied-alpha-ready):
-        //   color_out = src.rgb + dst.rgb * (1 - src.a)
-        //   alpha_out = src.a + dst.a * (1 - src.a)
-        // Opaque windows force src.a = 1 in the fragment shader, so
-        // the output equals src.rgb regardless of dst (no peeking
-        // through to a previous frame's content).
-        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
-        let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-
-        let dynamic_state_array = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state_array);
-
-        // Dynamic-rendering create-info: bake the scanout color
-        // format into the pipeline.
-        let color_formats = [color_format];
-        let mut rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .color_blend_state(&color_blend)
-            .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .push_next(&mut rendering_info);
-
-        let pipeline = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        } {
-            Ok(ps) => ps[0],
-            Err((_, e)) => {
-                unsafe {
-                    device.destroy_shader_module(vert_module, None);
-                    device.destroy_shader_module(frag_module, None);
-                    device.destroy_pipeline_layout(pipeline_layout, None);
-                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-                    device.destroy_sampler(sampler, None);
+        let pipeline_passthrough =
+            match build_pipeline_variant(device, pipeline_layout, color_format, 1) {
+                Ok(p) => p,
+                Err(e) => {
+                    unsafe {
+                        device.destroy_pipeline(pipeline_opaque, None);
+                        device.destroy_pipeline_layout(pipeline_layout, None);
+                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                        device.destroy_sampler(sampler, None);
+                    }
+                    return Err(e);
                 }
-                return Err(e.into());
-            }
-        };
-
-        // Shader modules can be destroyed once the pipeline owns
-        // their compiled bytecode.
-        unsafe {
-            device.destroy_shader_module(vert_module, None);
-            device.destroy_shader_module(frag_module, None);
-        }
+            };
 
         // Descriptor pool — one combined image sampler per set,
         // capped at MAX_DESCRIPTOR_SETS_PER_FRAME. Reset at the
@@ -302,7 +236,8 @@ impl CompositorPipeline {
             Ok(p) => p,
             Err(e) => {
                 unsafe {
-                    device.destroy_pipeline(pipeline, None);
+                    device.destroy_pipeline(pipeline_passthrough, None);
+                    device.destroy_pipeline(pipeline_opaque, None);
                     device.destroy_pipeline_layout(pipeline_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                     device.destroy_sampler(sampler, None);
@@ -313,13 +248,25 @@ impl CompositorPipeline {
 
         Ok(Self {
             vk,
-            pipeline,
+            pipeline_opaque,
+            pipeline_passthrough,
             pipeline_layout,
             descriptor_set_layout,
             sampler,
             descriptor_pool,
             color_format,
         })
+    }
+
+    /// Pick the pipeline variant for a draw. `alpha_passthrough = false`
+    /// → force-opaque (`SRC_ALPHA_MODE = 0`); `true` → pass-through.
+    #[must_use]
+    pub fn pipeline_for(&self, alpha_passthrough: bool) -> vk::Pipeline {
+        if alpha_passthrough {
+            self.pipeline_passthrough
+        } else {
+            self.pipeline_opaque
+        }
     }
 
     /// Reset the descriptor pool. Invalidates every descriptor set
@@ -366,11 +313,14 @@ impl Drop for CompositorPipeline {
         unsafe {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
             // Pool tears down all per-frame descriptor sets; safe
-            // before destroying the pipeline.
+            // before destroying the pipelines.
             self.vk
                 .device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.vk.device.destroy_pipeline(self.pipeline, None);
+            self.vk
+                .device
+                .destroy_pipeline(self.pipeline_passthrough, None);
+            self.vk.device.destroy_pipeline(self.pipeline_opaque, None);
             self.vk
                 .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -379,6 +329,121 @@ impl Drop for CompositorPipeline {
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.vk.device.destroy_sampler(self.sampler, None);
         }
+    }
+}
+
+/// Compile one fragment-stage variant of the composite pipeline.
+/// `src_alpha_mode` is the value of the frag shader's spec-constant
+/// 0 (`SRC_ALPHA_MODE` — 0 = force-opaque, 1 = pass-through). The
+/// vertex stage and all fixed-function state are identical across
+/// variants.
+fn build_pipeline_variant(
+    device: &ash::Device,
+    pipeline_layout: vk::PipelineLayout,
+    color_format: vk::Format,
+    src_alpha_mode: i32,
+) -> Result<vk::Pipeline, PipelineError> {
+    // Shader modules — destroyed after the pipeline owns the
+    // compiled bytecode.
+    let vert_module = create_shader_module(device, VERTEX_SPV)?;
+    let frag_module = match create_shader_module(device, FRAGMENT_SPV) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { device.destroy_shader_module(vert_module, None) };
+            return Err(e);
+        }
+    };
+
+    // Specialization constant 0 → `SRC_ALPHA_MODE`. `i32` matches
+    // the GLSL `const int` declaration.
+    let spec_map = [vk::SpecializationMapEntry::default()
+        .constant_id(0)
+        .offset(0)
+        .size(std::mem::size_of::<i32>())];
+    let spec_data = src_alpha_mode.to_ne_bytes();
+    let spec_info = vk::SpecializationInfo::default()
+        .map_entries(&spec_map)
+        .data(&spec_data);
+
+    let entry = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry)
+            .specialization_info(&spec_info),
+    ];
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    // Src-over alpha blending (premultiplied-alpha-ready):
+    //   color_out = src.rgb + dst.rgb * (1 - src.a)
+    //   alpha_out = src.a + dst.a * (1 - src.a)
+    // The force-opaque variant forces src.a = 1 in the fragment
+    // shader, so its output equals src.rgb regardless of dst (no
+    // peek-through). The pass-through variant honours the sampled
+    // alpha.
+    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+
+    let dynamic_state_array = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state_array);
+
+    let color_formats = [color_format];
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .push_next(&mut rendering_info);
+
+    let pipeline = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    };
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+    match pipeline {
+        Ok(ps) => Ok(ps[0]),
+        Err((_, e)) => Err(e.into()),
     }
 }
 
@@ -399,4 +464,19 @@ fn create_shader_module(
     }
     let info = vk::ShaderModuleCreateInfo::default().code(&code);
     Ok(unsafe { device.create_shader_module(&info, None)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn composite_pipeline_has_two_alpha_mode_variants() {
+        let vk = VkContext::new().expect("vk init");
+        let cp =
+            CompositorPipeline::new(vk, vk::Format::B8G8R8A8_UNORM).expect("compositor pipeline");
+        // Distinct pipeline objects for force-opaque vs pass-through.
+        assert_ne!(cp.pipeline_for(false), cp.pipeline_for(true));
+    }
 }

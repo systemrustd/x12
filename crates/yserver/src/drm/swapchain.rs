@@ -114,8 +114,11 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    #[cfg(test)]
-    pub(crate) fn empty_for_tests() -> Self {
+    /// Construct an empty `Swapchain` for tests — no buffers, no
+    /// pending scanout. Hidden from rustdoc; for fixture use only.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn empty_for_tests() -> Self {
         Self {
             buffers: Vec::new(),
             state: SwapState::new(0),

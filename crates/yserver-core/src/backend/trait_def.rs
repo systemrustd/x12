@@ -351,6 +351,60 @@ pub trait Backend: Send {
         host_window: WindowHandle,
     ) -> io::Result<PixmapHandle>;
 
+    /// L2 plan B.6a: allocate the off-screen mirror that backs a
+    /// newly redirected window. The backend allocates a fresh pixmap
+    /// handle, sets up a mirror at `(width, height)` for `depth`,
+    /// and seeds the alias registry's refcount=1 hold (reason 1 —
+    /// "window is redirected"). Subsequent
+    /// [`Self::name_window_pixmap`] calls on the same `host_window`
+    /// return this same handle with an incremented refcount.
+    ///
+    /// Default `Unsupported` so test doubles and host-X11 backends
+    /// don't have to implement it until they grow real redirect
+    /// support.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::ErrorKind::Unsupported` when the backend hasn't
+    /// implemented redirect activation. KMS overrides this in
+    /// `crates/yserver/src/kms/backend.rs`.
+    fn allocate_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        let _ = (origin, host_window, width, height, depth);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "allocate_redirected_backing not supported",
+        ))
+    }
+
+    /// L2 plan B.6c: release a redirect's reason-1 hold on a
+    /// backing pixmap. The backend decrements the alias registry's
+    /// refcount and frees the underlying pixmap if no
+    /// `NameWindowPixmap` alias holds it. Surviving aliases keep
+    /// it alive until their own `FreePixmap`.
+    ///
+    /// Default no-op so test doubles and host-X11 backends without
+    /// redirect support don't have to track aliases.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend errors from the underlying free path
+    /// (e.g. KMS's `free_pixmap` on the final reference drop).
+    fn release_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        let _ = (origin, backing);
+        Ok(())
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Resources (pixmap, font, cursor)
     // ──────────────────────────────────────────────────────────────

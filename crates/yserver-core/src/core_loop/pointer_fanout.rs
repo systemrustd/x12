@@ -33,11 +33,21 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// `handle_grabs` toggles passive-grab matching and active-grab
 /// redirection. Pass `false` from `AllowEvents ReplayPointer` to avoid
 /// re-checking the same passive grab that was just released.
+///
+/// `is_replay` is set when the call comes from the `AllowEvents
+/// ReplayPointer` re-delivery path. XI2 device + raw events were already
+/// fanned out on the original libinput-driven invocation (XI2 fanout is
+/// independent of core grab state), so the replay must skip them to
+/// avoid duplicate XI2 ButtonPress delivery — caja's GTK gesture
+/// controllers interpret a back-to-back XI2 press pair as a drag from
+/// (0,0), producing a phantom rubber-band selection on a single click
+/// over the desktop.
 pub fn pointer_event_fanout_to_state(
     state: &mut ServerState,
     xid_map: &HostXidMap,
     event: HostPointerEvent,
     handle_grabs: bool,
+    is_replay: bool,
 ) -> Vec<ClientId> {
     let mut dropped = Vec::new();
 
@@ -205,6 +215,14 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // ── XI2 fanout (always runs, independent of any core grab) ──────
+    //
+    // Skip on replay: XI2 was already fanned out on the original
+    // libinput-driven invocation. Re-running here would deliver a second
+    // XI2 ButtonPress for the same physical click and confuse GTK gesture
+    // controllers (see is_replay rationale on the public fn).
+    if is_replay {
+        return dropped;
+    }
     let Some(top_level_id) = top_level_id else {
         log::debug!(
             "pointer_fanout: kind={:?} host_xid=0x{:x} not in xid_map — XI2 fanout skipped",

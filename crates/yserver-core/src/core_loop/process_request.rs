@@ -210,6 +210,8 @@ pub fn process_request(
         80 => handle_copy_colormap_and_free(state, client_id, sequence, body),
         // ── SetCloseDownMode: validate mode (0/1/2 valid) ──
         112 => handle_set_close_down_mode(state, client_id, sequence, header),
+        // ── KillClient (AllTemporary or by resource owner) ──
+        113 => handle_kill_client(state, backend, client_id, sequence, body),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
         116 => handle_set_pointer_mapping(state, client_id, sequence),
         118 => handle_set_modifier_mapping(state, client_id, sequence),
@@ -331,7 +333,7 @@ pub fn process_request(
         // ── XKB extension proxy ──
         136 => handle_xkb_request(state, backend, origin, client_id, sequence, header, body),
         // ── XI2 extension dispatcher ──
-        137 => handle_xi2_request(state, client_id, sequence, header, body),
+        137 => handle_xi2_request(state, backend, origin, client_id, sequence, header, body),
         // ── PRESENT extension dispatcher ──
         145 => handle_present_request(state, backend, origin, client_id, sequence, header, body),
         // ── DAMAGE extension dispatcher ──
@@ -477,27 +479,137 @@ fn resolve_host_subwindow_visual_to_state(
     }
 }
 
-/// Drop every COMPOSITE NameWindowPixmap alias on `window` (state +
-/// host side). Mirrors `nested::invalidate_composite_named_pixmaps`.
-fn invalidate_composite_named_pixmaps_to_state(
+/// Allocate the redirect's reason-1 backing for `window` and set
+/// `Window.redirected_backing`. Shared between B.6a (single-window
+/// REDIRECT_WINDOW), B.6b (REDIRECT_SUBWINDOWS walking children),
+/// and the CreateWindow child-of-redirected hook.
+///
+/// Silently no-ops if the window doesn't exist, has no host XID
+/// yet, or the backend rejects the allocation. The caller doesn't
+/// emit a protocol error in any of those cases — the redirect
+/// record is already in place, so a later paint via
+/// `host_drawable_target` will simply fall back to the window's
+/// own host XID until a future event populates the backing.
+fn activate_redirect_backing_for(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
     window: ResourceId,
 ) {
-    let aliases: Vec<crate::resources::NamedCompositePixmap> = state
+    let snapshot = state
         .resources
-        .window_mut(window)
-        .map(|w| std::mem::take(&mut w.composite_named_pixmaps))
-        .unwrap_or_default();
-    if aliases.is_empty() {
+        .window(window)
+        .map(|w| (w.host_xid, w.width, w.height, w.depth));
+    let Some((Some(host_window), w_width, w_height, w_depth)) = snapshot else {
         return;
+    };
+    match backend.allocate_redirected_backing(origin, host_window, w_width, w_height, w_depth) {
+        Ok(host_pixmap) => {
+            if let Some(w) = state.resources.window_mut(window) {
+                w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                    host_pixmap,
+                    width: w_width,
+                    height: w_height,
+                    depth: w_depth,
+                });
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "activate_redirect_backing_for(0x{:x}): allocate failed: {err}",
+                window.0
+            );
+        }
     }
-    for a in &aliases {
-        let _ = state.resources.free_pixmap(a.client_pixmap);
+}
+
+/// Returns `true` if `parent` is the target of an active
+/// REDIRECT_SUBWINDOWS in `composite_redirects`. Used by the
+/// CreateWindow handler so new children of a subwindows-redirected
+/// parent inherit a backing automatically (L2 plan B.6b
+/// future-child hook).
+fn parent_has_subwindows_redirect(state: &ServerState, parent: ResourceId) -> bool {
+    state.composite_redirects.contains_key(&(parent, true))
+}
+
+/// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
+/// the spec, `NameWindowPixmap` aliases freeze with the pre-resize
+/// content of the window's backing; the next paint on the window
+/// must land on a freshly-allocated backing matching the new
+/// geometry. L2 plan B.6d.
+///
+/// Sequence when the window is redirected:
+///   1. Snapshot the existing backing handle.
+///   2. Allocate a new backing at the new (width, height, depth).
+///   3. Repoint `Window.redirected_backing` at the new backing.
+///   4. Release the old backing's reason-1 hold via
+///      `release_redirected_backing`. If `composite_named_pixmaps`
+///      aliases still reference it, refcount stays > 0 and the
+///      backing survives — its content is frozen at pre-resize.
+///      If no aliases hold it, the backing is freed.
+///
+/// `composite_named_pixmaps` is **not** touched here — the aliases
+/// remain valid X protocol resources, pointing at the old (frozen)
+/// backing's host XID. Their `host_pixmap` was set at
+/// `NameWindowPixmap` time and stays valid until the client's
+/// `FreePixmap` (or the disconnect cleanup).
+///
+/// When the window is **not** redirected (no backing), this is a
+/// no-op — `composite_named_pixmaps` should be empty by
+/// construction (the protocol layer only creates aliases on
+/// redirected windows).
+fn rotate_redirected_backing_on_resize(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    new_width: u16,
+    new_height: u16,
+) {
+    let snapshot = state.resources.window(window).and_then(|w| {
+        w.redirected_backing
+            .as_ref()
+            .map(|b| (b.host_pixmap, w.host_xid, w.depth))
+    });
+    let Some((old_backing, host_window, depth)) = snapshot else {
+        return;
+    };
+    let Some(host_window) = host_window else {
+        return;
+    };
+    // Allocate the new backing before swapping; if allocation fails
+    // we leave the old backing in place so paint keeps landing
+    // somewhere defined.
+    let new_backing = match backend.allocate_redirected_backing(
+        origin,
+        host_window,
+        new_width,
+        new_height,
+        depth,
+    ) {
+        Ok(h) => h,
+        Err(err) => {
+            log::warn!(
+                "rotate_redirected_backing_on_resize(0x{:x}, {new_width}x{new_height}): \
+                 allocate failed: {err}",
+                window.0
+            );
+            return;
+        }
+    };
+    if let Some(w) = state.resources.window_mut(window) {
+        w.redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: new_backing,
+            width: new_width,
+            height: new_height,
+            depth,
+        });
     }
-    for a in &aliases {
-        let _ = backend.free_pixmap(origin, a.host_pixmap.as_raw());
+    if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
+            old_backing.as_raw()
+        );
     }
 }
 
@@ -623,6 +735,37 @@ fn destroy_window_subtree(
             window.0
         );
     }
+    // L2 plan B.15 — release the reason-1 hold on each destroyed
+    // window's redirected backing. Surviving `NameWindowPixmap`
+    // aliases keep the backing alive; their `client_pixmap`
+    // resources remain valid X protocol pixmaps until the client's
+    // `FreePixmap` (or the disconnect cleanup).
+    let redirect_backings: Vec<crate::backend::PixmapHandle> = order
+        .iter()
+        .filter_map(|w| {
+            state
+                .resources
+                .window(*w)
+                .and_then(|win| win.redirected_backing.as_ref().map(|b| b.host_pixmap))
+        })
+        .collect();
+    for backing in redirect_backings {
+        if let Err(err) = backend.release_redirected_backing(origin, backing) {
+            log::warn!(
+                "DestroyWindow: release_redirected_backing(0x{:x}) failed: {err}",
+                backing.as_raw()
+            );
+        }
+    }
+    // Drop any COMPOSITE redirect records still keyed against the
+    // destroyed windows. The actual backing teardown happened
+    // above; this just keeps `composite_redirects` clean so a
+    // future REDIRECT_WINDOW on a new XID with the same numeric
+    // value (after the X11 ID allocator wraps) doesn't see a
+    // stale entry.
+    state
+        .composite_redirects
+        .retain(|(window, _), _| !order.contains(window));
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
 
@@ -2440,9 +2583,68 @@ fn handle_composite_request(
         x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
             if let Some((window, update)) = x11composite::parse_window_update(body) {
                 let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
-                state
-                    .composite_redirects
-                    .insert((ResourceId(window), subwindows), update);
+                // L2 plan B.1: Manual-only initially; reject other modes
+                // with BadValue. Reject other-owner conflicts with
+                // BadAccess; same-owner re-redirect is idempotent.
+                let mode = match update {
+                    0 => crate::server::CompositeRedirectMode::Manual,
+                    1 => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(update),
+                            COMPOSITE_MAJOR_OPCODE,
+                        );
+                    }
+                    _ => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(update),
+                            COMPOSITE_MAJOR_OPCODE,
+                        );
+                    }
+                };
+                let key = (ResourceId(window), subwindows);
+                if let Some(existing) = state.composite_redirects.get(&key)
+                    && existing.owner != client_id
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ACCESS,
+                        window,
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
+                }
+                state.composite_redirects.insert(
+                    key,
+                    crate::server::RedirectRecord {
+                        mode,
+                        owner: client_id,
+                    },
+                );
+                // L2 plan B.6a / B.6b: REDIRECT_WINDOW allocates
+                // a single backing for the named window;
+                // REDIRECT_SUBWINDOWS walks every immediate child
+                // of the named window and allocates a backing for
+                // each. Future children of a subwindows-redirected
+                // parent get a backing in the CreateWindow handler
+                // via `allocate_backing_if_parent_subwindow_redirected`.
+                if subwindows {
+                    let parent = ResourceId(window);
+                    let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
+                    for child in children {
+                        activate_redirect_backing_for(state, backend, origin, child);
+                    }
+                } else {
+                    activate_redirect_backing_for(state, backend, origin, ResourceId(window));
+                }
             }
         }
         x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
@@ -2451,6 +2653,16 @@ fn handle_composite_request(
                 state
                     .composite_redirects
                     .remove(&(ResourceId(window), subwindows));
+                // L2 plan B.6c: release the backing's reason-1 hold
+                // for the single-window case. Subtree redirects walk
+                // their subtree in B.6b — same teardown helper.
+                if !subwindows {
+                    crate::core_loop::process_disconnect::teardown_redirect_for_window(
+                        state,
+                        backend,
+                        ResourceId(window),
+                    );
+                }
             }
         }
         x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
@@ -5205,6 +5417,8 @@ fn handle_glx_request(
 
 fn handle_xi2_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -5241,15 +5455,28 @@ fn handle_xi2_request(
         }
         45 => {
             // XIGetClientPointer reply layout (xinput.xml):
-            //   response_type(1) | set:BOOL(1) | sequence(2) | length(4)
-            //   | win:WINDOW(4) | pad(20)
-            // Total = 32 bytes. set=0 (no per-client override), win=None.
-            // Earlier code wrote 34 bytes; xcb misaligned and asserted
-            // !xcb_xlib_threads_sequence_lost in the calling client.
-            debug!("client {} #{} XIGetClientPointer", client_id.0, sequence.0);
+            //   response_type(1) | pad0(1) | sequence(2) | length(4)
+            //   | set:BOOL(1) | pad1(3) | deviceid(2) | pad2(18)
+            // Total = 32 bytes.
+            //
+            // set=0 (no per-client master pointer override), deviceid=2
+            // (system default master pointer — matches the deviceid we
+            // advertise in XIQueryDevice's "Virtual core pointer" entry).
+            // The earlier handler returned deviceid=0, which GTK treats
+            // as an invalid device and uses verbatim in subsequent
+            // XInput requests — mate-panel's workspace-applet drag
+            // path crashed processing the bad reply, taking the panel
+            // down with it.
+            debug!(
+                "client {} #{} XIGetClientPointer -> set=0 deviceid=2",
+                client_id.0, sequence.0
+            );
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // win = None
-            reply.extend_from_slice(&[0u8; 20]);
+            // set(1) + pad(3) packed as a single u32 = 0 (set=False).
+            x11::write_u32(byte_order, &mut reply, 0);
+            // deviceid (u16) = 2, then pad to reach 32 bytes total.
+            x11::write_u16(byte_order, &mut reply, 2);
+            reply.extend_from_slice(&[0u8; 18]);
             debug_assert_eq!(reply.len(), 32);
             buf.extend_from_slice(&reply);
         }
@@ -5370,18 +5597,61 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         40 => {
-            debug!("client {} #{} XIQueryPointer", client_id.0, sequence.0);
-            let mut reply = x11::fixed_reply(byte_order, sequence, 1, 6);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, ROOT_WINDOW.0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
-            reply.extend_from_slice(&[0u8; 16]);
-            reply.extend_from_slice(&[0u8; 4]);
+            // XIQueryPointer: GDK calls this to fetch the current
+            // pointer position for gesture-drag anchors (caja-desktop
+            // marquee, mate-panel applet drags). Previously hardcoded
+            // every coordinate to 0, so every drag started from (0,0)
+            // regardless of the actual cursor position — caja then
+            // rubber-banded from screen origin to the click point on
+            // any single click. Wire the real cursor position through
+            // from the backend.
+            let queried_window = if body.len() >= 8 {
+                ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]))
+            } else {
+                ROOT_WINDOW
+            };
+            let pointer = backend.query_pointer(origin).ok();
+            let (root_x_int, root_y_int, mask, same_screen) =
+                if let Some(p) = pointer.filter(|p| p.same_screen) {
+                    (p.win_x, p.win_y, p.mask, 1u8)
+                } else {
+                    (0, 0, 0, 0u8)
+                };
+            let (origin_x, origin_y) = state.resources.window_absolute_position(queried_window);
+            let win_x_int =
+                i16::try_from(i32::from(root_x_int).saturating_sub(origin_x)).unwrap_or(i16::MAX);
+            let win_y_int =
+                i16::try_from(i32::from(root_y_int).saturating_sub(origin_y)).unwrap_or(i16::MAX);
+            debug!(
+                "client {} #{} XIQueryPointer window=0x{:x} -> root=({},{}) win=({},{}) mask=0x{:x}",
+                client_id.0,
+                sequence.0,
+                queried_window.0,
+                root_x_int,
+                root_y_int,
+                win_x_int,
+                win_y_int,
+                mask,
+            );
+            // Reply layout (length = 6 units = 24 bytes after the
+            // 8-byte header — total 32 + 24 = 56). FP1616 coords are
+            // (i32::from(coord) << 16) as u32; mask spans both byte-
+            // orders correctly because write_u32 honours `byte_order`.
+            let mut reply = x11::fixed_reply(byte_order, sequence, same_screen, 6);
+            x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
+            x11::write_u32(byte_order, &mut reply, 0); // child
+            x11::write_u32(byte_order, &mut reply, (i32::from(root_x_int) << 16) as u32);
+            x11::write_u32(byte_order, &mut reply, (i32::from(root_y_int) << 16) as u32);
+            x11::write_u32(byte_order, &mut reply, (i32::from(win_x_int) << 16) as u32);
+            x11::write_u32(byte_order, &mut reply, (i32::from(win_y_int) << 16) as u32);
+            x11::write_u16(byte_order, &mut reply, 0); // buttons_len
+            // mods.effective carries the X11 KeyButMask. Modern GDK
+            // splits modifiers vs buttons cleanly via the dedicated
+            // mods field; passing the merged mask here matches the
+            // legacy QueryPointer reply and what xorg-server returns.
+            x11::write_u16(byte_order, &mut reply, mask);
+            reply.extend_from_slice(&[0u8; 16]); // mods info (base/latched/locked/effective u32s zeroed)
+            reply.extend_from_slice(&[0u8; 4]); // group info
             buf.extend_from_slice(&reply);
         }
         // XI2 grab opcodes. We don't yet honour grabs in event routing,
@@ -5813,6 +6083,13 @@ fn handle_create_window(
                     new_id
                 );
             }
+            // L2 plan B.6b future-child hook: if the new window's
+            // parent is the target of REDIRECT_SUBWINDOWS, the
+            // freshly-created child inherits a redirect (and a
+            // backing) automatically per the COMPOSITE spec.
+            if parent_has_subwindows_redirect(state, parent) {
+                activate_redirect_backing_for(state, backend, origin, window_id);
+            }
         }
     }
     let wants_focus = {
@@ -6099,7 +6376,14 @@ fn handle_configure_window(
         let resized =
             old_size.is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
         if resized {
-            invalidate_composite_named_pixmaps_to_state(state, backend, origin, window_id);
+            rotate_redirected_backing_on_resize(
+                state,
+                backend,
+                origin,
+                window_id,
+                geometry.width,
+                geometry.height,
+            );
         }
         let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
         if grew {
@@ -6429,8 +6713,10 @@ fn handle_store_named_color(
 
 /// SetCloseDownMode (112): mode is in header.data. Valid values are
 /// 0 (Destroy), 1 (RetainPermanent), 2 (RetainTemporary). Any other
-/// value is BadValue. We don't actually implement Retain* (resources
-/// are always destroyed on disconnect) but we do validate the input.
+/// value is BadValue. The stored mode is consulted by `process_disconnect`
+/// to decide whether to free the client's resources or keep them
+/// (with the original `owner: ClientId` intact) and record the client
+/// as a zombie in `ServerState.zombie_clients`.
 fn handle_set_close_down_mode(
     state: &mut ServerState,
     client_id: ClientId,
@@ -6450,6 +6736,80 @@ fn handle_set_close_down_mode(
             u32::from(header.data),
             112,
         );
+    }
+    if header.data == 0 {
+        state.close_down_modes.remove(&client_id.0);
+    } else {
+        state.close_down_modes.insert(client_id.0, header.data);
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+/// KillClient (113): resource ID lives in the first 4 bytes of `body`.
+/// `resource == 0` is the spec-defined `AllTemporary` magic — destroy
+/// every zombie client whose stored close-down mode is `RetainTemporary`.
+/// Otherwise look up the resource's owner: if it's a live client,
+/// force-disconnect them (their close-down mode still applies); if it's
+/// a zombie, destroy that zombie's resources; if it's `SERVER_OWNER`,
+/// noop; if the resource doesn't exist, BadValue.
+fn handle_kill_client(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 4 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let resource = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    debug!(
+        "client {} #{} KillClient resource=0x{:x}",
+        client_id.0, sequence.0, resource
+    );
+    if resource == 0 {
+        let temp_zombies: Vec<u32> = state
+            .zombie_clients
+            .iter()
+            .filter_map(|(&id, &mode)| (mode == 2).then_some(id))
+            .collect();
+        for zid in temp_zombies {
+            super::process_disconnect::destroy_zombie_resources(state, backend, ClientId(zid));
+            state.zombie_clients.remove(&zid);
+        }
+        return Ok(RequestOutcome::Handled);
+    }
+    let Some(owner) = state.resources.resource_owner(ResourceId(resource)) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            resource,
+            113,
+        );
+    };
+    if owner == crate::resources::SERVER_OWNER {
+        // Server-reserved resource (root window, overlay, etc.). Noop.
+        return Ok(RequestOutcome::Handled);
+    }
+    if state.zombie_clients.contains_key(&owner.0) {
+        super::process_disconnect::destroy_zombie_resources(state, backend, owner);
+        state.zombie_clients.remove(&owner.0);
+        return Ok(RequestOutcome::Handled);
+    }
+    if owner == client_id {
+        // X11 spec: KillClient targeting any of your own resources
+        // forces your own connection closed. Your stored close-down
+        // mode still applies — process_disconnect consults it.
+        return Ok(RequestOutcome::Disconnect(client_id));
+    }
+    if state.clients.contains_key(&owner.0) {
+        // Force-disconnect the other client. Their close-down mode is
+        // honored: if they set RetainPermanent / RetainTemporary,
+        // their resources survive (they become a zombie) instead of
+        // being freed.
+        super::process_disconnect::process_disconnect(state, backend, owner);
     }
     Ok(RequestOutcome::Handled)
 }
@@ -7684,7 +8044,7 @@ fn handle_allow_events(
         // and AllowEvents-replay is rare, so the clone is cheap
         // compared to the wire writes the fanout produces.
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false);
+        let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, true);
     }
     Ok(RequestOutcome::Handled)
 }
@@ -10391,5 +10751,89 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, RequestOutcome::Handled));
+    }
+
+    // ---- L2 plan B.1: COMPOSITE redirect dispatch policy --------
+
+    fn composite_redirect_request_body(window: u32, mode: u8) -> Vec<u8> {
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&window.to_le_bytes());
+        body[4] = mode;
+        body
+    }
+
+    fn dispatch_composite_redirect(
+        state: &mut ServerState,
+        backend: &mut dyn crate::backend::Backend,
+        client_id: ClientId,
+        window: u32,
+        mode: u8,
+    ) -> RequestOutcome {
+        let body = composite_redirect_request_body(window, mode);
+        process_request(
+            state,
+            backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 144,
+                data: 1, // REDIRECT_WINDOW
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn redirect_window_conflict_from_different_client_returns_bad_access() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        // Client A redirects window 0xCAFE first (succeeds).
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xCAFE, 0);
+        // Client B tries the same redirect — must get BadAccess.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0xCAFE, 0);
+        peer_b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer_b.read_exact(&mut buf).expect("error delivered to B");
+        assert_eq!(buf[0], 0, "expected X11 Error, got opcode {}", buf[0]);
+        // BAD_ACCESS = 10
+        assert_eq!(buf[1], 10, "expected BadAccess (10), got {}", buf[1]);
+    }
+
+    #[test]
+    fn redirect_window_same_client_idempotent() {
+        let mut state = ServerState::new();
+        let mut peer_a = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Two REDIRECT_WINDOW from the same client on the same window:
+        // both should succeed with no error event written.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
+        peer_a.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let n = peer_a.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
+        assert_eq!(state.composite_redirects.len(), 1);
+    }
+
+    #[test]
+    fn redirect_automatic_mode_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // mode byte = 1 → Automatic. B.1 ships Manual only; the
+        // dispatcher returns BadValue.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 1);
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error delivered");
+        assert_eq!(buf[0], 0);
+        // BAD_VALUE = 2
+        assert_eq!(buf[1], 2, "expected BadValue (2), got {}", buf[1]);
+        assert!(state.composite_redirects.is_empty());
     }
 }

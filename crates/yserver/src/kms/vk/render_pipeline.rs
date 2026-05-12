@@ -749,11 +749,17 @@ fn build_pipeline(
     let op_code: u32 = u32::from(op as u8);
     let a8_dst: u32 = u32::from(color_format == vk::Format::R8_UNORM);
     let comp_alpha: u32 = u32::from(component_alpha);
-    let mut spec_data = [0u8; 16];
+    // L1 task A.11: depth-24 BGRA destinations are server-owned α —
+    // the frag stage must emit α = 1.0 so the per-op blend lands an
+    // opaque byte regardless of `XRenderColor.a`. Depth-32 ARGB and
+    // R8 (alpha-only) destinations pass α through unchanged.
+    let alpha_mode: u32 = u32::from(color_format != vk::Format::R8_UNORM && !dst_has_alpha);
+    let mut spec_data = [0u8; 20];
     spec_data[0..4].copy_from_slice(&mode.to_ne_bytes());
     spec_data[4..8].copy_from_slice(&op_code.to_ne_bytes());
     spec_data[8..12].copy_from_slice(&a8_dst.to_ne_bytes());
     spec_data[12..16].copy_from_slice(&comp_alpha.to_ne_bytes());
+    spec_data[16..20].copy_from_slice(&alpha_mode.to_ne_bytes());
     let spec_map_entries = [
         vk::SpecializationMapEntry::default()
             .constant_id(0)
@@ -770,6 +776,10 @@ fn build_pipeline(
         vk::SpecializationMapEntry::default()
             .constant_id(3)
             .offset(12)
+            .size(4),
+        vk::SpecializationMapEntry::default()
+            .constant_id(4)
+            .offset(16)
             .size(4),
     ];
     let spec_info = vk::SpecializationInfo::default()

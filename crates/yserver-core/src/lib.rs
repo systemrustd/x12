@@ -7,6 +7,6 @@ pub mod nested;
 pub mod present_scheduler;
 pub mod properties;
 pub mod randr;
-mod resources;
+pub mod resources;
 pub mod server;
 mod unix_fd;

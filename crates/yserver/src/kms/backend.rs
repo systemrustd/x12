@@ -60,6 +60,95 @@ struct MirrorReadback {
     bytes: Vec<u8>,
 }
 
+/// One entry in the [`AliasRegistry`]: tracks the refcount on a
+/// `Composite::NameWindowPixmap` backing pixmap, plus the
+/// width/height/depth snapshot the alias was created against.
+///
+/// Refcount sources, per the L2 spec:
+///   1. Active redirect on the matching window
+///      (`Window.redirected_backing`).
+///   2. Each live `NameWindowPixmap` alias on this backing.
+/// The backing drops when refcount reaches zero — Unredirect
+/// without aliases (1 → 0), DestroyWindow with surviving aliases
+/// (1 → 0 from owner; aliases keep it alive), final FreePixmap of
+/// the last alias (after Unredirect or Destroy).
+#[allow(dead_code, reason = "width/height/depth consumed by B.6d on resize")]
+#[derive(Clone, Copy, Debug)]
+pub struct AliasEntry {
+    pub refcount: u32,
+    pub width: u16,
+    pub height: u16,
+    pub depth: u8,
+}
+
+/// Refcounted backing-pixmap registry on the KMS backend. Keyed by
+/// the backing's `host_xid` (the `PixmapHandle` the protocol layer
+/// sees through `Window.redirected_backing.host_pixmap`).
+/// L2 plan B.3.
+#[derive(Default, Debug)]
+pub struct AliasRegistry {
+    entries: std::collections::HashMap<u32, AliasEntry>,
+}
+
+#[allow(
+    dead_code,
+    reason = "get/decref/len/is_empty consumed by B.6c (Unredirect teardown) + B.10c (overlay-demote quiescence); B.6d uses the width/height fields for resize check"
+)]
+impl AliasRegistry {
+    /// Add the initial entry for a backing pixmap. Caller seeds the
+    /// `refcount` (typically 1 for the redirect-activation hold).
+    pub fn insert(&mut self, host_pixmap: PixmapHandle, entry: AliasEntry) {
+        self.entries.insert(host_pixmap.as_raw(), entry);
+    }
+
+    /// Refcount-only lookup; returns `None` if the backing isn't
+    /// tracked (e.g. the redirect was torn down).
+    #[must_use]
+    pub fn get(&self, host_pixmap: PixmapHandle) -> Option<&AliasEntry> {
+        self.entries.get(&host_pixmap.as_raw())
+    }
+
+    /// Bump the refcount. Silently no-ops on an unknown handle — the
+    /// caller is expected to have inserted the entry first
+    /// (`Composite::NameWindowPixmap`'s ordering guarantees that).
+    pub fn incref(&mut self, host_pixmap: PixmapHandle) {
+        if let Some(e) = self.entries.get_mut(&host_pixmap.as_raw()) {
+            e.refcount = e.refcount.saturating_add(1);
+        }
+    }
+
+    /// Drop one reference. Returns `true` if the entry was removed
+    /// (refcount reached zero). Returns `false` on an unknown handle
+    /// or when refs remain — caller uses the return value to decide
+    /// whether to release the underlying Vulkan image.
+    pub fn decref(&mut self, host_pixmap: PixmapHandle) -> bool {
+        let key = host_pixmap.as_raw();
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return false;
+        };
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount == 0 {
+            self.entries.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of tracked backings. Mostly for test introspection.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True iff no backings are tracked. Used by overlay-demotion
+    /// quiescence checks (B.10c).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Axis-aligned overlap test for two rects of the same size in
 /// the same coordinate space. `vkCmdCopyImage` is UB when src and
 /// dst rects on the same image overlap; the
@@ -687,6 +776,22 @@ pub struct KmsBackend {
     cursors: HashMap<u32, CursorState>,
     active_cursor: Option<u32>,
 
+    // DRM hardware cursor plane (Phase 4.2 perf). When `Some` the
+    // composite pass skips the Vulkan cursor quad and the kernel
+    // positions a 64×64 overlay independently of compositor cadence
+    // via `drmModeMoveCursor` — microsecond-class ioctl, no GPU
+    // touch. Falls back to the Vulkan quad on cursors larger than
+    // `HW_CURSOR_W × HW_CURSOR_H`, or when the plane couldn't be
+    // initialised (test backend, KMS lacks cursor support).
+    pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
+    /// Cursor XID currently uploaded into `cursor_plane`; `None`
+    /// when nothing has been installed yet.
+    pub(crate) hw_cursor_xid: Option<u32>,
+    /// Hotspot of the cursor currently uploaded into the plane.
+    /// Used to translate global cursor coords into per-CRTC
+    /// `move_cursor` offsets.
+    pub(crate) hw_cursor_hotspot: (u16, u16),
+
     // X11 KeyButMask bits for currently-held mouse buttons (Button1Mask
     // = 0x100 .. Button5Mask = 0x1000). OR'd into the `state` field of
     // MotionNotify (and ButtonRelease) events so WMs can detect drag
@@ -744,6 +849,17 @@ pub struct KmsBackend {
     shape_bounding: HashMap<u32, Vec<xfixes::RegionRect>>, // kind=0
     shape_clip: HashMap<u32, Vec<xfixes::RegionRect>>,     // kind=1
     shape_input: HashMap<u32, Vec<xfixes::RegionRect>>,    // kind=2
+
+    /// Refcounted lifecycle for `Composite::NameWindowPixmap`
+    /// backings (L2 plan B.3). Entries get added by `RedirectWindow`
+    /// activation (B.6a, refcount=1) and bumped/decremented by
+    /// each alias / Unredirect / DestroyWindow / FreePixmap.
+    pub(crate) alias_registry: AliasRegistry,
+    /// `host_window → backing_pixmap_handle` map populated by
+    /// `allocate_redirected_backing`; `name_window_pixmap` looks
+    /// up the matching backing here. Cleared by B.6c when a
+    /// redirect is torn down.
+    pub(crate) host_window_to_backing: HashMap<u32, PixmapHandle>,
 }
 
 /// State for a RENDER picture on the KMS backend.
@@ -1111,6 +1227,203 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
 impl KmsBackend {
     pub fn open(device_path: &str) -> io::Result<Self> {
         Self::open_with_commit(device_path, drm::modeset::commit_modeset)
+    }
+
+    /// Construct a headless `KmsBackend` for integration tests.
+    ///
+    /// Wraps a `drm::Device::for_tests()` stub, leaves `vk = None`, and
+    /// seeds a single 800x600 "test" output. Sufficient to drive
+    /// `process_request` for protocol-level assertions; paint paths
+    /// that require Vulkan return early (the `vk.as_ref()` guards in
+    /// the op recorders short-circuit). Phase A composite tests that
+    /// need real Vulkan paint will gain a `for_tests_with_vk` sibling.
+    ///
+    /// Hidden from rustdoc — this is wiring for test fixtures, not a
+    /// public API. The first consumer is
+    /// `crates/yserver/tests/common/server_fixture.rs`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        let ctx = XkbContext(xkbcommon::xkb::Context::new(
+            xkbcommon::xkb::CONTEXT_NO_FLAGS,
+        ));
+        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+            &ctx.0,
+            "evdev",
+            "pc105",
+            "us",
+            "",
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .or_else(|| {
+            xkbcommon::xkb::Keymap::new_from_names(
+                &ctx.0,
+                "",
+                "",
+                "",
+                "",
+                None,
+                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+        })
+        .expect("test xkb keymap");
+        let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
+
+        KmsBackend {
+            device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
+            render_node_fd: None,
+            render_node_path: None,
+            dri3_sync_resources: HashMap::new(),
+            dri3_xshmfences: HashMap::new(),
+            outputs: vec![OutputLayout {
+                output: crate::drm::modeset::Output {
+                    connector: ::drm::control::from_u32(1).unwrap(),
+                    connector_name: "test".to_string(),
+                    crtc: ::drm::control::from_u32(1).unwrap(),
+                    plane: ::drm::control::from_u32(1).unwrap(),
+                    // SAFETY: tests never pass this mode to DRM; it is only
+                    // present to satisfy KmsBackend's production fields.
+                    mode: unsafe { std::mem::zeroed() },
+                    picked: crate::drm::modeset::Mode {
+                        name: "test".to_string(),
+                        width: 800,
+                        height: 600,
+                        vrefresh: 60,
+                        preferred: true,
+                    },
+                    plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                },
+                swapchain: crate::drm::Swapchain::empty_for_tests(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }],
+            fb_w: 800,
+            fb_h: 600,
+            windows: HashMap::new(),
+            next_host_xid: 0x0040_0000,
+            top_level_order: Vec::new(),
+            window_id: 1,
+            root_visual_xid: 0x21,
+            xid_map: HostXidMap::new(),
+            xkb_context: ctx,
+            xkb_keymap: XkbKeymap(keymap),
+            xkb_state,
+            input_ctx: None,
+            vk: None,
+            first_pageflip_logged: vec![false; 1],
+            screen_dirty: true,
+            scanout_pools: Vec::new(),
+            compositor_pipeline: None,
+            ops_command_pool: None,
+            ops_staging: None,
+            glyph_atlas: None,
+            text_pipeline: None,
+            render_pipelines: None,
+            solid_src_image: None,
+            solid_mask_image: None,
+            white_mask_image: None,
+            mask_scratch: None,
+            copy_scratch: None,
+            dst_readback: None,
+            logic_fill_pipelines: None,
+            font_loader: FontLoader::new().expect("test font loader"),
+            fonts: HashMap::new(),
+            pixmaps: HashMap::new(),
+            bg_pixel: None,
+            bg_pixmap: None,
+            // Initial cursor position: center of the 800×600 test
+            // framebuffer (matches the input_thread's own initial
+            // state). See parallel comment in the real constructor
+            // for the GTK gesture-drag rationale; tests don't rely
+            // on the cursor being at the origin and using midpoint
+            // here keeps the for_test backend internally consistent.
+            cursor_x: 400.0,
+            cursor_y: 300.0,
+            cursors: HashMap::new(),
+            active_cursor: None,
+            cursor_plane: None,
+            hw_cursor_xid: None,
+            hw_cursor_hotspot: (0, 0),
+            button_mask: 0,
+            prev_pointer_window: None,
+            pending_pointer_events: Vec::new(),
+            current_font: None,
+            current_function: GcFunction::Copy,
+            current_foreground: 0,
+            current_background: 0x00ff_ffff,
+            current_fill: FillState::Solid,
+            current_clip: ClipState::None,
+            pictures: HashMap::new(),
+            picture_rescued_images: HashMap::new(),
+            glyphsets: HashMap::new(),
+            shape_bounding: HashMap::new(),
+            shape_clip: HashMap::new(),
+            shape_input: HashMap::new(),
+            alias_registry: AliasRegistry::default(),
+            host_window_to_backing: HashMap::new(),
+        }
+    }
+
+    /// Variant of [`Self::for_tests`] that attaches a real `VkContext`
+    /// plus the supporting Vulkan state needed for the L1 alpha-invariant
+    /// tests to record into window / pixmap mirrors and read them back:
+    /// `ops_command_pool`, `ops_staging`, and `logic_fill_pipelines`.
+    /// Scanout-side state (`scanout_pools`, `compositor_pipeline`,
+    /// RENDER pipeline cache, etc.) is **not** initialised — those
+    /// require a real DRM device and land with the scanout-capture
+    /// task (A.16 in the composite implementation plan).
+    ///
+    /// Returns `Err` if any of the Vulkan-side bring-up steps fail.
+    /// Hidden from rustdoc; for test-fixture use only.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from `VkContext::new`, `OpsCommandPool::new`,
+    /// `OpsStaging::new`, and `LogicFillPipelineCache::new`.
+    #[doc(hidden)]
+    pub fn for_tests_with_vk() -> io::Result<Self> {
+        let mut backend = Self::for_tests();
+        let vk = crate::kms::vk::device::VkContext::new()
+            .map_err(|e| io::Error::other(format!("VkContext::new: {e}")))?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk))
+            .map_err(|e| io::Error::other(format!("OpsCommandPool::new: {e:?}")))?;
+        let ops_staging = crate::kms::vk::ops::OpsStaging::new(Arc::clone(&vk), 1024 * 1024)
+            .map_err(|e| io::Error::other(format!("OpsStaging::new: {e:?}")))?;
+        let logic_fill = crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache::new(
+            Arc::clone(&vk),
+            ash::vk::Format::B8G8R8A8_UNORM,
+        )
+        .map_err(|e| io::Error::other(format!("LogicFillPipelineCache::new: {e:?}")))?;
+        backend.vk = Some(vk);
+        backend.ops_command_pool = Some(ops_pool);
+        backend.ops_staging = Some(ops_staging);
+        backend.logic_fill_pipelines = Some(logic_fill);
+        Ok(backend)
+    }
+
+    /// Public wrapper over [`Self::read_mirror_pixels`] for test
+    /// fixtures. Returns `(width, height, bgra_bytes)` where `bytes`
+    /// is the tightly-packed `B8G8R8A8_UNORM` pixel buffer of the
+    /// mirror behind `host_xid` (a window or pixmap host XID).
+    /// `None` if the drawable is unknown, has no Vulkan mirror, or
+    /// the readback failed.
+    ///
+    /// Hidden from rustdoc; intended for the test fixture in
+    /// `crates/yserver/tests/common/server_fixture.rs`.
+    #[doc(hidden)]
+    pub fn capture_mirror_bgra8(&mut self, host_xid: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let rb = self.read_mirror_pixels(host_xid)?;
+        // The fixture's image accessor presumes 4 bytes per pixel
+        // (BGRA8). Mirrors of depth 1/8 use `R8_UNORM` (bpp = 1) —
+        // refuse to coerce those silently.
+        if rb.bytes_per_pixel != 4 {
+            return None;
+        }
+        Some((rb.width, rb.height, rb.bytes))
     }
 
     fn open_with_commit(
@@ -1586,10 +1899,25 @@ impl KmsBackend {
             pixmaps: HashMap::new(),
             bg_pixel: None,
             bg_pixmap: None,
-            cursor_x: 0.0,
-            cursor_y: 0.0,
+            // Initial cursor position: screen center, matching
+            // input_thread::LibinputThreadState::new() which seeds
+            // its own cursor at (fb_w/2, fb_h/2). Without this,
+            // KMS-backend state tracks the cursor at (0, 0) until
+            // the first libinput motion arrives — and during that
+            // window, any synthetic EnterNotify generated by
+            // window-map / focus changes carries (0, 0). GTK's
+            // gesture-drag controller in caja-desktop anchors its
+            // drag-start at the first event it sees, so a stray
+            // (0, 0) Enter locks the anchor at screen origin and
+            // produces a rubber-band selection from origin to the
+            // click point on every subsequent single click.
+            cursor_x: f32::from(fb_w) / 2.0,
+            cursor_y: f32::from(fb_h) / 2.0,
             cursors: HashMap::new(),
             active_cursor: None,
+            cursor_plane: None,
+            hw_cursor_xid: None,
+            hw_cursor_hotspot: (0, 0),
             button_mask: 0,
             prev_pointer_window: None,
             pending_pointer_events: Vec::new(),
@@ -1605,7 +1933,25 @@ impl KmsBackend {
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),
+            alias_registry: AliasRegistry::default(),
+            host_window_to_backing: HashMap::new(),
         };
+        // Try to bring up the DRM hardware cursor plane. A failure
+        // here is non-fatal — the compositor falls back to the
+        // Vulkan-composited cursor quad. Logged so we know which
+        // path is active.
+        match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&me.device)) {
+            Ok(plane) => {
+                log::info!("kms: hardware cursor plane initialised (64x64 ARGB8888)");
+                me.cursor_plane = Some(plane);
+            }
+            Err(e) => {
+                log::warn!(
+                    "kms: hardware cursor plane init failed ({e}); falling back to \
+                     Vulkan-composited cursor quad"
+                );
+            }
+        }
         // Install a built-in X-shaped cursor as the universal fallback;
         // any later DefineCursor on the root window will override it.
         me.install_default_cursor();
@@ -1628,6 +1974,201 @@ impl KmsBackend {
     /// for visibility on dark backgrounds. Hotspot at the center.
     #[allow(dead_code)] // associated-impl shim isn't strictly needed, kept for future use
     fn _placeholder(&self) {}
+
+    /// Refresh the hardware cursor plane's image to match the current
+    /// effective cursor. Idempotent — bails out cheaply when the
+    /// currently-uploaded cursor XID still matches `effective_cursor()`.
+    ///
+    /// Called from cursor-change paths (DefineCursor, install_default_cursor,
+    /// crossing into a window with a different cursor). Position is
+    /// handled separately by [`Self::hw_cursor_move`] — this routine
+    /// only touches the kernel ioctl on actual *image* changes.
+    ///
+    /// Falls back to hiding the plane (so the Vulkan cursor quad takes
+    /// over) when:
+    /// - The plane wasn't initialised (`cursor_plane` is `None`),
+    /// - The cursor extent exceeds `HW_CURSOR_W × HW_CURSOR_H`,
+    /// - The GPU readback or load_image fails.
+    pub(crate) fn hw_cursor_refresh(&mut self) {
+        use crate::kms::{
+            cursor_plane::{HW_CURSOR_H, HW_CURSOR_W},
+            vk::ops::{image as vk_image, run_one_shot_op},
+        };
+
+        if self.cursor_plane.is_none() {
+            return;
+        }
+        let Some(cursor_xid) = self.effective_cursor() else {
+            // No cursor at all — hide the plane.
+            self.hw_cursor_hide_all();
+            return;
+        };
+        if self.hw_cursor_xid == Some(cursor_xid) {
+            return;
+        }
+
+        // Snapshot extent + hotspot without holding a borrow.
+        let Some(cs) = self.cursors.get(&cursor_xid) else {
+            return;
+        };
+        let (cw, ch) = (cs.extent.width, cs.extent.height);
+        let (hot_x, hot_y) = (cs.hot_x, cs.hot_y);
+        if cs.vk_mirror.is_none() {
+            // No GPU image — we can't populate the plane buffer.
+            self.hw_cursor_hide_all();
+            return;
+        }
+        if cw == 0 || ch == 0 || cw > HW_CURSOR_W || ch > HW_CURSOR_H {
+            // Cursor too large for the hardware plane — hide it and
+            // let the composite path render the quad instead.
+            self.hw_cursor_hide_all();
+            return;
+        }
+        let bpp = 4u32; // cursor mirrors are BGRA8
+
+        // GPU readback into ops_staging. Same shape as
+        // `read_mirror_pixels` but reads directly from a cursor mirror
+        // (which lives in `self.cursors`, not in `windows`/`pixmaps`).
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return;
+        };
+        if self.ops_staging.is_none() {
+            return;
+        }
+        let total_bytes = u64::from(cw) * u64::from(ch) * u64::from(bpp);
+        if let Err(e) = self
+            .ops_staging
+            .as_mut()
+            .expect("checked is_none above")
+            .ensure(total_bytes)
+        {
+            log::warn!("hw_cursor_refresh: staging grow failed for {total_bytes} bytes: {e:?}");
+            return;
+        }
+        let regions = [ash::vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(ash::vk::Extent3D {
+                width: cw,
+                height: ch,
+                depth: 1,
+            })];
+        let staging_buffer = self.ops_staging.as_ref().expect("present").buffer();
+        let Some(mirror) = self
+            .cursors
+            .get_mut(&cursor_xid)
+            .and_then(|c| c.vk_mirror.as_mut())
+        else {
+            return;
+        };
+        if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+            vk_image::record_get_image(vk, cb, mirror, staging_buffer, &regions)
+        }) {
+            log::warn!("hw_cursor_refresh: record_get_image failed: {e:?}");
+            return;
+        }
+        let total_bytes_usize = total_bytes as usize;
+        let mut bytes = vec![0u8; total_bytes_usize];
+        // SAFETY: `ensure(total_bytes)` succeeded above, and
+        // `run_one_shot_op` waited for the submit before returning,
+        // so the staging range is now valid.
+        unsafe {
+            let staging_ptr = self.ops_staging.as_ref().expect("present").mapped_ptr();
+            std::ptr::copy_nonoverlapping(staging_ptr, bytes.as_mut_ptr(), total_bytes_usize);
+        }
+
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return;
+        };
+        if let Err(e) = plane.load_image(cw, ch, &bytes) {
+            log::warn!("hw_cursor_refresh: load_image failed: {e}");
+            return;
+        }
+        // Re-bind on every CRTC. Even if the same cursor was already
+        // showing, set_cursor2 has to be called again to swap in the
+        // new image (the kernel doesn't peek at the dumb buffer
+        // contents — only at the buffer handle).
+        let layouts_snapshot: Vec<::drm::control::crtc::Handle> =
+            self.outputs.iter().map(|l| l.output.crtc).collect();
+        for crtc_handle in layouts_snapshot {
+            if let Err(e) = plane.show(crtc_handle, (i32::from(hot_x), i32::from(hot_y))) {
+                log::warn!("hw_cursor_refresh: set_cursor2 failed on crtc: {e}");
+            }
+        }
+        self.hw_cursor_xid = Some(cursor_xid);
+        self.hw_cursor_hotspot = (hot_x, hot_y);
+
+        // Position the freshly-shown cursor immediately so it doesn't
+        // sit at stale per-CRTC coords from a previous cursor's life.
+        self.hw_cursor_move();
+    }
+
+    /// Issue `drmModeMoveCursor` on every CRTC to reflect the current
+    /// `(cursor_x, cursor_y)`. Cheap — one ioctl per output, no GPU
+    /// involvement. Called on every pointer-absolute event when the
+    /// HW plane is active.
+    pub(crate) fn hw_cursor_move(&mut self) {
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return;
+        };
+        if self.hw_cursor_xid.is_none() {
+            return;
+        }
+        let (hot_x, hot_y) = self.hw_cursor_hotspot;
+        let cursor_x = self.cursor_x as i32;
+        let cursor_y = self.cursor_y as i32;
+        for layout in &self.outputs {
+            // CRTC-local coords. The kernel clips outside the visible
+            // rect on each CRTC (effectively hiding the cursor on that
+            // output), so we just compute and submit blindly.
+            let cx = cursor_x - layout.x - i32::from(hot_x);
+            let cy = cursor_y - layout.y - i32::from(hot_y);
+            if let Err(e) = plane.move_to(layout.output.crtc, cx, cy) {
+                log::warn!("hw_cursor_move: move_cursor failed: {e}");
+            }
+        }
+    }
+
+    /// Detach the cursor plane from every CRTC. Used when the
+    /// effective cursor is too large for the plane (forcing fallback
+    /// to the composite quad) or when there's no cursor at all.
+    pub(crate) fn hw_cursor_hide_all(&mut self) {
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return;
+        };
+        let layouts_snapshot: Vec<::drm::control::crtc::Handle> =
+            self.outputs.iter().map(|l| l.output.crtc).collect();
+        for crtc_handle in layouts_snapshot {
+            if let Err(e) = plane.hide(crtc_handle) {
+                log::warn!("hw_cursor_hide_all: hide failed: {e}");
+            }
+        }
+        self.hw_cursor_xid = None;
+    }
+
+    /// True when the HW cursor plane currently has pixels uploaded
+    /// and is bound to at least one CRTC. The composite-scene builder
+    /// uses this to skip pushing the Vulkan cursor quad — without
+    /// this gate both the kernel overlay and the GPU quad would draw
+    /// the cursor twice (the latter trailing by one composite cadence
+    /// — which was the whole problem this fixes).
+    #[must_use]
+    pub(crate) fn hw_cursor_active(&self) -> bool {
+        self.cursor_plane
+            .as_ref()
+            .is_some_and(crate::kms::cursor_plane::CursorPlane::is_visible)
+            && self.hw_cursor_xid.is_some()
+    }
 }
 
 /// Advance every bo in a [`ScanoutBoPool`] one step on
@@ -1708,6 +2249,9 @@ impl KmsBackend {
             },
         );
         self.active_cursor = Some(xid);
+        // Push the freshly-installed default cursor onto the HW
+        // plane (no-op when the plane isn't available).
+        self.hw_cursor_refresh();
     }
 
     /// Upload tightly-packed BGRA bytes into the full extent of
@@ -2626,8 +3170,21 @@ impl KmsBackend {
             return false;
         };
 
+        // Resolve depth eagerly so the pipeline cache key reflects
+        // the destination's α policy. Drop the mirror borrow here so
+        // the subsequent `logic_fill_pipelines.as_mut()` doesn't
+        // conflict with `self.windows` / `self.pixmaps`.
+        let depth = if let Some(w) = self.windows.get(&dst_xid) {
+            w.depth
+        } else if let Some(p) = self.pixmaps.get(&dst_xid) {
+            p.depth
+        } else {
+            0
+        };
+        let opaque_alpha = depth != 32;
+
         let pipeline = match self.logic_fill_pipelines.as_mut() {
-            Some(cache) => match cache.get(function) {
+            Some(cache) => match cache.get(function, opaque_alpha) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("vk logic-fill: pipeline build failed for {function:?}: {e:?}");
@@ -2732,13 +3289,20 @@ impl KmsBackend {
             return false;
         };
 
+        // Resolve the destination depth before the mut-borrow of the
+        // mirror. L1 task A.3 needs it to decide the α policy:
+        //   depth == 32 → preserve the client's `fg` α byte (ARGB
+        //                 visual, alpha_mask = 0xff00_0000),
+        //   else        → force α = 1.0 (server-owned α; the
+        //                 composite scene's pass-through reveals the
+        //                 painted pixels as opaque).
         // Pull the mirror reference. Returns &mut DrawableImage.
-        let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
-            w.vk_mirror.as_mut()
+        let (depth, mirror) = if let Some(w) = self.windows.get_mut(&dst_xid) {
+            (w.depth, w.vk_mirror.as_mut())
         } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
-            p.vk_mirror.as_mut()
+            (p.depth, p.vk_mirror.as_mut())
         } else {
-            None
+            (0, None)
         };
         let Some(mirror) = mirror else {
             return false;
@@ -2755,14 +3319,19 @@ impl KmsBackend {
         // would leave depth-1 bit-1 fills as byte=0 (since fg=1 has
         // no bits in 16..23). xeyes's PolyFillArc onto its shape
         // mask hit exactly this trap.
+        let alpha = if depth == 32 {
+            ((fg >> 24) & 0xFF) as f32 / 255.0
+        } else {
+            1.0
+        };
         let color = if mirror.format == ash::vk::Format::R8_UNORM {
-            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
+            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, alpha]
         } else {
             [
                 ((fg >> 16) & 0xFF) as f32 / 255.0,
                 ((fg >> 8) & 0xFF) as f32 / 255.0,
                 (fg & 0xFF) as f32 / 255.0,
-                1.0,
+                alpha,
             ]
         };
 
@@ -3635,7 +4204,12 @@ impl KmsBackend {
             return false;
         };
 
-        let Some(src) = resolve_render_pic(self.pictures.get(&host_src)) else {
+        // `resolve_render_pic` returns None for gradients (the variant
+        // doesn't carry the picture XID); the trapezoid path must use
+        // the gradient-aware resolver. Without this, every mate-CC
+        // button-hover RenderTrapezoids — which sends a gradient as
+        // its source — declined and we rasterised on CPU for nothing.
+        let Some(src) = resolve_render_pic_with_gradient_xid(&self.pictures, host_src) else {
             return false;
         };
 
@@ -5244,8 +5818,37 @@ impl KmsBackend {
     }
 
     fn process_pointer_absolute(&mut self, x: f32, y: f32) {
-        self.cursor_x = x.clamp(0.0, self.fb_w as f32 - 1.0);
-        self.cursor_y = y.clamp(0.0, self.fb_h as f32 - 1.0);
+        let new_x = x.clamp(0.0, self.fb_w as f32 - 1.0);
+        let new_y = y.clamp(0.0, self.fb_h as f32 - 1.0);
+        // When the hardware cursor plane is active, the kernel
+        // positions the overlay independently of compositor cadence
+        // — `move_cursor` is one ioctl per CRTC, microseconds, no
+        // GPU touch. We do NOT dirty the screen in that case, so
+        // pointer-only motion costs zero composite frames.
+        //
+        // Without the HW plane, the cursor is rendered as a quad in
+        // the composite scene and every position change has to ride
+        // the next vsync-paced composite+flip. The `screen_dirty`
+        // mark is the only thing that drives that next flip — the
+        // `maybe_composite` in-flight gate caps the actual rate at
+        // vsync, so many pointer events between flips just re-set
+        // the flag idempotently.
+        if new_x != self.cursor_x || new_y != self.cursor_y {
+            self.cursor_x = new_x;
+            self.cursor_y = new_y;
+            // Crossing into a window with a different `cursor`
+            // attribute changes the effective cursor without any
+            // explicit DefineCursor — refresh first so the HW plane
+            // doesn't keep showing the previous window's cursor.
+            // No-op (single hash lookup) when the cursor hasn't
+            // changed.
+            self.hw_cursor_refresh();
+            if self.hw_cursor_active() {
+                self.hw_cursor_move();
+            } else {
+                self.screen_dirty = true;
+            }
+        }
         self.dispatch_motion_event();
     }
 
@@ -5440,16 +6043,6 @@ impl KmsBackend {
         // on press, 2 = NotifyUngrab on release.
         let post_state = self.serialize_modifiers() | self.button_mask;
         let press_mode: u8 = if pressed { 1 } else { 2 };
-        let press_kind = if pressed {
-            PointerEventKind::LeaveNotify
-        } else {
-            PointerEventKind::EnterNotify
-        };
-        let post_kind = if pressed {
-            PointerEventKind::EnterNotify
-        } else {
-            PointerEventKind::LeaveNotify
-        };
 
         // Resolve focus + grab to nested ResourceIds via xid_map.
         let grab_id = self.xid_map.get(&host_xid).copied();
@@ -5461,36 +6054,40 @@ impl KmsBackend {
             (Some(focus), Some(grab)) => {
                 let events =
                     yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
-                if events.is_empty() {
-                    // focus == grab: a single mode-stamped crossing
-                    // pair is sufficient (Leave→Enter on press,
-                    // Enter→Leave on release) on the same window.
-                    self.emit_crossing(host_xid, press_kind, press_mode, post_state);
-                    self.emit_crossing(host_xid, post_kind, press_mode, post_state);
-                } else {
-                    for ev in events {
-                        let win_host_xid = server_state
-                            .resources
-                            .window(ev.window)
-                            .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                            .unwrap_or(host_xid);
-                        let kind = match ev.kind {
-                            yserver_core::crossings::CrossingKind::Enter => {
-                                PointerEventKind::EnterNotify
-                            }
-                            yserver_core::crossings::CrossingKind::Leave => {
-                                PointerEventKind::LeaveNotify
-                            }
-                        };
-                        self.emit_crossing(win_host_xid, kind, press_mode, post_state);
-                    }
+                // When `focus == grab`, `implicit_grab_crossings`
+                // returns empty by design — X11 spec section 11
+                // (Input grab) treats the activation as a "warp"
+                // from the focus window to the grab window, and a
+                // warp to the same window emits no crossings. The
+                // earlier code emitted a spurious Leave→Enter pair
+                // here, which GTK's gesture-drag controller in
+                // caja-desktop interpreted as "drag aborted; drag
+                // restart from anchor (0,0)", producing a rubber-
+                // band selection from screen origin on every click.
+                for ev in events {
+                    let win_host_xid = server_state
+                        .resources
+                        .window(ev.window)
+                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                        .unwrap_or(host_xid);
+                    let kind = match ev.kind {
+                        yserver_core::crossings::CrossingKind::Enter => {
+                            PointerEventKind::EnterNotify
+                        }
+                        yserver_core::crossings::CrossingKind::Leave => {
+                            PointerEventKind::LeaveNotify
+                        }
+                    };
+                    self.emit_crossing(win_host_xid, kind, press_mode, post_state);
                 }
             }
             _ => {
                 // Either focus or grab isn't a known nested window;
-                // fall back to the one-event approximation.
-                self.emit_crossing(host_xid, press_kind, press_mode, post_state);
-                self.emit_crossing(host_xid, post_kind, press_mode, post_state);
+                // emit nothing. The empty-Vec interpretation above
+                // is also what the unknown-id case approximates —
+                // we can't compute the crossing chain without a
+                // resolved focus/grab pair, and emitting a spurious
+                // in-place pair was the bug we just removed.
             }
         }
     }
@@ -5779,7 +6376,7 @@ impl KmsBackend {
                     dst_size: [f32::from(layout_w), f32::from(layout_h)],
                     src_origin: [layout_x as f32 / pm_w, layout_y as f32 / pm_h],
                     src_size: [f32::from(layout_w) / pm_w, f32::from(layout_h) / pm_h],
-                    use_src_alpha: false,
+                    alpha_passthrough: false,
                 });
             }
         }
@@ -5793,7 +6390,14 @@ impl KmsBackend {
         // showed its visible portion on each scanout. Vulkan
         // viewport+scissor implicitly clips the same way, so a
         // straight quad at scanout-relative coords reproduces it.
-        if let Some(cursor_xid) = self.effective_cursor()
+        //
+        // Skip when the DRM hardware cursor plane is active — the
+        // kernel overlay draws on top of the scanout independently
+        // of this composite pass. Without the gate the cursor
+        // double-draws (HW overlay + compositor quad), with the
+        // GPU quad trailing by one composite cadence.
+        if !self.hw_cursor_active()
+            && let Some(cursor_xid) = self.effective_cursor()
             && let Some(cs) = self.cursors.get(&cursor_xid)
             && let Some(mirror) = cs.vk_mirror.as_ref()
         {
@@ -5807,7 +6411,7 @@ impl KmsBackend {
                 dst_size: [cw, ch],
                 src_origin: [0.0, 0.0],
                 src_size: [1.0, 1.0],
-                use_src_alpha: true,
+                alpha_passthrough: true,
             });
         }
 
@@ -5893,7 +6497,16 @@ impl KmsBackend {
                     dst_size: [rw as f32, rh as f32],
                     src_origin: [rx as f32 * inv_w, ry as f32 * inv_h],
                     src_size: [rw as f32 * inv_w, rh as f32 * inv_h],
-                    use_src_alpha: false,
+                    // L1 task A.16: window-mirror draws pass α
+                    // through. Every paint path (A.3..A.15) now
+                    // lands α=0xFF on depth-24 painted pixels, so
+                    // pass-through reveals only what's been
+                    // painted — unpainted regions stay
+                    // transparent and the composite scene's
+                    // src-over blend exposes the bg-pixmap (or
+                    // the prior frame) underneath, eliminating
+                    // the marco black-rim regression.
+                    alpha_passthrough: true,
                 });
             };
             match self.shape_bounding.get(&window_id) {
@@ -6903,7 +7516,11 @@ impl Backend for KmsBackend {
     }
 
     fn composite_opcode(&self) -> Option<u8> {
-        None
+        // L2 plan B.4 — advertise COMPOSITE. The companion B.5/B.6a
+        // give `name_window_pixmap` + `allocate_redirected_backing`
+        // their real impls; the trio lands together so the protocol
+        // layer never reaches an `Unsupported` after seeing this.
+        Some(144)
     }
 
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
@@ -6979,7 +7596,7 @@ impl Backend for KmsBackend {
         // it via `take`.
         let pending = std::mem::take(&mut self.pending_pointer_events);
         for ev in pending {
-            let _dropped = pointer_event_fanout_to_state(state, &self.xid_map, ev, true);
+            let _dropped = pointer_event_fanout_to_state(state, &self.xid_map, ev, true, false);
         }
     }
 
@@ -7335,12 +7952,82 @@ impl Backend for KmsBackend {
     fn name_window_pixmap(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_window: WindowHandle,
+        host_window: WindowHandle,
     ) -> io::Result<PixmapHandle> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "name_window_pixmap not supported",
-        ))
+        // L2 plan B.5: alias the existing redirected backing.
+        // Refcount-only — no allocation. The backing was allocated
+        // by B.6a (`allocate_redirected_backing`) at REDIRECT
+        // activation; here each NameWindowPixmap bumps the count.
+        let backing = self
+            .host_window_to_backing
+            .get(&host_window.as_raw())
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "window is not redirected (no backing)",
+                )
+            })?;
+        self.alias_registry.incref(backing);
+        Ok(backing)
+    }
+
+    fn release_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        // L2 plan B.6c — drop the redirect's reason-1 hold. If this
+        // was the last reference (no `NameWindowPixmap` alias
+        // survives), free the underlying pixmap mirror. Also
+        // unregister the `host_window → backing` mapping so a future
+        // `name_window_pixmap` on the same window doesn't hand back
+        // a stale handle.
+        let raw = backing.as_raw();
+        self.host_window_to_backing.retain(|_, h| h.as_raw() != raw);
+        if self.alias_registry.decref(backing) {
+            self.free_pixmap(origin, raw)?;
+        }
+        Ok(())
+    }
+
+    fn allocate_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        // L2 plan B.6a. Idempotency: if `host_window` already has a
+        // backing (same redirect-activation came around twice via
+        // recovery / retry), return the existing handle without
+        // bumping the registry — the redirect's reason-1 hold is
+        // still in place.
+        if let Some(existing) = self
+            .host_window_to_backing
+            .get(&host_window.as_raw())
+            .copied()
+        {
+            return Ok(existing);
+        }
+        // Allocate a regular pixmap mirror sized to the window's
+        // current geometry+depth. We piggyback `create_pixmap` —
+        // it owns the host XID allocation + mirror allocation +
+        // insert into `self.pixmaps`.
+        let backing = self.create_pixmap(origin, depth, width, height)?;
+        self.alias_registry.insert(
+            backing,
+            AliasEntry {
+                refcount: 1,
+                width,
+                height,
+                depth,
+            },
+        );
+        self.host_window_to_backing
+            .insert(host_window.as_raw(), backing);
+        Ok(backing)
     }
 
     fn create_pixmap(
@@ -7749,6 +8436,12 @@ impl Backend for KmsBackend {
         if cursor_host_xid != 0 && host_window_xid == self.window_id {
             self.active_cursor = Some(cursor_host_xid);
         }
+        // The window the pointer is over may have just had its
+        // cursor changed under it — push the new image to the HW
+        // plane. No-op when the effective cursor didn't actually
+        // change (e.g. setting a different window's cursor that
+        // the pointer isn't over).
+        self.hw_cursor_refresh();
         Ok(())
     }
 
@@ -9870,133 +10563,138 @@ pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
-
     use super::{Rectangle16, Repeat};
-    use yserver_core::{
-        backend::{Backend, ClipState, FillState, GcFunction},
-        host_x11::HostXidMap,
-    };
+    use yserver_core::backend::Backend;
     use yserver_protocol::x11::ResourceId;
 
-    use super::{KmsBackend, WindowState};
+    use super::{AliasEntry, AliasRegistry, KmsBackend, WindowState};
+    use yserver_core::backend::PixmapHandle;
+
+    #[test]
+    fn kms_backend_advertises_composite_opcode_144() {
+        let backend = KmsBackend::for_tests();
+        assert_eq!(backend.composite_opcode(), Some(144));
+    }
+
+    #[test]
+    fn allocate_redirected_backing_seeds_refcount_and_map() {
+        // L2 plan B.6a — backend allocates a backing for a host
+        // window XID, inserts into alias_registry at refcount=1,
+        // and registers in host_window_to_backing for later
+        // NameWindowPixmap lookups.
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0010);
+        let backing = backend
+            .allocate_redirected_backing(None, host_window, 200, 150, 24)
+            .expect("allocate_redirected_backing");
+        let entry = backend
+            .alias_registry
+            .get(backing)
+            .copied()
+            .expect("alias entry present");
+        assert_eq!(entry.refcount, 1);
+        assert_eq!(entry.width, 200);
+        assert_eq!(entry.height, 150);
+        assert_eq!(entry.depth, 24);
+        assert_eq!(
+            backend
+                .host_window_to_backing
+                .get(&host_window.as_raw())
+                .copied(),
+            Some(backing)
+        );
+    }
+
+    #[test]
+    fn name_window_pixmap_aliases_existing_backing_with_incref() {
+        // L2 plan B.5 — NameWindowPixmap on a redirected window
+        // returns the same backing handle and bumps the refcount.
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0011);
+        let backing = backend
+            .allocate_redirected_backing(None, host_window, 100, 50, 24)
+            .expect("allocate");
+        let pre = backend.alias_registry.get(backing).map(|e| e.refcount);
+        let aliased = backend
+            .name_window_pixmap(None, host_window)
+            .expect("alias");
+        assert_eq!(aliased, backing);
+        let post = backend.alias_registry.get(backing).map(|e| e.refcount);
+        assert_eq!(post, pre.map(|r| r + 1));
+    }
+
+    #[test]
+    fn unredirect_drops_backing_when_no_alias_holds_it() {
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0020);
+        let backing = backend
+            .allocate_redirected_backing(None, host_window, 32, 32, 24)
+            .expect("allocate");
+        backend
+            .release_redirected_backing(None, backing)
+            .expect("release");
+        assert!(backend.alias_registry.get(backing).is_none());
+        assert!(backend.host_window_to_backing.is_empty());
+    }
+
+    #[test]
+    fn unredirect_keeps_backing_alive_while_alias_holds_it() {
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0021);
+        let backing = backend
+            .allocate_redirected_backing(None, host_window, 32, 32, 24)
+            .expect("allocate");
+        // Alias bumps refcount to 2.
+        let _aliased = backend
+            .name_window_pixmap(None, host_window)
+            .expect("alias");
+        // Release drops reason-1 hold → refcount goes 2 → 1, entry stays.
+        backend
+            .release_redirected_backing(None, backing)
+            .expect("release");
+        assert_eq!(
+            backend.alias_registry.get(backing).map(|e| e.refcount),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn name_window_pixmap_errors_when_window_not_redirected() {
+        let mut backend = KmsBackend::for_tests();
+        let host_window = yserver_core::backend::WindowHandle::from_raw_panicking(0x100_0012);
+        let err = backend.name_window_pixmap(None, host_window).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn alias_registry_refcount_lifecycle() {
+        let mut reg = AliasRegistry::default();
+        let h = PixmapHandle::from_raw_panicking(0x77);
+        reg.insert(
+            h,
+            AliasEntry {
+                refcount: 1,
+                width: 100,
+                height: 50,
+                depth: 24,
+            },
+        );
+        reg.incref(h);
+        assert_eq!(reg.get(h).map(|e| e.refcount), Some(2));
+        // first decref: 2 → 1 (still referenced).
+        assert!(!reg.decref(h));
+        // second decref: 1 → 0 → removed.
+        assert!(reg.decref(h));
+        assert!(reg.get(h).is_none());
+        assert!(reg.is_empty());
+    }
 
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
 
     fn make_test_backend() -> KmsBackend {
-        let ctx = super::XkbContext(xkbcommon::xkb::Context::new(
-            xkbcommon::xkb::CONTEXT_NO_FLAGS,
-        ));
-        let keymap = xkbcommon::xkb::Keymap::new_from_names(
-            &ctx.0,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .or_else(|| {
-            xkbcommon::xkb::Keymap::new_from_names(
-                &ctx.0,
-                "",
-                "",
-                "",
-                "",
-                None,
-                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-            )
-        })
-        .expect("test xkb keymap");
-        let xkb_state = super::XkbState(xkbcommon::xkb::State::new(&keymap));
-
-        KmsBackend {
-            device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
-            render_node_fd: None,
-            render_node_path: None,
-            dri3_sync_resources: HashMap::new(),
-            dri3_xshmfences: HashMap::new(),
-            outputs: vec![super::OutputLayout {
-                output: crate::drm::modeset::Output {
-                    connector: drm::control::from_u32(1).unwrap(),
-                    connector_name: "test".to_string(),
-                    crtc: drm::control::from_u32(1).unwrap(),
-                    plane: drm::control::from_u32(1).unwrap(),
-                    // SAFETY: tests never pass this mode to DRM; it is only
-                    // present to satisfy KmsBackend's production fields.
-                    mode: unsafe { std::mem::zeroed() },
-                    picked: crate::drm::modeset::Mode {
-                        name: "test".to_string(),
-                        width: 800,
-                        height: 600,
-                        vrefresh: 60,
-                        preferred: true,
-                    },
-                    plane_fb_id_prop: drm::control::from_u32(1).unwrap(),
-                    plane_crtc_id_prop: drm::control::from_u32(1).unwrap(),
-                },
-                swapchain: crate::drm::Swapchain::empty_for_tests(),
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-            }],
-            fb_w: 800,
-            fb_h: 600,
-            windows: HashMap::new(),
-            next_host_xid: 0x0040_0000,
-            top_level_order: Vec::new(),
-            window_id: 1,
-            root_visual_xid: 0x21,
-            xid_map: HostXidMap::new(),
-            xkb_context: ctx,
-            xkb_keymap: super::XkbKeymap(keymap),
-            xkb_state,
-            input_ctx: None,
-            vk: None,
-            first_pageflip_logged: vec![false; 1],
-            screen_dirty: true,
-            scanout_pools: Vec::new(),
-            compositor_pipeline: None,
-            ops_command_pool: None,
-            ops_staging: None,
-            glyph_atlas: None,
-            text_pipeline: None,
-            render_pipelines: None,
-            solid_src_image: None,
-            solid_mask_image: None,
-            white_mask_image: None,
-            mask_scratch: None,
-            copy_scratch: None,
-            dst_readback: None,
-            logic_fill_pipelines: None,
-            font_loader: super::FontLoader::new().expect("test font loader"),
-            fonts: HashMap::new(),
-            pixmaps: HashMap::new(),
-            bg_pixel: None,
-            bg_pixmap: None,
-            cursor_x: 0.0,
-            cursor_y: 0.0,
-            cursors: HashMap::new(),
-            active_cursor: None,
-            button_mask: 0,
-            prev_pointer_window: None,
-            pending_pointer_events: Vec::new(),
-            current_font: None,
-            current_function: GcFunction::Copy,
-            current_foreground: 0,
-            current_background: 0x00ff_ffff,
-            current_fill: FillState::Solid,
-            current_clip: ClipState::None,
-            pictures: HashMap::new(),
-            picture_rescued_images: HashMap::new(),
-            glyphsets: HashMap::new(),
-            shape_bounding: HashMap::new(),
-            shape_clip: HashMap::new(),
-            shape_input: HashMap::new(),
-        }
+        KmsBackend::for_tests()
     }
 
     fn make_test_window(x: i16, y: i16, width: u16, height: u16, mapped: bool) -> WindowState {

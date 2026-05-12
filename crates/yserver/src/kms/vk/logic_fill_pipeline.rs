@@ -70,7 +70,13 @@ impl From<vk::Result> for LogicFillError {
 pub struct LogicFillPipelineCache {
     vk: Arc<VkContext>,
     pipeline_layout: vk::PipelineLayout,
-    pipelines: HashMap<u8, vk::Pipeline>,
+    /// Keyed by `(function_key, opaque_alpha as u8)`. The
+    /// `opaque_alpha=true` variant masks the alpha channel out of
+    /// the color write so the LogicOp only affects RGB — preserves
+    /// the L1 server-owned α invariant on depth-24 destinations.
+    /// `opaque_alpha=false` is the depth-32 ARGB path where the
+    /// LogicOp applies to all four channels per X11 semantics.
+    pipelines: HashMap<(u8, u8), vk::Pipeline>,
     color_format: vk::Format,
 }
 
@@ -96,14 +102,30 @@ impl LogicFillPipelineCache {
         self.pipeline_layout
     }
 
-    /// Look up or build the pipeline for `function`. Same pipeline
-    /// is reused for every subsequent fill with the same function.
-    pub fn get(&mut self, function: GcFunction) -> Result<vk::Pipeline, LogicFillError> {
-        let key = function_key(function);
+    /// Look up or build the pipeline for `function` with the
+    /// matching α policy. `opaque_alpha = true` is the depth-24
+    /// (server-owned α) path: the color blend attachment's write
+    /// mask drops alpha so the `VkLogicOp` only mutates RGB and
+    /// the destination's existing α byte is left intact (the L1
+    /// invariant: paint paths must never demote a previously-opaque
+    /// pixel to transparent). `false` is the depth-32 ARGB path —
+    /// LogicOp applies to all four channels.
+    pub fn get(
+        &mut self,
+        function: GcFunction,
+        opaque_alpha: bool,
+    ) -> Result<vk::Pipeline, LogicFillError> {
+        let key = (function_key(function), u8::from(opaque_alpha));
         if let Some(p) = self.pipelines.get(&key) {
             return Ok(*p);
         }
-        let p = build_pipeline(&self.vk, self.pipeline_layout, function, self.color_format)?;
+        let p = build_pipeline(
+            &self.vk,
+            self.pipeline_layout,
+            function,
+            self.color_format,
+            opaque_alpha,
+        )?;
         self.pipelines.insert(key, p);
         Ok(p)
     }
@@ -171,6 +193,7 @@ fn build_pipeline(
     pipeline_layout: vk::PipelineLayout,
     function: GcFunction,
     color_format: vk::Format,
+    opaque_alpha: bool,
 ) -> Result<vk::Pipeline, LogicFillError> {
     let device = &vk.device;
     let vert_module = create_shader_module(device, VERTEX_SPV)?;
@@ -208,9 +231,18 @@ fn build_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+    let write_mask = if opaque_alpha {
+        // Mask α out of the color write so the `VkLogicOp` only
+        // touches RGB. Preserves the destination's α byte (server-
+        // owned on depth-24, which by the L1 contract is already
+        // 0xFF on every painted pixel).
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+    } else {
+        vk::ColorComponentFlags::RGBA
+    };
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(false)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        .color_write_mask(write_mask)];
     let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(true)
         .logic_op(function_to_logic_op(function))

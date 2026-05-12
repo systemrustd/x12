@@ -1723,7 +1723,11 @@ pub fn encode_xi2_device_event(
     out.push(35); // GenericEvent
     out.push(major_opcode);
     write_u16(byte_order, out, sequence.0);
-    write_u32(byte_order, out, 13);
+    // length in 4-byte units beyond the 32-byte XGE header.
+    // Tail = 4*FP1616(coords) + 12 (lens/sourceid/pad/flags) + 16 (mods)
+    //      + 4 (group) + 4 (buttons mask) + 4 (valuators mask)
+    //      + 2*FP3232 (X/Y axisvalues, 8 bytes each) = 72 bytes = 18 units.
+    write_u32(byte_order, out, 18);
 
     write_u16(byte_order, out, evtype);
     write_u16(byte_order, out, deviceid);
@@ -1739,8 +1743,8 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
-    write_u16(byte_order, out, 1); // buttons_len
-    write_u16(byte_order, out, 0); // valuators_len
+    write_u16(byte_order, out, 1); // buttons_len: 1 u32 of button mask
+    write_u16(byte_order, out, 1); // valuators_len: 1 u32 of valuator mask
     write_u16(byte_order, out, sourceid);
     write_u16(byte_order, out, 0); // pad
     write_u32(byte_order, out, 0); // flags
@@ -1758,27 +1762,51 @@ pub fn encode_xi2_device_event(
     // button is now down ⇒ set its bit on top of `state`'s pre-event
     // mask. For ButtonRelease (5): the just-released button is no
     // longer down ⇒ clear its bit from `state`'s pre-event mask.
-    // For all other event types: 0.
+    // For Motion (6) and crossings: the currently-held buttons —
+    // identical to `state`'s pre-event mask since motion doesn't
+    // change which buttons are pressed. Previously we wrote 0 for
+    // motion, which left GTK's XI2 backend believing no buttons were
+    // held during a drag while the `state` field said otherwise; the
+    // inconsistency tripped mate-panel's applet-drag state machine
+    // on release.
     //
     // `state` carries pre-event button state in bits 8..13 (Button1..5).
-    if evtype == 4 || evtype == 5 {
-        let pre_buttons: u32 = u32::from((state >> 8) & 0x1f);
+    let pre_buttons: u32 = u32::from((state >> 8) & 0x1f);
+    let post_buttons = if evtype == 4 || evtype == 5 {
         let bit: u32 = if (1..=5).contains(&detail) {
             1 << (detail - 1)
         } else {
             0
         };
-        let post_buttons = if evtype == 4 {
+        if evtype == 4 {
             pre_buttons | bit
         } else {
             pre_buttons & !bit
-        };
-        write_u32(byte_order, out, post_buttons);
+        }
     } else {
-        write_u32(byte_order, out, 0);
-    }
+        pre_buttons
+    };
+    write_u32(byte_order, out, post_buttons);
 
-    debug_assert_eq!(out.len(), 84);
+    // Valuator mask: bits 0 (X) and 1 (Y) — master pointer always
+    // reports its absolute X/Y axes on Press/Release/Motion. GDK's
+    // XI2 backend reads these into GdkEventMotion's axis array;
+    // GtkGestureDrag uses the axis history to anchor the drag start.
+    // With valuators_len=0 (the previous encoding) GDK saw no axis
+    // data, the gesture anchor stayed at its initialized (0, 0),
+    // and a single press on caja-desktop produced a rubber-band
+    // selection from (0, 0) to the click point.
+    write_u32(byte_order, out, 0x0000_0003);
+
+    // Axis values: FP3232 (signed i32 integer part + unsigned u32
+    // fraction). Master pointer is in absolute mode; X/Y carry the
+    // root-relative position.
+    write_u32(byte_order, out, i32::from(root_x) as u32);
+    write_u32(byte_order, out, 0); // X fraction
+    write_u32(byte_order, out, i32::from(root_y) as u32);
+    write_u32(byte_order, out, 0); // Y fraction
+
+    debug_assert_eq!(out.len(), 104);
 }
 
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
@@ -3042,9 +3070,20 @@ mod tests {
             2,
         );
 
-        assert_eq!(out.len(), 84);
+        // 84 bytes (pre-valuator layout) + 4 (valuator mask) +
+        // 16 (2 FP3232 X/Y axisvalues) = 104.
+        assert_eq!(out.len(), 104);
         assert_eq!(&out[0..4], &[35, 137, 7, 0]);
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 13);
+        // length-in-4-byte-units beyond the 32-byte header: (104 - 32) / 4 = 18.
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 18);
+        // Valuator mask at offset 84 (after groups + buttons mask): X+Y bits.
+        assert_eq!(u32::from_le_bytes(out[84..88].try_into().unwrap()), 0x3);
+        // X axis integer part at offset 88: passed as root_x = 1.
+        assert_eq!(u32::from_le_bytes(out[88..92].try_into().unwrap()), 1);
+        // X fraction at offset 92: always 0 (integer-valued positions).
+        assert_eq!(u32::from_le_bytes(out[92..96].try_into().unwrap()), 0);
+        // Y axis integer part at offset 96: passed as root_y = 2.
+        assert_eq!(u32::from_le_bytes(out[96..100].try_into().unwrap()), 2);
     }
 
     #[test]

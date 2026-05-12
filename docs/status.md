@@ -4433,3 +4433,288 @@ screen. Next session will confirm.
 
 Validation: `cargo test --workspace` green
 (272 + 208 + 88 + 9).
+
+## KillClient + SetCloseDownMode retention (2026-05-11)
+
+Fuji (Intel iGPU) yserver-hw.log showed caja crash-looping
+~30 times under MATE: every replacement caja read
+`_XROOTPMAP_ID`, ran `CopyArea` from the stale pixmap ID,
+and Gdk aborted on the BadDrawable reply (request_code 62).
+Each instance also issued `unsupported opcode 113` —
+KillClient — right before the CopyArea.
+
+Root cause: caja runs the standard X11 root-pixmap handoff
+protocol. A short-lived helper subprocess `CreatePixmap`s
+the background, calls `SetCloseDownMode(RetainPermanent)`,
+and exits. The main caja then `MIT-SHM::PutImage`s into
+the retained pixmap, writes the ID into `_XROOTPMAP_ID`,
+and issues `KillClient(previous-helper-pixmap-id)` so the
+previous run's retained pixmap is freed. yserver was
+acknowledging `SetCloseDownMode` (opcode 112) as a no-op
+("resources are always destroyed on disconnect") and
+opcode 113 wasn't dispatched at all — so the helper's
+pixmap died with its socket and the main caja's CopyArea
+hit BadDrawable.
+
+### First attempt — broken (shared retain buckets)
+
+Stored mode in `ServerState.close_down_modes`; at
+disconnect with Retain*, re-owned the client's non-window
+resources to a global `RETAIN_PERMANENT` / `RETAIN_TEMPORARY`
+`ClientId` bucket on `ResourceTable`. `KillClient
+(resource_id)` looked up the resource's *current* owner
+and, if it was a bucket, destroyed the *whole* bucket.
+
+That crashed under MATE: two caja helpers (clients 32
+and 33) both retained their background pixmaps into the
+same `RETAIN_PERMANENT` bucket. caja's
+`KillClient(client-32-pixmap)` (intended to free only
+the previous helper's resources) destroyed every
+retained resource in the bucket — including client 33's
+just-retained pixmap. The next CopyArea on the now-gone
+pixmap fired BadDrawable; Gdk aborted caja; the loop
+restarted.
+
+### Second attempt — zombie clients (this commit)
+
+Retained resources keep their original `owner: ClientId`
+intact. Each disconnected-but-retained client is recorded
+as a zombie in `ServerState.zombie_clients: HashMap<u32,
+u8>` (`client_id → close_mode`). Each zombie owns its
+own resources independently; `KillClient(resource)`
+resolves to the *creator* ClientId and frees only that
+zombie's resources.
+
+- `ServerState.close_down_modes: HashMap<u32, u8>` —
+  written by `handle_set_close_down_mode`, consumed at
+  disconnect.
+- `ServerState.zombie_clients: HashMap<u32, u8>` —
+  populated at disconnect for mode 1 or 2.
+- `process_disconnect` reads the mode; if non-zero,
+  inserts into `zombie_clients` and skips the
+  `remove_non_window_resources_owned_by` sweep + backend
+  frees. Connection-tied state (event masks, grabs,
+  selections, extension tables) is still torn down — a
+  zombie has no socket to receive events on.
+- `handle_kill_client` (opcode 113):
+  - `resource == 0` (AllTemporary) — iterate zombies
+    where mode == 2, call `destroy_zombie_resources(zid)`
+    for each, drop them from `zombie_clients`.
+  - `resource != 0` — `resource_owner(id)` returns the
+    original creator's ClientId. If that owner is a
+    zombie, destroy that zombie's resources and remove
+    the zombie record. If it's a live client (not self),
+    force-disconnect them (their stored close-down mode
+    still applies). If self, return
+    `RequestOutcome::Disconnect`. If `SERVER_OWNER`,
+    noop. Unknown ID → BadValue.
+- `ResourceTable::resource_owner(id)` — single lookup
+  across windows / pixmaps / gcs / fonts / cursors /
+  pictures / glyphsets returning the owner ClientId.
+- `destroy_zombie_resources` mirrors the resource-destroy
+  half of `process_disconnect`; works for any ClientId,
+  doesn't require a live `state.clients` entry.
+- Scope deliberately bounded: zombies still have their
+  windows destroyed at disconnect (caja's helper owns no
+  windows; the root pixmap is what needs to survive).
+  Save-set semantics unchanged. Server reset to free
+  RetainPermanent zombies is unimplemented — they leak
+  until process exit.
+
+Validation: `cargo test --workspace` green
+(277 + 208 + 88 + 9 — 5 new tests covering
+`resource_owner` lookup, a two-retained-clients-don't-
+share-fate regression in the resource table, the
+RetainPermanent disconnect path keeping the original
+owner, the default Destroy disconnect path, and that
+`destroy_zombie_resources` only touches the targeted
+client's resources).
+
+### Follow-up findings after live MATE run
+
+Two surprises after the live test on fuji once the dconf
+state was reset:
+
+- **The caja crash loop was actually caused by stale dconf
+  state, not absent retention.** An earlier broken run had
+  written half-config into `~/.config/dconf/user`
+  (toplevel `top` defined, `object-id-list` empty). Wiping
+  `~/.config/{mate,dconf}` makes mate-panel re-apply the
+  default layout from `/usr/share/mate-panel/layouts/
+  default.layout` and the panel comes up with all applets
+  even on master (without this commit). So the retention
+  fix wasn't strictly required to unblock the loop.
+
+- **But this commit fixes the long-standing GTK flicker.**
+  The "MATE comes up — partial render" entry noted
+  rapid, irregular flicker in GTK widgets ("flicker isn't
+  two-compositors competing, it's in our RENDER / glyph /
+  damage path itself"). With `feature/close-down-retention`
+  applied, the flicker is gone — on both AMD and Intel.
+  Most likely mechanism: short-lived GTK/theme helper
+  clients push RENDER glyphsets / cursors / theme pixmaps
+  with `SetCloseDownMode(RetainPermanent)` expecting them
+  to outlive the helper. On master those die immediately
+  with the helper socket; the long-lived clients
+  (mate-panel, marco) keep re-fetching / re-rendering
+  every frame → flicker. With retention they survive →
+  stable render. That also matches the partial-render
+  diagnosis pointing at the RENDER/glyph path.
+
+Net: branch is more valuable than initially framed. Keeps
+spec-correct `KillClient` + close-down semantics AND fixes
+a visible cross-GPU rendering bug as a side effect.
+
+## Composite work landed; three follow-ups surfaced on discrete Polaris (2026-05-12)
+
+Phase A (L1 alpha contract) + most of Phase B (L2 redirect
+end-to-end) from
+[`2026-05-11-x11-composite-implementation.md`](superpowers/plans/2026-05-11-x11-composite-implementation.md)
+landed on `mate`. On UMA hardware (bee — Renoir APU, fuji —
+Skylake iGPU) MATE renders correctly: rim gone, marco's
+XRender compositor engages, shadows + ARGB titlebars work.
+Phase C (GLX_EXT_texture_from_pixmap) confirmed not needed
+for marco — marco engages compositor via XRender once L2
+works.
+
+Investigating "panel broken on silence" (RX 580 / Polaris
+discrete) on the `mate` branch turned up three separate
+issues, none of which is a regression in the composite
+work. They were latent before; the composite work made MATE
+viable enough at full resolution to surface them.
+
+### Issue 1 — Polaris discrete + multi-output flicker
+
+Symptom: at 2 × 2560×1440 (DP-1 + HDMI-A-1) the whole screen
+tears "like a christmas tree." Single-screen on the same
+machine is clean. Other machines (UMA) are clean at any
+config they support.
+
+Root cause: scanout BO allocation. `scanout.rs:10-28`
+allocates the scanout BO as a `VK_IMAGE_TILING_LINEAR`
+VkImage exported via dma-buf with no DRM modifier
+(`add_fb2` with `FbCmd2Flags::empty()`). The comment claims
+this "works on RADV gfx8/Polaris" because RADV-Polaris
+doesn't expose `VK_EXT_image_drm_format_modifier`. It does
+work on UMA — GTT *is* device memory there. On a discrete
+card the linear export lands in GTT (system RAM, mapped to
+GPU via PCIe), so every scanout read traverses PCIe.
+~1.7 GB/s sustained per output × 2 outputs is enough to
+overrun the DCE 11.2 display engine's fetch slots; missed
+slots show stale content.
+
+`vulkaninfo.log` confirms Mesa 26.1.0-arch2.1 RADV does not
+advertise `VK_EXT_image_drm_format_modifier` on POLARIS10,
+so yserver's check is correct — the design's fallback path
+just isn't sufficient on discrete cards.
+
+The "Vulkan-first for scanout BO allocation" decision in
+`scanout.rs:18-28` was defensible at the time but rested on
+the modifier extension being universal, which it isn't
+(RADV gfx8, lavapipe, sometimes Venus). Every other Linux
+compositor (wlroots, Mutter, KWin, Xorg-modesetting+glamor)
+uses **GBM for the scanout BO** and renders into it. GBM
+picks a tiled modifier in VRAM that the display engine can
+fetch efficiently. Rendering side stays Vulkan; the BO just
+gets imported via PRIME.
+
+Fix: GBM-allocated scanout BO, imported into Vulkan as the
+render target via `VK_EXT_external_memory_dma_buf` (already
+supported on RADV-Polaris per the same vulkaninfo). Renderer
+unchanged. The composite work above it is untouched.
+
+### Issue 2 — `vkQueueWaitIdle` per paint op stalls hover
+
+Symptom: hovering GTK widgets in mate-control-center
+produces seconds of pointer lag. Documented in `2d357cc`'s
+own commit message.
+
+Root cause: the paint pipeline issues
+`vkQueueWaitIdle` after each op, draining the entire GPU
+queue and blocking the CPU thread until completion. When
+GTK runs a cascade of small RENDER ops per hover repaint,
+each op round-trips through submit → wait. On UMA the
+round-trip is microseconds; on discrete Polaris over PCIe
+it's milliseconds. N × milliseconds = seconds.
+
+`2d357cc feat(kms): DRM hardware cursor plane` was an
+attempted workaround — route cursor motion around the slow
+composite path via `drmModeMoveCursor`. The mechanic works
+in principle but the legacy ioctl interacts badly with
+amdgpu DCE on Polaris (atomic ↔ legacy plane state
+diverges), producing the cursor artefacts on silence.
+amdgpu DCN (bee) and i915 (fuji) handle the compat path
+cleanly, which is why those machines look fine.
+
+Real fix: replace per-op `vkQueueWaitIdle` with proper
+synchronisation (timeline semaphores / per-op fences only
+for genuine cross-op dependencies). Independent ops then
+pipeline. Once that lands, the HW cursor plane is no
+longer needed — revert `2d357cc` and the cursor goes back
+through composite without lag, dodging the Polaris-DCE
+legacy-ioctl issue entirely.
+
+### Issue 3 — `c468e7e` regressed redirected widget paint
+
+Symptom: after `c468e7e feat(L2): Automatic redirect with
+seeded backing + scanout-from-backing` and follow-ups,
+panel widgets render invisibly on both Polaris and Renoir
+(GPU-independent). Last commit confirmed good was
+`2b2f604`.
+
+Mechanism: c468e7e reshapes the read/write asymmetry across
+the redirect boundary in three coupled ways — accepts
+Automatic mode (plan B.1 specified Manual-only), seeds the
+backing on activation, and switches scanout to read the
+backing. The three follow-ups (`449f513` reverted,
+`488e033` reverted, `0fd3c50` kept) are each patching one
+consumer of "where does this window's content live?" The
+remaining bug is one more consumer not yet covered. Classic
+asymmetric-routing fingerprint: paint to backing, source
+read still from window mirror (or vice versa), pixels never
+make it to glass.
+
+Two options: (a) revert c468e7e and friends back to
+`2b2f604`, accept Manual-only per the original plan, lose
+seeded backing + scanout-from-backing (marco uses Manual
+anyway); (b) finish the c468e7e audit — every site that
+resolves "the window's host content" (paint, source-Picture
+sampling, scanout walk, damage routing) goes through
+`host_drawable_target` consistently. (b) is the right fix;
+(a) is the quick rollback if (b) is too much surface for
+now.
+
+### Prioritised follow-up sequence
+
+Phase C (TFP) is required long-term — yserver can't claim
+to replace Xorg without supporting Compiz / KWin-X11
+OpenGL / Mutter-X11 etc., all of which depend on TFP for
+binding redirected pixmaps as GL textures. But sequencing
+TFP before the foundation work would land it on top of a
+broken scanout pipeline and a serialised render pipeline,
+which is exactly the workload (per-frame textured-quad
+fanout with shaders) those issues hurt most.
+
+Suggested order:
+
+1. **Fix Issue 3** — finish c468e7e routing or revert.
+   Unblocks MATE on silence (and on bee).
+2. **Fix Issue 1** — GBM-allocated scanout BO. Unbreaks
+   dual-screen Polaris; matches every other Linux
+   compositor's scanout-allocation pattern; necessary
+   foundation for TFP-driven workloads.
+3. **Fix Issue 2** — drop per-op `vkQueueWaitIdle`.
+   Unblocks GTK hover responsiveness; lets the GPU
+   pipeline behave like a pipeline; makes the per-frame
+   draw fanout that Compiz-class compositors do
+   sustainable. Revert `2d357cc` after.
+4. **Phase C — TFP**. `GLX_EXT_texture_from_pixmap`
+   extension string + `glXBindTexImageEXT` /
+   `glXReleaseTexImageEXT` (server-side mostly no-ops —
+   DRI3 fd export already works). Plan tasks C.1–C.4 in
+   the existing composite plan. 2–3 days on a sound
+   foundation.
+
+The composite plan/spec themselves are sound and don't need
+revision — Phase C just changes status from "withdrawn for
+marco" to "deferred until 1–3 land."

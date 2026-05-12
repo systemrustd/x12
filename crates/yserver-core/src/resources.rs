@@ -215,6 +215,7 @@ impl ResourceTable {
                 properties: HashMap::new(),
                 host_xid: None,
                 composite_named_pixmaps: Vec::new(),
+                redirected_backing: None,
             },
         );
 
@@ -259,6 +260,7 @@ impl ResourceTable {
                 properties: HashMap::new(),
                 host_xid: None,
                 composite_named_pixmaps: Vec::new(),
+                redirected_backing: None,
             },
         );
 
@@ -452,6 +454,7 @@ impl ResourceTable {
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
+            redirected_backing: None,
         };
 
         self.windows
@@ -1249,6 +1252,29 @@ impl ResourceTable {
         // drops the draw silently, same as before (drawing on InputOnly
         // is undefined / spec-error territory).
         if let Some(window) = self.windows.get(&id.0) {
+            // L2 plan B.7 — if the window is redirected, paint
+            // routes to the off-screen backing instead of the
+            // window's own host XID. The `Window` variant is still
+            // emitted so the caller's damage / scissor logic stays
+            // window-keyed via `nested`; only the host-side paint
+            // XID switches.
+            //
+            // The variant carries the backing's pixmap raw inside
+            // a `WindowHandle` newtype — a typed lie, since the
+            // backend treats both pixmap and window XIDs as raw
+            // `u32` keys against `self.pixmaps` / `self.windows`
+            // (it consults both maps). No production caller
+            // pattern-matches on `Window { host_xid: WindowHandle, .. }`
+            // and routes it back into a window-only API.
+            if let Some(backing) = window.redirected_backing.as_ref() {
+                let host_xid =
+                    crate::backend::WindowHandle::from_raw_panicking(backing.host_pixmap.as_raw());
+                return Some(HostDrawableTarget::Window {
+                    nested: id,
+                    host_xid,
+                    depth: backing.depth,
+                });
+            }
             let host_xid = window.host_xid?;
             return Some(HostDrawableTarget::Window {
                 nested: id,
@@ -1942,6 +1968,36 @@ impl ResourceTable {
         }
     }
 
+    /// Look up the current owner of `id` across every core resource
+    /// table. Returns `None` if the ID doesn't name any known resource.
+    /// Server-static resources (root window, overlay, default colormap /
+    /// visuals) carry `SERVER_OWNER`.
+    #[must_use]
+    pub fn resource_owner(&self, id: ResourceId) -> Option<ClientId> {
+        if let Some(w) = self.windows.get(&id.0) {
+            return Some(w.owner);
+        }
+        if let Some(p) = self.pixmaps.get(&id.0) {
+            return Some(p.owner);
+        }
+        if let Some(g) = self.gcs.get(&id.0) {
+            return Some(g.owner);
+        }
+        if let Some(f) = self.fonts.get(&id.0) {
+            return Some(f.owner);
+        }
+        if let Some(c) = self.cursors.get(&id.0) {
+            return Some(c.owner);
+        }
+        if let Some(p) = self.pictures.get(&id.0) {
+            return Some(p.client);
+        }
+        if let Some(g) = self.glyphsets.get(&id.0) {
+            return Some(g.client);
+        }
+        None
+    }
+
     #[must_use]
     pub fn any_resource_exists(&self, id: ResourceId) -> bool {
         self.windows.contains_key(&id.0)
@@ -2123,6 +2179,28 @@ pub struct Window {
     /// Per-window list of `Composite::NameWindowPixmap` aliases. All are
     /// invalidated together on resize per the COMPOSITE spec.
     pub composite_named_pixmaps: Vec<NamedCompositePixmap>,
+    /// Off-screen backing image for redirected windows (L2 plan
+    /// B.2). `None` for unredirected windows; populated by
+    /// `RedirectWindow` / `RedirectSubwindows` activation (B.6a)
+    /// and cleared by Unredirect (B.6c) or DestroyWindow (B.15).
+    /// On resize under redirect the backing is *rotated* to a
+    /// new image (B.6d) so existing `NameWindowPixmap` aliases
+    /// stay valid against the pre-resize content.
+    pub redirected_backing: Option<RedirectedBacking>,
+}
+
+/// Off-screen mirror backing a redirected window. `host_pixmap` is
+/// the backend pixmap handle (the X11 resource layer treats it as
+/// a synthetic pixmap drawable for paint-time routing). Width /
+/// height / depth snapshot the window's geometry at the moment the
+/// backing was allocated — used so resize can decide whether to
+/// rotate the backing.
+#[derive(Clone, Copy, Debug)]
+pub struct RedirectedBacking {
+    pub host_pixmap: crate::backend::PixmapHandle,
+    pub width: u16,
+    pub height: u16,
+    pub depth: u8,
 }
 
 impl Window {
@@ -2158,6 +2236,7 @@ impl Window {
             properties: HashMap::new(),
             host_xid: None,
             composite_named_pixmaps: Vec::new(),
+            redirected_backing: None,
         }
     }
 }
@@ -2411,6 +2490,12 @@ mod tests {
     }
 
     #[test]
+    fn fresh_window_has_no_redirected_backing() {
+        let placeholder = Window::placeholder(ResourceId(0x100_0042));
+        assert!(placeholder.redirected_backing.is_none());
+    }
+
+    #[test]
     fn reference_glyphset_alias_frees_host_only_after_last_alias() {
         let mut table = ResourceTable::new();
         table.create_glyphset(
@@ -2577,6 +2662,39 @@ mod tests {
             table.window(ROOT_WINDOW).unwrap().map_state,
             MapState::Viewable
         );
+    }
+
+    #[test]
+    fn host_drawable_target_redirected_window_returns_backing_xid() {
+        // L2 plan B.7: a window with `redirected_backing` set routes
+        // paint to the backing's host XID, carrying the backing's
+        // depth. The `nested` ResourceId stays the window itself so
+        // damage and event delivery keep the public XID.
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0x42);
+        let backing = crate::backend::PixmapHandle::from_raw_for_test(0x9999);
+        table
+            .windows
+            .get_mut(&0x0010_0002)
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: backing,
+            width: 100,
+            height: 50,
+            depth: 24,
+        });
+        match table.host_drawable_target(ResourceId(0x0010_0002)).unwrap() {
+            HostDrawableTarget::Window {
+                nested,
+                host_xid,
+                depth,
+            } => {
+                assert_eq!(nested, ResourceId(0x0010_0002));
+                assert_eq!(host_xid.as_raw(), 0x9999);
+                assert_eq!(depth, 24);
+            }
+            _ => panic!("expected Window variant routing to backing"),
+        }
     }
 
     #[test]
@@ -3829,5 +3947,67 @@ mod tests {
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         let f = state.font.expect("font handle");
         assert_eq!(f.as_raw(), 0x4242);
+    }
+
+    #[test]
+    fn resource_owner_returns_owner_across_table_kinds() {
+        let mut t = ResourceTable::new();
+        assert_eq!(t.resource_owner(ROOT_WINDOW), Some(SERVER_OWNER));
+        t.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0700_0010),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert_eq!(t.resource_owner(ResourceId(0x0700_0010)), Some(ClientId(7)));
+        assert_eq!(t.resource_owner(ResourceId(0xdead_beef)), None);
+    }
+
+    #[test]
+    fn resource_owner_distinguishes_separate_clients() {
+        // Regression test for the "shared retain bucket" bug: with two
+        // retained clients (32 and 33) both holding a pixmap, killing
+        // one of them by resource ID must not affect the other.
+        let mut t = ResourceTable::new();
+        t.create_pixmap(
+            ClientId(32),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0200_0001),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        t.create_pixmap(
+            ClientId(33),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0210_0001),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert_eq!(
+            t.resource_owner(ResourceId(0x0200_0001)),
+            Some(ClientId(32))
+        );
+        assert_eq!(
+            t.resource_owner(ResourceId(0x0210_0001)),
+            Some(ClientId(33))
+        );
+        // Removing one client's resources must leave the other's
+        // intact.
+        let _ = t.remove_non_window_resources_owned_by(ClientId(32));
+        assert!(t.resource_owner(ResourceId(0x0200_0001)).is_none());
+        assert_eq!(
+            t.resource_owner(ResourceId(0x0210_0001)),
+            Some(ClientId(33))
+        );
     }
 }

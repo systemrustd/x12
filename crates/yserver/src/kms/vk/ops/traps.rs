@@ -171,20 +171,31 @@ pub fn rasterize_trapezoids(
         let py1 = (bot.ceil() as i32).min(bbox_y + height as i32);
         for py in py0..py1 {
             let row = (py - bbox_y) as usize;
-            for px in bbox_x..bbox_x + width as i32 {
-                // Quick clip: skip pixels that can't possibly intersect.
-                let left_px = left.x_at(py as f32 + 0.5);
-                let right_px = right.x_at(py as f32 + 0.5);
-                let pxf = px as f32;
-                if (pxf + 1.0 <= left_px.min(right_px).floor()
-                    || pxf >= left_px.max(right_px).ceil())
-                    && (pxf + 1.0 <= top || pxf >= bot)
-                {
-                    continue;
-                }
+            // Per-row x-range derivation. Trapezoid sides are line
+            // segments, so x is monotonic in y along each side; the
+            // row's true x extent is bounded by sampling both edges
+            // at the visible portion of the row. Clamping `y_top` /
+            // `y_bot` to `[top, bot]` avoids extrapolating the side
+            // lines outside the trapezoid (which would falsely widen
+            // the range for the partial first/last row).
+            let pyf = py as f32;
+            let y_top = pyf.max(top);
+            let y_bot = (pyf + 1.0).min(bot);
+            let lx_top = left.x_at(y_top);
+            let lx_bot = left.x_at(y_bot);
+            let rx_top = right.x_at(y_top);
+            let rx_bot = right.x_at(y_bot);
+            let row_min = lx_top.min(lx_bot).min(rx_top).min(rx_bot);
+            let row_max = lx_top.max(lx_bot).max(rx_top).max(rx_bot);
+            let row_x0 = (row_min.floor() as i32).max(bbox_x);
+            let row_x1 = (row_max.ceil() as i32).min(bbox_x + width as i32);
+            if row_x1 <= row_x0 {
+                continue;
+            }
+            for px in row_x0..row_x1 {
                 let mut hits = 0_i32;
                 for sy in 0..SUBSAMPLES_PER_AXIS {
-                    let y = py as f32 + (sy as f32 + 0.5) / SUBSAMPLES_PER_AXIS as f32;
+                    let y = pyf + (sy as f32 + 0.5) / SUBSAMPLES_PER_AXIS as f32;
                     if y < top || y >= bot {
                         continue;
                     }
@@ -314,6 +325,91 @@ mod tests {
         }
         // Pixel (0,0) — outside — should be 0.
         assert_eq!(mask[0], 0);
+    }
+
+    /// Standalone perf probe for `rasterize_trapezoids`. Ignored by
+    /// default — run explicitly with `--release` to time the hot
+    /// path without the rest of the workspace:
+    ///
+    ///   cargo test -p yserver --release --lib \
+    ///       kms::vk::ops::traps::tests::bench -- --ignored --nocapture
+    ///
+    /// Simulates a single GTK-button hover frame: ~30 thin trapezoids
+    /// inside a 200×40 bbox (rounded-corner AA + emboss edges). Prints
+    /// total time and per-call cost so we can compare against the
+    /// pre-fix baseline if the regression ever comes back.
+    #[test]
+    #[ignore]
+    fn bench_button_hover_workload() {
+        use std::time::Instant;
+
+        // Mimic GTK's rounded-corner AA: a stack of 1-pixel-tall
+        // trapezoids whose left/right edges trace a quarter-circle.
+        // Real GTK frames send dozens of these per hover update.
+        let mut traps = Vec::new();
+        for i in 0..32 {
+            let y = i as f32 * 1.25;
+            let r = 8.0_f32 - (i as f32 * 0.25);
+            traps.push(Trapezoid {
+                top: fx(y),
+                bottom: fx(y + 1.25),
+                left_p1: (fx(8.0 - r), fx(y)),
+                left_p2: (fx(8.0 - r * 0.9), fx(y + 1.25)),
+                right_p1: (fx(192.0 + r), fx(y)),
+                right_p2: (fx(192.0 + r * 0.9), fx(y + 1.25)),
+            });
+        }
+
+        const ITERS: u32 = 1000;
+        // Warmup.
+        for _ in 0..10 {
+            std::hint::black_box(rasterize_trapezoids(&traps, 0, 0, 200, 40));
+        }
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(rasterize_trapezoids(&traps, 0, 0, 200, 40));
+        }
+        let dt = t0.elapsed();
+        let per_call_us = dt.as_secs_f64() * 1e6 / f64::from(ITERS);
+        eprintln!(
+            "rasterize_trapezoids: {ITERS} calls in {:?}  -> {per_call_us:.2} µs/call \
+             ({} trapezoids × 200×40 bbox)",
+            dt,
+            traps.len()
+        );
+    }
+
+    #[test]
+    fn thin_slanted_trapezoid_in_wide_bbox_only_paints_slant() {
+        // 2-pixel-wide parallelogram going diagonally from (10,0) at
+        // the top to (14,8) at the bottom, inside a 64×8 bbox. Pixels
+        // outside the slant must stay zero — historically a row-wide
+        // inner loop with a broken cheap-clip burned 4×4 samples on
+        // every bbox pixel, hammering CPU on GTK hover effects.
+        let trap = Trapezoid {
+            top: fx(0.0),
+            bottom: fx(8.0),
+            left_p1: (fx(10.0), fx(0.0)),
+            left_p2: (fx(14.0), fx(8.0)),
+            right_p1: (fx(12.0), fx(0.0)),
+            right_p2: (fx(16.0), fx(8.0)),
+        };
+        let mask = rasterize_trapezoids(&[trap], 0, 0, 64, 8);
+        // Pixel near the bottom-right of the slant must have ink;
+        // pixels at the far left and far right of the bbox must be
+        // untouched.
+        let row3 = 3 * 64;
+        assert!(
+            mask[row3 + 12] > 0,
+            "expected ink near the slant midpoint at (12,3)"
+        );
+        assert_eq!(mask[row3 + 0], 0, "left edge of bbox should be empty");
+        assert_eq!(mask[row3 + 63], 0, "right edge of bbox should be empty");
+        // Bottom row: slant has moved right, columns 0..10 should be empty.
+        let row7 = 7 * 64;
+        for px in 0..10 {
+            assert_eq!(mask[row7 + px], 0, "row 7 col {px} should be empty");
+        }
     }
 
     #[test]

@@ -83,10 +83,13 @@ pub struct CompositeDraw {
     /// Source UV size in normalised texture coords (0..1). `[1, 1]`
     /// for the whole-texture case.
     pub src_size: [f32; 2],
-    /// `true` to blend with src-over using the sampled alpha
-    /// (cursor / alpha-pixmaps); `false` to force opaque (windows /
-    /// X8R8G8B8 mirrors with unspecified alpha pad).
-    pub use_src_alpha: bool,
+    /// `true` selects the pass-through composite pipeline (the
+    /// mirror's sampled α reaches the scanout's blend stage). Used
+    /// by cursor + window-mirror draws post-L1 task A.16. `false`
+    /// selects the force-opaque variant — the bg-pixmap root draw
+    /// stays here because the root mirror is always fully painted
+    /// and forcing α=1.0 sidesteps any α invariant on it.
+    pub alpha_passthrough: bool,
 }
 
 /// One frame's worth of composite work for a single output. Built
@@ -280,13 +283,20 @@ fn record_composite_command_buffer(
         device.cmd_set_viewport(cb, 0, &viewport);
         device.cmd_set_scissor(cb, 0, &[render_area]);
 
-        // 4. Bind pipeline.
-        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-
-        // 5. Per-draw: bind descriptor, push consts, draw 4 verts
-        //    (TRIANGLE_STRIP quad).
+        // 4. Per-draw: pick the alpha-mode pipeline variant
+        //    (force-opaque vs pass-through), bind descriptor, push
+        //    consts, draw 4 verts (TRIANGLE_STRIP quad). Pipeline
+        //    rebinding between adjacent draws of the same variant is
+        //    cheap on a same-handle redundant bind; if profiling
+        //    shows it matters we can group draws by alpha mode.
         let viewport_size = [bo.width as f32, bo.height as f32];
+        let mut last_pipeline: Option<vk::Pipeline> = None;
         for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
+            let pl = pipeline.pipeline_for(draw.alpha_passthrough);
+            if last_pipeline != Some(pl) {
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
+                last_pipeline = Some(pl);
+            }
             let sets = [descriptors[i]];
             device.cmd_bind_descriptor_sets(
                 cb,
@@ -302,8 +312,6 @@ fn record_composite_command_buffer(
                 viewport: viewport_size,
                 src_origin: draw.src_origin,
                 src_size: draw.src_size,
-                use_src_alpha: if draw.use_src_alpha { 1.0 } else { 0.0 },
-                _pad: 0.0,
             };
             device.cmd_push_constants(
                 cb,
