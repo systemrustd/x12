@@ -6352,10 +6352,22 @@ impl KmsBackend {
             return Ok(());
         }
 
-        // Open a paint batch for this composite cycle. The frame_id is
-        // shared across all outputs composited in this cycle.
-        let frame_id = self.scheduler.open_batch();
-
+        // No Vulkan / no ops pool → composite path is unavailable.
+        let vk_arc = match self.vk.as_ref() {
+            Some(v) => v.clone(),
+            None => {
+                log::debug!("composite cycle: no Vulkan; skipping");
+                return Ok(());
+            }
+        };
+        let pool_handle = match self.ops_command_pool.as_ref() {
+            Some(p) => p.handle(),
+            None => {
+                log::debug!("composite cycle: no ops pool; skipping");
+                return Ok(());
+            }
+        };
+        let frame_id = self.scheduler.open_batch(vk_arc, pool_handle);
         log::debug!(
             "composite cycle frame_id={} in_flight_len={}",
             frame_id,
@@ -6378,6 +6390,32 @@ impl KmsBackend {
                     .collect()
             })
             .collect();
+
+        // Candidate outputs (passed the damage gate). Pass to
+        // close_and_submit as `dirty_outputs` for audit logging
+        // only — the actual phase-4 holder list is built by
+        // `OutputFrame::new` AFTER `try_vulkan_composite_flip`
+        // succeeds (which can still skip a candidate via the
+        // flip-pending / BO-availability gates further down).
+        let dirty_outputs: Vec<usize> = (0..self.outputs.len())
+            .filter(|&i| self.outputs[i].damage.needs_composite())
+            .collect();
+
+        // Flush paint BEFORE the per-output composite loop. Until
+        // 3B starts migrating recorders, the batch is Idle on every
+        // cycle and this is a cheap state transition.
+        if let Err(e) = self.scheduler.close_and_submit(dirty_outputs) {
+            log::warn!("composite cycle: paint batch submit failed: {e}");
+        }
+
+        // Audit assertion (debug-only): no batch may be open during
+        // the per-output composite loop. Recorders that would
+        // auto-open one here would race with composite (the F2
+        // finding from codex's review).
+        debug_assert!(
+            self.scheduler.current_batch_state().is_none(),
+            "paint batch leaked into composite loop"
+        );
 
         #[allow(clippy::needless_range_loop)] // index needed to split &mut/& borrows on self
         for layout_idx in 0..self.outputs.len() {
@@ -6492,9 +6530,6 @@ impl KmsBackend {
                     scanout_retired: false,
                 });
         }
-
-        let _batch = self.scheduler.close_batch();
-        // Phase 1: discard. Phase 2 submits its CB here.
 
         Ok(())
     }

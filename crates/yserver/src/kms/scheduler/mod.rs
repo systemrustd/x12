@@ -4,22 +4,24 @@
 //! Phase 1 lands the types with minimal behavior; recorders and the
 //! hot-path `vkQueueWaitIdle` calls are unchanged.
 
+use std::sync::Arc;
+
+use ash::vk;
+
+use crate::kms::vk::device::VkContext;
+
+use self::{
+    in_flight::InFlight,
+    paint_batch::{BatchError, BatchState, PaintBatch},
+};
+
+// `batch_upload_arena` is added in T2; `batch_descriptor_arena` in T3.
 pub mod composite_pool_ring;
 pub mod damage;
 pub mod in_flight;
 pub mod output_frame;
 pub mod paint_batch;
 
-use self::{in_flight::InFlight, paint_batch::PaintBatch};
-
-/// Server-wide scheduling state. Owned as a single field on
-/// `KmsBackend`. Per-output damage lives on `OutputLayout`, not
-/// here — `OutputLayout` is the natural home for per-output state.
-///
-/// Phase 1: a shell wrapping the in-flight queue and the
-/// current paint batch. The "only layer allowed to submit on the
-/// hot path" invariant from the HLD is not yet enforced — phase 1
-/// recorders still call `run_one_shot_op` directly.
 #[derive(Debug, Default)]
 pub struct RenderScheduler {
     pub in_flight: InFlight,
@@ -27,26 +29,61 @@ pub struct RenderScheduler {
 }
 
 impl RenderScheduler {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Open a paint batch for this composite cycle if one isn't
-    /// already open. Returns the batch's `frame_id`. Phase 1:
-    /// called from `composite_and_flip` at the start of each cycle.
-    pub fn open_batch(&mut self) -> u64 {
+    /// Open a paint batch if one isn't already open. Returns the
+    /// batch's `frame_id`. Phase 3 takes `vk` + `pool` so the batch
+    /// can lazy-allocate a primary CB on first append.
+    pub fn open_batch(&mut self, vk: Arc<VkContext>, pool: vk::CommandPool) -> u64 {
         if let Some(batch) = self.current_paint_batch.as_ref() {
             return batch.frame_id;
         }
         let frame_id = self.in_flight.allocate_frame_id();
-        self.current_paint_batch = Some(PaintBatch::new(frame_id));
+        self.current_paint_batch = Some(PaintBatch::new(frame_id, vk, pool));
         frame_id
     }
 
-    /// Close the current batch. Phase 1: nothing to flush; the
-    /// batch is just discarded. Phase 2+ submits its CB here.
-    pub fn close_batch(&mut self) -> Option<PaintBatch> {
-        self.current_paint_batch.take()
+    /// Close + submit the current batch. Returns `Ok(())` if no
+    /// batch was open, if it was Idle, or if it was already
+    /// Poisoned (a recorder error this cycle — paint is best-effort
+    /// at the cycle-close granularity). Phase 3 invariant:
+    /// composite samples mirrors this batch wrote, so the
+    /// `vkQueueWaitIdle` inside `submit_and_wait` is what makes
+    /// the next-step composite safe.
+    ///
+    /// **Returning `Err(BatchError::Vk)` is fatal to the KMS
+    /// renderer.** Per `PaintBatch::submit_and_wait`'s path-2
+    /// semantics, a Vk error here means a CB and its resources
+    /// have been abandoned. Callers MUST stop normal rendering
+    /// and enter backend teardown; do not continue calling
+    /// `record_paint_op` / `flush_if_needed`.
+    ///
+    /// `dirty_outputs` is populated by the caller before this
+    /// returns — `composite_and_flip` knows which outputs passed
+    /// the damage gate (candidates only; see `PaintBatch::dirty_outputs`
+    /// field doc).
+    #[allow(clippy::missing_errors_doc)]
+    pub fn close_and_submit(&mut self, dirty_outputs: Vec<usize>) -> Result<(), BatchError> {
+        let Some(mut batch) = self.current_paint_batch.take() else {
+            return Ok(());
+        };
+        batch.dirty_outputs = dirty_outputs;
+        let result = batch.submit_and_wait();
+        drop(batch); // releases via retire/poison/leak per state
+        match result {
+            Ok(()) | Err(BatchError::Poisoned) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// State of the current batch, or `None` if no batch is open.
+    /// Used by audit assertions in `composite_and_flip`.
+    #[must_use]
+    pub fn current_batch_state(&self) -> Option<BatchState> {
+        self.current_paint_batch.as_ref().map(PaintBatch::state)
     }
 }
 
@@ -55,28 +92,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_batch_allocates_monotonic_frame_ids() {
-        let mut s = RenderScheduler::new();
-        let a = s.open_batch();
-        s.close_batch();
-        let b = s.open_batch();
-        assert!(b > a);
-    }
-
-    #[test]
-    fn open_batch_is_idempotent_within_a_cycle() {
-        let mut s = RenderScheduler::new();
-        let a = s.open_batch();
-        let b = s.open_batch();
-        assert_eq!(a, b, "re-opening without closing returns the same frame_id");
-    }
-
-    #[test]
-    fn close_batch_drops_current() {
-        let mut s = RenderScheduler::new();
-        s.open_batch();
-        assert!(s.current_paint_batch.is_some());
-        s.close_batch();
+    fn fresh_scheduler_has_no_batch_open() {
+        let s = RenderScheduler::new();
         assert!(s.current_paint_batch.is_none());
+    }
+
+    #[test]
+    fn close_and_submit_with_no_batch_is_noop() {
+        let mut s = RenderScheduler::new();
+        assert!(s.close_and_submit(Vec::new()).is_ok());
     }
 }
