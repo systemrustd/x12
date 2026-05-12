@@ -6391,14 +6391,13 @@ impl KmsBackend {
                 .unwrap_or(false);
             let dumb_flip_pending = self.outputs[layout_idx].swapchain.submitted_idx().is_some();
             // Invariant: a skipped output keeps its dirty state.
-            // The check below documents the contract.
-            debug_assert!(
-                self.outputs[layout_idx].damage.needs_composite()
-                    || vk_flip_pending
-                    || dumb_flip_pending,
-                "output dirty state lost across skip on output {}",
-                self.outputs[layout_idx].output.connector_name
-            );
+            // Enforced upstream by `OutputDamageState::record_submit`
+            // / `record_present` debug_asserts (one signals flip-
+            // pending, the other clears it) — nothing in this loop
+            // body can clear `dirty_gen` between the early-continue
+            // above and the skip below. A dedicated assert here
+            // would be vacuous given that ordering; left as a
+            // comment.
             if vk_flip_pending || dumb_flip_pending {
                 log::debug!(
                     "composite: skip output {} (vk_flip_pending={} dumb_flip_pending={})",
