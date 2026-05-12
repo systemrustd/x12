@@ -11,6 +11,32 @@
 //!
 //! See `docs/superpowers/specs/2026-05-12-rendering-rearchitecture-hld.md`
 //! for the destination shape this implements.
+//!
+//! ## Layout-state policy
+//!
+//! Phase 3A: poison-and-discard. A failed `append` poisons the
+//! batch; the CB is freed without submit; `BatchResource`s
+//! release. Phase 3A relies on the recorder-side late-mutation
+//! invariant — every `set_current_layout` follows the recorder's
+//! last fallible operation. If that invariant holds for a
+//! recorder, CPU/GPU layout state stays consistent even when the
+//! batch is poisoned (no GPU work ran ⇒ GPU state unchanged; CPU
+//! mutation never happened ⇒ CPU state unchanged).
+//!
+//! Audited 2026-05-13 (load-bearing for 3B):
+//!   - fill::record_fill_rectangles: late ✓
+//!   - fill::record_logic_fill: late ✓
+//!   - copy::record_copy_area_distinct: late ✓
+//!   - copy::record_copy_area_same: late ✓
+//!
+//! Deferred to their respective tranches (3C/3D BLOCK on these
+//! audits passing — or on implementing the touched-drawable
+//! invalidation hook described in `paint_batch.rs`'s module doc):
+//!   - copy::record_copy_area_same_overlap (3D)
+//!   - image::record_put_image (3C)
+//!   - render::record_render_composite (3D)
+//!   - text::record_text_run (3D)
+//!   - traps::record_* (3D)
 
 // The public methods on PaintBatch have extensive inline documentation that
 // covers their error and panic behaviour; formal `# Errors` / `# Panics`
@@ -475,5 +501,20 @@ mod tests {
         let e = BatchError::InvalidState(BatchState::Submitted);
         let s = format!("{e}");
         assert!(s.contains("Submitted"), "got: {s}");
+    }
+
+    #[test]
+    #[ignore = "requires VkContext mock harness (not available in unit tests); \
+                T5 hardware smoke covers this via flush_if_needed"]
+    fn append_failure_poisons_batch() {
+        // (pseudo-Vulkan harness; if the test infra can't construct
+        // a VkContext, this becomes a hardware smoke step in T5.)
+        //
+        // 1. Open a batch.
+        // 2. Call append with a closure that returns
+        //    vk::Result::ERROR_DEVICE_LOST.
+        // 3. Assert batch.state() == BatchState::Poisoned.
+        // 4. Assert a second append on the same batch returns
+        //    BatchError::Poisoned.
     }
 }
