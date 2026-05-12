@@ -53,7 +53,14 @@ impl OutputDamageState {
 
     /// Composite was recorded + submitted for this output. The
     /// dirty generation captured is `dirty_gen` at this moment.
+    /// Bumps arriving after this call advance `dirty_gen` past
+    /// `last_submitted_gen`, so they will re-arm `needs_composite`
+    /// after the flip retires.
     pub fn record_submit(&mut self) {
+        debug_assert!(
+            !self.flip_pending,
+            "record_submit called while flip already pending",
+        );
         self.last_submitted_gen = self.dirty_gen;
         self.flip_pending = true;
     }
@@ -63,6 +70,10 @@ impl OutputDamageState {
     /// any bumps that arrived between submit and present remain in
     /// `dirty_gen` and re-arm `needs_composite`.
     pub fn record_present(&mut self) {
+        debug_assert!(
+            self.flip_pending,
+            "record_present called without prior record_submit",
+        );
         self.last_presented_gen = self.last_submitted_gen;
         self.flip_pending = false;
     }
@@ -142,5 +153,15 @@ mod tests {
         s.record_submit();
         s.record_present();
         assert!(!s.needs_composite());
+    }
+
+    #[test]
+    fn multiple_bumps_without_submit_still_need_composite() {
+        let mut s = OutputDamageState::new();
+        s.bump_dirty();
+        s.bump_dirty();
+        s.bump_dirty();
+        assert!(s.needs_composite());
+        assert_eq!(s.dirty_gen(), 4); // initial 1 + three bumps
     }
 }
