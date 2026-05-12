@@ -6277,8 +6277,16 @@ impl KmsBackend {
 
             // Pass 2: write back.
             let f = self.scheduler.in_flight.get_mut(i).unwrap();
+            let prev_gpu = f.gpu_retired;
             f.gpu_retired = new_gpu;
             f.scanout_retired = new_scanout;
+            if !prev_gpu && new_gpu && composite_fence != ash::vk::Fence::null() {
+                log::trace!(
+                    "in_flight: gpu_retired (fence) frame_id={} output_idx={}",
+                    f.frame_id,
+                    f.output_idx,
+                );
+            }
         }
 
         let drained = self.scheduler.in_flight.drain_retired();
@@ -6315,6 +6323,12 @@ impl KmsBackend {
         // Open a paint batch for this composite cycle. The frame_id is
         // shared across all outputs composited in this cycle.
         let frame_id = self.scheduler.open_batch();
+
+        log::debug!(
+            "composite cycle frame_id={} in_flight_len={}",
+            frame_id,
+            self.scheduler.in_flight.len()
+        );
 
         let top_levels: Vec<u32> = self.top_level_order.clone();
 
@@ -6376,6 +6390,15 @@ impl KmsBackend {
                 })
                 .unwrap_or(false);
             let dumb_flip_pending = self.outputs[layout_idx].swapchain.submitted_idx().is_some();
+            // Invariant: a skipped output keeps its dirty state.
+            // The check below documents the contract.
+            debug_assert!(
+                self.outputs[layout_idx].damage.needs_composite()
+                    || vk_flip_pending
+                    || dumb_flip_pending,
+                "output dirty state lost across skip on output {}",
+                self.outputs[layout_idx].output.connector_name
+            );
             if vk_flip_pending || dumb_flip_pending {
                 log::debug!(
                     "composite: skip output {} (vk_flip_pending={} dumb_flip_pending={})",

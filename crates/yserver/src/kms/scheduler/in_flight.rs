@@ -64,6 +64,20 @@ impl InFlight {
     }
 
     pub fn push(&mut self, frame: InFlightFrame) {
+        // Submission order is monotonic per output. A new frame
+        // for the same output must have a higher frame_id than
+        // the youngest in-flight frame for that output. Out-of-
+        // order pushes would break drain ordering and resource
+        // lifetime reasoning.
+        debug_assert!(
+            self.frames
+                .iter()
+                .rev()
+                .find(|f| f.output_idx == frame.output_idx)
+                .is_none_or(|prev| prev.frame_id < frame.frame_id),
+            "InFlight::push: out-of-order frame_id for output {}",
+            frame.output_idx,
+        );
         self.frames.push_back(frame);
     }
 
