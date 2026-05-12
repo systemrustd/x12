@@ -75,6 +75,10 @@ impl InFlight {
         self.frames.iter_mut()
     }
 
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut InFlightFrame> {
+        self.frames.get_mut(index)
+    }
+
     /// Drain the prefix of fully-retired frames. Returns how many
     /// were drained. Stops at the first non-retired frame —
     /// out-of-order retirement is allowed in the bools but not in
@@ -173,5 +177,53 @@ mod tests {
             "must not drain frame 2 while frame 1 is still in-flight"
         );
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn is_empty_reflects_push_and_drain() {
+        let mut q = InFlight::default();
+        assert!(q.is_empty());
+        q.push(mk_frame(1, 0));
+        assert!(!q.is_empty());
+        let mut iter = q.frames_mut();
+        let f = iter.next().unwrap();
+        f.gpu_retired = true;
+        f.scanout_retired = true;
+        drop(iter);
+        q.drain_retired();
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn drain_retired_on_empty_queue_returns_zero() {
+        let mut q = InFlight::default();
+        assert_eq!(q.drain_retired(), 0);
+    }
+
+    #[test]
+    fn drain_retired_blocks_on_scanout_only_retirement() {
+        // Symmetric to drain_retired_removes_only_fully_retired_frames
+        // but exercising the scanout-only side. Both bits must be set.
+        let mut q = InFlight::default();
+        q.push(mk_frame(1, 0));
+        let mut iter = q.frames_mut();
+        let f = iter.next().unwrap();
+        f.scanout_retired = true;
+        drop(iter);
+        assert_eq!(
+            q.drain_retired(),
+            0,
+            "scanout-only retirement is not enough"
+        );
+    }
+
+    #[test]
+    fn get_mut_returns_frame_at_index() {
+        let mut q = InFlight::default();
+        q.push(mk_frame(1, 0));
+        q.push(mk_frame(2, 1));
+        assert_eq!(q.get_mut(0).unwrap().frame_id, 1);
+        assert_eq!(q.get_mut(1).unwrap().frame_id, 2);
+        assert!(q.get_mut(2).is_none());
     }
 }
