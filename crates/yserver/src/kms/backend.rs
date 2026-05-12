@@ -603,7 +603,6 @@ pub(crate) struct OutputLayout {
     /// first composite for this output (requires `vk` + the
     /// compositor pipeline's `descriptor_set_layout`). `None` on
     /// the `for_tests` path (no Vulkan).
-    #[allow(dead_code)]
     pub composite_pools: Option<crate::kms::scheduler::composite_pool_ring::CompositePoolRing>,
 }
 
@@ -6294,6 +6293,31 @@ impl KmsBackend {
                     f.output_frame.frame_id,
                     f.output_frame.output_idx,
                 );
+            }
+        }
+
+        // Release pool slots for frames that are about to be drained.
+        // We must do this BEFORE drain_retired() because drain pops
+        // the frames and we'd lose access to their pool_slot info.
+        let to_release: Vec<(usize, usize)> = self
+            .scheduler
+            .in_flight
+            .frames()
+            .take_while(|f| f.fully_retired())
+            .map(|f| {
+                (
+                    f.output_frame.output_idx,
+                    f.output_frame.composite_pool_slot,
+                )
+            })
+            .collect();
+        for (output_idx, pool_slot) in to_release {
+            if let Some(ring) = self
+                .outputs
+                .get_mut(output_idx)
+                .and_then(|o| o.composite_pools.as_mut())
+            {
+                ring.release(pool_slot);
             }
         }
 
