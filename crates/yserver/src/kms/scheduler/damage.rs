@@ -70,10 +70,15 @@ impl OutputDamageState {
     /// any bumps that arrived between submit and present remain in
     /// `dirty_gen` and re-arm `needs_composite`.
     pub fn record_present(&mut self) {
-        debug_assert!(
-            self.flip_pending,
-            "record_present called without prior record_submit",
-        );
+        if !self.flip_pending {
+            // A pageflip-complete arrived without a matching
+            // `record_submit`. The most plausible causes are a
+            // stale event flushed at startup, or a kernel-initiated
+            // pageflip from initial modeset / vt-switch. The damage
+            // state has nothing to advance; ignore.
+            log::warn!("record_present called without prior record_submit (no-op)");
+            return;
+        }
         self.last_presented_gen = self.last_submitted_gen;
         self.flip_pending = false;
     }
@@ -163,5 +168,16 @@ mod tests {
         s.bump_dirty();
         assert!(s.needs_composite());
         assert_eq!(s.dirty_gen(), 4); // initial 1 + three bumps
+    }
+
+    #[test]
+    fn record_present_without_prior_submit_is_no_op() {
+        let mut s = OutputDamageState::new();
+        let dirty_before = s.dirty_gen();
+        let presented_before = s.last_presented_gen();
+        s.record_present();
+        assert_eq!(s.dirty_gen(), dirty_before);
+        assert_eq!(s.last_presented_gen(), presented_before);
+        assert!(!s.flip_pending());
     }
 }

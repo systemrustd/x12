@@ -3,6 +3,18 @@
 //! Phase 1 carries just enough state to push into `InFlight`. The
 //! command buffer, descriptors, and the wait dependency on
 //! `PaintBatch` arrive in phase 2/3/4.
+//!
+//! ## Phase-2 follow-up
+//!
+//! `OutputFrame` currently duplicates the field set of
+//! `InFlightFrame` — composite_and_flip constructs `InFlightFrame`
+//! directly and `OutputFrame::new` has no production caller. Phase
+//! 2 (frame-owned composite descriptor pools) will reconcile the
+//! two: either `OutputFrame` gains the descriptor-pool/CB fields
+//! and composite constructs it first, pushing through into
+//! `InFlightFrame`, or `OutputFrame` is deleted and its
+//! responsibilities folded into `InFlightFrame`. The HLD names
+//! both as separate primitives; phase 2 picks one.
 
 use ash::vk;
 

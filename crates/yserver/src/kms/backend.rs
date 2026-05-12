@@ -6430,10 +6430,20 @@ impl KmsBackend {
             );
 
             // Push an InFlightFrame for this successful submit.
-            // Phase 1: composite_fence is vk::Fence::null() — treated as
-            // "already GPU-retired" in poll_in_flight because
-            // vkQueueWaitIdle inside try_vulkan_composite_flip has already
-            // drained the queue. Phase 4 swaps null for a real fence.
+            //
+            // Phase-1 retirement is "two-stage shaped," not truly two-stage yet.
+            // The GPU side uses a *placeholder* `vk::Fence::null()` — `null` is
+            // treated as "already GPU-retired" in `poll_in_flight`. This is
+            // correct in phase 1 because:
+            //   - Paint ops drain the queue via `run_one_shot_op` (vk/ops/mod.rs)
+            //     BEFORE composite submits, so by the time `record_submit` runs
+            //     there is no in-flight paint work on the queue.
+            //   - The composite submit itself goes through KMS with IN_FENCE_FD,
+            //     and we don't touch the targeted BO until `BoPhase::Free` after
+            //     pageflip-complete — so scanout retirement transitively implies
+            //     GPU completion.
+            // Phase 4 swaps `null` for a real signalled-by-composite-submit
+            // fence (or a timeline counter) and removes the hot-path waitIdle.
             let submitted_gen = self.outputs[layout_idx].damage.last_submitted_gen();
             self.scheduler
                 .in_flight
@@ -6471,7 +6481,7 @@ impl KmsBackend {
             .and_then(|p| p.as_ref())?;
         let Some(bo_idx) = pool.bos.iter().position(|b| b.state.phase == BoPhase::Free) else {
             log::warn!(
-                "vk composite: no Free bo in pool for output {} — falling back to pixman",
+                "vk composite: no Free bo in pool for output {} — deferring frame",
                 self.outputs[layout_idx].output.connector_name
             );
             return None;
@@ -6497,7 +6507,7 @@ impl KmsBackend {
             Err(e) => {
                 log::warn!(
                     "vk composite: record_and_present_composite failed on output {}: {e} \
-                     — falling back to pixman this frame",
+                     — skipping frame",
                     self.outputs[layout_idx].output.connector_name
                 );
                 None
