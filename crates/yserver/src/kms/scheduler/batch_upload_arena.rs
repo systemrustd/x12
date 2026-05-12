@@ -42,6 +42,11 @@ pub struct UploadAllocation {
     pub mapped_ptr: NonNull<u8>,
 }
 
+// SAFETY: `NonNull<u8>` is not `Send` by default. The KMS backend's
+// single-threaded-core invariant (phase 6.8) guarantees these
+// allocations are never moved across threads; the mapping is owned
+// by the same thread that issues paint records and reads them back
+// from staging.
 unsafe impl Send for UploadAllocation {}
 
 #[derive(Debug)]
@@ -54,21 +59,19 @@ struct Chunk {
     used: u64,
 }
 
+// SAFETY: same as `UploadAllocation` — the single-threaded-core
+// invariant (phase 6.8) keeps chunks pinned to the backend thread.
 unsafe impl Send for Chunk {}
 
 pub struct BatchUploadArena {
     vk: Arc<VkContext>,
     chunks: Vec<Chunk>,
-    /// First chunk's initial capacity; subsequent chunks double up
-    /// to `MAX_CHUNK_SIZE`.
-    min_chunk_size: u64,
 }
 
 impl std::fmt::Debug for BatchUploadArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BatchUploadArena")
             .field("chunks", &self.chunks.len())
-            .field("min_chunk_size", &self.min_chunk_size)
             .finish_non_exhaustive()
     }
 }
@@ -81,7 +84,6 @@ impl BatchUploadArena {
         Self {
             vk,
             chunks: Vec::new(),
-            min_chunk_size: MIN_CHUNK_SIZE,
         }
     }
 
@@ -113,13 +115,16 @@ impl BatchUploadArena {
             }
         }
 
-        // Grow: allocate a new chunk.
+        // Grow: allocate a new chunk. Doubles up to MAX_CHUNK_SIZE
+        // (caps a single chunk at 64 MiB); falls back to
+        // MIN_CHUNK_SIZE on first alloc; always at least `size` so a
+        // single large request never gets an undersized chunk.
         let next_size = self
             .chunks
             .last()
             .map(|c| (c.size * 2).min(MAX_CHUNK_SIZE))
-            .unwrap_or(self.min_chunk_size)
-            .max(size); // never undersize for the request
+            .unwrap_or(MIN_CHUNK_SIZE)
+            .max(size);
         let chunk = Self::allocate_chunk(&self.vk, next_size)?;
         let mapped_ptr = chunk.base_ptr;
         let buffer = chunk.buffer;
@@ -137,7 +142,7 @@ impl BatchUploadArena {
     fn allocate_chunk(vk: &VkContext, size: u64) -> Result<Chunk, ArenaError> {
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { vk.device.create_buffer(&buf_info, None)? };
 
