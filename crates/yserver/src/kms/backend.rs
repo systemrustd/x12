@@ -6230,9 +6230,9 @@ impl KmsBackend {
             let (composite_fence, output_idx, bo_slot, gpu_done, scanout_done) = {
                 let f = self.scheduler.in_flight.get_mut(i).unwrap();
                 (
-                    f.composite_fence,
-                    f.output_idx,
-                    f.bo_slot,
+                    f.output_frame.composite_fence,
+                    f.output_frame.output_idx,
+                    f.output_frame.bo_slot,
                     f.gpu_retired,
                     f.scanout_retired,
                 )
@@ -6283,8 +6283,8 @@ impl KmsBackend {
             if !prev_gpu && new_gpu && composite_fence != ash::vk::Fence::null() {
                 log::trace!(
                     "in_flight: gpu_retired (fence) frame_id={} output_idx={}",
-                    f.frame_id,
-                    f.output_idx,
+                    f.output_frame.frame_id,
+                    f.output_frame.output_idx,
                 );
             }
         }
@@ -6448,11 +6448,19 @@ impl KmsBackend {
             self.scheduler
                 .in_flight
                 .push(crate::kms::scheduler::in_flight::InFlightFrame {
-                    output_idx: layout_idx,
-                    frame_id,
-                    submitted_gen,
-                    composite_fence: ash::vk::Fence::null(),
-                    bo_slot,
+                    output_frame: crate::kms::scheduler::output_frame::OutputFrame::new(
+                        layout_idx,
+                        frame_id,
+                        submitted_gen,
+                        bo_slot,
+                        // composite_pool_slot: PLACEHOLDER until T5.
+                        // Must not be read by any caller before T5 lands the
+                        // real value from `try_vulkan_composite_flip`.
+                        // T6 starts reading this field (release-on-retirement)
+                        // and must not land before T5.
+                        0,
+                        ash::vk::Fence::null(),
+                    ),
                     gpu_retired: false,
                     scanout_retired: false,
                 });

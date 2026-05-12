@@ -19,20 +19,20 @@
 
 use std::collections::VecDeque;
 
-use ash::vk;
+use crate::kms::scheduler::output_frame::OutputFrame;
 
 /// A single in-flight `OutputFrame`'s retirement bookkeeping.
 ///
+/// `output_frame` owns the renderable resources (BO slot, descriptor
+/// pool slot, composite fence). `gpu_retired` / `scanout_retired`
+/// track the two retirement observations.
+///
 /// The fields are public to the scheduler module so the polling
 /// code (which lives in `KmsBackend` because it owns `VkContext`
-/// and the BO pools) can set the bools directly.
+/// and the BO pools) can read/write them directly.
 #[derive(Debug)]
 pub struct InFlightFrame {
-    pub output_idx: usize,
-    pub frame_id: u64,
-    pub submitted_gen: u64,
-    pub composite_fence: vk::Fence,
-    pub bo_slot: Option<usize>,
+    pub output_frame: OutputFrame,
     pub gpu_retired: bool,
     pub scanout_retired: bool,
 }
@@ -73,10 +73,10 @@ impl InFlight {
             self.frames
                 .iter()
                 .rev()
-                .find(|f| f.output_idx == frame.output_idx)
-                .is_none_or(|prev| prev.frame_id < frame.frame_id),
+                .find(|f| f.output_frame.output_idx == frame.output_frame.output_idx)
+                .is_none_or(|prev| prev.output_frame.frame_id < frame.output_frame.frame_id),
             "InFlight::push: out-of-order frame_id for output {}",
-            frame.output_idx,
+            frame.output_frame.output_idx,
         );
         self.frames.push_back(frame);
     }
@@ -115,14 +115,18 @@ impl InFlight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk;
 
     fn mk_frame(id: u64, output: usize) -> InFlightFrame {
         InFlightFrame {
-            output_idx: output,
-            frame_id: id,
-            submitted_gen: id,
-            composite_fence: vk::Fence::null(),
-            bo_slot: Some(0),
+            output_frame: OutputFrame::new(
+                output,
+                id,
+                id,      // submitted_gen
+                Some(0), // bo_slot
+                0,       // composite_pool_slot
+                vk::Fence::null(),
+            ),
             gpu_retired: false,
             scanout_retired: false,
         }
@@ -155,29 +159,21 @@ mod tests {
         let mut q = InFlight::default();
         q.push(mk_frame(1, 0));
         q.push(mk_frame(2, 0));
-        // GPU done on frame 1, scanout not yet.
         q.frames_mut().next().unwrap().gpu_retired = true;
         let drained = q.drain_retired();
         assert_eq!(drained, 0, "GPU-only retirement is not enough");
-        // Scanout also done on frame 1.
         q.frames_mut().next().unwrap().scanout_retired = true;
         let drained = q.drain_retired();
         assert_eq!(drained, 1);
         assert_eq!(q.len(), 1);
-        assert_eq!(q.frames().next().unwrap().frame_id, 2);
+        assert_eq!(q.frames().next().unwrap().output_frame.frame_id, 2);
     }
 
     #[test]
     fn drain_retired_only_drains_prefix() {
-        // Frames retire in submission order on the same output. The
-        // queue is FIFO; out-of-order retirement (e.g. a later
-        // frame's GPU work completing before an earlier frame's)
-        // does not cause a hole — the later frame waits for the
-        // earlier to drain.
         let mut q = InFlight::default();
         q.push(mk_frame(1, 0));
         q.push(mk_frame(2, 0));
-        // Mark frame 2 fully retired, frame 1 not.
         {
             let mut iter = q.frames_mut();
             let _f1 = iter.next();
@@ -216,8 +212,6 @@ mod tests {
 
     #[test]
     fn drain_retired_blocks_on_scanout_only_retirement() {
-        // Symmetric to drain_retired_removes_only_fully_retired_frames
-        // but exercising the scanout-only side. Both bits must be set.
         let mut q = InFlight::default();
         q.push(mk_frame(1, 0));
         let mut iter = q.frames_mut();
@@ -236,8 +230,8 @@ mod tests {
         let mut q = InFlight::default();
         q.push(mk_frame(1, 0));
         q.push(mk_frame(2, 1));
-        assert_eq!(q.get_mut(0).unwrap().frame_id, 1);
-        assert_eq!(q.get_mut(1).unwrap().frame_id, 2);
+        assert_eq!(q.get_mut(0).unwrap().output_frame.frame_id, 1);
+        assert_eq!(q.get_mut(1).unwrap().output_frame.frame_id, 2);
         assert!(q.get_mut(2).is_none());
     }
 }
