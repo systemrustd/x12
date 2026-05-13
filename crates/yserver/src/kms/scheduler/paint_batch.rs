@@ -371,8 +371,8 @@ impl PaintBatch {
     /// 1a. **Fence creation fails** (`create_fence` before
     ///     submit): the CB never entered the queue and no fence
     ///     was created. Free the CB, retire resources, return
-    ///     the error. Mechanically identical to 1b but listed
-    ///     separately so reviewers don't have to infer it.
+    ///     the error. Differs from 1b only in that there is no
+    ///     fence to destroy.
     /// 1b. **Submit fails** (`queue_submit2` returns Err): the
     ///     CB never entered the queue. Destroy the fence
     ///     (created in 1a's step but not yet given to the queue),
@@ -489,12 +489,26 @@ impl PaintBatch {
     }
 
     /// Drop a holder reference. Transitions to Retired when
-    /// `holders == 0 && state == Submitted`. Phase 4 wire-up;
-    /// phase 3 is dead code today but landed for shape.
+    /// `holders == 0 && state == Submitted`. Phase 4 T1 keeps
+    /// `holders` at 0 (no caller currently invokes
+    /// `acquire_holder`); this method is reachable shape-only.
+    ///
+    /// **T2/Phase 6 hazard.** After T1, a `Submitted` batch
+    /// owns a live `VkFence`. Calling `retire_now` from here
+    /// when the fence has NOT signaled would destroy the fence
+    /// while the GPU may still be running the submitted CB —
+    /// undefined behaviour. Any future wire-up of
+    /// `acquire_holder`/`release_holder` MUST first either
+    /// `wait_for_completion()` (blocking) or
+    /// `try_retire_if_signaled()` (non-blocking) on the batch.
+    /// Do not call `retire_now` directly from here.
     pub fn release_holder(&mut self) {
         debug_assert!(self.holders > 0, "release_holder underflow");
         self.holders = self.holders.saturating_sub(1);
         if self.holders == 0 && self.state == BatchState::Submitted {
+            // FIXME(phase4-T2+): see method doc — calling
+            // retire_now here is unsafe once a real holder
+            // model lands. Today dead because holders == 0.
             self.retire_now();
         }
     }
@@ -535,6 +549,12 @@ impl PaintBatch {
     /// freeing a recording CB that was never submitted. All
     /// `retire_resources` are released.
     fn poison(&mut self) {
+        debug_assert!(
+            self.fence.is_none(),
+            "poison() called with live fence — caller must destroy or \
+             explicitly leak the fence first (the path-2 wait-failure leak \
+             takes the Submitted-state branch and never reaches poison)"
+        );
         if let Some(cb) = self.cb.take() {
             unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
         }
