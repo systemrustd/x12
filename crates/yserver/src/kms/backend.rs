@@ -8129,28 +8129,100 @@ impl KmsBackend {
     /// Logs any per-output error and returns the last one so callers
     /// still see a failure, while attempting to tear down everything.
     pub fn disable_output(&mut self) -> io::Result<()> {
-        // Drain in-flight scanout-bo state first: vkDeviceWaitIdle +
-        // close any held fence fds. Without this, mid-flight Vulkan
-        // submits could race the DRM disable_output ioctl and leak
-        // fds. No-op when no Vulkan-fed pool exists for an output.
-        if let Some(vk) = self.vk.as_ref() {
-            for pool in &mut self.scanout_pools {
-                if let Some(p) = pool.as_mut() {
-                    p.drain_all_pending(vk);
+        // 6-step teardown per codex pinpoint (docs/known-issues.md
+        // "P0: KMS teardown..."). The previous implementation
+        // collapsed steps 3+4 by force-resetting BO state via
+        // drain_all_pending BEFORE the atomic disable, which lied
+        // BOs to Free while KMS still had FBs bound → atomic disable
+        // EINVAL → kernel `atomic remove_fb failed with -22` warning
+        // and Wayland host compositors saw no outputs.
+
+        // Step 1: Stop submitting new composites. composite_and_flip
+        // and try_vulkan_composite_flip both early-return when this
+        // is true.
+        self.shutting_down = true;
+
+        // Step 2: Flush + retire the open PaintBatch (best-effort —
+        // BatchFlushReason::Shutdown is a non-strict reason; failures
+        // are logged but don't abort the rest of shutdown).
+        if let Err(e) =
+            self.flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::Shutdown)
+        {
+            log::warn!("shutdown: PaintBatch flush failed: {e:?}");
+        }
+
+        // Step 3: Wait for any submitted Vulkan work to complete.
+        // After this, GPU is idle; KMS may still have pageflips
+        // pending in its own queue, but no new Vk submits can race
+        // shutdown (step 1 stopped them) and no in-flight Vk work
+        // can race the upcoming atomic commit.
+        if let Some(vk) = self.vk.as_ref()
+            && let Err(e) = unsafe { vk.device.device_wait_idle() }
+        {
+            log::warn!("shutdown: vkDeviceWaitIdle: {e}");
+        }
+
+        // Step 4: Drain DRM pageflip completions per output until no
+        // bo is in BoPhase::Pending. Bounded by a 500 ms ceiling so a
+        // genuinely stuck kernel doesn't hang shutdown. DO NOT
+        // force-reset BO state here — has_pending_pageflip must
+        // observe the real KMS state, not a userspace lie.
+        if let Err(e) = self.drain_pending_pageflips_for_shutdown() {
+            log::warn!("shutdown: drain_pending_pageflips: {e}");
+        }
+
+        // Step 5: Now safe to issue the atomic disable_output per
+        // output. With no Pending flips, the kernel will accept the
+        // commit instead of returning EINVAL. Track per-output
+        // success so step 6 can skip force-reset on outputs whose
+        // disable failed (those still have KMS bindings).
+        let mut last_err: Option<io::Error> = None;
+        let mut disable_ok: Vec<bool> = Vec::with_capacity(self.outputs.len());
+        for layout in &self.outputs {
+            match drm::modeset::disable_output(&self.device, &layout.output) {
+                Ok(()) => disable_ok.push(true),
+                Err(e) => {
+                    log::warn!(
+                        "disable_output failed for {}: {e}",
+                        layout.output.connector_name
+                    );
+                    disable_ok.push(false);
+                    last_err = Some(e);
                 }
             }
         }
 
-        let mut last_err: Option<io::Error> = None;
-        for layout in &self.outputs {
-            if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
-                log::warn!(
-                    "disable_output failed for {}: {e}",
-                    layout.output.connector_name
-                );
-                last_err = Some(e);
+        // Step 6: For each output whose atomic disable succeeded, KMS
+        // has released its hold on the framebuffer; force-resetting
+        // BO state (close any straggler fence fds) is now safe and
+        // RAII drops the scanout pool when KmsBackend itself drops.
+        //
+        // For an output whose disable FAILED, KMS may still hold the
+        // FB. Plain "skip drain_all_pending" is NOT enough — when
+        // KmsBackend drops shortly after this returns, scanout_pools
+        // drops, which drops each ScanoutBo, whose Drop unconditionally
+        // calls destroy_framebuffer + close_buffer(gem) (see
+        // scanout.rs Drop impl). That's the exact RMFB-while-KMS-holds-FB
+        // path that produces `atomic remove_fb failed with -22` and
+        // strands Wayland host sessions. So for failed outputs we
+        // `disarm_scanout_pool(idx)` — each ScanoutBo's `disarmed`
+        // flag flips to true, and its Drop becomes a no-op. The
+        // resources leak until DRM-fd close at process exit, at which
+        // point the kernel reaps GEM + FB as part of its normal
+        // device-fd cleanup. Vulkan resources leak similarly via Vk
+        // device drop. Codex flagged this in the v2 review.
+        for (idx, success) in disable_ok.iter().copied().enumerate() {
+            if success {
+                if let Some(vk) = self.vk.as_ref()
+                    && let Some(p) = self.scanout_pools.get_mut(idx).and_then(|p| p.as_mut())
+                {
+                    p.drain_all_pending(vk);
+                }
+            } else {
+                self.disarm_scanout_pool(idx);
             }
         }
+
         last_err.map_or(Ok(()), Err)
     }
 }
