@@ -1719,9 +1719,9 @@ impl KmsBackend {
     ///   try_vk_solid_fill:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   try_vk_put_image:                 image::record_put_image             — migrated 3C T1 (record_paint_batch_op + arena)
     ///   try_vk_text_run:                  text::record_text_run               — migrated 3E T1 (record_paint_op)
-    ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
+    ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback (3F-2)
     ///   try_vk_render_composite_glyphs:   text::record_text_run               — migrated 3E T2 (record_paint_op)
-    ///   try_vk_render_composite:          render::record_render_composite     — borrow-conflict fallback
+    ///   try_vk_render_composite:          render::record_render_composite     — migrated 3F-1 (record_paint_batch_op + BatchDescriptorArena)
     ///
     ///   open_with_commit (constructor):   record_solid_color_clear            — left alone (one-time init, no DrawableImage)
     ///   hw_cursor_refresh:                image::record_get_image             — left on Readback flush (readback handler)
@@ -5592,7 +5592,7 @@ impl KmsBackend {
         mask_component_alpha: bool,
     ) -> bool {
         use crate::kms::vk::{
-            ops::{render as vk_render, run_one_shot_op},
+            ops::render as vk_render,
             render_pipeline::{StdPictOp, record_solid_color_clear},
         };
 
@@ -5621,12 +5621,14 @@ impl KmsBackend {
             return false;
         }
 
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            log::debug!("vk composite bail: no Vk context (dst=0x{dst_xid:x})");
-            return false;
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            log::debug!("vk composite bail: no ops_command_pool (dst=0x{dst_xid:x})");
+        // 3F-1: acquire batch resources up-front (gated by
+        // renderer_failed). Replaces the raw vk + ops_pool reads;
+        // the renderer_failed gate inside paint_resources() is the
+        // same one fill/copy/image/text now go through.
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            log::debug!(
+                "vk composite bail: paint_resources unavailable (renderer_failed or vk/pool absent) (dst=0x{dst_xid:x})"
+            );
             return false;
         };
         if self.render_pipelines.is_none()
@@ -5766,16 +5768,6 @@ impl KmsBackend {
             .as_ref()
             .expect("checked above")
             .pipeline_layout();
-
-        if let Err(e) = self
-            .render_pipelines
-            .as_ref()
-            .expect("checked above")
-            .reset_descriptors()
-        {
-            log::warn!("vk render_composite: descriptor pool reset failed: {e:?}");
-            return false;
-        }
 
         let solid_src_view = self
             .solid_src_image
@@ -6005,6 +5997,27 @@ impl KmsBackend {
             }
         }
 
+        // 3F-1: dst_readback.ensure may grow (destroy old scratch
+        // image after queue_wait_idle), which does NOT wait for
+        // un-submitted batch commands. If an earlier op in the
+        // open batch recorded `cmd_copy_image(dst → old_scratch)`,
+        // freeing the old image would dangle. Pre-flush the batch
+        // before the grow. needs_grow is false for the steady-state
+        // path (no resize) so this only fires on first sight of a
+        // larger dst. Same mitigation 3D applied to CopyScratch.
+        let needs_readback_grow = needs_dst_readback
+            && self
+                .dst_readback
+                .as_ref()
+                .is_some_and(|r| r.needs_grow(dst_format, dst_extent.width, dst_extent.height));
+        if needs_readback_grow {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("vk render_composite: pre-resize flush failed: {e:?}");
+                return false;
+            }
+        }
+
         // For Disjoint/Conjoint ops the shader reads the dst pixel
         // through binding 2; we copy dst → scratch inside the CB
         // below and bind the scratch's sampleable view here. For
@@ -6027,31 +6040,6 @@ impl KmsBackend {
         } else {
             white_mask_view
         };
-
-        let descriptor_set = match self
-            .render_pipelines
-            .as_ref()
-            .expect("checked above")
-            .allocate_descriptor_for_views(src_view, mask_view, dst_readback_view)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("vk render_composite: descriptor alloc failed: {e:?}");
-                return false;
-            }
-        };
-
-        // 3D-deferred: render-composite needs per-batch MaskScratch + descriptor
-        // strategy + dst_readback lifetime before migrating. The pre-record
-        // ProtocolBarrier flush keeps this legacy path safe alongside batched
-        // fill/copy/PutImage in the same protocol cycle.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
 
         // Pull mut refs. Split-borrow on disjoint fields lets us
         // hand all of these into the closure simultaneously.
@@ -6120,37 +6108,58 @@ impl KmsBackend {
             mask_xform: combined_mask_xform,
         };
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            if let Some(c) = src_clear_color {
-                record_solid_color_clear(vk, cb, solid_src_image, c);
-            }
-            if let Some(c) = mask_clear_color {
-                record_solid_color_clear(vk, cb, solid_mask_image, c);
-            }
-            // Disjoint/Conjoint: snapshot dst into the readback
-            // scratch, then restore dst to its current layout so
-            // record_render_composite can transition it normally.
-            if let Some(rb) = dst_readback {
-                rb.record_copy_from(
+        // 3F-1: descriptor allocation moves into the closure where
+        // `&mut PaintBatch` is available — `batch.descriptor_arena_mut()`
+        // returns the per-batch arena. The set lives until batch
+        // retirement (NOT until the next render-composite call), so
+        // multiple render-composites in one batch don't trample each
+        // other's descriptors the way the shared-pool path would.
+        //
+        // `render_cache` is a shared borrow on self.render_pipelines
+        // — disjoint from the &mut self.scheduler that record_paint_batch_op
+        // takes, and from the &mut captures (dst_mirror / solid_src /
+        // solid_mask / dst_readback) which are all in disjoint fields.
+        let render_cache = self.render_pipelines.as_ref().expect("checked above");
+        let result = self
+            .scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
+                let descriptor_set = render_cache.allocate_descriptor_for_views_into(
+                    batch.descriptor_arena_mut(),
+                    src_view,
+                    mask_view,
+                    dst_readback_view,
+                )?;
+                if let Some(c) = src_clear_color {
+                    record_solid_color_clear(vk, cb, solid_src_image, c);
+                }
+                if let Some(c) = mask_clear_color {
+                    record_solid_color_clear(vk, cb, solid_mask_image, c);
+                }
+                // Disjoint/Conjoint: snapshot dst into the readback
+                // scratch, then restore dst to its current layout so
+                // record_render_composite can transition it normally.
+                if let Some(rb) = dst_readback {
+                    rb.record_copy_from(
+                        cb,
+                        dst_mirror.vk_image,
+                        dst_mirror.current_layout(),
+                        dst_format,
+                        dst_mirror.extent,
+                    );
+                }
+                vk_render::record_render_composite(
+                    vk,
                     cb,
-                    dst_mirror.vk_image,
-                    dst_mirror.current_layout(),
-                    dst_format,
-                    dst_mirror.extent,
-                );
-            }
-            vk_render::record_render_composite(
-                vk,
-                cb,
-                dst_mirror,
-                pipeline,
-                pipeline_layout,
-                descriptor_set,
-                &attrs,
-                rects,
-                scissor,
-            )
-        }) {
+                    dst_mirror,
+                    pipeline,
+                    pipeline_layout,
+                    descriptor_set,
+                    &attrs,
+                    rects,
+                    scissor,
+                )
+            });
+        match result {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
