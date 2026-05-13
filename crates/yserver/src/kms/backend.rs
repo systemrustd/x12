@@ -1583,13 +1583,25 @@ impl KmsBackend {
         let dirty_outputs: Vec<usize> = (0..self.outputs.len())
             .filter(|&i| self.outputs[i].damage.needs_composite())
             .collect();
-        let result = self.scheduler.close_and_submit(dirty_outputs);
         let strict = matches!(
             reason,
             BatchFlushReason::Readback
                 | BatchFlushReason::ExternalSync
                 | BatchFlushReason::ProtocolBarrier
         );
+
+        // 4-T3: strict reasons use the blocking submit (close_and_submit
+        // → submit_and_wait → wait_for_fences on the batch's own fence).
+        // Best-effort reasons use the async path: close_and_submit_async
+        // moves the batch to the submitted-paint-batches queue; the
+        // composite-tick poll retires it later when its fence signals.
+        let result = if strict {
+            self.scheduler.close_and_submit(dirty_outputs)
+        } else {
+            self.scheduler
+                .close_and_submit_async(dirty_outputs)
+                .map(|_fence| ())
+        };
         match result {
             Ok(()) => Ok(()),
             Err(BatchError::Vk(r)) => {
@@ -6889,6 +6901,23 @@ impl KmsBackend {
     /// (snapshot via get_mut, compute, write back via get_mut)
     /// avoids the borrow split.
     fn poll_in_flight(&mut self) {
+        // 4-T3: drain any signaled paint batches first. Paint
+        // batches retire independently of output frames — they
+        // can signal even when no composite is in flight (e.g.,
+        // a ProtocolBarrier flush in the middle of a paint cycle
+        // that completes before the next composite).
+        if let Err(e) = self.scheduler.poll_retired_paint_batches() {
+            log::error!(
+                "poll_in_flight: paint-batch retirement poll failed: {e:?}; \
+                 latching renderer_failed"
+            );
+            self.renderer_failed = true;
+            // Continue with output-frame polling — the latched
+            // renderer_failed flag stops new paint work, but
+            // existing scanout frames still need their pageflip
+            // tracking to complete cleanly.
+        }
+
         let n = self.scheduler.in_flight.len();
         for i in 0..n {
             // Pass 1: snapshot the polling inputs.

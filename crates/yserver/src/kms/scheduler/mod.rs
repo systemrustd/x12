@@ -27,6 +27,13 @@ pub mod paint_batch;
 pub struct RenderScheduler {
     pub in_flight: InFlight,
     pub current_paint_batch: Option<PaintBatch>,
+    /// FIFO queue of submitted-but-not-yet-retired paint batches.
+    /// Pushed by `close_and_submit_async`; drained by
+    /// `poll_retired_paint_batches` when each batch's fence
+    /// signals. Retirement is strict-prefix-FIFO (stop at first
+    /// non-signaled batch — resource lifetimes layer on submission
+    /// order, same as `InFlight::drain_retired`).
+    pub submitted_paint_batches: std::collections::VecDeque<PaintBatch>,
 }
 
 impl RenderScheduler {
@@ -78,6 +85,76 @@ impl RenderScheduler {
             Ok(()) | Err(BatchError::Poisoned) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Async sibling of `close_and_submit`. Submits the current
+    /// paint batch and moves it to `submitted_paint_batches` for
+    /// later poll-driven retirement. Returns the fence handle so
+    /// callers that need synchronous completion (strict flushes)
+    /// can `wait_for_fences` on it themselves.
+    ///
+    /// Behavior on no-batch / Idle / Poisoned matches
+    /// `close_and_submit`:
+    ///   - no batch open → `Ok(vk::Fence::null())`.
+    ///   - Idle batch (no CB) → retires directly, returns null fence.
+    ///   - Poisoned → `Ok(vk::Fence::null())` (best-effort
+    ///     swallows; strict caller surfaces separately).
+    ///
+    /// Path-1 (submit failure): same as `close_and_submit` — the
+    /// returned `Err(BatchError::Vk)` is fatal to the KMS renderer.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn close_and_submit_async(
+        &mut self,
+        dirty_outputs: Vec<usize>,
+    ) -> Result<vk::Fence, BatchError> {
+        let Some(mut batch) = self.current_paint_batch.take() else {
+            return Ok(vk::Fence::null());
+        };
+        batch.dirty_outputs = dirty_outputs;
+        match batch.submit_async() {
+            Ok(fence) => {
+                if batch.state() == BatchState::Submitted {
+                    self.submitted_paint_batches.push_back(batch);
+                }
+                // else: state was Idle and submit_async retired
+                // synchronously; nothing to push. fence is null.
+                Ok(fence)
+            }
+            Err(BatchError::Poisoned) => {
+                drop(batch);
+                Ok(vk::Fence::null())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Non-blocking poll over the submitted-paint-batch queue.
+    /// Walks front-to-back; calls `try_retire_if_signaled` on
+    /// each; removes any that successfully retired. Stops at the
+    /// first non-signaled batch (strict-prefix-FIFO).
+    ///
+    /// Returns the number of batches retired. On a fence-status
+    /// error, the batch is left in the queue in `Submitted`
+    /// (leaked resources) and the error propagates — the caller
+    /// MUST treat this as a renderer-failed condition.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn poll_retired_paint_batches(&mut self) -> Result<usize, BatchError> {
+        let mut retired = 0;
+        while let Some(batch) = self.submitted_paint_batches.front_mut() {
+            if batch.try_retire_if_signaled()? {
+                self.submitted_paint_batches.pop_front();
+                retired += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(retired)
+    }
+
+    /// Total in-flight paint batches (Submitted, not yet Retired).
+    /// Used by backpressure logic in T4.
+    pub fn pending_paint_batches(&self) -> usize {
+        self.submitted_paint_batches.len()
     }
 
     /// State of the current batch, or `None` if no batch is open.
