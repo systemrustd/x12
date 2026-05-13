@@ -9,7 +9,13 @@ Predecessor: phase 3A (`4af9e01` results doc; tip `4af9e01`)
 
 **Goal:** Migrate the four scratch-free paint recorders (`fill::record_fill_rectangles`, `fill::record_logic_fill`, `copy::record_copy_area_distinct`, `copy::record_copy_area_same`) from `run_one_shot_op` (per-op submit + `vkQueueWaitIdle`) to appending into the per-frame `PaintBatch` via the 3A APIs. After 3B, every call site for these four recorders goes through `record_paint_op`; the batch carries real recorded work into `flush_if_needed(VisibleComposite)` for the first time. **`copy::record_copy_area_same_overlap` is deferred to 3D** (uses `CopyScratch` shared scratch image; needs the upload-arena infrastructure 3C lays).
 
-**Architecture:** 3A's `record_paint_op` / `record_paint_batch_op` live on `KmsBackend` and are `&mut self` — that conflicts with the `&mut self.windows[id].vk_mirror` borrows recorder call sites already hold. **3B T0 moves the implementation onto `RenderScheduler`** so call sites can split borrows: `&mut self.scheduler` is disjoint from `&mut self.windows`/`&mut self.pixmaps`. The KmsBackend methods become thin shims for callers that don't hold a conflicting borrow. T0 also lands the **`renderer_failed: bool` gate** that prevents cascade-of-abandoned-CBs once T1's first recorder can produce a fatal `Err`.
+**Architecture:** Three pieces of infrastructure land before the migrations:
+
+1. **Legacy paint boundary (T0).** Once fill/copy are in the batch, any *later* paint op still on `run_one_shot_op` (image / render / text / traps / copy-same-overlap / mirror.record_upload_rect) that touches the same drawable would observe the batched recorder's CPU-side `set_current_layout` mutation while the GPU hasn't yet executed the batched work. Fix: every paint-side `run_one_shot_op` call gets routed through a `run_legacy_paint_op` wrapper that calls `flush_if_needed(ProtocolBarrier)` first. Migrate every paint-side site to the wrapper before any recorder migrates.
+
+2. **`renderer_failed` gate (T1).** Set on fatal Vk error from `flush_if_needed`. Gates every paint entry point so a single failure doesn't cascade into more abandoned CBs each cycle.
+
+3. **`record_paint_op` on `RenderScheduler` (T1).** 3A's versions live on `KmsBackend` (taking `&mut self`) — conflicts with `&mut self.windows[id]` borrows recorder call sites hold. T1 moves the implementation onto `RenderScheduler` so call sites can split borrows: `&mut self.scheduler` is disjoint from `&mut self.windows` / `&mut self.pixmaps`. A `KmsBackend::paint_resources()` helper returns `Option<(Arc<VkContext>, vk::CommandPool)>` only when `!renderer_failed` — call sites use it to ensure the gate runs even when going through scheduler-direct calls.
 
 **Tech Stack:** Rust 2021, `ash` for Vulkan. Existing `kms/scheduler/`, `kms/vk/ops/{fill,copy}.rs`, `kms/backend.rs`.
 
@@ -52,18 +58,188 @@ Use explicit `git add <file>` per file — **do NOT use `git commit -am`**.
 
 ---
 
-## Task 0: `renderer_failed` gate + move record_paint_op onto RenderScheduler
+## Task 0: Legacy paint boundary — `run_legacy_paint_op` wrapper
+
+**Files:**
+- Modify: `crates/yserver/src/kms/backend.rs` (add `run_legacy_paint_op` helper + migrate every paint-side `run_one_shot_op` call site to use it)
+
+**Why this exists.** Once T2 migrates fill, here's the failure mode:
+
+```text
+1. Request handler A calls fill (migrated): records fill commands into the batch CB,
+   mutates mirror.current_layout → SHADER_READ_ONLY_OPTIMAL on the CPU. No submit yet.
+2. Request handler B calls image::record_put_image (NOT migrated):
+   reads mirror.current_layout (SHADER_READ_ONLY_OPTIMAL), emits a
+   "from SHADER_READ_ONLY → TRANSFER_DST" barrier in its own CB,
+   submits via run_one_shot_op + vkQueueWaitIdle.
+3. The GPU executes B's CB before A's CB — A is still in the batch, unsubmitted.
+4. B's barrier transitions FROM a layout the GPU hasn't reached yet.
+   At minimum: validation errors. At worst: corrupt pixels.
+```
+
+The fix: every remaining paint-side `run_one_shot_op` call gets prefixed with `flush_if_needed(ProtocolBarrier)` so the batch is force-submitted (and idle-waited via `submit_and_wait`) before the legacy op runs. Wrap the pattern as `KmsBackend::run_legacy_paint_op<F>(F)` so it's a single point of audit.
+
+**`ProtocolBarrier` choice.** From 3A T5 the enum has `ProtocolBarrier` documented as "An explicit protocol barrier requested it. (Place-holder for future use; X11 doesn't define one directly today.)" A legacy paint op is exactly that — a synchronous barrier saying "everything before me must complete before I run." Update the variant's doc as part of T0 Step 1 to mention this concrete use, so the next reader knows it's no longer a placeholder.
+
+**Scope.** Migrate every paint-side `run_one_shot_op` call. The three readback handlers (`try_vk_get_image_pixels`, `hw_cursor_refresh`, `read_mirror_pixels`) keep their explicit `flush_if_needed(Readback)` + `run_one_shot_op` pattern — Readback is stricter than ProtocolBarrier (surfaces failures, doesn't just no-op-and-continue), so wrapping them would weaken the contract. Document this distinction inline.
+
+- [ ] **Step 1: Update `BatchFlushReason::ProtocolBarrier` doc + add `run_legacy_paint_op` helper**
+
+First, update the `ProtocolBarrier` variant doc in `crates/yserver/src/kms/scheduler/paint_batch.rs` (added in 3A T5). Replace the placeholder text with the concrete use:
+
+```rust
+    /// An explicit protocol barrier requested it. The phase-3B
+    /// `KmsBackend::run_legacy_paint_op` wrapper uses this reason
+    /// to flush the batch before any paint op still on
+    /// `run_one_shot_op`, so a migrated recorder's CPU-side layout
+    /// mutation has GPU-completed before the legacy op reads it.
+    ProtocolBarrier,
+```
+
+Then, in `crates/yserver/src/kms/backend.rs`, near the existing `flush_if_needed`:
+
+```rust
+    /// Run a paint op via `run_one_shot_op` after first flushing any
+    /// pending `PaintBatch`. Use this at every paint-side
+    /// `run_one_shot_op` call site that is NOT yet migrated to
+    /// `record_paint_op` — phase-3B–3D migrations replace these
+    /// wrappers one family at a time.
+    ///
+    /// **Why the flush:** a migrated recorder (e.g., fill) records
+    /// commands into the batch and mutates CPU-side
+    /// `DrawableImage::current_layout` immediately, while the
+    /// batch CB hasn't been submitted. A later legacy op reading
+    /// `current_layout` would emit barriers from a layout the GPU
+    /// hasn't reached. The flush forces the batch to submit + wait
+    /// idle before the legacy op runs.
+    ///
+    /// Readback handlers (`GetImage`, `read_mirror_pixels`,
+    /// `hw_cursor_refresh`) DO NOT use this wrapper — they keep
+    /// their stricter `flush_if_needed(Readback)` + direct
+    /// `run_one_shot_op` because Readback surfaces failures
+    /// (returning `ERROR_DEVICE_LOST`) where ProtocolBarrier
+    /// silently swallows them, and a readback that proceeds with
+    /// an unflushed batch is silent corruption.
+    pub fn run_legacy_paint_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
+    where
+        F: FnOnce(&crate::kms::vk::device::VkContext, ash::vk::CommandBuffer) -> Result<(), ash::vk::Result>,
+    {
+        use crate::kms::scheduler::paint_batch::BatchFlushReason;
+        if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+            // ProtocolBarrier is strict — flush failure here means the
+            // batch was Poisoned or the renderer is failed. Either way
+            // the legacy op cannot proceed safely.
+            log::warn!("run_legacy_paint_op: pre-flush failed ({e:?})");
+            return Err(e);
+        }
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        crate::kms::vk::ops::run_one_shot_op(&vk_arc, pool_handle, record)
+    }
+```
+
+- [ ] **Step 2: Catalogue every paint-side `run_one_shot_op` call site**
+
+```bash
+rg -nB2 -A5 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs > /tmp/paint-sites.txt
+wc -l /tmp/paint-sites.txt
+```
+
+Phase 2 results doc reported 39 sites. Cross-reference with the per-family count from 3A:
+- fill: 4 (migrated in T2)
+- copy: 5 (4 migrated in T3, 1 = same_overlap deferred)
+- image: 4 (PutImage migrated in 3C; 2 GetImage sites stay synchronous-with-flush)
+- render: 8
+- text: 6
+- traps: 10
+- plus `mirror.record_upload_rect` and other non-family sites.
+
+For each catalogued site, decide:
+- **Wrap with `run_legacy_paint_op`**: every paint-side site that is NOT already a readback handler. Includes: copy-same-overlap, image::PutImage (until 3C migrates), all render sites, all text sites, all traps sites, mirror.record_upload_rect, render_pipeline::record_solid_color_clear (around line 1801), etc.
+- **Leave alone (Readback handler)**: `try_vk_get_image_pixels`, `hw_cursor_refresh`, `read_mirror_pixels` — they already do `flush_if_needed(Readback)` + `run_one_shot_op` and that's the correct pattern.
+- **Skip (will be migrated in 3B's T2/T3)**: fill (4 sites), copy-distinct + copy-same (4 sites). T2/T3 replace `run_one_shot_op` entirely; wrapping then unwrapping is churn. Leave these on raw `run_one_shot_op` for now; T2/T3 will catch them.
+
+Document the catalogue as a comment block at the top of the relevant `backend.rs` section so 3C/3D authors see the list.
+
+- [ ] **Step 3: Migrate every catalogued site to `run_legacy_paint_op`**
+
+For each site, the transformation is:
+
+```rust
+// Before:
+run_one_shot_op(&vk_arc, pool_handle, |vk, cb| { ... recorder ... })
+
+// After:
+self.run_legacy_paint_op(|vk, cb| { ... recorder ... })
+```
+
+The closure body is unchanged. The `vk_arc` and `pool_handle` extractions can be deleted from the surrounding code if no other op uses them (`run_legacy_paint_op` extracts them internally).
+
+**Borrow conflicts.** Same risk as the migration in T2/T3: `&mut self` for `run_legacy_paint_op` collides with `&mut self.windows[id]` borrows for the recorder. The `paint_resources()` helper from T1 doesn't apply here (it returns the resources for direct scheduler calls; legacy ops still go through `run_one_shot_op`). **If a site fails to compile, leave it on raw `run_one_shot_op`-with-explicit-flush:**
+
+```rust
+// Borrow-conflict fallback:
+if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+    log::warn!("legacy paint flush failed: {e:?}");
+    return /* whatever the no-op fallback is */;
+}
+let vk_arc = self.vk.as_ref().cloned()?;
+let pool_handle = self.ops_command_pool.as_ref()?.handle();
+let mirror = &mut self.windows[id]....;
+run_one_shot_op(&vk_arc, pool_handle, |vk, cb| { ... recorder ... })
+```
+
+Document each fallback with `// borrow-conflict fallback for run_legacy_paint_op`. T1's scheduler-API move informs whether to lift these into a helper later (a `run_legacy_paint_op_with_resources(vk_arc, pool_handle, ...)` shape, mirroring the scheduler-direct call pattern).
+
+- [ ] **Step 4: Verify**
+
+```bash
+cargo +nightly fmt
+cargo clippy
+cargo test
+```
+
+Expected: green. No new warnings. No behaviour change yet — every paint cycle has an Idle batch (no migrations) so `flush_if_needed(ProtocolBarrier)` is a cheap state transition.
+
+- [ ] **Step 5: Audit cutover**
+
+```bash
+# Every paint-side run_one_shot_op site is now either:
+# (a) inside run_legacy_paint_op's body (one site, the dispatch),
+# (b) one of the explicit-flush borrow-conflict fallbacks (commented),
+# (c) one of the three Readback handlers,
+# (d) an unmigrated fill/copy site (T2/T3 catches).
+rg -nB2 -A4 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs | grep -v '//' | wc -l
+```
+
+Inspect the output: every remaining raw `run_one_shot_op` should be in one of the four categories above. If any unaudited site remains, file as a concern.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/yserver/src/kms/backend.rs \
+        crates/yserver/src/kms/scheduler/paint_batch.rs
+git commit -m "feat(kms): run_legacy_paint_op wrapper — flush PaintBatch before legacy paint ops"
+```
+
+---
+
+## Task 1: `renderer_failed` gate + move record_paint_op onto RenderScheduler
 
 **Files:**
 - Modify: `crates/yserver/src/kms/scheduler/paint_batch.rs` (no change to PaintBatch; just touched if needed)
 - Modify: `crates/yserver/src/kms/scheduler/mod.rs` (add `record_paint_op` + `record_paint_batch_op` to `RenderScheduler`)
 - Modify: `crates/yserver/src/kms/backend.rs` (add `renderer_failed` field + gates; reduce existing `record_paint_op{,_batch_op}` to thin shims; gate `composite_and_flip` and `flush_if_needed`)
 
-This task lands the infrastructure that T1/T2 build on. **Two orthogonal pieces** — could split into T0a/T0b, but they're tightly coupled (the gate runs at the same entry points the move touches), so single task.
+This task lands the infrastructure that T2/T3 build on. **Two orthogonal pieces** — could split into two tasks, but they're tightly coupled (the gate runs at the same entry points the move touches), so single task.
 
 ### Why move to `RenderScheduler`?
 
-3A put `record_paint_op` on `KmsBackend` (taking `&mut self`). T1's first call site looks like:
+3A put `record_paint_op` on `KmsBackend` (taking `&mut self`). T2's first call site looks like:
 
 ```rust
 let mirror = &mut self.windows[id].vk_mirror.unwrap();  // &mut self.windows
@@ -86,11 +262,11 @@ scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {  // &mut self.schedule
 
 `&mut self.scheduler` and `&mut self.windows` are disjoint fields; the borrow checker handles them.
 
-The KmsBackend `record_paint_op` / `record_paint_batch_op` become shims for callers that don't hold a conflicting borrow. T1 will reveal whether they're actually used; if not, T2 can delete them.
+The KmsBackend `record_paint_op` / `record_paint_batch_op` become shims for callers that don't hold a conflicting borrow. T2/T3 will reveal whether they're actually used; if not, a future cleanup can delete them.
 
 ### `renderer_failed` flag — Option A from the design appendix
 
-`composite_and_flip` returns fatal Vk errors via `io::Error::other(...)`, but the trait-surface `Backend::on_page_flip_ready` returns `()` and drops the error on the floor. Once T1 migrates fill, a fatal `submit_and_wait` failure produces an abandoned `Submitted`-state batch; the next composite cycle would try to use it and produce more abandoned CBs each tick.
+`composite_and_flip` returns fatal Vk errors via `io::Error::other(...)`, but the trait-surface `Backend::on_page_flip_ready` returns `()` and drops the error on the floor. Once T2 migrates fill, a fatal `submit_and_wait` failure produces an abandoned `Submitted`-state batch; the next composite cycle would try to use it and produce more abandoned CBs each tick.
 
 **Option A** (recommended in the plan appendix): in-band `renderer_failed: bool` on `KmsBackend`. Set true on any fatal Vk failure from `flush_if_needed`. Gate every paint entry point on it: `record_paint_op`, `record_paint_batch_op`, `flush_if_needed`, `composite_and_flip`, `try_vulkan_composite_flip` — all early-return / no-op when the flag is set.
 
@@ -114,7 +290,7 @@ In `crates/yserver/src/kms/scheduler/mod.rs`, add to `impl RenderScheduler`:
     /// site holds for the recorder's `&mut DrawableImage` argument.
     pub fn record_paint_batch_op<F>(
         &mut self,
-        vk: Arc<VkContext>,
+        vk_arc: Arc<VkContext>,
         pool: vk::CommandPool,
         record: F,
     ) -> Result<(), vk::Result>
@@ -126,7 +302,9 @@ In `crates/yserver/src/kms/scheduler/mod.rs`, add to `impl RenderScheduler`:
         ) -> Result<(), vk::Result>,
     {
         // open_batch consumes the Arc — clone for the closure invocation.
-        let _ = self.open_batch(vk.clone(), pool);
+        // Note: parameter is `vk_arc` not `vk` so it doesn't shadow the
+        // `ash::vk` module used for `vk::Result::*` below.
+        let _ = self.open_batch(vk_arc.clone(), pool);
         let batch = self
             .current_paint_batch
             .as_mut()
@@ -151,7 +329,7 @@ In `crates/yserver/src/kms/scheduler/mod.rs`, add to `impl RenderScheduler`:
             BatchState::Recording => {}
         }
         let cb = batch.command_buffer().expect("Recording implies cb");
-        match record(&vk, batch, cb) {
+        match record(&vk_arc, batch, cb) {
             Ok(()) => Ok(()),
             Err(e) => {
                 batch.poison_external();
@@ -165,30 +343,68 @@ In `crates/yserver/src/kms/scheduler/mod.rs`, add to `impl RenderScheduler`:
     /// for textual-rewrite migration.
     pub fn record_paint_op<F>(
         &mut self,
-        vk: Arc<VkContext>,
+        vk_arc: Arc<VkContext>,
         pool: vk::CommandPool,
         record: F,
     ) -> Result<(), vk::Result>
     where
         F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
     {
-        self.record_paint_batch_op(vk, pool, |vk, _batch, cb| record(vk, cb))
+        self.record_paint_batch_op(vk_arc, pool, |vk, _batch, cb| record(vk, cb))
     }
 ```
 
 The `Arc<VkContext>` and `vk::CommandPool` types are already in scope (file imports them at the top from 3A T1 step 2). If not, add the imports.
 
-- [ ] **Step 2: Reduce `KmsBackend::record_paint_op` / `record_paint_batch_op` to thin shims**
+- [ ] **Step 2: Add `KmsBackend::paint_resources()` helper**
+
+This is the load-bearing fix for the renderer-failed-bypass concern: every direct call to `self.scheduler.record_paint_op(vk_arc, pool_handle, ...)` MUST go through this helper to extract `vk_arc` and `pool_handle`. The helper is the single point where `renderer_failed` is checked.
+
+```rust
+    /// Returns the resources needed to call
+    /// `self.scheduler.record_paint_op` / `record_paint_batch_op`,
+    /// or `None` if the renderer is failed / Vk is unavailable /
+    /// the ops pool is not yet built.
+    ///
+    /// **Use this at every paint call site that needs to take a
+    /// `&mut self.windows[id]` / `&mut self.pixmaps[id]` borrow
+    /// for the recorder's `&mut DrawableImage` argument.** Going
+    /// through `self.record_paint_op(...)` (the shim added in
+    /// step 3) is convenient when no such borrow conflict exists,
+    /// but the shim is `&mut self` and conflicts with field
+    /// borrows.
+    ///
+    /// Both shim and helper gate on `renderer_failed` — every
+    /// paint entry point checks the flag.
+    fn paint_resources(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::kms::vk::device::VkContext>,
+        ash::vk::CommandPool,
+    )> {
+        if self.renderer_failed {
+            return None;
+        }
+        let vk_arc = self.vk.as_ref().cloned()?;
+        let pool_handle = self.ops_command_pool.as_ref()?.handle();
+        Some((vk_arc, pool_handle))
+    }
+```
+
+`&self` (not `&mut self`) — so it can be called from a context that already has `&mut self.windows` (the `&self` captures only the immutable subfields `self.vk`, `self.ops_command_pool`, `self.renderer_failed`, all disjoint from `self.windows` and `self.scheduler`).
+
+- [ ] **Step 3: Reduce `KmsBackend::record_paint_op` / `record_paint_batch_op` to thin shims**
 
 In `crates/yserver/src/kms/backend.rs`, replace the existing bodies (added in 3A T5) with:
 
 ```rust
-    /// Shim: pull vk + ops pool, delegate to the scheduler-level
-    /// `record_paint_batch_op`. Useful when the caller doesn't hold
-    /// a conflicting `&mut self.windows` / `.pixmaps` borrow.
-    /// Recorders that DO hold such a borrow must call
-    /// `self.scheduler.record_paint_batch_op(vk_arc, pool_handle, ...)`
-    /// directly (use field projection on self at the call site).
+    /// Shim: pull vk + ops pool via `paint_resources()`, delegate
+    /// to the scheduler-level `record_paint_batch_op`. Useful when
+    /// the caller doesn't hold a conflicting `&mut self.windows`
+    /// / `.pixmaps` borrow. Recorders that DO hold such a borrow
+    /// must use `paint_resources()` + `self.scheduler.record_paint_batch_op(...)`
+    /// directly (field projection works because `&mut self.scheduler`
+    /// is disjoint from `&mut self.windows`).
     pub fn record_paint_batch_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
     where
         F: FnOnce(
@@ -197,14 +413,11 @@ In `crates/yserver/src/kms/backend.rs`, replace the existing bodies (added in 3A
             ash::vk::CommandBuffer,
         ) -> Result<(), ash::vk::Result>,
     {
-        if self.renderer_failed {
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            // Either renderer_failed or vk/ops_pool unavailable. The
+            // caller's existing fallback (typically log + return
+            // false to fall back to pixman) handles either case.
             return Err(ash::vk::Result::ERROR_DEVICE_LOST);
-        }
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
         };
         self.scheduler.record_paint_batch_op(vk_arc, pool_handle, record)
     }
@@ -218,9 +431,9 @@ In `crates/yserver/src/kms/backend.rs`, replace the existing bodies (added in 3A
     }
 ```
 
-Both shims now also gate on `renderer_failed` — if the flag is set, paint is rejected before any batch state machine work happens.
+Both shims gate on `renderer_failed` via `paint_resources()` — if the flag is set, paint is rejected before any batch state machine work happens.
 
-- [ ] **Step 3: Add `renderer_failed` field + gates on `composite_and_flip` and `flush_if_needed`**
+- [ ] **Step 4: Add `renderer_failed` field + gates on `composite_and_flip` and `flush_if_needed`**
 
 In `crates/yserver/src/kms/backend.rs`, find `KmsBackend` struct definition and add the field (place near `ops_command_pool` for adjacency to other backend-state fields):
 
@@ -307,7 +520,7 @@ Also gate `try_vulkan_composite_flip` (it's called from inside the per-output lo
 
 The three readback-flush sites (`try_vk_get_image_pixels`, `hw_cursor_refresh`, `read_mirror_pixels`) already check `flush_if_needed`'s return — they get `ERROR_DEVICE_LOST` via the new gate and fall through their existing error paths. No code changes needed there.
 
-- [ ] **Step 4: Add unit tests for the gate**
+- [ ] **Step 5: Add unit tests for the gate**
 
 In `crates/yserver/src/kms/backend.rs` `#[cfg(test)] mod tests`:
 
@@ -354,7 +567,7 @@ In `crates/yserver/src/kms/backend.rs` `#[cfg(test)] mod tests`:
 
 If `KmsBackend::for_tests()` doesn't exist verbatim, look at the existing test in `composite_and_flip_does_not_set_flip_pending_on_no_vk_path` (around line 11877) for the test harness pattern; reuse it.
 
-- [ ] **Step 5: Verify**
+- [ ] **Step 6: Verify**
 
 ```bash
 cargo +nightly fmt
@@ -362,30 +575,25 @@ cargo clippy
 cargo test
 ```
 
-Expected: 4 new tests pass. The existing `record_paint_op` test from 3A T5 (`record_paint_op_returns_init_failure_without_vk`, if it exists) still passes — the no-vk path is hit before the renderer_failed check.
+Expected: 4 new tests pass. The existing `record_paint_op` test from 3A T5 (`record_paint_op_returns_init_failure_without_vk`, if it exists) may need its expected error code updated — `paint_resources()` returning `None` now collapses the no-vk case to `ERROR_DEVICE_LOST` from the shim. Update or delete that test as appropriate.
 
-Verify the shim still works as before for the no-borrow-conflict case:
-```bash
-cargo test -p yserver kms
-```
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/yserver/src/kms/scheduler/mod.rs crates/yserver/src/kms/backend.rs
-git commit -m "feat(kms): RenderScheduler::record_paint_op + renderer_failed gate"
+git commit -m "feat(kms): RenderScheduler::record_paint_op + renderer_failed gate + paint_resources helper"
 ```
 
 ---
 
-## Task 1: Migrate `fill` family
+## Task 2: Migrate `fill` family
 
 **Files:**
 - Modify: `crates/yserver/src/kms/backend.rs` (4 call sites by current grep count)
 
 The simplest family — no scratch deps. Two recorders (`fill::record_fill_rectangles`, `fill::record_logic_fill`); 4 call sites in `backend.rs`.
 
-**Per-call-site transformation template.** Original:
+**Per-call-site transformation template.** Original (post-T0, every paint-side site is either `run_legacy_paint_op` or one of the four fill sites that T0 left alone):
 
 ```rust
         let vk_arc = self.vk.as_ref().cloned()?;
@@ -396,20 +604,27 @@ The simplest family — no scratch deps. Two recorders (`fill::record_fill_recta
         })
 ```
 
-Migrated (`&mut self.scheduler` is disjoint from `&mut self.windows` / `.pixmaps`):
+Migrated (uses `paint_resources()` so the `renderer_failed` gate runs; `&mut self.scheduler` is disjoint from `&mut self.windows` / `.pixmaps`):
 
 ```rust
-        let vk_arc = self.vk.as_ref().cloned()?;
-        let pool_handle = self.ops_command_pool.as_ref()?.handle();
+        let (vk_arc, pool_handle) = self.paint_resources()?;
         // ... compute color, rects, scissor, get mirror ...
         self.scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {
             fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
         })
 ```
 
+If the function's return type doesn't match `paint_resources()`'s `Option`, adapt:
+
+```rust
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            return false; // or whatever the existing no-vk path returns
+        };
+```
+
 The `run_one_shot_op` import becomes unused if no other op in the same function uses it; remove from the function-scope `use` if so. The `fill` import stays.
 
-**Renderer-failed handling.** `record_paint_op` already gates on `self.renderer_failed` via the shim chain. If the backend is failed, the recorder returns `Err(ERROR_DEVICE_LOST)` — caller's existing error path (typically log-and-fall-back-to-pixman) runs.
+**Renderer-failed handling.** `paint_resources()` returns `None` if `renderer_failed` is set — caller's existing no-vk fallback (log-and-fall-back-to-pixman, or return false) handles the failed case the same way it handled "Vk unavailable" before.
 
 **3A T4 audit confirmed**: both fill recorders have NO error paths from Rust's side (Vulkan calls are in `unsafe { }` blocks returning `()`). So `Poisoned` is unreachable from fill.
 
@@ -446,14 +661,20 @@ Expected: all green. No new warnings. The composite cycle log should show the ba
 
 - [ ] **Step 4: Audit cutover**
 
+`run_one_shot_op` and the recorder name are on different lines, so single-line greps miss them. Use `rg -U` (multiline) or grep for the recorder name with context:
+
 ```bash
-# Should be zero hits — all fill call sites migrated:
-rg -n 'run_one_shot_op.*fill::' crates/yserver/src/kms/backend.rs
-# Or with the imports pattern:
-rg -n 'run_one_shot_op\(.*\n.*fill::record_' crates/yserver/src/kms/backend.rs
+# Show context around every fill recorder call site. Each one
+# should now be inside `self.scheduler.record_paint_op(...)`,
+# NOT inside `run_one_shot_op(...)`.
+rg -nB2 -A2 'fill::record_fill_rectangles|fill::record_logic_fill' crates/yserver/src/kms/backend.rs
+
+# Or multiline:
+rg -nU 'run_one_shot_op[^)]*\)\s*,\s*\|[^|]*\|\s*\{[^}]*fill::record_' crates/yserver/src/kms/backend.rs
+# Expected: zero matches.
 ```
 
-If non-zero, you missed a site. Migrate it.
+Inspect each `fill::record_*` hit visually: confirm the call is wrapped in `self.scheduler.record_paint_op(...)`, not `run_one_shot_op(...)`.
 
 - [ ] **Step 5: Commit**
 
@@ -464,12 +685,12 @@ git commit -m "refactor(kms): migrate fill recorders to PaintBatch via record_pa
 
 ---
 
-## Task 2: Migrate `copy` distinct + same (NOT same_overlap)
+## Task 3: Migrate `copy` distinct + same (NOT same_overlap)
 
 **Files:**
 - Modify: `crates/yserver/src/kms/backend.rs` (4 call sites by current grep count)
 
-Two recorders (`copy::record_copy_area_distinct`, `copy::record_copy_area_same`); 4 call sites. Same transformation template as T1.
+Two recorders (`copy::record_copy_area_distinct`, `copy::record_copy_area_same`); 4 call sites. Same transformation template as T2 (fill).
 
 **Critical scoping:** `copy::record_copy_area_same_overlap` (the third copy recorder) is NOT migrated here. It uses `CopyScratch`, a backend-shared scratch image; the second use within one batch would alias the first. Defers to 3D after 3C lands the per-batch upload arena strategy that informs how shared scratch images are handled.
 
@@ -487,15 +708,18 @@ The `\b` word boundary in the grep is important: it excludes `copy::record_copy_
 
 - [ ] **Step 2: Migrate each call site**
 
-Same transformation as T1. Examples:
+Same transformation as T2. Examples:
 
 ```rust
 // Before (~2670):
+let vk_arc = self.vk.as_ref().cloned()?;
+let pool_handle = self.ops_command_pool.as_ref()?.handle();
 if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
     vk_copy::record_copy_area_distinct(vk, cb, src, &mut cm, &regions)
 }) { ... }
 
 // After:
+let (vk_arc, pool_handle) = self.paint_resources()?;
 if let Err(e) = self.scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {
     vk_copy::record_copy_area_distinct(vk, cb, src, &mut cm, &regions)
 }) { ... }
@@ -508,6 +732,9 @@ return match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
 }) { ... };
 
 // After:
+let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+    return false;
+};
 return match self.scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {
     copy::record_copy_area_same(vk, cb, mirror, &regions)
 }) { ... };
@@ -526,12 +753,17 @@ cargo test
 - [ ] **Step 4: Audit cutover**
 
 ```bash
-# Distinct + same should be zero:
-rg -n 'run_one_shot_op.*copy::record_copy_area_distinct\|run_one_shot_op.*copy::record_copy_area_same\b' crates/yserver/src/kms/backend.rs
+# Show context around every distinct + same recorder call. Each
+# should now be inside `self.scheduler.record_paint_op(...)`.
+rg -nB2 -A2 'copy::record_copy_area_distinct|copy::record_copy_area_same\b|vk_copy::record_copy_area_distinct|vk_copy::record_copy_area_same\b' crates/yserver/src/kms/backend.rs
 
-# same_overlap should still have its hit (deferred to 3D):
-rg -n 'run_one_shot_op.*record_copy_area_same_overlap' crates/yserver/src/kms/backend.rs
-# Expected: 1 hit
+# Note: the `\b` excludes `record_copy_area_same_overlap`.
+
+# same_overlap should still be inside `run_legacy_paint_op`
+# (T0 wrapped it):
+rg -nB2 -A2 'record_copy_area_same_overlap' crates/yserver/src/kms/backend.rs
+# Expected: still inside run_legacy_paint_op (or the borrow-conflict
+# fallback). NOT inside record_paint_op.
 ```
 
 - [ ] **Step 5: Commit**
@@ -543,7 +775,7 @@ git commit -m "refactor(kms): migrate copy distinct+same recorders to PaintBatch
 
 ---
 
-## Task 3: Validation + results doc
+## Task 4: Validation + results doc
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3b-results.md`
@@ -562,21 +794,38 @@ Expected: all three exit 0.
 
 - [ ] **Step 2: Cutover greps**
 
+Use context-greps (recorder name + surrounding lines) since `run_one_shot_op` and the recorder are on different lines.
+
 ```bash
-# Migrated families: zero hits.
-rg -n 'run_one_shot_op.*fill::' crates/yserver/src/kms/backend.rs
-rg -n 'run_one_shot_op.*copy::record_copy_area_distinct\|run_one_shot_op.*copy::record_copy_area_same\b' crates/yserver/src/kms/backend.rs
+# Migrated fill sites: each `fill::record_*` should be inside
+# `self.scheduler.record_paint_op(...)`. Inspect visually.
+rg -nB2 -A2 'fill::record_fill_rectangles|fill::record_logic_fill' crates/yserver/src/kms/backend.rs
 
-# same_overlap still on run_one_shot_op (3D scope):
-rg -n 'run_one_shot_op.*record_copy_area_same_overlap' crates/yserver/src/kms/backend.rs
+# Migrated copy sites: each `record_copy_area_distinct` / `record_copy_area_same`
+# (with word boundary to exclude same_overlap) should be inside
+# `self.scheduler.record_paint_op(...)`.
+rg -nB2 -A2 'record_copy_area_distinct|record_copy_area_same\b' crates/yserver/src/kms/backend.rs
 
-# Other families still on run_one_shot_op (3C/3D scope):
-rg -c 'run_one_shot_op' crates/yserver/src/kms/backend.rs
-# Expected: down by ~8 from phase-2 baseline (4 fill + 4 copy = 8 sites moved); other families unchanged.
+# same_overlap should be inside `run_legacy_paint_op(...)`
+# (T0 wrapped) or its borrow-conflict fallback. NOT inside
+# record_paint_op (3D will migrate).
+rg -nB2 -A2 'record_copy_area_same_overlap' crates/yserver/src/kms/backend.rs
+
+# Total raw `run_one_shot_op` calls should be down significantly
+# from the phase-2 baseline (39 sites): 4 fill + 4 copy migrated
+# to record_paint_op; ~25 sites wrapped via `run_legacy_paint_op`
+# (the wrapper itself contains 1 raw call). Most remaining raw
+# `run_one_shot_op` hits should be inside `run_legacy_paint_op`'s
+# body or borrow-conflict fallbacks.
+rg -c 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs
 
 # renderer_failed wired:
 rg -n 'renderer_failed' crates/yserver/src/kms/backend.rs
-# Expected: field declaration + 4-5 gate sites + 4 test references.
+# Expected: field declaration + ~5 gate sites + 4 test references.
+
+# paint_resources is the gateway for direct scheduler calls:
+rg -n 'paint_resources\(' crates/yserver/src/kms/backend.rs
+# Expected: ~8-12 hits (4 fill + 4 copy + a few others) plus the definition.
 ```
 
 - [ ] **Step 3: XTS regression**
@@ -611,7 +860,7 @@ User runs the desktop session (`just yserver-mate-hw-release` or local equivalen
 
 Create `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3b-results.md` modeled on phase-3A's. Sections:
 
-- Scope landed (T0 + T1 + T2).
+- Scope landed (T0 + T1 + T2 + T3).
 - Preflight checks.
 - Cutover grep results (paste actual output).
 - XTS / rendercheck status.
@@ -635,15 +884,18 @@ git commit -m "docs: phase-3B rendering re-architecture validation results"
 
 3B is complete when:
 
-1. All 3 tasks committed; tree green (`cargo test`, `cargo clippy`, `cargo fmt --check`).
-2. `RenderScheduler::record_paint_op` and `record_paint_batch_op` exist; `KmsBackend`'s versions are thin shims.
-3. `KmsBackend::renderer_failed` field gates `record_paint_op{,_batch_op}`, `flush_if_needed`, `composite_and_flip`, `try_vulkan_composite_flip`.
-4. `composite_and_flip` sets `renderer_failed = true` on fatal Vk error from `flush_if_needed(VisibleComposite)`.
-5. All 4 `fill` family call sites in `backend.rs` migrated to `self.scheduler.record_paint_op(...)`.
-6. All 4 `copy::record_copy_area_distinct` + `record_copy_area_same` call sites migrated.
-7. `copy::record_copy_area_same_overlap` still uses `run_one_shot_op` (deferred to 3D).
-8. XTS / rendercheck / hardware smoke green; no regressions vs phase 3A.
-9. The `flush_if_needed(VisibleComposite)` path in `composite_and_flip` is now load-bearing — it carries real recorded work into `submit_and_wait` for the first time.
+1. All 5 tasks committed; tree green (`cargo test`, `cargo clippy`, `cargo fmt --check`).
+2. `KmsBackend::run_legacy_paint_op` exists and wraps `flush_if_needed(ProtocolBarrier)` + `run_one_shot_op`. Every paint-side `run_one_shot_op` call site is either (a) inside `run_legacy_paint_op`'s dispatch body, (b) a borrow-conflict fallback that still does explicit pre-flush, (c) one of the three `Readback` handlers, or (d) about to be replaced by the migration tasks (T2/T3 fill/copy).
+3. `RenderScheduler::record_paint_op` and `record_paint_batch_op` exist; `KmsBackend`'s versions are thin shims that gate via `paint_resources()`.
+4. `KmsBackend::paint_resources()` returns `Option<(Arc<VkContext>, vk::CommandPool)>` and gates on `renderer_failed`. Every direct `self.scheduler.record_paint_op(...)` call site goes through it.
+5. `KmsBackend::renderer_failed` field gates `record_paint_op{,_batch_op}` (via `paint_resources`), `flush_if_needed`, `composite_and_flip`, `try_vulkan_composite_flip`, `run_legacy_paint_op`.
+6. `composite_and_flip` sets `renderer_failed = true` on fatal Vk error from `flush_if_needed(VisibleComposite)`.
+7. All 4 `fill` family call sites in `backend.rs` migrated to `self.scheduler.record_paint_op(...)`.
+8. All 4 `copy::record_copy_area_distinct` + `record_copy_area_same` call sites migrated.
+9. `copy::record_copy_area_same_overlap` is wrapped via `run_legacy_paint_op` (deferred from migration to 3D).
+10. XTS / rendercheck / hardware smoke green; no regressions vs phase 3A.
+11. The `flush_if_needed(VisibleComposite)` path in `composite_and_flip` is now load-bearing — it carries real recorded work into `submit_and_wait` for the first time.
+12. Mixed batched + legacy paint ops on the same drawable produce correct rendering — the load-bearing test is XTS5 + rendercheck, both of which exercise interleaved fill/copy/render sequences.
 
 ## What's next
 
