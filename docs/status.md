@@ -63,6 +63,13 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Interleaved fixes during 3E smoke: composite-pool-release per-frame (`cb44c1d`), Composite mode-constant attempt + revert (`92a2a83` → `3751c11`, filed).
   - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3e-results.md`
 
+- [x] **Phase 3F-1 — Render-composite migration** (`fade626` + fix-ups `c4a4965`)
+  - Migrated `try_vk_render_composite` to `record_paint_batch_op`. Descriptor set allocated per-batch via `RenderPipelineCache::allocate_descriptor_for_views_into` + `BatchDescriptorArena` (T2, `3fe108b`). `DstReadback::needs_grow` accessor (T1, `afc18f6`) + pre-resize flush gate prevents the same dangling-image hazard 3D fixed for `CopyScratch`.
+  - Unconditional pre-record `ProtocolBarrier` flush before each RENDER Composite is gone; composite-heavy frames now pack into the open `PaintBatch` alongside fill / copy / put_image / text.
+  - `try_vk_render_traps_or_tris` and the legacy shared-pool allocator + `reset_descriptors` deliberately retained for 3F-2.
+  - Hardware smoke: TBD (user-owned).
+  - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3f-1-results.md`
+
 ### Inter-phase chores landed alongside
 
 - [x] **Composite defer log summary** (`4c4741b`) — turn per-frame `pool_ring_exhausted` warn-spam into a periodic 5s `info!` summary.
@@ -71,11 +78,12 @@ Cross-cutting bugs and followups that don't fit a phase live in
 
 ### Remaining — in priority order
 
-- [ ] **Phase 3F — Render-composite + traps + scratch infrastructure**
-  - Recorders: `try_vk_render_composite` (RENDER Composite), `try_vk_render_traps_or_tris` (RENDER Trapezoids/Triangles).
-  - Per-batch `MaskScratch::upload_r8` staging (currently shared host buffer, aliases between in-batch ops).
-  - `dst_readback` strategy for non-Over RENDER operators (current `ensure` grow has the same `queue_wait_idle + destroy` hazard as 3D's `CopyScratch`).
-  - Sized roughly like 3D × 2; may split into 3F-1 (render-composite + dst_readback) and 3F-2 (traps + MaskScratch) if scope rules.
+- [ ] **Phase 3F-2 — Render-traps/triangles migration + MaskScratch arena**
+  - Recorder: `try_vk_render_traps_or_tris` (RENDER Trapezoids/Triangles/TriStrip/TriFan).
+  - `MaskScratch::upload_r8` → `BatchUploadArena` migration (currently shared host buffer, aliases between in-batch ops).
+  - `MaskScratch::needs_grow` for the image-side grow path (analogous to 3F-1's `DstReadback::needs_grow`).
+  - Removal of the legacy `RenderPipelineCache::reset_descriptors` / `allocate_descriptor_for_views` + the `RenderPipelineCache.descriptor_pool` field when their last caller goes away.
+  - Audit-catalogue label fix: `try_vk_render_traps (composite)` → real name `try_vk_render_traps_or_tris`.
 - [ ] **Phase 4 — Sync rework**
   - Retire `vkQueueWaitIdle` from `run_one_shot_op` (the hot-path drain).
   - Retire the close-time wait in `PaintBatch::submit_and_wait`.
