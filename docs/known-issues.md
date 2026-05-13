@@ -38,6 +38,21 @@ once the underlying patterns are understood.
 
 ## Input, grabs, event routing
 
+- [ ] **Caja right-click context menu pops up offset (too far right
+      and down).** Observed 2026-05-13 on dual-screen MATE smoke
+      (5120x1440 = 2× 2560x1440). Right-clicking an item in caja
+      produces a context menu that appears displaced from the click
+      origin — both axes off. Click events themselves look correctly
+      coordinate-translated in pointer_fanout debug logs (`root=(x,y)
+      event_xy=(rx,ry)` with sane window-relative deltas). So the
+      bug is most likely in either (a) the popup-window placement
+      math caja does (it queries pointer / window position and adds
+      an offset; one of those queries returns the wrong value), or
+      (b) some dual-screen origin confusion when caja places the
+      popup. Worth investigating with xtrace on a single-screen
+      yserver first — the dual-screen geometry adds confounders.
+      Could also be xfixes ShapeExtents or the popup's
+      synthesize-ConfigureNotify path. Filed for later.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
