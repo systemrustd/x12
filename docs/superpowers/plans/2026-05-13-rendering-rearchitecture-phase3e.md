@@ -92,33 +92,60 @@ Key invariants 3E inherits from 3A/3B/3C/3D:
 - [ ] **Step 1: Read backend.rs lines 4430–4551**
 
 Note the structure:
-1. Lines 4430–4470: parameter check, mirror format check. **Keeps as-is.**
-2. Lines 4472–4494: intern loop. **Keeps as-is** (self-contained one-shot per glyph).
-3. Lines 4496–4501: `foreground_rgba` build. Keeps.
-4. Lines 4503–4513: inline `flush_if_needed(BatchFlushReason::ProtocolBarrier)`. **REMOVED.**
-5. Lines 4515–4529: mirror + atlas + pipeline borrows. Keeps but reorder if needed.
-6. Lines 4531–4550: `run_one_shot_op(...) { record_text_run(...) }`. **Replaced by `self.scheduler.record_paint_op(...)`.**
+1. Lines 4430–4445: parameter check, early returns on empty input. **Keeps.**
+2. Lines 4446–4451: **OLD** raw `self.vk.as_ref().cloned()` + `self.ops_command_pool.as_ref().map(|p| p.handle())` bindings. Used today by the intern loop's `pool_handle` arg AND by `run_one_shot_op` below. **REPLACED** with a single `paint_resources()` call that gates on `renderer_failed`.
+3. Lines 4452–4470: atlas / pipeline presence check + mirror format check. **Keeps.**
+4. Lines 4472–4494: intern loop. **Keeps as-is** (self-contained one-shot per glyph, uses `pool_handle` from step 2 — now sourced from `paint_resources()`).
+5. Lines 4496–4501: `foreground_rgba` build. **Keeps.**
+6. Lines 4503–4513: inline `flush_if_needed(BatchFlushReason::ProtocolBarrier)`. **REMOVED.**
+7. Lines 4515–4529: mirror + atlas + pipeline borrows. **Keeps** (these are the closure's captures).
+8. Lines 4531–4550: `run_one_shot_op(...) { record_text_run(...) }`. **Replaced by `self.scheduler.record_paint_op(...)`**, reusing `vk_arc` / `pool_handle` from step 2.
 
 ### Step 2: Apply the migration
 
-- [ ] **Step 2: Replace the function body from the `foreground_rgba` line onward**
+The key structural change codex flagged in plan-v1 review: replace BOTH the early `vk_arc`/`pool_handle` raw binding AND the later one-shot recorder with a **single** `paint_resources()` call placed BEFORE the intern loop. This (a) gates the glyph upload on `renderer_failed`, (b) removes the duplicate binding that becomes unused after the migration, (c) keeps the borrow split clean.
 
-Keep lines 4430–4501 (parameter check + mirror format check + intern loop + foreground_rgba build) UNCHANGED.
+- [ ] **Step 2a: Replace the early raw binding (lines ~4446–4451)**
 
-Replace lines 4503–4550 (the inline flush + run_one_shot_op block) with:
+Find:
 
 ```rust
-        // Acquire batch resources (gated by renderer_failed). After
-        // the intern loop above; atlas is fully populated and in
-        // SHADER_READ_ONLY_OPTIMAL.
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return false;
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return false;
+        };
+```
+
+Replace with:
+
+```rust
+        // 3E: acquire batch resources up-front (gated by
+        // renderer_failed). Atlas upload (intern) and the recorder
+        // BOTH route through this — single source for vk_arc /
+        // pool_handle removes the duplicate binding that pre-3E
+        // had (one for intern's pool, one for run_one_shot_op's
+        // submit).
         let Some((vk_arc, pool_handle)) = self.paint_resources() else {
             return false;
         };
+```
 
-        // Re-borrow the mirror mutably for the recording.
-        // self.scheduler is disjoint from self.windows / self.pixmaps;
-        // self.glyph_atlas and self.text_pipeline are read-only shared
-        // borrows that coexist with the closure's recording.
+- [ ] **Step 2b: Keep the intern loop unchanged**
+
+The intern loop body uses `pool_handle` (from step 2a) — no edit needed inside the loop.
+
+- [ ] **Step 2c: Replace the flush + run_one_shot_op block (lines ~4503–4550)**
+
+Replace the entire block from the inline `use crate::kms::scheduler::paint_batch::BatchFlushReason;` flush down through the `match run_one_shot_op(...) { ... }` (and its closing brace) with:
+
+```rust
+        // Re-borrow the mirror mutably for the recording. The
+        // closure also captures atlas + pipeline (read-only) from
+        // disjoint fields. self.scheduler.record_paint_op is the
+        // remaining mutable borrow; field-disjoint, so the borrow
+        // checker accepts.
         let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
@@ -157,7 +184,9 @@ Replace lines 4503–4550 (the inline flush + run_one_shot_op block) with:
     }
 ```
 
-Also delete the unused `run_one_shot_op` import. Find the `use` statement at the top of the function:
+- [ ] **Step 2d: Delete the unused `run_one_shot_op` import**
+
+Find the `use` statement at the top of the function:
 
 ```rust
         use crate::kms::vk::{
@@ -242,25 +271,56 @@ EOF
 
 - [ ] **Step 1: Read backend.rs lines 5181–5473**
 
-Most of the function (5181–5421) is RENDER-protocol parsing: walking the `items` byte buffer to build `Vec<TextGlyph>`. All of that is unchanged. The migration only touches the tail.
+Most of the function (5181–5421) is RENDER-protocol parsing — walking the `items` byte buffer to build `Vec<TextGlyph>`. All of that is unchanged. The migration touches the early raw `vk_arc`/`pool_handle` binding (~lines 5244–5258) AND the tail (`flush_if_needed` + `run_one_shot_op` ~lines 5427–5472).
 
-The flush + run_one_shot_op block is at lines 5427–5472. Same shape as T1.
+Same shape as T1. Codex's plan-v1 review caught that both functions have a duplicate binding once the run_one_shot_op call is replaced — fold the change into a single `paint_resources()` call before the intern loop.
 
 ### Step 2: Apply the migration
 
-- [ ] **Step 2: Replace lines 5427–5472**
+- [ ] **Step 2a: Replace the early raw binding (lines ~5244–5258)**
 
-Replace the inline `flush_if_needed(ProtocolBarrier)` block + the `run_one_shot_op(...)` call with:
+Find:
 
 ```rust
-        // Acquire batch resources (gated by renderer_failed). After
-        // the intern loop above; atlas is fully populated and in
-        // SHADER_READ_ONLY_OPTIMAL.
-        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            log::debug!("vk text bail: no Vk context");
             return false;
         };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            log::debug!("vk text bail: no ops_command_pool");
+            return false;
+        };
+```
 
-        // Re-borrow the mirror mutably for the recording.
+Replace with:
+
+```rust
+        // 3E: acquire batch resources up-front (gated by
+        // renderer_failed). Atlas upload (intern) and the recorder
+        // BOTH route through this — single source for vk_arc /
+        // pool_handle.
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            log::debug!("vk text bail: paint_resources unavailable (renderer_failed or vk/pool absent)");
+            return false;
+        };
+```
+
+(Folding the two prior log-debug lines into one is acceptable — they were two separate bail reasons before but `paint_resources()` returns `None` for any of the three conditions, so a single log line is fine.)
+
+- [ ] **Step 2b: Keep the intern loop unchanged**
+
+The intern loop's `atlas.intern(..., pool_handle)` call already references `pool_handle` from step 2a. No edit inside the loop.
+
+- [ ] **Step 2c: Replace the flush + run_one_shot_op block (lines ~5427–5472)**
+
+Replace the entire `use crate::kms::scheduler::paint_batch::BatchFlushReason; if let Err(e) = self.flush_if_needed(...)` block AND the subsequent `match run_one_shot_op(...) { ... }` call with:
+
+```rust
+        // Re-borrow the mirror mutably for the recording. The
+        // closure also captures atlas + pipeline (read-only) from
+        // disjoint fields. self.scheduler.record_paint_op is the
+        // remaining mutable borrow; field-disjoint, so the borrow
+        // checker accepts.
         let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
@@ -299,7 +359,9 @@ Replace the inline `flush_if_needed(ProtocolBarrier)` block + the `run_one_shot_
     }
 ```
 
-Also drop the unused `run_one_shot_op` from the function's `use` statement near line 5194-5197:
+- [ ] **Step 2d: Delete the unused `run_one_shot_op` import**
+
+Find the `use` statement near line 5194-5197:
 
 ```rust
         use crate::kms::vk::{
@@ -308,59 +370,37 @@ Also drop the unused `run_one_shot_op` from the function's `use` statement near 
         };
 ```
 
-becomes:
+Change to:
 
 ```rust
         use crate::kms::vk::{glyph::GlyphKey, ops::text as vk_text};
 ```
 
-### Step 3: Also check the early `vk_arc` / `pool_handle` acquisition
+### Step 3: Build
 
-- [ ] **Step 3: Find any duplicate `vk_arc` / `pool_handle` binding**
-
-Earlier in the function (around lines 5244–5258), `try_vk_render_composite_glyphs` does:
-
-```rust
-        let Some(vk_arc) = self.vk.as_ref().cloned() else { ... };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else { ... };
-```
-
-These are used by `intern`'s `pool_handle` argument (line ~5405). They are NOT replaced by `paint_resources()` because:
-- `intern` is called BEFORE the migration's `paint_resources()` call.
-- `intern` only needs the raw `pool_handle`, not the `renderer_failed`-gated tuple.
-- Keeping the early binding for intern + the new `paint_resources()` for the recorder is fine — they're sequential, no borrow conflict.
-
-**Do NOT remove the early binding.** Leave it as-is; the `paint_resources()` call inside Step 2's replacement is a separate, later binding.
-
-Verify by running `cargo check -p yserver` — expect clean. If you see "unused vk_arc" warnings, that means the early binding ISN'T used by anything else (only by the now-removed `run_one_shot_op` body). In that case, **delete the early binding** and rely on `paint_resources()` for the rest of the function. But `pool_handle` is definitely used by `intern` at line ~5405, so keep that.
-
-Read the function again post-edit to confirm: `vk_arc` should be used at the call to `record_paint_op` (the new one); `pool_handle` should be used by `intern` (early loop) AND by `record_paint_op` (the new one). If `vk_arc`'s early binding is unused, delete it but keep `pool_handle`.
-
-### Step 4: Build
-
-- [ ] **Step 4: `cargo check -p yserver`**
+- [ ] **Step 3: `cargo check -p yserver`**
 
 Expected: clean.
 
-### Step 5: Run tests
+### Step 4: Run tests
 
-- [ ] **Step 5: `cargo test -p yserver --lib`**
+- [ ] **Step 4: `cargo test -p yserver --lib`**
 
 Expected: 138 passed.
 
-### Step 6: fmt + clippy
+### Step 5: fmt + clippy
 
-- [ ] **Step 6: `cargo +nightly fmt --check`**
+- [ ] **Step 5: `cargo +nightly fmt --check`**
 
 Expected: no diff.
 
-- [ ] **Step 7: `cargo clippy -p yserver 2>&1 | tail -10`**
+- [ ] **Step 6: `cargo clippy -p yserver 2>&1 | tail -10`**
 
 Expected: 5 pre-existing warnings; no new ones.
 
-### Step 7: Commit T2
+### Step 6: Commit T2
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/yserver/src/kms/backend.rs
