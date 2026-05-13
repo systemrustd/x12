@@ -268,7 +268,7 @@ impl PictOp {
 /// Backwards-compatible alias for the old name.
 pub use PictOp as StdPictOp;
 
-/// Cache + sampler + pool for the per-op-and-format pipeline
+/// Cache + sampler + layouts for the per-op-and-format pipeline
 /// family. Built lazily on demand; reused for the rest of the
 /// session. Pipelines key on `(op, dst_format)` because the
 /// per-op blend factors depend on whether the dst is BGRA8 or
