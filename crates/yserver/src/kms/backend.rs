@@ -2618,14 +2618,28 @@ impl KmsBackend {
         let pixels_ptr = pixels.as_ptr();
         let pixels_len = pixels.len();
 
-        self.scheduler
+        let mut arena_oom = false;
+        let result = self
+            .scheduler
             .record_paint_batch_op(vk_arc, pool_handle, |_vk, batch, cb| {
-                let alloc = batch.upload_arena_mut().alloc(needed, 16).map_err(|e| {
-                    log::warn!(
-                        "vk upload_bgra_to_mirror: arena alloc {needed} bytes failed: {e:?}"
-                    );
-                    ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
-                })?;
+                let alloc = match batch.upload_arena_mut().alloc(needed, 16) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // Arena alloc failed BEFORE we recorded anything into the
+                        // batch CB. Don't poison the batch — that would drop
+                        // unrelated 3B fill/copy work recorded earlier in this
+                        // batch (e.g., create_glyph_cursor reaches here with the
+                        // batch in Recording state if a fill ran earlier).
+                        // Signal failure via the outer flag; the closure returns
+                        // Ok(()) so the batch state is unchanged.
+                        log::warn!(
+                            "vk upload_bgra_to_mirror: arena alloc {needed} bytes failed: {e:?} — \
+                             cursor mirror upload will fail without poisoning batch"
+                        );
+                        arena_oom = true;
+                        return Ok(());
+                    }
+                };
                 // SAFETY: `alloc.mapped_ptr` is a HOST_VISIBLE |
                 // HOST_COHERENT mapped pointer at `alloc.buffer +
                 // alloc.offset` covering `needed` bytes;
@@ -2648,7 +2662,12 @@ impl KmsBackend {
                     },
                 );
                 Ok(())
-            })
+            });
+
+        if arena_oom {
+            return Err(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        }
+        result
     }
 
     /// Read the full mirror of a window or pixmap drawable back to
