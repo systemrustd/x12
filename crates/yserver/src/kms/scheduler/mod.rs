@@ -175,6 +175,33 @@ impl RenderScheduler {
         Ok(retired)
     }
 
+    /// Synchronously retire every batch currently in the
+    /// submitted-paint-batches queue. For shutdown only — best-
+    /// effort `flush_if_needed(Shutdown)` would leave batches in
+    /// the queue and `PaintBatch::drop` would leak them.
+    ///
+    /// Order: FIFO. Calls `wait_for_completion` on each batch.
+    /// On any failure, the remaining batches are left in the
+    /// queue (their `Drop` will fire the leak warning); the
+    /// error propagates. Caller MUST already have latched a
+    /// renderer-failed condition before calling, OR be prepared
+    /// to handle the leak (acceptable at shutdown).
+    ///
+    /// Should be called AFTER `vkDeviceWaitIdle()` in the
+    /// teardown sequence — at that point every fence is
+    /// guaranteed signaled, so each `wait_for_completion`
+    /// returns immediately. Calling before `vkDeviceWaitIdle`
+    /// would block on each fence in turn (still correct, just
+    /// pessimal).
+    #[allow(clippy::missing_errors_doc)]
+    pub fn drain_submitted_paint_batches(&mut self) -> Result<(), BatchError> {
+        while let Some(mut batch) = self.submitted_paint_batches.pop_front() {
+            batch.wait_for_completion()?;
+            drop(batch);
+        }
+        Ok(())
+    }
+
     /// Total in-flight paint batches (Submitted, not yet Retired).
     /// Used by backpressure logic in T4.
     pub fn pending_paint_batches(&self) -> usize {

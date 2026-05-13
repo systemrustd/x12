@@ -8278,6 +8278,19 @@ impl KmsBackend {
             log::warn!("shutdown: vkDeviceWaitIdle: {e}");
         }
 
+        // 4-T5: drain any paint batches that didn't finish
+        // retiring through the composite-tick poll. After
+        // vkDeviceWaitIdle their fences are signaled, so
+        // each wait_for_completion returns immediately —
+        // we're just running the CB-free + resource-release
+        // + fence-destroy sequence on the host side.
+        if let Err(e) = self.scheduler.drain_submitted_paint_batches() {
+            log::warn!(
+                "shutdown: drain_submitted_paint_batches failed ({e:?}); \
+                 remaining batches will fire the leak warning on Drop"
+            );
+        }
+
         // Step 4: Drain DRM pageflip completions per output until no
         // bo is in BoPhase::Pending. Bounded by a 500 ms ceiling so a
         // genuinely stuck kernel doesn't hang shutdown. DO NOT
