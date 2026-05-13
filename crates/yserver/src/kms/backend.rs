@@ -3926,6 +3926,7 @@ impl KmsBackend {
             return false;
         };
 
+        let mut arena_oom = false;
         let result = self
             .scheduler
             .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
@@ -3933,8 +3934,18 @@ impl KmsBackend {
                 let alloc = match batch.upload_arena_mut().alloc(total_bytes, 16) {
                     Ok(a) => a,
                     Err(e) => {
-                        log::warn!("vk put_image: arena alloc {total_bytes} bytes failed: {e:?}");
-                        return Err(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+                        // Arena alloc failed BEFORE we recorded anything into the
+                        // batch CB. Don't poison the batch — that would drop
+                        // unrelated fill/copy work landed by earlier handlers.
+                        // Signal failure via the outer flag instead; the closure
+                        // returns Ok(()) so record_paint_batch_op leaves the
+                        // batch state unchanged.
+                        log::warn!(
+                            "vk put_image: arena alloc {total_bytes} bytes failed: {e:?} — \
+                             falling back to pixman without poisoning batch"
+                        );
+                        arena_oom = true;
+                        return Ok(());
                     }
                 };
 
@@ -4042,6 +4053,9 @@ impl KmsBackend {
                 crate::kms::vk::ops::image::record_put_image(vk, cb, mirror, alloc.buffer, &regions)
             });
 
+        if arena_oom {
+            return false;
+        }
         match result {
             Ok(()) => {
                 // The Vk-direct write made the mirror current; we do
