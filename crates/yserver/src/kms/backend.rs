@@ -1706,7 +1706,7 @@ impl KmsBackend {
     ///   try_vk_copy_area (distinct):      copy::record_copy_area_distinct     — migrated T3 (record_paint_op)
     ///   try_vk_fill_with_function:        fill::record_logic_fill             — migrated T2 (record_paint_op)
     ///   try_vk_solid_fill:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
-    ///   try_vk_put_image:                 image::record_put_image             — borrow-conflict fallback
+    ///   try_vk_put_image:                 image::record_put_image             — migrated 3C T1 (record_paint_batch_op + arena)
     ///   try_vk_text_run:                  text::record_text_run               — borrow-conflict fallback
     ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
     ///   try_vk_render_composite_glyphs:   text::record_text_run               — borrow-conflict fallback
@@ -3788,8 +3788,6 @@ impl KmsBackend {
         dst_y: i16,
         data: &[u8],
     ) -> bool {
-        use crate::kms::vk::ops::{image as vk_image, run_one_shot_op};
-
         if width == 0 || height == 0 {
             return false;
         }
@@ -3803,16 +3801,6 @@ impl KmsBackend {
             24 | 32 => 4,
             _ => return false,
         };
-
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return false;
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return false;
-        };
-        if self.ops_staging.is_none() {
-            return false;
-        }
 
         // GC clip is in dst space. MIT-SHM PutImage clears the clip
         // before calling backend.put_image, so this returns the input
@@ -3918,132 +3906,15 @@ impl KmsBackend {
             return true;
         }
 
-        if let Err(e) = self
-            .ops_staging
-            .as_mut()
-            .expect("checked is_none above")
-            .ensure(total_bytes)
-        {
-            log::warn!(
-                "vk put_image: staging grow failed for {total_bytes} bytes: {e:?} — \
-                 falling back to pixman"
-            );
+        // Acquire batch resources (gated by renderer_failed).
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
             return false;
-        }
+        };
 
-        // Memcpy host → staging with byte permutation matching the
-        // pixman path's pixel formula. For depth-24/32 the pixman
-        // arm reads `r=data[0], g=data[1], b=data[2], a=data[3]` and
-        // writes the u32 `(a<<24)|(r<<16)|(g<<8)|b`, which lays down
-        // memory bytes `[b, g, r, a]` in a u32 LE word — exactly
-        // what `B8G8R8A8_UNORM` reads as `(B, G, R, A)`.
-        // For depth-8 the pixman path is a per-byte copy; mirror is
-        // R8, same byte-per-pixel layout.
-        let staging_ptr = self.ops_staging.as_ref().unwrap().mapped_ptr();
-        for plan in &plans {
-            let row_dst_bytes = plan.extent_w as usize * src_bpp;
-            for row in 0..plan.extent_h {
-                let host_row = (plan.src_y + row) as usize;
-                let src_row_byte_start = host_row * src_row_stride;
-                if src_row_byte_start + src_row_stride > data.len() {
-                    // Truncated source — zero-fill the staging row.
-                    unsafe {
-                        let dst = staging_ptr
-                            .add(plan.staging_offset as usize + row as usize * row_dst_bytes);
-                        std::ptr::write_bytes(dst, 0, row_dst_bytes);
-                    }
-                    continue;
-                }
-                unsafe {
-                    let dst_row = staging_ptr
-                        .add(plan.staging_offset as usize + row as usize * row_dst_bytes);
-                    let src_row = data.as_ptr().add(src_row_byte_start);
-                    match depth {
-                        1 => {
-                            // X11 ZPixmap depth-1: bits packed per the
-                            // server's advertised bitmap_format_bit_order,
-                            // scanlines padded to 32 bits. Setup advertises
-                            // LSBFirst (= setup.byte_order for the LE
-                            // clients we accept) — pixel 0 is bit 0 (LSB)
-                            // of byte 0. Unpack each bit into a byte
-                            // (0xFF / 0x00) for the R8 mirror. (Was
-                            // MSB-first; that mismatch produced an
-                            // every-8-pixel sawtooth on shape masks.)
-                            for col in 0..plan.extent_w as usize {
-                                let bit_index = plan.src_x as usize + col;
-                                let byte = *src_row.add(bit_index >> 3);
-                                let bit = (byte >> (bit_index & 7)) & 1;
-                                *dst_row.add(col) = if bit != 0 { 0xFF } else { 0x00 };
-                            }
-                        }
-                        8 => {
-                            let src = src_row.add(plan.src_x as usize);
-                            std::ptr::copy_nonoverlapping(src, dst_row, row_dst_bytes);
-                        }
-                        24 | 32 => {
-                            // 4 bpp with byte permutation. src bytes
-                            // are conventionally [r, g, b, a]; we emit
-                            // [b, g, r, a] (or [b, g, r, 0xFF] for
-                            // depth==24) to match the
-                            // `B8G8R8A8_UNORM` mirror's memory order.
-                            let src = src_row.add(plan.src_x as usize * 4);
-                            for col in 0..plan.extent_w as usize {
-                                let s = src.add(col * 4);
-                                let d = dst_row.add(col * 4);
-                                let r = *s;
-                                let g = *s.add(1);
-                                let b = *s.add(2);
-                                let a = if depth == 32 { *s.add(3) } else { 0xFFu8 };
-                                *d = b;
-                                *d.add(1) = g;
-                                *d.add(2) = r;
-                                *d.add(3) = a;
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-        }
-
-        // Build BufferImageCopy regions.
-        let regions: Vec<ash::vk::BufferImageCopy> = plans
-            .iter()
-            .map(|p| {
-                ash::vk::BufferImageCopy::default()
-                    .buffer_offset(p.staging_offset)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(
-                        ash::vk::ImageSubresourceLayers::default()
-                            .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_offset(ash::vk::Offset3D {
-                        x: p.image_x,
-                        y: p.image_y,
-                        z: 0,
-                    })
-                    .image_extent(ash::vk::Extent3D {
-                        width: p.extent_w,
-                        height: p.extent_h,
-                        depth: 1,
-                    })
-            })
-            .collect();
-
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // mirror is borrowed from self.windows/pixmaps below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
-
-        // Reborrow the mirror mutably for the recording.
+        // Re-borrow the mirror mutably for the recording. The borrow
+        // is held across `self.scheduler.record_paint_batch_op` — that
+        // mutates `self.scheduler` only, disjoint from
+        // `self.windows`/`self.pixmaps`.
         let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
@@ -4054,19 +3925,130 @@ impl KmsBackend {
         let Some(mirror) = mirror else {
             return false;
         };
-        let staging_buffer = self.ops_staging.as_ref().expect("checked above").buffer();
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            vk_image::record_put_image(vk, cb, mirror, staging_buffer, &regions)
-        }) {
+        let result = self
+            .scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
+                // Per-batch staging allocation (replaces OpsStaging).
+                let alloc = match batch.upload_arena_mut().alloc(total_bytes, 16) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("vk put_image: arena alloc {total_bytes} bytes failed: {e:?}");
+                        return Err(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+                    }
+                };
+
+                // Host → staging memcpy with depth-specific byte
+                // permutation. For depth-24/32 the pixman arm reads
+                // `r=data[0], g=data[1], b=data[2], a=data[3]` and
+                // writes the u32 `(a<<24)|(r<<16)|(g<<8)|b`, which
+                // lays down memory bytes `[b, g, r, a]` in a u32 LE
+                // word — exactly what `B8G8R8A8_UNORM` reads as
+                // `(B, G, R, A)`. For depth-8 the pixman path is a
+                // per-byte copy; mirror is R8, same byte-per-pixel
+                // layout.
+                let staging_base = alloc.mapped_ptr.as_ptr();
+                for plan in &plans {
+                    let row_dst_bytes = plan.extent_w as usize * src_bpp;
+                    for row in 0..plan.extent_h {
+                        let host_row = (plan.src_y + row) as usize;
+                        let src_row_byte_start = host_row * src_row_stride;
+                        if src_row_byte_start + src_row_stride > data.len() {
+                            // Truncated source — zero-fill the staging row.
+                            unsafe {
+                                let dst = staging_base.add(
+                                    plan.staging_offset as usize + row as usize * row_dst_bytes,
+                                );
+                                std::ptr::write_bytes(dst, 0, row_dst_bytes);
+                            }
+                            continue;
+                        }
+                        unsafe {
+                            let dst_row = staging_base
+                                .add(plan.staging_offset as usize + row as usize * row_dst_bytes);
+                            let src_row = data.as_ptr().add(src_row_byte_start);
+                            match depth {
+                                1 => {
+                                    // X11 ZPixmap depth-1: bits packed
+                                    // per the server's advertised
+                                    // bitmap_format_bit_order (LSBFirst);
+                                    // scanlines padded to 32 bits.
+                                    // Unpack each bit into a byte
+                                    // (0xFF / 0x00) for the R8 mirror.
+                                    for col in 0..plan.extent_w as usize {
+                                        let bit_index = plan.src_x as usize + col;
+                                        let byte = *src_row.add(bit_index >> 3);
+                                        let bit = (byte >> (bit_index & 7)) & 1;
+                                        *dst_row.add(col) = if bit != 0 { 0xFF } else { 0x00 };
+                                    }
+                                }
+                                8 => {
+                                    let src = src_row.add(plan.src_x as usize);
+                                    std::ptr::copy_nonoverlapping(src, dst_row, row_dst_bytes);
+                                }
+                                24 | 32 => {
+                                    // 4 bpp with byte permutation. src
+                                    // bytes are conventionally
+                                    // [r, g, b, a]; we emit [b, g, r, a]
+                                    // (or [b, g, r, 0xFF] for depth==24)
+                                    // to match the `B8G8R8A8_UNORM`
+                                    // mirror's memory order.
+                                    let src = src_row.add(plan.src_x as usize * 4);
+                                    for col in 0..plan.extent_w as usize {
+                                        let s = src.add(col * 4);
+                                        let d = dst_row.add(col * 4);
+                                        let r = *s;
+                                        let g = *s.add(1);
+                                        let b = *s.add(2);
+                                        let a = if depth == 32 { *s.add(3) } else { 0xFFu8 };
+                                        *d = b;
+                                        *d.add(1) = g;
+                                        *d.add(2) = r;
+                                        *d.add(3) = a;
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
+
+                // Build BufferImageCopy regions with alloc-relative offsets.
+                let regions: Vec<ash::vk::BufferImageCopy> = plans
+                    .iter()
+                    .map(|p| {
+                        ash::vk::BufferImageCopy::default()
+                            .buffer_offset(alloc.offset + p.staging_offset)
+                            .buffer_row_length(0)
+                            .buffer_image_height(0)
+                            .image_subresource(
+                                ash::vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_offset(ash::vk::Offset3D {
+                                x: p.image_x,
+                                y: p.image_y,
+                                z: 0,
+                            })
+                            .image_extent(ash::vk::Extent3D {
+                                width: p.extent_w,
+                                height: p.extent_h,
+                                depth: 1,
+                            })
+                    })
+                    .collect();
+
+                crate::kms::vk::ops::image::record_put_image(vk, cb, mirror, alloc.buffer, &regions)
+            });
+
+        match result {
             Ok(()) => {
-                // The Vk-direct write made the mirror current; we
-                // do NOT mark damage here. Damage tells
-                // `MirrorUploader` to upload pixman → mirror at the
-                // next composite frame, which would *clobber* the
-                // bytes we just wrote with whatever (stale) pixman
-                // contents. The original 4.1.4.3 commit incorrectly
-                // marked damage with the inverted reasoning.
+                // The Vk-direct write made the mirror current; we do
+                // NOT mark damage here. Damage tells `MirrorUploader`
+                // to upload pixman → mirror at the next composite
+                // frame, which would *clobber* the bytes we just
+                // wrote with whatever (stale) pixman contents.
                 true
             }
             Err(e) => {
