@@ -26,8 +26,8 @@ Read `docs/known-issues.md` (the "P0: KMS teardown..." entry, at the end of the 
 
 | File | Role | Touched in |
 |---|---|---|
-| `crates/yserver/src/kms/backend.rs` | Add `shutting_down: bool` field; gate `composite_and_flip` + `try_vulkan_composite_flip`; rewrite `disable_output` (~line 7996); add `drain_pending_pageflips_for_shutdown` helper method | T1, T2 |
-| `crates/yserver/src/kms/vk/scanout.rs` | Add `pub fn has_pending_pageflip(&self) -> bool` on `ScanoutBoPool` — semantic predicate the shutdown helper polls until false. `drain_all_pending` keeps its body but its CALL SITE moves from before-atomic to after-atomic. | T1 |
+| `crates/yserver/src/kms/backend.rs` | Add `shutting_down: bool` field; gate `composite_and_flip` + `try_vulkan_composite_flip`; rewrite `disable_output` (~line 7996); add `drain_pending_pageflips_for_shutdown` helper; add `disarm_scanout_pool` helper for the disable-failed path | T1, T2 |
+| `crates/yserver/src/kms/vk/scanout.rs` | Add `pub fn has_pending_pageflip(&self) -> bool` on `ScanoutBoPool`. Add `disarmed: bool` field on `ScanoutBo` plus `pub fn disarm(&mut self)` setter. Modify `Drop for ScanoutBo` to early-return when `disarmed` is true (leak FB + GEM + Vk resources; DRM-fd close at process exit reaps everything). `drain_all_pending` keeps its body but its CALL SITE moves from before-atomic to after-atomic. | T1 |
 | `docs/superpowers/plans/2026-05-13-kms-teardown-fix-results.md` | Results doc | T3 |
 
 ## Pre-task notes (read before starting)
@@ -94,53 +94,73 @@ Insert the new method directly above `pub fn drain_all_pending` (~line 547) so t
     }
 ```
 
-- [ ] **Step 1c: Add a unit test**
+- [ ] **Step 1c: Add `disarmed: bool` field + `disarm()` method on `ScanoutBo`**
 
-Find the existing `#[cfg(test)] mod tests` block in `scanout.rs` (around line 900+). Add at the end of `mod tests`:
+`disarm` makes a BO's Drop a no-op so the kernel reaps the FB + GEM via DRM-fd close at process exit. This is the safety net for the disable-failed path (codex finding #1): when atomic disable_output returns EINVAL, KMS may still hold the FB; explicit `destroy_framebuffer` from RAII Drop would then produce the kernel `atomic remove_fb failed with -22` warning that strands the Wayland host session.
+
+Locate the `ScanoutBo` struct (around `scanout.rs:188`). Add a new field at the END of the struct (after the existing fields):
 
 ```rust
-    #[test]
-    fn has_pending_pageflip_reports_pending_state() {
-        // We can't construct a full ScanoutBoPool without Vk + DRM,
-        // but BoState alone is enough to exercise the predicate
-        // logic by reaching into the inner state machine.
-        let mut state = BoState::default();
-        assert_eq!(state.phase, BoPhase::Free);
+    /// When `true`, `Drop` early-returns: no explicit
+    /// `destroy_framebuffer`, no GEM close, no Vk teardown. The
+    /// process-exit DRM-fd close + Vulkan device drop reap everything.
+    /// Set by `disarm()` from the shutdown path when atomic
+    /// `disable_output` failed for this BO's CRTC — KMS may still
+    /// hold the FB, so user-side teardown would corrupt kernel state.
+    disarmed: bool,
+```
 
-        // Walk to Submitted then Pending (via the actual transitions
-        // so we don't bypass the state machine).
-        state.transition_to_recording();
-        state.transition_to_submitted(/* fake fd */ 42);
-        let in_fd = state.transition_to_pending(/* fake out fence fd */ 43);
-        assert!(matches!(in_fd, Some(42)));
-        assert_eq!(state.phase, BoPhase::Pending);
+Initialize the field in `ScanoutBo::allocate` (~line 568+). Find the existing `ScanoutBo { ... }` struct construction and add `disarmed: false` to it.
 
-        // The predicate's logic is `bos.iter().any(phase == Pending)`.
-        // Confirm the Pending arm is what we expect to detect.
-        let pending = state.phase == BoPhase::Pending;
-        assert!(pending);
+Then add a `disarm` method to the `impl ScanoutBo` block:
 
-        // Walk on; should leave Pending.
-        state.transition_to_on_screen();
-        assert_eq!(state.phase, BoPhase::OnScreen);
-        let on_screen_is_pending = state.phase == BoPhase::Pending;
-        assert!(!on_screen_is_pending);
-
-        // Closing the captured fds is fence-fd hygiene only; they're
-        // not real fds here. Forget them to silence the SAFETY assumptions.
-        std::mem::forget(in_fd);
+```rust
+    /// Mark this BO as "let process-exit clean up." Subsequent
+    /// `Drop` is a no-op. Idempotent.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
     }
 ```
 
-(If `BoState::default()` doesn't give phase = `Free`, the test will fail and you should read the `Default` impl to understand the starting state. The plan author confirmed `Free` is the `#[default]` variant at `scanout.rs:51`.)
+- [ ] **Step 1d: Make `Drop for ScanoutBo` honor `disarmed`**
 
-- [ ] **Step 1d: Build + tests + clippy**
+Find `impl Drop for ScanoutBo` (~line 418). At the very top of the `drop` body, add the early-return:
+
+```rust
+impl Drop for ScanoutBo {
+    fn drop(&mut self) {
+        if self.disarmed {
+            // Disarmed by shutdown-failed-disable path; let DRM-fd
+            // close (process exit) reap FB + GEM, and Vulkan device
+            // drop reap VkImage + memory. Touching these explicitly
+            // while KMS may still hold the FB produces the `atomic
+            // remove_fb failed with -22` warning that strands
+            // Wayland host sessions.
+            log::warn!(
+                "ScanoutBo disarmed (atomic disable_output failed); \
+                 leaking FB/GEM/Vk to be reaped by DRM-fd close"
+            );
+            return;
+        }
+        // Defensive fence-fd cleanup. ... (existing body unchanged) ...
+```
+
+Leave the rest of the existing `drop` body unchanged.
+
+- [ ] **Step 1e: Build + tests + clippy**
 
 Run: `cargo check -p yserver` → expect clean.
-Run: `cargo test -p yserver --lib has_pending_pageflip` → expect 1 passed.
-Run: `cargo test -p yserver --lib` → expect 139 passed (was 138 before).
+Run: `cargo test -p yserver --lib` → expect **138 passed** (no new tests added; the predicate is too thin to mock-test and codex's review explicitly cautioned against a fake test that doesn't exercise the predicate).
 Run: `cargo +nightly fmt --check` → expect clean.
 Run: `cargo clippy -p yserver 2>&1 | tail -5` → expect 5 pre-existing warnings, no new ones.
+
+**Why no unit test for `has_pending_pageflip`**: codex's review of v2 caught that the test I'd drafted walked `BoState` transitions without ever calling `ScanoutBoPool::has_pending_pageflip` — it was performative. The predicate's body is `self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)`, a 1-line operation; a real test requires constructing a `ScanoutBoPool` (Vk + DRM mocks the codebase doesn't have). Hardware smoke (T3) validates the predicate via observed behaviour — the kernel WARN disappears iff the predicate correctly gates the atomic disable.
+
+### Step 1f: Build (after adding disarm + Drop early-return)
+
+Verify the changes compile cleanly before moving on:
+
+Run: `cargo check -p yserver` → clean.
 
 ### Step 2: Add `shutting_down` field to `KmsBackend`
 
@@ -341,7 +361,31 @@ Add this method to the same `impl KmsBackend` block as `disable_output`:
                 {
                     advance_pool_on_pageflip_complete(pool);
                 }
+                // Keep damage state internally consistent during the
+                // bounded shutdown loop (codex review nit). Not load-
+                // bearing for process exit; cheap.
+                self.outputs[output_idx].damage.record_present();
             }
+        }
+    }
+
+    /// Disarm every scanout BO in the given pool index so its `Drop`
+    /// becomes a no-op. Called for outputs whose atomic
+    /// `disable_output` failed — KMS may still hold the FB, so
+    /// user-side `destroy_framebuffer` from `ScanoutBo::Drop` would
+    /// produce the `atomic remove_fb failed with -22` kernel WARN
+    /// that strands Wayland host sessions. Process-exit DRM-fd close
+    /// reaps the FB + GEM; Vulkan device drop reaps VkImage.
+    fn disarm_scanout_pool(&mut self, output_idx: usize) {
+        let Some(pool) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(|p| p.as_mut())
+        else {
+            return;
+        };
+        for bo in &mut pool.bos {
+            bo.disarm();
         }
     }
 ```
@@ -371,22 +415,36 @@ Run: `cargo test -p yserver --lib` → 139 passed.
 ```bash
 git add crates/yserver/src/kms/vk/scanout.rs crates/yserver/src/kms/backend.rs
 git commit -m "$(cat <<'EOF'
-feat(kms): add shutting_down gate + has_pending_pageflip + shutdown drain helper
+feat(kms): KMS teardown infra — shutting_down gate, disarm, drain helper
 
 T1 of the KMS teardown fix. No behavior change yet: this just adds
 the infrastructure T2 will rewire disable_output to use.
 
-- ScanoutBoPool::has_pending_pageflip: predicate exposing whether
-  any bo is in BoPhase::Pending (KMS-accepted flip with no
-  pageflip-complete event yet).
-- KmsBackend::shutting_down: bool field, latched in disable_output
-  (wired in T2). composite_and_flip and try_vulkan_composite_flip
-  early-out on the flag, alongside the existing renderer_failed
-  gate.
-- KmsBackend::drain_pending_pageflips_for_shutdown: poll-loop
-  helper that drains kernel pageflip events until no bo is
-  Pending, with a 500 ms ceiling. Will be called from disable_output
-  in T2.
+ScanoutBoPool::has_pending_pageflip: predicate exposing whether any
+bo is in BoPhase::Pending (KMS-accepted flip with no pageflip-complete
+event yet).
+
+ScanoutBo::disarmed + disarm(): when set, Drop early-returns so FB +
+GEM + Vk resources leak until DRM-fd close at process exit reaps
+them. Used by the shutdown failure path (codex v2 review found that
+"skip drain_all_pending" alone wasn't enough — RAII's Drop still
+destroys the FB while KMS may hold it, producing the kernel
+`atomic remove_fb failed with -22` warning).
+
+KmsBackend::shutting_down: bool field, latched in disable_output
+(wired in T2). composite_and_flip and try_vulkan_composite_flip
+early-out on the flag, alongside the existing renderer_failed gate.
+
+KmsBackend::drain_pending_pageflips_for_shutdown: poll-loop helper
+that drains kernel pageflip events until no bo is Pending, with a
+500 ms ceiling. Polls DRM fd via nix::poll::poll (POLLIN, 50 ms
+per iteration); only calls drain_events when POLLIN is actually set
+in revents (drm::Device::receive_events is a blocking read, would
+hang past the ceiling otherwise — codex v2 finding).
+
+KmsBackend::disarm_scanout_pool: walks a pool's bos calling disarm()
+on each. Will be called from disable_output's failure-path step 6
+in T2.
 
 Reference: docs/known-issues.md "P0: KMS teardown..." entry.
 
@@ -515,21 +573,34 @@ Replace the entire body of `pub fn disable_output(&mut self) -> io::Result<()>` 
         // has released its hold on the framebuffer; force-resetting
         // BO state (close any straggler fence fds) is now safe and
         // RAII drops the scanout pool when KmsBackend itself drops.
+        //
         // For an output whose disable FAILED, KMS may still hold the
-        // FB — force-resetting that pool would re-introduce the
-        // exact UAF this fix is meant to prevent. Skip it; the
-        // straggler fences leak into the kernel's lifecycle (sync_file
-        // refs survive our fd close until the DRM device closes).
-        // This is codex's per-output-success gating.
-        if let Some(vk) = self.vk.as_ref() {
-            for (idx, pool) in self.scanout_pools.iter_mut().enumerate() {
-                let success = disable_ok.get(idx).copied().unwrap_or(false);
-                if !success {
-                    continue;
+        // FB. Plain "skip drain_all_pending" is NOT enough — when
+        // KmsBackend drops shortly after this returns, scanout_pools
+        // drops, which drops each ScanoutBo, whose Drop unconditionally
+        // calls destroy_framebuffer + close_buffer(gem) (see
+        // scanout.rs Drop impl). That's the exact RMFB-while-KMS-holds-FB
+        // path that produces `atomic remove_fb failed with -22` and
+        // strands Wayland host sessions. So for failed outputs we
+        // `disarm_scanout_pool(idx)` — each ScanoutBo's `disarmed`
+        // flag flips to true, and its Drop becomes a no-op. The
+        // resources leak until DRM-fd close at process exit, at which
+        // point the kernel reaps FB + GEM as part of its normal
+        // device-fd cleanup. Vulkan resources leak similarly via Vk
+        // device drop. Codex flagged this in the v2 review.
+        for (idx, success) in disable_ok.iter().copied().enumerate() {
+            if success {
+                if let Some(vk) = self.vk.as_ref() {
+                    if let Some(p) = self
+                        .scanout_pools
+                        .get_mut(idx)
+                        .and_then(|p| p.as_mut())
+                    {
+                        p.drain_all_pending(vk);
+                    }
                 }
-                if let Some(p) = pool.as_mut() {
-                    p.drain_all_pending(vk);
-                }
+            } else {
+                self.disarm_scanout_pool(idx);
             }
         }
 
@@ -710,12 +781,14 @@ EOF
 
 1. `cargo +nightly fmt --check` clean.
 2. `cargo clippy -p yserver` produces 5 pre-existing `doc_lazy_continuation` warnings; no new warnings.
-3. `cargo test --workspace` green; yserver lib 139 passed (was 138 pre-T1).
+3. `cargo test --workspace` green; yserver lib 138 passed (no new tests — codex's v2 review noted that a "real" predicate test requires Vk+DRM mocks the codebase doesn't have; the predicate is a 1-line `bos.iter().any(...)` and a performative test would be worse than none).
 4. `KmsBackend::shutting_down: bool` exists; both constructors initialize it; both composite paths (`composite_and_flip`, `try_vulkan_composite_flip`) gate on it.
-5. `ScanoutBoPool::has_pending_pageflip` exists with the obvious "any bo in `BoPhase::Pending`" body and a unit test.
-6. `drain_pending_pageflips_for_shutdown` exists; polls the DRM fd with a 50 ms timeout per iteration; bounded by 500 ms total; calls `advance_pool_on_pageflip_complete` for each completing CRTC; does NOT force-reset BO state. **Crucial**: only calls `drain_events` when `poll` reports `POLLIN` in `revents`. `drm::Device::receive_events()` is a blocking `read()`; calling it without confirmed readiness can hang past the timeout.
-7. `disable_output` follows the 6-step sequence in the documented order. `drain_all_pending` runs AFTER the atomic disable, not before — AND it runs only for outputs whose atomic disable succeeded (per-output `disable_ok` gating). Outputs whose disable failed are skipped on the force-reset path because KMS may still hold their FB; force-resetting would reintroduce the original UAF.
-8. Hardware smoke: yserver exit on a separate TTY leaves the dms + labwc session on F1 intact; `journalctl -k` shows no `atomic remove_fb failed with -22` warning after yserver exit; `yserver-hw.log` shows no `disable_output failed ... Invalid argument` warning.
+5. `ScanoutBoPool::has_pending_pageflip` exists with the obvious "any bo in `BoPhase::Pending`" body.
+6. `drain_pending_pageflips_for_shutdown` exists; polls the DRM fd with a 50 ms timeout per iteration; bounded by 500 ms total; calls `advance_pool_on_pageflip_complete` + `record_present` for each completing CRTC; does NOT force-reset BO state. **Crucial**: only calls `drain_events` when `poll` reports `POLLIN` in `revents`. `drm::Device::receive_events()` is a blocking `read()`; calling it without confirmed readiness can hang past the timeout.
+7. `disable_output` follows the 6-step sequence. `drain_all_pending` runs AFTER the atomic disable AND only for outputs whose atomic disable succeeded. For FAILED outputs, `disarm_scanout_pool(idx)` flips every BO's `disarmed: true` so its `Drop` becomes a no-op — FB + GEM + Vk resources leak until DRM-fd close at process exit. This closes the "Drop still destroys the FB via RAII even if we skip drain_all_pending" hole codex flagged in v2.
+8. `ScanoutBo::disarmed: bool` field exists (default `false`); `ScanoutBo::disarm()` setter exists; `Drop for ScanoutBo` early-returns when `disarmed` is true, with a `log::warn!` noting the leak.
+9. `KmsBackend::disarm_scanout_pool(idx)` helper exists and walks the indexed pool's `bos` calling `disarm()` on each.
+10. Hardware smoke: yserver exit on a separate TTY leaves the dms + labwc session on F1 intact; `journalctl -k` shows no `atomic remove_fb failed with -22` warning after yserver exit; `yserver-hw.log` shows no `disable_output failed ... Invalid argument` warning (success case) OR shows the warning AND the matching `ScanoutBo disarmed (atomic disable_output failed)` warn from the failure path (graceful degradation case — session still recovers because no FB was destroyed).
 
 ## Verification greps (post-fix)
 
@@ -736,8 +809,16 @@ $ rg -n 'has_pending_pageflip' crates/yserver/src/kms/
 
 $ rg -n 'drain_all_pending' crates/yserver/src/kms/backend.rs
 # Expected: 1 hit, inside disable_output, AFTER the atomic disable_output
-# call (step 6, post-atomic force-reset). The pre-atomic call from before
-# T2 must be gone.
+# call (step 6, post-atomic force-reset, ONLY on success branch). The
+# pre-atomic call from before T2 must be gone.
+
+$ rg -n 'disarm\|disarmed' crates/yserver/src/kms/vk/scanout.rs crates/yserver/src/kms/backend.rs
+# Expected ≥ 5 hits:
+#   - scanout.rs: `disarmed: bool` field; `pub fn disarm(&mut self)`;
+#     `if self.disarmed` early-return in Drop; init `disarmed: false`
+#     in ScanoutBo::allocate.
+#   - backend.rs: `disarm_scanout_pool` helper definition + one call
+#     site in disable_output step 6 failure branch.
 ```
 
 ## Notes for the implementer
