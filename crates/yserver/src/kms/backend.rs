@@ -1719,7 +1719,7 @@ impl KmsBackend {
     ///   try_vk_solid_fill:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   try_vk_put_image:                 image::record_put_image             — migrated 3C T1 (record_paint_batch_op + arena)
     ///   try_vk_text_run:                  text::record_text_run               — migrated 3E T1 (record_paint_op)
-    ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback (3F-2)
+    ///   try_vk_render_traps_or_tris:      render::record_render_composite     — migrated 3F-2 (record_paint_batch_op + arena upload + arena descriptors)
     ///   try_vk_render_composite_glyphs:   text::record_text_run               — migrated 3E T2 (record_paint_op)
     ///   try_vk_render_composite:          render::record_render_composite     — migrated 3F-1 (record_paint_batch_op + BatchDescriptorArena)
     ///
@@ -4740,7 +4740,7 @@ impl KmsBackend {
         bbox_h: u32,
     ) -> bool {
         use crate::kms::vk::{
-            ops::{render as vk_render, run_one_shot_op},
+            ops::render as vk_render,
             render_pipeline::{StdPictOp, record_solid_color_clear},
         };
 
@@ -4776,10 +4776,13 @@ impl KmsBackend {
             return false;
         }
 
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return false;
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+        // 3F-2: acquire batch resources up-front (gated by
+        // renderer_failed). Same shape try_vk_render_composite uses
+        // since 3F-1.
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            log::debug!(
+                "vk render_traps bail: paint_resources unavailable (renderer_failed or vk/pool absent) (dst=0x{dst_xid:x})"
+            );
             return false;
         };
         if self.render_pipelines.is_none()
@@ -4846,18 +4849,6 @@ impl KmsBackend {
             }
         }
 
-        // Upload CPU-rasterised mask first — independent of the
-        // composite recording. Resizes the scratch on demand.
-        if let Err(e) = self
-            .mask_scratch
-            .as_mut()
-            .expect("checked above")
-            .upload_r8(pool_handle, bbox_w, bbox_h, coverage_mask)
-        {
-            log::warn!("vk render_traps: mask upload failed: {e:?}");
-            return false;
-        }
-
         // Pipeline + scissor. render_traps doesn't compute via the
         // component-alpha path (its mask is the CPU-rasterised
         // coverage, not a client picture), so component_alpha=false.
@@ -4878,27 +4869,12 @@ impl KmsBackend {
             .as_ref()
             .expect("checked above")
             .pipeline_layout();
-        if let Err(e) = self
-            .render_pipelines
-            .as_ref()
-            .expect("checked above")
-            .reset_descriptors()
-        {
-            log::warn!("vk render_traps: descriptor pool reset failed: {e:?}");
-            return false;
-        }
 
         let solid_src_view = self
             .solid_src_image
             .as_ref()
             .expect("checked above")
             .image_view();
-        let mask_view = self
-            .mask_scratch
-            .as_ref()
-            .expect("checked above")
-            .image_view();
-        let mask_extent = self.mask_scratch.as_ref().expect("checked above").extent();
 
         // Resolve src view + extent + (optional) clear colour.
         // Tracks any per-source affine the picture itself induces
@@ -4991,6 +4967,58 @@ impl KmsBackend {
             RenderPic::None => return false,
         }
 
+        // 3F-2: both MaskScratch::ensure_image_size and
+        // DstReadback::ensure may grow (destroy old image after
+        // queue_wait_idle), which does NOT wait for un-submitted
+        // batch commands. Pre-flush the batch before either grow.
+        // needs_*_grow are false for the steady-state path (no
+        // resize), so this only fires on first use of a given size
+        // (no old image to dangle, harmless) or on a real grow.
+        // Same mitigation 3D applied to CopyScratch and 3F-1 to
+        // DstReadback.
+        let needs_mask_grow = self
+            .mask_scratch
+            .as_ref()
+            .is_some_and(|m| m.needs_image_grow(bbox_w, bbox_h));
+        let needs_readback_grow = needs_dst_readback
+            && self
+                .dst_readback
+                .as_ref()
+                .is_some_and(|r| r.needs_grow(dst_format, dst_extent.width, dst_extent.height));
+        if needs_mask_grow || needs_readback_grow {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("vk render_traps: pre-resize flush failed: {e:?}");
+                return false;
+            }
+        }
+
+        // 3F-2: ensure_image_size now happens outside the closure
+        // (it's `&mut self.mask_scratch` and takes the
+        // post-pre-flush window). The recorder below uses the
+        // already-sized image and only records the upload's
+        // barrier-copy-barrier.
+        if let Err(e) = self
+            .mask_scratch
+            .as_mut()
+            .expect("checked above")
+            .ensure_image_size(bbox_w, bbox_h)
+        {
+            log::warn!("vk render_traps: mask ensure_image_size failed: {e:?}");
+            return false;
+        }
+
+        // P1: `mask_view` / `mask_extent` MUST be read AFTER
+        // `ensure_image_size` — the grow path destroys the old
+        // `vk::ImageView`, so a pre-ensure capture would dangle on
+        // resize.
+        let mask_view = self
+            .mask_scratch
+            .as_ref()
+            .expect("checked above")
+            .image_view();
+        let mask_extent = self.mask_scratch.as_ref().expect("checked above").extent();
+
         // Disjoint/Conjoint ops reach this path too (e.g. rendercheck's
         // `Conjoint*` triangles cases). For those the shader reads dst
         // via binding 2; ensure the dst-readback scratch is sized for
@@ -5017,18 +5045,6 @@ impl KmsBackend {
             }
         } else {
             white_mask_view
-        };
-        let descriptor_set = match self
-            .render_pipelines
-            .as_ref()
-            .expect("checked above")
-            .allocate_descriptor_for_views(src_view, mask_view, dst_readback_view)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("vk render_traps: descriptor alloc failed: {e:?}");
-                return false;
-            }
         };
 
         // Pixman's `zero_src_has_no_effect` table inverted: ops where
@@ -5093,18 +5109,6 @@ impl KmsBackend {
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
 
-        // 3D-deferred: render-traps needs per-batch MaskScratch + descriptor
-        // strategy + dst_readback lifetime before migrating. The pre-record
-        // ProtocolBarrier flush keeps this legacy path safe alongside batched
-        // fill/copy/PutImage in the same protocol cycle.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
-
         let dst_mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
@@ -5116,43 +5120,104 @@ impl KmsBackend {
             return false;
         };
         let solid_src_image = self.solid_src_image.as_mut().expect("checked above");
+        let mask_scratch = self.mask_scratch.as_mut().expect("checked above");
         let dst_readback = if needs_dst_readback {
             Some(self.dst_readback.as_mut().expect("checked above"))
         } else {
             None
         };
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            if let Some(color) = src_clear_color {
-                record_solid_color_clear(vk, cb, solid_src_image, color);
-            }
-            // Disjoint/Conjoint: snapshot dst into the readback scratch
-            // so the shader can sample it at binding 2. Mirrors the
-            // sequencing in try_vk_render_composite.
-            if let Some(rb) = dst_readback {
-                rb.record_copy_from(
+        // 3F-2: mask upload + descriptor alloc move into the closure.
+        // `render_cache` is a shared borrow on self.render_pipelines —
+        // disjoint from &mut self.scheduler and the other &mut field
+        // captures.
+        //
+        // Arena alloc failure uses the outer-flag pattern (3C T2):
+        // failure happens BEFORE any CB recording, so a poisoned-batch
+        // return would discard unrelated 3B/3C/3E/3F-1 work already
+        // recorded in this batch. Set `arena_oom = true`, return Ok,
+        // and report failure to the caller after `record_paint_batch_op`
+        // returns.
+        let render_cache = self.render_pipelines.as_ref().expect("checked above");
+        let mut arena_oom = false;
+        let mask_bytes = coverage_mask;
+        let mask_w = bbox_w;
+        let mask_h = bbox_h;
+        let mask_len = mask_bytes.len();
+        let result = self
+            .scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
+                let needed = u64::from(mask_w) * u64::from(mask_h);
+                let alloc = match batch.upload_arena_mut().alloc(needed, 4) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!(
+                            "vk render_traps: arena alloc {needed} bytes failed: {e:?} — \
+                             mask upload will fail without poisoning batch"
+                        );
+                        arena_oom = true;
+                        return Ok(());
+                    }
+                };
+                // SAFETY: alloc.mapped_ptr is HOST_VISIBLE |
+                // HOST_COHERENT mapped at alloc.buffer + alloc.offset
+                // covering `needed` bytes; mask_bytes is valid for
+                // mask_len = needed bytes (debug-asserted in the
+                // recorder upstream as `coverage_mask.len() == w * h`).
+                debug_assert_eq!(mask_len, needed as usize);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mask_bytes.as_ptr(),
+                        alloc.mapped_ptr.as_ptr(),
+                        mask_len,
+                    );
+                }
+                mask_scratch.record_upload_r8(vk, cb, alloc.buffer, alloc.offset, mask_w, mask_h);
+
+                let descriptor_set = render_cache.allocate_descriptor_for_views_into(
+                    batch.descriptor_arena_mut(),
+                    src_view,
+                    mask_view,
+                    dst_readback_view,
+                )?;
+
+                if let Some(color) = src_clear_color {
+                    record_solid_color_clear(vk, cb, solid_src_image, color);
+                }
+                // Disjoint/Conjoint: snapshot dst into the readback
+                // scratch so the shader can sample it at binding 2.
+                // Mirrors try_vk_render_composite's sequencing.
+                if let Some(rb) = dst_readback {
+                    rb.record_copy_from(
+                        cb,
+                        dst_mirror.vk_image,
+                        dst_mirror.current_layout(),
+                        dst_format,
+                        dst_mirror.extent,
+                    );
+                }
+                vk_render::record_render_composite(
+                    vk,
                     cb,
-                    dst_mirror.vk_image,
-                    dst_mirror.current_layout(),
-                    dst_format,
-                    dst_mirror.extent,
-                );
-            }
-            vk_render::record_render_composite(
-                vk,
-                cb,
-                dst_mirror,
-                pipeline,
-                pipeline_layout,
-                descriptor_set,
-                &attrs,
-                &rects,
-                scissor,
-            )
-        }) {
+                    dst_mirror,
+                    pipeline,
+                    pipeline_layout,
+                    descriptor_set,
+                    &attrs,
+                    &rects,
+                    scissor,
+                )
+            });
+        if arena_oom {
+            return false;
+        }
+        match result {
             Ok(()) => true,
             Err(e) => {
-                log::warn!("vk render_traps: record failed on dst xid {dst_xid:#x}: {e:?}");
+                log::warn!(
+                    "vk render_traps: record failed on dst xid {dst_xid:#x}: \
+                     {e:?} — falling back to pixman"
+                );
                 false
             }
         }
