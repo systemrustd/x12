@@ -170,13 +170,25 @@ fn log_input_devnodes() {
 /// Both event types expose only `scroll_value` (in cursor-pixel-
 /// equivalent units, no v120 quantization). Convert at ~15 px per
 /// logical wheel click (xwayland/Sway convention) → factor 8.
+///
+/// `has_axis(axis)` MUST be checked first: libinput emits a
+/// `client bug: value requested for unset axis` error if
+/// `scroll_value` is called for an axis the event doesn't carry.
 fn finger_or_continuous_to_event<E>(ev: &E) -> Option<InputEvent>
 where
     E: PointerScrollEvent,
 {
     const PX_TO_V120: f64 = 8.0;
-    let dx_v120 = (ev.scroll_value(Axis::Horizontal) * PX_TO_V120) as i32;
-    let dy_v120 = (ev.scroll_value(Axis::Vertical) * PX_TO_V120) as i32;
+    let dx_v120 = if ev.has_axis(Axis::Horizontal) {
+        (ev.scroll_value(Axis::Horizontal) * PX_TO_V120) as i32
+    } else {
+        0
+    };
+    let dy_v120 = if ev.has_axis(Axis::Vertical) {
+        (ev.scroll_value(Axis::Vertical) * PX_TO_V120) as i32
+    } else {
+        0
+    };
     if dx_v120 == 0 && dy_v120 == 0 {
         return None;
     }
@@ -212,8 +224,20 @@ fn translate(event: &Event) -> Option<InputEvent> {
         }),
         Event::Pointer(PointerEvent::ScrollWheel(ev)) => {
             // Wheel events come pre-quantized in v120 (120 = one click).
-            let dx_v120 = ev.scroll_value_v120(Axis::Horizontal) as i32;
-            let dy_v120 = ev.scroll_value_v120(Axis::Vertical) as i32;
+            // has_axis(axis) MUST be checked first: libinput emits a
+            // `client bug: value requested for unset axis` error if
+            // scroll_value_v120 is called for an axis the event doesn't
+            // carry. A pure vertical wheel event has Horizontal unset.
+            let dx_v120 = if ev.has_axis(Axis::Horizontal) {
+                ev.scroll_value_v120(Axis::Horizontal) as i32
+            } else {
+                0
+            };
+            let dy_v120 = if ev.has_axis(Axis::Vertical) {
+                ev.scroll_value_v120(Axis::Vertical) as i32
+            } else {
+                0
+            };
             if dx_v120 == 0 && dy_v120 == 0 {
                 return None;
             }
