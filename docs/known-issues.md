@@ -151,6 +151,24 @@ once the underlying patterns are understood.
       RENDER-driven damage (composite, fill rectangles, glyphs) is
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
+- [ ] **Background image colors look R↔B swapped.** Observed
+      visually under MATE: a JPEG wallpaper rendered with cat eyes
+      that should be green/yellow comes out blue/cyan. Yellow = R+G;
+      losing R or swapping R↔B turns yellow into cyan/blue, which
+      matches. Pre-existing (predates phase 3 work). The depth-24/32
+      byte permutation in `try_vk_put_image` (`backend.rs` `match
+      depth { 24 | 32 => ... }`) reads source `[r,g,b,a]` and writes
+      `[b,g,r,a]` to the `B8G8R8A8_UNORM` mirror — but X11 PutImage in
+      ZPixmap form sends bytes in the visual's native order. For a
+      typical TrueColor BGRA visual at depth 24, the wire bytes are
+      already `[B,G,R,_]`. If yserver's depth-24 visual advertises
+      BGRA byte order but PutImage assumes the source is RGBA, the
+      permutation effectively swaps R and B. Investigation path:
+      `xtruss` a PutImage from a known client, compare the wire bytes
+      against the visual byte order yserver advertises in the
+      connection setup, then either drop the permutation for BGRA
+      visuals or fix the visual advertisement to match. Same
+      permutation lives in pixman path historically; check both.
 
 ## wmaker on KMS
 
