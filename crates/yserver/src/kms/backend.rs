@@ -6002,9 +6002,11 @@ impl KmsBackend {
         // un-submitted batch commands. If an earlier op in the
         // open batch recorded `cmd_copy_image(dst → old_scratch)`,
         // freeing the old image would dangle. Pre-flush the batch
-        // before the grow. needs_grow is false for the steady-state
-        // path (no resize) so this only fires on first sight of a
-        // larger dst. Same mitigation 3D applied to CopyScratch.
+        // before the grow. needs_grow fires on first use of a
+        // given dst format (no old image to dangle, harmless) and
+        // on resize (the real hazard); steady-state with a stable
+        // dst extent skips the flush. Same mitigation 3D applied
+        // to CopyScratch.
         let needs_readback_grow = needs_dst_readback
             && self
                 .dst_readback
