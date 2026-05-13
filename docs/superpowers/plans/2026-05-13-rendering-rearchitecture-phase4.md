@@ -54,14 +54,14 @@ From `paint_batch.rs:57-92`:
 | `Readback` | strict | Synchronous-reply request needs CPU-visible pixels (GetImage, MIT-SHM GetImage). |
 | `ExternalSync` | strict | External sync export pending (DRI3 Present fence handoff, SYNC ext fence trigger). |
 | `ProtocolBarrier` | strict | Explicit protocol barrier requested it. Drawable destruction, gradient create, pre-resize-flush for scratch grow. |
-| `VisibleComposite` | best-effort | Top of `composite_and_flip`'s per-output loop — composite samples mirrors. After Phase 4 the composite-fence machinery + dirty-tracking guarantee mirrors are GPU-complete before sampling. |
+| `VisibleComposite` | best-effort | Top of `composite_and_flip`'s per-output loop. After Phase 4 it returns immediately; composite-side mirror sampling is ordered by same-queue submission order + paint recorders' ending barriers to `SHADER_READ_ONLY_OPTIMAL` (see Pre-task note 5 for the spec rule). |
 | `SizeLimit` | best-effort | Batch hit a size limit. Phase 4+ uses this if we start enforcing one. |
 | `LatencyLimit` | best-effort | Batch hit a latency limit. Same. |
 | `Shutdown` | best-effort | Server shutdown / hot teardown. Cleanly waits at the end. |
 
 After Phase 4, strict reasons go through `submit_and_wait` (or its renamed equivalent — see T2) and block on `vkWaitForFences`. Best-effort reasons go through `submit_async` and push to the submitted-batch queue.
 
-**`VisibleComposite` is the load-bearing best-effort case.** Composite samples drawable mirrors that prior paint ops wrote. Today the close-time `queue_wait_idle` is what makes the composite-side sample safe. After Phase 4 we need a different mechanism — the composite path captures its own fence dependency. The relevant invariant lives in `OutputFrame`'s `holders` system (3A-era scaffolding): a composite frame can declare a dependency on a `PaintBatch`'s fence and not start sampling until that fence signals. Phase 4 finally wires `holders` for real (today they're `holders: 0` because `submit_and_wait` made the dependency implicit). This is the load-bearing T-task.
+**`VisibleComposite` going async is the load-bearing best-effort case.** Composite samples drawable mirrors that prior paint ops wrote. Today the close-time `queue_wait_idle` makes the sample safe by being broad. After Phase 4 the safety comes from a narrower mechanism: each paint recorder ends its CB with an explicit image-layout-and-access barrier transitioning the mirror to `SHADER_READ_ONLY_OPTIMAL`, and composite's CB is submitted later on the same graphics queue. Per the Vulkan spec (`vkCmdPipelineBarrier2` + same-queue submission ordering), that combination is the correct memory dependency for "paint writes happen-before composite reads" — no `queue_wait_idle`, no semaphore handoff, no holder wiring needed. Pre-task note 5 has the full framing.
 
 ### Key invariants Phase 4 inherits
 
