@@ -4434,19 +4434,19 @@ impl KmsBackend {
         foreground: u32,
         rendered: &[RenderedGlyph],
     ) -> bool {
-        use crate::kms::vk::{
-            glyph::GlyphKey,
-            ops::{run_one_shot_op, text as vk_text},
-        };
+        use crate::kms::vk::{glyph::GlyphKey, ops::text as vk_text};
 
         if rendered.is_empty() {
             return true;
         }
 
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return false;
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+        // 3E: acquire batch resources up-front (gated by
+        // renderer_failed). Atlas upload (intern) and the recorder
+        // BOTH route through this — single source for vk_arc /
+        // pool_handle removes the duplicate binding that pre-3E
+        // had (one for intern's pool, one for run_one_shot_op's
+        // submit).
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
             return false;
         };
         if self.glyph_atlas.is_none() || self.text_pipeline.is_none() {
@@ -4500,21 +4500,11 @@ impl KmsBackend {
             1.0,
         ];
 
-        // 3D-deferred: text-run needs per-batch glyph-atlas-upload + descriptor
-        // strategy before migrating to record_paint_batch_op. The pre-record
-        // ProtocolBarrier flush keeps this legacy path safe alongside batched
-        // fill/copy/PutImage in the same protocol cycle.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
-
-        // Pull mut refs after the atlas borrow ends. The atlas
-        // and the pipeline are immutable for the recording step;
-        // the mirror is &mut.
+        // Re-borrow the mirror mutably for the recording. The
+        // closure also captures atlas + pipeline (read-only) from
+        // disjoint fields. self.scheduler.record_paint_op is the
+        // remaining mutable borrow; field-disjoint, so the borrow
+        // checker accepts.
         let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&host_xid) {
@@ -4528,17 +4518,19 @@ impl KmsBackend {
         let atlas = self.glyph_atlas.as_ref().expect("checked above");
         let pipeline = self.text_pipeline.as_ref().expect("checked above");
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            vk_text::record_text_run(
-                vk,
-                cb,
-                mirror,
-                atlas,
-                pipeline,
-                &glyphs_to_draw,
-                foreground_rgba,
-            )
-        }) {
+        match self
+            .scheduler
+            .record_paint_op(vk_arc, pool_handle, |vk, cb| {
+                vk_text::record_text_run(
+                    vk,
+                    cb,
+                    mirror,
+                    atlas,
+                    pipeline,
+                    &glyphs_to_draw,
+                    foreground_rgba,
+                )
+            }) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
