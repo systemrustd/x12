@@ -16,6 +16,13 @@ pub const RELEASE_OVERLAY_WINDOW: u8 = 8;
 pub const MAJOR_VERSION: u32 = 0;
 pub const MINOR_VERSION: u32 = 4;
 
+/// `update` byte values for `RedirectWindow` / `RedirectSubwindows`.
+/// Per `compositeproto.txt`: `Automatic = 0`, `Manual = 1`. Real
+/// compositing window managers (xfwm4, picom, compton, xcompmgr)
+/// request Manual = 1.
+pub const REDIRECT_AUTOMATIC: u8 = 0;
+pub const REDIRECT_MANUAL: u8 = 1;
+
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }

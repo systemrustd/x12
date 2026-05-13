@@ -2583,21 +2583,19 @@ fn handle_composite_request(
         x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
             if let Some((window, update)) = x11composite::parse_window_update(body) {
                 let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
-                // L2 plan B.1: Manual-only initially; reject other modes
-                // with BadValue. Reject other-owner conflicts with
-                // BadAccess; same-owner re-redirect is idempotent.
+                // Per compositeproto.txt: Automatic = 0, Manual = 1.
+                // Real compositing WMs (xfwm4, picom, etc.) request
+                // Manual. yserver's Composite implementation doesn't
+                // yet differentiate the two modes — it accepts both
+                // and tracks the requested mode for future use.
+                // BadValue on any other byte. Reject other-owner
+                // conflicts with BadAccess; same-owner re-redirect is
+                // idempotent.
                 let mode = match update {
-                    0 => crate::server::CompositeRedirectMode::Manual,
-                    1 => {
-                        return emit_x11_error(
-                            state,
-                            client_id,
-                            sequence,
-                            x11::error::BAD_VALUE,
-                            u32::from(update),
-                            COMPOSITE_MAJOR_OPCODE,
-                        );
+                    x11composite::REDIRECT_AUTOMATIC => {
+                        crate::server::CompositeRedirectMode::Automatic
                     }
+                    x11composite::REDIRECT_MANUAL => crate::server::CompositeRedirectMode::Manual,
                     _ => {
                         return emit_x11_error(
                             state,
@@ -10825,13 +10823,35 @@ mod tests {
     }
 
     #[test]
-    fn redirect_automatic_mode_returns_bad_value() {
+    fn redirect_manual_mode_succeeds() {
+        // Per compositeproto.txt Manual = 1. xfwm4, picom, compton,
+        // xcompmgr all request Manual; previously yserver had the
+        // constants inverted and rejected this with BadValue, which
+        // prevented xfce4-session from starting.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // mode byte = 1 → Automatic. B.1 ships Manual only; the
-        // dispatcher returns BadValue.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 1);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xCAFE, 1);
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "no error expected on Manual redirect; got {n} bytes");
+        assert!(
+            state
+                .composite_redirects
+                .contains_key(&(ResourceId(0xCAFE), false))
+        );
+    }
+
+    #[test]
+    fn redirect_invalid_mode_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Bytes ≥ 2 are not valid Composite redirect modes (only
+        // Automatic = 0 and Manual = 1 are defined). Server must
+        // BadValue.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 2);
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
         peer.read_exact(&mut buf).expect("error delivered");
