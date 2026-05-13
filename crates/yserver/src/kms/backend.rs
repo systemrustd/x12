@@ -1720,7 +1720,7 @@ impl KmsBackend {
     ///   try_vk_put_image:                 image::record_put_image             — migrated 3C T1 (record_paint_batch_op + arena)
     ///   try_vk_text_run:                  text::record_text_run               — migrated 3E T1 (record_paint_op)
     ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
-    ///   try_vk_render_composite_glyphs:   text::record_text_run               — borrow-conflict fallback
+    ///   try_vk_render_composite_glyphs:   text::record_text_run               — migrated 3E T2 (record_paint_op)
     ///   try_vk_render_composite:          render::record_render_composite     — borrow-conflict fallback
     ///
     ///   open_with_commit (constructor):   record_solid_color_clear            — left alone (one-time init, no DrawableImage)
@@ -5183,10 +5183,7 @@ impl KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> bool {
-        use crate::kms::vk::{
-            glyph::GlyphKey,
-            ops::{run_one_shot_op, text as vk_text},
-        };
+        use crate::kms::vk::{glyph::GlyphKey, ops::text as vk_text};
 
         // PictOp `Over` (3) is the natural fit for the text pipeline's
         // pre-mul srcover blend state. `Src` (1) overrides dst rather
@@ -5233,12 +5230,14 @@ impl KmsBackend {
             return false;
         }
 
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            log::debug!("vk text bail: no Vk context");
-            return false;
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            log::debug!("vk text bail: no ops_command_pool");
+        // 3E: acquire batch resources up-front (gated by
+        // renderer_failed). Atlas upload (intern) and the recorder
+        // BOTH route through this — single source for vk_arc /
+        // pool_handle.
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            log::debug!(
+                "vk text bail: paint_resources unavailable (renderer_failed or vk/pool absent)"
+            );
             return false;
         };
         if self.glyph_atlas.is_none() || self.text_pipeline.is_none() {
@@ -5416,19 +5415,11 @@ impl KmsBackend {
             return true;
         }
 
-        // 3D-deferred: text-run needs per-batch glyph-atlas-upload + descriptor
-        // strategy before migrating to record_paint_batch_op. The pre-record
-        // ProtocolBarrier flush keeps this legacy path safe alongside batched
-        // fill/copy/PutImage in the same protocol cycle.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
-
-        // Pull the mirror + atlas + pipeline references for recording.
+        // Re-borrow the mirror mutably for the recording. The
+        // closure also captures atlas + pipeline (read-only) from
+        // disjoint fields. self.scheduler.record_paint_op is the
+        // remaining mutable borrow; field-disjoint, so the borrow
+        // checker accepts.
         let mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
@@ -5442,17 +5433,19 @@ impl KmsBackend {
         let atlas = self.glyph_atlas.as_ref().expect("checked above");
         let pipeline = self.text_pipeline.as_ref().expect("checked above");
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            vk_text::record_text_run(
-                vk,
-                cb,
-                mirror,
-                atlas,
-                pipeline,
-                &glyphs_to_draw,
-                foreground_premul,
-            )
-        }) {
+        match self
+            .scheduler
+            .record_paint_op(vk_arc, pool_handle, |vk, cb| {
+                vk_text::record_text_run(
+                    vk,
+                    cb,
+                    mirror,
+                    atlas,
+                    pipeline,
+                    &glyphs_to_draw,
+                    foreground_premul,
+                )
+            }) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
