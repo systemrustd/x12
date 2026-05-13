@@ -2605,38 +2605,50 @@ impl KmsBackend {
         mirror: &mut crate::kms::vk::target::DrawableImage,
         pixels: &[u8],
     ) -> Result<(), ash::vk::Result> {
-        let staging = self
-            .ops_staging
-            .as_mut()
-            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let needed = pixels.len() as u64;
         if needed == 0 {
             return Ok(());
         }
-        staging.ensure(needed)?;
-        let staging_buffer = staging.buffer();
-        let staging_ptr = staging.mapped_ptr();
-        // SAFETY: `staging_ptr` is a host-mapped, write-combine pointer
-        // into a buffer we just grew to `needed` bytes; `pixels.as_ptr()`
-        // is valid for `pixels.len()`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging_ptr, pixels.len());
-        }
+
+        let (vk_arc, pool_handle) = self
+            .paint_resources()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+
         let extent = mirror.extent;
-        // NLL: `staging` borrow on `self.ops_staging` ends above;
-        // `staging_buffer` and `staging_ptr` are Copy values.
-        self.run_legacy_paint_op(|_vk, cb| {
-            mirror.record_upload_rect(
-                cb,
-                staging_buffer,
-                0,
-                ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                },
-            );
-            Ok(())
-        })
+        let pixels_ptr = pixels.as_ptr();
+        let pixels_len = pixels.len();
+
+        self.scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, |_vk, batch, cb| {
+                let alloc = batch.upload_arena_mut().alloc(needed, 16).map_err(|e| {
+                    log::warn!(
+                        "vk upload_bgra_to_mirror: arena alloc {needed} bytes failed: {e:?}"
+                    );
+                    ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                })?;
+                // SAFETY: `alloc.mapped_ptr` is a HOST_VISIBLE |
+                // HOST_COHERENT mapped pointer at `alloc.buffer +
+                // alloc.offset` covering `needed` bytes;
+                // `pixels_ptr` is valid for `pixels_len` bytes and
+                // we checked `pixels_len == needed`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pixels_ptr,
+                        alloc.mapped_ptr.as_ptr(),
+                        pixels_len,
+                    );
+                }
+                mirror.record_upload_rect(
+                    cb,
+                    alloc.buffer,
+                    alloc.offset,
+                    ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    },
+                );
+                Ok(())
+            })
     }
 
     /// Read the full mirror of a window or pixmap drawable back to
