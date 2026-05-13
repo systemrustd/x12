@@ -54,7 +54,7 @@ Read `docs/known-issues.md` (the "P0: KMS teardown..." entry, at the end of the 
 
 8. **Gate the composite path on `shutting_down` AND `renderer_failed`** at the same call sites. Both make `composite_and_flip` a no-op. Don't combine them into a single flag — `renderer_failed` is recoverable-via-restart while `shutting_down` is terminal-by-design.
 
-9. **No new tests required for hardware behavior** (no DRM mock in the codebase). One small unit test for `ScanoutBoPool::has_pending_pageflip` predicate is reasonable. Hardware smoke is the validation gate.
+9. **No new unit tests added in T1.** Initial drafts proposed a test, but codex's v2 review caught that a "real" `ScanoutBoPool::has_pending_pageflip` test requires Vk + DRM mocks the codebase doesn't have, and a performative test that walks `BoState` transitions without exercising the predicate is worse than none. Hardware smoke (T3) is the validation gate.
 
 10. **clippy**: project preference is plain `cargo clippy`. 5 pre-existing `doc_lazy_continuation` warnings remain; no new ones.
 
@@ -103,7 +103,10 @@ Locate the `ScanoutBo` struct (around `scanout.rs:188`). Add a new field at the 
 ```rust
     /// When `true`, `Drop` early-returns: no explicit
     /// `destroy_framebuffer`, no GEM close, no Vk teardown. The
-    /// process-exit DRM-fd close + Vulkan device drop reap everything.
+    /// Resources are then leaked until process-exit DRM-fd close +
+    /// VkDevice teardown — the kernel reaps GEM/FB on device-fd close
+    /// and the userspace heap goes away with the process. This is a
+    /// deliberate last-resort leak path, not a normal cleanup route.
     /// Set by `disarm()` from the shutdown path when atomic
     /// `disable_output` failed for this BO's CRTC — KMS may still
     /// hold the FB, so user-side teardown would corrupt kernel state.
@@ -131,11 +134,13 @@ impl Drop for ScanoutBo {
     fn drop(&mut self) {
         if self.disarmed {
             // Disarmed by shutdown-failed-disable path; let DRM-fd
-            // close (process exit) reap FB + GEM, and Vulkan device
-            // drop reap VkImage + memory. Touching these explicitly
-            // while KMS may still hold the FB produces the `atomic
-            // remove_fb failed with -22` warning that strands
-            // Wayland host sessions.
+            // close (process exit) reap GEM/FB and VkDevice teardown
+            // releases the userspace handles. We are DELIBERATELY
+            // leaking: this Drop deliberately skips vkDestroyImage,
+            // vkFreeMemory, destroy_framebuffer, close_buffer(gem),
+            // etc. — because touching them while KMS may still hold
+            // the FB produces the `atomic remove_fb failed with -22`
+            // warning that strands Wayland host sessions.
             log::warn!(
                 "ScanoutBo disarmed (atomic disable_output failed); \
                  leaking FB/GEM/Vk to be reaped by DRM-fd close"
@@ -201,7 +206,7 @@ Match the trailing-comma style of neighbouring fields (the struct literal uses t
 - [ ] **Step 2d: Build + tests**
 
 Run: `cargo check -p yserver` → clean.
-Run: `cargo test -p yserver --lib` → 139 passed.
+Run: `cargo test -p yserver --lib` → 138 passed.
 
 ### Step 3: Gate `composite_and_flip` and `try_vulkan_composite_flip` on `shutting_down`
 
@@ -253,7 +258,7 @@ In `try_vulkan_composite_flip`:
 - [ ] **Step 3c: Build + tests**
 
 Run: `cargo check -p yserver` → clean.
-Run: `cargo test -p yserver --lib` → 139 passed.
+Run: `cargo test -p yserver --lib` → 138 passed.
 
 ### Step 4: Add the `drain_pending_pageflips_for_shutdown` helper
 
@@ -375,7 +380,10 @@ Add this method to the same `impl KmsBackend` block as `disable_output`:
     /// user-side `destroy_framebuffer` from `ScanoutBo::Drop` would
     /// produce the `atomic remove_fb failed with -22` kernel WARN
     /// that strands Wayland host sessions. Process-exit DRM-fd close
-    /// reaps the FB + GEM; Vulkan device drop reaps VkImage.
+    /// reaps the GEM/FB; VkDevice teardown releases the userspace
+    /// handles. This Drop deliberately skips per-object cleanup
+    /// (vkDestroyImage, destroy_framebuffer, close_buffer, etc.) —
+    /// it's a deliberate last-resort leak, not a normal teardown.
     fn disarm_scanout_pool(&mut self, output_idx: usize) {
         let Some(pool) = self
             .scanout_pools
@@ -406,7 +414,7 @@ If `nix::poll::poll` signature differs from what's written: in `nix` 0.31 the si
 
 - [ ] **Step 4e: Run tests**
 
-Run: `cargo test -p yserver --lib` → 139 passed.
+Run: `cargo test -p yserver --lib` → 138 passed.
 
 ### Step 5: Commit T1
 
@@ -616,7 +624,7 @@ Expected: clean.
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p yserver --lib`
-Expected: 139 passed (same as T1 end).
+Expected: 138 passed (same as T1 end; T2 adds no tests).
 
 - [ ] **Step 5: fmt + clippy**
 
@@ -687,7 +695,7 @@ cargo test --workspace 2>&1 | tail -15
 Expected:
 - fmt: no diff.
 - clippy: 5 pre-existing `doc_lazy_continuation` warnings; no new ones.
-- tests: yserver lib 139 passed (138 prior + 1 new `has_pending_pageflip_*` test), workspace green.
+- tests: yserver lib 138 passed (no new tests added — see T1 Step 1e rationale), workspace green.
 
 - [ ] **Step 2: Greps confirm 6-step structure**
 
@@ -700,8 +708,9 @@ rg -n 'shutting_down' crates/yserver/src/kms/backend.rs
 # gate + try_vulkan_composite_flip gate + disable_output write = 6+ hits
 
 rg -n 'drain_pending_pageflips_for_shutdown\|has_pending_pageflip' crates/yserver/src/kms/
-# Expected: 1 helper definition + 1 disable_output call + 1 has_pending_pageflip
-# definition + 1 use inside the helper + 1 in the unit test = 5+ hits
+# Expected: 1 drain_pending_pageflips_for_shutdown definition + 1 call from
+# disable_output + 1 has_pending_pageflip definition + 1 use inside the
+# drain helper = 4 hits. No unit test.
 ```
 
 ### Step 2: Hardware smoke (REQUIRED)
@@ -804,8 +813,8 @@ $ rg -n 'drain_pending_pageflips_for_shutdown' crates/yserver/src/kms/backend.rs
 # Expected: 2 hits — definition + 1 disable_output call site.
 
 $ rg -n 'has_pending_pageflip' crates/yserver/src/kms/
-# Expected: ≥ 3 hits — definition, use in drain_pending_pageflips_for_shutdown,
-# unit test.
+# Expected: 2 hits — definition in scanout.rs + use in
+# drain_pending_pageflips_for_shutdown. No unit test.
 
 $ rg -n 'drain_all_pending' crates/yserver/src/kms/backend.rs
 # Expected: 1 hit, inside disable_output, AFTER the atomic disable_output
