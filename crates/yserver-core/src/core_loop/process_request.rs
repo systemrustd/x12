@@ -8885,7 +8885,7 @@ fn handle_create_pixmap(
         request.drawable.0,
     );
     let new_id = request.pixmap.0;
-    let (validation_failed, drawable_exists) = {
+    let (owned, in_use, drawable_exists) = {
         let handle = state.clients.get(&client_id.0).expect("client registered");
         let owned = crate::server::IdAllocator::validate_owned(
             new_id,
@@ -8895,9 +8895,15 @@ fn handle_create_pixmap(
         let in_use = state.resources.any_resource_exists(request.pixmap);
         let drawable_exists = state.resources.window(request.drawable).is_some()
             || state.resources.pixmap(request.drawable).is_some();
-        (!owned || in_use, drawable_exists)
+        (owned, in_use, drawable_exists)
     };
-    if validation_failed {
+    if !owned || in_use {
+        log::warn!(
+            "client {} CreatePixmap BadIDChoice pid=0x{:x} ({})",
+            client_id.0,
+            new_id,
+            if !owned { "out-of-range" } else { "in-use" },
+        );
         return emit_x11_error(
             state,
             client_id,
