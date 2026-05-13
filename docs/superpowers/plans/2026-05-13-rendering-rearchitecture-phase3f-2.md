@@ -143,7 +143,9 @@ After 3F-2 lands, the **only** uses of `queue_wait_idle` left in `backend.rs`-re
 
 7. **OOM-poison concern (real here)**. Arena alloc failure must use the outer-flag pattern (Invariant 6 above). Descriptor alloc failure CAN poison via `?` — that's after CB recording has started, so poisoning is the right state transition. The pre-resize flush failure is detected BEFORE the closure runs; on failure the function early-returns without touching the batch.
 
-8. **Test coverage**: no direct unit test for `try_vk_render_traps_or_tris`. Coverage is xts5 + rendercheck + hardware smoke. T5 hardware smoke is the gate. The adapta-nokto + mate-cc reproducer in `docs/known-issues.md` is a natural workload for "did this phase land cleanly?" — a successful T5 smoke should show **noticeably reduced lag** even before phase 5 lands.
+8. **Record-time CPU layout tracking under poisoning.** `MaskScratch::record_upload_r8` advances `self.current_layout` immediately after recording the final barrier into the CB. If a later `?` in the closure poisons the batch, the CB never executes — but the CPU-side `current_layout` already reflects the would-be-executed state. The next batch's `record_upload_r8` would then emit a wrong-old-layout barrier (transitioning from `SHADER_READ_ONLY` when the GPU actually has the image in the prior layout). This is the same pattern `SolidColorImage` and the drawable mirrors already follow; the subsystem accepts it because the alternative (mirroring submit/retire-time layout updates from the CPU side) is much more invasive. Worth noting because 3F-2 brings MaskScratch into this contract for the first time; mention in the results doc that this is a known limitation shared with the other paint-side resources, with Phase 6 (batch-owned refcounted handles) as the eventual structural fix.
+
+9. **Test coverage**: no direct unit test for `try_vk_render_traps_or_tris`. Coverage is xts5 + rendercheck + hardware smoke. T5 hardware smoke is the gate. The adapta-nokto + mate-cc reproducer in `docs/known-issues.md` is a natural workload for "did this phase land cleanly?" — a successful T5 smoke should show **noticeably reduced lag** even before phase 5 lands.
 
 9. **clippy / fmt**: plain `cargo clippy -p yserver`, `cargo +nightly fmt`. 5 pre-existing `doc_lazy_continuation` warnings; no new ones.
 
@@ -574,6 +576,7 @@ Disposition table (same orientation note as 3F-1 — line numbers approximate):
 | drawable src format gating | Keeps. |
 | **`mask_scratch.upload_r8(pool_handle, bbox_w, bbox_h, coverage_mask)`** (~lines 4849-4859) | **REPLACED**: mask upload moves INSIDE the closure (arena alloc + copy + `record_upload_r8`). The `ensure_image_size` part moves out, gated on `needs_image_grow + pre-flush`. |
 | `render_pipelines.get(...)` + `pipeline_layout()` + **`reset_descriptors()`** | **`reset_descriptors` REMOVED**. Keep `get` + `pipeline_layout`. |
+| `solid_src_view` / `mask_view` / `mask_extent` reads (~lines 4891-4901) | **REORDERED**: `mask_view` and `mask_extent` MUST be re-fetched AFTER the new `mask_scratch.ensure_image_size(...)` call (Step 5 below) — `ensure_image_size` destroys the old `vk::ImageView` on grow (see `mask_scratch.rs:111`), so a pre-ensure fetch would dangle. `solid_src_view` is unaffected. |
 | src/mask/solid view resolution | Keeps. |
 | src view resolution (R8 mask / depth-24 / regular paths) | Keeps. |
 | `dst_readback.ensure` + `view` | **REORDERED** with new pre-flush gating (combined needs_grow). |
@@ -700,6 +703,19 @@ Locate the `let dst_readback_view = if needs_dst_readback {` block (~line 5004).
 ```
 
 (The mask sizes are now guaranteed `≥ bbox_w × bbox_h` by `ensure_image_size`; the closure can safely call `record_upload_r8` without re-checking.)
+
+**P1 follow-on**: the existing `mask_view = ...image_view()` + `mask_extent = ...extent()` reads at ~lines 4896-4901 currently sit BEFORE the insertion point above. Move them to immediately AFTER this `ensure_image_size` block, so the captured `vk::ImageView` reflects the post-grow image (a pre-grow fetch would dangle when `ensure_image_size` destroys the old view via `mask_scratch.rs:111`'s `destroy_image_view(self.view, ...)`). `solid_src_view` can stay at its current position — it isn't affected by mask grow. Concretely, after this step the order should be:
+
+```rust
+// 1. needs_grow checks + conditional pre-flush (this step)
+// 2. self.mask_scratch.as_mut().expect("...").ensure_image_size(bbox_w, bbox_h)?;
+// 3. let mask_view = self.mask_scratch.as_ref().expect("...").image_view();
+// 4. let mask_extent = self.mask_scratch.as_ref().expect("...").extent();
+// 5. (existing dst_readback ensure + view + descriptor + xform + CompositeAttrs)
+// 6. (closure captures + record_paint_batch_op)
+```
+
+The `solid_src_view` read at ~line 4891 can stay where it is (it doesn't depend on the mask grow). When verifying with `cargo check`, an "use of moved value" or "dangling reference" diagnostic on `mask_view` is the symptom of forgetting to move it.
 
 ### Step 4: Delete the legacy `allocate_descriptor_for_views` call
 
@@ -1052,17 +1068,17 @@ EOF
 
 ### Step 1: Verify zero remaining callers
 
-- [ ] **Step 1: Confirm zero remaining callers**
+- [ ] **Step 1: Confirm zero remaining callable sites**
 
 ```bash
 cd /home/jos/Projects/yserver
-rg -n 'reset_descriptors\b' crates/yserver/src crates/yserver-core/src crates/yserver-protocol/src
-rg -n '\.allocate_descriptor_for_views\b' crates/yserver/src crates/yserver-core/src crates/yserver-protocol/src
+rg -n 'reset_descriptors\(' crates/yserver/src crates/yserver-core/src crates/yserver-protocol/src
+rg -n '\.allocate_descriptor_for_views\(' crates/yserver/src crates/yserver-core/src crates/yserver-protocol/src
 ```
 
-Expected: ZERO hits for both (the function definitions in `render_pipeline.rs` are about to be removed, so even those hits should be confined to `render_pipeline.rs` itself).
+Expected: hits ONLY inside `crates/yserver/src/kms/vk/render_pipeline.rs` (the function definitions about to be removed). Note the `\(` discriminator — bare-name doc-comment references in `crates/yserver/src/kms/scheduler/batch_descriptor_arena.rs:14-45` (audit catalogue scaffolding from 3A) don't count and will be cleaned up in Step 8 below.
 
-If any caller remains, STOP — T3 didn't fully land or there's a path the plan didn't anticipate.
+If any other caller remains, STOP — T3 didn't fully land or there's a path the plan didn't anticipate.
 
 ### Step 2: Remove the methods
 
@@ -1179,6 +1195,27 @@ Confirm it has no remaining users in this file (rg already greens it with no cal
 
 (Note: there is a `MAX_DESCRIPTOR_SETS_PER_FRAME` of the same name in `crates/yserver/src/kms/vk/pipeline.rs` — that's a separate const for the compositor pipeline and is used by `backend.rs:7172`. Leave that one alone. Confirm by `grep -rn 'MAX_DESCRIPTOR_SETS_PER_FRAME' crates/yserver/src/` after the edit — should show only the pipeline.rs definition and the one backend.rs usage of the pipeline.rs one.)
 
+- [ ] **Step 9: Bring the `batch_descriptor_arena.rs` header doc comment current**
+
+The current header at `crates/yserver/src/kms/scheduler/batch_descriptor_arena.rs:14-45` is the 3A-era audit catalogue ("`# Paint-side descriptor pool catalogue (for 3D plan author)`") that called out the now-deleted `RenderPipelineCache::reset_descriptors` + `allocate_descriptor_for_views` as the migration targets. After T4's deletions those references are stale.
+
+Open `crates/yserver/src/kms/scheduler/batch_descriptor_arena.rs` and replace lines 14-45 (the catalogue block, starting with `//! # Paint-side descriptor pool catalogue` and ending with the 3D-migration-plan note) with a single short paragraph reflecting the post-migration state:
+
+```rust
+//! # Migration history
+//!
+//! Created in 3A to replace `RenderPipelineCache`'s shared
+//! `descriptor_pool`. Wired up in 3F-1 (`try_vk_render_composite`)
+//! and 3F-2 (`try_vk_render_traps_or_tris`); the legacy shared-pool
+//! API on `RenderPipelineCache` was removed at the end of 3F-2.
+//! `TextPipeline` still owns a single per-pipeline pool for its
+//! atlas binding — that's a one-pre-allocated-set pattern, not a
+//! per-call allocation, so it doesn't have the
+//! reset-invalidates-live-sets hazard this arena solves.
+```
+
+Leave lines 1-12 (the actual module doc) intact.
+
 ### Step 4: Build
 
 - [ ] **Step 9: `cargo check -p yserver`**
@@ -1204,7 +1241,7 @@ Expected: 5 pre-existing warnings, no new ones.
 - [ ] **Step 13: Commit**
 
 ```bash
-git add crates/yserver/src/kms/vk/render_pipeline.rs
+git add crates/yserver/src/kms/vk/render_pipeline.rs crates/yserver/src/kms/scheduler/batch_descriptor_arena.rs
 git commit -m "$(cat <<'EOF'
 refactor(kms): remove legacy RenderPipelineCache shared-pool API
 
@@ -1254,10 +1291,10 @@ rg -n 'flush_if_needed[(]BatchFlushReason::ProtocolBarrier' crates/yserver/src/k
 Expected: the OLD unconditional pre-record flush inside `try_vk_render_traps_or_tris` is gone. ONE **needs-grow-only** pre-flush remains inside `try_vk_render_traps_or_tris` (covering both mask and dst_readback grow). Other remaining sites: `run_legacy_paint_op` body, drawable-destruction sites, gradient-create sites, `try_vk_copy_area` resize-only, `try_vk_render_composite` resize-only.
 
 ```bash
-rg -n 'allocate_descriptor_for_views\b' crates/yserver/src/kms/
+rg -n '\.allocate_descriptor_for_views\(' crates/yserver/src/kms/
 ```
 
-Expected: ZERO hits (the legacy variant is fully gone after T4).
+Expected: ZERO hits (the legacy variant is fully gone after T4). The `\(` discriminator distinguishes callable invocations from bare-name doc references; the `batch_descriptor_arena.rs` audit catalogue was refreshed in T4 Step 9 so doc-only mentions are also gone, but the `\(` guards against re-introduction if a future doc edit references the removed name.
 
 ```bash
 rg -n 'allocate_descriptor_for_views_into' crates/yserver/src/kms/
@@ -1266,7 +1303,7 @@ rg -n 'allocate_descriptor_for_views_into' crates/yserver/src/kms/
 Expected: 1 definition (`render_pipeline.rs`) + 2 call sites (`backend.rs` — inside `try_vk_render_composite` from 3F-1 + inside `try_vk_render_traps_or_tris` from 3F-2).
 
 ```bash
-rg -n 'reset_descriptors' crates/yserver/src/kms/
+rg -n 'reset_descriptors\(' crates/yserver/src/kms/
 ```
 
 Expected: ZERO hits (the function is gone after T4).
@@ -1445,13 +1482,13 @@ $ rg -n 'flush_if_needed[(]BatchFlushReason::ProtocolBarrier' crates/yserver/src
 $ rg -n 'record_paint_batch_op|record_paint_op' crates/yserver/src/kms/backend.rs
 # ≥ 11 call sites total.
 
-$ rg -n 'allocate_descriptor_for_views\b' crates/yserver/src/kms/
-# ZERO (legacy variant deleted).
+$ rg -n '\.allocate_descriptor_for_views\(' crates/yserver/src/kms/
+# ZERO (legacy variant deleted; \( discriminates calls from doc-only references).
 
 $ rg -n 'allocate_descriptor_for_views_into' crates/yserver/src/kms/
 # 1 def + 2 call sites (try_vk_render_composite + try_vk_render_traps_or_tris).
 
-$ rg -n 'reset_descriptors' crates/yserver/src/kms/
+$ rg -n 'reset_descriptors\(' crates/yserver/src/kms/
 # ZERO (the function is gone).
 
 $ rg -n 'needs_grow|needs_image_grow' crates/yserver/src/kms/
