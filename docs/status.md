@@ -83,16 +83,27 @@ Cross-cutting bugs and followups that don't fit a phase live in
 - [x] **Scroll-wheel support** (`b7d17a1`) — `InputEvent::PointerScroll` + libinput axis translation + synthetic-button-code mapping to X11 buttons 4/5/6/7. `has_axis` fix (`56f93d9`) closes a libinput "client bug" log flood.
 - [x] **Composite pool-release per-frame** (`cb44c1d`) — fixed a pre-existing FIFO-drain bug where one lagging output held pool slots hostage for already-retired frames on the other output. Caught by codex during 3E smoke.
 
+- [x] **Phase 4 — Sync rework (close-time wait)** (`2135a16` + `642d544` + `6fe4a71` + `49ff484` + `f68d8c2`)
+  - T1: replaced `vkQueueWaitIdle` in `PaintBatch::submit_and_wait` with `wait_for_fences` on a per-batch `VkFence`. Narrower wait scope.
+  - T2: added `submit_async` / `try_retire_if_signaled` / `wait_for_completion` async-retirement building blocks.
+  - T3: `RenderScheduler` gained `submitted_paint_batches` queue + `close_and_submit_async` + `poll_retired_paint_batches`. `flush_if_needed` branches strict (blocking) vs best-effort (async). Poll wired into composite tick.
+  - T4: `MAX_IN_FLIGHT_PAINT_BATCHES = 4` backpressure cap on the queue.
+  - T5: `drain_submitted_paint_batches` called after `vkDeviceWaitIdle()` in shutdown.
+  - **Hardware smoke: confirmed on fuji (2026-05-14)** — heavy GTK use (GIMP drag, steady-state mate session) is now low-CPU and lag-free; "snappy as fuck" per user. Adapta + mate-cc burst case unchanged (separate workload, separate phase below).
+  - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase4-results.md`
+
 ### Remaining — in priority order
 
-- [ ] **Phase 4 — Sync rework**
-  - Retire `vkQueueWaitIdle` from `run_one_shot_op` (the hot-path drain).
-  - Retire the close-time wait in `PaintBatch::submit_and_wait`.
-  - Real `VkFence` polled via `vkGetFenceStatus`, or timeline semaphore. Many readers + writers; non-blocking status checks at composite poll.
+- [ ] **Pixmap-allocation pool — burst-absorbing `VkImage` recycling** (was: "AMD investigation phase")
+  - Confirmed cross-vendor reproducer: apply adapta-nokto theme with mate-cc visible → catastrophic on bee (RDNA2 + Arch) and fuji (Intel + Arch); usable-but-slow on imac (Polaris11 + older Ubuntu).
+  - Not amdgpu-specific — Intel chokes too. Recent kernels (Arch) catastrophic; older (Ubuntu 25.04) merely slow.
+  - Root cause per perf data + interactive testing: yserver's per-pixmap `VkImage`/memory/VA alloc-free path can't absorb workload bursts. mate-cc launcher first-paint and system-wide theme transitions both fire dense `CreatePixmap`/`FreePixmap` cycles for small (16x16, 32x32) widget pixmaps; the kernel allocator serializes under burst rate.
+  - Fix shape: `VkImagePool` on `KmsBackend` keyed by `(extent, format, usage)`. `FreePixmap` of small pixmaps returns image to pool; `CreatePixmap` checks pool first. Bounded pool size per bucket. Drain at backend teardown.
+  - Validation: adapta + mate-cc apply test on bee + fuji.
 - [ ] **Phase 5 — Targeted `VkFence` for record_get_image + atlas grow**
   - `record_get_image` still on `run_one_shot_op + queue_wait_idle` (4 readback handlers).
-  - `GlyphAtlas::intern`'s per-glyph one-shot upload + waitidle (phase-3E deliberate defer).
-  - `MaskScratch` / `CopyScratch` / `dst_readback` `ensure_size` grow paths (after 3F migrates their consumers, the grow can defer through the batch retire queue instead of waitidle).
+  - `GlyphAtlas::intern`'s per-glyph one-shot upload + waitidle (phase-3E deliberate defer; profile shows it's not steady-state hot — re-evaluate priority).
+  - `MaskScratch` / `CopyScratch` / `dst_readback` `ensure_size` grow paths (after 3F migrated their consumers, the grow can defer through the batch retire queue instead of waitidle).
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
   - Codex's long-term recommendation from 3B salvage: instead of relying on protocol destruction barriers + `queue_wait_idle`, adopt destroyed VkImages into the open `PaintBatch` via `BatchResource` so destruction defers automatically.
   - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F will introduce for `MaskScratch` + `dst_readback`, and the 3B destruction-barrier collection.
