@@ -502,6 +502,59 @@ impl RenderPipelineCache {
         unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
         Ok(set)
     }
+
+    /// Per-batch variant of `allocate_descriptor_for_views`. Allocates
+    /// the descriptor set from the supplied `BatchDescriptorArena`
+    /// (whose chunks live until the batch retires) instead of the
+    /// per-cache shared pool (which `reset_descriptors` invalidates).
+    /// Callers that record into an open `PaintBatch` MUST use this
+    /// path — the shared-pool variant is unsafe under batching
+    /// because subsequent ops in the same batch would reset and
+    /// invalidate sets still referenced by un-submitted CB commands.
+    ///
+    /// 3F-1: first consumer is `try_vk_render_composite`. 3F-2 will
+    /// migrate `try_vk_render_traps_or_tris` and remove the legacy
+    /// shared-pool path along with `reset_descriptors`.
+    pub fn allocate_descriptor_for_views_into(
+        &self,
+        arena: &mut crate::kms::scheduler::batch_descriptor_arena::BatchDescriptorArena,
+        src_view: vk::ImageView,
+        mask_view: vk::ImageView,
+        dst_view: vk::ImageView,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let set = arena.allocate_set(self.descriptor_set_layout)?;
+        let src_info = [vk::DescriptorImageInfo::default()
+            .image_view(src_view)
+            .sampler(self.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let mask_info = [vk::DescriptorImageInfo::default()
+            .image_view(mask_view)
+            .sampler(self.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let dst_info = [vk::DescriptorImageInfo::default()
+            .image_view(dst_view)
+            .sampler(self.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&src_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&mask_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&dst_info),
+        ];
+        unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
+        Ok(set)
+    }
 }
 
 impl Drop for RenderPipelineCache {
