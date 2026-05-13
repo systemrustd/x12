@@ -70,6 +70,29 @@ impl DstReadback {
         }
     }
 
+    /// True if a later `ensure(format, width, height)` call would
+    /// reallocate the per-format scratch image. Callers in batched
+    /// paint paths use this BEFORE entering `record_paint_batch_op`
+    /// so they can flush any in-flight batch — `ensure` destroys
+    /// the old image after `queue_wait_idle`, which does NOT wait
+    /// for un-submitted commands. Without a pre-flush, an open
+    /// batch CB embedding the old scratch image would dangle.
+    ///
+    /// Unknown formats return `false` (the caller's `ensure` will
+    /// fail with `NoMemoryType` for the same input — a flush wouldn't
+    /// change that outcome).
+    pub fn needs_grow(&self, format: vk::Format, width: u32, height: u32) -> bool {
+        let slot = match format {
+            vk::Format::B8G8R8A8_UNORM => self.bgra.as_ref(),
+            vk::Format::R8_UNORM => self.r8.as_ref(),
+            _ => return false,
+        };
+        match slot {
+            Some(img) => width > img.extent.width || height > img.extent.height,
+            None => true, // first allocation also counts as "grow"
+        }
+    }
+
     /// Ensure the per-format scratch is at least `(width, height)`
     /// pixels. Reallocates power-of-two on grow. Returns the matching
     /// scratch for further use.
