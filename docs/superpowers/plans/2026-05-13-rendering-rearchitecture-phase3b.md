@@ -115,11 +115,11 @@ Then, in `crates/yserver/src/kms/backend.rs`, near the existing `flush_if_needed
     ///
     /// Readback handlers (`GetImage`, `read_mirror_pixels`,
     /// `hw_cursor_refresh`) DO NOT use this wrapper — they keep
-    /// their stricter `flush_if_needed(Readback)` + direct
-    /// `run_one_shot_op` because Readback surfaces failures
-    /// (returning `ERROR_DEVICE_LOST`) where ProtocolBarrier
-    /// silently swallows them, and a readback that proceeds with
-    /// an unflushed batch is silent corruption.
+    /// their existing `flush_if_needed(Readback)` + direct
+    /// `run_one_shot_op` for semantic clarity that they read
+    /// CPU-visible pixels. Behaviour-wise Readback and
+    /// ProtocolBarrier are both strict (both surface Vk errors
+    /// via `ERROR_DEVICE_LOST`); only the audit signal differs.
     pub fn run_legacy_paint_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
     where
         F: FnOnce(&crate::kms::vk::device::VkContext, ash::vk::CommandBuffer) -> Result<(), ash::vk::Result>,
@@ -159,9 +159,10 @@ Phase 2 results doc reported 39 sites. Cross-reference with the per-family count
 - plus `mirror.record_upload_rect` and other non-family sites.
 
 For each catalogued site, decide:
-- **Wrap with `run_legacy_paint_op`**: every paint-side site that is NOT already a readback handler. Includes: copy-same-overlap, image::PutImage (until 3C migrates), all render sites, all text sites, all traps sites, mirror.record_upload_rect, render_pipeline::record_solid_color_clear (around line 1801), etc.
+- **Wrap with `run_legacy_paint_op`**: every paint-side site that is NOT already a readback handler. This includes fill and copy-distinct/same too — they migrate in T2/T3, but the intermediate state between T2's commit (fill batched) and T3's commit (copy migrated) would otherwise have the exact ordering/layout hazard T0 prevents (a batched fill followed by a still-raw copy-distinct reads CPU-mutated layout while GPU hasn't reached it). T2/T3 then unwrap, replacing `run_legacy_paint_op` with `self.scheduler.record_paint_op(...)`. The "wrap then unwrap" pattern is the price of safe per-commit intermediate states.
 - **Leave alone (Readback handler)**: `try_vk_get_image_pixels`, `hw_cursor_refresh`, `read_mirror_pixels` — they already do `flush_if_needed(Readback)` + `run_one_shot_op` and that's the correct pattern.
-- **Skip (will be migrated in 3B's T2/T3)**: fill (4 sites), copy-distinct + copy-same (4 sites). T2/T3 replace `run_one_shot_op` entirely; wrapping then unwrapping is churn. Leave these on raw `run_one_shot_op` for now; T2/T3 will catch them.
+
+Wrap targets after this filter: fill (4 sites), copy-distinct + copy-same (4 sites), copy-same-overlap (1 site), image::PutImage (until 3C migrates), all render sites, all text sites, all traps sites, mirror.record_upload_rect, render_pipeline::record_solid_color_clear (around line 1801), and any other paint-side `run_one_shot_op` call. By T0's commit, every paint-side raw `run_one_shot_op` is either inside `run_legacy_paint_op`'s body or a documented borrow-conflict fallback.
 
 Document the catalogue as a comment block at the top of the relevant `backend.rs` section so 3C/3D authors see the list.
 
@@ -453,7 +454,7 @@ In `crates/yserver/src/kms/backend.rs`, find `KmsBackend` struct definition and 
 
 Initialize to `false` in `KmsBackend::new` (or wherever the struct is constructed — likely 2-3 sites including `for_tests`). Use `git grep -n 'KmsBackend {' crates/yserver/src/kms/backend.rs` to find every constructor literal.
 
-In `flush_if_needed`, gate the body:
+In `flush_if_needed`, both gate the body AND latch `renderer_failed` on Vk failure. The latch was previously only in `composite_and_flip`'s VisibleComposite path; doing it inside `flush_if_needed` covers ALL callers (composite, run_legacy_paint_op, the readback handlers) consistently:
 
 ```rust
     pub fn flush_if_needed(
@@ -462,7 +463,9 @@ In `flush_if_needed`, gate the body:
     ) -> Result<(), ash::vk::Result> {
         use crate::kms::scheduler::paint_batch::{BatchError, BatchFlushReason};
         if self.renderer_failed {
-            // Best-effort reasons swallow; strict reasons surface.
+            // Already failed: best-effort reasons swallow; strict
+            // reasons surface ERROR_DEVICE_LOST so the caller's
+            // synchronous-reply contract isn't silently broken.
             return match reason {
                 BatchFlushReason::Readback
                 | BatchFlushReason::ExternalSync
@@ -471,9 +474,30 @@ In `flush_if_needed`, gate the body:
             };
         }
         log::trace!("flush_if_needed: reason={reason:?}");
-        // ... existing body unchanged ...
+        // ... existing close_and_submit + strict/best-effort error mapping ...
+        // CHANGE: on Vk error (path-2 wait failure ⇒ abandoned
+        // resources), latch renderer_failed BEFORE returning.
+        // Every caller path then sees a consistent failed state on
+        // the next invocation.
+        match result {
+            Ok(()) => Ok(()),
+            Err(BatchError::Vk(r)) => {
+                log::error!(
+                    "flush_if_needed({reason:?}): submit_and_wait returned fatal {r:?}; \
+                     latching renderer_failed — KMS renderer disabled until restart"
+                );
+                self.renderer_failed = true;
+                Err(r)
+            }
+            Err(BatchError::Poisoned) if strict => {
+                // ... existing arm ...
+            }
+            // ... existing arms ...
+        }
     }
 ```
+
+(The full existing body from 3A T5 stays; the only ADDED behaviour is `self.renderer_failed = true` in the `Err(BatchError::Vk(_))` arm. The existing strict-reason mapping for `Poisoned` / `InvalidState` is unchanged.)
 
 In `composite_and_flip`, add the gate before the existing vk/pool extraction:
 
@@ -489,20 +513,21 @@ In `composite_and_flip`, add the gate before the existing vk/pool extraction:
         // ... existing body ...
 ```
 
-In the existing `flush_if_needed(VisibleComposite)` error path (T5 step 4), set the flag:
+The existing `flush_if_needed(VisibleComposite)` error path (3A T5 step 4) currently logs + returns `io::Error`. With `flush_if_needed` now latching `renderer_failed` itself, the composite call site simplifies:
 
 ```rust
         if let Err(e) = self.flush_if_needed(BatchFlushReason::VisibleComposite) {
-            log::error!(
-                "composite cycle: paint batch flush returned fatal {e:?}; \
-                 marking renderer_failed — KMS renderer disabled until restart"
-            );
-            self.renderer_failed = true;
+            // flush_if_needed already latched renderer_failed and
+            // logged the underlying Vk error. Propagate to the
+            // event loop; future composite ticks early-return at
+            // the top of this function via the renderer_failed gate.
             return Err(std::io::Error::other(format!(
                 "PaintBatch::submit_and_wait failed: {e:?}"
             )));
         }
 ```
+
+The `self.renderer_failed = true` line is gone here — it's done inside `flush_if_needed` already.
 
 Also gate `try_vulkan_composite_flip` (it's called from inside the per-output loop in `composite_and_flip`, so the early-return above already covers it; but a defense-in-depth gate at its entry point catches future direct callers):
 
@@ -565,6 +590,8 @@ In `crates/yserver/src/kms/backend.rs` `#[cfg(test)] mod tests`:
     }
 ```
 
+A test for "`flush_if_needed` latches `renderer_failed` on Vk Err" needs a real or mocked `VkContext` that can be forced into a wait-failure state. If the test harness doesn't support that, leave the latch test as a hardware-smoke item in T4 step 5 and add a `#[ignore]`'d stub here documenting what it should do once a mock exists.
+
 If `KmsBackend::for_tests()` doesn't exist verbatim, look at the existing test in `composite_and_flip_does_not_set_flip_pending_on_no_vk_path` (around line 11877) for the test harness pattern; reuse it.
 
 - [ ] **Step 6: Verify**
@@ -593,13 +620,11 @@ git commit -m "feat(kms): RenderScheduler::record_paint_op + renderer_failed gat
 
 The simplest family — no scratch deps. Two recorders (`fill::record_fill_rectangles`, `fill::record_logic_fill`); 4 call sites in `backend.rs`.
 
-**Per-call-site transformation template.** Original (post-T0, every paint-side site is either `run_legacy_paint_op` or one of the four fill sites that T0 left alone):
+**Per-call-site transformation template.** Original (post-T0, every fill site is inside `run_legacy_paint_op`):
 
 ```rust
-        let vk_arc = self.vk.as_ref().cloned()?;
-        let pool_handle = self.ops_command_pool.as_ref()?.handle();
         // ... compute color, rects, scissor, get mirror ...
-        run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+        self.run_legacy_paint_op(|vk, cb| {
             fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
         })
 ```
@@ -621,6 +646,8 @@ If the function's return type doesn't match `paint_resources()`'s `Option`, adap
             return false; // or whatever the existing no-vk path returns
         };
 ```
+
+**For sites that T0 had to leave on the borrow-conflict fallback** (raw `run_one_shot_op` with explicit `flush_if_needed(ProtocolBarrier)` first): replace the whole construct with `paint_resources()` + scheduler-direct call as above. The explicit flush is no longer needed because `record_paint_op` appends to the batch instead of submitting independently. Remove the flush call.
 
 The `run_one_shot_op` import becomes unused if no other op in the same function uses it; remove from the function-scope `use` if so. The `fill` import stays.
 
@@ -708,13 +735,11 @@ The `\b` word boundary in the grep is important: it excludes `copy::record_copy_
 
 - [ ] **Step 2: Migrate each call site**
 
-Same transformation as T2. Examples:
+Same transformation as T2 (fill). Post-T0, each site is inside `run_legacy_paint_op`. Replace with `paint_resources()` + `self.scheduler.record_paint_op(...)`. Examples:
 
 ```rust
-// Before (~2670):
-let vk_arc = self.vk.as_ref().cloned()?;
-let pool_handle = self.ops_command_pool.as_ref()?.handle();
-if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+// Before (post-T0, at ~2670):
+if let Err(e) = self.run_legacy_paint_op(|vk, cb| {
     vk_copy::record_copy_area_distinct(vk, cb, src, &mut cm, &regions)
 }) { ... }
 
@@ -726,8 +751,8 @@ if let Err(e) = self.scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {
 ```
 
 ```rust
-// Before (~3140):
-return match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+// Before (post-T0, at ~3140):
+return match self.run_legacy_paint_op(|vk, cb| {
     copy::record_copy_area_same(vk, cb, mirror, &regions)
 }) { ... };
 
@@ -739,6 +764,8 @@ return match self.scheduler.record_paint_op(vk_arc, pool_handle, |vk, cb| {
     copy::record_copy_area_same(vk, cb, mirror, &regions)
 }) { ... };
 ```
+
+For borrow-conflict fallback sites (still on raw `run_one_shot_op` with explicit pre-flush from T0): same pattern as T2 — replace the whole construct with `paint_resources()` + scheduler-direct call, drop the explicit flush call.
 
 Drop `run_one_shot_op` from function-scope imports where no other op uses it.
 
@@ -885,11 +912,11 @@ git commit -m "docs: phase-3B rendering re-architecture validation results"
 3B is complete when:
 
 1. All 5 tasks committed; tree green (`cargo test`, `cargo clippy`, `cargo fmt --check`).
-2. `KmsBackend::run_legacy_paint_op` exists and wraps `flush_if_needed(ProtocolBarrier)` + `run_one_shot_op`. Every paint-side `run_one_shot_op` call site is either (a) inside `run_legacy_paint_op`'s dispatch body, (b) a borrow-conflict fallback that still does explicit pre-flush, (c) one of the three `Readback` handlers, or (d) about to be replaced by the migration tasks (T2/T3 fill/copy).
+2. `KmsBackend::run_legacy_paint_op` exists and wraps `flush_if_needed(ProtocolBarrier)` + `run_one_shot_op`. After T0, every paint-side `run_one_shot_op` call site is either (a) inside `run_legacy_paint_op`'s dispatch body, (b) a borrow-conflict fallback that still does explicit pre-flush, or (c) one of the three `Readback` handlers. After T2 and T3, the fill and copy-distinct/same sites move further to `record_paint_op`; same_overlap, render, text, traps, etc. stay on `run_legacy_paint_op` until 3C/3D.
 3. `RenderScheduler::record_paint_op` and `record_paint_batch_op` exist; `KmsBackend`'s versions are thin shims that gate via `paint_resources()`.
 4. `KmsBackend::paint_resources()` returns `Option<(Arc<VkContext>, vk::CommandPool)>` and gates on `renderer_failed`. Every direct `self.scheduler.record_paint_op(...)` call site goes through it.
 5. `KmsBackend::renderer_failed` field gates `record_paint_op{,_batch_op}` (via `paint_resources`), `flush_if_needed`, `composite_and_flip`, `try_vulkan_composite_flip`, `run_legacy_paint_op`.
-6. `composite_and_flip` sets `renderer_failed = true` on fatal Vk error from `flush_if_needed(VisibleComposite)`.
+6. `flush_if_needed` latches `renderer_failed = true` on any fatal Vk error from `submit_and_wait` (any reason, any caller — composite, legacy-paint, readback handlers all latch consistently). `composite_and_flip` propagates the resulting `io::Error` upward; no per-call-site latching duplication.
 7. All 4 `fill` family call sites in `backend.rs` migrated to `self.scheduler.record_paint_op(...)`.
 8. All 4 `copy::record_copy_area_distinct` + `record_copy_area_same` call sites migrated.
 9. `copy::record_copy_area_same_overlap` is wrapped via `run_legacy_paint_op` (deferred from migration to 3D).
