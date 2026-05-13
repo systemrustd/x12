@@ -465,9 +465,5 @@ that the host hides for us.
       minor for extension requests). Touches every `emit_x11_error`
       call site (~60-80 across the file). Cosmetic but high impact
       on future debugging sessions.
-- [ ] **`just yserver-bare-metal` recipe.** Automate the kmscon
-      dance (stop kmscon for current VT → run yserver → restart
-      kmscon on exit). Already documented as a manual recipe in
-      status.md's Phase 6.1 follow-ups; ~10 lines of just/sh.
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.
