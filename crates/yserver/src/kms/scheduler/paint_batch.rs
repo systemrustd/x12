@@ -488,6 +488,154 @@ impl PaintBatch {
         }
     }
 
+    /// Submit + return immediately (no wait). The batch transitions
+    /// to `Submitted`; retirement happens later via
+    /// `try_retire_if_signaled` (non-blocking) or the caller's
+    /// explicit `wait_for_completion` (blocking).
+    ///
+    /// Mirrors `submit_and_wait`'s paths 1a (fence-create fail)
+    /// and 1b (submit fail). Path 2 (wait failure) is not
+    /// applicable here — there is no wait. The caller is
+    /// responsible for either:
+    ///   - Polling `try_retire_if_signaled` until it returns true,
+    ///     OR
+    ///   - Calling `wait_for_completion()` explicitly (blocks
+    ///     on the fence and retires on success, equivalent to
+    ///     `submit_and_wait` from a `Submitted` state).
+    ///
+    /// Returns the fence handle on success (`Copy` `vk::Fence`,
+    /// not a borrow), so callers that want to issue a synchronous
+    /// `wait_for_fences` themselves can do so without going back
+    /// through `&mut self`.
+    ///
+    /// On Idle (no CB allocated): no submit; transitions directly
+    /// to Retired and returns a null fence (the caller's poll
+    /// will never block on it).
+    pub fn submit_async(&mut self) -> Result<vk::Fence, BatchError> {
+        match self.state {
+            BatchState::Poisoned => return Err(BatchError::Poisoned),
+            BatchState::Retired => return Err(BatchError::InvalidState(BatchState::Retired)),
+            BatchState::Submitted => return Err(BatchError::InvalidState(BatchState::Submitted)),
+            BatchState::Idle => {
+                self.state = BatchState::Closed;
+                self.retire_now();
+                return Ok(vk::Fence::null());
+            }
+            BatchState::Recording => self.close()?,
+            BatchState::Closed => {}
+        }
+        let cb = self.cb.expect("Closed implies cb was allocated");
+
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = match unsafe { self.vk.device.create_fence(&fence_info, None) } {
+            Ok(f) => f,
+            Err(e) => {
+                unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+                self.cb = None;
+                self.state = BatchState::Closed;
+                self.poison();
+                return Err(BatchError::Vk(e));
+            }
+        };
+        self.fence = Some(fence);
+
+        let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+
+        if let Err(e) = unsafe {
+            self.vk
+                .device
+                .queue_submit2(self.vk.graphics_queue, &submit, fence)
+        } {
+            unsafe {
+                self.vk.device.destroy_fence(fence, None);
+                self.vk.device.free_command_buffers(self.pool, &[cb]);
+            }
+            self.cb = None;
+            self.fence = None;
+            self.state = BatchState::Closed;
+            self.poison();
+            return Err(BatchError::Vk(e));
+        }
+
+        self.state = BatchState::Submitted;
+        Ok(fence)
+    }
+
+    /// Non-blocking poll. If the batch is in `Submitted` and its
+    /// fence is signaled, retire it (free CB, destroy fence,
+    /// release resources) and return `true`. Otherwise return
+    /// `false` (still in flight, or already in a terminal state).
+    ///
+    /// Treats fence-status query errors (other than `NOT_READY`)
+    /// the same as a wait failure: the batch is left in
+    /// `Submitted` and resources are leaked. The caller must
+    /// surface this as a renderer-failed condition.
+    pub fn try_retire_if_signaled(&mut self) -> Result<bool, BatchError> {
+        if self.state != BatchState::Submitted {
+            return Ok(false);
+        }
+        let Some(fence) = self.fence else {
+            debug_assert!(false, "Submitted without fence");
+            return Ok(false);
+        };
+        let status = unsafe { self.vk.device.get_fence_status(fence) };
+        match status {
+            Ok(true) => {
+                let cb = self.cb.expect("Submitted implies cb was allocated");
+                unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+                self.cb = None;
+                self.retire_now();
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(e) => {
+                log::error!(
+                    "PaintBatch::try_retire_if_signaled: get_fence_status failed \
+                     ({e:?}); CB / fence / resources abandoned. KMS renderer is \
+                     in an unrecoverable state — caller MUST tear down or disable."
+                );
+                Err(BatchError::Vk(e))
+            }
+        }
+    }
+
+    /// Blocking equivalent of `try_retire_if_signaled` — waits on
+    /// the fence and retires on success. For strict-flush callers
+    /// that `submit_async`'d earlier and now need synchronous
+    /// completion (used by T4 backpressure and T5 shutdown drain).
+    ///
+    /// Same path-2 semantics as `submit_and_wait`'s wait-failure
+    /// branch: on `wait_for_fences` error, the batch is left in
+    /// `Submitted` and resources are leaked.
+    pub fn wait_for_completion(&mut self) -> Result<(), BatchError> {
+        if self.state != BatchState::Submitted {
+            return Err(BatchError::InvalidState(self.state));
+        }
+        let Some(fence) = self.fence else {
+            debug_assert!(false, "Submitted without fence");
+            return Err(BatchError::InvalidState(self.state));
+        };
+        let fences = [fence];
+        match unsafe { self.vk.device.wait_for_fences(&fences, true, u64::MAX) } {
+            Ok(()) => {
+                let cb = self.cb.expect("Submitted implies cb was allocated");
+                unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+                self.cb = None;
+                self.retire_now();
+                Ok(())
+            }
+            Err(e) => {
+                log::error!(
+                    "PaintBatch::wait_for_completion: wait_for_fences failed \
+                     ({e:?}); CB / fence / resources abandoned. KMS renderer is \
+                     in an unrecoverable state — caller MUST tear down or disable."
+                );
+                Err(BatchError::Vk(e))
+            }
+        }
+    }
+
     /// Drop a holder reference. Transitions to Retired when
     /// `holders == 0 && state == Submitted`. Phase 4 T1 keeps
     /// `holders` at 0 (no caller currently invokes
