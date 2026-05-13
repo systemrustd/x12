@@ -278,10 +278,6 @@ pub struct RenderPipelineCache {
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
-    /// Descriptor pool sized for many per-call sets. Reset per
-    /// frame at the call site (a render_composite sequence
-    /// allocates fresh sets).
-    descriptor_pool: vk::DescriptorPool,
     /// Compiled pipelines, keyed by `(op, dst_format, dst_has_alpha,
     /// component_alpha)`. `dst_has_alpha` and `component_alpha` flip
     /// the per-op blend factor table — see [`PictOp::blend_factors`].
@@ -304,13 +300,6 @@ impl From<vk::Result> for RenderPipelineError {
         RenderPipelineError::Vk(r)
     }
 }
-
-/// Soft cap on per-frame `render_composite` draws sharing the
-/// descriptor pool. wmaker + fvwm sessions stay well under 256;
-/// rendercheck can spike but the worst case is still under a
-/// thousand. Reset at the start of each call so the cap is per
-/// `render_composite` invocation rather than per session.
-pub const MAX_DESCRIPTOR_SETS_PER_FRAME: u32 = 1024;
 
 impl RenderPipelineCache {
     pub fn new(vk: Arc<VkContext>) -> Result<Self, RenderPipelineError> {
@@ -382,31 +371,11 @@ impl RenderPipelineCache {
             }
         };
 
-        // Each set has 3 combined-image-samplers (src + mask + dst readback).
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(MAX_DESCRIPTOR_SETS_PER_FRAME * 3)];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(MAX_DESCRIPTOR_SETS_PER_FRAME)
-            .pool_sizes(&pool_sizes);
-        let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe {
-                    device.destroy_pipeline_layout(pipeline_layout, None);
-                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-                    device.destroy_sampler(sampler, None);
-                }
-                return Err(e.into());
-            }
-        };
-
         Ok(Self {
             vk,
             pipeline_layout,
             descriptor_set_layout,
             sampler,
-            descriptor_pool,
             pipelines: HashMap::new(),
         })
     }
@@ -441,80 +410,22 @@ impl RenderPipelineCache {
         Ok(p)
     }
 
-    /// Reset the per-call descriptor pool. Invalidates every
-    /// descriptor set allocated since the last reset; call before
-    /// allocating a new set for a fresh `render_composite` call.
-    pub fn reset_descriptors(&self) -> Result<(), vk::Result> {
-        unsafe {
-            self.vk
-                .device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-        }
-    }
-
-    /// Allocate a fresh descriptor set bound to `src_view` (binding
+    /// Per-batch descriptor allocation. Allocates the descriptor
+    /// set from the supplied `BatchDescriptorArena` (whose chunks
+    /// live until the batch retires) and binds `src_view` (binding
     /// 0) + `mask_view` (binding 1) + `dst_view` (binding 2),
     /// sharing the linear sampler. Caller picks views — for "no
     /// mask" pass the backend-shared white-mask scratch view; for
     /// fixed-function ops that don't read dst, pass the white-mask
     /// scratch as `dst_view` (it's unused by the shader).
-    pub fn allocate_descriptor_for_views(
-        &self,
-        src_view: vk::ImageView,
-        mask_view: vk::ImageView,
-        dst_view: vk::ImageView,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        let layouts = [self.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let sets = unsafe { self.vk.device.allocate_descriptor_sets(&alloc_info)? };
-        let set = sets[0];
-        let src_info = [vk::DescriptorImageInfo::default()
-            .image_view(src_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let mask_info = [vk::DescriptorImageInfo::default()
-            .image_view(mask_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let dst_info = [vk::DescriptorImageInfo::default()
-            .image_view(dst_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&src_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&mask_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&dst_info),
-        ];
-        unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
-        Ok(set)
-    }
-
-    /// Per-batch variant of `allocate_descriptor_for_views`. Allocates
-    /// the descriptor set from the supplied `BatchDescriptorArena`
-    /// (whose chunks live until the batch retires) instead of the
-    /// per-cache shared pool (which `reset_descriptors` invalidates).
-    /// Callers that record into an open `PaintBatch` MUST use this
-    /// path — the shared-pool variant is unsafe under batching
-    /// because subsequent ops in the same batch would reset and
-    /// invalidate sets still referenced by un-submitted CB commands.
     ///
-    /// 3F-1: first consumer is `try_vk_render_composite`. 3F-2 will
-    /// migrate `try_vk_render_traps_or_tris` and remove the legacy
-    /// shared-pool path along with `reset_descriptors`.
+    /// 3F-1 introduced this arena-backed variant for
+    /// `try_vk_render_composite`; 3F-2 migrated
+    /// `try_vk_render_traps_or_tris` onto it and removed the legacy
+    /// shared-pool path. All `RENDER` callers now go through this
+    /// entry point — the per-batch arena owns the pool, so resetting
+    /// for the next batch never invalidates sets still referenced by
+    /// un-submitted CB commands.
     pub fn allocate_descriptor_for_views_into(
         &self,
         arena: &mut crate::kms::scheduler::batch_descriptor_arena::BatchDescriptorArena,
@@ -564,9 +475,6 @@ impl Drop for RenderPipelineCache {
             for &p in self.pipelines.values() {
                 self.vk.device.destroy_pipeline(p, None);
             }
-            self.vk
-                .device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.vk
                 .device
                 .destroy_pipeline_layout(self.pipeline_layout, None);

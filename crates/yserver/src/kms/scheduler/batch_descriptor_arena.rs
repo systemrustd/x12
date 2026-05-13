@@ -11,38 +11,16 @@
 //! chunks stay valid because pools are released only at batch
 //! retirement.
 //!
-//! # Paint-side descriptor pool catalogue (for 3D plan author)
+//! # Migration history
 //!
-//! Audit grep:
-//! ```text
-//! rg -nB1 -A4 'create_descriptor_pool|allocate_descriptor_sets|reset_descriptor_pool' \
-//!    crates/yserver/src/kms/vk/ | grep -v 'composite_pool_ring\|pipeline.rs\b'
-//! ```
-//!
-//! Results (as of 2026-05-13):
-//!
-//! - `render_pipeline.rs:392` — `RenderPipelineCache::new` calls `create_descriptor_pool`
-//!   (one pool per cache instance, sized for COMBINED_IMAGE_SAMPLER descriptors).
-//! - `render_pipeline.rs:451` — `RenderPipelineCache::reset_descriptors` calls
-//!   `reset_descriptor_pool`. This is the shared-pool reset that's unsafe across
-//!   multiple recorder appends in one CB — the primary motivation for this arena.
-//! - `render_pipeline.rs:471` — `RenderPipelineCache::allocate_descriptor_for_views`
-//!   calls `allocate_descriptor_sets` from the shared pool.
-//! - `text_pipeline.rs:273` — `TextPipeline::new` calls `create_descriptor_pool`
-//!   (one pool per pipeline instance, for the glyph atlas sampler set).
-//! - `text_pipeline.rs:289` — `TextPipeline::new` calls `allocate_descriptor_sets`
-//!   immediately after pool creation (one pre-allocated set for atlas binding).
-//!
-//! The `compositor.rs:156` hit is from the composite path and routes through
-//! `CompositePoolRing` (phase 2) — NOT a paint-side pool; 3D leaves it alone.
-//!
-//! `dst_readback.rs`, `logic_fill_pipeline.rs`, and the `ops/` directory have
-//! no descriptor pool calls.
-//!
-//! 3D migration plan: route `RenderPipelineCache::allocate_descriptor_for_views`
-//! and `TextPipeline`'s atlas-set allocation through `BatchDescriptorArena`
-//! instead of the per-pipeline shared pools. The shared pools can then be removed
-//! from those pipeline types once all their callers are migrated.
+//! Created in 3A to replace `RenderPipelineCache`'s shared
+//! `descriptor_pool`. Wired up in 3F-1 (`try_vk_render_composite`)
+//! and 3F-2 (`try_vk_render_traps_or_tris`); the legacy shared-pool
+//! API on `RenderPipelineCache` was removed at the end of 3F-2.
+//! `TextPipeline` still owns a single per-pipeline pool for its
+//! atlas binding — that's a one-pre-allocated-set pattern, not a
+//! per-call allocation, so it doesn't have the
+//! reset-invalidates-live-sets hazard this arena solves.
 
 use std::sync::Arc;
 
