@@ -486,7 +486,17 @@ impl PaintBatch {
     /// `retire_resources` are released.
     fn poison(&mut self) {
         if let Some(cb) = self.cb.take() {
-            unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+            // If the CB is in a recording state (begin_command_buffer was
+            // called but end_command_buffer was not), some Vulkan drivers
+            // (e.g. the amdgpu radeon driver) crash when attempting to
+            // free or reset an open CB. Skip the explicit free for
+            // Recording-state batches — the CB will be released when the
+            // command pool itself is destroyed (OpsCommandPool::Drop calls
+            // queue_wait_idle + destroy_command_pool, which implicitly
+            // frees all CBs in the pool, including recording ones).
+            if self.state != BatchState::Recording {
+                unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+            }
         }
         if let Some(arena) = self.upload_arena.take() {
             Box::new(arena).release(&self.vk);

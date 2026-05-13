@@ -1613,14 +1613,14 @@ impl KmsBackend {
     /// (every site as of 2026-05-13):
     ///
     ///   upload_bgra_to_mirror:            mirror.record_upload_rect          — wrapped
-    ///   fill_mirror_solid:                fill::record_fill_rectangles        — wrapped
+    ///   fill_mirror_solid:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   copy_drawable_to_new_cursor_mirror: vk_copy::record_copy_area_distinct — wrapped
     ///   copy_pixmap_mirror_to_cursor:     vk_copy::record_copy_area_distinct  — borrow-conflict fallback
     ///   try_vk_copy_area (same-overlap):  copy::record_copy_area_same_overlap — borrow-conflict fallback
     ///   try_vk_copy_area (same):          copy::record_copy_area_same         — borrow-conflict fallback
     ///   try_vk_copy_area (distinct):      copy::record_copy_area_distinct     — borrow-conflict fallback
-    ///   try_vk_fill_with_function:        fill::record_logic_fill             — borrow-conflict fallback
-    ///   try_vk_solid_fill:                fill::record_fill_rectangles        — borrow-conflict fallback
+    ///   try_vk_fill_with_function:        fill::record_logic_fill             — migrated T2 (record_paint_op)
+    ///   try_vk_solid_fill:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   try_vk_put_image:                 image::record_put_image             — borrow-conflict fallback
     ///   try_vk_text_run:                  text::record_text_run               — borrow-conflict fallback
     ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
@@ -2673,6 +2673,9 @@ impl KmsBackend {
         fg: u32,
     ) -> Result<(), ash::vk::Result> {
         use crate::kms::vk::ops::fill;
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            return Err(ash::vk::Result::ERROR_DEVICE_LOST);
+        };
         let extent = mirror.extent;
         let color = [
             ((fg >> 16) & 0xFF) as f32 / 255.0,
@@ -2688,9 +2691,10 @@ impl KmsBackend {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
-        self.run_legacy_paint_op(|vk, cb| {
-            fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
-        })
+        self.scheduler
+            .record_paint_op(vk_arc, pool_handle, |vk, cb| {
+                fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
+            })
     }
 
     /// Allocate a cursor mirror sized for `src` and `vkCmdCopyImage`
@@ -3420,25 +3424,11 @@ impl KmsBackend {
             return true;
         }
 
-        use crate::kms::vk::ops::{fill, run_one_shot_op};
+        use crate::kms::vk::ops::fill;
 
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
             return false;
         };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return false;
-        };
-
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // mirror is borrowed from self.windows/pixmaps below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
 
         // Resolve depth eagerly so the pipeline cache key reflects
         // the destination's α policy. Drop the mirror borrow here so
@@ -3522,18 +3512,20 @@ impl KmsBackend {
             extent: mirror.extent,
         };
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            fill::record_logic_fill(
-                vk,
-                cb,
-                mirror,
-                pipeline,
-                pipeline_layout,
-                color,
-                &vk_rects,
-                scissor,
-            )
-        }) {
+        match self
+            .scheduler
+            .record_paint_op(vk_arc, pool_handle, |vk, cb| {
+                fill::record_logic_fill(
+                    vk,
+                    cb,
+                    mirror,
+                    pipeline,
+                    pipeline_layout,
+                    color,
+                    &vk_rects,
+                    scissor,
+                )
+            }) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
@@ -3545,30 +3537,13 @@ impl KmsBackend {
     }
 
     fn try_vk_solid_fill(&mut self, dst_xid: u32, fg: u32, rects: &[Rectangle16]) -> bool {
-        use crate::kms::vk::ops::{fill, run_one_shot_op};
+        use crate::kms::vk::ops::fill;
         if rects.is_empty() {
             return false;
         }
-        // Snapshot the &Arc<VkContext> + pool handle (Copy) so the
-        // borrow on `self.vk` / `self.ops_command_pool` ends before
-        // we mut-borrow the mirror.
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
             return false;
         };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return false;
-        };
-
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // mirror is borrowed from self.windows/pixmaps below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
-        {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("legacy paint flush failed: {e:?}");
-                return false;
-            }
-        }
 
         // Resolve the destination depth before the mut-borrow of the
         // mirror. L1 task A.3 needs it to decide the α policy:
@@ -3647,9 +3622,11 @@ impl KmsBackend {
             extent: mirror.extent,
         };
 
-        match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-            fill::record_fill_rectangles(vk, cb, mirror, color, &vk_rects, scissor)
-        }) {
+        match self
+            .scheduler
+            .record_paint_op(vk_arc, pool_handle, |vk, cb| {
+                fill::record_fill_rectangles(vk, cb, mirror, color, &vk_rects, scissor)
+            }) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
