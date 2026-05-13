@@ -295,31 +295,52 @@ that the host hides for us.
       signal handler that explicitly calls the console restore
       before re-raising, and propagate the K_OFF restore through
       panic hooks too.
-- [ ] **`disable_output` atomic commit rejected with EINVAL on
-      shutdown — leaves DRM state that breaks Wayland host sessions.**
-      `KmsBackend::disable_output` builds an atomic request that clears
-      plane FB_ID/CRTC_ID, sets CRTC ACTIVE/MODE_ID to 0, and clears
-      connector CRTC_ID — all in one commit (`drm/modeset.rs:387`).
-      The kernel rejects it with `-EINVAL` (`os error 22`), so on exit
-      the framebuffer stays attached to the CRTC. Kernel emits
-      `WARNING ... atomic remove_fb failed with -22` from
-      `drm_framebuffer_remove → drm_mode_rmfb_work_fn` (deferred RMFB
-      work) — see the journal traces. **The user-visible consequence**
-      is that the host's Wayland compositor (labwc / dms / Sway /
-      anything that expects clean modeset state) cannot recover the
-      output after yserver exits; user must reboot. X-based hosts
-      (Xorg + lightdm/MATE) survived because Xorg's startup runs a
-      more aggressive DRM reset before grabbing outputs.
-      Workaround: run yserver from a separate TTY (Ctrl+Alt+F3, run,
-      Ctrl+Alt+F1 to return) — the kernel VT-switch back tends to
-      force a saner reset than letting the host compositor try to
-      take over a still-bound CRTC. Real fix: split the disable into
-      steps the kernel will accept — clear plane first (single commit),
-      then deactivate CRTC (separate commit with MODE_ID cleared as
-      its own blob unset), then clear connector binding. Probably
-      needs cross-reference with Mesa's libdrm fallback or Xorg's
-      `drmModeAtomicCommit` deactivation sequence. **High priority**
-      for anyone testing yserver on a daily-driver machine.
+- [ ] **P0: KMS teardown leaves DRM state that breaks Wayland host
+      sessions.** Diagnosed by codex. On shutdown the sequence is:
+      yserver log `disable_output failed for DP-1/HDMI-A-1: ...
+      Invalid argument`; kernel `atomic remove_fb failed with -22`
+      from `drm_framebuffer_remove → drm_mode_rmfb_work_fn`. The
+      host's Wayland compositor (labwc / dms / Sway) then sees
+      `qt.qpa.wayland: There are no outputs - creating placeholder
+      screen` and `WlrOutputService: Received empty outputs list`.
+      Must reboot to recover. X-based hosts survived because Xorg's
+      startup runs a more aggressive DRM reset before grabbing
+      outputs.
+
+      **Root cause (codex pinpoint)**: `KmsBackend::disable_output`
+      at `backend.rs:7996` calls `ScanoutBoPool::drain_all_pending()`,
+      which does `vkDeviceWaitIdle` and then **force-resets BO state
+      to Free** (`vk/scanout.rs:548`). It does NOT wait for or drain
+      kernel page-flip completion events. So userspace decides scanout
+      BOs are reusable while KMS may still have FBs bound or flips
+      pending. Then `drm/modeset.rs:387`'s atomic commit fails with
+      EINVAL, and RAII drop later destroys framebuffers still known
+      to KMS → kernel `remove_fb` warning + host compositor sees
+      empty outputs.
+
+      **Fix recipe** (6 steps, per codex):
+      1. On shutdown, stop submitting new composites.
+      2. Flush/retire the paint batch.
+      3. Wait for submitted Vulkan work.
+      4. Drain or wait for all DRM page-flip completions per output —
+         WITHOUT lying BOs back to Free first.
+      5. Disable outputs.
+      6. Only then drop/destroy scanout framebuffers and BOs.
+
+      Also: don't force-reset scanout BO state as part of normal
+      shutdown until the output is disabled or the pageflip has
+      completed. That reset is fine as a "modeset reset" helper only
+      after the kernel side has quiesced.
+
+      **Workaround**: run yserver from a separate TTY (Ctrl+Alt+F3,
+      run, Ctrl+Alt+F1 to return) — the kernel VT-switch back tends
+      to force a saner reset than letting the host compositor take
+      over a still-bound CRTC.
+
+      Codex's note: "I would not blame/revert the 3D copy-same-overlap
+      migration based on this log. The evidence points at KMS
+      shutdown state, and it matches your 'real graphical session did
+      not recover' symptom exactly."
 - [ ] **xeyes-on-e16 window drag is sluggish on bare HW.** Observed
       on a real DP-attached AMD card via `yserver-e16-...-hw` (KMS).
       During a drag the dragged frame visibly lags the cursor.
