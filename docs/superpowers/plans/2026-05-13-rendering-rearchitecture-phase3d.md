@@ -82,9 +82,9 @@ Key invariants 3D inherits from 3A/3B/3C:
 
 ### Step 0: Add `CopyScratch::needs_grow` accessor
 
-- [ ] **Step 0a: Read `copy_scratch.rs` lines 40–90 to confirm `CopyScratch` field shape**
+- [ ] **Step 0a: Read `copy_scratch.rs` to confirm field shape**
 
-The struct has `image: vk::Image`, `width: u32`, `height: u32`, `current_layout`, and Vk handles. (Field names may differ; confirm by reading.)
+`CopyScratch` stores its dimensions in `extent: vk::Extent2D` (not separate `width`/`height` fields).
 
 - [ ] **Step 0b: Add the `needs_grow` accessor**
 
@@ -98,11 +98,9 @@ Append to the `impl CopyScratch` block (right above `ensure_size`):
     /// which does NOT wait for un-submitted commands. Without a pre-flush,
     /// an open batch CB embedding the old image would dangle.
     pub fn needs_grow(&self, width: u32, height: u32) -> bool {
-        width > self.width || height > self.height
+        width > self.extent.width || height > self.extent.height
     }
 ```
-
-(Adjust field names if they differ — read the struct first to confirm.)
 
 - [ ] **Step 0c: Build**
 
@@ -341,9 +339,9 @@ rg -n 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs
 Expected: ZERO hits inside `try_vk_copy_area` (the same-overlap arm no longer uses it). Remaining hits: `run_legacy_paint_op` body, 3 readback handlers, 3E-deferred fallbacks (text-run × 2, render-composite × 2), `open_with_commit`, `dump_scanout_one`. Compared to end-of-3C, the count should be one lower.
 
 ```bash
-rg -n 'flush_if_needed.ProtocolBarrier.\|flush_if_needed[(]BatchFlushReason::ProtocolBarrier' crates/yserver/src/kms/backend.rs
+rg -n 'flush_if_needed[(]BatchFlushReason::ProtocolBarrier' crates/yserver/src/kms/backend.rs
 ```
-Expected: ZERO hits inside `try_vk_copy_area`. Remaining: 4 text/render legacy fallbacks (3E-deferred), `run_legacy_paint_op` body, 5 drawable-destruction sites, 2 gradient-create sites.
+Expected: the OLD unconditional borrow-conflict fallback inside `try_vk_copy_area` same-overlap is gone. ONE intentional **resize-only** pre-flush remains in the same-overlap arm — fires only when `CopyScratch::needs_grow` returns true. Other remaining sites: 4 text/render legacy fallbacks (3E-deferred), `run_legacy_paint_op` body, 5 drawable-destruction sites, 2 gradient-create sites.
 
 ```bash
 rg -n 'record_paint_batch_op' crates/yserver/src/kms/backend.rs
@@ -387,7 +385,7 @@ Follow the 3A/3B/3C template. Sections:
 3. **Preflight checks**: fmt, clippy, test counts from your actual run.
 4. **Cutover greps**: real `rg` output, semantic site listing.
 5. **Done conditions**: enumerated below.
-6. **Hardware smoke**: user-deferred (write "Deferred to user. Migration is correctness-preserving by construction; same recorder body, same shared-CopyScratch semantics, now inside the open batch CB. The pre-record ProtocolBarrier flush that fired on xterm scrollback / text-selection drag is gone.").
+6. **Hardware smoke**: user-deferred (write "Deferred to user. Migration is correctness-preserving by construction; same recorder body, same shared-CopyScratch semantics, now inside the open batch CB. The steady-state / unconditional pre-record ProtocolBarrier flush that fired on every same-overlap op (xterm scrollback / text-selection drag) is gone; a resize-only pre-flush remains, firing only when CopyScratch::needs_grow returns true (typically once at startup / when a new max rect is seen).").
 7. **Plan bugs caught (folded back into plan)**: any recipe-level issues hit during T1 execution. If none, write "None — recipe applied cleanly."
 8. **Commit summary** table: Plan, T1, T2.
 9. **Known deferred items** — point to 3E for: text-run, render-composite, traps, MaskScratch upload, glyph atlas incremental upload. Note `record_get_image` is phase 5 scope.
@@ -444,7 +442,9 @@ $ rg -n 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs
 $ rg -n 'flush_if_needed[(]BatchFlushReason::ProtocolBarrier' crates/yserver/src/kms/backend.rs
 # SITES expected: 4 text/render legacy fallbacks (3E), run_legacy_paint_op
 # body, 5 drawable-destruction sites, 2 gradient-create sites.
-# ZERO hits inside try_vk_copy_area.
+# Inside try_vk_copy_area: ONE resize-only pre-flush (fires only when
+# CopyScratch::needs_grow returns true). The OLD unconditional borrow-
+# conflict fallback is gone.
 
 $ rg -n 'record_paint_batch_op' crates/yserver/src/kms/backend.rs
 # Expected: at least 3 call sites (3C T1, 3C T2, 3D).
