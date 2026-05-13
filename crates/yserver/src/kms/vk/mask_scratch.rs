@@ -94,6 +94,19 @@ impl MaskScratch {
         self.view
     }
 
+    /// True if a later `ensure_image_size(width, height)` call would
+    /// reallocate the per-format scratch image. Callers in batched
+    /// paint paths use this BEFORE entering `record_paint_batch_op`
+    /// so they can flush any in-flight batch — `ensure_image_size`
+    /// destroys the old image after `queue_wait_idle`, which does
+    /// NOT wait for un-submitted commands. Without a pre-flush, an
+    /// open batch CB embedding the old scratch image would dangle.
+    /// Mirrors `DstReadback::needs_grow` (3F-1) and
+    /// `CopyScratch::needs_grow` (3D).
+    pub fn needs_image_grow(&self, width: u32, height: u32) -> bool {
+        width > self.extent.width || height > self.extent.height
+    }
+
     /// Ensure the scratch image is at least `(width, height)` pixels,
     /// reallocating if smaller. After this returns the image is in
     /// `UNDEFINED` layout (treated as new) when reallocation happens.
