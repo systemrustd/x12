@@ -6874,28 +6874,51 @@ impl KmsBackend {
             }
         }
 
-        // Release pool slots for frames that are about to be drained.
-        // We must do this BEFORE drain_retired() because drain pops
-        // the frames and we'd lose access to their pool_slot info.
-        let to_release: Vec<(usize, usize)> = self
+        // Release pool slots for EVERY fully-retired frame whose slot
+        // is not yet released — independent of FIFO drain order. The
+        // earlier `take_while(|f| f.fully_retired())` shape blocked
+        // pool release on the head of the in-flight queue: with two
+        // outputs, one lagging frame on output A could hold pool slots
+        // hostage for already-retired frames on output B, exhausting
+        // the per-output CompositePoolRing → composite frames deferred
+        // → black screen. The fix: walk all frames, release each
+        // retired-and-not-yet-released frame's slot, set
+        // pool_released=true. drain_retired() stays FIFO for the
+        // broader frame lifecycle (other resources are layered on
+        // submission order, see InFlight::push doc).
+        //
+        // (Diagnosed by codex 2026-05-13 from the MATE-on-3E log
+        // showing "vk composite: deferred frames ... pool_ring_exhausted"
+        // mounting up while nothing else fails.)
+        let to_release: Vec<(usize, usize, usize)> = self
             .scheduler
             .in_flight
             .frames()
-            .take_while(|f| f.fully_retired())
-            .map(|f| {
+            .enumerate()
+            .filter(|(_, f)| f.fully_retired() && !f.pool_released)
+            .map(|(idx, f)| {
                 (
+                    idx,
                     f.output_frame.output_idx,
                     f.output_frame.composite_pool_slot,
                 )
             })
             .collect();
-        for (output_idx, pool_slot) in to_release {
-            if let Some(ring) = self
+        for (frame_idx, output_idx, pool_slot) in to_release {
+            let ring = self
                 .outputs
                 .get_mut(output_idx)
-                .and_then(|o| o.composite_pools.as_mut())
-            {
+                .and_then(|o| o.composite_pools.as_mut());
+            debug_assert!(
+                ring.is_some(),
+                "in-flight frame for output {output_idx} has no composite_pools ring \
+                 (submitted frames should always have one)"
+            );
+            if let Some(ring) = ring {
                 ring.release(pool_slot);
+                if let Some(f) = self.scheduler.in_flight.get_mut(frame_idx) {
+                    f.pool_released = true;
+                }
             }
         }
 
@@ -7117,6 +7140,7 @@ impl KmsBackend {
                     ),
                     gpu_retired: false,
                     scanout_retired: false,
+                    pool_released: false,
                 });
         }
 

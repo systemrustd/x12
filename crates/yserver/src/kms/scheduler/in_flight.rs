@@ -27,6 +27,15 @@ use crate::kms::scheduler::output_frame::OutputFrame;
 /// pool slot, composite fence). `gpu_retired` / `scanout_retired`
 /// track the two retirement observations.
 ///
+/// `pool_released` is set when the frame's composite descriptor pool
+/// slot has been returned to the per-output `CompositePoolRing`. This
+/// happens **independently of FIFO drain order**: a frame's pool slot
+/// is released as soon as the frame is `fully_retired`, even if older
+/// frames on a DIFFERENT output are still in-flight. Without this,
+/// one lagging output can hold pool slots hostage for already-retired
+/// frames on other outputs → `CompositePoolRing` exhaustion → black
+/// screen.
+///
 /// The fields are public to the scheduler module so the polling
 /// code (which lives in `KmsBackend` because it owns `VkContext`
 /// and the BO pools) can read/write them directly.
@@ -35,6 +44,7 @@ pub struct InFlightFrame {
     pub output_frame: OutputFrame,
     pub gpu_retired: bool,
     pub scanout_retired: bool,
+    pub pool_released: bool,
 }
 
 impl InFlightFrame {
@@ -129,6 +139,7 @@ mod tests {
             ),
             gpu_retired: false,
             scanout_retired: false,
+            pool_released: false,
         }
     }
 
