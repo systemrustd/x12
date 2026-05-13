@@ -169,6 +169,18 @@ once the underlying patterns are understood.
       connection setup, then either drop the permutation for BGRA
       visuals or fix the visual advertisement to match. Same
       permutation lives in pixman path historically; check both.
+- [ ] **Text rendering broken under xfce4 / GTK heavy workloads.**
+      Observed 2026-05-13 with `just yserver-xfce-hw`: xfwm4
+      decorations render fine, but text inside two pop-up dialogs
+      was illegible (user: "can't read the text"). Black background
+      where panel/wallpaper should be (separate issue — see listener
+      starvation entry below). Likely candidates: glyph atlas upload
+      timing (the L2-deferred MaskScratch / glyph-atlas migration in
+      phase 3E will touch this); the CompositeGlyphs xSrc/ySrc-vs-pen
+      bug pattern (already in feedback memory); or a GTK font-rendering
+      pipeline that uses RENDER paths yserver hasn't fully wired.
+      Repro under ynest first to isolate from KMS-side issues. Defer
+      until phase 3E lands text-run migration; revisit then.
 
 ## wmaker on KMS
 
@@ -398,6 +410,34 @@ that the host hides for us.
       regardless of whether it's run nested under ynest or directly.
       Pre-existing environment / dconf / stdin quirk; needs
       investigation. Blocks the gtk3-demo arm of the WM smoke matrix.
+
+## Core loop fairness
+
+- [ ] **Listener accept starves under high-volume per-client request
+      streams.** Observed 2026-05-13 with `just yserver-xfce-hw`:
+      xfce4-panel made 5 attempts to open `:7.0` over ~50ms, all
+      returned "cannot open display"; yserver-hw.log shows zero new
+      client setups between 13:00:48 (client 38) and the user's
+      Ctrl-Alt-Backspace zap at 13:00:59, despite the kernel-side
+      `connect()` succeeding for those 5 panel attempts.
+      Meanwhile client 13 (likely xfdesktop or xfsettingsd) sent
+      **32,293 QueryPointer requests in 11 seconds** (~3000/sec) and
+      client 6 (xfwm4) was hammering SHAPE::Combine. The single-threaded
+      core loop's per-iteration work was dominated by reading existing
+      clients' floods; mio readiness for the LISTENER_TOKEN was queued
+      but never serviced, so the new fds languished without an X11
+      setup handshake completing.
+      Root cause: `core_loop::run_core`'s mio poll iteration likely
+      drains each ready fd until WouldBlock before checking the next
+      one (a classic head-of-line blocking pattern). Fix shape: cap
+      per-client read budget per poll iteration (e.g., 16-32 requests
+      per client per tick) so a chatty client doesn't monopolize the
+      core. Alternatively, prioritize LISTENER_TOKEN at the top of the
+      iteration. Touches `core_loop/run.rs`; medium scope.
+      Secondary observation: client 13's 3000 Hz QueryPointer polling
+      is itself worth investigating — that's likely yserver returning
+      a stale or wrong reply to xfdesktop's pointer query, causing it
+      to retry indefinitely. Spec compliance issue.
 
 ## Dev-loop / observability
 
