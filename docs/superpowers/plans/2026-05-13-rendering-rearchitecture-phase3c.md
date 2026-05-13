@@ -15,7 +15,9 @@
 Read `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3b-results.md` first. Key invariants from 3B that 3C inherits:
 
 1. **Drop-order**: `KmsBackend.scheduler` is declared BEFORE `KmsBackend.ops_command_pool`. Don't touch field order. (`feedback_kmsbackend_drop_order` memory.)
-2. **Drawable-destruction barriers**: `DestroyWindow`, `configure_window` resize, `FreePixmap`, `RenderFreePicture`, `RenderCreateCursor` rescued path already flush the batch before dropping `VkImage`s. PutImage targets windows + pixmaps and `upload_bgra_to_mirror`'s callers (`create_cursor`, `create_glyph_cursor`) write fresh cursor mirrors that get destroyed via `render_create_cursor`'s rescue path. **No new destruction sites need barriers** — the 3B set covers PutImage and mirror upload. (`feedback_paintbatch_destruction_barrier` memory.)
+2. **Drawable-destruction barriers**: `DestroyWindow`, `configure_window` resize, `FreePixmap`, `RenderFreePicture`, `RenderCreateCursor` rescued path already flush the batch before dropping `VkImage`s.
+   - **PutImage** (T1): targets are windows and pixmaps; `DestroyWindow` + `configure_window` resize + `FreePixmap` barriers cover these. ✓
+   - **Mirror upload** (T2, called by `create_cursor` / `create_glyph_cursor` / `install_default_cursor`): cursor mirrors are stored in `self.cursors`, NOT in `self.windows` / `self.pixmaps`. There is **no FreeCursor handler today** in this codebase, so the in-flight batch can never observe a cursor mirror dropping mid-frame. This is safe today, but **if a FreeCursor handler is ever added**, it MUST `flush_if_needed(ProtocolBarrier)` before dropping `CursorState.vk_mirror` — same pattern as 3B's other destruction sites. (Codex review of this plan flagged the original "cursor mirrors get destroyed via render_create_cursor's rescue path" wording as incorrect; corrected here.) (`feedback_paintbatch_destruction_barrier` memory.)
 3. **`renderer_failed` gate**: `paint_resources()` returns `None` when latched. Every migrated recorder must go through it.
 4. **`record_paint_batch_op` is the load-bearing API** for recorders that need batch resources. `record_paint_op` (shim) is only for recorders that ignore the batch handle (3B fill/copy).
 
@@ -24,7 +26,7 @@ Read `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3b-results
 The 3B results doc mentioned `MaskScratch::upload_r8`, glyph atlas, and gradient upload as 3C candidates. They're **not** in this plan:
 
 - **MaskScratch + glyph atlas**: their consumers are `text::record_text_run` and `render::record_render_composite`, neither of which migrates until 3D. Migrating just the mask/glyph upload code without migrating its consumers gives us a recorder that records into the batch CB followed by a legacy paint op (text/render run_one_shot_op) that reads from the mask scratch — the latter would have to flush the former, defeating the point. Defer to 3D where mask + consumer migrate together.
-- **Gradient upload** (`gradient::build`): runs at `RenderCreateLinearGradient` time, not per-frame. Currently uses its own one-shot. Frequency is low (handful per session for typical workloads). A one-line `flush_if_needed(ProtocolBarrier)` at create time keeps it safe under batching without migration. **Add this prophylactic flush as a small T-bonus** so a future render-trap recorder accessing a freshly-created gradient can't race the upload. See T3.
+- **Gradient upload** (`GradientPicture::new_linear` / `new_radial`): runs at `RenderCreate*Gradient` time, not per-frame. Currently uses its own one-shot with internal wait. The freshly-created gradient has a brand-new XID so no in-flight batch can reference it — this is **conservative cleanup, not load-bearing UAF protection**. T3 adds a `flush_if_needed(ProtocolBarrier)` at create-time as a hygiene boundary between batched paint and the one-shot upload. Could be dropped if it ever shows up as overhead; current frequency (handful per session) makes it free.
 
 3C scope is exactly: `try_vk_put_image` + `upload_bgra_to_mirror` migrations + gradient barrier + cleanup.
 
@@ -479,12 +481,13 @@ fn render_create_linear_gradient(
 Insert at each site, just before the `GradientPicture::new_linear` / `new_radial` call:
 
 ```rust
-// Protocol barrier: GradientPicture::new_* runs its own one-shot
-// upload CB outside the PaintBatch. Flush any open batch first so
-// the two pipelines don't interleave (cheap boundary; gradient
-// creates are low-frequency). Returns Ok(None) on flush Err — the
-// caller treats that as "gradient not creatable", which is the
-// existing fallback shape for this handler.
+// Conservative protocol boundary: GradientPicture::new_* runs its
+// own one-shot upload CB outside the PaintBatch. The new gradient
+// has a fresh XID, so no in-flight batch can race it — this flush
+// is hygiene cleanup between the batched paint pipeline and the
+// gradient one-shot, not a UAF fix. Cheap because gradient creates
+// are low-frequency. On flush Err return Ok(None), matching the
+// handler's existing "vk init failed" fallback shape.
 if let Err(e) = self.flush_if_needed(
     crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
 ) {
@@ -538,16 +541,16 @@ EOF
 
 ### Step 1: Static verification
 
-- [ ] **Step 1: Cutover greps**
+- [ ] **Step 1: Cutover greps (semantic, not numeric)**
 
-Run: `rg -c 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs`
-Expected: 13 hits (was 15 at end of 3B; T1 + T2 removed one each).
+Run: `rg -n 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs`
+Expected: zero hits inside `try_vk_put_image` or `upload_bgra_to_mirror`. Remaining hits should be: `run_legacy_paint_op` body, the 3 readback handlers (`try_vk_get_image_pixels`, `hw_cursor_refresh`, `read_mirror_pixels`), the 3D-deferred borrow-conflict fallbacks (text / render / traps / copy-same-overlap), `open_with_commit` (constructor), and `dump_scanout_one` (diagnostic).
 
-Run: `rg -c 'ops_staging' crates/yserver/src/kms/backend.rs`
-Expected: 4–6 hits (only the readback handlers + struct field + init now reference it).
+Run: `rg -n 'ops_staging' crates/yserver/src/kms/backend.rs`
+Expected: zero hits inside `try_vk_put_image` or `upload_bgra_to_mirror`. Remaining hits are the struct field, the initializer, the three readback handlers, and any hw_cursor_refresh/readback path. (The exact count drifts with comments — don't gate on a number; gate on **where** it appears.)
 
-Run: `rg -c 'record_paint_batch_op' crates/yserver/src/kms/backend.rs`
-Expected: ≥ 2 (T1 + T2 call sites). 3B used `record_paint_op` (the shim) throughout, so any non-zero usage of the wide API is from 3C.
+Run: `rg -n 'record_paint_batch_op' crates/yserver/src/kms/backend.rs`
+Expected: at least 2 call sites — one in `try_vk_put_image`, one in `upload_bgra_to_mirror`. 3B used `record_paint_op` (the shim) throughout, so any usage of the wide API is from 3C.
 
 - [ ] **Step 2: Tree green**
 
@@ -634,17 +637,22 @@ EOF
 8. The `run_legacy_paint_op` audit catalogue (~backend.rs:1697) reflects the T1/T2 migrations.
 9. Hardware smoke green on the user's host; no `paint batch submit failed`, no `arena alloc * failed` under load, no GPU faults.
 
-## Cutover greps (post-3C)
+## Cutover greps (post-3C — semantic, not numeric)
 
 ```
-$ rg -c 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs
-13          (was 15 at end of 3B; T1 + T2 each removed one)
+$ rg -n 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs
+# Expected SITES (not a count): run_legacy_paint_op body, 3 readback handlers,
+# 3D-deferred borrow-conflict fallbacks (text/render/traps/copy-same-overlap),
+# open_with_commit, dump_scanout_one. ZERO hits inside try_vk_put_image
+# or upload_bgra_to_mirror.
 
-$ rg -c 'ops_staging' crates/yserver/src/kms/backend.rs
-≤6          (struct field + init + 3 readback handler reads; no paint-side writes)
+$ rg -n 'ops_staging' crates/yserver/src/kms/backend.rs
+# Expected SITES: struct field, initializer, three readback handlers.
+# ZERO hits inside try_vk_put_image or upload_bgra_to_mirror.
 
-$ rg -c 'record_paint_batch_op' crates/yserver/src/kms/backend.rs
-≥2          (T1 + T2 call sites at minimum)
+$ rg -n 'record_paint_batch_op' crates/yserver/src/kms/backend.rs
+# Expected: at least 2 call sites — one each in try_vk_put_image and
+# upload_bgra_to_mirror.
 ```
 
 ## Out-of-scope deferred to 3D
