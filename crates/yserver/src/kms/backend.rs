@@ -8021,7 +8021,6 @@ impl KmsBackend {
     /// Caller MUST NOT have called `ScanoutBoPool::drain_all_pending`
     /// before this — that force-resets BO state to Free and would
     /// make `has_pending_pageflip` lie.
-    #[allow(dead_code)] // wired in by T2 of the KMS teardown fix plan.
     fn drain_pending_pageflips_for_shutdown(&mut self) -> io::Result<()> {
         use ::drm::control::crtc;
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -8111,7 +8110,6 @@ impl KmsBackend {
     /// handles. This Drop deliberately skips per-object cleanup
     /// (vkDestroyImage, destroy_framebuffer, close_buffer, etc.) —
     /// it's a deliberate last-resort leak, not a normal teardown.
-    #[allow(dead_code)] // wired in by T2 of the KMS teardown fix plan.
     fn disarm_scanout_pool(&mut self, output_idx: usize) {
         let Some(pool) = self
             .scanout_pools
