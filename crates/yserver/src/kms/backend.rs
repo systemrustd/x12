@@ -5162,8 +5162,12 @@ impl KmsBackend {
                 // SAFETY: alloc.mapped_ptr is HOST_VISIBLE |
                 // HOST_COHERENT mapped at alloc.buffer + alloc.offset
                 // covering `needed` bytes; mask_bytes is valid for
-                // mask_len = needed bytes (debug-asserted in the
-                // recorder upstream as `coverage_mask.len() == w * h`).
+                // mask_len bytes. mask_len == needed holds by
+                // construction: rasterize_trapezoids and
+                // rasterize_triangles both return `vec![0u8;
+                // (w * h) as usize]`, and `mask_w * mask_h ==
+                // bbox_w * bbox_h ==` coverage_mask length. The
+                // debug_assert below catches any future drift.
                 debug_assert_eq!(mask_len, needed as usize);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
