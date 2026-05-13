@@ -4463,9 +4463,10 @@ impl KmsBackend {
             1.0,
         ];
 
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // mirror is borrowed from self.windows/pixmaps below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        // 3D-deferred: text-run needs per-batch glyph-atlas-upload + descriptor
+        // strategy before migrating to record_paint_batch_op. The pre-record
+        // ProtocolBarrier flush keeps this legacy path safe alongside batched
+        // fill/copy/PutImage in the same protocol cycle.
         {
             use crate::kms::scheduler::paint_batch::BatchFlushReason;
             if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
@@ -5063,9 +5064,10 @@ impl KmsBackend {
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
 
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // dst_mirror/solid_src_image/dst_readback are borrowed from self below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        // 3D-deferred: render-traps needs per-batch MaskScratch + descriptor
+        // strategy + dst_readback lifetime before migrating. The pre-record
+        // ProtocolBarrier flush keeps this legacy path safe alongside batched
+        // fill/copy/PutImage in the same protocol cycle.
         {
             use crate::kms::scheduler::paint_batch::BatchFlushReason;
             if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
@@ -5385,9 +5387,10 @@ impl KmsBackend {
             return true;
         }
 
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // mirror is borrowed from self.windows/pixmaps below;
-        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        // 3D-deferred: text-run needs per-batch glyph-atlas-upload + descriptor
+        // strategy before migrating to record_paint_batch_op. The pre-record
+        // ProtocolBarrier flush keeps this legacy path safe alongside batched
+        // fill/copy/PutImage in the same protocol cycle.
         {
             use crate::kms::scheduler::paint_batch::BatchFlushReason;
             if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
@@ -6016,9 +6019,10 @@ impl KmsBackend {
             }
         };
 
-        // Borrow-conflict fallback for run_legacy_paint_op:
-        // dst_mirror/solid_src_image/solid_mask_image/dst_readback are borrowed
-        // from self below; self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        // 3D-deferred: render-composite needs per-batch MaskScratch + descriptor
+        // strategy + dst_readback lifetime before migrating. The pre-record
+        // ProtocolBarrier flush keeps this legacy path safe alongside batched
+        // fill/copy/PutImage in the same protocol cycle.
         {
             use crate::kms::scheduler::paint_batch::BatchFlushReason;
             if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
