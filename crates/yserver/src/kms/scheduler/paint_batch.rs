@@ -75,8 +75,11 @@ pub enum BatchFlushReason {
     /// An external sync export is pending. DRI3 Present fence
     /// handoff, SYNC extension fence trigger.
     ExternalSync,
-    /// An explicit protocol barrier requested it. (Place-holder for
-    /// future use; X11 doesn't define one directly today.)
+    /// An explicit protocol barrier requested it. The phase-3B
+    /// `KmsBackend::run_legacy_paint_op` wrapper uses this reason
+    /// to flush the batch before any paint op still on
+    /// `run_one_shot_op`, so a migrated recorder's CPU-side layout
+    /// mutation has GPU-completed before the legacy op reads it.
     ProtocolBarrier,
     /// The batch hit a size/op-count limit. Not load-bearing in
     /// phase 3 (no limit enforced); reserved for phase 4+.

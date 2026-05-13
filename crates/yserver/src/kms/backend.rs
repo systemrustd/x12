@@ -1582,6 +1582,78 @@ impl KmsBackend {
         self.record_paint_batch_op(|vk, _batch, cb| record(vk, cb))
     }
 
+    /// Run a paint op via `run_one_shot_op` after first flushing any
+    /// pending `PaintBatch`. Use this at every paint-side
+    /// `run_one_shot_op` call site that is NOT yet migrated to
+    /// `record_paint_op` — phase-3B–3D migrations replace these
+    /// wrappers one family at a time.
+    ///
+    /// **Why the flush:** a migrated recorder (e.g., fill) records
+    /// commands into the batch and mutates CPU-side
+    /// `DrawableImage::current_layout` immediately, while the
+    /// batch CB hasn't been submitted. A later legacy op reading
+    /// `current_layout` would emit barriers from a layout the GPU
+    /// hasn't reached. The flush forces the batch to submit + wait
+    /// idle before the legacy op runs.
+    ///
+    /// Readback handlers (`GetImage`, `read_mirror_pixels`,
+    /// `hw_cursor_refresh`) DO NOT use this wrapper — they keep
+    /// their existing `flush_if_needed(Readback)` + direct
+    /// `run_one_shot_op` for semantic clarity that they read
+    /// CPU-visible pixels. Behaviour-wise Readback and
+    /// ProtocolBarrier are both strict (both surface Vk errors
+    /// via `ERROR_DEVICE_LOST`); only the audit signal differs.
+    ///
+    /// Phase-3B T0 catalogue of paint-side run_one_shot_op sites
+    /// (every site as of 2026-05-13):
+    ///
+    ///   upload_bgra_to_mirror:            mirror.record_upload_rect          — wrapped
+    ///   fill_mirror_solid:                fill::record_fill_rectangles        — wrapped
+    ///   copy_drawable_to_new_cursor_mirror: vk_copy::record_copy_area_distinct — wrapped
+    ///   copy_pixmap_mirror_to_cursor:     vk_copy::record_copy_area_distinct  — borrow-conflict fallback
+    ///   try_vk_copy_area (same-overlap):  copy::record_copy_area_same_overlap — borrow-conflict fallback
+    ///   try_vk_copy_area (same):          copy::record_copy_area_same         — borrow-conflict fallback
+    ///   try_vk_copy_area (distinct):      copy::record_copy_area_distinct     — borrow-conflict fallback
+    ///   try_vk_fill_with_function:        fill::record_logic_fill             — borrow-conflict fallback
+    ///   try_vk_solid_fill:                fill::record_fill_rectangles        — borrow-conflict fallback
+    ///   try_vk_put_image:                 image::record_put_image             — borrow-conflict fallback
+    ///   try_vk_text_run:                  text::record_text_run               — borrow-conflict fallback
+    ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
+    ///   try_vk_render_composite_glyphs:   text::record_text_run               — borrow-conflict fallback
+    ///   try_vk_render_composite:          render::record_render_composite     — borrow-conflict fallback
+    ///
+    ///   open_with_commit (constructor):   record_solid_color_clear            — left alone (one-time init, no DrawableImage)
+    ///   hw_cursor_refresh:                image::record_get_image             — left on Readback flush (readback handler)
+    ///   read_mirror_pixels:               image::record_get_image             — left on Readback flush (readback handler)
+    ///   try_vk_get_image_pixels:          image::record_get_image             — left on Readback flush (readback handler)
+    ///   dump_scanout_one:                 (scanout dump, different signature) — left alone (not paint-side)
+    ///
+    /// T1 will move record_paint_op to RenderScheduler, enabling borrow-split
+    /// and resolving the borrow-conflict fallbacks above.
+    pub fn run_legacy_paint_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
+    where
+        F: FnOnce(
+            &crate::kms::vk::device::VkContext,
+            ash::vk::CommandBuffer,
+        ) -> Result<(), ash::vk::Result>,
+    {
+        use crate::kms::scheduler::paint_batch::BatchFlushReason;
+        if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+            // ProtocolBarrier is strict — flush failure here means the
+            // batch was Poisoned or the renderer failed. Either way
+            // the legacy op cannot proceed safely.
+            log::warn!("run_legacy_paint_op: pre-flush failed ({e:?})");
+            return Err(e);
+        }
+        let Some(vk_arc) = self.vk.as_ref().cloned() else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
+            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        crate::kms::vk::ops::run_one_shot_op(&vk_arc, pool_handle, record)
+    }
+
     fn open_with_commit(
         device_path: &str,
         commit: fn(
@@ -2441,13 +2513,6 @@ impl KmsBackend {
         mirror: &mut crate::kms::vk::target::DrawableImage,
         pixels: &[u8],
     ) -> Result<(), ash::vk::Result> {
-        use crate::kms::vk::ops::run_one_shot_op;
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
         let staging = self
             .ops_staging
             .as_mut()
@@ -2466,7 +2531,9 @@ impl KmsBackend {
             std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging_ptr, pixels.len());
         }
         let extent = mirror.extent;
-        run_one_shot_op(&vk_arc, pool_handle, |_vk, cb| {
+        // NLL: `staging` borrow on `self.ops_staging` ends above;
+        // `staging_buffer` and `staging_ptr` are Copy values.
+        self.run_legacy_paint_op(|_vk, cb| {
             mirror.record_upload_rect(
                 cb,
                 staging_buffer,
@@ -2599,17 +2666,7 @@ impl KmsBackend {
         mirror: &mut crate::kms::vk::target::DrawableImage,
         fg: u32,
     ) -> Result<(), ash::vk::Result> {
-        use crate::kms::vk::ops::{fill, run_one_shot_op};
-        let vk_arc = self
-            .vk
-            .as_ref()
-            .cloned()
-            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let pool_handle = self
-            .ops_command_pool
-            .as_ref()
-            .map(|p| p.handle())
-            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        use crate::kms::vk::ops::fill;
         let extent = mirror.extent;
         let color = [
             ((fg >> 16) & 0xFF) as f32 / 255.0,
@@ -2625,7 +2682,7 @@ impl KmsBackend {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
-        run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+        self.run_legacy_paint_op(|vk, cb| {
             fill::record_fill_rectangles(vk, cb, mirror, color, &rects, scissor)
         })
     }
@@ -2639,14 +2696,12 @@ impl KmsBackend {
         &mut self,
         src: &mut crate::kms::vk::target::DrawableImage,
     ) -> Option<crate::kms::vk::target::DrawableImage> {
-        use crate::kms::vk::ops::{copy as vk_copy, run_one_shot_op};
+        use crate::kms::vk::ops::copy as vk_copy;
 
         let cw = src.extent.width;
         let ch = src.extent.height;
         let mut cm = self.allocate_cursor_mirror(cw, ch)?;
 
-        let vk_arc = self.vk.as_ref().cloned()?;
-        let pool_handle = self.ops_command_pool.as_ref()?.handle();
         let regions = [ash::vk::ImageCopy::default()
             .src_subresource(
                 ash::vk::ImageSubresourceLayers::default()
@@ -2666,7 +2721,7 @@ impl KmsBackend {
                 depth: 1,
             })];
 
-        if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
+        if let Err(e) = self.run_legacy_paint_op(|vk, cb| {
             vk_copy::record_copy_area_distinct(vk, cb, src, &mut cm, &regions)
         }) {
             log::warn!("copy_drawable_to_new_cursor_mirror: copy failed: {e:?}");
@@ -2688,16 +2743,6 @@ impl KmsBackend {
     ) -> Result<(), ash::vk::Result> {
         use crate::kms::vk::ops::{copy as vk_copy, run_one_shot_op};
 
-        let vk_arc = self
-            .vk
-            .as_ref()
-            .cloned()
-            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let pool_handle = self
-            .ops_command_pool
-            .as_ref()
-            .map(|p| p.handle())
-            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let regions = [ash::vk::ImageCopy::default()
             .src_subresource(
                 ash::vk::ImageSubresourceLayers::default()
@@ -2716,6 +2761,24 @@ impl KmsBackend {
                 height: ch,
                 depth: 1,
             })];
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // `src` is borrowed from `self.pixmaps`; `self.run_legacy_paint_op`
+        // needs `&mut self`. T1's scheduler-API move resolves this.
+        use crate::kms::scheduler::paint_batch::BatchFlushReason;
+        if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+            log::warn!("legacy paint flush failed: {e:?}");
+            return Err(e);
+        }
+        let vk_arc = self
+            .vk
+            .as_ref()
+            .cloned()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let pool_handle = self
+            .ops_command_pool
+            .as_ref()
+            .map(|p| p.handle())
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let src = self
             .pixmaps
             .get_mut(&host_xid)
@@ -3049,6 +3112,17 @@ impl KmsBackend {
             return false;
         };
 
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
+
         // GC clip the dst rect into a sub-rect list. Each
         // surviving sub-rect's src offset shifts by the same
         // amount the dst was clipped (mirrors the existing pixman
@@ -3349,6 +3423,17 @@ impl KmsBackend {
             return false;
         };
 
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
+
         // Resolve depth eagerly so the pipeline cache key reflects
         // the destination's α policy. Drop the mirror borrow here so
         // the subsequent `logic_fill_pipelines.as_mut()` doesn't
@@ -3467,6 +3552,17 @@ impl KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return false;
         };
+
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
 
         // Resolve the destination depth before the mut-borrow of the
         // mirror. L1 task A.3 needs it to decide the α policy:
@@ -3826,6 +3922,17 @@ impl KmsBackend {
                     })
             })
             .collect();
+
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
 
         // Reborrow the mirror mutably for the recording.
         let mirror = if let Some(w) = self.windows.get_mut(&host_xid) {
@@ -4219,6 +4326,17 @@ impl KmsBackend {
             (foreground & 0xFF) as f32 / 255.0,
             1.0,
         ];
+
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
 
         // Pull mut refs after the atlas borrow ends. The atlas
         // and the pipeline are immutable for the recording step;
@@ -4809,6 +4927,17 @@ impl KmsBackend {
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
 
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // dst_mirror/solid_src_image/dst_readback are borrowed from self below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
+
         let dst_mirror = if let Some(w) = self.windows.get_mut(&dst_xid) {
             w.vk_mirror.as_mut()
         } else if let Some(p) = self.pixmaps.get_mut(&dst_xid) {
@@ -5118,6 +5247,17 @@ impl KmsBackend {
 
         if glyphs_to_draw.is_empty() {
             return true;
+        }
+
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // mirror is borrowed from self.windows/pixmaps below;
+        // self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
         }
 
         // Pull the mirror + atlas + pipeline references for recording.
@@ -5739,6 +5879,17 @@ impl KmsBackend {
                 return false;
             }
         };
+
+        // Borrow-conflict fallback for run_legacy_paint_op:
+        // dst_mirror/solid_src_image/solid_mask_image/dst_readback are borrowed
+        // from self below; self.run_legacy_paint_op needs &mut self. T1 resolves this.
+        {
+            use crate::kms::scheduler::paint_batch::BatchFlushReason;
+            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
+                log::warn!("legacy paint flush failed: {e:?}");
+                return false;
+            }
+        }
 
         // Pull mut refs. Split-borrow on disjoint fields lets us
         // hand all of these into the closure simultaneously.
