@@ -212,12 +212,11 @@ Expected: green. No new warnings. No behaviour change yet — every paint cycle 
 # Every paint-side run_one_shot_op site is now either:
 # (a) inside run_legacy_paint_op's body (one site, the dispatch),
 # (b) one of the explicit-flush borrow-conflict fallbacks (commented),
-# (c) one of the three Readback handlers,
-# (d) an unmigrated fill/copy site (T2/T3 catches).
+# (c) one of the three Readback handlers.
 rg -nB2 -A4 'run_one_shot_op\(' crates/yserver/src/kms/backend.rs | grep -v '//' | wc -l
 ```
 
-Inspect the output: every remaining raw `run_one_shot_op` should be in one of the four categories above. If any unaudited site remains, file as a concern.
+Inspect the output: every remaining raw `run_one_shot_op` should be in one of the three categories above. If any unaudited site remains (in particular, any raw fill/copy/render/text/traps/etc. call), file as a concern — T2/T3 should be starting from a fully-wrapped baseline.
 
 - [ ] **Step 6: Commit**
 
