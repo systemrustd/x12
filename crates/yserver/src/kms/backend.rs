@@ -8572,8 +8572,25 @@ impl Backend for KmsBackend {
         // composite may still sample it. flush_if_needed submits the
         // batch and queue_wait_idles, draining BOTH before we drop
         // the WindowState.
-        let _ = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
+        //
+        // On strict-flush Err (renderer is failed / GPU may still
+        // hold the image), DO NOT drop the window's vk_mirror —
+        // PaintBatch::submit_and_wait path-2 may have left the
+        // GPU referencing it. Leave the WindowState in place so
+        // its mirror outlives the abandoned GPU work; backend
+        // teardown's global device_wait_idle eventually drains.
+        // Return the error so the client sees a protocol failure
+        // (acceptable; the renderer is dead anyway).
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::error!(
+                "destroy_window: pre-destruction flush failed ({e:?}); leaving WindowState in place to avoid UAF"
+            );
+            return Err(std::io::Error::other(format!(
+                "destroy_window pre-flush failed: {e:?}"
+            )));
+        }
 
         if self.windows.remove(&host_xid).is_some() {
             // Update parent's children list (or top-level stacking order
@@ -8737,10 +8754,21 @@ impl Backend for KmsBackend {
             // dropping it via the reassignment below. This also
             // flushes the fresh fill on `new_mirror` recorded just
             // above, which is fine — the next composite picks it up.
-            let _ = self.flush_if_needed(
+            //
+            // On strict-flush Err: DO NOT replace the mirror. The
+            // GPU may still reference the old one (path-2 leak),
+            // and new_mirror's fill submission is in an indeterminate
+            // state. Keep the old mirror; `mem::forget` new_mirror
+            // so its Drop doesn't free a VkImage the GPU may still
+            // hold. Renderer is failed; resize visually fails too.
+            if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
-            );
-            if let Some(window) = self.windows.get_mut(&host_xid) {
+            ) {
+                log::error!(
+                    "configure_window resize: pre-replace flush failed ({e:?}); keeping old mirror and leaking new_mirror to avoid UAF"
+                );
+                std::mem::forget(new_mirror);
+            } else if let Some(window) = self.windows.get_mut(&host_xid) {
                 window.vk_mirror = new_mirror;
             }
         }
@@ -9018,8 +9046,20 @@ impl Backend for KmsBackend {
         // in-flight composite may still reference this pixmap's
         // VkImage. flush_if_needed submits the batch + queue_wait_idle
         // before we drop / rescue the mirror.
-        let _ = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
+        //
+        // On strict-flush Err: DO NOT drop the pixmap. Leave it in
+        // self.pixmaps so its mirror outlives the abandoned GPU
+        // work; backend teardown drains.
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::error!(
+                "free_pixmap: pre-destruction flush failed ({e:?}); leaving PixmapState in place to avoid UAF"
+            );
+            return Err(std::io::Error::other(format!(
+                "free_pixmap pre-flush failed: {e:?}"
+            )));
+        }
         if let Some(ps) = self.pixmaps.remove(&host_xid) {
             // Rescue the vk_mirror for any picture still referencing
             // this pixmap (e.g. fvwm frees the cursor source pixmap
@@ -10481,8 +10521,20 @@ impl Backend for KmsBackend {
         // Phase-3B drawable-destruction barrier: a batched paint or
         // in-flight composite may still reference this picture's
         // rescued vk_mirror (if any). Flush before dropping.
-        let _ = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
+        //
+        // On strict-flush Err: DO NOT drop the picture or its
+        // rescued image. Leave them in place so any GPU references
+        // outlive; backend teardown drains.
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::error!(
+                "render_free_picture: pre-destruction flush failed ({e:?}); leaving picture + rescued image in place to avoid UAF"
+            );
+            return Err(std::io::Error::other(format!(
+                "render_free_picture pre-flush failed: {e:?}"
+            )));
+        }
         self.pictures.remove(&host_pic);
         self.picture_rescued_images.remove(&host_pic);
         Ok(())
@@ -11033,9 +11085,26 @@ impl Backend for KmsBackend {
             // drop, destroying the rescued mirror's VkImage. Flush
             // the batch before the drop so the GPU has consumed the
             // copy.
-            let _ = self.flush_if_needed(
+            //
+            // On strict-flush Err: the GPU may still reference src
+            // (path-2 leak) AND the new cursor mirror (also pending
+            // in the abandoned batch). Leak both via `mem::forget`
+            // and bail out — `picture_rescued_images.remove()`
+            // already consumed src so we can't put it back, but
+            // forgetting it prevents the Drop from freeing the
+            // VkImage the GPU may still hold.
+            if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
-            );
+            ) {
+                log::error!(
+                    "render_create_cursor: post-copy flush failed ({e:?}); leaking rescued src + new cursor mirror to avoid UAF"
+                );
+                std::mem::forget(src);
+                if let Some(m) = vk_mirror {
+                    std::mem::forget(m);
+                }
+                return Ok(None);
+            }
             // `src` drops here, releasing the rescued mirror's VkImage.
             self.cursors.insert(
                 id,
