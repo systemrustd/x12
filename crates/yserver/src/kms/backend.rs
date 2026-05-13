@@ -1718,7 +1718,7 @@ impl KmsBackend {
     ///   try_vk_fill_with_function:        fill::record_logic_fill             — migrated T2 (record_paint_op)
     ///   try_vk_solid_fill:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   try_vk_put_image:                 image::record_put_image             — migrated 3C T1 (record_paint_batch_op + arena)
-    ///   try_vk_text_run:                  text::record_text_run               — borrow-conflict fallback
+    ///   try_vk_text_run:                  text::record_text_run               — migrated 3E T1 (record_paint_op)
     ///   try_vk_render_traps (composite):  render::record_render_composite     — borrow-conflict fallback
     ///   try_vk_render_composite_glyphs:   text::record_text_run               — borrow-conflict fallback
     ///   try_vk_render_composite:          render::record_render_composite     — borrow-conflict fallback
