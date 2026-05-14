@@ -87,6 +87,21 @@ pub struct Triangle {
     pub p3: (i32, i32),
 }
 
+impl Triangle {
+    /// Convert this triangle (16.16 fixed-point) into the f32-based
+    /// instance struct the GPU pipeline
+    /// (`trap_pipeline::TrapPipeline::triangle_pipeline`) expects as
+    /// per-instance vertex attributes (gpu-trap T3).
+    #[must_use]
+    pub fn to_instance_data(&self) -> crate::kms::vk::trap_pipeline::TriangleInstanceData {
+        crate::kms::vk::trap_pipeline::TriangleInstanceData {
+            p1: [fixed_to_f32(self.p1.0), fixed_to_f32(self.p1.1)],
+            p2: [fixed_to_f32(self.p2.0), fixed_to_f32(self.p2.1)],
+            p3: [fixed_to_f32(self.p3.0), fixed_to_f32(self.p3.1)],
+        }
+    }
+}
+
 /// Bounding box (integer pixels). Inclusive lower bound, exclusive
 /// upper. Returns `None` if any trapezoid is degenerate / empty —
 /// caller treats that as "no draw".

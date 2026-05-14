@@ -26,6 +26,8 @@ use super::device::VkContext;
 
 const TRAP_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/trap.vert.spv"));
 const TRAP_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/trap.frag.spv"));
+const TRIANGLE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
+const TRIANGLE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
 
 /// Per-instance trap data — exactly the per-trap geometry the
 /// fragment shader needs for analytic edge coverage. The bbox is in
@@ -50,6 +52,50 @@ pub struct TrapInstanceData {
 const _: () = assert!(std::mem::size_of::<TrapInstanceData>() == 40);
 
 impl TrapInstanceData {
+    /// View this struct as a byte slice for direct memcpy into the
+    /// host-visible upload arena.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `repr(C)` with f32 fields, no padding (asserted
+        // above); the resulting slice never outlives `self`.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref::<Self>(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+/// Per-instance triangle data — three corners as `vec2`s. The bbox
+/// is in `TrapDrawPushConsts` (shared with the trapezoid pipeline),
+/// not here.
+///
+/// Layout: 3 × `vec2` = 6 `f32` = 24 bytes. Vertex input attributes
+/// (binding 0, `VK_VERTEX_INPUT_RATE_INSTANCE`) decompose into 3
+/// slots: `p1:vec2`, `p2:vec2`, `p3:vec2`. The triangle pipeline
+/// (`triangle_pipeline`) shares the same pipeline layout / push
+/// consts as the trapezoid pipeline; only the vertex input layout
+/// and shaders differ.
+///
+/// RENDER's `Triangles` request does NOT specify a winding
+/// convention — points may arrive CW or CCW. Winding-order handling
+/// is in the triangle vertex shader (computes signed-area sign once
+/// per instance, passes as `orient` flat float) so the fragment can
+/// pick a consistent inside-side regardless. Mirrors the
+/// sign-agnostic CPU reference `point_in_triangle` in
+/// `vk/ops/traps.rs::point_in_triangle`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TriangleInstanceData {
+    pub p1: [f32; 2],
+    pub p2: [f32; 2],
+    pub p3: [f32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<TriangleInstanceData>() == 24);
+
+impl TriangleInstanceData {
     /// View this struct as a byte slice for direct memcpy into the
     /// host-visible upload arena.
     #[must_use]
@@ -110,16 +156,19 @@ impl From<vk::Result> for TrapPipelineError {
     }
 }
 
-/// GPU rasterization pipeline for RENDER Trapezoids.
+/// GPU rasterization pipeline for RENDER Trapezoids + Triangles.
 ///
 /// Holds the shared pipeline layout (push constants only — no
 /// descriptor sets, per-instance data is via vertex attributes) and
-/// the trapezoid pipeline. T3 adds a sibling `triangle_pipeline`
-/// against the same layout.
+/// two sibling pipelines: `trapezoid_pipeline` (T2) writing 4-edge
+/// coverage masks and `triangle_pipeline` (T3) writing 3-edge masks.
+/// Both share the same push-const layout (`TrapDrawPushConsts`)
+/// but differ in vertex input layout and shader pair.
 pub struct TrapPipeline {
     vk: Arc<VkContext>,
     pipeline_layout: vk::PipelineLayout,
     trapezoid_pipeline: vk::Pipeline,
+    triangle_pipeline: vk::Pipeline,
 }
 
 impl std::fmt::Debug for TrapPipeline {
@@ -127,6 +176,7 @@ impl std::fmt::Debug for TrapPipeline {
         f.debug_struct("TrapPipeline")
             .field("pipeline_layout", &self.pipeline_layout)
             .field("trapezoid_pipeline", &self.trapezoid_pipeline)
+            .field("triangle_pipeline", &self.triangle_pipeline)
             .finish_non_exhaustive()
     }
 }
@@ -156,11 +206,22 @@ impl TrapPipeline {
                 return Err(e);
             }
         };
+        let triangle_pipeline = match build_triangle_pipeline(&vk, pipeline_layout, mask_format) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    device.destroy_pipeline(trapezoid_pipeline, None);
+                    device.destroy_pipeline_layout(pipeline_layout, None);
+                }
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             vk,
             pipeline_layout,
             trapezoid_pipeline,
+            triangle_pipeline,
         })
     }
 
@@ -171,12 +232,19 @@ impl TrapPipeline {
     pub fn trapezoid_pipeline(&self) -> vk::Pipeline {
         self.trapezoid_pipeline
     }
+
+    pub fn triangle_pipeline(&self) -> vk::Pipeline {
+        self.triangle_pipeline
+    }
 }
 
 impl Drop for TrapPipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
+            self.vk
+                .device
+                .destroy_pipeline(self.triangle_pipeline, None);
             self.vk
                 .device
                 .destroy_pipeline(self.trapezoid_pipeline, None);
@@ -333,6 +401,134 @@ fn build_trap_pipeline(
     Ok(pipeline)
 }
 
+fn build_triangle_pipeline(
+    vk: &VkContext,
+    pipeline_layout: vk::PipelineLayout,
+    mask_format: vk::Format,
+) -> Result<vk::Pipeline, TrapPipelineError> {
+    let device = &vk.device;
+    let vert_module = create_shader_module(device, TRIANGLE_VERT_SPV)?;
+    let frag_module = match create_shader_module(device, TRIANGLE_FRAG_SPV) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { device.destroy_shader_module(vert_module, None) };
+            return Err(e);
+        }
+    };
+
+    let entry = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(entry),
+    ];
+
+    // Per-instance vertex input. One binding (stride = 24), three
+    // attributes — three `vec2`s for `p1`, `p2`, `p3`. INSTANCE rate
+    // so the same 4 quad verts (TRIANGLE_STRIP) re-use one attribute
+    // set per instance.
+    let bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<TriangleInstanceData>() as u32)
+        .input_rate(vk::VertexInputRate::INSTANCE)];
+    let attributes = [
+        // location 0: p1 : vec2
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0),
+        // location 1: p2 : vec2
+        vk::VertexInputAttributeDescription::default()
+            .location(1)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(8),
+        // location 2: p3 : vec2
+        vk::VertexInputAttributeDescription::default()
+            .location(2)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(16),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    // Saturated additive blend on R only — same scheme as the
+    // trapezoid pipeline. R8_UNORM clamps to [0, 1] in the
+    // framebuffer, which gives the same union-with-saturating-add
+    // semantics as the CPU path (`out[idx] = saturating_add(cov)`
+    // in `rasterize_triangles`).
+    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::R)];
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op_enable(false)
+        .attachments(&color_blend_attachments);
+
+    let dynamic_state_array = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state_array);
+    let color_formats = [mask_format];
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .push_next(&mut rendering_info);
+
+    let pipeline = match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    } {
+        Ok(ps) => ps[0],
+        Err((_, e)) => {
+            unsafe {
+                device.destroy_shader_module(vert_module, None);
+                device.destroy_shader_module(frag_module, None);
+            }
+            return Err(e.into());
+        }
+    };
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+    Ok(pipeline)
+}
+
 fn create_shader_module(
     device: &ash::Device,
     spv_bytes: &[u8],
@@ -358,6 +554,11 @@ mod tests {
     }
 
     #[test]
+    fn triangle_instance_data_size_is_24() {
+        assert_eq!(std::mem::size_of::<TriangleInstanceData>(), 24);
+    }
+
+    #[test]
     fn push_consts_size_is_32() {
         assert_eq!(std::mem::size_of::<TrapDrawPushConsts>(), 32);
     }
@@ -378,6 +579,21 @@ mod tests {
         assert_eq!(&bytes[0..4], &1.0_f32.to_ne_bytes());
         // Last vec2 component (right_p2.y) is 5.0.
         assert_eq!(&bytes[36..40], &5.0_f32.to_ne_bytes());
+    }
+
+    #[test]
+    fn triangle_instance_data_as_bytes_roundtrip() {
+        let data = TriangleInstanceData {
+            p1: [1.0, 2.0],
+            p2: [3.0, 4.0],
+            p3: [5.0, 6.0],
+        };
+        let bytes = data.as_bytes();
+        assert_eq!(bytes.len(), 24);
+        // First f32 (p1.x) is 1.0.
+        assert_eq!(&bytes[0..4], &1.0_f32.to_ne_bytes());
+        // Last f32 (p3.y) is 6.0.
+        assert_eq!(&bytes[20..24], &6.0_f32.to_ne_bytes());
     }
 
     #[test]
