@@ -79,6 +79,37 @@ pub struct VkCallStats {
     /// above. Should be near-zero; any non-zero is a missed
     /// instrumentation site.
     pub submit_other: AtomicU64,
+
+    // ProtocolBarrier subdivision — eight call sites in backend.rs
+    // all use flush_if_needed(ProtocolBarrier). Per-site counts tell
+    // us which path drives the protocol_barrier=N rollup.
+    /// backend.rs ~9663 — drawable / window destruction barrier.
+    pub pb_drawable_destroy: AtomicU64,
+    /// backend.rs ~9843 — window resize pre-flush gate.
+    pub pb_window_resize: AtomicU64,
+    /// backend.rs ~10193 — image dealloc fallback (missing defer
+    /// prereqs path).
+    pub pb_image_dealloc_fallback: AtomicU64,
+    /// backend.rs ~10215 — imported dma-buf release before Drop.
+    pub pb_dmabuf_release: AtomicU64,
+    /// backend.rs ~11699 — Picture destruction (RENDER FreePicture).
+    pub pb_picture_destroy: AtomicU64,
+    /// backend.rs ~12132 — render_create_linear_gradient pre-build.
+    pub pb_gradient_linear: AtomicU64,
+    /// backend.rs ~12207 — render_create_radial_gradient pre-build.
+    pub pb_gradient_radial: AtomicU64,
+    /// backend.rs ~12293 — cursor set_picture_cursor pre-flush.
+    pub pb_cursor_picture: AtomicU64,
+
+    // submit_other subdivision — three callers of
+    // DrawableImage::initialize_clear; the existing submit_other
+    // counter is the sum of these.
+    /// backend.rs ~3186 — cursor mirror init clear.
+    pub init_clear_cursor: AtomicU64,
+    /// backend.rs ~7319 — window mirror init clear.
+    pub init_clear_window: AtomicU64,
+    /// backend.rs ~7388 — pixmap mirror init clear.
+    pub init_clear_pixmap: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -109,6 +140,17 @@ pub struct VkCallStatsSnapshot {
     pub submit_one_shot: u64,
     pub submit_compositor: u64,
     pub submit_other: u64,
+    pub pb_drawable_destroy: u64,
+    pub pb_window_resize: u64,
+    pub pb_image_dealloc_fallback: u64,
+    pub pb_dmabuf_release: u64,
+    pub pb_picture_destroy: u64,
+    pub pb_gradient_linear: u64,
+    pub pb_gradient_radial: u64,
+    pub pb_cursor_picture: u64,
+    pub init_clear_cursor: u64,
+    pub init_clear_window: u64,
+    pub init_clear_pixmap: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -138,6 +180,17 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     submit_one_shot: AtomicU64::new(0),
     submit_compositor: AtomicU64::new(0),
     submit_other: AtomicU64::new(0),
+    pb_drawable_destroy: AtomicU64::new(0),
+    pb_window_resize: AtomicU64::new(0),
+    pb_image_dealloc_fallback: AtomicU64::new(0),
+    pb_dmabuf_release: AtomicU64::new(0),
+    pb_picture_destroy: AtomicU64::new(0),
+    pb_gradient_linear: AtomicU64::new(0),
+    pb_gradient_radial: AtomicU64::new(0),
+    pb_cursor_picture: AtomicU64::new(0),
+    init_clear_cursor: AtomicU64::new(0),
+    init_clear_window: AtomicU64::new(0),
+    init_clear_pixmap: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -172,6 +225,17 @@ impl VkCallStats {
             submit_one_shot: self.submit_one_shot.swap(0, Ordering::Relaxed),
             submit_compositor: self.submit_compositor.swap(0, Ordering::Relaxed),
             submit_other: self.submit_other.swap(0, Ordering::Relaxed),
+            pb_drawable_destroy: self.pb_drawable_destroy.swap(0, Ordering::Relaxed),
+            pb_window_resize: self.pb_window_resize.swap(0, Ordering::Relaxed),
+            pb_image_dealloc_fallback: self.pb_image_dealloc_fallback.swap(0, Ordering::Relaxed),
+            pb_dmabuf_release: self.pb_dmabuf_release.swap(0, Ordering::Relaxed),
+            pb_picture_destroy: self.pb_picture_destroy.swap(0, Ordering::Relaxed),
+            pb_gradient_linear: self.pb_gradient_linear.swap(0, Ordering::Relaxed),
+            pb_gradient_radial: self.pb_gradient_radial.swap(0, Ordering::Relaxed),
+            pb_cursor_picture: self.pb_cursor_picture.swap(0, Ordering::Relaxed),
+            init_clear_cursor: self.init_clear_cursor.swap(0, Ordering::Relaxed),
+            init_clear_window: self.init_clear_window.swap(0, Ordering::Relaxed),
+            init_clear_pixmap: self.init_clear_pixmap.swap(0, Ordering::Relaxed),
         }
     }
 }

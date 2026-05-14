@@ -42,6 +42,11 @@ pub fn run() -> io::Result<()> {
     if std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some() {
         thread::spawn(|| {
             use std::time::Duration;
+            // Previous-snapshot cache for the pool delta. The pool's
+            // stats counters are cumulative; we emit per-second
+            // deltas so the line reads the same way as the vk-call
+            // rates.
+            let mut prev_pool = crate::kms::vk::pixmap_pool::PixmapPoolStats::default();
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let s = crate::kms::vk::call_stats::VK_CALLS.snapshot_and_reset();
@@ -86,6 +91,65 @@ pub fn run() -> io::Result<()> {
                     s.submit_compositor,
                     s.submit_other,
                 );
+                // ProtocolBarrier per-site breakdown — the sum of
+                // these eight counters equals `protocol_barrier`
+                // above. Identifies which lifecycle path drives the
+                // ProtocolBarrier flush rate.
+                log::info!(
+                    "vk pb src [1s]: drawable_destroy={} window_resize={} \
+                     image_dealloc_fb={} dmabuf_release={} picture_destroy={} \
+                     gradient_linear={} gradient_radial={} cursor_picture={}",
+                    s.pb_drawable_destroy,
+                    s.pb_window_resize,
+                    s.pb_image_dealloc_fallback,
+                    s.pb_dmabuf_release,
+                    s.pb_picture_destroy,
+                    s.pb_gradient_linear,
+                    s.pb_gradient_radial,
+                    s.pb_cursor_picture,
+                );
+                // submit_other per-caller breakdown — sum equals
+                // `other` above. Distinguishes cursor / window /
+                // pixmap mirror init clears.
+                log::info!(
+                    "vk init_clear src [1s]: cursor={} window={} pixmap={}",
+                    s.init_clear_cursor,
+                    s.init_clear_window,
+                    s.init_clear_pixmap,
+                );
+                // PixmapPool deltas — cumulative counters minus the
+                // previous snapshot. Tells us per second whether the
+                // pool is being consulted (takes_hit+takes_miss),
+                // whether mirrors return to it (returns_accepted),
+                // and which rejection path fires (bucket_full means
+                // PIXMAP_POOL_BUCKET_CAP is too small; oversize
+                // means MAX_POOLED_DIM is too small).
+                if let Some(cur) = crate::kms::vk::pixmap_pool::telemetry_snapshot() {
+                    let d_hit = cur.total_takes_hit.wrapping_sub(prev_pool.total_takes_hit);
+                    let d_miss = cur
+                        .total_takes_miss
+                        .wrapping_sub(prev_pool.total_takes_miss);
+                    let d_acc = cur
+                        .total_returns_accepted
+                        .wrapping_sub(prev_pool.total_returns_accepted);
+                    let d_full = cur
+                        .total_returns_rejected_bucket_full
+                        .wrapping_sub(prev_pool.total_returns_rejected_bucket_full);
+                    let d_over = cur
+                        .total_returns_rejected_oversize
+                        .wrapping_sub(prev_pool.total_returns_rejected_oversize);
+                    log::info!(
+                        "pixmap pool [1s]: takes_hit={} takes_miss={} \
+                         returns_accepted={} returns_rejected_bucket_full={} \
+                         returns_rejected_oversize={}",
+                        d_hit,
+                        d_miss,
+                        d_acc,
+                        d_full,
+                        d_over,
+                    );
+                    prev_pool = cur;
+                }
             }
         });
     }

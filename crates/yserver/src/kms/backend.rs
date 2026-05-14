@@ -1551,6 +1551,7 @@ impl KmsBackend {
         let pixmap_pool = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
             &vk,
         )));
+        crate::kms::vk::pixmap_pool::register_for_telemetry(&pixmap_pool);
         // gpu-trap T2: mirror the production init so for_tests_with_vk-
         // driven tests exercise the same `trap_pipeline.is_some()` path.
         // Failure here leaves the field `None`; tests that don't rely on
@@ -2356,9 +2357,11 @@ impl KmsBackend {
         // `allocate_pixmap_mirror` will try-take from it ahead of
         // freshly allocating (wired in T3).
         let pixmap_pool = vk.as_ref().map(|vkctx| {
-            Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
+            let p = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
                 vkctx,
-            )))
+            )));
+            crate::kms::vk::pixmap_pool::register_for_telemetry(&p);
+            p
         });
 
         // GPU trap-rasterize pipeline (gpu-trap T1/T2). When this
@@ -3182,10 +3185,11 @@ impl KmsBackend {
             32,
         ) {
             Ok(mut img) => {
-                if let Some(pool) = self.ops_command_pool.as_ref()
-                    && let Err(e) = img.initialize_clear(pool.handle())
-                {
-                    log::warn!("cursor mirror initialize_clear failed: {e:?}");
+                if let Some(pool) = self.ops_command_pool.as_ref() {
+                    crate::vk_count!(init_clear_cursor);
+                    if let Err(e) = img.initialize_clear(pool.handle()) {
+                        log::warn!("cursor mirror initialize_clear failed: {e:?}");
+                    }
                 }
                 // Cursor mirror is fully dirty at creation so the
                 // first composite pass has it populated before
@@ -7315,10 +7319,11 @@ impl KmsBackend {
             u32::from(height),
         ) {
             Ok(mut img) => {
-                if let Some(pool) = self.ops_command_pool.as_ref()
-                    && let Err(e) = img.initialize_clear(pool.handle())
-                {
-                    log::warn!("window mirror initialize_clear failed: {e:?}");
+                if let Some(pool) = self.ops_command_pool.as_ref() {
+                    crate::vk_count!(init_clear_window);
+                    if let Err(e) = img.initialize_clear(pool.handle()) {
+                        log::warn!("window mirror initialize_clear failed: {e:?}");
+                    }
                 }
                 Some(img)
             }
@@ -7384,10 +7389,11 @@ impl KmsBackend {
             depth,
         ) {
             Ok(mut img) => {
-                if let Some(pool) = self.ops_command_pool.as_ref()
-                    && let Err(e) = img.initialize_clear(pool.handle())
-                {
-                    log::warn!("pixmap mirror initialize_clear failed: {e:?}");
+                if let Some(pool) = self.ops_command_pool.as_ref() {
+                    crate::vk_count!(init_clear_pixmap);
+                    if let Err(e) = img.initialize_clear(pool.handle()) {
+                        log::warn!("pixmap mirror initialize_clear failed: {e:?}");
+                    }
                 }
                 Some(img)
             }
@@ -9659,6 +9665,7 @@ impl Backend for KmsBackend {
         // teardown's global device_wait_idle eventually drains.
         // Return the error so the client sees a protocol failure
         // (acceptable; the renderer is dead anyway).
+        crate::vk_count!(pb_drawable_destroy);
         if let Err(e) = self
             .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
         {
@@ -9839,6 +9846,7 @@ impl Backend for KmsBackend {
             // state. Keep the old mirror; `mem::forget` new_mirror
             // so its Drop doesn't free a VkImage the GPU may still
             // hold. Renderer is failed; resize visually fails too.
+            crate::vk_count!(pb_window_resize);
             if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
             ) {
@@ -10189,6 +10197,7 @@ impl Backend for KmsBackend {
             // No defer infrastructure — preserve the pre-T2 flush +
             // direct-drop behaviour for this rare path. Should never
             // trigger post-init for server-owned mirrors.
+            crate::vk_count!(pb_image_dealloc_fallback);
             if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
             ) {
@@ -10211,6 +10220,7 @@ impl Backend for KmsBackend {
             // flush ensures the GPU is done with the imported image
             // before its Drop tears down image / view / memory and
             // releases the dma-buf fd.
+            crate::vk_count!(pb_dmabuf_release);
             if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
             ) {
@@ -11695,6 +11705,7 @@ impl Backend for KmsBackend {
         // On strict-flush Err: DO NOT drop the picture or its
         // rescued image. Leave them in place so any GPU references
         // outlive; backend teardown drains.
+        crate::vk_count!(pb_picture_destroy);
         if let Err(e) = self
             .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
         {
@@ -12128,6 +12139,7 @@ impl Backend for KmsBackend {
         // gradient one-shot, not a UAF fix. Cheap because gradient creates
         // are low-frequency. On flush Err return Ok(None), matching the
         // handler's existing "vk init failed" fallback shape.
+        crate::vk_count!(pb_gradient_linear);
         if let Err(e) = self
             .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
         {
@@ -12203,6 +12215,7 @@ impl Backend for KmsBackend {
         // gradient one-shot, not a UAF fix. Cheap because gradient creates
         // are low-frequency. On flush Err return Ok(None), matching the
         // handler's existing "vk init failed" fallback shape.
+        crate::vk_count!(pb_gradient_radial);
         if let Err(e) = self
             .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
         {
@@ -12289,6 +12302,7 @@ impl Backend for KmsBackend {
             // already consumed src so we can't put it back, but
             // forgetting it prevents the Drop from freeing the
             // VkImage the GPU may still hold.
+            crate::vk_count!(pb_cursor_picture);
             if let Err(e) = self.flush_if_needed(
                 crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
             ) {

@@ -26,7 +26,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use ash::vk;
@@ -67,6 +67,30 @@ pub struct PixmapPoolStats {
     pub total_returns_accepted: u64,
     pub total_returns_rejected_bucket_full: u64,
     pub total_returns_rejected_oversize: u64,
+}
+
+/// Telemetry-side handle to the latest constructed pool. Set by
+/// `PixmapPool::new`; read by the telemetry thread in
+/// `yserver::run` to log per-second deltas. `Weak` so the pool can
+/// still drop cleanly on backend teardown.
+pub static GLOBAL_LATEST_POOL: Mutex<Weak<PixmapPool>> = Mutex::new(Weak::new());
+
+/// Capture-the-most-recent-pool hook. Called by `PixmapPool::new`
+/// via an `Arc::new_cyclic`-style indirection — but since the pool
+/// is constructed via plain `Arc::new(PixmapPool::new(..))` we
+/// expose a helper the construction site uses immediately after.
+pub fn register_for_telemetry(pool: &Arc<PixmapPool>) {
+    if let Ok(mut g) = GLOBAL_LATEST_POOL.lock() {
+        *g = Arc::downgrade(pool);
+    }
+}
+
+/// Telemetry-side snapshot accessor. Returns `None` if no pool has
+/// been registered, or the registered pool has been dropped.
+#[must_use]
+pub fn telemetry_snapshot() -> Option<PixmapPoolStats> {
+    let weak = GLOBAL_LATEST_POOL.lock().ok()?.clone();
+    weak.upgrade().map(|p| p.stats())
 }
 
 pub struct PixmapPool {
