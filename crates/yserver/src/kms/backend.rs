@@ -775,6 +775,22 @@ pub struct KmsBackend {
     /// dangling pool handle (driver-dependent: AMD radv panics).
     pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
 
+    /// Backend-owned recycle pool for server-owned pixmap-backing
+    /// `(VkImage, VkImageView, VkDeviceMemory)` triples (pixmap-pool
+    /// T1). `free_pixmap` returns mirrors here via
+    /// `defer_resource_release` adopting a `PooledPixmapReturn`; the
+    /// next `CreatePixmap` of a matching `(width, height, format)`
+    /// hits the pool instead of round-tripping the kernel.
+    ///
+    /// `None` when Vulkan didn't come up.
+    ///
+    /// Drop order: declared AFTER `scheduler` so any
+    /// `BatchResource::release` still in-flight on the scheduler's
+    /// retire path can observe a live pool. Declared BEFORE
+    /// `ops_command_pool` so the pool's defensive `queue_wait_idle`
+    /// in `Drop` sees a live device queue.
+    pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
+
     // Drawing-op command pool (sub-phase 4.1.4). Separate from
     // `MirrorUploader`'s transfer pool — drawing ops emit graphics
     // workload (begin_rendering / clear_attachments / draws), the
@@ -1426,6 +1442,7 @@ impl KmsBackend {
             vk: None,
             first_pageflip_logged: vec![false; 1],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
+            pixmap_pool: None,
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
             ops_command_pool: None,
@@ -1511,7 +1528,16 @@ impl KmsBackend {
             ash::vk::Format::B8G8R8A8_UNORM,
         )
         .map_err(|e| io::Error::other(format!("LogicFillPipelineCache::new: {e:?}")))?;
+        // pixmap-pool T2: backend-owned recycle pool for server-owned
+        // pixmap-backing triples. Mirrors the production init in
+        // `open_with_commit`; needed here so `free_pixmap` in
+        // for_tests_with_vk-driven tests goes through the same
+        // defer-release path.
+        let pixmap_pool = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
+            &vk,
+        )));
         backend.vk = Some(vk);
+        backend.pixmap_pool = Some(pixmap_pool);
         backend.ops_command_pool = Some(ops_pool);
         backend.ops_staging = Some(ops_staging);
         backend.logic_fill_pipelines = Some(logic_fill);
@@ -2193,6 +2219,17 @@ impl KmsBackend {
             .as_ref()
             .map(|vkctx| crate::kms::vk::dst_readback::DstReadback::new(Arc::clone(vkctx)));
 
+        // Backend-owned pixmap-backing recycle pool (pixmap-pool T1).
+        // Created once Vulkan is up; `free_pixmap` returns mirrors
+        // here via the scheduler's defer-release mechanism and
+        // `allocate_pixmap_mirror` will try-take from it ahead of
+        // freshly allocating (wired in T3).
+        let pixmap_pool = vk.as_ref().map(|vkctx| {
+            Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
+                vkctx,
+            )))
+        });
+
         let logic_fill_pipelines = vk.as_ref().and_then(|vkctx| {
             match crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache::new(
                 Arc::clone(vkctx),
@@ -2231,6 +2268,7 @@ impl KmsBackend {
             vk,
             first_pageflip_logged: vec![false; layouts_len],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
+            pixmap_pool,
             scanout_pools,
             compositor_pipeline,
             ops_command_pool,
@@ -9571,45 +9609,137 @@ impl Backend for KmsBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        // Phase-3B drawable-destruction barrier: a batched paint or
-        // in-flight composite may still reference this pixmap's
-        // VkImage. flush_if_needed submits the batch + queue_wait_idle
-        // before we drop / rescue the mirror.
+        // pixmap-pool T2: no synchronous flush. The mirror's VkImage
+        // may be referenced by commands in the currently-open paint
+        // batch or in any in-flight batch on `submitted_paint_batches`.
+        // We adopt the mirror's (image, view, memory) into the open
+        // batch as a `PooledPixmapReturn` BatchResource; when that
+        // batch retires (its fence signals), the BatchResource's
+        // release returns the entry to the pool (or destroys if the
+        // bucket is full / the key is ineligible).
         //
-        // On strict-flush Err: DO NOT drop the pixmap. Leave it in
-        // self.pixmaps so its mirror outlives the abandoned GPU
-        // work; backend teardown drains.
-        if let Err(e) = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
-        {
-            log::error!(
-                "free_pixmap: pre-destruction flush failed ({e:?}); leaving PixmapState in place to avoid UAF"
-            );
-            return Err(std::io::Error::other(format!(
-                "free_pixmap pre-flush failed: {e:?}"
-            )));
-        }
-        if let Some(ps) = self.pixmaps.remove(&host_xid) {
-            // Rescue the vk_mirror for any picture still referencing
-            // this pixmap (e.g. fvwm frees the cursor source pixmap
-            // before CreateCursor). The mirror keeps the GPU image
-            // alive on the rescue map; whoever consumes the rescue
-            // (currently render_create_cursor) drops it.
-            if let Some(mirror) = ps.vk_mirror {
-                let mut mirror = Some(mirror);
-                for (&pic_xid, pic) in &self.pictures {
-                    if let PictureState::Drawable { host_xid: xid, .. } = pic
-                        && *xid == host_xid
-                        && let Some(m) = mirror.take()
-                    {
-                        self.picture_rescued_images.insert(pic_xid, m);
-                        break;
-                    }
-                }
-                // If no picture referenced the pixmap, `mirror` drops
-                // here (Drop releases the VkImage/allocation).
+        // Replaces Phase 3B's drawable-destruction barrier flush at
+        // this site.
+
+        let Some(ps) = self.pixmaps.remove(&host_xid) else {
+            return Ok(());
+        };
+        let Some(mirror) = ps.vk_mirror else {
+            return Ok(());
+        };
+
+        // Picture rescue path stays unchanged: a live picture
+        // referencing this pixmap takes the mirror so its alpha can
+        // outlive the FreePixmap (fvwm cursor pattern).
+        let mut mirror_opt = Some(mirror);
+        for (&pic_xid, pic) in &self.pictures {
+            if let PictureState::Drawable { host_xid: xid, .. } = pic
+                && *xid == host_xid
+                && let Some(m) = mirror_opt.take()
+            {
+                self.picture_rescued_images.insert(pic_xid, m);
+                break;
             }
         }
+        let Some(mirror) = mirror_opt else {
+            // Rescue took ownership; nothing to pool.
+            return Ok(());
+        };
+
+        // Every mirror with a live `VkImage` MUST go through
+        // defer-release, not direct-drop (codex P0 round 3:
+        // `DrawableImage::Drop` is non-waiting, so direct-dropping a
+        // mirror after the synchronous flush is removed is UAF /
+        // driver-crash risk for any in-flight VkImage). Eligibility
+        // and bucket-cap rejection are handled INSIDE
+        // `PooledPixmapReturn::release` via `try_return`'s `Err`
+        // path: ineligible (oversize) and full-bucket entries are
+        // destroyed by the BatchResource at batch-retire time — by
+        // which point the open batch's fence has signalled and the
+        // GPU is done with the image. This is the load-bearing UAF
+        // avoidance.
+        //
+        // DRI3-imported mirrors are an exception: they're backed by
+        // `ImageBacking::Imported` (client-owned dma-buf), and
+        // `DrawableImage::into_pool_entry` panics for that variant —
+        // pooling client-imported memory makes no sense. Route them
+        // through the synchronous flush+drop fallback below, which
+        // is also where pre-init / partial-init paths land.
+        let imported = matches!(
+            mirror.backing,
+            crate::kms::vk::target::ImageBacking::Imported { .. }
+        );
+        let prereqs = (
+            self.pixmap_pool.as_ref().cloned(),
+            self.vk.as_ref().cloned(),
+            self.ops_command_pool.as_ref().map(|p| p.handle()),
+        );
+        let (Some(pool), Some(vk_arc), Some(pool_handle)) = prereqs else {
+            // No defer infrastructure — preserve the pre-T2 flush +
+            // direct-drop behaviour for this rare path. Should never
+            // trigger post-init for server-owned mirrors.
+            if let Err(e) = self.flush_if_needed(
+                crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
+            ) {
+                log::error!(
+                    "free_pixmap fallback path: pre-destruction flush failed ({e:?}); \
+                     leaking mirror to avoid UAF"
+                );
+                // Leak rather than UAF. Renderer is already in a bad
+                // state if this branch ran.
+                std::mem::forget(mirror);
+                return Err(std::io::Error::other(format!(
+                    "free_pixmap fallback flush failed: {e:?}"
+                )));
+            }
+            drop(mirror);
+            return Ok(());
+        };
+        if imported {
+            // Same fallback shape as missing-prereqs: synchronous
+            // flush ensures the GPU is done with the imported image
+            // before its Drop tears down image / view / memory and
+            // releases the dma-buf fd.
+            if let Err(e) = self.flush_if_needed(
+                crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
+            ) {
+                log::error!(
+                    "free_pixmap imported path: pre-destruction flush failed ({e:?}); \
+                     leaking mirror to avoid UAF"
+                );
+                std::mem::forget(mirror);
+                return Err(std::io::Error::other(format!(
+                    "free_pixmap imported flush failed: {e:?}"
+                )));
+            }
+            drop(mirror);
+            return Ok(());
+        }
+
+        // Defer-release path (the common case for every server-owned
+        // mirror on a Vulkan-up backend). Build the BatchResource —
+        // eligibility + bucket-cap are evaluated INSIDE its
+        // `release()`, not here.
+        let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
+            width: mirror.extent.width,
+            height: mirror.extent.height,
+            format: mirror.format,
+        };
+        let entry = mirror.into_pool_entry();
+        let pooled_return = Box::new(crate::kms::vk::pixmap_pool::PooledPixmapReturn {
+            pool,
+            key,
+            entry: Some(entry),
+        });
+
+        // Phase 5 T2 defer-release. Adopts into the currently-open
+        // paint batch (creating an Idle one if none). When that
+        // batch retires (its fence signals), the BatchResource's
+        // release runs — `try_return` attempts to pool; on `Err`
+        // (ineligible / full bucket) destroys.
+        self.scheduler
+            .defer_resource_release(vk_arc, pool_handle, pooled_return);
+
         Ok(())
     }
 
