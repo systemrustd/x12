@@ -10050,6 +10050,31 @@ fn handle_change_property(
             18,
         );
     }
+    // Diagnostic: log WM_CLASS (and _NET_WM_PID) so we can map
+    // yserver client_id → user-space process when debugging
+    // missing-click / dead-applet issues. WM_CLASS is two
+    // null-terminated strings (instance, class); _NET_WM_PID is a
+    // CARD32. Both are set once near client init, so noise is
+    // bounded.
+    if let Some(prop_name) = state.atoms.name(req.property) {
+        if prop_name == "WM_CLASS" && req.format == 8 {
+            let s = String::from_utf8_lossy(&req.data).replace('\0', " | ");
+            log::info!(
+                "client {} WM_CLASS on 0x{:x}: {}",
+                client_id.0,
+                req.window.0,
+                s.trim_end_matches(" | "),
+            );
+        } else if prop_name == "_NET_WM_PID" && req.format == 32 && req.data.len() >= 4 {
+            let pid = u32::from_le_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
+            log::info!(
+                "client {} _NET_WM_PID on 0x{:x}: {}",
+                client_id.0,
+                req.window.0,
+                pid,
+            );
+        }
+    }
     let existing = state
         .resources
         .window_property(req.window, req.property)

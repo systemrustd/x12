@@ -169,7 +169,7 @@ See `known-issues.md` for the full ticklist with detail. Highlights tracked here
 
 - [ ] **`disable_output` atomic EINVAL** — recurring shutdown warn; disarm path mitigates but per-property split is the real fix.
 - [x] **Composite Manual-mode (`update=1`) accepted** — fixed 2026-05-14: both modes register the redirect record; `activate_redirect_backing_for` is skipped (decoupling the record from backing allocation). Unblocks notification-area-applet, xfwm4, picom, xcompmgr. Hardware-confirmed on fuji.
-- [ ] **Caja right-click popup offset** — coordinate-translation bug, surfaced 2026-05-13.
+- [ ] **GTK file-manager popup offset + wrong rubber-band** — coordinate-translation bug; Caja (2026-05-13) and Thunar (2026-05-15) both affected, so not dual-screen specific.
 - [ ] **Caja wheel needs view-switch** — yserver event-delivery regression; 3 bisect candidates filed.
 - [x] **Color R↔B swap on JPEG backgrounds + saturated icons** — fixed 2026-05-14: `try_vk_put_image` now treats the wire as `[B,G,R,A]` per the advertised visual masks (matches `B8G8R8A8_UNORM`). Hardware-confirmed on fuji.
 - [x] **`minor_code = 0` hardcoded in extension error encoder** — fixed 2026-05-15: 76 extension-dispatcher call sites converted to `emit_x11_error_with_minor`. Composite, MIT-SHM (+ children), PRESENT, DRI3, GLX, RANDR, XI2/XKEYBOARD, RENDER now emit the real per-extension minor; core requests stay on `emit_x11_error` (minor=0 is spec-correct).
