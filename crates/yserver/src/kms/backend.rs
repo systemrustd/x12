@@ -8394,6 +8394,21 @@ impl KmsBackend {
             );
         }
 
+        // pixmap-pool T4: every PooledPixmapReturn BatchResource has
+        // fired by now (scheduler drain walked retire_resources). The
+        // pool's buckets hold entries to destroy. PixmapPool::Drop is
+        // the defensive fallback if this path is skipped.
+        if let Some(pool) = self.pixmap_pool.as_ref() {
+            let strong = Arc::strong_count(pool);
+            if strong > 1 {
+                log::warn!(
+                    "shutdown: PixmapPool strong_count={strong} > 1 at drain time; \
+                     a BatchResource may be leaking past scheduler drain"
+                );
+            }
+            pool.drain();
+        }
+
         // Step 4: Drain DRM pageflip completions per output until no
         // bo is in BoPhase::Pending. Bounded by a 500 ms ceiling so a
         // genuinely stuck kernel doesn't hang shutdown. DO NOT
