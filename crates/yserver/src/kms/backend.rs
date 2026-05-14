@@ -5001,25 +5001,22 @@ impl KmsBackend {
             RenderPic::None => return false,
         }
 
-        // 3F-2: both MaskScratch::ensure_image_size and
-        // DstReadback::ensure may grow (destroy old image after
-        // queue_wait_idle), which does NOT wait for un-submitted
-        // batch commands. Pre-flush the batch before either grow.
-        // needs_*_grow are false for the steady-state path (no
-        // resize), so this only fires on first use of a given size
-        // (no old image to dangle, harmless) or on a real grow.
-        // Same mitigation 3D applied to CopyScratch and 3F-1 to
-        // DstReadback.
+        // 3F-2: MaskScratch::ensure_image_size may still grow (destroy
+        // old image after queue_wait_idle), which does NOT wait for
+        // un-submitted batch commands. Pre-flush the batch before the
+        // grow. needs_mask_grow is false for the steady-state path
+        // (no resize), so this only fires on first use of a given
+        // size (no old image to dangle, harmless) or on a real grow.
+        //
+        // 5-T4: DstReadback's half of this gate has been removed —
+        // it now uses `ensure_returning_old` + defer-release below.
+        // T5 will migrate MaskScratch the same way and delete this
+        // gate entirely.
         let needs_mask_grow = self
             .mask_scratch
             .as_ref()
             .is_some_and(|m| m.needs_image_grow(bbox_w, bbox_h));
-        let needs_readback_grow = needs_dst_readback
-            && self
-                .dst_readback
-                .as_ref()
-                .is_some_and(|r| r.needs_grow(dst_format, dst_extent.width, dst_extent.height));
-        if needs_mask_grow || needs_readback_grow {
+        if needs_mask_grow {
             use crate::kms::scheduler::paint_batch::BatchFlushReason;
             if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
                 log::warn!("vk render_traps: pre-resize flush failed: {e:?}");
@@ -5064,11 +5061,30 @@ impl KmsBackend {
             .expect("checked above")
             .image_view();
         let dst_readback_view = if needs_dst_readback {
-            let scratch = self.dst_readback.as_mut().expect("checked above");
-            if let Err(e) = scratch.ensure(dst_format, dst_extent.width, dst_extent.height) {
-                log::warn!("vk render_traps: dst readback ensure failed: {e:?}");
-                return false;
+            // 5-T4: defer-release replaces the pre-flush gate. The
+            // scratch's &mut borrow MUST end BEFORE
+            // `self.scheduler.defer_resource_release` borrows
+            // `&mut self`. Use a tight block so the `as_mut()` binding
+            // drops at the closing brace, then reborrow for view
+            // extraction.
+            let retired = {
+                let scratch = self.dst_readback.as_mut().expect("checked above");
+                match scratch.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("vk render_traps: dst readback ensure failed: {e:?}");
+                        return false;
+                    }
+                }
+            }; // <-- scratch's &mut borrow ends here.
+            if let Some(old) = retired {
+                self.scheduler
+                    .defer_resource_release(vk_arc.clone(), pool_handle, old);
             }
+            // Reborrow self.dst_readback for view extraction now that
+            // the earlier &mut and the scheduler borrow have ended.
+            let scratch = self.dst_readback.as_mut().expect("checked above");
             match scratch.view(dst_format, dst_has_alpha) {
                 Ok(Some(v)) => v,
                 Ok(None) => return false,
@@ -6100,40 +6116,40 @@ impl KmsBackend {
             }
         }
 
-        // 3F-1: dst_readback.ensure may grow (destroy old scratch
-        // image after queue_wait_idle), which does NOT wait for
-        // un-submitted batch commands. If an earlier op in the
-        // open batch recorded `cmd_copy_image(dst → old_scratch)`,
-        // freeing the old image would dangle. Pre-flush the batch
-        // before the grow. needs_grow fires on first use of a
-        // given dst format (no old image to dangle, harmless) and
-        // on resize (the real hazard); steady-state with a stable
-        // dst extent skips the flush. Same mitigation 3D applied
-        // to CopyScratch.
-        let needs_readback_grow = needs_dst_readback
-            && self
-                .dst_readback
-                .as_ref()
-                .is_some_and(|r| r.needs_grow(dst_format, dst_extent.width, dst_extent.height));
-        if needs_readback_grow {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("vk render_composite: pre-resize flush failed: {e:?}");
-                return false;
-            }
-        }
-
-        // For Disjoint/Conjoint ops the shader reads the dst pixel
-        // through binding 2; we copy dst → scratch inside the CB
-        // below and bind the scratch's sampleable view here. For
-        // standard ops the binding is unused — bind the white-mask
-        // scratch to satisfy the descriptor layout.
+        // 3F-1 / 5-T4: For Disjoint/Conjoint ops the shader reads the
+        // dst pixel through binding 2; we copy dst → scratch inside
+        // the CB below and bind the scratch's sampleable view here.
+        // For standard ops the binding is unused — bind the
+        // white-mask scratch to satisfy the descriptor layout.
+        //
+        // The pre-Phase-5 pre-flush gate (needs_grow → ProtocolBarrier)
+        // is gone: DstReadback now uses `ensure_returning_old`, which
+        // hands the old image to the scheduler's defer-release flow.
+        // The old image survives any in-flight CB that references it.
         let dst_readback_view = if needs_dst_readback {
-            let scratch = self.dst_readback.as_mut().expect("checked above");
-            if let Err(e) = scratch.ensure(dst_format, dst_extent.width, dst_extent.height) {
-                log::warn!("vk render_composite: dst readback ensure failed: {e:?}");
-                return false;
+            // The scratch's &mut borrow MUST end BEFORE
+            // `self.scheduler.defer_resource_release` borrows
+            // `&mut self`. Use a tight block so the `as_mut()` binding
+            // drops at the closing brace, then reborrow for view
+            // extraction.
+            let retired = {
+                let scratch = self.dst_readback.as_mut().expect("checked above");
+                match scratch.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("vk render_composite: dst readback ensure failed: {e:?}");
+                        return false;
+                    }
+                }
+            }; // <-- scratch's &mut borrow ends here.
+            if let Some(old) = retired {
+                self.scheduler
+                    .defer_resource_release(vk_arc.clone(), pool_handle, old);
             }
+            // Reborrow self.dst_readback for view extraction now that
+            // the earlier &mut and the scheduler borrow have ended.
+            let scratch = self.dst_readback.as_mut().expect("checked above");
             match scratch.view(dst_format, dst_has_alpha) {
                 Ok(Some(v)) => v,
                 Ok(None) => return false,

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::device::VkContext;
+use crate::kms::scheduler::paint_batch::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DstReadbackError {
@@ -38,6 +39,31 @@ pub enum DstReadbackError {
 impl From<vk::Result> for DstReadbackError {
     fn from(r: vk::Result) -> Self {
         DstReadbackError::Vk(r)
+    }
+}
+
+/// 5-T4: wraps the just-replaced per-format scratch (image + views +
+/// memory) so the scheduler can release it after the in-flight batch
+/// retires. The new image has already been installed on `DstReadback`
+/// by the time this is constructed.
+#[derive(Debug)]
+struct RetiredDstReadbackImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    no_alpha_view: Option<vk::ImageView>,
+    memory: vk::DeviceMemory,
+}
+
+impl BatchResource for RetiredDstReadbackImage {
+    fn release(self: Box<Self>, vk: &VkContext) {
+        unsafe {
+            if let Some(v) = self.no_alpha_view {
+                vk.device.destroy_image_view(v, None);
+            }
+            vk.device.destroy_image_view(self.view, None);
+            vk.device.destroy_image(self.image, None);
+            vk.device.free_memory(self.memory, None);
+        }
     }
 }
 
@@ -70,38 +96,20 @@ impl DstReadback {
         }
     }
 
-    /// True if a later `ensure(format, width, height)` call would
-    /// reallocate the per-format scratch image. Callers in batched
-    /// paint paths use this BEFORE entering `record_paint_batch_op`
-    /// so they can flush any in-flight batch — `ensure` destroys
-    /// the old image after `queue_wait_idle`, which does NOT wait
-    /// for un-submitted commands. Without a pre-flush, an open
-    /// batch CB embedding the old scratch image would dangle.
+    /// 5-T4: like the pre-Phase-5 `ensure` but returns the old
+    /// per-format image wrapped as a `BatchResource` for the caller
+    /// to defer-release through the scheduler. Returns `Ok(None)`
+    /// if no grow was needed (slot is fine, scratch unchanged).
     ///
-    /// Unknown formats return `false` (the caller's `ensure` will
-    /// fail with `NoMemoryType` for the same input — a flush wouldn't
-    /// change that outcome).
-    pub fn needs_grow(&self, format: vk::Format, width: u32, height: u32) -> bool {
-        let slot = match format {
-            vk::Format::B8G8R8A8_UNORM => self.bgra.as_ref(),
-            vk::Format::R8_UNORM => self.r8.as_ref(),
-            _ => return false,
-        };
-        match slot {
-            Some(img) => width > img.extent.width || height > img.extent.height,
-            None => true, // first allocation also counts as "grow"
-        }
-    }
-
-    /// Ensure the per-format scratch is at least `(width, height)`
-    /// pixels. Reallocates power-of-two on grow. Returns the matching
-    /// scratch for further use.
-    pub fn ensure(
+    /// Allocation-first ordering: if `allocate` fails the scratch is
+    /// untouched and the caller sees `Err`. Past the successful
+    /// `allocate` the function MUST NOT fail.
+    pub fn ensure_returning_old(
         &mut self,
         format: vk::Format,
         width: u32,
         height: u32,
-    ) -> Result<(), DstReadbackError> {
+    ) -> Result<Option<Box<dyn BatchResource>>, DstReadbackError> {
         let slot = match format {
             vk::Format::B8G8R8A8_UNORM => &mut self.bgra,
             vk::Format::R8_UNORM => &mut self.r8,
@@ -111,7 +119,7 @@ impl DstReadback {
             && img.extent.width >= width
             && img.extent.height >= height
         {
-            return Ok(());
+            return Ok(None);
         }
         let new_extent = match slot.as_ref() {
             Some(img) => vk::Extent2D {
@@ -123,20 +131,18 @@ impl DstReadback {
                 height: height.next_power_of_two().max(64),
             },
         };
-        if let Some(old) = slot.take() {
-            unsafe {
-                let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-                if let Some(v) = old.no_alpha_view {
-                    self.vk.device.destroy_image_view(v, None);
-                }
-                self.vk.device.destroy_image_view(old.view, None);
-                self.vk.device.destroy_image(old.image, None);
-                self.vk.device.free_memory(old.memory, None);
-            }
-        }
         let new_img = allocate(&self.vk, format, new_extent)?;
+        // Allocation succeeded — past here the function MUST NOT fail.
+        let retired = slot.take().map(|old| {
+            Box::new(RetiredDstReadbackImage {
+                image: old.image,
+                view: old.view,
+                no_alpha_view: old.no_alpha_view,
+                memory: old.memory,
+            }) as Box<dyn BatchResource>
+        });
         *slot = Some(new_img);
-        Ok(())
+        Ok(retired)
     }
 
     /// Sampleable view for the per-format scratch.
@@ -186,7 +192,8 @@ impl DstReadback {
     /// Record a copy from `dst_image` (currently in `dst_layout`) into
     /// the per-format scratch image, then transition the scratch into
     /// `SHADER_READ_ONLY_OPTIMAL` and the dst back into `dst_layout`.
-    /// Caller must have called `ensure` for the dst format/extent.
+    /// Caller must have called `ensure_returning_old` for the dst
+    /// format/extent.
     pub fn record_copy_from(
         &mut self,
         cb: vk::CommandBuffer,
@@ -197,9 +204,12 @@ impl DstReadback {
     ) {
         let device = &self.vk.device;
         let scratch = match format {
-            vk::Format::B8G8R8A8_UNORM => self.bgra.as_mut().expect("ensure() not called"),
-            vk::Format::R8_UNORM => self.r8.as_mut().expect("ensure() not called"),
-            _ => unreachable!("ensure() rejected this format"),
+            vk::Format::B8G8R8A8_UNORM => self
+                .bgra
+                .as_mut()
+                .expect("ensure_returning_old() not called"),
+            vk::Format::R8_UNORM => self.r8.as_mut().expect("ensure_returning_old() not called"),
+            _ => unreachable!("ensure_returning_old() rejected this format"),
         };
 
         // Transition: dst → TRANSFER_SRC, scratch → TRANSFER_DST.
