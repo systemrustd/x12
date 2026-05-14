@@ -12132,20 +12132,11 @@ impl Backend for KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return Ok(None);
         };
-        // Conservative protocol boundary: GradientPicture::new_* runs its
-        // own one-shot upload CB outside the PaintBatch. The new gradient
-        // has a fresh XID, so no in-flight batch can race it — this flush
-        // is hygiene cleanup between the batched paint pipeline and the
-        // gradient one-shot, not a UAF fix. Cheap because gradient creates
-        // are low-frequency. On flush Err return Ok(None), matching the
-        // handler's existing "vk init failed" fallback shape.
-        crate::vk_count!(pb_gradient_linear);
-        if let Err(e) = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
-        {
-            log::warn!("render_create_linear_gradient: pre-build flush failed ({e:?})");
-            return Ok(None);
-        }
+        // No pre-build flush: the new gradient has a fresh XID, so
+        // GradientPicture::new_linear's one-shot upload CB can't race
+        // anything in the open paint batch. Telemetry on bee/fuji
+        // showed gradient create rates of 50-90/sec — strict-flushing
+        // each one cost a queue submit + wait per gradient.
         let gradient =
             match GradientPicture::new_linear(vkctx, pool_handle, (p1x, p1y), (p2x, p2y), &stops) {
                 Ok(g) => g,
@@ -12208,20 +12199,8 @@ impl Backend for KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return Ok(None);
         };
-        // Conservative protocol boundary: GradientPicture::new_* runs its
-        // own one-shot upload CB outside the PaintBatch. The new gradient
-        // has a fresh XID, so no in-flight batch can race it — this flush
-        // is hygiene cleanup between the batched paint pipeline and the
-        // gradient one-shot, not a UAF fix. Cheap because gradient creates
-        // are low-frequency. On flush Err return Ok(None), matching the
-        // handler's existing "vk init failed" fallback shape.
-        crate::vk_count!(pb_gradient_radial);
-        if let Err(e) = self
-            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
-        {
-            log::warn!("render_create_radial_gradient: pre-build flush failed ({e:?})");
-            return Ok(None);
-        }
+        // No pre-build flush — see render_create_linear_gradient for
+        // the rationale; same fresh-XID argument applies.
         let gradient = match GradientPicture::new_radial(
             vkctx,
             pool_handle,

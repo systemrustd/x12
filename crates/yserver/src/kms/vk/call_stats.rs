@@ -94,10 +94,6 @@ pub struct VkCallStats {
     pub pb_dmabuf_release: AtomicU64,
     /// backend.rs ~11699 — Picture destruction (RENDER FreePicture).
     pub pb_picture_destroy: AtomicU64,
-    /// backend.rs ~12132 — render_create_linear_gradient pre-build.
-    pub pb_gradient_linear: AtomicU64,
-    /// backend.rs ~12207 — render_create_radial_gradient pre-build.
-    pub pb_gradient_radial: AtomicU64,
     /// backend.rs ~12293 — cursor set_picture_cursor pre-flush.
     pub pb_cursor_picture: AtomicU64,
 
@@ -145,8 +141,6 @@ pub struct VkCallStatsSnapshot {
     pub pb_image_dealloc_fallback: u64,
     pub pb_dmabuf_release: u64,
     pub pb_picture_destroy: u64,
-    pub pb_gradient_linear: u64,
-    pub pb_gradient_radial: u64,
     pub pb_cursor_picture: u64,
     pub init_clear_cursor: u64,
     pub init_clear_window: u64,
@@ -185,8 +179,6 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     pb_image_dealloc_fallback: AtomicU64::new(0),
     pb_dmabuf_release: AtomicU64::new(0),
     pb_picture_destroy: AtomicU64::new(0),
-    pb_gradient_linear: AtomicU64::new(0),
-    pb_gradient_radial: AtomicU64::new(0),
     pb_cursor_picture: AtomicU64::new(0),
     init_clear_cursor: AtomicU64::new(0),
     init_clear_window: AtomicU64::new(0),
@@ -230,8 +222,6 @@ impl VkCallStats {
             pb_image_dealloc_fallback: self.pb_image_dealloc_fallback.swap(0, Ordering::Relaxed),
             pb_dmabuf_release: self.pb_dmabuf_release.swap(0, Ordering::Relaxed),
             pb_picture_destroy: self.pb_picture_destroy.swap(0, Ordering::Relaxed),
-            pb_gradient_linear: self.pb_gradient_linear.swap(0, Ordering::Relaxed),
-            pb_gradient_radial: self.pb_gradient_radial.swap(0, Ordering::Relaxed),
             pb_cursor_picture: self.pb_cursor_picture.swap(0, Ordering::Relaxed),
             init_clear_cursor: self.init_clear_cursor.swap(0, Ordering::Relaxed),
             init_clear_window: self.init_clear_window.swap(0, Ordering::Relaxed),

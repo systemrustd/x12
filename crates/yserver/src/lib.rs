@@ -98,14 +98,12 @@ pub fn run() -> io::Result<()> {
                 log::info!(
                     "vk pb src [1s]: drawable_destroy={} window_resize={} \
                      image_dealloc_fb={} dmabuf_release={} picture_destroy={} \
-                     gradient_linear={} gradient_radial={} cursor_picture={}",
+                     cursor_picture={}",
                     s.pb_drawable_destroy,
                     s.pb_window_resize,
                     s.pb_image_dealloc_fallback,
                     s.pb_dmabuf_release,
                     s.pb_picture_destroy,
-                    s.pb_gradient_linear,
-                    s.pb_gradient_radial,
                     s.pb_cursor_picture,
                 );
                 // submit_other per-caller breakdown — sum equals
