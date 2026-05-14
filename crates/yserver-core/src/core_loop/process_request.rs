@@ -490,6 +490,12 @@ fn resolve_host_subwindow_visual_to_state(
 /// record is already in place, so a later paint via
 /// `host_drawable_target` will simply fall back to the window's
 /// own host XID until a future event populates the backing.
+///
+/// Currently uncalled — Composite redirect registration was decoupled
+/// from backing activation (see the REDIRECT_WINDOW handler comment)
+/// because no compositor sampling path exists yet. Kept for revival
+/// when the backing-as-source path lands.
+#[allow(dead_code)]
 fn activate_redirect_backing_for(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -521,15 +527,6 @@ fn activate_redirect_backing_for(
             );
         }
     }
-}
-
-/// Returns `true` if `parent` is the target of an active
-/// REDIRECT_SUBWINDOWS in `composite_redirects`. Used by the
-/// CreateWindow handler so new children of a subwindows-redirected
-/// parent inherit a backing automatically (L2 plan B.6b
-/// future-child hook).
-fn parent_has_subwindows_redirect(state: &ServerState, parent: ResourceId) -> bool {
-    state.composite_redirects.contains_key(&(parent, true))
 }
 
 /// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
@@ -2583,21 +2580,17 @@ fn handle_composite_request(
         x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
             if let Some((window, update)) = x11composite::parse_window_update(body) {
                 let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
-                // L2 plan B.1: Manual-only initially; reject other modes
-                // with BadValue. Reject other-owner conflicts with
-                // BadAccess; same-owner re-redirect is idempotent.
+                // compositeproto: update=0 → Automatic, update=1 → Manual.
+                // Both wire constants are spec-legal; reject anything else
+                // with BadValue. We don't yet have a compositor consumer
+                // for the redirected-backing pixmap, so registering the
+                // record is enough — NameWindowPixmap consults the record
+                // and that's the part real compositing WMs need to make
+                // progress (xfwm4, picom, xcompmgr, mate-panel's
+                // notification-area-applet for its tray window).
                 let mode = match update {
-                    0 => crate::server::CompositeRedirectMode::Manual,
-                    1 => {
-                        return emit_x11_error(
-                            state,
-                            client_id,
-                            sequence,
-                            x11::error::BAD_VALUE,
-                            u32::from(update),
-                            COMPOSITE_MAJOR_OPCODE,
-                        );
-                    }
+                    0 => crate::server::CompositeRedirectMode::Automatic,
+                    1 => crate::server::CompositeRedirectMode::Manual,
                     _ => {
                         return emit_x11_error(
                             state,
@@ -2629,22 +2622,12 @@ fn handle_composite_request(
                         owner: client_id,
                     },
                 );
-                // L2 plan B.6a / B.6b: REDIRECT_WINDOW allocates
-                // a single backing for the named window;
-                // REDIRECT_SUBWINDOWS walks every immediate child
-                // of the named window and allocates a backing for
-                // each. Future children of a subwindows-redirected
-                // parent get a backing in the CreateWindow handler
-                // via `allocate_backing_if_parent_subwindow_redirected`.
-                if subwindows {
-                    let parent = ResourceId(window);
-                    let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
-                    for child in children {
-                        activate_redirect_backing_for(state, backend, origin, child);
-                    }
-                } else {
-                    activate_redirect_backing_for(state, backend, origin, ResourceId(window));
-                }
+                // We deliberately do NOT call activate_redirect_backing_for.
+                // A previous fix (`92a2a83`, reverted at `3751c11`) tried
+                // it and broke MATE rendering — paint got diverted to a
+                // backing pixmap that no compositor was reading from. The
+                // backing-as-source path is unimplemented; until it lands,
+                // the redirect record alone is what consumers check.
             }
         }
         x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
@@ -6087,13 +6070,12 @@ fn handle_create_window(
                     new_id
                 );
             }
-            // L2 plan B.6b future-child hook: if the new window's
-            // parent is the target of REDIRECT_SUBWINDOWS, the
-            // freshly-created child inherits a redirect (and a
-            // backing) automatically per the COMPOSITE spec.
-            if parent_has_subwindows_redirect(state, parent) {
-                activate_redirect_backing_for(state, backend, origin, window_id);
-            }
+            // L2 plan B.6b future-child hook: under spec, a freshly
+            // created child of a REDIRECT_SUBWINDOWS parent inherits
+            // the redirect. NameWindowPixmap's check at the top of
+            // NAME_WINDOW_PIXMAP already consults `composite_redirects`
+            // for the parent, so no per-child bookkeeping is needed
+            // until the backing-pixmap path lands.
         }
     }
     let wants_focus = {
@@ -10831,13 +10813,27 @@ mod tests {
     }
 
     #[test]
-    fn redirect_automatic_mode_returns_bad_value() {
+    fn redirect_manual_mode_is_accepted() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // mode byte = 1 → Automatic. B.1 ships Manual only; the
-        // dispatcher returns BadValue.
+        // compositeproto: update=1 → Manual. xfwm4, picom, xcompmgr,
+        // and mate-panel's notification-area-applet all request Manual.
         dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 1);
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
+        assert_eq!(state.composite_redirects.len(), 1);
+    }
+
+    #[test]
+    fn redirect_invalid_mode_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Anything outside {0, 1} is a spec violation → BadValue.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 2);
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
         peer.read_exact(&mut buf).expect("error delivered");

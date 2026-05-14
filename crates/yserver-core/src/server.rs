@@ -155,10 +155,11 @@ pub struct ActivePointerGrab {
     pub time: u32,
 }
 
-/// XComposite redirect mode. L2 task B.1 ships `Manual` only — the
-/// only mode marco / picom use; `Automatic` is rare and rejected
-/// with `BadValue` at the dispatch boundary (see spec open
-/// question #3).
+/// XComposite redirect mode. Both wire constants are accepted —
+/// `Automatic` (update=0) and `Manual` (update=1) — but the
+/// redirected-backing pixmap path is unimplemented, so no code
+/// currently branches on the variant. The record's presence is what
+/// `NameWindowPixmap` and the disconnect-cleanup paths consult.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeRedirectMode {
     Manual,

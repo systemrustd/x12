@@ -168,7 +168,7 @@ Cross-cutting bugs and followups that don't fit a phase live in
 See `known-issues.md` for the full ticklist with detail. Highlights tracked here for awareness during rework planning:
 
 - [ ] **`disable_output` atomic EINVAL** — recurring shutdown warn; disarm path mitigates but per-property split is the real fix.
-- [ ] **Composite Manual-mode regression** — `92a2a83` reverted; needs decoupling of redirect-record from `redirected_backing` allocation.
+- [x] **Composite Manual-mode (`update=1`) accepted** — fixed 2026-05-14: both modes register the redirect record; `activate_redirect_backing_for` is skipped (decoupling the record from backing allocation). Unblocks notification-area-applet, xfwm4, picom, xcompmgr. Hardware-confirmed on fuji.
 - [ ] **Caja right-click popup offset** — coordinate-translation bug, surfaced 2026-05-13.
 - [ ] **Caja wheel needs view-switch** — yserver event-delivery regression; 3 bisect candidates filed.
 - [x] **Color R↔B swap on JPEG backgrounds + saturated icons** — fixed 2026-05-14: `try_vk_put_image` now treats the wire as `[B,G,R,A]` per the advertised visual masks (matches `B8G8R8A8_UNORM`). Hardware-confirmed on fuji.

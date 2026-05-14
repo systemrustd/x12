@@ -458,31 +458,21 @@ that the host hides for us.
 
 ## Extension polish
 
-- [ ] **Composite extension: xfwm4 / picom / xcompmgr can't redirect
-      (`update=1` Manual mode rejected with BadValue).** Per
-      compositeproto.txt, `Automatic=0` and `Manual=1` should both
-      be accepted. yserver currently accepts only `update=0` (and
-      stores it as the `Manual` enum variant internally — the names
-      don't match the wire). Real compositing WMs request Manual
-      (`update=1`) and get BadValue.
-      A previous fix (commit `92a2a83`, reverted at `3751c11`)
-      attempted to accept both wire constants per spec. That broke
-      MATE rendering — accepting `update=1` activated
-      `activate_redirect_backing_for` for some MATE-side caller
-      (marco-compositor?) and `host_drawable_target` then routed
-      paint to the redirected-backing pixmap which the compositor
-      doesn't read from, producing a mostly-black screen ("alles
-      kapot"). The minimal-impact fix attempted post-revert by codex
-      (collapse both modes to `Manual` enum variant) was cosmetic —
-      no code branches on the variant; the activation path is the
-      real culprit.
-      Real fix shape: register the redirect record but **skip
-      `activate_redirect_backing_for`** until the compositor can
-      actually sample `redirected_backing`. OR finish the
-      backing-as-source compositor path. Either way, the redirect
-      record is what NameWindowPixmap and friends check; the backing
-      allocation is what diverts paint away from the window mirror.
-      The two can be decoupled. Filed 2026-05-13.
+- [x] **~~Composite extension: xfwm4 / picom / xcompmgr can't
+      redirect (`update=1` Manual mode rejected with BadValue).~~
+      FIXED 2026-05-14.** Surfaced as the MATE notification-area
+      applet crashing on every login (Gdk error handler aborts on
+      `BadValue, request_code 144 (Composite), serial 282`).
+      Fix shape per the previous "register the record but skip
+      `activate_redirect_backing_for`" recommendation: both
+      `update=0` (Automatic) and `update=1` (Manual) now insert the
+      redirect record, but the backing-pixmap activation is dropped
+      from all three call sites (composite handler x2 + CreateWindow
+      child-of-redirected hook). NameWindowPixmap reads the record;
+      no consumer reads the backing today. `activate_redirect_backing_for`
+      kept under `#[allow(dead_code)]` for revival when the
+      backing-as-source compositor path lands. Confirmed on fuji:
+      notification-area-applet survives login.
 - [ ] **e16 RENDER coverage audit.** Was deferred in Phase 3.4 because
       e16 didn't reach a stable rendering state. Phase 3.4's atom-name
       fix unblocked e16 startup, so this audit is now actionable. Run
