@@ -172,7 +172,7 @@ See `known-issues.md` for the full ticklist with detail. Highlights tracked here
 - [ ] **Caja right-click popup offset** — coordinate-translation bug, surfaced 2026-05-13.
 - [ ] **Caja wheel needs view-switch** — yserver event-delivery regression; 3 bisect candidates filed.
 - [x] **Color R↔B swap on JPEG backgrounds + saturated icons** — fixed 2026-05-14: `try_vk_put_image` now treats the wire as `[B,G,R,A]` per the advertised visual masks (matches `B8G8R8A8_UNORM`). Hardware-confirmed on fuji.
-- [ ] **`minor_code = 0` hardcoded in extension error encoder** — debug-clarity bug; threading the minor through `emit_x11_error` (~60-80 call sites).
+- [x] **`minor_code = 0` hardcoded in extension error encoder** — fixed 2026-05-15: 76 extension-dispatcher call sites converted to `emit_x11_error_with_minor`. Composite, MIT-SHM (+ children), PRESENT, DRI3, GLX, RANDR, XI2/XKEYBOARD, RENDER now emit the real per-extension minor; core requests stay on `emit_x11_error` (minor=0 is spec-correct).
 - [ ] **Listener starvation under chatty clients** — single-threaded core loop's per-iteration read budget is unbounded; xfce4-panel couldn't complete X11 setup handshake while xfdesktop flooded QueryPointer.
 - [ ] **xfce4 text rendering broken** — may or may not be fixed by 3E; needs revalidation.
 - [ ] **XInput2 valuator scroll** — GTK apps that depend on XI2 axis events don't see the wheel until they fall back to core button-4/5.

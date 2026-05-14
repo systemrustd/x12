@@ -473,6 +473,17 @@ that the host hides for us.
       kept under `#[allow(dead_code)]` for revival when the
       backing-as-source compositor path lands. Confirmed on fuji:
       notification-area-applet survives login.
+- [ ] **RANDR `QueryOutputProperty` returns `BadValue=0` on every
+      call.** Surfaced 2026-05-15 once the `minor_code` threading
+      fix made RANDR error replies legible: marco calls
+      `QueryOutputProperty` (RANDR minor 21) on the outputs we
+      advertise, yserver always returns BadValue. ~3 calls per
+      session under MATE — not user-visible but worth a stub. Real
+      X.Org returns the property's range/values; we could return
+      "no such property" (BadAtom) or an empty range to silence
+      marco without changing behavior. Same shape likely applies
+      to `GetOutputProperty` and `ConfigureOutputProperty` (minors
+      22 + 23) — audit when fixing.
 - [ ] **e16 RENDER coverage audit.** Was deferred in Phase 3.4 because
       e16 didn't reach a stable rendering state. Phase 3.4's atom-name
       fix unblocked e16 startup, so this audit is now actionable. Run
@@ -535,25 +546,16 @@ that the host hides for us.
       classifier in `BackendEventSink::handle_backend_event` that
       maps specific `(major, minor, code)` tuples to DEBUG level
       so the WARN log is actually scannable.
-- [ ] **X11 error encoder hard-codes `minor_code = 0` for extension
-      errors.** `emit_x11_error(state, client_id, sequence, code,
-      bad_value, major_opcode)` has no `minor` parameter and bakes
-      `minor_code: 0` into the encoded error reply (see callers in
-      `crates/yserver-core/src/core_loop/process_request.rs`; the
-      Composite handler around line 2583 is one of many). Real X.Org
-      threads the per-extension minor opcode through. The wire bug:
-      a client receives `error_code 2 (BadValue), request_code 144
-      (Composite), minor_code 0` regardless of whether the failing
-      request was `RedirectSubwindows` (minor 2),
-      `NameWindowPixmap` (minor 6), etc. — confusing debugging.
-      Surfaced 2026-05-13 when chasing the xfwm4 Composite startup
-      failure (the error said minor 0 = QueryVersion, but the
-      actual failing request was `RedirectSubwindows` = minor 2 —
-      the inverted Automatic/Manual mode constants bug). Fix:
-      thread the minor opcode through `emit_x11_error` (add a
-      parameter; default to 0 for core requests; pass the request
-      minor for extension requests). Touches every `emit_x11_error`
-      call site (~60-80 across the file). Cosmetic but high impact
-      on future debugging sessions.
+- [x] **~~X11 error encoder hard-codes `minor_code = 0` for
+      extension errors.~~ FIXED 2026-05-15.** Threaded the minor
+      opcode through 76 extension-dispatcher call sites in
+      `process_request.rs` via the existing
+      `emit_x11_error_with_minor` helper. Composite, MIT-SHM (+
+      children: CreatePixmap, PutImage, GetImage, CreateSegment),
+      PRESENT, DRI3, GLX, RANDR, XI2/XKEYBOARD, RENDER all now emit
+      error replies with the real per-extension minor. Core
+      requests stay on `emit_x11_error` with `minor=0` (spec-correct
+      for non-extension errors). Future emit_x11_error log lines
+      decode the failing minor immediately.
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.

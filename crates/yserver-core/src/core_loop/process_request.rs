@@ -1368,22 +1368,24 @@ fn handle_randr_request(
         }
         x11randr::RR_GET_OUTPUT_INFO => {
             let Some(req) = x11randr::parse_output_request(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     0,
+                    u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
             };
             let Some(info_data) = state.randr.output_info(req.output, req.config_timestamp) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     req.output,
+                    u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
             };
@@ -1414,22 +1416,24 @@ fn handle_randr_request(
         }
         x11randr::RR_GET_CRTC_INFO => {
             let Some(req) = x11randr::parse_crtc_request(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     0,
+                    u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
             };
             let Some(crtc_data) = state.randr.crtc_info(req.crtc, req.config_timestamp) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     req.crtc,
+                    u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
             };
@@ -1624,12 +1628,13 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 0,
+                u16::from(header.data),
                 RANDR_MAJOR_OPCODE,
             );
         }
@@ -2592,12 +2597,13 @@ fn handle_composite_request(
                     0 => crate::server::CompositeRedirectMode::Automatic,
                     1 => crate::server::CompositeRedirectMode::Manual,
                     _ => {
-                        return emit_x11_error(
+                        return emit_x11_error_with_minor(
                             state,
                             client_id,
                             sequence,
                             x11::error::BAD_VALUE,
                             u32::from(update),
+                            u16::from(minor),
                             COMPOSITE_MAJOR_OPCODE,
                         );
                     }
@@ -2606,12 +2612,13 @@ fn handle_composite_request(
                 if let Some(existing) = state.composite_redirects.get(&key)
                     && existing.owner != client_id
                 {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ACCESS,
                         window,
+                        u16::from(minor),
                         COMPOSITE_MAJOR_OPCODE,
                     );
                 }
@@ -2681,54 +2688,59 @@ fn handle_composite_request(
                 )
             });
             let Some((host_xid, w_width, w_height, w_depth, redirected)) = snapshot else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_WINDOW,
                     window_raw,
+                    u16::from(minor),
                     COMPOSITE_MAJOR_OPCODE,
                 );
             };
             if !redirected {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_MATCH,
                     window_raw,
+                    u16::from(minor),
                     COMPOSITE_MAJOR_OPCODE,
                 );
             }
             let Some(host_window_xid) = host_xid else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     pixmap_raw,
+                    u16::from(minor),
                     COMPOSITE_MAJOR_OPCODE,
                 );
             };
             if backend.composite_opcode().is_none() {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     pixmap_raw,
+                    u16::from(minor),
                     COMPOSITE_MAJOR_OPCODE,
                 );
             }
             let host_pixmap_xid = match backend.name_window_pixmap(origin, host_window_xid) {
                 Ok(handle) => handle,
                 Err(_) => {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         pixmap_raw,
+                        u16::from(minor),
                         COMPOSITE_MAJOR_OPCODE,
                     );
                 }
@@ -2853,12 +2865,13 @@ fn handle_mit_shm_request(
         }
         shm::ATTACH => {
             let Some(req) = shm::parse_attach(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2871,12 +2884,13 @@ fn handle_mit_shm_request(
                     );
                 }
                 Err(_) => {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_VALUE,
                         req.shmseg,
+                        u16::from(minor),
                         MIT_SHM_MAJOR_OPCODE,
                     );
                 }
@@ -2884,22 +2898,24 @@ fn handle_mit_shm_request(
         }
         shm::ATTACH_FD => {
             let Some(req) = shm::parse_attach_fd(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
             let Some(fd) = attached_fd else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
                     req.shmseg,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2911,12 +2927,13 @@ fn handle_mit_shm_request(
                     state.mit_shm_segments.insert(req.shmseg, segment);
                 }
                 Err(_) => {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_VALUE,
                         req.shmseg,
+                        u16::from(minor),
                         MIT_SHM_MAJOR_OPCODE,
                     );
                 }
@@ -2929,12 +2946,13 @@ fn handle_mit_shm_request(
         }
         shm::CREATE_PIXMAP => {
             let Some(req) = shm::parse_create_pixmap(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2942,12 +2960,13 @@ fn handle_mit_shm_request(
         }
         shm::PUT_IMAGE => {
             let Some(req) = shm::parse_put_image(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2955,12 +2974,13 @@ fn handle_mit_shm_request(
         }
         shm::GET_IMAGE => {
             let Some(req) = shm::parse_get_image(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2968,12 +2988,13 @@ fn handle_mit_shm_request(
         }
         shm::CREATE_SEGMENT => {
             let Some(req) = shm::parse_create_segment(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(minor),
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
@@ -2993,6 +3014,7 @@ fn handle_mit_shm_create_pixmap(
     req: yserver_protocol::x11::mit_shm::CreatePixmapRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
+    use yserver_protocol::x11::mit_shm as shm;
     debug!(
         "client {} #{} MIT-SHM::CreatePixmap pid=0x{:x} drawable=0x{:x} {}x{} d{}",
         client_id.0, sequence.0, req.pid, req.drawable, req.width, req.height, req.depth,
@@ -3010,42 +3032,46 @@ fn handle_mit_shm_create_pixmap(
     let drawable_exists = state.resources.window(ResourceId(req.drawable)).is_some()
         || state.resources.pixmap(ResourceId(req.drawable)).is_some();
     if validation_failed {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_ID_CHOICE,
             req.pid,
+            u16::from(shm::CREATE_PIXMAP),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     if !drawable_exists {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_DRAWABLE,
             req.drawable,
+            u16::from(shm::CREATE_PIXMAP),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     if !supported_pixmap_depth(req.depth) {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
             u32::from(req.depth),
+            u16::from(shm::CREATE_PIXMAP),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     let Some(expected_len) = zpixmap_expected_len(req.width, req.height, req.depth) else {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
             req.shmseg,
+            u16::from(shm::CREATE_PIXMAP),
             MIT_SHM_MAJOR_OPCODE,
         );
     };
@@ -3061,12 +3087,13 @@ fn handle_mit_shm_create_pixmap(
     };
     let snapshot: Vec<u8> = {
         let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.shmseg,
+                u16::from(shm::CREATE_PIXMAP),
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
@@ -3074,12 +3101,13 @@ fn handle_mit_shm_create_pixmap(
         let start = req.offset as usize;
         let end = start.saturating_add(expected_len);
         if end > bytes.len() {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.offset,
+                u16::from(shm::CREATE_PIXMAP),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
@@ -3131,6 +3159,7 @@ fn handle_mit_shm_put_image(
     req: yserver_protocol::x11::mit_shm::PutImageRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
+    use yserver_protocol::x11::mit_shm as shm;
     debug!(
         "client {} #{} MIT-SHM::PutImage drawable=0x{:x} {}x{} d{}",
         client_id.0, sequence.0, req.drawable, req.src_width, req.src_height, req.depth
@@ -3142,23 +3171,25 @@ fn handle_mit_shm_put_image(
         return Ok(RequestOutcome::Handled);
     };
     let Some(stride_bytes) = zpixmap_expected_len(req.src_width, req.src_height, req.depth) else {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
             req.shmseg,
+            u16::from(shm::PUT_IMAGE),
             MIT_SHM_MAJOR_OPCODE,
         );
     };
     let snapshot: Vec<u8> = {
         let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.shmseg,
+                u16::from(shm::PUT_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
@@ -3166,12 +3197,13 @@ fn handle_mit_shm_put_image(
         let start = req.offset as usize;
         let end = start.saturating_add(stride_bytes);
         if end > bytes.len() {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.offset,
+                u16::from(shm::PUT_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
@@ -3211,22 +3243,24 @@ fn handle_mit_shm_get_image(
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     {
         let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.shmseg,
+                u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
         if segment.read_only {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_ACCESS,
                 req.shmseg,
+                u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
@@ -3235,12 +3269,13 @@ fn handle_mit_shm_get_image(
         .resources
         .host_drawable_target(ResourceId(req.drawable));
     let Some(target) = target else {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_DRAWABLE,
             req.drawable,
+            u16::from(shm::GET_IMAGE),
             MIT_SHM_MAJOR_OPCODE,
         );
     };
@@ -3258,46 +3293,50 @@ fn handle_mit_shm_get_image(
         .ok()
         .flatten();
     let Some(host_reply_bytes) = host_bytes else {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_DRAWABLE,
             req.drawable,
+            u16::from(shm::GET_IMAGE),
             MIT_SHM_MAJOR_OPCODE,
         );
     };
     let pixel_data: Vec<u8> = host_reply_bytes.get(32..).unwrap_or(&[]).to_vec();
     {
         let Some(segment) = state.mit_shm_segments.get_mut(&req.shmseg) else {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.shmseg,
+                u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
         let Some(buf) = segment.as_mut_slice() else {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_ACCESS,
                 req.shmseg,
+                u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
         let start = req.offset as usize;
         let end = start.saturating_add(pixel_data.len());
         if end > buf.len() {
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
                 req.offset,
+                u16::from(shm::GET_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
@@ -3322,47 +3361,52 @@ fn handle_mit_shm_create_segment(
     req: yserver_protocol::x11::mit_shm::CreateSegmentRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
+    use yserver_protocol::x11::mit_shm as shm;
     if req.size == 0 {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
             req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     let fd = unsafe { libc::memfd_create(c"yserver-shm".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_ALLOC,
             req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     if unsafe { libc::ftruncate(fd, libc::off_t::from(req.size as i32)) } < 0 {
         unsafe { libc::close(fd) };
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_ALLOC,
             req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
     let fd_for_client = unsafe { libc::dup(fd) };
     if fd_for_client < 0 {
         unsafe { libc::close(fd) };
-        return emit_x11_error(
+        return emit_x11_error_with_minor(
             state,
             client_id,
             sequence,
             x11::error::BAD_ALLOC,
             req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
             MIT_SHM_MAJOR_OPCODE,
         );
     }
@@ -3370,12 +3414,13 @@ fn handle_mit_shm_create_segment(
         Ok(s) => s,
         Err(_) => {
             unsafe { libc::close(fd_for_client) };
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_ALLOC,
                 req.shmseg,
+                u16::from(shm::CREATE_SEGMENT),
                 MIT_SHM_MAJOR_OPCODE,
             );
         }
@@ -3756,12 +3801,13 @@ fn handle_present_request(
         }
         x11present::PIXMAP => {
             let Some(req) = x11present::parse_pixmap(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             };
@@ -3774,22 +3820,24 @@ fn handle_present_request(
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
             let dst = state.resources.host_drawable_target(ResourceId(req.window));
             if !window_exists {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_WINDOW,
                     req.window,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             }
             if !pixmap_exists {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_DRAWABLE,
                     req.pixmap,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             }
@@ -3805,12 +3853,13 @@ fn handle_present_request(
             ) = (src, dst)
             {
                 if src_depth != dst.depth() {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_MATCH,
                         req.pixmap,
+                        u16::from(header.data),
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
@@ -3939,12 +3988,13 @@ fn handle_present_request(
         }
         x11present::PIXMAP_SYNCED => {
             let Some(req) = x11present::parse_pixmap_synced(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             };
@@ -3960,22 +4010,24 @@ fn handle_present_request(
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
             let dst = state.resources.host_drawable_target(ResourceId(req.window));
             if !window_exists {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_WINDOW,
                     req.window,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             }
             if !pixmap_exists {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_DRAWABLE,
                     req.pixmap,
+                    u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
             }
@@ -4330,12 +4382,13 @@ fn handle_dri3_request(
                         "client {} #{} DRI3::Open drawable=0x{drawable:x} -> BadAlloc ({err})",
                         client_id.0, sequence.0
                     );
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         0,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4343,12 +4396,13 @@ fn handle_dri3_request(
         }
         x11dri3::PIXMAP_FROM_BUFFER => {
             let Some(req) = x11dri3::parse_pixmap_from_buffer(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4357,12 +4411,13 @@ fn handle_dri3_request(
                     "client {} #{} DRI3::PixmapFromBuffer no SCM_RIGHTS fd attached -> BadAlloc",
                     client_id.0, sequence.0
                 );
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.pixmap,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4414,12 +4469,13 @@ fn handle_dri3_request(
                         req.depth,
                         req.bpp,
                     );
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         req.pixmap,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4427,12 +4483,13 @@ fn handle_dri3_request(
         }
         x11dri3::PIXMAP_FROM_BUFFERS => {
             let Some(req) = x11dri3::parse_pixmap_from_buffers(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4444,12 +4501,13 @@ fn handle_dri3_request(
                      (multi-plane out of scope for Phase 4.2)",
                     client_id.0, sequence.0, req.num_buffers
                 );
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.pixmap,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
@@ -4458,12 +4516,13 @@ fn handle_dri3_request(
                     "client {} #{} DRI3::PixmapFromBuffers no SCM_RIGHTS fd attached -> BadAlloc",
                     client_id.0, sequence.0
                 );
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.pixmap,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4522,12 +4581,13 @@ fn handle_dri3_request(
                         req.depth,
                         req.bpp,
                     );
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         req.pixmap,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4535,12 +4595,13 @@ fn handle_dri3_request(
         }
         x11dri3::BUFFER_FROM_PIXMAP => {
             let Some(pixmap) = x11dri3::parse_buffer_from_pixmap(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4551,12 +4612,13 @@ fn handle_dri3_request(
             {
                 Some(h) => h,
                 None => {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_DRAWABLE,
                         pixmap,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4586,12 +4648,13 @@ fn handle_dri3_request(
                         "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadAlloc ({err})",
                         client_id.0, sequence.0
                     );
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         pixmap,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4605,12 +4668,13 @@ fn handle_dri3_request(
                 "client {} #{} DRI3::BuffersFromPixmap (deferred — single-plane only via BufferFromPixmap)",
                 client_id.0, sequence.0
             );
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_ALLOC,
                 0,
+                u16::from(header.data),
                 DRI3_MAJOR_OPCODE,
             );
         }
@@ -4618,12 +4682,13 @@ fn handle_dri3_request(
             let req = match x11dri3::parse_get_supported_modifiers(body) {
                 Some(r) => r,
                 None => {
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_LENGTH,
                         0,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4659,32 +4724,35 @@ fn handle_dri3_request(
         }
         x11dri3::FENCE_FROM_FD => {
             if !caps.fence_fd {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_IMPLEMENTATION,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
             let Some(req) = x11dri3::parse_fence_from_fd(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
             let Some(fd) = attached_fd else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.fence,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4720,22 +4788,24 @@ fn handle_dri3_request(
         }
         x11dri3::FD_FROM_FENCE => {
             if !caps.fence_fd {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_IMPLEMENTATION,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
             let Some(req) = x11dri3::parse_fd_from_fence(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4758,12 +4828,13 @@ fn handle_dri3_request(
                         "client {} #{} DRI3::FDFromFence 0x{:x} -> BadAlloc ({e})",
                         client_id.0, sequence.0, req.fence
                     );
-                    return emit_x11_error(
+                    return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_ALLOC,
                         req.fence,
+                        u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
                     );
                 }
@@ -4771,32 +4842,35 @@ fn handle_dri3_request(
         }
         x11dri3::IMPORT_SYNCOBJ => {
             if !caps.syncobj {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_IMPLEMENTATION,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
             let Some(req) = x11dri3::parse_import_syncobj(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
             let Some(fd) = attached_fd else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.syncobj,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -4805,34 +4879,37 @@ fn handle_dri3_request(
                     "client {} #{} DRI3::ImportSyncobj 0x{:x} -> BadAlloc ({e})",
                     client_id.0, sequence.0, req.syncobj
                 );
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_ALLOC,
                     req.syncobj,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
         }
         x11dri3::FREE_SYNCOBJ => {
             if !caps.syncobj {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_IMPLEMENTATION,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             }
             let Some(syncobj) = x11dri3::parse_free_syncobj(body) else {
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_LENGTH,
                     0,
+                    u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
             };
@@ -5371,13 +5448,14 @@ fn handle_glx_request(
                 "client {} #{} GLX::VendorPrivate (rejected: GLXUnsupportedPrivateRequest)",
                 client_id.0, sequence.0
             );
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 crate::nested::GLX_FIRST_ERROR
                     + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
                 0,
+                u16::from(header.data),
                 crate::nested::GLX_MAJOR_OPCODE,
             );
         }
@@ -5388,13 +5466,14 @@ fn handle_glx_request(
                 "client {} #{} GLX unsupported minor={other} -> GLXBadRequest",
                 client_id.0, sequence.0
             );
-            return emit_x11_error(
+            return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
                 crate::nested::GLX_FIRST_ERROR
                     + yserver_protocol::x11::glx::ERROR_GLX_BAD_RENDER_REQUEST,
                 0,
+                u16::from(header.data),
                 crate::nested::GLX_MAJOR_OPCODE,
             );
         }
