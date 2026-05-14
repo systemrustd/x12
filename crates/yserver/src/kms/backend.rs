@@ -1764,7 +1764,15 @@ impl KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
         };
-        crate::kms::vk::ops::run_one_shot_op(&vk_arc, pool_handle, record)
+        if let Err(e) = crate::kms::vk::ops::run_one_shot_op(&vk_arc, pool_handle, record) {
+            log::error!(
+                "run_legacy_paint_op: run_one_shot_op returned fatal {e:?}; \
+                 latching renderer_failed — KMS renderer disabled until restart"
+            );
+            self.renderer_failed = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn open_with_commit(
@@ -2431,7 +2439,11 @@ impl KmsBackend {
         if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
             vk_image::record_get_image(vk, cb, mirror, staging_buffer, &regions)
         }) {
-            log::warn!("hw_cursor_refresh: record_get_image failed: {e:?}");
+            log::error!(
+                "hw_cursor_refresh: run_one_shot_op returned fatal {e:?}; \
+                 latching renderer_failed — KMS renderer disabled until restart"
+            );
+            self.renderer_failed = true;
             return;
         }
         let total_bytes_usize = total_bytes as usize;
@@ -2781,7 +2793,11 @@ impl KmsBackend {
         if let Err(e) = run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
             vk_image::record_get_image(vk, cb, mirror, staging_buffer, &regions)
         }) {
-            log::warn!("read_mirror_pixels: record_get_image failed: {e:?}");
+            log::error!(
+                "read_mirror_pixels: run_one_shot_op returned fatal {e:?}; \
+                 latching renderer_failed — KMS renderer disabled until restart"
+            );
+            self.renderer_failed = true;
             return None;
         }
 
@@ -4387,10 +4403,12 @@ impl KmsBackend {
             }) {
                 Ok(()) => {}
                 Err(e) => {
-                    log::warn!(
-                        "vk get_image: record failed on xid {host_xid:#x}: {e:?} — \
-                         falling back to pixman"
+                    log::error!(
+                        "try_vk_get_image_pixels: run_one_shot_op returned fatal {e:?} \
+                         on xid {host_xid:#x}; latching renderer_failed — KMS renderer \
+                         disabled until restart"
                     );
+                    self.renderer_failed = true;
                     return false;
                 }
             }
@@ -8024,7 +8042,7 @@ impl KmsBackend {
         // the dst side which is permissive enough not to fight either.
         // run_one_shot_op submits + waits idle, so when it returns the
         // staging buffer is host-coherent and ready to read.
-        run_one_shot_op(vk, pool_handle, |vk, cb| {
+        let run_result = run_one_shot_op(vk, pool_handle, |vk, cb| {
             let pre = [ash::vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -8084,8 +8102,15 @@ impl KmsBackend {
             let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
             Ok(())
-        })
-        .map_err(|e| io::Error::other(format!("scanout copy submit: {e:?}")))?;
+        });
+        if let Err(e) = run_result {
+            log::error!(
+                "dump_scanout_one: run_one_shot_op returned fatal {e:?}; \
+                 latching renderer_failed — KMS renderer disabled until restart"
+            );
+            self.renderer_failed = true;
+            return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
+        }
 
         let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
 

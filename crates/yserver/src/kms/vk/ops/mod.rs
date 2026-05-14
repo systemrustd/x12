@@ -63,14 +63,30 @@ impl Drop for OpsCommandPool {
 }
 
 /// Allocate a one-shot primary CB from `pool`, run `record`
-/// against it, submit + `vkQueueWaitIdle`, free the CB.
+/// against it, submit + wait, free the CB.
 ///
 /// Free function (not a method on `KmsBackend`) so the caller can
 /// hold a `&mut DrawableImage` borrow into the closure without
 /// fighting the borrow checker over `&self` vs `&mut self.windows`.
-/// Per-op submit + wait_idle is the simple cadence used through
+/// Per-op submit + wait is the simple cadence used through
 /// the 4.1.4 family port; batch CBs land with 4.1.4.6 RENDER
 /// `Composite` where op rate spikes.
+///
+/// Phase 5 retires the trailing `vkQueueWaitIdle` in favour of a
+/// per-op `VkFence` + `vkWaitForFences`. Caller semantics are
+/// unchanged (still blocking; data is back on return); wait scope
+/// is narrower (this submission only, not the whole queue).
+///
+/// 5-path failure taxonomy (extends `PaintBatch::submit_and_wait`'s
+/// 4-path model — `run_one_shot_op` has the additional pre-submit
+/// failure window of `record(...)` and `end_command_buffer`):
+///   0. pre-submit failure (begin/record/end): CB safe to free.
+///   1a. fence-create failure: CB safe to free.
+///   1b. submit failure: destroy fence, CB safe to free.
+///   2.  wait failure (CB in flight): LEAK CB + fence. Renderer
+///       must be torn down.
+///   3.  success: destroy fence + free CB; Ok(()).
+/// See inline comments for the exact branching.
 pub fn run_one_shot_op<F>(
     vk: &VkContext,
     pool: vk::CommandPool,
@@ -85,26 +101,98 @@ where
         .command_buffer_count(1);
     let cb = unsafe { vk.device.allocate_command_buffers(&alloc_info)?[0] };
 
+    // 5-T1: per-op fence instead of vkQueueWaitIdle. Same
+    // blocking semantics for the caller (data is back on return)
+    // but narrower wait scope — only waits for THIS submission,
+    // not every prior submission on the graphics queue (which
+    // today includes composite-side work).
+    //
+    // 5-path failure taxonomy (extends Phase 4's submit_and_wait
+    // model — `run_one_shot_op` has an extra failure window
+    // before fence-create because `record(...)` and
+    // `end_command_buffer` can fail):
+    //
+    //   0a. begin_command_buffer fails: CB allocated but never
+    //       recorded. Free CB, return Err.
+    //   0b. record(...) callback returns Err: CB partially
+    //       recorded but never submitted. Free CB, return Err.
+    //   0c. end_command_buffer fails: same — CB never submitted.
+    //       Free CB, return Err.
+    //   1a. create_fence fails: CB recorded, no fence yet. Free
+    //       CB, return Err. No fence to destroy.
+    //   1b. queue_submit2 fails: CB never queued. Destroy fence,
+    //       free CB, return Err.
+    //   2.  wait_for_fences fails: CB IS in flight or device is
+    //       lost. ABANDON the CB and the fence — Vulkan handles
+    //       are leaked until VkContext::Drop. Same leak-not-UB
+    //       contract as Phase 4's submit_and_wait. Returns Err;
+    //       caller MUST treat the renderer as fatal.
+    //   3.  wait_for_fences Ok: destroy fence, free CB, Ok(()).
+    //
+    // Implementation: the closure tracks whether the failure was
+    // pre-submit (CB free is safe) or post-submit (CB free is
+    // UB). The simplest encoding is a flag returned alongside
+    // the Result, or — as below — a custom enum the outer free
+    // matches on. The flag-out-of-closure approach (used here)
+    // keeps the closure body simple at the cost of one extra
+    // mutable binding.
+    let mut cb_safe_to_free = true;
     let result = (|| -> Result<(), vk::Result> {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // Paths 0a / 0b / 0c — pre-submit failures. cb_safe_to_free
+        // stays true; the outer block frees the CB on the Err
+        // returned here.
         unsafe { vk.device.begin_command_buffer(cb, &begin)? };
         record(vk, cb)?;
         unsafe { vk.device.end_command_buffer(cb)? };
 
+        // Path 1a — fence creation failure (pre-submit).
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe { vk.device.create_fence(&fence_info, None) }?;
+
+        // Path 1b — submit failure. Destroy the fence; the CB is
+        // still safe to free (cb_safe_to_free stays true).
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
-        unsafe {
-            vk.device
-                .queue_submit2(vk.graphics_queue, &submit, vk::Fence::null())?;
-            vk.device.queue_wait_idle(vk.graphics_queue)?;
+        if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
+            unsafe { vk.device.destroy_fence(fence, None) };
+            return Err(e);
         }
-        Ok(())
+
+        // From this point on, the CB is in flight; on any Err
+        // before fence-destroy, freeing the CB is UB.
+        let fences = [fence];
+        match unsafe { vk.device.wait_for_fences(&fences, true, u64::MAX) } {
+            Ok(()) => {
+                // Path 3: clean. Destroy fence; CB free happens
+                // outside the closure.
+                unsafe { vk.device.destroy_fence(fence, None) };
+                Ok(())
+            }
+            Err(e) => {
+                // Path 2: device-lost or similar. Leak the CB AND
+                // the fence — both handles are abandoned. Caller
+                // observes Err and treats the renderer as failed.
+                cb_safe_to_free = false;
+                log::error!(
+                    "run_one_shot_op: wait_for_fences failed ({e:?}); \
+                     CB and fence abandoned. KMS renderer is in an \
+                     unrecoverable state — caller MUST tear down or disable."
+                );
+                Err(e)
+            }
+        }
     })();
 
-    // Free the CB regardless of recording outcome; the pool is
-    // RESET_COMMAND_BUFFER, individual frees are cheap.
-    unsafe { vk.device.free_command_buffers(pool, &[cb]) };
+    // Free the CB on every path EXCEPT path 2 (post-submit wait
+    // failure). Pre-submit failures (paths 0a/0b/0c/1a/1b) leave
+    // the CB unsubmitted, so freeing it is safe. Path 3 (clean
+    // success) frees it. Path 2 leaves cb_safe_to_free = false
+    // and the CB is abandoned.
+    if cb_safe_to_free {
+        unsafe { vk.device.free_command_buffers(pool, &[cb]) };
+    }
     result
 }
 
