@@ -6,6 +6,14 @@ members = [
 ]
 resolver = "3"
 
+# Keep DWARF unwind info in release builds so `perf record --call-graph
+# dwarf` can resolve Rust frames. Without this, ~65% of samples in a
+# release-build flamegraph land in [unknown] frames. Optimisation level
+# and codegen are unchanged — only the debug-info section grows
+# (binary ~3-4x bigger, runtime perf identical).
+[profile.release]
+debug = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
