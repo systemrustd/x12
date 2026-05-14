@@ -5690,27 +5690,6 @@ fn handle_xi2_request(
                 buf.extend_from_slice(&[0u8; 3]); // pad
             }
 
-            fn write_scroll_class(
-                buf: &mut Vec<u8>,
-                sourceid: u16,
-                number: u16,
-                scroll_type: u16,
-            ) {
-                let le = ClientByteOrder::LittleEndian;
-                // Header(8) + scroll_type+pad(4) + flags(4) +
-                // increment(8) = 24 bytes = 6 units.
-                x11::write_u16(le, buf, 3); // type = Scroll
-                x11::write_u16(le, buf, 6);
-                x11::write_u16(le, buf, sourceid);
-                x11::write_u16(le, buf, number);
-                x11::write_u16(le, buf, scroll_type);
-                x11::write_u16(le, buf, 0); // pad
-                x11::write_u32(le, buf, 0); // flags = 0
-                // FP3232 increment = 1.0
-                x11::write_u32(le, buf, 1);
-                x11::write_u32(le, buf, 0);
-            }
-
             fn write_key_class(buf: &mut Vec<u8>, sourceid: u16) {
                 let le = ClientByteOrder::LittleEndian;
                 // Header(8) + num_keycodes(implicit via pad u16 slot...) —
@@ -5733,7 +5712,13 @@ fn handle_xi2_request(
             let mut infos = Vec::new();
 
             // Master Pointer (deviceid=2): Button(7) + Valuator(X) +
-            // Valuator(Y) + Scroll(Vertical) + Scroll(Horizontal).
+            // Valuator(Y). No XIScrollClass — we deliver scroll as
+            // core button 4/5/6/7 events. Adding XIScroll classes
+            // here without also declaring corresponding scroll
+            // valuators (axes 2/3) trips
+            // `_gdk_x11_device_xi2_add_scroll_valuator` assertions
+            // on every GTK process startup. Real XI2 axis-scroll
+            // support is filed as a separate followup.
             {
                 let deviceid: u16 = 2;
                 let name = "Virtual core pointer";
@@ -5741,12 +5726,10 @@ fn handle_xi2_request(
                 write_button_class(&mut classes, deviceid, 7);
                 write_valuator_class(&mut classes, deviceid, 0, i32::from(screen_w).max(1) - 1);
                 write_valuator_class(&mut classes, deviceid, 1, i32::from(screen_h).max(1) - 1);
-                write_scroll_class(&mut classes, deviceid, 2, 1); // vertical
-                write_scroll_class(&mut classes, deviceid, 3, 2); // horizontal
                 x11::write_u16(le, &mut infos, deviceid);
                 x11::write_u16(le, &mut infos, 1); // use = MasterPointer
                 x11::write_u16(le, &mut infos, 3); // attachment = paired keyboard
-                x11::write_u16(le, &mut infos, 5); // num_classes
+                x11::write_u16(le, &mut infos, 3); // num_classes
                 x11::write_u16(le, &mut infos, name.len() as u16);
                 infos.push(1); // enabled
                 infos.push(0); // pad
