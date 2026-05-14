@@ -9865,7 +9865,6 @@ fn handle_query_pointer(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} QueryPointer", client_id.0, sequence.0);
     let queried_window = if body.len() >= 4 {
         ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
     } else {
@@ -9885,9 +9884,21 @@ fn handle_query_pointer(
         let root_y = pointer.win_y;
         let win_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
         let win_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
+        // Per X11 spec, `child` is the direct child of `queried_window`
+        // that contains the pointer, or None (0) if the pointer is on
+        // the queried window itself or on no descendant. Previously
+        // this was hardcoded to ROOT_WINDOW, which made GTK's
+        // QueryPointer-based hover/tooltip polling never see a
+        // transition between children — xfce4-panel spun 3500 times
+        // per second on QueryPointer, starving its event loop and
+        // dropping clicks on every panel applet.
+        let child = state
+            .resources
+            .direct_child_at(queried_window, win_x, win_y)
+            .unwrap_or(ResourceId(0));
         x11::QueryPointerReply {
             root: ROOT_WINDOW,
-            child: ROOT_WINDOW,
+            child,
             root_x,
             root_y,
             win_x,
@@ -9897,10 +9908,22 @@ fn handle_query_pointer(
     } else {
         x11::QueryPointerReply {
             root: ROOT_WINDOW,
-            child: ROOT_WINDOW,
+            child: ResourceId(0),
             ..Default::default()
         }
     };
+    debug!(
+        "client {} #{} QueryPointer queried=0x{:x} -> root=({},{}) win=({},{}) child=0x{:x} mask=0x{:x}",
+        client_id.0,
+        sequence.0,
+        queried_window.0,
+        reply_data.root_x,
+        reply_data.root_y,
+        reply_data.win_x,
+        reply_data.win_y,
+        reply_data.child.0,
+        reply_data.mask,
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
