@@ -8,6 +8,7 @@
 //! listener.
 
 use std::{
+    collections::HashMap,
     io,
     os::{
         fd::AsRawFd,
@@ -35,6 +36,172 @@ use crate::{
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
 };
+
+/// Diagnostic: per-second loop telemetry emit interval. Toggle via
+/// `YSERVER_LOOP_TELEMETRY=1` env var (off by default to avoid log
+/// spam in normal runs). When on, every ~1s we emit a single
+/// `info!` line with:
+///   - iterations/sec
+///   - requests/sec + max-drain-per-iter
+///   - top-3 opcodes by count + total time
+///   - host_input + page_flip dispatches/sec
+///   - max time between subsequent HostInput dispatches (cursor-lag proxy)
+///   - max single-iteration wall time
+///
+/// Costs: one HashMap lookup + counter increment per request, one
+/// `Instant::now()` per iteration boundary, and one `info!` line per
+/// second. Should be <0.5% overhead even at high request rates.
+const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Number of opcodes to show in the per-second telemetry emit.
+const TELEMETRY_TOP_N: usize = 3;
+
+#[derive(Debug, Default)]
+struct LoopTelemetry {
+    enabled: bool,
+    last_emit: Option<Instant>,
+    iter_count: u64,
+    requests_total: u64,
+    requests_per_iter_max: u32,
+    requests_by_opcode: HashMap<u8, (u64, Duration)>,
+    request_total_time: Duration,
+    longest_request: (u8, Duration),
+    host_input_count: u64,
+    host_input_max_gap: Duration,
+    last_host_input: Option<Instant>,
+    page_flip_count: u64,
+    max_iter_wall: Duration,
+}
+
+impl LoopTelemetry {
+    fn new() -> Self {
+        let enabled = std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some();
+        Self {
+            enabled,
+            last_emit: None,
+            ..Default::default()
+        }
+    }
+
+    fn record_request(&mut self, opcode: u8, dur: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.requests_total += 1;
+        self.request_total_time += dur;
+        let entry = self.requests_by_opcode.entry(opcode).or_default();
+        entry.0 += 1;
+        entry.1 += dur;
+        if dur > self.longest_request.1 {
+            self.longest_request = (opcode, dur);
+        }
+    }
+
+    fn record_host_input(&mut self, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        self.host_input_count += 1;
+        if let Some(prev) = self.last_host_input {
+            let gap = now.saturating_duration_since(prev);
+            if gap > self.host_input_max_gap {
+                self.host_input_max_gap = gap;
+            }
+        }
+        self.last_host_input = Some(now);
+    }
+
+    fn record_iteration(&mut self, requests_this_iter: u32, iter_wall: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.iter_count += 1;
+        if requests_this_iter > self.requests_per_iter_max {
+            self.requests_per_iter_max = requests_this_iter;
+        }
+        if iter_wall > self.max_iter_wall {
+            self.max_iter_wall = iter_wall;
+        }
+    }
+
+    fn maybe_emit(&mut self, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let last = match self.last_emit {
+            Some(t) => t,
+            None => {
+                self.last_emit = Some(now);
+                return;
+            }
+        };
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed < TELEMETRY_EMIT_INTERVAL {
+            return;
+        }
+        let secs = elapsed.as_secs_f64().max(1e-6);
+
+        // Top-N opcodes by total time (the most-actionable view; opcodes
+        // that fire often but cheap-each don't dominate, opcodes that
+        // fire rarely but expensive-each do).
+        let mut by_time: Vec<(u8, u64, Duration)> = self
+            .requests_by_opcode
+            .iter()
+            .map(|(op, (cnt, t))| (*op, *cnt, *t))
+            .collect();
+        by_time.sort_by(|a, b| b.2.cmp(&a.2));
+        let top_time: Vec<String> = by_time
+            .iter()
+            .take(TELEMETRY_TOP_N)
+            .map(|(op, cnt, t)| format!("op{op}:n={cnt}/t={:.1}ms", t.as_secs_f64() * 1000.0))
+            .collect();
+
+        let mut by_count = by_time.clone();
+        by_count.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_count: Vec<String> = by_count
+            .iter()
+            .take(TELEMETRY_TOP_N)
+            .map(|(op, cnt, t)| format!("op{op}:n={cnt}/t={:.1}ms", t.as_secs_f64() * 1000.0))
+            .collect();
+
+        log::info!(
+            "loop telemetry [{:.2}s]: iter/s={:.0} req/s={:.0} drain_max={} \
+             req_time={:.1}ms ({:.1}%) longest=op{}:{:.2}ms \
+             host_input/s={:.1} gap_max={:.1}ms \
+             page_flip/s={:.1} iter_wall_max={:.1}ms \
+             top_by_time=[{}] top_by_count=[{}]",
+            secs,
+            self.iter_count as f64 / secs,
+            self.requests_total as f64 / secs,
+            self.requests_per_iter_max,
+            self.request_total_time.as_secs_f64() * 1000.0,
+            self.request_total_time.as_secs_f64() / secs * 100.0,
+            self.longest_request.0,
+            self.longest_request.1.as_secs_f64() * 1000.0,
+            self.host_input_count as f64 / secs,
+            self.host_input_max_gap.as_secs_f64() * 1000.0,
+            self.page_flip_count as f64 / secs,
+            self.max_iter_wall.as_secs_f64() * 1000.0,
+            top_time.join(","),
+            top_count.join(","),
+        );
+
+        // Reset accumulators for next window. Keep `enabled` /
+        // `last_host_input` (cross-window gap measurement) /
+        // `last_emit`. Everything else zeroes.
+        self.last_emit = Some(now);
+        self.iter_count = 0;
+        self.requests_total = 0;
+        self.requests_per_iter_max = 0;
+        self.requests_by_opcode.clear();
+        self.request_total_time = Duration::ZERO;
+        self.longest_request = (0, Duration::ZERO);
+        self.host_input_count = 0;
+        self.host_input_max_gap = Duration::ZERO;
+        self.page_flip_count = 0;
+        self.max_iter_wall = Duration::ZERO;
+    }
+}
 
 /// X11 default auto-repeat initial delay before the first synthetic
 /// KeyPress fires. Matches xset's `-r` defaults; not yet pulled from
@@ -92,6 +259,13 @@ pub fn run_core(
     }
 
     let mut events = Events::with_capacity(64);
+    let mut telemetry = LoopTelemetry::new();
+    if telemetry.enabled {
+        log::info!(
+            "loop telemetry: enabled (YSERVER_LOOP_TELEMETRY set); \
+             1s rollups via info!"
+        );
+    }
     loop {
         // If a key is currently held, wake the loop in time to fire
         // the next synthetic repeat. `Duration::ZERO` keeps mio
@@ -102,6 +276,12 @@ pub fn run_core(
                 .unwrap_or(Duration::ZERO)
         });
         poll.poll(&mut events, poll_timeout)?;
+        let iter_start = if telemetry.enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut requests_this_iter: u32 = 0;
         for ev in events.iter() {
             match ev.token() {
                 LISTENER_TOKEN => {
@@ -115,6 +295,9 @@ pub fn run_core(
                     // composite/flip if the screen is dirty. mio is
                     // edge-triggered; the backend itself owns
                     // batching, so this dispatch never coalesces.
+                    if telemetry.enabled {
+                        telemetry.page_flip_count += 1;
+                    }
                     backend.on_page_flip_ready(state);
                 }
                 LIBINPUT_TOKEN => {
@@ -188,6 +371,12 @@ pub fn run_core(
                                 body,
                                 attached_fd,
                             } => {
+                                let req_opcode = header.opcode;
+                                let req_start = if telemetry.enabled {
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
                                 let outcome = match process_request(
                                     state,
                                     backend,
@@ -208,12 +397,16 @@ pub fn run_core(
                                         log::warn!(
                                             "request handler error (client {} opcode {}): {err}",
                                             id.0,
-                                            header.opcode
+                                            req_opcode,
                                         );
                                         RequestOutcome::Handled
                                     }
                                 };
                                 backend.mark_dirty();
+                                if let Some(start) = req_start {
+                                    telemetry.record_request(req_opcode, start.elapsed());
+                                }
+                                requests_this_iter += 1;
                                 if let RequestOutcome::Disconnect(disc_id) = outcome {
                                     crate::core_loop::process_disconnect::process_disconnect(
                                         state, backend, disc_id,
@@ -253,10 +446,18 @@ pub fn run_core(
                                 );
                             }
                             Message::HostInput(ev) => {
+                                if telemetry.enabled {
+                                    telemetry.record_host_input(Instant::now());
+                                }
                                 handle_host_input(state, backend, ev);
                                 backend.mark_dirty();
                             }
-                            Message::PageFlipReady => backend.on_page_flip_ready(state),
+                            Message::PageFlipReady => {
+                                if telemetry.enabled {
+                                    telemetry.page_flip_count += 1;
+                                }
+                                backend.on_page_flip_ready(state);
+                            }
                             Message::DumpScanout => backend.dump_scanout(),
                         }
                     }
@@ -313,6 +514,15 @@ pub fn run_core(
         // no-op if a flip is still in flight on the KMS path.
         if let Err(e) = backend.maybe_composite() {
             log::warn!("core_loop::run: maybe_composite failed: {e}");
+        }
+
+        // Diagnostic: per-iteration accounting + per-second telemetry
+        // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
+        if let Some(start) = iter_start {
+            let now = Instant::now();
+            let wall = now.saturating_duration_since(start);
+            telemetry.record_iteration(requests_this_iter, wall);
+            telemetry.maybe_emit(now);
         }
     }
 }
