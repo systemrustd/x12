@@ -6,6 +6,7 @@
 //! still runs through pixman; this module brings up Vulkan in
 //! parallel.
 
+pub mod call_stats;
 pub mod compositor;
 pub mod copy_scratch;
 pub mod device;

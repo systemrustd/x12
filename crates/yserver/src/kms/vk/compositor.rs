@@ -241,6 +241,7 @@ fn record_composite_command_buffer(
         device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        crate::vk_count!(begin_command_buffer);
         device.begin_command_buffer(cb, &begin)?;
 
         // 1. Layout transition: previous (we don't track between
@@ -263,6 +264,7 @@ fn record_composite_command_buffer(
             );
         let to_color_arr = [to_color];
         let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
         // 2. Begin dynamic rendering with the bo's color view.
@@ -287,6 +289,7 @@ fn record_composite_command_buffer(
             .render_area(render_area)
             .layer_count(1)
             .color_attachments(&color_attachment);
+        crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
 
         // 3. Dynamic state: viewport + scissor cover the whole bo.
@@ -298,7 +301,9 @@ fn record_composite_command_buffer(
             min_depth: 0.0,
             max_depth: 1.0,
         }];
+        crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
+        crate::vk_count!(cmd_set_scissor);
         device.cmd_set_scissor(cb, 0, &[render_area]);
 
         // 4. Per-draw: pick the alpha-mode pipeline variant
@@ -312,10 +317,12 @@ fn record_composite_command_buffer(
         for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
             let pl = pipeline.pipeline_for(draw.alpha_passthrough);
             if last_pipeline != Some(pl) {
+                crate::vk_count!(cmd_bind_pipeline);
                 device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
                 last_pipeline = Some(pl);
             }
             let sets = [descriptors[i]];
+            crate::vk_count!(cmd_bind_descriptor_sets);
             device.cmd_bind_descriptor_sets(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -331,6 +338,7 @@ fn record_composite_command_buffer(
                 src_origin: draw.src_origin,
                 src_size: draw.src_size,
             };
+            crate::vk_count!(cmd_push_constants);
             device.cmd_push_constants(
                 cb,
                 pipeline.pipeline_layout,
@@ -338,9 +346,11 @@ fn record_composite_command_buffer(
                 0,
                 push.as_bytes(),
             );
+            crate::vk_count!(cmd_draw);
             device.cmd_draw(cb, 4, 1, 0, 0);
         }
 
+        crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
 
         // 6. Layout transition: COLOR_ATTACHMENT_OPTIMAL → GENERAL
@@ -362,8 +372,10 @@ fn record_composite_command_buffer(
             );
         let to_scanout_arr = [to_scanout];
         let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
 
+        crate::vk_count!(end_command_buffer);
         device.end_command_buffer(cb)?;
     }
     Ok(())

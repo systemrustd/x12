@@ -5531,6 +5531,7 @@ impl KmsBackend {
                     .image(mask_image)
                     .subresource_range(color_range)];
                 let dep = ash::vk::DependencyInfo::default().image_memory_barriers(&to_attach);
+                crate::vk_count!(cmd_pipeline_barrier2);
                 unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
 
                 // 2. cmdBeginRendering with LOAD_OP_CLEAR. The
@@ -5567,10 +5568,12 @@ impl KmsBackend {
                     .render_area(bbox_render_area)
                     .layer_count(1)
                     .color_attachments(&color_attachments);
+                crate::vk_count!(cmd_begin_rendering);
                 unsafe { vk.device.cmd_begin_rendering(cb, &rendering_info) };
 
                 // 3. Bind pipeline + per-instance vertex buffer.
                 unsafe {
+                    crate::vk_count!(cmd_bind_pipeline);
                     vk.device.cmd_bind_pipeline(
                         cb,
                         ash::vk::PipelineBindPoint::GRAPHICS,
@@ -5589,6 +5592,7 @@ impl KmsBackend {
                     _pad: [0.0; 2],
                 };
                 unsafe {
+                    crate::vk_count!(cmd_push_constants);
                     vk.device.cmd_push_constants(
                         cb,
                         prim_layout,
@@ -5608,15 +5612,19 @@ impl KmsBackend {
                     max_depth: 1.0,
                 };
                 unsafe {
+                    crate::vk_count!(cmd_set_viewport);
                     vk.device.cmd_set_viewport(cb, 0, &[viewport]);
+                    crate::vk_count!(cmd_set_scissor);
                     vk.device.cmd_set_scissor(cb, 0, &[bbox_render_area]);
                 }
 
                 // 6. Draw: 4 verts (unit quad via TRIANGLE_STRIP)
                 //    × n_instances.
+                crate::vk_count!(cmd_draw);
                 unsafe { vk.device.cmd_draw(cb, 4, n_instances, 0, 0) };
 
                 // 7. End rendering.
+                crate::vk_count!(cmd_end_rendering);
                 unsafe { vk.device.cmd_end_rendering(cb) };
 
                 // 8. Barrier COLOR_ATTACHMENT → SHADER_READ_ONLY
@@ -5632,6 +5640,7 @@ impl KmsBackend {
                     .image(mask_image)
                     .subresource_range(color_range)];
                 let dep = ash::vk::DependencyInfo::default().image_memory_barriers(&to_read);
+                crate::vk_count!(cmd_pipeline_barrier2);
                 unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
                 // Layout-tracking update deferred to AFTER the
                 // final fallible record step (record_render_composite).
@@ -8544,6 +8553,7 @@ impl KmsBackend {
                         .layer_count(1),
                 )];
             let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
 
             let region = [ash::vk::BufferImageCopy::default()
@@ -8562,6 +8572,7 @@ impl KmsBackend {
                     depth: 1,
                 })];
             unsafe {
+                crate::vk_count!(cmd_copy_image_to_buffer);
                 vk.device.cmd_copy_image_to_buffer(
                     cb,
                     image,
@@ -8586,6 +8597,7 @@ impl KmsBackend {
                         .layer_count(1),
                 )];
             let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
             Ok(())
         });

@@ -536,6 +536,7 @@ fn upload_initial(
                     .layer_count(1),
             )];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
         let region = vk::BufferImageCopy::default()
@@ -555,6 +556,7 @@ fn upload_initial(
             });
         let regions = [region];
         unsafe {
+            crate::vk_count!(cmd_copy_buffer_to_image);
             device.cmd_copy_buffer_to_image(
                 cb,
                 buffer,
@@ -578,6 +580,7 @@ fn upload_initial(
                     .layer_count(1),
             )];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
         Ok(())
     });

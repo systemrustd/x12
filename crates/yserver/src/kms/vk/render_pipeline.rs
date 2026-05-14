@@ -641,11 +641,13 @@ pub fn record_solid_color_clear(
         .image(solid.image())
         .subresource_range(color_subresource_range())];
     let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
     let clear_color = vk::ClearColorValue { float32: color };
     let ranges = [color_subresource_range()];
     unsafe {
+        crate::vk_count!(cmd_clear_color_image);
         device.cmd_clear_color_image(
             cb,
             solid.image(),
@@ -665,6 +667,7 @@ pub fn record_solid_color_clear(
         .image(solid.image())
         .subresource_range(color_subresource_range())];
     let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
     solid.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 }

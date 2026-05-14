@@ -48,9 +48,11 @@ pub fn record_put_image(
         .image(dst.vk_image)
         .subresource_range(color_subresource_range())];
     let to_dst_dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_dst_dep) };
 
     unsafe {
+        crate::vk_count!(cmd_copy_buffer_to_image);
         device.cmd_copy_buffer_to_image(
             cb,
             staging,
@@ -70,6 +72,7 @@ pub fn record_put_image(
         .image(dst.vk_image)
         .subresource_range(color_subresource_range())];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     dst.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -103,9 +106,11 @@ pub fn record_get_image(
         .image(src.vk_image)
         .subresource_range(color_subresource_range())];
     let to_src_dep = vk::DependencyInfo::default().image_memory_barriers(&to_src);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_src_dep) };
 
     unsafe {
+        crate::vk_count!(cmd_copy_image_to_buffer);
         device.cmd_copy_image_to_buffer(
             cb,
             src.vk_image,
@@ -125,6 +130,7 @@ pub fn record_get_image(
         .image(src.vk_image)
         .subresource_range(color_subresource_range())];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     src.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);

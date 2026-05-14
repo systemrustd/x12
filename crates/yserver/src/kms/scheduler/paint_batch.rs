@@ -288,6 +288,7 @@ impl PaintBatch {
         let cb = unsafe { self.vk.device.allocate_command_buffers(&alloc_info)?[0] };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        crate::vk_count!(begin_command_buffer);
         if let Err(e) = unsafe { self.vk.device.begin_command_buffer(cb, &begin) } {
             unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
             return Err(BatchError::Vk(e));
@@ -343,6 +344,7 @@ impl PaintBatch {
             }
             BatchState::Recording => {
                 let cb = self.cb.expect("Recording state implies cb is Some");
+                crate::vk_count!(end_command_buffer);
                 unsafe { self.vk.device.end_command_buffer(cb)? };
                 self.state = BatchState::Closed;
                 Ok(())

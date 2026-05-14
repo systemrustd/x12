@@ -234,6 +234,7 @@ impl DstReadback {
                 .subresource_range(color_subresource_range()),
         ];
         let pre_dep = vk::DependencyInfo::default().image_memory_barriers(&pre);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &pre_dep) };
 
         let region = [vk::ImageCopy::default()
@@ -253,6 +254,7 @@ impl DstReadback {
                 depth: 1,
             })];
         unsafe {
+            crate::vk_count!(cmd_copy_image);
             device.cmd_copy_image(
                 cb,
                 dst_image,
@@ -285,6 +287,7 @@ impl DstReadback {
                 .subresource_range(color_subresource_range()),
         ];
         let post_dep = vk::DependencyInfo::default().image_memory_barriers(&post);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &post_dep) };
 
         scratch.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;

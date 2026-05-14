@@ -681,6 +681,7 @@ impl DrawableImage {
             let device = &self.vk.device;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            crate::vk_count!(begin_command_buffer);
             unsafe { device.begin_command_buffer(cb, &begin)? };
 
             let to_dst = [vk::ImageMemoryBarrier2::default()
@@ -698,6 +699,7 @@ impl DrawableImage {
                         .layer_count(1),
                 )];
             let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
             let clear_color = vk::ClearColorValue {
@@ -708,6 +710,7 @@ impl DrawableImage {
                 .level_count(1)
                 .layer_count(1)];
             unsafe {
+                crate::vk_count!(cmd_clear_color_image);
                 device.cmd_clear_color_image(
                     cb,
                     self.vk_image,
@@ -732,13 +735,16 @@ impl DrawableImage {
                         .layer_count(1),
                 )];
             let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
+            crate::vk_count!(end_command_buffer);
             unsafe { device.end_command_buffer(cb)? };
 
             let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
             unsafe {
+                crate::vk_count!(queue_submit2);
                 device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null())?;
                 device.queue_wait_idle(self.vk.graphics_queue)?;
             }
@@ -800,6 +806,7 @@ impl DrawableImage {
             );
         let to_dst_arr = [to_dst];
         let to_dst_dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &to_dst_dep) };
 
         // Copy staging buffer rect → image.
@@ -824,6 +831,7 @@ impl DrawableImage {
             });
         let regions = [copy_region];
         unsafe {
+            crate::vk_count!(cmd_copy_buffer_to_image);
             device.cmd_copy_buffer_to_image(
                 cb,
                 staging_buffer,
@@ -851,6 +859,7 @@ impl DrawableImage {
             );
         let to_read_arr = [to_read];
         let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
         self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;

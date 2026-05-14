@@ -72,6 +72,7 @@ pub fn record_fill_rectangles(
         );
     let to_color_arr = [to_color];
     let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color_arr);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_color_dep) };
 
     // 2. Begin rendering (loadOp=LOAD: preserve existing pixels;
@@ -90,6 +91,7 @@ pub fn record_fill_rectangles(
         .layer_count(1)
         .color_attachments(&color_attachment);
     unsafe {
+        crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
 
         // 3. Viewport = full mirror; scissor = GC clip.
@@ -101,8 +103,10 @@ pub fn record_fill_rectangles(
             min_depth: 0.0,
             max_depth: 1.0,
         }];
+        crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
         let scissor = [clip_scissor];
+        crate::vk_count!(cmd_set_scissor);
         device.cmd_set_scissor(cb, 0, &scissor);
 
         // 4. Solid-fill: cmd_clear_attachments with one VkClearRect
@@ -124,6 +128,7 @@ pub fn record_fill_rectangles(
             .collect();
         device.cmd_clear_attachments(cb, &attachments, &clear_rects);
 
+        crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
     }
 
@@ -145,6 +150,7 @@ pub fn record_fill_rectangles(
         );
     let to_read_arr = [to_read];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read_arr);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     target.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -197,6 +203,7 @@ pub fn record_logic_fill(
         );
     let to_color_arr = [to_color];
     let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color_arr);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_color_dep) };
 
     let render_area = vk::Rect2D {
@@ -223,8 +230,11 @@ pub fn record_logic_fill(
     }];
 
     unsafe {
+        crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
+        crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
+        crate::vk_count!(cmd_bind_pipeline);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
         let dst_vp = [target.extent.width as f32, target.extent.height as f32];
@@ -258,6 +268,7 @@ pub fn record_logic_fill(
                     height: (sy1 - sy0) as u32,
                 },
             }];
+            crate::vk_count!(cmd_set_scissor);
             device.cmd_set_scissor(cb, 0, &scissor);
 
             let pc = LogicFillPushConsts {
@@ -267,6 +278,7 @@ pub fn record_logic_fill(
                 _pad: [0.0, 0.0],
                 fg_color,
             };
+            crate::vk_count!(cmd_push_constants);
             device.cmd_push_constants(
                 cb,
                 pipeline_layout,
@@ -274,9 +286,11 @@ pub fn record_logic_fill(
                 0,
                 pc.as_bytes(),
             );
+            crate::vk_count!(cmd_draw);
             device.cmd_draw(cb, 4, 1, 0, 0);
         }
 
+        crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
     }
 
@@ -296,6 +310,7 @@ pub fn record_logic_fill(
         );
     let to_read_arr = [to_read];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read_arr);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     target.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);

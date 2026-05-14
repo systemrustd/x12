@@ -32,6 +32,45 @@ pub fn run() -> io::Result<()> {
 
     log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
 
+    // Vulkan-call-rate telemetry: emit a per-second snapshot of
+    // call counters from `kms::vk::call_stats::VK_CALLS`. Gated on
+    // the same `YSERVER_LOOP_TELEMETRY` env var the core-loop
+    // telemetry uses so the two rollups appear together. The
+    // counter increments at each call site are unconditional
+    // (atomic-add is ~1ns); only the per-second emission is
+    // env-gated.
+    if std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some() {
+        thread::spawn(|| {
+            use std::time::Duration;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let s = crate::kms::vk::call_stats::VK_CALLS.snapshot_and_reset();
+                log::info!(
+                    "vk call rate [1s]: barrier2={} draw={} bind_pl={} bind_ds={} \
+                     push_const={} viewport={} scissor={} begin_rendering={} \
+                     end_rendering={} copy_b2i={} copy_i={} copy_i2b={} \
+                     clear_color_image={} queue_submit2={} begin_cb={} end_cb={}",
+                    s.cmd_pipeline_barrier2,
+                    s.cmd_draw,
+                    s.cmd_bind_pipeline,
+                    s.cmd_bind_descriptor_sets,
+                    s.cmd_push_constants,
+                    s.cmd_set_viewport,
+                    s.cmd_set_scissor,
+                    s.cmd_begin_rendering,
+                    s.cmd_end_rendering,
+                    s.cmd_copy_buffer_to_image,
+                    s.cmd_copy_image,
+                    s.cmd_copy_image_to_buffer,
+                    s.cmd_clear_color_image,
+                    s.queue_submit2,
+                    s.begin_command_buffer,
+                    s.end_command_buffer,
+                );
+            }
+        });
+    }
+
     let signal_fd = block_termination_signals()?;
 
     // Take over the console TTY before opening anything else: stops the

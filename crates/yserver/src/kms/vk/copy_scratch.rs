@@ -128,6 +128,7 @@ impl CopyScratch {
             .image(self.image)
             .subresource_range(color_subresource_range())];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { self.vk.device.cmd_pipeline_barrier2(cb, &dep) };
         self.current_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
     }
@@ -147,6 +148,7 @@ impl CopyScratch {
             .image(self.image)
             .subresource_range(color_subresource_range())];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+        crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { self.vk.device.cmd_pipeline_barrier2(cb, &dep) };
         self.current_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     }

@@ -98,6 +98,7 @@ pub fn record_copy_area_same_overlap(
         .image(img.vk_image)
         .subresource_range(color_subresource_range())];
     let pre_dep = vk::DependencyInfo::default().image_memory_barriers(&pre);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &pre_dep) };
     scratch.record_to_transfer_dst(cb);
 
@@ -120,6 +121,7 @@ pub fn record_copy_area_same_overlap(
         })
         .collect();
     unsafe {
+        crate::vk_count!(cmd_copy_image);
         device.cmd_copy_image(
             cb,
             img.vk_image,
@@ -141,6 +143,7 @@ pub fn record_copy_area_same_overlap(
         .image(img.vk_image)
         .subresource_range(color_subresource_range())];
     let mid_dep = vk::DependencyInfo::default().image_memory_barriers(&mid);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &mid_dep) };
     scratch.record_to_transfer_src(cb);
 
@@ -162,6 +165,7 @@ pub fn record_copy_area_same_overlap(
         })
         .collect();
     unsafe {
+        crate::vk_count!(cmd_copy_image);
         device.cmd_copy_image(
             cb,
             scratch.image(),
@@ -183,6 +187,7 @@ pub fn record_copy_area_same_overlap(
         .image(img.vk_image)
         .subresource_range(color_subresource_range())];
     let post_dep = vk::DependencyInfo::default().image_memory_barriers(&post);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &post_dep) };
 
     img.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -221,9 +226,11 @@ fn record_distinct_image_copy(
             .subresource_range(color_subresource_range()),
     ];
     let pre_dep = vk::DependencyInfo::default().image_memory_barriers(&pre);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &pre_dep) };
 
     unsafe {
+        crate::vk_count!(cmd_copy_image);
         device.cmd_copy_image(
             cb,
             src.vk_image,
@@ -256,6 +263,7 @@ fn record_distinct_image_copy(
             .subresource_range(color_subresource_range()),
     ];
     let post_dep = vk::DependencyInfo::default().image_memory_barriers(&post);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &post_dep) };
 
     src.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -283,9 +291,11 @@ fn record_same_image_copy(
         .image(img.vk_image)
         .subresource_range(color_subresource_range())];
     let pre_dep = vk::DependencyInfo::default().image_memory_barriers(&pre);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &pre_dep) };
 
     unsafe {
+        crate::vk_count!(cmd_copy_image);
         device.cmd_copy_image(
             cb,
             img.vk_image,
@@ -306,6 +316,7 @@ fn record_same_image_copy(
         .image(img.vk_image)
         .subresource_range(color_subresource_range())];
     let post_dep = vk::DependencyInfo::default().image_memory_barriers(&post);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &post_dep) };
 
     img.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);

@@ -58,6 +58,7 @@ pub fn record_text_run(
         .image(target.vk_image)
         .subresource_range(color_subresource_range())];
     let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_color_dep) };
 
     let render_area = vk::Rect2D {
@@ -86,10 +87,15 @@ pub fn record_text_run(
     let scissor = [render_area];
 
     unsafe {
+        crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
+        crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
+        crate::vk_count!(cmd_set_scissor);
         device.cmd_set_scissor(cb, 0, &scissor);
+        crate::vk_count!(cmd_bind_pipeline);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
+        crate::vk_count!(cmd_bind_descriptor_sets);
         device.cmd_bind_descriptor_sets(
             cb,
             vk::PipelineBindPoint::GRAPHICS,
@@ -117,6 +123,7 @@ pub fn record_text_run(
                 ],
                 foreground,
             );
+            crate::vk_count!(cmd_push_constants);
             device.cmd_push_constants(
                 cb,
                 pipeline.pipeline_layout,
@@ -124,9 +131,11 @@ pub fn record_text_run(
                 0,
                 pc.as_bytes(),
             );
+            crate::vk_count!(cmd_draw);
             device.cmd_draw(cb, 4, 1, 0, 0);
         }
 
+        crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
     }
 
@@ -140,6 +149,7 @@ pub fn record_text_run(
         .image(target.vk_image)
         .subresource_range(color_subresource_range())];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+    crate::vk_count!(cmd_pipeline_barrier2);
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     target.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);

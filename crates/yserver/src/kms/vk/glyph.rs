@@ -385,6 +385,7 @@ impl GlyphAtlas {
                 .image(image)
                 .subresource_range(color_subresource_range())];
             let to_dst_dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { device.cmd_pipeline_barrier2(cb, &to_dst_dep) };
 
             let region = vk::BufferImageCopy::default()
@@ -408,6 +409,7 @@ impl GlyphAtlas {
                 });
             let regions = [region];
             unsafe {
+                crate::vk_count!(cmd_copy_buffer_to_image);
                 device.cmd_copy_buffer_to_image(
                     cb,
                     buffer,
@@ -427,6 +429,7 @@ impl GlyphAtlas {
                 .image(image)
                 .subresource_range(color_subresource_range())];
             let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+            crate::vk_count!(cmd_pipeline_barrier2);
             unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
             Ok(())
         })?;

@@ -143,8 +143,10 @@ where
         // Paths 0a / 0b / 0c — pre-submit failures. cb_safe_to_free
         // stays true; the outer block frees the CB on the Err
         // returned here.
+        crate::vk_count!(begin_command_buffer);
         unsafe { vk.device.begin_command_buffer(cb, &begin)? };
         record(vk, cb)?;
+        crate::vk_count!(end_command_buffer);
         unsafe { vk.device.end_command_buffer(cb)? };
 
         // Path 1a — fence creation failure (pre-submit).
@@ -155,6 +157,7 @@ where
         // still safe to free (cb_safe_to_free stays true).
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        crate::vk_count!(queue_submit2);
         if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
             unsafe { vk.device.destroy_fence(fence, None) };
             return Err(e);
