@@ -5001,48 +5001,34 @@ impl KmsBackend {
             RenderPic::None => return false,
         }
 
-        // 3F-2: MaskScratch::ensure_image_size may still grow (destroy
-        // old image after queue_wait_idle), which does NOT wait for
-        // un-submitted batch commands. Pre-flush the batch before the
-        // grow. needs_mask_grow is false for the steady-state path
-        // (no resize), so this only fires on first use of a given
-        // size (no old image to dangle, harmless) or on a real grow.
+        // 5-T5: defer-release replaces the pre-flush gate. The old
+        // mask image is adopted into the scheduler's retire flow so
+        // it survives any in-flight CB.
         //
-        // 5-T4: DstReadback's half of this gate has been removed —
-        // it now uses `ensure_returning_old` + defer-release below.
-        // T5 will migrate MaskScratch the same way and delete this
-        // gate entirely.
-        let needs_mask_grow = self
-            .mask_scratch
-            .as_ref()
-            .is_some_and(|m| m.needs_image_grow(bbox_w, bbox_h));
-        if needs_mask_grow {
-            use crate::kms::scheduler::paint_batch::BatchFlushReason;
-            if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                log::warn!("vk render_traps: pre-resize flush failed: {e:?}");
-                return false;
+        // CRITICAL borrow-checker note (same pattern as T3/T4): the
+        // scratch's &mut borrow MUST end BEFORE
+        // `self.scheduler.defer_resource_release` borrows `&mut self`.
+        // Use a tight block so the `as_mut()` binding drops at the
+        // closing brace. Reborrow `self.mask_scratch` later (as &ref)
+        // for view + extent below.
+        let retired = {
+            let scratch = self.mask_scratch.as_mut().expect("checked above");
+            match scratch.ensure_image_size_returning_old(bbox_w, bbox_h) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("vk render_traps: mask ensure_image_size failed: {e:?}");
+                    return false;
+                }
             }
+        }; // <-- scratch's &mut borrow ends here.
+        if let Some(old) = retired {
+            self.scheduler
+                .defer_resource_release(vk_arc.clone(), pool_handle, old);
         }
 
-        // 3F-2: ensure_image_size now happens outside the closure
-        // (it's `&mut self.mask_scratch` and takes the
-        // post-pre-flush window). The recorder below uses the
-        // already-sized image and only records the upload's
-        // barrier-copy-barrier.
-        if let Err(e) = self
-            .mask_scratch
-            .as_mut()
-            .expect("checked above")
-            .ensure_image_size(bbox_w, bbox_h)
-        {
-            log::warn!("vk render_traps: mask ensure_image_size failed: {e:?}");
-            return false;
-        }
-
-        // P1: `mask_view` / `mask_extent` MUST be read AFTER
-        // `ensure_image_size` — the grow path destroys the old
-        // `vk::ImageView`, so a pre-ensure capture would dangle on
-        // resize.
+        // P1: `mask_view` / `mask_extent` MUST be read AFTER the grow
+        // above — the grow path replaces the old `vk::ImageView`, so a
+        // pre-grow capture would refer to the just-retired view.
         let mask_view = self
             .mask_scratch
             .as_ref()

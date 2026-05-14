@@ -8,10 +8,14 @@
 //! barrier-copy-barrier sequence that uploads it into a transient
 //! `R8_UNORM` `VkImage`. The image view is lifetime-stable as long
 //! as the caller doesn't request a bigger mask; resize via
-//! [`MaskScratch::ensure_image_size`] re-allocates and invalidates
-//! the old view, so callers in batched paint paths MUST consult
-//! [`MaskScratch::needs_image_grow`] BEFORE entering a batch and
-//! flush the open batch first if a grow is imminent.
+//! [`MaskScratch::ensure_image_size_returning_old`] allocates a new
+//! image, returns the old one wrapped as a `BatchResource` for
+//! defer-release, and installs the new fields on the scratch.
+//!
+//! 5-T5: defer-release replaces the pre-Phase-5 pre-flush gate —
+//! the old image survives any in-flight CB because the scheduler
+//! holds it until the open `PaintBatch` retires (or releases it
+//! synchronously if no in-flight batch exists).
 //!
 //! Single shared scratch — the renderer schedules render-traps
 //! into PaintBatches that submit before the next protocol cycle,
@@ -23,6 +27,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::device::VkContext;
+use crate::kms::scheduler::paint_batch::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MaskScratchError {
@@ -35,6 +40,27 @@ pub enum MaskScratchError {
 impl From<vk::Result> for MaskScratchError {
     fn from(r: vk::Result) -> Self {
         MaskScratchError::Vk(r)
+    }
+}
+
+/// 5-T5: wraps the just-replaced scratch image (image + view +
+/// memory) so the scheduler can release it after the in-flight batch
+/// retires. The new image has already been installed on `MaskScratch`
+/// by the time this is constructed.
+#[derive(Debug)]
+struct RetiredMaskScratchImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    image_memory: vk::DeviceMemory,
+}
+
+impl BatchResource for RetiredMaskScratchImage {
+    fn release(self: Box<Self>, vk: &VkContext) {
+        unsafe {
+            vk.device.destroy_image_view(self.view, None);
+            vk.device.destroy_image(self.image, None);
+            vk.device.free_memory(self.image_memory, None);
+        }
     }
 }
 
@@ -75,50 +101,41 @@ impl MaskScratch {
         self.view
     }
 
-    /// True if a later `ensure_image_size(width, height)` call would
-    /// reallocate the scratch image. Callers in batched
-    /// paint paths use this BEFORE entering `record_paint_batch_op`
-    /// so they can flush any in-flight batch — `ensure_image_size`
-    /// destroys the old image after `queue_wait_idle`, which does
-    /// NOT wait for un-submitted commands. Without a pre-flush, an
-    /// open batch CB embedding the old scratch image would dangle.
-    /// Mirrors `DstReadback::needs_grow` (3F-1) and
-    /// `CopyScratch::needs_grow` (3D).
-    pub fn needs_image_grow(&self, width: u32, height: u32) -> bool {
-        width > self.extent.width || height > self.extent.height
-    }
-
-    /// Ensure the scratch image is at least `(width, height)` pixels,
-    /// reallocating if smaller. After this returns the image is in
-    /// `UNDEFINED` layout (treated as new) when reallocation happens.
+    /// 5-T5: ensure the scratch image is at least `(width, height)`
+    /// pixels, reallocating if smaller. Returns `Ok(None)` if no grow
+    /// was needed (scratch unchanged). On grow, allocates the new
+    /// resource first (so a failure leaves the scratch untouched),
+    /// then installs the new fields and returns the old image
+    /// wrapped as a `BatchResource` for the caller to defer-release
+    /// through the scheduler.
     ///
-    /// 3F-2: callers in batched paint paths MUST pre-flush the open
-    /// PaintBatch with `BatchFlushReason::ProtocolBarrier` before
-    /// calling this if `needs_image_grow(width, height)` returns
-    /// `true`. The grow path destroys the old image after
-    /// `queue_wait_idle`, which does NOT wait for un-submitted
-    /// commands.
-    pub fn ensure_image_size(&mut self, width: u32, height: u32) -> Result<(), MaskScratchError> {
+    /// Allocation-first ordering: if `allocate_image` fails the
+    /// scratch is untouched and the caller sees `Err`. Past the
+    /// successful `allocate_image` the function MUST NOT fail.
+    pub fn ensure_image_size_returning_old(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn BatchResource>>, MaskScratchError> {
         if width <= self.extent.width && height <= self.extent.height {
-            return Ok(());
+            return Ok(None);
         }
         let new_extent = vk::Extent2D {
             width: self.extent.width.max(width).next_power_of_two().max(256),
             height: self.extent.height.max(height).next_power_of_two().max(256),
         };
         let (image, view, image_memory) = allocate_image(&self.vk, new_extent)?;
-        unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            self.vk.device.destroy_image_view(self.view, None);
-            self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.image_memory, None);
-        }
-        self.image = image;
-        self.view = view;
-        self.image_memory = image_memory;
+        // Allocation succeeded — past here the function MUST NOT fail.
+        let old_image = std::mem::replace(&mut self.image, image);
+        let old_view = std::mem::replace(&mut self.view, view);
+        let old_memory = std::mem::replace(&mut self.image_memory, image_memory);
         self.extent = new_extent;
         self.current_layout = vk::ImageLayout::UNDEFINED;
-        Ok(())
+        Ok(Some(Box::new(RetiredMaskScratchImage {
+            image: old_image,
+            view: old_view,
+            image_memory: old_memory,
+        })))
     }
 
     /// Record the barrier-copy-barrier sequence that uploads
@@ -129,9 +146,10 @@ impl MaskScratch {
     /// transition); on CB execute the image lands in that layout.
     ///
     /// Caller is responsible for:
-    ///   1. Calling `ensure_image_size(width, height)?` BEFORE this
-    ///      method (after any required pre-resize batch flush, per
-    ///      `needs_image_grow`).
+    ///   1. Calling `ensure_image_size_returning_old(width, height)?`
+    ///      BEFORE this method, and routing any returned old image
+    ///      through `RenderScheduler::defer_resource_release` so the
+    ///      old `vk::Image`/view/memory outlives any in-flight CB.
     ///   2. Allocating staging via `BatchUploadArena::alloc(width *
     ///      height, 4)` and copying the row-major coverage bytes
     ///      into the returned `mapped_ptr`.
@@ -153,7 +171,7 @@ impl MaskScratch {
         }
         debug_assert!(
             width <= self.extent.width && height <= self.extent.height,
-            "MaskScratch::record_upload_r8: caller must ensure_image_size first",
+            "MaskScratch::record_upload_r8: caller must ensure_image_size_returning_old first",
         );
         let device = &vk.device;
         let old_layout = self.current_layout;
