@@ -39,30 +39,20 @@ const MAX_IN_FLIGHT_PAINT_BATCHES: usize = 4;
 /// `defer_resource_release` which does the action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferDecision {
-    /// No live batch could reference the resource. Caller releases
-    /// synchronously. This covers:
+    /// No live (non-poisoned) batch could reference the resource.
+    /// Caller releases synchronously. This covers:
     ///   - Empty scheduler (no submitted batches, no open batch).
-    ///   - Open batch is `Idle` / `Poisoned` AND `submitted_paint_batches`
-    ///     is empty (no in-flight GPU work, no recorded CB).
+    ///   - Open batch is `Poisoned` AND `submitted_paint_batches` is empty
+    ///     (poison drop is a no-op — adopting would leak).
     Synchronous,
-    /// Open batch is `Recording` / `Closed` (has a CB that may
-    /// reference the resource). Adopt into the current open batch;
-    /// its fence at submit time signals after every prior submitted
-    /// batch's fence (same-queue FIFO), so the adopted resource
-    /// outlives every possible reference.
-    AdoptOpenRecording,
-    /// No usable open batch (None / `Idle` / `Poisoned`) but at least
-    /// one batch is in `submitted_paint_batches`. Adopt into the
-    /// most-recently-submitted batch (back of the queue). Same FIFO
-    /// argument as `AdoptOpenRecording`: that batch's fence is the
-    /// latest pending fence on the queue, so when it signals every
-    /// older submission has signaled too, and the resource releases
-    /// safely. Specifically introduced to fix the `AMD page-fault on
-    /// FreePicture defer-release` issue: previously `AdoptOpen`
-    /// lazy-opened an Idle batch with no CB, which retired
-    /// immediately on the next `close_and_submit{,_async}` regardless
-    /// of submitted predecessors — UAF.
-    AdoptLastSubmitted,
+    /// At least one live (non-poisoned) batch (open or in-flight) might
+    /// hold a CB that references the resource. Adopt into the open
+    /// batch (creating one in Idle state if none exists). The open
+    /// batch's `state()` is guaranteed non-Poisoned by the time we
+    /// adopt: either it's already non-Poisoned, or
+    /// `defer_resource_release` discards the Poisoned batch before
+    /// opening a fresh Idle one to host the adoption.
+    AdoptOpen,
 }
 
 #[derive(Debug, Default)]
@@ -328,53 +318,28 @@ impl RenderScheduler {
     /// construct a real `PaintBatch` (which would require an
     /// `Arc<VkContext>` and a `vk::CommandPool`).
     ///
-    /// **Decision tree:**
-    ///
-    /// | current_state              | has_submitted | result               |
-    /// |----------------------------|---------------|----------------------|
-    /// | None                       | false         | Synchronous          |
-    /// | None                       | true          | AdoptLastSubmitted   |
-    /// | Some(Idle)                 | false         | Synchronous          |
-    /// | Some(Idle)                 | true          | AdoptLastSubmitted   |
-    /// | Some(Recording \| Closed)  | any           | AdoptOpenRecording   |
-    /// | Some(Poisoned)             | false         | Synchronous          |
-    /// | Some(Poisoned)             | true          | AdoptLastSubmitted   |
-    /// | Some(Submitted \| Retired) | any           | (unreachable)        |
-    ///
-    /// **Why `Idle` routes to `AdoptLastSubmitted` (not `AdoptOpenRecording`).**
-    /// An `Idle` batch has no CB allocated; `submit_{and_wait, async}`
-    /// short-circuits Idle → Retired without going through the queue.
-    /// If we adopted the resource into the Idle batch and submitted
-    /// predecessors are still in flight referencing the same VkImage,
-    /// the short-circuit retires the Idle batch and drops the resource
-    /// *immediately* — UAF. Routing to `AdoptLastSubmitted` piggybacks
-    /// the resource on the back submitted batch's fence; same-queue
-    /// FIFO means it signals after every prior fence.
-    ///
-    /// **Poisoned-batch handling**: a `Poisoned` current batch is NOT
-    /// a host for adoption (`PaintBatch::Drop` for Poisoned is a no-op,
-    /// so any adopted resource would leak). If there are no submitted
-    /// predecessors either, the resource releases synchronously.
-    /// Otherwise the production `defer_resource_release` discards the
-    /// Poisoned batch first and routes to `AdoptLastSubmitted`.
+    /// **Poisoned-batch handling**: a `Poisoned` current batch is
+    /// NOT a host for adoption — `PaintBatch::Drop` for Poisoned is
+    /// a no-op, so an adopted resource would leak. If the only
+    /// "live" thing is a Poisoned current batch with no submitted
+    /// predecessors, the answer is `Synchronous`. If there ARE
+    /// submitted predecessors, the production
+    /// `defer_resource_release` discards the Poisoned batch and
+    /// opens a fresh Idle one to host the adoption — this pure
+    /// helper returns `AdoptOpen` for that pre-discard case.
     #[must_use]
     pub fn defer_resource_release_decision_for(
         has_submitted: bool,
         current_state: Option<BatchState>,
     ) -> DeferDecision {
-        match current_state {
-            Some(BatchState::Recording | BatchState::Closed) => DeferDecision::AdoptOpenRecording,
-            // None / Idle / Poisoned: no CB recording or already-
-            // dead-on-arrival. Defer to the back of the submitted
-            // queue if there's GPU work in flight; otherwise nothing
-            // can reference the resource.
-            _ => {
-                if has_submitted {
-                    DeferDecision::AdoptLastSubmitted
-                } else {
-                    DeferDecision::Synchronous
-                }
-            }
+        let current_is_live = matches!(
+            current_state,
+            Some(s) if s != BatchState::Poisoned
+        );
+        if !has_submitted && !current_is_live {
+            DeferDecision::Synchronous
+        } else {
+            DeferDecision::AdoptOpen
         }
     }
 
@@ -389,53 +354,52 @@ impl RenderScheduler {
         )
     }
 
-    /// Defer-release the boxed `BatchResource`: keep the resource
-    /// alive until every in-flight CB that could reference it has
-    /// retired, then drop it. The decision routes one of three ways
-    /// per `defer_resource_release_decision_for`:
+    /// Defer-release the boxed `BatchResource`: adopt it into the
+    /// currently-open paint batch if any batch (open or in flight)
+    /// might hold a CB referencing the resource, OR release it
+    /// synchronously if nothing in flight could possibly reference
+    /// it.
     ///
-    /// - `Synchronous`: nothing in flight, no recorded CB → release
-    ///   directly on the calling thread.
-    /// - `AdoptOpenRecording`: open batch has a CB → adopt into it;
-    ///   the batch's eventual submit signals after every prior
-    ///   submission's fence (same-queue FIFO), so the adopted
-    ///   resource outlives every reference.
-    /// - `AdoptLastSubmitted`: no usable open batch but submitted
-    ///   batches exist → adopt into the most-recently-submitted
-    ///   batch (back of `submitted_paint_batches`). Its fence is
-    ///   the latest pending fence on the queue; when it signals,
-    ///   every older submission has signaled too. The single-
-    ///   threaded core loop guarantees no race with
-    ///   `poll_retired_paint_batches`.
+    /// `vk_arc` and `pool` are required for the adopt branch — when
+    /// no batch is open, `defer_resource_release` lazy-opens one
+    /// (Idle state, no CB allocated) to host the adoption. If the
+    /// caller never appends to that batch, the next
+    /// `close_and_submit` transitions Idle → Retired directly and
+    /// the adopted resource releases at that moment (no submit, no
+    /// fence, no wait).
     ///
-    /// **Why we don't lazy-open an Idle batch here anymore.**
-    /// Previous behavior was to call `open_batch` for the no-open-
-    /// batch path and adopt into the freshly-opened Idle batch. The
-    /// problem: a subsequent `close_and_submit{,_async}` on an Idle
-    /// batch short-circuits to `retire_now` without going through
-    /// the queue, releasing the adopted resource *immediately* —
-    /// while submitted predecessors are still in flight. On bee
-    /// (RDNA2 / RADV) this surfaced as an amdgpu PERMISSION_FAULTS
-    /// page fault when the shader sampled a freed VkImage. Adopting
-    /// into the back submitted batch instead piggybacks the resource
-    /// on a fence that *will* be observed before retirement.
+    /// **Why adopt into the OPEN batch even when only submitted
+    /// batches exist.** Submitted-batches' CBs reference what was
+    /// recorded at submit time; the resource being deferred was just
+    /// freshly-allocated and assigned to its owning scratch struct,
+    /// so it cannot be in any submitted batch's CB. It CAN be in the
+    /// open batch's CB (if the caller recorded ops between
+    /// `ensure_*_returning_old` and this call), and even if today's
+    /// call sites don't do that, the API must be safe by
+    /// construction. The currently-open batch's fence signals after
+    /// all submitted batches' fences (same-queue FIFO submit order),
+    /// so adopting there is strictly safer than adopting into any
+    /// of the submitted batches.
     ///
-    /// `vk` and `pool` are no longer strictly needed (no lazy-open
-    /// branch), but retained in the signature for backward
-    /// compatibility with the existing five call sites. `vk` is
-    /// still used by the Synchronous branch.
+    /// **Subtlety: open batch may be Idle.** That's fine — Idle
+    /// batches still have `retire_resources`; their `submit_and_wait`
+    /// at Idle short-circuits to `retire_now`, which walks and
+    /// releases the adopted resource. The single-threaded core loop
+    /// invariant ensures no race: this function runs on the same
+    /// thread as the next `close_and_submit`.
     pub fn defer_resource_release(
         &mut self,
         vk: Arc<VkContext>,
-        _pool: vk::CommandPool,
+        pool: vk::CommandPool,
         resource: Box<dyn paint_batch::BatchResource>,
     ) {
         // Discard a Poisoned current batch before deciding. A
         // Poisoned batch's Drop is a no-op (the leak-on-error
         // contract), so adopting into it would silently leak the
-        // resource. After discard, the decision tree sees
-        // current_state=None and routes correctly: Synchronous if no
-        // submitted predecessors, AdoptLastSubmitted otherwise.
+        // resource. If there are submitted predecessors, the
+        // resource still needs adopt-into-a-live-batch lifetime —
+        // open a fresh Idle batch below. If there are no
+        // predecessors either, the synchronous branch runs.
         if let Some(b) = self.current_paint_batch.as_ref()
             && b.state() == BatchState::Poisoned
         {
@@ -445,16 +409,11 @@ impl RenderScheduler {
             DeferDecision::Synchronous => {
                 resource.release(&vk);
             }
-            DeferDecision::AdoptOpenRecording => {
+            DeferDecision::AdoptOpen => {
+                let _ = self.open_batch(vk, pool);
                 self.current_paint_batch
                     .as_mut()
-                    .expect("AdoptOpenRecording implies Some(Recording|Closed)")
-                    .adopt(resource);
-            }
-            DeferDecision::AdoptLastSubmitted => {
-                self.submitted_paint_batches
-                    .back_mut()
-                    .expect("AdoptLastSubmitted implies non-empty queue")
+                    .expect("open_batch just ran")
                     .adopt(resource);
             }
         }
@@ -491,75 +450,46 @@ mod tests {
     }
 
     #[test]
-    fn defer_decision_submitted_only_is_last_submitted() {
-        // No open batch, submitted in flight → adopt into the back of
-        // the submitted queue (the fix for the bee FreePicture UAF).
+    fn defer_decision_submitted_only_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(true, None),
-            DeferDecision::AdoptLastSubmitted
+            DeferDecision::AdoptOpen
         );
     }
 
     #[test]
-    fn defer_decision_current_idle_no_submitted_is_synchronous() {
-        // Idle batch with no CB and no submitted predecessors: no
-        // in-flight GPU work that could reference the resource.
-        // Release directly. (Pre-fix this answered AdoptOpen and
-        // lazy-host the Idle, which was harmless when no submitted
-        // existed.)
+    fn defer_decision_current_idle_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(false, Some(BatchState::Idle)),
-            DeferDecision::Synchronous
+            DeferDecision::AdoptOpen
         );
     }
 
     #[test]
-    fn defer_decision_current_idle_with_submitted_is_last_submitted() {
-        // The load-bearing fix: open Idle (no CB) + submitted in
-        // flight → adopt into back submitted batch, NOT into Idle.
-        // Pre-fix this returned AdoptOpen which short-circuited Idle
-        // and released the resource while submitted predecessors
-        // still referenced it (UAF, amdgpu PERMISSION_FAULTS).
-        assert_eq!(
-            RenderScheduler::defer_resource_release_decision_for(true, Some(BatchState::Idle)),
-            DeferDecision::AdoptLastSubmitted
-        );
-    }
-
-    #[test]
-    fn defer_decision_current_recording_is_open_recording() {
+    fn defer_decision_current_recording_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(
                 false,
                 Some(BatchState::Recording)
             ),
-            DeferDecision::AdoptOpenRecording
+            DeferDecision::AdoptOpen
         );
     }
 
     #[test]
-    fn defer_decision_current_recording_with_submitted_is_open_recording() {
-        // Open Recording always wins over submitted: its fence
-        // signals after every submitted fence (same-queue FIFO).
-        assert_eq!(
-            RenderScheduler::defer_resource_release_decision_for(true, Some(BatchState::Recording)),
-            DeferDecision::AdoptOpenRecording
-        );
-    }
-
-    #[test]
-    fn defer_decision_current_closed_is_open_recording() {
+    fn defer_decision_current_closed_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(false, Some(BatchState::Closed)),
-            DeferDecision::AdoptOpenRecording
+            DeferDecision::AdoptOpen
         );
     }
 
     #[test]
     fn defer_decision_current_poisoned_no_submitted_is_synchronous() {
-        // A Poisoned current batch is NOT a valid adoption host
-        // (its Drop is a no-op). With no submitted predecessors,
-        // the resource must release synchronously.
+        // The load-bearing P2 case: a Poisoned current batch is
+        // NOT a valid adoption host (its Drop is a no-op). With no
+        // submitted predecessors, the resource must release
+        // synchronously.
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(false, Some(BatchState::Poisoned)),
             DeferDecision::Synchronous
@@ -567,15 +497,15 @@ mod tests {
     }
 
     #[test]
-    fn defer_decision_current_poisoned_with_submitted_is_last_submitted() {
-        // Predecessors might reference the resource → adopt into the
-        // back submitted batch. The production fn discards the
-        // Poisoned batch first, but this pure helper sees the raw
-        // snapshot and answers identically because Poisoned routes
-        // to the same arm as None / Idle.
+    fn defer_decision_current_poisoned_with_submitted_is_adopt() {
+        // Predecessors might reference the resource → adopt. The
+        // production fn discards the Poisoned batch and opens a
+        // fresh Idle one; this pure helper sees only the
+        // (has_submitted=true, Poisoned) snapshot and answers
+        // AdoptOpen accordingly.
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(true, Some(BatchState::Poisoned)),
-            DeferDecision::AdoptLastSubmitted
+            DeferDecision::AdoptOpen
         );
     }
 
@@ -583,40 +513,24 @@ mod tests {
     // invariant violation (current_paint_batch is never observed in
     // those states at a defer-release call site — Submitted lives
     // in submitted_paint_batches, Retired is short-lived inside
-    // close_and_submit). Test for completeness; falls into the
-    // "no usable open batch" arm and routes by has_submitted.
+    // close_and_submit). Test for completeness; should answer
+    // AdoptOpen (the conservative direction) but is unreachable.
     #[test]
-    fn defer_decision_current_submitted_no_submitted_is_synchronous() {
+    fn defer_decision_current_submitted_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(
                 false,
                 Some(BatchState::Submitted)
             ),
-            DeferDecision::Synchronous
+            DeferDecision::AdoptOpen
         );
     }
 
     #[test]
-    fn defer_decision_current_submitted_with_submitted_is_last_submitted() {
-        assert_eq!(
-            RenderScheduler::defer_resource_release_decision_for(true, Some(BatchState::Submitted)),
-            DeferDecision::AdoptLastSubmitted
-        );
-    }
-
-    #[test]
-    fn defer_decision_current_retired_no_submitted_is_synchronous() {
+    fn defer_decision_current_retired_is_adopt() {
         assert_eq!(
             RenderScheduler::defer_resource_release_decision_for(false, Some(BatchState::Retired)),
-            DeferDecision::Synchronous
-        );
-    }
-
-    #[test]
-    fn defer_decision_current_retired_with_submitted_is_last_submitted() {
-        assert_eq!(
-            RenderScheduler::defer_resource_release_decision_for(true, Some(BatchState::Retired)),
-            DeferDecision::AdoptLastSubmitted
+            DeferDecision::AdoptOpen
         );
     }
 
@@ -632,7 +546,7 @@ mod tests {
         );
     }
 
-    // Adopt-branch downstream behavior (PaintBatch::adopt +
+    // AdoptOpen branch's downstream behavior (PaintBatch::adopt +
     // retire_now release) is covered by binary integration tests +
     // hardware smoke — those require a real Vulkan context.
 }
