@@ -110,14 +110,25 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Hardware smoke: TBD (user-owned). The load-bearing test: bee + fuji under adapta-nokto + mate-cc. If `bee` improves, AMD-specific investigation is no longer next-priority.
   - Results: `docs/superpowers/plans/2026-05-14-pixmap-allocation-pool-results.md`
 
+- [x] **GPU trap rasterization — RENDER Trapezoids / Triangles on the GPU** (`151c8be` (plan) + `0f5e605` + `4dd56a6` + `b7d0e77` + `c819a52` + `4fead28` + `5bf046b` + this T6 commit)
+  - Moved RENDER `Trapezoids` / `Triangles` coverage-mask generation off the CPU (where it was 19.73% of CPU per the bee/RDNA2 + adapta-nokto perf trace) onto the GPU via a new `TrapPipeline`. The synchronous CPU rasterize + `MaskScratch::record_upload_r8` upload pair on the X protocol request handler's hot path is gone — `try_vk_render_traps_or_tris` is pure-recording (deferred through `record_paint_batch_op`), so the input loop returns in microseconds instead of blocking per request. The 19.73% CPU cost is zero by construction (code path no longer exists).
+  - T1 (`0f5e605`): `TrapPipeline` infrastructure — new `crates/yserver/src/kms/vk/trap_pipeline.rs` with two pipelines (trap + triangle) sharing one push-const layout (no descriptor sets — per-instance data via vertex attributes). `TrapInstanceData` (40 bytes), `TriangleInstanceData` (24 bytes), `TrapDrawPushConsts` (32 bytes: mask_extent + bbox). `Trapezoid::to_instance_data` + `Triangle::to_instance_data` conversion helpers. `BatchUploadArena` buffer usage gained `VERTEX_BUFFER` flag. Two new shaders (trap.vert/frag.glsl) compiled to SPIR-V via existing build.rs. No caller wired.
+  - T2 (`4dd56a6` + fix-up `b7d0e77`): trapezoid arm wired to GPU. `KmsBackend.trap_pipeline` field + dual ctor init. Per-batch arena upload + `vkCmdDraw(4, n_traps)` into MaskScratch. Mask-LOCAL vertex emit + bbox-origin pushed to fragment so MaskScratch coords always start at (0, 0) where `record_render_composite` reads. Fix-up deferred `set_current_layout` until after fallible record steps succeed (codex T2 P2 — prevents CPU-tracked layout drifting from GPU state on failure).
+  - T3 (`c819a52` + fix-up `4fead28`): triangle arm wired to GPU. Triangle shader handles RENDER's no-fixed-winding-convention via vertex-shader signed-area-orientation + flat-interpolated `orient` sign. Fix-up flipped winding sign (codex T3 P1 — `-1.0` for CCW per the `(-d.y, d.x)` perpendicular convention) and added explicit `orient = 0.0` degenerate handling with fragment `discard` (codex T3 P2 — collinear-but-nonzero-length-edge triangles weren't rejected).
+  - T4 (partial): rendercheck triangles 456/456 PASS, blend 4/4 PASS, coord PASS; composite/cacomposite/gradients didn't complete in T4's time budget. No regressions on what ran. Full validation deferred to user-owned hardware smoke (the linear coverage approximation does NOT need the wedge fallback based on the data so far).
+  - T5 (`5bf046b`): dead-code deletion — `rasterize_trapezoids` + `rasterize_triangles` + `MaskScratch::record_upload_r8` deleted. `rg` returns one doc-comment historical note; zero call sites. The 19.73% CPU cost in the bee adapta-nokto perf trace is gone by construction.
+  - Hardware smoke: TBD (user-owned). Load-bearing test: bee adapta-nokto + mate-cc post-pool + post-GPU-trap should be dramatically improved; window-drag CPU should drop materially; rendercheck full run should be no-regression vs Phase 5 baseline.
+  - Results: `docs/superpowers/plans/2026-05-14-gpu-trap-rasterization-results.md`
+
 ### Remaining — in priority order
 
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
   - Codex's long-term recommendation from 3B salvage: instead of relying on protocol destruction barriers + `queue_wait_idle`, adopt destroyed VkImages into the open `PaintBatch` via `BatchResource` so destruction defers automatically.
   - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F introduced for `MaskScratch` + `dst_readback`, the 3B destruction-barrier collection, the Phase-5 `Retired*Image` flavours, and the pixmap-pool `PooledPixmapReturn` — all into a uniform refcounted-handle model.
-- [ ] **AMD-specific investigation — DEPRIORITIZED pending pixmap-pool hardware smoke**
-  - If T6 hardware smoke confirms the pool closes the bee adapta-nokto + mate-cc lag: AMD-specific investigation drops off the critical path (root cause was the vendor-agnostic kernel allocator burst, not amdgpu-specific behaviour).
-  - If `bee` is still slow post-pool: amdgpu ftrace + ioctl-rate measurement per `project_amd_lag_investigation.md` memory is the next move.
+- [ ] **AMD-specific investigation — DEPRIORITIZED pending bee smoke validation of GPU trap rasterize + pool**
+  - Both load-bearing root causes (pixmap-pool's kernel-allocator burst + GPU-trap's CPU-rasterize-on-hot-path) are addressed structurally and are vendor-agnostic.
+  - If bee hardware smoke confirms adapta-nokto + mate-cc is smooth post-pool + post-GPU-trap: AMD-specific investigation drops off the critical path entirely.
+  - If `bee` is still slow: amdgpu ftrace + ioctl-rate measurement per `project_amd_lag_investigation.md` memory is the next move; the residual cost is somewhere unexpected (libdrm_amdgpu was 4.62% pre-GPU-trap — a candidate but not enough on its own to explain catastrophic lag).
 
 ---
 
