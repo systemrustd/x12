@@ -12,16 +12,26 @@
 //
 // Winding-order handling: RENDER does NOT specify CW vs CCW. The
 // vertex shader computes `orient` (signed-area sign of p1, p2, p3)
-// and passes it through as a flat float (+1 for CCW, -1 for CW).
-// The fragment uses `orient` as the `inside_side` argument for all
-// three `edge_coverage_linear` calls, which flips the half-plane
-// convention to match the actual triangle orientation. This mirrors
-// the CPU reference `point_in_triangle` in `vk/ops/traps.rs:304`,
-// which is sign-agnostic — "interior" = all three barycentric signs
-// agree (all positive OR all negative). The GPU version is
-// equivalent: multiplying every edge's signed-distance by the same
-// `orient` makes "interior" mean "all three edges return their
-// inside-side positive coverage".
+// and passes it through as a flat float (-1 for CCW, +1 for CW,
+// 0 for degenerate/collinear). The fragment uses `orient` as the
+// `inside_side` argument for all three `edge_coverage_linear` calls,
+// which flips the half-plane convention to match the actual triangle
+// orientation. This mirrors the CPU reference `point_in_triangle`
+// in `vk/ops/traps.rs:304`, which is sign-agnostic — "interior" =
+// all three barycentric signs agree (all positive OR all negative).
+//
+// Sign-flip rationale: with edge perpendicular `n = (-d.y, d.x)`
+// (90° CCW from edge direction), interior of a CCW triangle has
+// POSITIVE signed_dist for every edge. To make the coverage formula
+// `clamp(0.5 - signed_dist * inside_side, 0, 1)` return HIGH coverage
+// for interior, we need `signed_dist * inside_side` NEGATIVE → so
+// CCW (positive signed_dist) needs inside_side = -1.
+//
+// Degenerate (collinear) triangle: vertex shader sets `orient = 0.0`
+// when |signed_area_2| is below the area-epsilon. Fragment discards.
+// (Without this, a slanted collinear triangle with three distinct
+// vertices would have nonzero edge lengths and produce non-zero
+// product coverage — incorrect; the triangle covers zero area.)
 //
 // `c_i` from `edge_coverage_linear` is already clamped to [0, 1] —
 // DO NOT take `abs(c_i)`. The sign handling lives in the
@@ -67,6 +77,16 @@ float edge_coverage_linear(vec2 p, vec2 a, vec2 b, float inside_side) {
 }
 
 void main() {
+    // Collinear (degenerate) triangle: the vertex shader signals this
+    // with orient = 0.0. Discard so the fragment contributes nothing
+    // to the coverage mask. (Plain `coverage = 0.0; return;` would
+    // also write zero to the framebuffer, defeating the
+    // additive-blend "no contribution = leave existing value alone"
+    // pattern. `discard` skips the framebuffer write entirely.)
+    if (orient == 0.0) {
+        discard;
+    }
+
     // Translate fragment-local coords to absolute pixel coords for
     // the edge math (the quad emits in mask-local space to land mask
     // data at MaskScratch[(0,0)..(bbox_w, bbox_h)]).

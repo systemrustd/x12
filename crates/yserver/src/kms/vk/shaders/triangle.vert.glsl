@@ -9,11 +9,31 @@
 // Winding-order handling: RENDER does NOT specify a winding
 // convention — triangles arrive in either CW or CCW order. The
 // vertex shader computes the signed-area of (p1, p2, p3) once per
-// instance and forwards its sign as `orient` (flat, +1 / -1) so the
+// instance and forwards its sign as `orient` (flat, -1 / +1 / 0) so the
 // fragment shader can pick a consistent inside-side for each edge
 // regardless of winding. This mirrors the sign-agnostic CPU
 // reference in `vk/ops/traps.rs::point_in_triangle` (which uses
 // "all-three-signs-agree" barycentric tests).
+//
+// Sign convention (load-bearing): with `edge_coverage_linear`'s
+// perpendicular `n = (-d.y, d.x)` (90° CCW from edge direction),
+// an interior pixel of a CCW-wound triangle has POSITIVE signed_dist
+// against each edge (interior is in +n direction). The shader's
+// coverage formula `clamp(0.5 - signed_dist * inside_side, 0, 1)`
+// returns HIGH coverage when `signed_dist * inside_side < 0`.
+// Therefore: for CCW (signed_area_2 > 0), `inside_side = -1`. For
+// CW (signed_area_2 < 0), `inside_side = +1`. The previous
+// convention (+1 for CCW) was inverted and made positive-area
+// triangles render empty (caught by codex T3 review P1).
+//
+// Degenerate (collinear) triangle handling: when |signed_area_2|
+// is below an area-epsilon, the triangle covers zero area. The
+// `len < 1e-6` zero-length-edge guard inside `edge_coverage_linear`
+// only catches edges that are literally zero-length — a slanted
+// collinear triangle with three distinct vertices has nonzero edge
+// lengths and would produce nonzero (incorrect) coverage. The
+// vertex shader sets `orient = 0.0` for these; the fragment
+// shader discards on `orient == 0.0`.
 
 layout(push_constant) uniform PushConsts {
     vec2 mask_extent;        // mask scratch image extent (pixels)
@@ -59,13 +79,25 @@ void main() {
     p3 = in_p3;
 
     // Signed area × 2 of (p1, p2, p3). Positive ⇒ CCW; negative ⇒ CW;
-    // ~0 ⇒ collinear (degenerate). The degenerate case is handled
-    // downstream by the `len < 1e-6` guard inside
-    // `edge_coverage_linear`, which forces one or more edges to
-    // return 0 coverage, collapsing the product to 0. So the sign
-    // chosen here for a degenerate triangle is irrelevant.
+    // |area_2| below the epsilon ⇒ collinear (degenerate); the
+    // fragment shader discards on `orient == 0.0`.
+    //
+    // Sign convention (see header doc): CCW interior has positive
+    // signed_dist against each edge; we want signed_dist * inside_side
+    // to be NEGATIVE for interior so the coverage formula returns
+    // high values. Hence CCW → orient = -1, CW → orient = +1.
     float signed_area_2 =
         (in_p2.x - in_p1.x) * (in_p3.y - in_p1.y) -
         (in_p2.y - in_p1.y) * (in_p3.x - in_p1.x);
-    orient = signed_area_2 >= 0.0 ? 1.0 : -1.0;
+    // Epsilon is in pixel² units. 1e-3 covers floating-point noise
+    // around collinear configurations while allowing any visibly
+    // non-degenerate triangle through (~0.03 px on a side).
+    float area_eps = 1e-3;
+    if (abs(signed_area_2) < area_eps) {
+        orient = 0.0;
+    } else if (signed_area_2 > 0.0) {
+        orient = -1.0;
+    } else {
+        orient = 1.0;
+    }
 }
