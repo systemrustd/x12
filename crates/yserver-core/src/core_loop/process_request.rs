@@ -5813,8 +5813,23 @@ fn handle_xi2_request(
             // rubber-banded from screen origin to the click point on
             // any single click. Wire the real cursor position through
             // from the backend.
-            let queried_window = if body.len() >= 8 {
-                ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]))
+            // XIQueryPointer body layout (per xinput.xml):
+            //   bytes [0..4] window (WINDOW)
+            //   bytes [4..6] deviceid (u16)
+            //   bytes [6..8] pad
+            // Previously this read body[4..8], which is deviceid + pad
+            // — i.e. always interpreted as some sentinel xid (e.g.
+            // `0xfd820002`, `0xffff0002`). Then
+            // `window_absolute_position` couldn't find the bogus xid
+            // and returned `(0, 0)`, so the win-relative coords came
+            // out equal to the root-absolute coords. GTK popups in
+            // file managers (Thunar, Caja) place themselves at
+            // `(window_origin + win_xy + menu_offset)` — with our
+            // wrong reply they ended up offset by the window's own
+            // origin, and rubber-band drags anchored at root (0,0)
+            // instead of at the click point.
+            let queried_window = if body.len() >= 4 {
+                ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
             } else {
                 ROOT_WINDOW
             };
@@ -6535,8 +6550,16 @@ fn handle_configure_window(
         .as_ref()
         .and_then(|(id, _, _)| state.resources.window(*id).map(|w| w.parent));
     debug!(
-        "client {} #{} ConfigureWindow 0x{:x} mask=0x{:x} host_xid={:?}",
-        client_id.0, sequence.0, request.window.0, request.value_mask, host_xid
+        "client {} #{} ConfigureWindow 0x{:x} mask=0x{:x} x={:?} y={:?} w={:?} h={:?} host_xid={:?}",
+        client_id.0,
+        sequence.0,
+        request.window.0,
+        request.value_mask,
+        request.x,
+        request.y,
+        request.width,
+        request.height,
+        host_xid,
     );
     if let Some(xid) = host_xid {
         let _ = backend.configure_subwindow(
@@ -7289,7 +7312,6 @@ fn handle_get_geometry(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} GetGeometry", client_id.0, sequence.0);
     let drawable = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
     let geometry = state
         .resources
@@ -7308,6 +7330,19 @@ fn handle_get_geometry(
             14,
         );
     };
+    debug!(
+        "client {} #{} GetGeometry 0x{:x} -> root=0x{:x} pos=({},{}) size=({}x{}) border={} depth={}",
+        client_id.0,
+        sequence.0,
+        drawable.0,
+        geometry.root.0,
+        geometry.x,
+        geometry.y,
+        geometry.width,
+        geometry.height,
+        geometry.border_width,
+        geometry.depth,
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -10646,11 +10681,7 @@ fn handle_translate_coordinates(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!(
-        "client {} #{} TranslateCoordinates",
-        client_id.0, sequence.0
-    );
-    let (child, dst_x, dst_y) = if body.len() >= 12 {
+    let (child, dst_x, dst_y, log_src, log_dst, log_src_xy) = if body.len() >= 12 {
         let src_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let src_x = i16::from_le_bytes([body[8], body[9]]);
@@ -10665,10 +10696,29 @@ fn handle_translate_coordinates(
             .resources
             .child_containing_point(dst_window, abs_x, abs_y)
             .unwrap_or(ResourceId(0));
-        (child, dst_x, dst_y)
+        (
+            child,
+            dst_x,
+            dst_y,
+            src_window.0,
+            dst_window.0,
+            (src_x, src_y),
+        )
     } else {
-        (ResourceId(0), 0i16, 0i16)
+        (ResourceId(0), 0i16, 0i16, 0u32, 0u32, (0i16, 0i16))
     };
+    debug!(
+        "client {} #{} TranslateCoordinates src=0x{:x} dst=0x{:x} src_xy=({},{}) -> dst_xy=({},{}) child=0x{:x}",
+        client_id.0,
+        sequence.0,
+        log_src,
+        log_dst,
+        log_src_xy.0,
+        log_src_xy.1,
+        dst_x,
+        dst_y,
+        child.0,
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
