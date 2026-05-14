@@ -9847,16 +9847,54 @@ fn handle_send_event(
         }
     }
     let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
-    debug!(
-        "client {} #{} SendEvent type={} dest=0x{:x} event_mask=0x{:x} propagate={} targets={:?}",
-        client_id.0,
-        sequence.0,
-        req.event[0] & 0x7f,
-        req.destination.0,
-        req.event_mask,
-        req.propagate,
-        targets.iter().map(|c| c.0).collect::<Vec<_>>(),
-    );
+    let core_type_logged = req.event[0] & 0x7f;
+    // For synthetic ConfigureNotify (type=22), decode and log x/y/w/h
+    // so we can see what the WM tells clients about their root
+    // position. The wire body (after the 4-byte type/seq prefix) is:
+    //   event_window(4) + window(4) + above_sibling(4) +
+    //   x(2) + y(2) + width(2) + height(2) + border(2) +
+    //   override_redirect(1) + pad(1)
+    if core_type_logged == 22 {
+        let e = &req.event;
+        let event_w = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+        let window_w = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+        let above = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+        let x = i16::from_le_bytes([e[16], e[17]]);
+        let y = i16::from_le_bytes([e[18], e[19]]);
+        let w = u16::from_le_bytes([e[20], e[21]]);
+        let h = u16::from_le_bytes([e[22], e[23]]);
+        let bw = u16::from_le_bytes([e[24], e[25]]);
+        let or = e[26];
+        debug!(
+            "client {} #{} SendEvent type=22 (ConfigureNotify) dest=0x{:x} \
+             ev_win=0x{:x} win=0x{:x} above=0x{:x} pos=({},{}) size=({}x{}) \
+             border={} override={} targets={:?}",
+            client_id.0,
+            sequence.0,
+            req.destination.0,
+            event_w,
+            window_w,
+            above,
+            x,
+            y,
+            w,
+            h,
+            bw,
+            or,
+            targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+        );
+    } else {
+        debug!(
+            "client {} #{} SendEvent type={} dest=0x{:x} event_mask=0x{:x} propagate={} targets={:?}",
+            client_id.0,
+            sequence.0,
+            core_type_logged,
+            req.destination.0,
+            req.event_mask,
+            req.propagate,
+            targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+        );
+    }
     Ok(RequestOutcome::Handled)
 }
 

@@ -69,27 +69,70 @@ once the underlying patterns are understood.
       after caja launches, vs after a view-switch. The difference
       tells which window the wheel events are landing on (vs which
       window caja's view widget expects). Filed 2026-05-13.
-- [ ] **GTK file-manager right-click popup offset + wrong-axis
-      rubber-band selection (Caja + Thunar).** Observed 2026-05-13
-      in caja (dual-screen MATE, 5120×1440 = 2×2560×1440) and
-      2026-05-15 in Thunar (single-screen xfce, 1920×1080) — same
-      bug-class affects both file managers, so it isn't dual-screen
-      specific. Right-clicking an item produces a context menu
-      displaced from the click origin in both axes; dragging to
-      rubber-band selects the wrong region. Click events themselves
-      look correctly coordinate-translated in pointer_fanout debug
-      logs (`root=(x,y) event_xy=(rx,ry)` with sane window-relative
-      deltas). So the bug is most likely in either (a) the
-      popup-window placement / drag-anchor math the file manager
-      does (it queries pointer / window position via
-      `XQueryPointer` / `XIQueryPointer` / `XTranslateCoordinates`
-      and adds an offset; one of those queries returns wrong
-      values), or (b) a yserver reply we send for one of those
-      queries having a bad coordinate frame. Worth instrumenting
-      `XQueryPointer` / `XIQueryPointer` / `XTranslateCoordinates`
-      replies with their per-call coords and comparing against the
-      expected. Could also be xfixes ShapeExtents or the popup's
-      synthesize-ConfigureNotify path.
+- [ ] **GTK file-manager right-click popup offset (X-only) +
+      rubber-band selection wrong (Caja + Thunar).** Caja
+      2026-05-13 (dual-screen MATE), Thunar 2026-05-15
+      (single-screen xfce). Right-clicking produces a context menu
+      displaced from the click; dragging rubber-bands from the wrong
+      anchor. Partially diagnosed 2026-05-15:
+
+      Concrete observation in xfce / Thunar at 1920×1080, single
+      output:
+      - xfwm4 reparents Thunar (`0xf00007`) into a frame at
+        root `(635, 296)`, Thunar at frame-rel `(5, 29)` → Thunar
+        root origin `(640, 325)`.
+      - Right-click event delivered with `event_x=240, event_y=102,
+        root_x=880, root_y=427` — all correct.
+      - xfwm4 sends synthetic ConfigureNotify `pos=(640, 325)` to
+        Thunar — also correct (confirmed via SendEvent body log).
+      - Thunar then calls
+        `XTranslateCoordinates(0xf00007, root, 880, 427) → (1520, 752)`
+        — passing the click's *root* coords as if they were
+        *window-relative* to Thunar. yserver returns the
+        mathematically correct answer for that input (640+880,
+        325+427), but Thunar shouldn't have asked.
+      - Popup configures to `(1514, 409)`. X = `event.x_root +
+        thunar.origin.x - 6` (i.e. `event.x_root` *plus* the X
+        origin Thunar already knows about, then a small menu
+        offset). Y = `event.y_root - 18` (correct, only the small
+        menu offset — Y origin is *not* double-added).
+
+      The bug is purely **X-axis**: GTK adds Thunar's root X origin
+      to `event.x_root` for popup placement but doesn't do the
+      same for Y. Same GTK code runs on real X.Org without the bug,
+      so yserver is sending Thunar / GTK one specific value that's
+      wrong on its X coordinate only. Eliminated so far:
+      `XIQueryPointer` reply (fixed offset bug in commit `2be99f8`,
+      still doesn't fix this), `XQueryPointer` (Thunar only calls
+      it once at startup), `XTranslateCoordinates` (returns the
+      arithmetically correct value for what was asked),
+      `GetGeometry` (returns parent-relative `(5,29)` for Thunar —
+      correct), `SendEvent` ConfigureNotify
+      (`pos=(640,325)` is correct), screen size (1920×1080
+      single output, RANDR CRTC at `(0,0)`).
+
+      Next-round candidates worth instrumenting (the asymmetric
+      X-only nature is the clue — find a property/reply that has
+      separate X and Y where ours has wrong X but right Y):
+      - `_NET_FRAME_EXTENTS` value xfwm4 sets on Thunar (decode
+        ChangeProperty payload for atom 78). If `left` is being
+        reported as `thunar.origin.x = 640` instead of the actual
+        frame inset (5px), that'd match the symptom.
+      - `_NET_WORKAREA` value (atom 130). If x_origin advertised
+        is non-zero, popup placement is shifted.
+      - GTK's `gdk_window_get_root_origin` on internal sub-windows
+        — Thunar may use a popup-helper window's origin, and we
+        may return `(640, 0)` if our window-tracking is borked
+        for that specific window class.
+      - xfwm4's frame computation: maybe yserver returns
+        `XQueryTree(frame)` with a phantom child that confuses the
+        frame-extents calculation.
+
+      The diagnostic infra is already in place: TranslateCoord,
+      GetGeometry, ConfigureWindow x/y, SendEvent ConfigureNotify
+      body, WM_CLASS/PID, XIQueryPointer. Next session: add
+      ChangeProperty payload logging for `_NET_FRAME_EXTENTS` and
+      `_NET_WORKAREA` and re-smoke.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
