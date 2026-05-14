@@ -8046,8 +8046,9 @@ impl KmsBackend {
         // `COLOR_ATTACHMENT_OPTIMAL` (composite leaves it there) or
         // sometimes `PRESENT_SRC_KHR` after a flip — use GENERAL on
         // the dst side which is permissive enough not to fight either.
-        // run_one_shot_op submits + waits idle, so when it returns the
-        // staging buffer is host-coherent and ready to read.
+        // run_one_shot_op submits and waits via a per-op VkFence
+        // (5-T1), so when it returns the staging buffer is
+        // host-coherent and ready to read.
         let run_result = run_one_shot_op(vk, pool_handle, |vk, cb| {
             let pre = [ash::vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)

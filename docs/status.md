@@ -92,6 +92,14 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - **Hardware smoke: confirmed on fuji (2026-05-14)** — heavy GTK use (GIMP drag, steady-state mate session) is now low-CPU and lag-free; "snappy as fuck" per user. Adapta + mate-cc burst case unchanged (separate workload, separate phase below).
   - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase4-results.md`
 
+- [x] **Phase 5 — Targeted `VkFence` for run_one_shot_op + scratch grow defer-release** (`604f009` + `c6dfecc` + `eea0316` + `067b6c3` + `43dd62c` + `11321b6` + this T7 commit)
+  - T1: `run_one_shot_op` swapped `queue_wait_idle(graphics_queue)` for per-op `VkFence` + `wait_for_fences`. 5-path failure taxonomy (extends Phase 4's 4-path model with pre-submit failure window of `begin` / `record` / `end`). `cb_safe_to_free` flag gates outer CB free. 5 in-scope callers (`hw_cursor_refresh`, `read_mirror_pixels`, `try_vk_get_image_pixels`, `dump_scanout_one`, `run_legacy_paint_op`) latch `renderer_failed` on Err.
+  - T2: `RenderScheduler::defer_resource_release` adopts a `BatchResource` into the open paint batch (lazy-Idle-open) when any live batch might reference it; synchronous release otherwise. `Poisoned` current batch is discarded before deciding (Drop on Poisoned is no-op → can't host adoptions). Companion `defer_resource_release_decision_for` pure helper + 10-case test matrix.
+  - T3 / T4 / T5: `CopyScratch::ensure_size_returning_old` / `DstReadback::ensure_returning_old` / `MaskScratch::ensure_image_size_returning_old` return the OLD image wrapped as `Retired*Image: BatchResource`; callers defer-release through the scheduler. The three pre-flush gates (3D `CopyScratch`, 3F-1 `DstReadback`, 3F-2 `MaskScratch+DstReadback`) are entirely gone.
+  - T6: redundant `queue_wait_idle`s deleted from `OpsStaging::ensure` and `GlyphAtlas::grow_staging`. Post-T1, every caller of these grow paths goes through `run_one_shot_op` whose per-op fence already retired the OLD buffer's last referencing CB. Audit comments left at both sites.
+  - Hardware smoke: TBD (user-owned).
+  - Results: `docs/superpowers/plans/2026-05-14-rendering-rearchitecture-phase5-results.md`
+
 ### Remaining — in priority order
 
 - [ ] **Pixmap-allocation pool — burst-absorbing `VkImage` recycling** (was: "AMD investigation phase")
@@ -100,10 +108,6 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Root cause per perf data + interactive testing: yserver's per-pixmap `VkImage`/memory/VA alloc-free path can't absorb workload bursts. mate-cc launcher first-paint and system-wide theme transitions both fire dense `CreatePixmap`/`FreePixmap` cycles for small (16x16, 32x32) widget pixmaps; the kernel allocator serializes under burst rate.
   - Fix shape: `VkImagePool` on `KmsBackend` keyed by `(extent, format, usage)`. `FreePixmap` of small pixmaps returns image to pool; `CreatePixmap` checks pool first. Bounded pool size per bucket. Drain at backend teardown.
   - Validation: adapta + mate-cc apply test on bee + fuji.
-- [ ] **Phase 5 — Targeted `VkFence` for record_get_image + atlas grow**
-  - `record_get_image` still on `run_one_shot_op + queue_wait_idle` (4 readback handlers).
-  - `GlyphAtlas::intern`'s per-glyph one-shot upload + waitidle (phase-3E deliberate defer; profile shows it's not steady-state hot — re-evaluate priority).
-  - `MaskScratch` / `CopyScratch` / `dst_readback` `ensure_size` grow paths (after 3F migrated their consumers, the grow can defer through the batch retire queue instead of waitidle).
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
   - Codex's long-term recommendation from 3B salvage: instead of relying on protocol destruction barriers + `queue_wait_idle`, adopt destroyed VkImages into the open `PaintBatch` via `BatchResource` so destruction defers automatically.
   - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F will introduce for `MaskScratch` + `dst_readback`, and the 3B destruction-barrier collection.

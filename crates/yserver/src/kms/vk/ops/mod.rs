@@ -239,10 +239,10 @@ impl OpsStaging {
         self.size
     }
 
-    /// Grow if needed so `at_least` bytes fit. Idle-waits the graphics
-    /// queue before tearing the old buffer down — eager-submit-per-op
-    /// means there's no in-flight work referencing it, but cheap to be
-    /// safe.
+    /// Grow if needed so `at_least` bytes fit. After 5-T6, no
+    /// synchronous wait — callers all wait per-op via
+    /// `run_one_shot_op`'s VkFence, so the OLD buffer's last
+    /// referencing CB has already retired.
     pub fn ensure(&mut self, at_least: u64) -> Result<(), vk::Result> {
         if at_least <= self.size {
             return Ok(());
