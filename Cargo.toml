@@ -11,6 +11,17 @@ resolver = "3"
 # release-build flamegraph land in [unknown] frames. Optimisation level
 # and codegen are unchanged — only the debug-info section grows
 # (binary ~3-4x bigger, runtime perf identical).
+#
+# For profiling work that needs reliable stack walking, also rebuild
+# with frame pointers and use `perf record --call-graph fp`:
+#
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release -p yserver
+#   perf record -F 999 -p $(pgrep yserver) -g --call-graph fp ...
+#
+# DWARF unwinding without frame pointers reads a stack snapshot and
+# reconstructs frames from CFI; it fails partway through inlined
+# Rust call chains and produces [unknown] frames. Frame pointers
+# (~1-2% runtime cost) make the unwind path infallible.
 [profile.release]
 debug = true
 

@@ -443,8 +443,15 @@ yserver-mate-hw log="debug":
 # stderr formatting cost (observed at ~5% of CPU under debug+debug
 # build) or by the underlying paint pipeline. If hover responds
 # noticeably faster than `yserver-mate-hw`, logging was the bottleneck.
+#
+# Build is forced with `-C force-frame-pointers=yes` so that
+# `perf record --call-graph fp` can walk the stack reliably for
+# flamegraphs. Without this, optimized Rust release builds produce
+# ~66% [unknown] frames in the flamegraph (DWARF unwinding fails
+# partway through inlined call chains). ~1-2% runtime cost; harmless
+# for general release use, essential for profiling.
 yserver-mate-hw-release log="warn":
-    cargo build --release --bin yserver
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
@@ -468,7 +475,7 @@ yserver-mate-hw-release log="warn":
 # through; pass `log=warn` if you need quieter output, but you'll
 # lose the rollup lines (they're info!-level).
 yserver-mate-hw-telemetry log="info":
-    cargo build --release --bin yserver
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw.log 2>&1 &\
