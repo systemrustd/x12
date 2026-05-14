@@ -11,6 +11,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::{device::VkContext, ops::run_one_shot_op};
+use crate::kms::scheduler::paint_batch::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CopyScratchError {
@@ -23,6 +24,25 @@ pub enum CopyScratchError {
 impl From<vk::Result> for CopyScratchError {
     fn from(r: vk::Result) -> Self {
         CopyScratchError::Vk(r)
+    }
+}
+
+/// 5-T3: wraps the just-replaced scratch image + memory so the
+/// scheduler can release it after the in-flight batch retires. The
+/// new image has already been installed on `CopyScratch` by the time
+/// this is constructed.
+#[derive(Debug)]
+struct RetiredCopyScratchImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl BatchResource for RetiredCopyScratchImage {
+    fn release(self: Box<Self>, vk: &VkContext) {
+        unsafe {
+            vk.device.destroy_image(self.image, None);
+            vk.device.free_memory(self.memory, None);
+        }
     }
 }
 
@@ -61,37 +81,36 @@ impl CopyScratch {
         self.extent
     }
 
-    /// True if a later `ensure_size(width, height)` call would reallocate
-    /// the scratch image. Callers in batched paint paths use this BEFORE
-    /// entering `record_paint_batch_op` so they can flush any in-flight
-    /// batch — `ensure_size` destroys the old image after `queue_wait_idle`,
-    /// which does NOT wait for un-submitted commands. Without a pre-flush,
-    /// an open batch CB embedding the old image would dangle.
-    pub fn needs_grow(&self, width: u32, height: u32) -> bool {
-        width > self.extent.width || height > self.extent.height
-    }
-
-    /// Ensure the scratch is at least `(width, height)` pixels.
-    /// Reallocates and resets the layout if a grow happens.
-    pub fn ensure_size(&mut self, width: u32, height: u32) -> Result<(), CopyScratchError> {
+    /// 5-T3: like the pre-Phase-5 `ensure_size` but returns the old
+    /// image wrapped as a `BatchResource` for the caller to defer-release
+    /// through the scheduler. Returns `Ok(None)` if no grow was needed
+    /// (old image is fine, scratch unchanged).
+    ///
+    /// Allocation-first ordering: if `allocate_image` fails the scratch
+    /// is untouched and the caller sees `Err`. Past the successful
+    /// `allocate_image` the function MUST NOT fail.
+    pub fn ensure_size_returning_old(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn BatchResource>>, CopyScratchError> {
         if width <= self.extent.width && height <= self.extent.height {
-            return Ok(());
+            return Ok(None);
         }
         let new_extent = vk::Extent2D {
             width: self.extent.width.max(width).next_power_of_two().max(256),
             height: self.extent.height.max(height).next_power_of_two().max(256),
         };
         let (image, memory) = allocate_image(&self.vk, new_extent)?;
-        unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
-        }
-        self.image = image;
-        self.memory = memory;
+        // Allocation succeeded — past here the function MUST NOT fail.
+        let old_image = std::mem::replace(&mut self.image, image);
+        let old_memory = std::mem::replace(&mut self.memory, memory);
         self.extent = new_extent;
         self.current_layout = vk::ImageLayout::UNDEFINED;
-        Ok(())
+        Ok(Some(Box::new(RetiredCopyScratchImage {
+            image: old_image,
+            memory: old_memory,
+        })))
     }
 
     /// Record a barrier transitioning the scratch into

@@ -3323,28 +3323,37 @@ impl KmsBackend {
                 // vk_arc / pool_handle come from the outer-scope
                 // paint_resources() call at the top of this function.
 
-                // Step 1: If a scratch resize is needed, pre-flush the
-                // batch BEFORE acquiring any mut borrows AND BEFORE
-                // scratch.ensure_size (which is the operation that
-                // would otherwise free an image still referenced by
-                // an unsubmitted batch CB). ensure_size destroys the
-                // old image after queue_wait_idle, which does NOT
-                // wait for un-submitted commands. This check uses a
-                // shared borrow of self.copy_scratch that ends before
-                // the flush_if_needed call (&mut self).
-                let needs_scratch_grow = self
-                    .copy_scratch
-                    .as_ref()
-                    .is_some_and(|s| s.needs_grow(u32::from(width), u32::from(height)));
-                if needs_scratch_grow {
-                    use crate::kms::scheduler::paint_batch::BatchFlushReason;
-                    if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                        log::warn!("vk copy same-overlap: pre-resize flush failed: {e:?}");
+                // 5-T3: defer-release replaces the pre-flush gate. No
+                // need to drain the open batch — the old scratch image
+                // is adopted into the scheduler's retire flow so it
+                // survives any in-flight CB.
+                //
+                // CRITICAL borrow-checker note (codex P1): the scratch's
+                // &mut borrow MUST end BEFORE
+                // `self.scheduler.defer_resource_release` borrows
+                // `&mut self`. Use a tight block so the `as_mut()`
+                // binding drops at the closing brace. Reborrow
+                // `self.copy_scratch` later (for the recorder closure)
+                // as a fresh borrow — that's fine because the earlier
+                // &mut already ended.
+                let retired = {
+                    let Some(scratch) = self.copy_scratch.as_mut() else {
                         return false;
+                    };
+                    match scratch.ensure_size_returning_old(u32::from(width), u32::from(height)) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::warn!("vk copy: scratch resize failed: {e:?}");
+                            return false;
+                        }
                     }
+                }; // <-- scratch's &mut borrow ends here.
+                if let Some(old) = retired {
+                    self.scheduler
+                        .defer_resource_release(vk_arc.clone(), pool_handle, old);
                 }
 
-                // Step 2: Resolve the mirror; we need a single &mut to it.
+                // Resolve the mirror; we need a single &mut to it.
                 let Some(mirror) = self
                     .windows
                     .get_mut(&src_xid)
@@ -3370,18 +3379,13 @@ impl KmsBackend {
                     return true;
                 }
 
-                // Step 3: Re-borrow scratch + ensure_size. If the
-                // pre-flush above ran, ensure_size's destroy-old path
-                // is safe because the batch was fully retired. If
-                // no flush was needed (no grow), ensure_size is a no-op
-                // on the dimension check.
+                // Re-borrow scratch for the recorder closure. The
+                // resize above (if any) already happened; here we
+                // just hand the live `&mut CopyScratch` to the
+                // record_copy_area_same_overlap helper.
                 let Some(scratch) = self.copy_scratch.as_mut() else {
                     return false;
                 };
-                if let Err(e) = scratch.ensure_size(u32::from(width), u32::from(height)) {
-                    log::warn!("vk copy: scratch resize failed: {e:?}");
-                    return false;
-                }
                 let bbox_origin = (i32::from(src_x), i32::from(src_y));
 
                 let result =
