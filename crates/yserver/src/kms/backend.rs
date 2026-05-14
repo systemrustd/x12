@@ -11698,45 +11698,26 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pic: u32,
     ) -> io::Result<()> {
-        // Synchronous protocol-level removal: the picture XID is no
-        // longer resolvable, so no subsequent X11 request can
-        // record a paint op referencing it. The picture's rescued
-        // mirror (if any) is the only Vulkan handle still alive
-        // after this point.
-        self.pictures.remove(&host_pic);
-        let Some(rescued) = self.picture_rescued_images.remove(&host_pic) else {
-            return Ok(());
-        };
-
-        // Adopt the rescued mirror into the open paint batch via
-        // defer_resource_release. The currently-open batch's fence
-        // signals AFTER every previously-submitted batch's fence
-        // (same-queue FIFO submit order), so any in-flight CB that
-        // references this image will have completed by the time
-        // `RescuedMirrorRelease::release` drops the image. If no
-        // batch is open and none in flight, `defer_resource_release`
-        // releases synchronously on the same thread.
+        // Phase-3B drawable-destruction barrier: a batched paint or
+        // in-flight composite may still reference this picture's
+        // rescued vk_mirror (if any). Flush before dropping.
         //
-        // Previously this site issued `flush_if_needed(ProtocolBarrier)`
-        // — a synchronous queue_submit2 + wait_for_fences per
-        // FreePicture. Default-theme MATE drag telemetry showed
-        // picture_destroy peaking at 975/sec on bee (RDNA2 / RADV)
-        // and 888/sec on fuji (Kaby Lake HD 620 / ANV), making this
-        // the dominant ProtocolBarrier source.
-        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
-            // Renderer dead or Vulkan unavailable — drop the rescued
-            // image directly. Same end state as the prior code's
-            // error path, but without the surfaced error: FreePicture
-            // has no reply, so the client never observed the error
-            // anyway, and the renderer-failed latch is set elsewhere
-            // by strict paths that DO need to surface it.
-            drop(rescued);
-            return Ok(());
-        };
+        // On strict-flush Err: DO NOT drop the picture or its
+        // rescued image. Leave them in place so any GPU references
+        // outlive; backend teardown drains.
         crate::vk_count!(pb_picture_destroy);
-        let wrapper = Box::new(crate::kms::vk::target::RescuedMirrorRelease { image: rescued });
-        self.scheduler
-            .defer_resource_release(vk_arc, pool_handle, wrapper);
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::error!(
+                "render_free_picture: pre-destruction flush failed ({e:?}); leaving picture + rescued image in place to avoid UAF"
+            );
+            return Err(std::io::Error::other(format!(
+                "render_free_picture pre-flush failed: {e:?}"
+            )));
+        }
+        self.pictures.remove(&host_pic);
+        self.picture_rescued_images.remove(&host_pic);
         Ok(())
     }
 

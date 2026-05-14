@@ -974,38 +974,6 @@ impl DrawableImage {
     }
 }
 
-/// `BatchResource` wrapper that releases a `DrawableImage` at batch-
-/// retire time. Used by `render_free_picture` to defer-drop a
-/// rescued picture mirror: the X RENDER FreePicture is processed
-/// synchronously (XID removed from the picture map) but the
-/// underlying `VkImage` / `VkImageView` / `VkDeviceMemory` may
-/// still be referenced by an in-flight command buffer. Adopting
-/// into the open paint batch via `RenderScheduler::defer_resource_release`
-/// keeps the image alive until that batch's fence signals, at
-/// which point `release` drops the `Box`, `DrawableImage::Drop`
-/// fires, and the Vulkan handles are destroyed.
-pub struct RescuedMirrorRelease {
-    pub image: DrawableImage,
-}
-
-impl std::fmt::Debug for RescuedMirrorRelease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // DrawableImage doesn't impl Debug (no useful info — just
-        // raw Vulkan handles). The retire-resources Vec carrying
-        // this only debug-prints the wrapper type name.
-        f.debug_struct("RescuedMirrorRelease")
-            .finish_non_exhaustive()
-    }
-}
-
-impl crate::kms::scheduler::paint_batch::BatchResource for RescuedMirrorRelease {
-    fn release(self: Box<Self>, _vk: &VkContext) {
-        // Drop self → drops self.image → DrawableImage::Drop
-        // destroys VkImage / VkImageView / VkDeviceMemory.
-        drop(self);
-    }
-}
-
 impl Drop for DrawableImage {
     fn drop(&mut self) {
         unsafe {
