@@ -4259,15 +4259,18 @@ impl KmsBackend {
                     }
                 };
 
-                // Host → staging memcpy with depth-specific byte
-                // permutation. For depth-24/32 the pixman arm reads
-                // `r=data[0], g=data[1], b=data[2], a=data[3]` and
-                // writes the u32 `(a<<24)|(r<<16)|(g<<8)|b`, which
-                // lays down memory bytes `[b, g, r, a]` in a u32 LE
-                // word — exactly what `B8G8R8A8_UNORM` reads as
-                // `(B, G, R, A)`. For depth-8 the pixman path is a
-                // per-byte copy; mirror is R8, same byte-per-pixel
-                // layout.
+                // Host → staging memcpy. For depth-24/32 the X11
+                // wire is ZPixmap in the visual's byte order: with our
+                // advertised masks (R=0x00FF0000, G=0x0000FF00,
+                // B=0x000000FF) and an LE client, a 32-bit pixel
+                // `(A<<24)|(R<<16)|(G<<8)|B` is written LE → memory
+                // bytes `[B, G, R, A]`. That already matches
+                // `B8G8R8A8_UNORM`'s memory order, so depth-32 is a
+                // straight memcpy. depth-24 has the same byte layout
+                // on the wire but the 4th byte is undefined padding;
+                // overwrite it with 0xFF so the mirror reads opaque
+                // for RENDER composites. For depth-8 it's a per-byte
+                // copy; mirror is R8, same byte-per-pixel layout.
                 let staging_base = alloc.mapped_ptr.as_ptr();
                 for plan in &plans {
                     let row_dst_bytes = plan.extent_w as usize * src_bpp;
@@ -4308,24 +4311,16 @@ impl KmsBackend {
                                     std::ptr::copy_nonoverlapping(src, dst_row, row_dst_bytes);
                                 }
                                 24 | 32 => {
-                                    // 4 bpp with byte permutation. src
-                                    // bytes are conventionally
-                                    // [r, g, b, a]; we emit [b, g, r, a]
-                                    // (or [b, g, r, 0xFF] for depth==24)
-                                    // to match the `B8G8R8A8_UNORM`
-                                    // mirror's memory order.
+                                    // Wire bytes [B, G, R, A] already
+                                    // match B8G8R8A8_UNORM. depth-32:
+                                    // straight memcpy. depth-24: copy
+                                    // then stamp byte[3] = 0xFF.
                                     let src = src_row.add(plan.src_x as usize * 4);
-                                    for col in 0..plan.extent_w as usize {
-                                        let s = src.add(col * 4);
-                                        let d = dst_row.add(col * 4);
-                                        let r = *s;
-                                        let g = *s.add(1);
-                                        let b = *s.add(2);
-                                        let a = if depth == 32 { *s.add(3) } else { 0xFFu8 };
-                                        *d = b;
-                                        *d.add(1) = g;
-                                        *d.add(2) = r;
-                                        *d.add(3) = a;
+                                    std::ptr::copy_nonoverlapping(src, dst_row, row_dst_bytes);
+                                    if depth == 24 {
+                                        for col in 0..plan.extent_w as usize {
+                                            *dst_row.add(col * 4 + 3) = 0xFFu8;
+                                        }
                                     }
                                 }
                                 _ => unreachable!(),

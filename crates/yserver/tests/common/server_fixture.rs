@@ -660,10 +660,12 @@ impl ServerFixture {
 
     /// `PutImage` (opcode 72) ZPixmap of `data` into `drawable` at
     /// `(dst_x, dst_y)`. `data` is the X11 ZPixmap wire payload —
-    /// for depth 24/32 that's `width * height` 4-byte BGRA-ish
-    /// pixels (X11 actually uses `[r, g, b, a]` byte order on the
-    /// wire; the backend permutes to the mirror's BGRA layout).
-    /// Pad to a 4-byte boundary; X11 wire requires it.
+    /// for depth 24/32 that's `width * height` 4-byte pixels in the
+    /// visual's byte order. yserver advertises `red=0x00FF0000`,
+    /// `green=0x0000FF00`, `blue=0x000000FF`, so the LE wire
+    /// encoding is `[B, G, R, A]` (matching the mirror's
+    /// `B8G8R8A8_UNORM` layout). Pad to a 4-byte boundary;
+    /// X11 wire requires it.
     pub fn put_image_zpixmap(
         &mut self,
         drawable: ResourceId,

@@ -203,8 +203,8 @@ fn copy_area_preserves_alpha_on_depth32_argb() {
     for _ in 0..8 {
         for x in 0..8 {
             let a = if x < 4 { 0x80 } else { 0xC0 };
-            // wire order: r, g, b, a
-            data.extend_from_slice(&[0x10, 0x20, 0x30, a]);
+            // wire order: B, G, R, A (visual byte order on LE)
+            data.extend_from_slice(&[0x30, 0x20, 0x10, a]);
         }
     }
     fix.put_image_zpixmap(src, gc, 32, 0, 0, 8, 8, &data);
@@ -262,10 +262,11 @@ fn put_image_zpixmap_writes_alpha_255_on_depth24() {
     let win = fix.create_window(8, 8, 24);
     fix.map_window(win);
     let gc = fix.create_gc(win, 0);
-    // X11 wire: 4 bytes per pixel `[r, g, b, a]`. Client passes
-    // a=0 — under the L1 contract the backend must overwrite with
-    // 0xFF for depth-24 destinations.
-    let pixel = [0xff, 0x80, 0x40, 0x00]; // r=ff g=80 b=40 a=0
+    // X11 wire: 4 bytes per pixel in visual byte order `[B, G, R, A]`
+    // (yserver advertises red=0x00FF0000 etc., so on LE this is the
+    // spec-correct order). Client passes a=0 — under the L1 contract
+    // the backend must overwrite with 0xFF for depth-24 destinations.
+    let pixel = [0x40, 0x80, 0xff, 0x00]; // wire B=40 G=80 R=ff A=0
     let mut data = Vec::with_capacity(8 * 8 * 4);
     for _ in 0..(8 * 8) {
         data.extend_from_slice(&pixel);
@@ -286,7 +287,7 @@ fn put_image_zpixmap_argb32_preserves_client_alpha() {
     let mut fix = ServerFixture::start();
     let pix = fix.create_pixmap(8, 8, 32);
     let gc = fix.create_gc(pix, 0);
-    let pixel = [0xff, 0x00, 0x00, 0x80]; // r=ff g=0 b=0 α=0x80
+    let pixel = [0x00, 0x00, 0xff, 0x80]; // wire B=0 G=0 R=ff α=0x80
     let mut data = Vec::with_capacity(8 * 8 * 4);
     for _ in 0..(8 * 8) {
         data.extend_from_slice(&pixel);

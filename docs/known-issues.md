@@ -197,24 +197,20 @@ once the underlying patterns are understood.
       RENDER-driven damage (composite, fill rectangles, glyphs) is
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
-- [ ] **Background image colors look R↔B swapped.** Observed
-      visually under MATE: a JPEG wallpaper rendered with cat eyes
-      that should be green/yellow comes out blue/cyan. Yellow = R+G;
-      losing R or swapping R↔B turns yellow into cyan/blue, which
-      matches. Pre-existing (predates phase 3 work). The depth-24/32
-      byte permutation in `try_vk_put_image` (`backend.rs` `match
-      depth { 24 | 32 => ... }`) reads source `[r,g,b,a]` and writes
-      `[b,g,r,a]` to the `B8G8R8A8_UNORM` mirror — but X11 PutImage in
-      ZPixmap form sends bytes in the visual's native order. For a
-      typical TrueColor BGRA visual at depth 24, the wire bytes are
-      already `[B,G,R,_]`. If yserver's depth-24 visual advertises
-      BGRA byte order but PutImage assumes the source is RGBA, the
-      permutation effectively swaps R and B. Investigation path:
-      `xtruss` a PutImage from a known client, compare the wire bytes
-      against the visual byte order yserver advertises in the
-      connection setup, then either drop the permutation for BGRA
-      visuals or fix the visual advertisement to match. Same
-      permutation lives in pixman path historically; check both.
+- [x] **~~Background image colors look R↔B swapped.~~ FIXED
+      2026-05-14.** yserver advertises X.Org-standard masks
+      (`red=0x00FF0000`, `green=0x0000FF00`, `blue=0x000000FF`) and
+      echoes the client's byte_order as `image_byte_order`, so the
+      spec-correct LE wire encoding of a ZPixmap pixel is `[B,G,R,A]`
+      — already matching the mirror's `B8G8R8A8_UNORM` layout.
+      `try_vk_put_image` was reading the wire as `[r,g,b,a]` and
+      permuting to `[b,g,r,a]`, double-swapping any spec-compliant
+      client. Fix: straight `copy_nonoverlapping` for depth-32; same
+      for depth-24 with a `byte[3]:=0xFF` post-pass to keep the
+      mirror opaque for RENDER composites. Confirmed on fuji: MATE
+      wallpaper + Chrome icon now render correctly. Test fixture
+      doc + the three PutImage/CopyArea alpha_invariant inputs
+      updated to feed wire bytes in spec order.
 - [ ] **Text rendering broken under xfce4 / GTK heavy workloads.**
       Observed 2026-05-13 with `just yserver-xfce-hw`: xfwm4
       decorations render fine, but text inside two pop-up dialogs

@@ -171,7 +171,7 @@ See `known-issues.md` for the full ticklist with detail. Highlights tracked here
 - [ ] **Composite Manual-mode regression** — `92a2a83` reverted; needs decoupling of redirect-record from `redirected_backing` allocation.
 - [ ] **Caja right-click popup offset** — coordinate-translation bug, surfaced 2026-05-13.
 - [ ] **Caja wheel needs view-switch** — yserver event-delivery regression; 3 bisect candidates filed.
-- [ ] **Color R↔B swap on JPEG backgrounds** — likely PutImage byte-permutation vs visual-byte-order mismatch.
+- [x] **Color R↔B swap on JPEG backgrounds + saturated icons** — fixed 2026-05-14: `try_vk_put_image` now treats the wire as `[B,G,R,A]` per the advertised visual masks (matches `B8G8R8A8_UNORM`). Hardware-confirmed on fuji.
 - [ ] **`minor_code = 0` hardcoded in extension error encoder** — debug-clarity bug; threading the minor through `emit_x11_error` (~60-80 call sites).
 - [ ] **Listener starvation under chatty clients** — single-threaded core loop's per-iteration read budget is unbounded; xfce4-panel couldn't complete X11 setup handshake while xfdesktop flooded QueryPointer.
 - [ ] **xfce4 text rendering broken** — may or may not be fixed by 3E; needs revalidation.
