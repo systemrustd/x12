@@ -39,3 +39,6 @@ PXL_*
 *.perf.data
 bee-*.data
 bee-*.data.old
+
+# Flamegraphs / per-run perf artifacts (binary-ish SVGs, large)
+bee-*.svg
