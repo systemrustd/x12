@@ -1628,15 +1628,47 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                0,
-                u16::from(header.data),
-                RANDR_MAJOR_OPCODE,
+            // yserver runs at the KMS-set mode and doesn't reconfigure
+            // outputs/CRTCs on demand. Returning BadValue here makes
+            // mate-settings-daemon (and any other RANDR-using "restore
+            // last session" client) fail and warn the user about
+            // unsaved display settings every login. Stub Success
+            // instead — the screen stays as it is, which is fine for
+            // single-mode setups, and the client thinks its restore
+            // worked. status=Success(0), new_timestamp=now.
+            //
+            // SetScreenConfig reply (32 bytes): status (in data byte) +
+            // length=0 + new_timestamp(4) + config_timestamp(4) +
+            // root(4) + subpixel_order(2) + pad(10). SetCrtcConfig
+            // reply (32 bytes): status (in data byte) + length=0 +
+            // new_timestamp(4) + pad(20).
+            let ts = state.timestamp_now();
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            x11::write_u32(byte_order, &mut reply, ts);
+            if minor == x11randr::RR_SET_SCREEN_CONFIG {
+                x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
+                x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
+                x11::write_u16(byte_order, &mut reply, 0); // SubPixelUnknown
+                reply.extend_from_slice(&[0u8; 10]);
+            } else {
+                reply.extend_from_slice(&[0u8; 20]);
+            }
+            debug_assert_eq!(reply.len(), 32);
+            debug!(
+                "client {} #{} RANDR::{} -> Success (stub) timestamp={}",
+                client_id.0,
+                sequence.0,
+                if minor == x11randr::RR_SET_SCREEN_CONFIG {
+                    "SetScreenConfig"
+                } else {
+                    "SetCrtcConfig"
+                },
+                ts,
             );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
         }
         other => {
             debug!(

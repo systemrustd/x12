@@ -473,17 +473,51 @@ that the host hides for us.
       kept under `#[allow(dead_code)]` for revival when the
       backing-as-source compositor path lands. Confirmed on fuji:
       notification-area-applet survives login.
-- [ ] **RANDR `QueryOutputProperty` returns `BadValue=0` on every
-      call.** Surfaced 2026-05-15 once the `minor_code` threading
-      fix made RANDR error replies legible: marco calls
-      `QueryOutputProperty` (RANDR minor 21) on the outputs we
-      advertise, yserver always returns BadValue. ~3 calls per
-      session under MATE — not user-visible but worth a stub. Real
-      X.Org returns the property's range/values; we could return
-      "no such property" (BadAtom) or an empty range to silence
-      marco without changing behavior. Same shape likely applies
-      to `GetOutputProperty` and `ConfigureOutputProperty` (minors
-      22 + 23) — audit when fixing.
+- [x] **~~RANDR `SetCrtcConfig` / `SetScreenConfig` return
+      `BadValue=0` instead of a Success reply.~~ STUB-FIXED
+      2026-05-15.** Surfaced once the `minor_code` threading fix
+      made RANDR error replies legible: mate-settings-daemon's
+      display-settings restore on login was failing because the
+      dispatcher hard-rejected RANDR minors 2 (SetScreenConfig)
+      and 21 (SetCrtcConfig) with BadValue. yserver runs at a
+      fixed KMS-set mode and doesn't reconfigure outputs/CRTCs
+      on demand, so the handler now stubs a Success reply with a
+      current timestamp. The screen stays at the active mode (fine
+      for the single-mode-per-session use case); the client thinks
+      its restore worked. MATE's "couldn't save/restore display
+      settings" warning is gone.
+- [ ] **Real RANDR `SetCrtcConfig` / `SetScreenConfig` (runtime
+      mode change).** The stub above always replies Success
+      without actually switching modes. To honour the client's
+      request we'd need ~2–3 phases of work spanning the protocol
+      and KMS backend:
+      1. Enumerate all KMS-supported modes per connector via
+         `drmModeGetConnector` and surface them through
+         `GetScreenResources` / `GetOutputInfo` with stable XIDs.
+      2. Round-trip mode XID → `drmModeModeInfo` for atomic
+         commit.
+      3. Runtime modeset entry point in `kms::backend` (we have
+         startup `enable_output` + `disable_output`; need a
+         "switch this CRTC to mode M" that re-allocates scanout
+         BOs at the new size, reprograms the atomic commit, and
+         rolls back on kernel rejection).
+      4. Resize composite pass attachments + Vulkan framebuffers;
+         drain in-flight work cleanly across the switch.
+      5. Resize the X11 root, fire ConfigureNotify/ResizeRequest
+         to top-levels, recompute the window-tree layout against
+         the new screen extent.
+      6. Send `RRCrtcChangeNotify` + `RRScreenChangeNotify` to
+         every RANDR client that selected input (depends on the
+         separate "RRSelectInput mask storage" followup
+         landing first).
+      7. Multi-output sequencing + partial-failure semantics when
+         the client configures multiple CRTCs in one request flow.
+      8. Wire-level validation: reject mode XIDs not ours, reject
+         kernel-rejected configurations.
+      Each piece is reasonable on its own; together it touches the
+      compositor critical path and is its own phase of work.
+      Deferred until the use case (interactive resolution change /
+      hot-plug reconfiguration) becomes load-bearing.
 - [ ] **e16 RENDER coverage audit.** Was deferred in Phase 3.4 because
       e16 didn't reach a stable rendering state. Phase 3.4's atom-name
       fix unblocked e16 startup, so this audit is now actionable. Run
