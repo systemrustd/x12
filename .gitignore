@@ -34,3 +34,8 @@ PXL_*
 *.jpeg
 *.png
 *.heic
+
+# perf data captures (binary, can be large)
+*.perf.data
+bee-*.data
+bee-*.data.old

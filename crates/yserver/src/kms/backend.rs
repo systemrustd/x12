@@ -5610,7 +5610,16 @@ impl KmsBackend {
                         .subresource_range(color_range)];
                     let dep = ash::vk::DependencyInfo::default().image_memory_barriers(&to_read);
                     unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
-                    mask_scratch.set_current_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                    // Layout-tracking update deferred to AFTER the
+                    // final fallible record step (record_render_composite).
+                    // The cmd_pipeline_barrier2 above is RECORDED into
+                    // the CB but only executes when the CB is submitted.
+                    // If a subsequent record step fails the batch is
+                    // poisoned and the CB never submits, so the GPU
+                    // never sees these barriers — advancing the CPU
+                    // layout-tracking here would diverge from GPU
+                    // reality. See `set_current_layout` after
+                    // `record_render_composite` below.
                 } else {
                     // Triangle (legacy CPU rasterize bridge) — T3
                     // replaces this with a GPU draw.
@@ -5678,7 +5687,7 @@ impl KmsBackend {
                         dst_mirror.extent,
                     );
                 }
-                vk_render::record_render_composite(
+                let composite_result = vk_render::record_render_composite(
                     vk,
                     cb,
                     dst_mirror,
@@ -5688,7 +5697,23 @@ impl KmsBackend {
                     &attrs,
                     &rects,
                     scissor,
-                )
+                );
+                // gpu-trap T2 P2 fix-up: advance MaskScratch's
+                // CPU-tracked layout to SHADER_READ_ONLY_OPTIMAL ONLY
+                // after the final fallible record step (record_render_composite)
+                // has succeeded. If any prior step in this closure
+                // failed via `?`, control never reaches here and the
+                // batch will poison — the recorded COLOR_ATTACHMENT →
+                // SHADER_READ_ONLY barrier never executes on the GPU,
+                // so advancing CPU layout-tracking would diverge from
+                // GPU reality. Skipped for the Tris arm (it goes
+                // through record_upload_r8 which has its own
+                // pre-existing layout tracking; T3 rewrites that arm
+                // to GPU and unifies the deferred-update pattern).
+                if composite_result.is_ok() && traps_slice.is_some() {
+                    mask_scratch.set_current_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
+                composite_result
             });
         if arena_oom {
             return false;
