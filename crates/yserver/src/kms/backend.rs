@@ -1544,6 +1544,61 @@ impl KmsBackend {
         Ok(backend)
     }
 
+    /// Snapshot of the backend's [`PixmapPool`] stats. Returns `None`
+    /// if the pool was never initialised (no Vulkan context attached —
+    /// e.g. the headless `for_tests` path).
+    ///
+    /// Test / introspection only. Stable enough to expose as `pub`
+    /// (could ship in a debug HUD); not part of any documented public
+    /// API. Hidden from rustdoc.
+    ///
+    /// [`PixmapPool`]: crate::kms::vk::pixmap_pool::PixmapPool
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pixmap_pool_stats(&self) -> Option<crate::kms::vk::pixmap_pool::PixmapPoolStats> {
+        self.pixmap_pool.as_ref().map(|p| p.stats())
+    }
+
+    /// Close the currently-open paint batch (if any) AND drain every
+    /// in-flight submitted batch, blocking on each fence. Forces the
+    /// `PooledPixmapReturn` `BatchResource`s adopted by `free_pixmap`
+    /// to release their entries back into the pool synchronously.
+    ///
+    /// Test-only — production code retires batches lazily via
+    /// `poll_retired_paint_batches` and composite ticks; the
+    /// `_for_test` suffix is the contract. Do not call from
+    /// production paths.
+    ///
+    /// A bare "drain submitted batches" is **not** sufficient because
+    /// `free_pixmap` adopts the mirror's BatchResource into the
+    /// *currently-open* batch, which will not appear in
+    /// `submitted_paint_batches` until something closes it. This
+    /// helper closes first, then drains.
+    ///
+    /// Hidden from rustdoc.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`BatchError`] returned by
+    /// `close_and_submit_async` or `drain_submitted_paint_batches`.
+    ///
+    /// [`BatchError`]: crate::kms::scheduler::paint_batch::BatchError
+    #[doc(hidden)]
+    pub fn force_retire_in_flight_for_test(
+        &mut self,
+    ) -> Result<(), crate::kms::scheduler::paint_batch::BatchError> {
+        // Close + submit-async whatever is open (no-op for an Idle/
+        // missing batch, returning a null fence). The submit_async
+        // path queues a Submitted batch on submitted_paint_batches.
+        self.scheduler.close_and_submit_async(Vec::new())?;
+        // Drain every submitted batch, waiting on each fence in FIFO
+        // order. After this returns, every BatchResource adopted by
+        // earlier free_pixmap calls has released — pool stats reflect
+        // the final return-accept / return-reject tallies.
+        self.scheduler.drain_submitted_paint_batches()?;
+        Ok(())
+    }
+
     /// Public wrapper over [`Self::read_mirror_pixels`] for test
     /// fixtures. Returns `(width, height, bgra_bytes)` where `bytes`
     /// is the tightly-packed `B8G8R8A8_UNORM` pixel buffer of the
