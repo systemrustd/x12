@@ -1,22 +1,25 @@
-//! GPU rasterization pipeline for RENDER `Trapezoids` (gpu-trap T1).
+//! GPU rasterization pipelines for RENDER `Trapezoids` and
+//! `Triangles` (gpu-trap T1 / T3).
 //!
-//! Replaces the CPU 4×4 supersampled rasterizer (see
-//! `kms::vk::ops::traps::rasterize_trapezoids`) with a single Vulkan
-//! draw that writes coverage directly into the `R8_UNORM` MaskScratch
-//! image. The fragment shader computes analytic edge coverage per
-//! pixel; saturated additive blending (ONE + ONE ADD, clamped by the
-//! R8_UNORM format to `[0, 1]`) gives the same union-with-
-//! saturating-add semantics as the CPU path's `saturating_add`.
+//! Replaces the retired CPU 4×4 supersampled rasterizer with a single
+//! Vulkan draw per RENDER request that writes coverage directly into
+//! the `R8_UNORM` MaskScratch image. The fragment shader computes
+//! analytic edge coverage per pixel; saturated additive blending
+//! (ONE + ONE ADD, clamped by the R8_UNORM format to `[0, 1]`) gives
+//! the same union-with-saturating-add semantics as the CPU path's
+//! per-pixel `saturating_add`.
 //!
-//! Cadence: one draw call per request, `vkCmdDraw(4, n_traps)`. All
-//! primitives collapse into a single instanced draw; per-instance
-//! vertex attributes encode the trap geometry. The bbox is a per-
-//! draw constant carried in push constants.
+//! Cadence: one draw call per request, `vkCmdDraw(4, n_primitives)`.
+//! All primitives in the same RENDER request collapse into a single
+//! instanced draw; per-instance vertex attributes encode the trap /
+//! triangle geometry. The bbox is a per-draw constant carried in
+//! push constants.
 //!
-//! No caller is wired in T1 — this file just stands up the pipeline,
-//! shaders, and shared layout. T2 attaches the trapezoid arm of
-//! `try_vk_render_traps_or_tris`. The triangle arm follows in T3
-//! with a sibling pipeline (or extended layout).
+//! Both pipelines share a pipeline layout (push consts identical);
+//! they differ in vertex input + shaders. `trapezoid_pipeline()`
+//! consumes [`TrapInstanceData`] (40 bytes per instance);
+//! `triangle_pipeline()` consumes [`TriangleInstanceData`] (24 bytes
+//! per instance).
 
 use std::sync::Arc;
 
@@ -476,8 +479,7 @@ fn build_triangle_pipeline(
     // Saturated additive blend on R only — same scheme as the
     // trapezoid pipeline. R8_UNORM clamps to [0, 1] in the
     // framebuffer, which gives the same union-with-saturating-add
-    // semantics as the CPU path (`out[idx] = saturating_add(cov)`
-    // in `rasterize_triangles`).
+    // semantics as the retired CPU path's per-pixel `saturating_add`.
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
         .src_color_blend_factor(vk::BlendFactor::ONE)

@@ -4799,11 +4799,10 @@ impl KmsBackend {
         }
         let bw = (bx1 - bx) as u32;
         let bh = (by1 - by) as u32;
-        // gpu-trap T2: rasterize_trapezoids is gone from this arm.
+        // gpu-trap T2/T3/T5: CPU rasterize is gone from both arms.
         // `try_vk_render_traps_or_tris` builds the coverage mask on the
         // GPU inside the open paint batch (no synchronous CPU work in
-        // the X protocol request handler). The triangle arm still
-        // CPU-rasterizes until T3.
+        // the X protocol request handler).
         self.try_vk_render_traps_or_tris(
             op,
             host_src,
@@ -5538,7 +5537,7 @@ impl KmsBackend {
                 //    render area is in MaskScratch-LOCAL coords
                 //    starting at (0, 0) — writes the coverage mask
                 //    to the top-left of MaskScratch, matching the
-                //    CPU `record_upload_r8` convention so the
+                //    pre-gpu-trap CPU-upload convention so the
                 //    surrounding composite's mask sampling
                 //    (mask_origin = -bbox_x, -bbox_y for full_dst
                 //    or 0, 0 otherwise) lands at the right pixels.

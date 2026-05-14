@@ -37,9 +37,9 @@ void main() {
     // gpu-trap T2: the quad emits at MaskScratch-LOCAL coords
     // (0..bbox_w, 0..bbox_h), not absolute mask coords. This puts
     // the GPU-rasterized mask data at MaskScratch[0..bbox_w,
-    // 0..bbox_h], matching the existing CPU-rasterize convention
-    // that `record_upload_r8` uses; the surrounding composite path
-    // then samples mask[(dst.x + mask_origin.x)] without changes.
+    // 0..bbox_h], matching the pre-gpu-trap CPU-upload convention;
+    // the surrounding composite path then samples
+    // mask[(dst.x + mask_origin.x)] without changes.
     // The fragment shader still computes coverage in ABSOLUTE coords
     // (trap edges arrive in absolute pixel coords from the X
     // protocol) — it adds `bbox_origin_pixel` to `gl_FragCoord` to

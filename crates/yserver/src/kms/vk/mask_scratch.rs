@@ -2,12 +2,13 @@
 //!
 //! Some RENDER ops (`Trapezoids`, `Triangles`, glyph-shape composites
 //! that aren't through the atlas) need an A8 coverage mask that
-//! doesn't correspond to any X drawable. CPU rasterise the mask
-//! into a per-batch `BatchUploadArena` chunk, then call
-//! [`MaskScratch::record_upload_r8`] to record the
-//! barrier-copy-barrier sequence that uploads it into a transient
-//! `R8_UNORM` `VkImage`. The image view is lifetime-stable as long
-//! as the caller doesn't request a bigger mask; resize via
+//! doesn't correspond to any X drawable. The mask is rasterized
+//! GPU-side by the [`trap_pipeline`](super::trap_pipeline) draw,
+//! which targets this image as a `COLOR_ATTACHMENT`; the surrounding
+//! composite then samples it as a `SHADER_READ_ONLY_OPTIMAL` mask.
+//!
+//! The image view is lifetime-stable as long as the caller doesn't
+//! request a bigger mask; resize via
 //! [`MaskScratch::ensure_image_size_returning_old`] allocates a new
 //! image, returns the old one wrapped as a `BatchResource` for
 //! defer-release, and installs the new fields on the scratch.
@@ -21,6 +22,12 @@
 //! into PaintBatches that submit before the next protocol cycle,
 //! so the scratch only has pending uses inside the current
 //! recording batch.
+//!
+//! Pre-gpu-trap (T5) note: a `record_upload_r8` method used to
+//! upload CPU-rasterized coverage into this image via a staged copy
+//! from a `BatchUploadArena` chunk. The CPU rasterizer was retired
+//! in gpu-trap T5 in favour of the GPU draw, and the upload helper
+//! went with it.
 
 use std::sync::Arc;
 
@@ -161,96 +168,6 @@ impl MaskScratch {
             view: old_view,
             image_memory: old_memory,
         })))
-    }
-
-    /// Record the barrier-copy-barrier sequence that uploads
-    /// `width × height` R8 pixels from `src_buffer + src_offset`
-    /// to the scratch image's top-left `(0, 0)` rect, into the
-    /// supplied CB. After this returns the image's `current_layout`
-    /// reflects `SHADER_READ_ONLY_OPTIMAL` (the CB's terminal
-    /// transition); on CB execute the image lands in that layout.
-    ///
-    /// Caller is responsible for:
-    ///   1. Calling `ensure_image_size_returning_old(width, height)?`
-    ///      BEFORE this method, and routing any returned old image
-    ///      through `RenderScheduler::defer_resource_release` so the
-    ///      old `vk::Image`/view/memory outlives any in-flight CB.
-    ///   2. Allocating staging via `BatchUploadArena::alloc(width *
-    ///      height, 4)` and copying the row-major coverage bytes
-    ///      into the returned `mapped_ptr`.
-    ///   3. Passing the resulting `buffer` + `offset` here.
-    ///
-    /// `width` / `height` must be ≤ `self.extent` (no grow inside
-    /// this method); zero-sized rects no-op.
-    pub fn record_upload_r8(
-        &mut self,
-        vk: &VkContext,
-        cb: vk::CommandBuffer,
-        src_buffer: vk::Buffer,
-        src_offset: u64,
-        width: u32,
-        height: u32,
-    ) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        debug_assert!(
-            width <= self.extent.width && height <= self.extent.height,
-            "MaskScratch::record_upload_r8: caller must ensure_image_size_returning_old first",
-        );
-        let device = &vk.device;
-        let old_layout = self.current_layout;
-        let to_dst = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(self.image)
-            .subresource_range(color_subresource_range())];
-        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
-        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
-
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(src_offset)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_offset(vk::Offset3D::default())
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-        let regions = [region];
-        unsafe {
-            device.cmd_copy_buffer_to_image(
-                cb,
-                src_buffer,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &regions,
-            );
-        }
-
-        let to_read = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(self.image)
-            .subresource_range(color_subresource_range())];
-        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
-        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
-
-        self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 }
 
