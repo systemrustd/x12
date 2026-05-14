@@ -440,8 +440,21 @@ impl GlyphAtlas {
             new_size = new_size.checked_mul(2).unwrap_or(at_least);
         }
         let (buffer, memory, mapped) = allocate_staging(&self.vk, new_size)?;
+        // 5-T6: no queue_wait_idle. `grow_staging`'s only caller is
+        // `GlyphAtlas::intern`, which submits per-glyph one-shot CBs
+        // and waits on each (today via `queue_wait_idle` — still in
+        // intern, deliberate Phase 5 deferred; tomorrow via a
+        // per-glyph fence in a follow-up phase). At the time
+        // `grow_staging` runs, either:
+        //   (a) there has been no prior glyph upload yet (first
+        //       grow: no CB ever referenced this buffer); OR
+        //   (b) the last successful glyph upload has already been
+        //       waited on (intern's per-glyph wait drained it).
+        // In either case the OLD staging buffer has no live CB
+        // reference and is safe to free synchronously. If a future
+        // caller takes the atlas staging through a non-waiting
+        // path, this comment block becomes the audit point.
         unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
             self.vk.device.unmap_memory(self.staging_memory);
             self.vk.device.destroy_buffer(self.staging_buffer, None);
             self.vk.device.free_memory(self.staging_memory, None);

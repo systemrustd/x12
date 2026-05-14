@@ -252,8 +252,17 @@ impl OpsStaging {
             new_size = new_size.checked_mul(2).unwrap_or(at_least);
         }
         let (buffer, memory, mapped) = allocate_ops_staging(&self.vk, new_size)?;
+        // 5-T6: no queue_wait_idle. All callers of `OpsStaging`
+        // (`hw_cursor_refresh`, `read_mirror_pixels`,
+        // `try_vk_get_image_pixels`, `dump_scanout_one`) go through
+        // `run_one_shot_op` which after 5-T1 waits on a per-op
+        // fence before returning. The immediately-prior readback's
+        // CB therefore has retired before we get here, and the OLD
+        // staging buffer can be freed without any additional wait.
+        // If a future caller takes this buffer through a non-waiting
+        // path, this comment block becomes the audit point — DO NOT
+        // remove without re-auditing.
         unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
             self.vk.device.unmap_memory(self.memory);
             self.vk.device.destroy_buffer(self.buffer, None);
             self.vk.device.free_memory(self.memory, None);
