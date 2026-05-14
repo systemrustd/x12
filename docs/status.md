@@ -110,6 +110,18 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Hardware smoke: TBD (user-owned). The load-bearing test: bee + fuji under adapta-nokto + mate-cc. If `bee` improves, AMD-specific investigation is no longer next-priority.
   - Results: `docs/superpowers/plans/2026-05-14-pixmap-allocation-pool-results.md`
 
+- [x] **Diagnostics + perf-followup wins** (`6e3fda7` + `147b1c5` + `95421e5` + `ca8ec6d`, all in `pre-timeline-rework` tag at `8daa1b1`)
+  - Per-Vulkan-call rate counters (`kms/vk/call_stats.rs`) with `YSERVER_LOOP_TELEMETRY=1` env-gated per-second emission: `barrier2`, `draw`, `bind_pl`, `bind_ds`, `push_const`, `viewport`, `scissor`, `begin_rendering`, `end_rendering`, `copy_*`, `clear_color_image`, `queue_submit2`, `begin_cb`, `end_cb`.
+  - Per-source `queue_submit2` attribution (`vk submit src` line): `vis_composite`, `readback`, `ext_sync`, `protocol_barrier`, `size_limit`, `latency_limit`, `shutdown`, `one_shot`, `compositor`, `other`. Sum tracks queue_submit2 within Idle-flush noise.
+  - ProtocolBarrier site-subdivision (`vk pb src` line): `drawable_destroy`, `window_resize`, `image_dealloc_fb`, `dmabuf_release`, `picture_destroy`, `cursor_picture` (gradient sites removed alongside their flushes).
+  - `submit_other` (init_clear) site-subdivision: cursor / window / pixmap.
+  - PixmapPool per-second deltas (`pixmap pool` line): `takes_hit`, `takes_miss`, `returns_accepted`, `returns_rejected_bucket_full`, `returns_rejected_oversize`. Exposed via `Mutex<Weak<PixmapPool>>` registered at construction.
+  - **Win — gradient pre-build flush removed** (`ca8ec6d`): the `flush_if_needed(ProtocolBarrier)` at the top of `render_create_linear_gradient` + `render_create_radial_gradient` was documented as "hygiene cleanup … not a UAF fix". Telemetry showed 50-90 gradient creates/sec on both bee and fuji during MATE drag, each forcing a strict queue submit + wait. Removed; ~25% drop in fuji's `queue_submit2` peak (1430→1047/sec).
+  - **Telemetry findings** (recorded for future work):
+    - Picture destruction (`picture_destroy`) was the dominant ProtocolBarrier source — peaks ~975/sec on bee, ~888/sec on fuji during MATE drag.
+    - On fuji, `window_resize` settled to a sustained 80/sec steady-state pattern paired with 80/sec `init_clear_window` — something in MATE resizes a window 80×/sec independent of user input. Worth understanding eventually.
+    - Pool `rejected_oversize` peaks ~253/sec on bee (matched `init_clear_pixmap` peak): MAX_POOLED_DIM=128 makes large pixmaps bypass the pool entirely. Raising the cap is a candidate follow-up but has memory-tradeoff implications.
+
 - [x] **GPU trap rasterization — RENDER Trapezoids / Triangles on the GPU** (`151c8be` (plan) + `0f5e605` + `4dd56a6` + `b7d0e77` + `c819a52` + `4fead28` + `5bf046b` + this T6 commit)
   - Moved RENDER `Trapezoids` / `Triangles` coverage-mask generation off the CPU (where it was 19.73% of CPU per the bee/RDNA2 + adapta-nokto perf trace) onto the GPU via a new `TrapPipeline`. The synchronous CPU rasterize + `MaskScratch::record_upload_r8` upload pair on the X protocol request handler's hot path is gone — `try_vk_render_traps_or_tris` is pure-recording (deferred through `record_paint_batch_op`), so the input loop returns in microseconds instead of blocking per request. The 19.73% CPU cost is zero by construction (code path no longer exists).
   - T1 (`0f5e605`): `TrapPipeline` infrastructure — new `crates/yserver/src/kms/vk/trap_pipeline.rs` with two pipelines (trap + triangle) sharing one push-const layout (no descriptor sets — per-instance data via vertex attributes). `TrapInstanceData` (40 bytes), `TriangleInstanceData` (24 bytes), `TrapDrawPushConsts` (32 bytes: mask_extent + bbox). `Trapezoid::to_instance_data` + `Triangle::to_instance_data` conversion helpers. `BatchUploadArena` buffer usage gained `VERTEX_BUFFER` flag. Two new shaders (trap.vert/frag.glsl) compiled to SPIR-V via existing build.rs. No caller wired.
@@ -120,15 +132,34 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Hardware smoke: TBD (user-owned). Load-bearing test: bee adapta-nokto + mate-cc post-pool + post-GPU-trap should be dramatically improved; window-drag CPU should drop materially; rendercheck full run should be no-regression vs Phase 5 baseline.
   - Results: `docs/superpowers/plans/2026-05-14-gpu-trap-rasterization-results.md`
 
+### Paused — 2026-05-14
+
+- [⏸] **Timeline-semaphore migration — picture defer-release attempt** (commits `d8cfe42`, `0cd4b9e`, `00f3817`, `ea3c6f2`, `445d732`, `b03b585`, `cb73af4`, `73b3728` on `graphics-followups`; rollback tag `pre-timeline-rework` at `8daa1b1`).
+  - **Motivation.** The picture_destroy strict flush (~900/sec on both machines during MATE drag) was the dominant ProtocolBarrier source. Attempted to convert it to a defer-release through a new timeline-keyed model.
+  - **Plan**: `docs/superpowers/plans/2026-05-14-timeline-semaphore-migration.md`. Six stages; only 1-4 + ad-hoc fixes attempted.
+  - **What works** — **fuji** with the full stack (HEAD = `73b3728`):
+    - `queue_submit2` peak dropped from 1430/sec baseline → ~700/sec.
+    - `picture_destroy` rate: 0 (defer-release path active).
+    - User report: "can't make it lag" — perceived as smooth.
+  - **What doesn't work** — **bee**: still GPU-faults under MATE drag. Same fault fingerprint across every iteration (amdgpu `PERMISSION_FAULTS:3`, TCP or CB/DB client, RW=0 or 1). Multiple fixes attempted (handle=0 flush fallback, pool path migration, `Arc::strong_count` check on defer-queue gc, `queue_wait_idle` on `destroy_window`); none stabilised bee.
+  - **Why bee specifically** — RADV's TCP / CB/DB hardware catches freed-VA reads/writes; ANV swallows them silently. So fuji's "working" state may also have latent UAFs that just don't surface.
+  - **Architectural gap that wasn't closed** — the compositor submits its CB on the same `graphics_queue` as paint batches but isn't in `submitted_paint_batches`, doesn't annotate handles via the touched/timeline system, and isn't drained by `flush_if_needed(ProtocolBarrier)`. Any resource sampled by the compositor (window mirrors, cursor mirror, bg_pixmap, etc.) has a lifetime hole when freed via paths that only flush paint. Stage 2 should have included compositor-side handle annotation as a prerequisite; trying to retrofit it through call-site patches didn't converge.
+  - **Process lesson** (`feedback_stop_iterating_when_fixes_dont_land` memory): same fault signature across 5 iterations was the cue to revert, not stack more patches. The last few "small fixes" were hunch-based.
+  - **State left for resumption**:
+    - `pre-timeline-rework` tag is the known-stable baseline. Reset there if bee stability is needed immediately (loses fuji's win).
+    - The work past the tag is preserved on `graphics-followups`; it should NOT ship as-is.
+    - Next attempt needs the comprehensive design pass with codex — every submission path (paint, compositor, one-shot, init_clear) must signal the timeline AND annotate handles, BEFORE migrating any consumer call site.
+
 ### Remaining — in priority order
 
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
   - Codex's long-term recommendation from 3B salvage: instead of relying on protocol destruction barriers + `queue_wait_idle`, adopt destroyed VkImages into the open `PaintBatch` via `BatchResource` so destruction defers automatically.
   - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F introduced for `MaskScratch` + `dst_readback`, the 3B destruction-barrier collection, the Phase-5 `Retired*Image` flavours, and the pixmap-pool `PooledPixmapReturn` — all into a uniform refcounted-handle model.
-- [ ] **AMD-specific investigation — DEPRIORITIZED pending bee smoke validation of GPU trap rasterize + pool**
-  - Both load-bearing root causes (pixmap-pool's kernel-allocator burst + GPU-trap's CPU-rasterize-on-hot-path) are addressed structurally and are vendor-agnostic.
-  - If bee hardware smoke confirms adapta-nokto + mate-cc is smooth post-pool + post-GPU-trap: AMD-specific investigation drops off the critical path entirely.
-  - If `bee` is still slow: amdgpu ftrace + ioctl-rate measurement per `project_amd_lag_investigation.md` memory is the next move; the residual cost is somewhere unexpected (libdrm_amdgpu was 4.62% pre-GPU-trap — a candidate but not enough on its own to explain catastrophic lag).
+- [ ] **AMD-specific investigation — STILL OUTSTANDING after pool + GPU-trap + diag-followups**
+  - Smoke on 2026-05-14: bee at `pre-timeline-rework` (= post-pool + post-GPU-trap + gradient-flush-removed) is **no GPU faults but laggy**. The pool kernel-allocator + GPU-trap wins didn't close the perceived lag gap on RDNA2; they did on fuji/Intel.
+  - Telemetry showed `queue_submit2` peaks ~1000-1200/sec on bee during MATE drag. Per-source split: `picture_destroy` ~975/sec, `one_shot` ~695/sec, `other (init_clear)` ~140/sec, `compositor` ~60/sec, paint paths the rest. The picture_destroy contribution is the natural next target (timeline-migration would have closed it if not for the bee-specific UAF problem above).
+  - Pre-existing perf snapshot showed 42.86% of CPU in `libvulkan_radeon.so` (RADV per-submit cost) vs 25.54% in yserver. So even AT the same submit rate, bee carries a substantially higher per-submit driver tax than fuji.
+  - Next investigation moves (when resumed): (a) retry timeline-semaphore migration with compositor-side annotation included, (b) reduce the absolute number of one_shot submits (glyph atlas + gradient creates), (c) ftrace amdgpu BO create/submit/wait rates per `project_amd_lag_investigation.md`.
 
 ---
 
