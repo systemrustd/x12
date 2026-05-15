@@ -7356,17 +7356,26 @@ impl KmsBackend {
         if let Some(pool) = self.pixmap_pool.as_ref()
             && let Some(entry) = pool.try_take(key)
         {
-            // Pool hit: construct DrawableImage from the entry.
-            // `new_from_pool` preserves the previous tenant's
-            // `current_layout`, leaves lazy mask / no-alpha views
-            // unbuilt, and we skip `initialize_clear` — the first
-            // paint will overwrite the whole image.
-            let img = crate::kms::vk::target::DrawableImage::new_from_pool(
+            // Pool hit: construct DrawableImage from the entry, then
+            // clear it. X11 clients (xfdesktop's thumbnail tiles, for
+            // one) rely on the Xorg/Xephyr convention of zero-filled
+            // new pixmaps — the spec says "undefined" but every real
+            // server zeroes, and clients composite smaller content
+            // onto the tile expecting the rest to be transparent.
+            // Skipping clear leaked the previous tenant's pixels
+            // through wherever the first paint didn't cover.
+            let mut img = crate::kms::vk::target::DrawableImage::new_from_pool(
                 std::sync::Arc::clone(vkctx),
                 entry,
                 format,
                 ash::vk::Extent2D { width, height },
             );
+            if let Some(cmd_pool) = self.ops_command_pool.as_ref() {
+                crate::vk_count!(init_clear_pixmap);
+                if let Err(e) = img.initialize_clear(cmd_pool.handle()) {
+                    log::warn!("pooled pixmap initialize_clear failed: {e:?}");
+                }
+            }
             return Some(img);
         }
 

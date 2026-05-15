@@ -866,12 +866,13 @@ impl DrawableImage {
         self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
-    /// Construct a `DrawableImage` from a pooled entry. Skips
-    /// `initialize_clear` — the previous tenant's pixels are
-    /// invisible (caller marks `mark_full_damage`; the first paint
-    /// overwrites the whole image). The pool entry's
-    /// `current_layout` is preserved so the first upload's
-    /// pre-barrier transitions correctly.
+    /// Construct a `DrawableImage` from a pooled entry. The pool
+    /// entry's `current_layout` is preserved so the first upload's
+    /// pre-barrier transitions correctly. Caller is responsible for
+    /// clearing the recycled image — X11 clients rely on the
+    /// Xorg/Xephyr convention of zero-filled new pixmaps (composite
+    /// of smaller-than-tile content onto an uncleared pool entry
+    /// leaks the previous tenant's pixels).
     ///
     /// Lazy `mask_view` / `no_alpha_src_view` are set to `None`;
     /// they'll be rebuilt on demand if needed.
