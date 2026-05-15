@@ -438,6 +438,20 @@ yserver-wmaker-xterm-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "wmaker log:   wmaker-hw.log"'
 
+# Run picom against yserver as a RENDER smoke test. picom v13's
+# `xrender` backend exercises a wider RENDER surface than xfwm4 /
+# marco do — useful for shaking out RENDER coverage gaps once the
+# v2 rendering model lands. The script writes a temp picom.conf;
+# no per-user config needed. Optional argument overrides the test
+# client (default xclock):
+#     just yserver-picom-hw                 # xclock + kernel blur
+#     just yserver-picom-hw client=xterm    # transparent terminal
+# NB: picom currently redraws once then goes silent on yserver (the
+# Damage / XFixes infrastructure gap), so this harness is parked
+# until the v2 work re-enables compositor support.
+yserver-picom-hw client="xclock":
+    tools/picom-yserver.sh {{client}}
+
 yserver-xfce-hw log="debug":
     cargo build --bin yserver
     bash -c '\
