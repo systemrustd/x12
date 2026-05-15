@@ -47,20 +47,23 @@ once the underlying patterns are understood.
       mid-session clients pick up the right baseline. Caja now
       scrolls from the first click in its default view.
       Residual: the FIRST app a yserver session opens (e.g.
-      appearance settings) doesn't scroll on its initial scrolls;
-      opening any subsequent GTK app unsticks scrolling everywhere,
-      including back in the originally-broken app. The pattern is
-      not per-app event-mask — it's process-wide GDK state that
-      flips once another GTK process queries devices or selects XI2
-      events. Suspect: GDK caches device state at app launch and
-      misses the scroll-axis info on the FIRST query of the session
-      (despite our reply being correct in x11trace). Working
-      theories not yet tried: emit XI_HierarchyChanged on first
-      libinput device discovery; emit XI_DeviceChanged after the
-      first scroll-axis update; advertise a slave-pointer device
-      with the scroll classes attached (real Xorg pattern). User
-      workaround: launch any extra GTK app at session start, then
-      close it; from then on scroll works everywhere.
+      appearance settings) doesn't scroll on its initial scrolls.
+      Merely launching another GTK app is NOT enough — the trigger
+      is **scrolling inside that other app** (e.g. caja). Once
+      scrolling works in app B, returning to app A and scrolling
+      works there too. The pattern persists across the rest of the
+      session.
+      The wire trace shows app A receives XI_Motion-with-scroll-
+      axis events the entire time, with consistent axisvalues; it
+      simply doesn't fire scroll handlers on them until something
+      about scrolling in app B flips a per-process GDK state.
+      Working theories not yet tried: XIScrollClass mode mismatch
+      (we declare Relative but emit cumulative; real Xorg pattern
+      is Relative + per-event delta); GDK needs an XI_DeviceChanged
+      event after the first scroll-axis advance; cursor wasn't
+      over the right widget initially (Enter event hadn't seeded
+      something). User workaround: scroll once in any other GTK
+      app first.
 - [x] **GTK file-manager right-click popup offset + rubber-band
       anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
       `ea7c186`: the XIQueryPointer reply encoder placed the BOOL
