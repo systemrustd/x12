@@ -548,8 +548,11 @@ exact failure mode v2 is designed to eliminate.
   shape but living inside `RenderEngine` cleanly.
 - `set_filter`, `set_picture_transform`, `set_picture_clip` —
   metadata on `DrawableStore`'s picture-side state.
-- `KmsBackend` (v1) can be deleted once rendercheck + real-app
-  smoke pass on `KmsBackendV2`. `KmsCore` survives the deletion.
+- `KmsBackend` (v1) **stays in tree** through Stage 3 and beyond
+  as a known-good fallback. Stage 3 closing means v2 has parity,
+  not production-readiness; deletion waits for v2 to be the proven
+  default under real usage over time. See Risk 4 for the deletion
+  criteria.
 - This is the **first stage where real apps make sense as
   acceptance gates** — Stage 2 deliberately skipped them because
   it doesn't paint text.
@@ -611,12 +614,25 @@ and which v2 components it touches.
 v1, `KmsBackendV2` for v2), picked by `YSERVER_RENDER_MODEL` at
 startup. Both embed the same `KmsCore` for protocol bookkeeping.
 Per-method fallback is explicitly NOT supported (would create
-split-brain storage). Open question: when does `KmsBackend` (v1)
-get deleted? Cleanest is at Stage 3 close (rendercheck + real-app
-parity proven on v2). Keeping both indefinitely is a maintenance
-trap; deleting too early loses a known-good fallback during a
-Stage 2/3 stuck point. The shared `KmsCore` survives v1's
-deletion — `KmsBackendV2` continues to use it.
+split-brain storage). **v1 stays in tree until v2 is the proven
+production default** — not just "parity at Stage 3 close" but
+"used as the default for an extended period without regressions,
+across real workloads and hardware classes." Concretely, v1 is
+deletable when:
+
+- v2 has been the `YSERVER_RENDER_MODEL` default for ≥1 month
+  across daily use,
+- no v2-only regression has been filed and stayed open over a
+  recent window,
+- compositor support (Stage 4) and any perf work (Stage 5) have
+  landed and stabilized,
+- the cost of maintaining `KmsBackend` is felt to exceed its value
+  as a fallback (subjective judgment call, made deliberately).
+
+Keeping both indefinitely is a maintenance cost; deleting too
+early loses a known-good fallback during a stuck point. The
+shared `KmsCore` survives v1's eventual deletion —
+`KmsBackendV2` continues to use it.
 
 **Risk 5 — composite-overlay-window semantics.** Today's
 `GetOverlayWindow` returns a fake xid (`COMPOSITE_OVERLAY_WINDOW.0`)
