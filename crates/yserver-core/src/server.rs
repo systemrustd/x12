@@ -282,6 +282,14 @@ pub struct ServerState {
     /// blocking is left as a known gap — see followup §5 in
     /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
     pub sync_pending_awaits: Vec<SyncPendingAwait>,
+    /// Cumulative XI2 scroll-axis values for the master pointer.
+    /// `[0]` is valuator number 2 (vertical scroll), `[1]` is
+    /// valuator number 3 (horizontal scroll). Increments by 1 per
+    /// logical wheel click, matching the `increment=1.0` advertised
+    /// on the XIScrollClass entries in the XIQueryDevice reply. GDK
+    /// reads the cumulative value off each XI_Motion-with-scroll-
+    /// axis event and computes deltas from the previous sample.
+    pub scroll_axis_value: [i32; 2],
 }
 
 /// Server-side key auto-repeat. Carries the original `HostKeyEvent`
@@ -383,6 +391,7 @@ impl ServerState {
             repeat_state: None,
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
+            scroll_axis_value: [0; 2],
         }
     }
 

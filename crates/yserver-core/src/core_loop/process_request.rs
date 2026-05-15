@@ -5663,10 +5663,20 @@ fn handle_xi2_request(
                 sourceid: u16,
                 number: u16,
                 max_int: i32,
+                mode: u8,
+                value: i32,
             ) {
                 let le = ClientByteOrder::LittleEndian;
                 // Header(8) + label(4) + min(8) + max(8) + value(8) +
                 // resolution(4) + mode+pad(4) = 44 bytes = 11 units.
+                // `mode`: 0 = Relative (scroll axes), 1 = Absolute
+                // (pointer X/Y). `value`: the axis's current value,
+                // used by GDK as the baseline for computing per-event
+                // deltas. For pointer X/Y this is 0 at startup (GDK
+                // doesn't care). For scroll axes this MUST be the
+                // current cumulative counter — otherwise GDK's first
+                // scroll Motion event yields a giant delta that the
+                // scroll handler either ignores or over-applies.
                 x11::write_u16(le, buf, 2); // type = Valuator
                 x11::write_u16(le, buf, 11);
                 x11::write_u16(le, buf, sourceid);
@@ -5678,12 +5688,45 @@ fn handle_xi2_request(
                 // FP3232 max = (max_int, 0)
                 x11::write_u32(le, buf, max_int as u32);
                 x11::write_u32(le, buf, 0);
-                // FP3232 value = 0.0
-                x11::write_u32(le, buf, 0);
+                // FP3232 value = (value, 0)
+                x11::write_u32(le, buf, value as u32);
                 x11::write_u32(le, buf, 0);
                 x11::write_u32(le, buf, 0); // resolution
-                buf.push(1); // mode = Absolute
+                buf.push(mode);
                 buf.extend_from_slice(&[0u8; 3]); // pad
+            }
+
+            // Scroll class: declares one of the device's valuators as
+            // a scroll axis. Length is 6 4-byte units (24 bytes).
+            // `number` references the valuator class; `scroll_type`:
+            // 1 = Vertical, 2 = Horizontal. Increment is 1.0 (one
+            // logical click per unit), matching our button-4/5
+            // synthesis at v120 boundaries.
+            fn write_scroll_class(
+                buf: &mut Vec<u8>,
+                sourceid: u16,
+                number: u16,
+                scroll_type: u16,
+            ) {
+                let le = ClientByteOrder::LittleEndian;
+                x11::write_u16(le, buf, 3); // type = Scroll
+                x11::write_u16(le, buf, 6); // length = 6 units = 24 bytes
+                x11::write_u16(le, buf, sourceid);
+                x11::write_u16(le, buf, number);
+                x11::write_u16(le, buf, scroll_type);
+                x11::write_u16(le, buf, 0); // pad
+                // Flags: NoEmulation (0x1) tells GDK "real axis
+                // events come on this scroll axis; do NOT expect or
+                // process XI_ButtonPress(4/5/6/7) as scroll
+                // emulation from this device." We emit both the
+                // XI_Motion-with-scroll-axis events and the core
+                // ButtonPress(4/5) (the latter for non-XI2 clients);
+                // setting NoEmulation prevents GDK's XI2 backend
+                // from double-firing scroll on both event types.
+                x11::write_u32(le, buf, 1); // flags = NoEmulation
+                // FP3232 increment = 1.0 → (1, 0)
+                x11::write_u32(le, buf, 1);
+                x11::write_u32(le, buf, 0);
             }
 
             fn write_key_class(buf: &mut Vec<u8>, sourceid: u16) {
@@ -5707,25 +5750,73 @@ fn handle_xi2_request(
 
             let mut infos = Vec::new();
 
-            // Master Pointer (deviceid=2): Button(7) + Valuator(X) +
-            // Valuator(Y). No XIScrollClass — we deliver scroll as
-            // core button 4/5/6/7 events. Adding XIScroll classes
-            // here without also declaring corresponding scroll
-            // valuators (axes 2/3) trips
-            // `_gdk_x11_device_xi2_add_scroll_valuator` assertions
-            // on every GTK process startup. Real XI2 axis-scroll
-            // support is filed as a separate followup.
+            // Master Pointer (deviceid=2):
+            //   Button(7) + Valuator(0 X Absolute) + Valuator(1 Y
+            //   Absolute) + Valuator(2 vscroll Relative) + Valuator(3
+            //   hscroll Relative) + Scroll(2 Vertical) + Scroll(3
+            //   Horizontal).
+            //
+            // Earlier attempt `20fd361` declared the Scroll classes
+            // referencing axes 2/3 but only declared valuators 0/1 —
+            // GDK's `_gdk_x11_device_xi2_add_scroll_valuator` asserts
+            // `scroll_number < n_axes`, firing Gdk-CRITICAL on every
+            // GTK startup. That regression was reverted in `e690ca0`.
+            // This time the scroll valuators ARE declared, so GDK
+            // registers them as scroll axes and processes wheel input
+            // through its modern path instead of the legacy
+            // button-4/5 fallback (which left caja / appearance
+            // settings ignoring the wheel until a view-switch).
             {
                 let deviceid: u16 = 2;
                 let name = "Virtual core pointer";
                 let mut classes = Vec::new();
                 write_button_class(&mut classes, deviceid, 7);
-                write_valuator_class(&mut classes, deviceid, 0, i32::from(screen_w).max(1) - 1);
-                write_valuator_class(&mut classes, deviceid, 1, i32::from(screen_h).max(1) - 1);
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    0,
+                    i32::from(screen_w).max(1) - 1,
+                    1,
+                    0,
+                );
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    1,
+                    i32::from(screen_h).max(1) - 1,
+                    1,
+                    0,
+                );
+                // Scroll axes report the current cumulative counter
+                // so GDK uses it as the per-client baseline. Without
+                // this, GDK's first XI_Motion-with-scroll-axis event
+                // for a client that connects mid-session yields
+                // delta = (current_counter - 0) ≫ 1, which the
+                // scroll handler either drops or over-applies — the
+                // visible "wheel does nothing in caja until view-
+                // switch resyncs" symptom.
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    2,
+                    0,
+                    0,
+                    state.scroll_axis_value[0],
+                );
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    3,
+                    0,
+                    0,
+                    state.scroll_axis_value[1],
+                );
+                write_scroll_class(&mut classes, deviceid, 2, 1); // vertical
+                write_scroll_class(&mut classes, deviceid, 3, 2); // horizontal
                 x11::write_u16(le, &mut infos, deviceid);
                 x11::write_u16(le, &mut infos, 1); // use = MasterPointer
                 x11::write_u16(le, &mut infos, 3); // attachment = paired keyboard
-                x11::write_u16(le, &mut infos, 3); // num_classes
+                x11::write_u16(le, &mut infos, 7); // num_classes
                 x11::write_u16(le, &mut infos, name.len() as u16);
                 infos.push(1); // enabled
                 infos.push(0); // pad

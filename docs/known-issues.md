@@ -38,37 +38,29 @@ once the underlying patterns are understood.
 
 ## Input, grabs, event routing
 
-- [ ] **Caja mouse wheel doesn't work until a view-switch (yserver
-      event-delivery bug).** Observed 2026-05-13 on dual-screen MATE
-      smoke. When caja launches in its default view (list or icon),
-      the mouse wheel does nothing. After toggling the view mode once
-      (View → Icon View / View → List View), the wheel works in
-      whichever view caja is in, and keeps working across subsequent
-      view switches. Pre-regression (before 3E text-run migration),
-      list view's wheel worked from launch — so this is a real
-      regression, not just GTK initialization quirk.
-      yserver does emit core button-4/5 press+release pairs from the
-      libinput scroll path (verified in `yserver-hw.log` —
-      `libinput button code=0x181 pressed=true → X11 detail=5`,
-      138 events in the smoke run). So the wheel reaches X11. The
-      stateful "fix after view-switch" pattern points at:
-      (a) initial event-mask subscription on caja's view widget not
-          including ButtonPressMask in the right window, OR
-      (b) pointer-grab state from caja's initial focus chain
-          consuming wheel events before they reach the view widget,
-          OR
-      (c) some Enter/Leave / crossing-event sequence on view-switch
-          that re-establishes the focus chain.
-      Bisect candidates among recent input/render changes: the 3E
-      text-run migration (no input code, but changes render timing
-      → could affect when/which Configure/Map/Expose events caja
-      sees relative to its event-mask setup); the scroll-wheel
-      commit `b7d17a1`; the `has_axis` fix `56f93d9`.
-      Investigation path: log every PointerButton(4/5) event's
-      target window + propagation chain in the first 5 seconds
-      after caja launches, vs after a view-switch. The difference
-      tells which window the wheel events are landing on (vs which
-      window caja's view widget expects). Filed 2026-05-13.
+- [~] **GTK wheel scroll needs another app to open first (residual
+      after XI2-valuator-scroll fix).** Largely fixed 2026-05-15 by
+      adding XIScrollClass + scroll valuators 2/3 to the master
+      pointer's XIQueryDevice reply, emitting XI_Motion events with
+      cumulative scroll-axis values on each wheel click, and
+      reporting the current counter as the axis's `value` field so
+      mid-session clients pick up the right baseline. Caja now
+      scrolls from the first click in its default view.
+      Residual: the FIRST app a yserver session opens (e.g.
+      appearance settings) doesn't scroll on its initial scrolls;
+      opening any subsequent GTK app unsticks scrolling everywhere,
+      including back in the originally-broken app. The pattern is
+      not per-app event-mask — it's process-wide GDK state that
+      flips once another GTK process queries devices or selects XI2
+      events. Suspect: GDK caches device state at app launch and
+      misses the scroll-axis info on the FIRST query of the session
+      (despite our reply being correct in x11trace). Working
+      theories not yet tried: emit XI_HierarchyChanged on first
+      libinput device discovery; emit XI_DeviceChanged after the
+      first scroll-axis update; advertise a slave-pointer device
+      with the scroll classes attached (real Xorg pattern). User
+      workaround: launch any extra GTK app at session start, then
+      close it; from then on scroll works everywhere.
 - [x] **GTK file-manager right-click popup offset + rubber-band
       anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
       `ea7c186`: the XIQueryPointer reply encoder placed the BOOL

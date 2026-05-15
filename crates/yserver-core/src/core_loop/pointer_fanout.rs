@@ -284,6 +284,40 @@ pub fn pointer_event_fanout_to_state(
         merge_dropped(&mut dropped, extras);
     }
 
+    // If this is a wheel button press (4 = up, 5 = down, 6 = left,
+    // 7 = right), increment the corresponding XI2 scroll-axis
+    // counter and prepend an XI_Motion event carrying the new
+    // cumulative axis value before the XI_ButtonPress. GDK's XI2
+    // backend reads the scroll axis from this Motion event and
+    // computes the scroll delta; without it the device's
+    // XIScrollClass entries are declared (via XIQueryDevice) but
+    // GDK never sees axis-change motion, so the scroll handler
+    // stays silent — which is the visible "wheel doesn't work
+    // until view-switch" caja / appearance-settings symptom.
+    //
+    // ButtonRelease doesn't carry a delta; only ButtonPress
+    // increments. The legacy XI_ButtonPress(4/5) event is still
+    // emitted below for core-X11 clients and for GDK's legacy
+    // fallback (currently unflagged — no XIPointerEmulated yet, so
+    // GDK might also process the button event as a scroll; if that
+    // double-fires we'll add the flag in a follow-up).
+    let scroll_axis_info: Option<(u8, i32)> = if event.kind == PointerEventKind::ButtonPress
+        && (event.detail >= 4 && event.detail <= 7)
+    {
+        let (axis_idx, delta): (usize, i32) = match event.detail {
+            4 => (0, -1),
+            5 => (0, 1),
+            6 => (1, -1),
+            7 => (1, 1),
+            _ => unreachable!(),
+        };
+        state.scroll_axis_value[axis_idx] = state.scroll_axis_value[axis_idx].wrapping_add(delta);
+        let scroll_axis_num: u8 = if axis_idx == 0 { 2 } else { 3 };
+        Some((scroll_axis_num, state.scroll_axis_value[axis_idx]))
+    } else {
+        None
+    };
+
     // XI2 device events (crossing or non-crossing).
     let extras = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
         if matches!(
@@ -310,6 +344,26 @@ pub fn pointer_event_fanout_to_state(
                 2,
             );
         } else {
+            if let Some((axis, value)) = scroll_axis_info {
+                x11::encode_xi2_motion_with_scroll(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    2,
+                    event.time,
+                    ROOT_WINDOW,
+                    nested_id,
+                    event.root_x,
+                    event.root_y,
+                    event_x,
+                    event_y,
+                    event.state,
+                    2,
+                    axis,
+                    value,
+                );
+            }
             x11::encode_xi2_device_event(
                 buf,
                 order,

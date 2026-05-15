@@ -1720,6 +1720,7 @@ pub fn encode_xi2_device_event(
     detail: u32,
     sourceid: u16,
 ) {
+    let start = out.len();
     out.push(35); // GenericEvent
     out.push(major_opcode);
     write_u16(byte_order, out, sequence.0);
@@ -1806,7 +1807,92 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, i32::from(root_y) as u32);
     write_u32(byte_order, out, 0); // Y fraction
 
-    debug_assert_eq!(out.len(), 104);
+    debug_assert_eq!(out.len() - start, 104);
+}
+
+/// Encode an XInput2 `XI_Motion` event carrying a scroll-axis update
+/// for one of the master-pointer's scroll valuators (axis 2 =
+/// vertical, axis 3 = horizontal). Tail layout matches
+/// `encode_xi2_device_event` except the valuator mask covers bits
+/// 0/1/`scroll_axis` and the axisvalue list carries three FP3232
+/// entries: X, Y, then the scroll axis's cumulative value. Length
+/// goes up by one FP3232 (8 bytes / 2 units) over the regular
+/// device event → 20 units. GDK's XI2 backend reads the cumulative
+/// value off this event and computes a scroll delta from the
+/// previous sample.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi2_motion_with_scroll(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    deviceid: u16,
+    time: u32,
+    root: ResourceId,
+    event: ResourceId,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    state: u16,
+    sourceid: u16,
+    scroll_axis: u8,
+    scroll_value: i32,
+) {
+    let start = out.len();
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(byte_order, out, sequence.0);
+    // Tail = base 72 (see encode_xi2_device_event) + 8 (extra
+    // FP3232 axis value) = 80 bytes = 20 units.
+    write_u32(byte_order, out, 20);
+
+    write_u16(byte_order, out, 6); // evtype = XI_Motion
+    write_u16(byte_order, out, deviceid);
+    write_u32(byte_order, out, time);
+    write_u32(byte_order, out, 0); // detail = 0 for motion
+    write_u32(byte_order, out, root.0);
+    write_u32(byte_order, out, event.0);
+    write_u32(byte_order, out, 0); // child
+
+    write_u32(byte_order, out, (i32::from(root_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(root_y) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
+    write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
+
+    write_u16(byte_order, out, 1); // buttons_len
+    write_u16(byte_order, out, 1); // valuators_len
+    write_u16(byte_order, out, sourceid);
+    write_u16(byte_order, out, 0); // pad
+    write_u32(byte_order, out, 0); // flags
+
+    // mods
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, u32::from(state));
+
+    out.extend_from_slice(&[0; 4]); // group
+
+    // Button mask reflects current button state (pre-event for motion
+    // = same as state). State bits 8..13 are Button1..5.
+    let post_buttons: u32 = u32::from((state >> 8) & 0x1f);
+    write_u32(byte_order, out, post_buttons);
+
+    // Valuator mask: bits 0 (X), 1 (Y), and the scroll axis.
+    let mask: u32 = 0x3 | (1u32 << u32::from(scroll_axis));
+    write_u32(byte_order, out, mask);
+
+    // Axis values (FP3232: signed i32 integer + u32 fraction).
+    // Order matches mask LSB-first: axis 0 (X), 1 (Y), then scroll.
+    write_u32(byte_order, out, i32::from(root_x) as u32);
+    write_u32(byte_order, out, 0); // X fraction
+    write_u32(byte_order, out, i32::from(root_y) as u32);
+    write_u32(byte_order, out, 0); // Y fraction
+    write_u32(byte_order, out, scroll_value as u32);
+    write_u32(byte_order, out, 0); // scroll fraction
+
+    debug_assert_eq!(out.len() - start, 112);
 }
 
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
