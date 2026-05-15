@@ -939,6 +939,156 @@ struct PixmapState {
 // The remaining font-protocol helper in this file is
 // xlfd_pattern_matches, which the ListFonts dispatcher still owns.
 
+/// Bundle of state produced by [`platform_init`] for both
+/// `KmsBackend` (v1) and `KmsBackendV2` (v2) to embed. Each backend
+/// embeds the fields directly today; in Stage 2 these move into a
+/// real `PlatformBackend` component on the v2 side.
+pub(crate) struct PlatformInit {
+    pub(crate) device: Arc<drm::Device>,
+    pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
+    pub(crate) render_node_path: Option<std::path::PathBuf>,
+    pub(crate) layouts: Vec<OutputLayout>,
+    pub(crate) fb_w: u16,
+    pub(crate) fb_h: u16,
+    pub(crate) input_ctx: Option<crate::input::SendContext>,
+}
+
+/// Shared DRM / outputs / libinput bring-up for the v1 and v2
+/// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
+/// and `KmsBackendV2::open` use the same code path.
+///
+/// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
+/// stay in the v1-specific portion of `open_with_commit` for now —
+/// v2 doesn't build any of that in Stage 1b (paint paths are
+/// stubbed). Stage 2 promotes the appropriate subset into the
+/// real `PlatformBackend` component.
+///
+/// # Errors
+///
+/// Propagates DRM open / output discovery / per-output commit
+/// failures. On bring-up error any output already committed gets
+/// disabled before returning so the next caller starts clean.
+pub(crate) fn platform_init(
+    device_path: &str,
+    commit: fn(
+        &crate::drm::Device,
+        &crate::drm::modeset::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<PlatformInit> {
+    let device = Arc::new(drm::Device::open(device_path)?);
+    let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
+    {
+        Ok((fd, path)) => {
+            use std::os::fd::AsRawFd;
+            let raw = fd.as_raw_fd();
+            let stat_minor = std::fs::metadata(&path)
+                .ok()
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    let rdev = m.rdev();
+                    ((rdev >> 8) & 0xff, rdev & 0xff)
+                })
+                .map(|(maj, min)| format!("{maj}:{min}"))
+                .unwrap_or_else(|| "?".into());
+            log::info!(
+                "DRI3 render node ready (sibling of {device_path}): fd={raw} \
+                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
+            );
+            (Some(fd), Some(path))
+        }
+        Err(err) => {
+            log::warn!(
+                "DRI3 render node unavailable: {err}; DRI3 import path will be \
+                     unavailable but the rest of yserver continues"
+            );
+            (None, None)
+        }
+    };
+    let outputs = drm::modeset::discover_outputs(&device)?;
+
+    // Horizontal layout in connector order. If anything fails part
+    // way through bring-up, disable everything we have already
+    // committed so the next caller starts from a clean slate.
+    let mut layouts: Vec<OutputLayout> = Vec::with_capacity(outputs.len());
+    let mut next_x: i32 = 0;
+    let mut bring_up_err: Option<io::Error> = None;
+    for output in outputs {
+        let w = output.picked.width;
+        let h = output.picked.height;
+        let mut buffers = Vec::with_capacity(2);
+        let mut buffer_err: Option<io::Error> = None;
+        for _ in 0..2 {
+            match drm::Buffer::new(Arc::clone(&device), w, h) {
+                Ok(b) => buffers.push(b),
+                Err(e) => {
+                    buffer_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = buffer_err {
+            bring_up_err = Some(e);
+            break;
+        }
+        let initial_fb = buffers[0].fb_id();
+        if let Err(e) = commit(&device, &output, initial_fb) {
+            bring_up_err = Some(e);
+            break;
+        }
+        let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
+        layouts.push(OutputLayout {
+            output,
+            swapchain,
+            x: next_x,
+            y: 0,
+            width: w,
+            height: h,
+            damage: crate::kms::scheduler::damage::OutputDamageState::new(),
+            composite_pools: None,
+        });
+        next_x = next_x.saturating_add(i32::from(w));
+    }
+    if let Some(err) = bring_up_err {
+        for done in layouts.iter().rev() {
+            let _ = drm::modeset::disable_output(&device, &done.output);
+        }
+        return Err(err);
+    }
+
+    // fb_w / fb_h carry the virtual-screen extent. Saturating
+    // cast: huge layouts that exceed u16 are clamped — the rest
+    // of the backend assumes u16 framebuffer dims.
+    let fb_w: u16 = layouts
+        .iter()
+        .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    let fb_h: u16 = layouts
+        .iter()
+        .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+
+    let input_ctx = match crate::input::SendContext::new() {
+        Ok(ctx) => Some(ctx),
+        Err(err) => {
+            log::warn!("libinput unavailable, continuing without input: {err}");
+            None
+        }
+    };
+
+    Ok(PlatformInit {
+        device,
+        render_node_fd,
+        render_node_path,
+        layouts,
+        fb_w,
+        fb_h,
+        input_ctx,
+    })
+}
+
 impl KmsBackend {
     pub fn open(device_path: &str) -> io::Result<Self> {
         Self::open_with_commit(device_path, drm::modeset::commit_modeset)
@@ -1457,111 +1607,15 @@ impl KmsBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let device = Arc::new(drm::Device::open(device_path)?);
-        let (render_node_fd, render_node_path) =
-            match crate::kms::render_node::open_for_card(&*device) {
-                Ok((fd, path)) => {
-                    use std::os::fd::AsRawFd;
-                    let raw = fd.as_raw_fd();
-                    let stat_minor = std::fs::metadata(&path)
-                        .ok()
-                        .map(|m| {
-                            use std::os::unix::fs::MetadataExt;
-                            let rdev = m.rdev();
-                            ((rdev >> 8) & 0xff, rdev & 0xff)
-                        })
-                        .map(|(maj, min)| format!("{maj}:{min}"))
-                        .unwrap_or_else(|| "?".into());
-                    log::info!(
-                        "DRI3 render node ready (sibling of {device_path}): fd={raw} \
-                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
-                    );
-                    (Some(fd), Some(path))
-                }
-                Err(err) => {
-                    log::warn!(
-                        "DRI3 render node unavailable: {err}; DRI3 import path will be \
-                     unavailable but the rest of yserver continues"
-                    );
-                    (None, None)
-                }
-            };
-        let outputs = drm::modeset::discover_outputs(&device)?;
-
-        // Horizontal layout in connector order. If anything fails part
-        // way through bring-up, disable everything we have already
-        // committed so the next caller starts from a clean slate.
-        // TODO(phase-6.10): no unit test exercises this rollback yet —
-        // discover_outputs requires a real DRM device, so a synthetic
-        // seam isn't cheap. Manual smoke at Step 5/6 covers it.
-        let mut layouts: Vec<OutputLayout> = Vec::with_capacity(outputs.len());
-        let mut next_x: i32 = 0;
-        let mut bring_up_err: Option<io::Error> = None;
-        for output in outputs {
-            let w = output.picked.width;
-            let h = output.picked.height;
-            let mut buffers = Vec::with_capacity(2);
-            let mut buffer_err: Option<io::Error> = None;
-            for _ in 0..2 {
-                match drm::Buffer::new(Arc::clone(&device), w, h) {
-                    Ok(b) => buffers.push(b),
-                    Err(e) => {
-                        buffer_err = Some(e);
-                        break;
-                    }
-                }
-            }
-            if let Some(e) = buffer_err {
-                bring_up_err = Some(e);
-                break;
-            }
-            let initial_fb = buffers[0].fb_id();
-            if let Err(e) = commit(&device, &output, initial_fb) {
-                bring_up_err = Some(e);
-                break;
-            }
-            let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-            layouts.push(OutputLayout {
-                output,
-                swapchain,
-                x: next_x,
-                y: 0,
-                width: w,
-                height: h,
-                damage: crate::kms::scheduler::damage::OutputDamageState::new(),
-                composite_pools: None,
-            });
-            next_x = next_x.saturating_add(i32::from(w));
-        }
-        if let Some(err) = bring_up_err {
-            for done in layouts.iter().rev() {
-                let _ = drm::modeset::disable_output(&device, &done.output);
-            }
-            return Err(err);
-        }
-
-        // fb_w / fb_h carry the virtual-screen extent. Saturating
-        // cast: huge layouts that exceed u16 are clamped — the rest
-        // of the backend assumes u16 framebuffer dims (changing that
-        // is out of scope for Step 3).
-        let fb_w: u16 = layouts
-            .iter()
-            .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
-            .max()
-            .unwrap_or(0);
-        let fb_h: u16 = layouts
-            .iter()
-            .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
-            .max()
-            .unwrap_or(0);
-
-        let input_ctx = match crate::input::SendContext::new() {
-            Ok(ctx) => Some(ctx),
-            Err(err) => {
-                log::warn!("libinput unavailable, continuing without input: {err}");
-                None
-            }
-        };
+        let PlatformInit {
+            device,
+            render_node_fd,
+            render_node_path,
+            layouts,
+            fb_w,
+            fb_h,
+            input_ctx,
+        } = platform_init(device_path, commit)?;
 
         let core = KmsCore::new(fb_w, fb_h)?;
 

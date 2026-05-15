@@ -23,8 +23,6 @@ use yserver_core::{
     server::ServerState,
 };
 
-use crate::kms::KmsBackend;
-
 const DISPLAY: u16 = 7;
 
 pub fn run() -> io::Result<()> {
@@ -166,7 +164,7 @@ pub fn run() -> io::Result<()> {
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
-    let mut backend = KmsBackend::open(&device_path)?;
+    let mut backend = crate::kms::KmsBackendKind::open_from_env(&device_path)?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -278,7 +276,7 @@ pub fn run() -> io::Result<()> {
         rx,
         sender,
         &mut state,
-        &mut backend,
+        backend.as_dyn_backend_mut(),
         Some(listener),
         &alloc,
     );

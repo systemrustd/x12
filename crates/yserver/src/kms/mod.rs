@@ -1,17 +1,20 @@
-mod backend;
+pub(crate) mod backend;
 pub mod compositor;
 #[cfg(target_os = "linux")]
 pub mod console;
 pub(crate) mod core;
 pub mod cpu_types;
 pub(crate) mod cursor_plane;
+pub(crate) mod dispatch;
 pub mod event;
 pub mod fonts;
 pub mod render;
 pub(crate) mod render_node;
 pub mod scheduler;
+pub mod v2;
 pub mod vk;
 pub(super) mod xkb;
 pub(crate) mod xshmfence;
 
 pub use backend::KmsBackend;
+pub use dispatch::KmsBackendKind;
