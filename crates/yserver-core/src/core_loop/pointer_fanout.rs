@@ -285,22 +285,25 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // If this is a wheel button press (4 = up, 5 = down, 6 = left,
-    // 7 = right), increment the corresponding XI2 scroll-axis
-    // counter and prepend an XI_Motion event carrying the new
-    // cumulative axis value before the XI_ButtonPress. GDK's XI2
-    // backend reads the scroll axis from this Motion event and
-    // computes the scroll delta; without it the device's
-    // XIScrollClass entries are declared (via XIQueryDevice) but
-    // GDK never sees axis-change motion, so the scroll handler
-    // stays silent — which is the visible "wheel doesn't work
-    // until view-switch" caja / appearance-settings symptom.
+    // 7 = right), prepend an XI_Motion event carrying the per-
+    // event scroll delta before the XI_ButtonPress. The Motion's
+    // axis value is the DELTA (±1 per click), NOT the cumulative
+    // counter — XIScrollClass is declared Relative (mode=0), so
+    // per the XI2 spec the axis value in each Motion event is the
+    // change since the previous event. GDK divides by increment
+    // (1.0) and fires a scroll event.
     //
-    // ButtonRelease doesn't carry a delta; only ButtonPress
-    // increments. The legacy XI_ButtonPress(4/5) event is still
-    // emitted below for core-X11 clients and for GDK's legacy
-    // fallback (currently unflagged — no XIPointerEmulated yet, so
-    // GDK might also process the button event as a scroll; if that
-    // double-fires we'll add the flag in a follow-up).
+    // The earlier cumulative-counter encoding was a Relative-mode
+    // mismatch: GDK interpreted the cumulative value AS the delta,
+    // which fires N scroll events on the Nth wheel click and
+    // confuses clients that joined mid-session. State tracking on
+    // ServerState (scroll_axis_value) is kept for telemetry / for
+    // any future Absolute-mode switch but isn't used for emission.
+    //
+    // ButtonRelease doesn't carry a delta; only ButtonPress does.
+    // The legacy XI_ButtonPress(4/5) event still goes out below
+    // for core-X11 clients and for non-XI2 fallback. XIScrollClass
+    // has NoEmulation flag set, so GDK ignores those for scroll.
     let scroll_axis_info: Option<(u8, i32)> = if event.kind == PointerEventKind::ButtonPress
         && (event.detail >= 4 && event.detail <= 7)
     {
@@ -313,7 +316,7 @@ pub fn pointer_event_fanout_to_state(
         };
         state.scroll_axis_value[axis_idx] = state.scroll_axis_value[axis_idx].wrapping_add(delta);
         let scroll_axis_num: u8 = if axis_idx == 0 { 2 } else { 3 };
-        Some((scroll_axis_num, state.scroll_axis_value[axis_idx]))
+        Some((scroll_axis_num, delta))
     } else {
         None
     };

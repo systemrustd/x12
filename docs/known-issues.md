@@ -46,24 +46,26 @@ once the underlying patterns are understood.
       reporting the current counter as the axis's `value` field so
       mid-session clients pick up the right baseline. Caja now
       scrolls from the first click in its default view.
-      Residual: the FIRST app a yserver session opens (e.g.
-      appearance settings) doesn't scroll on its initial scrolls.
-      Merely launching another GTK app is NOT enough — the trigger
-      is **scrolling inside that other app** (e.g. caja). Once
-      scrolling works in app B, returning to app A and scrolling
-      works there too. The pattern persists across the rest of the
-      session.
-      The wire trace shows app A receives XI_Motion-with-scroll-
-      axis events the entire time, with consistent axisvalues; it
-      simply doesn't fire scroll handlers on them until something
-      about scrolling in app B flips a per-process GDK state.
-      Working theories not yet tried: XIScrollClass mode mismatch
-      (we declare Relative but emit cumulative; real Xorg pattern
-      is Relative + per-event delta); GDK needs an XI_DeviceChanged
-      event after the first scroll-axis advance; cursor wasn't
-      over the right widget initially (Enter event hadn't seeded
-      something). User workaround: scroll once in any other GTK
-      app first.
+      Residual: the FIRST app a yserver session opens
+      occasionally doesn't scroll on its initial scrolls. The
+      trigger to unstick is **any scroll event reaching any GTK
+      target** — scrolling on the MATE desktop (caja-managed)
+      counts even though it produces no visible scroll. After
+      that, scrolling works everywhere for the rest of the
+      session. Non-deterministic: across three test runs, two
+      needed the warm-up and one worked first try.
+      Wire is delta-correct now (Relative mode, ±1 per click,
+      NoEmulation flag, valuator 2/3 declared). The race appears
+      to be between yserver emitting XI_Motion-with-scroll-axis
+      and GDK's XI2 device-init handshake completing — if GDK
+      hasn't finished caching the device's scroll classes when
+      the first event arrives, the event is dropped. Real Xorg
+      may avoid this by sending some initial axis state with
+      XI_HierarchyChanged or by serializing XIQueryDevice replies
+      against subsequent events.
+      User workaround: scroll once on the desktop or in any
+      other GTK app to prime. Filed for follow-up; not worth
+      blocking on.
 - [x] **GTK file-manager right-click popup offset + rubber-band
       anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
       `ea7c186`: the XIQueryPointer reply encoder placed the BOOL
