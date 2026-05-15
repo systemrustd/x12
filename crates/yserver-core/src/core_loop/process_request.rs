@@ -5854,22 +5854,32 @@ fn handle_xi2_request(
             );
             // Reply layout (length = 6 units = 24 bytes after the
             // 8-byte header — total 32 + 24 = 56). FP1616 coords are
-            // (i32::from(coord) << 16) as u32; mask spans both byte-
-            // orders correctly because write_u32 honours `byte_order`.
-            let mut reply = x11::fixed_reply(byte_order, sequence, same_screen, 6);
+            // (i32::from(coord) << 16) as u32. Per xinput.xml the
+            // BOOL `same_screen` is at offset 32 (NOT in the `pad0`
+            // slot at offset 1 — confirmed via x11trace 2026-05-15).
+            // GTK uses `same_screen` to pick popup-placement code
+            // paths; encoding it as pad0 left every client reading
+            // `same_screen=false` and routing through the "different
+            // screen" branch, which made Thunar's right-click popup
+            // appear at root+window_origin instead of near the click.
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 6);
             x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
             x11::write_u32(byte_order, &mut reply, 0); // child
             x11::write_u32(byte_order, &mut reply, (i32::from(root_x_int) << 16) as u32);
             x11::write_u32(byte_order, &mut reply, (i32::from(root_y_int) << 16) as u32);
             x11::write_u32(byte_order, &mut reply, (i32::from(win_x_int) << 16) as u32);
             x11::write_u32(byte_order, &mut reply, (i32::from(win_y_int) << 16) as u32);
-            x11::write_u16(byte_order, &mut reply, 0); // buttons_len
-            // mods.effective carries the X11 KeyButMask. Modern GDK
-            // splits modifiers vs buttons cleanly via the dedicated
-            // mods field; passing the merged mask here matches the
-            // legacy QueryPointer reply and what xorg-server returns.
-            x11::write_u16(byte_order, &mut reply, mask);
-            reply.extend_from_slice(&[0u8; 16]); // mods info (base/latched/locked/effective u32s zeroed)
+            reply.push(same_screen); // byte 32: same_screen (BOOL)
+            reply.push(0); // byte 33: pad
+            x11::write_u16(byte_order, &mut reply, 0); // bytes 34-35: buttons_len
+            // ModifierInfo: 4× CARD32 = base / latched / locked /
+            // effective. `mask` carries the X11 KeyButMask snapshot
+            // from the backend; place it in `effective_mods` so GDK
+            // sees a non-zero effective modifier state.
+            x11::write_u32(byte_order, &mut reply, 0); // base_mods
+            x11::write_u32(byte_order, &mut reply, 0); // latched_mods
+            x11::write_u32(byte_order, &mut reply, 0); // locked_mods
+            x11::write_u32(byte_order, &mut reply, u32::from(mask)); // effective_mods
             reply.extend_from_slice(&[0u8; 4]); // group info
             buf.extend_from_slice(&reply);
         }
@@ -10259,6 +10269,41 @@ fn handle_change_property(
                 client_id.0,
                 req.window.0,
                 pid,
+            );
+        } else if prop_name == "_NET_FRAME_EXTENTS" && req.format == 32 && req.data.len() >= 16 {
+            // 4× CARDINAL: left, right, top, bottom (frame inset
+            // around the client window). GTK reads this to position
+            // popups; if it's corrupted we'd see the popup-placement
+            // bug for reparented application windows.
+            let l = u32::from_le_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
+            let r = u32::from_le_bytes([req.data[4], req.data[5], req.data[6], req.data[7]]);
+            let t = u32::from_le_bytes([req.data[8], req.data[9], req.data[10], req.data[11]]);
+            let b = u32::from_le_bytes([req.data[12], req.data[13], req.data[14], req.data[15]]);
+            log::info!(
+                "client {} _NET_FRAME_EXTENTS on 0x{:x}: left={} right={} top={} bottom={}",
+                client_id.0,
+                req.window.0,
+                l,
+                r,
+                t,
+                b,
+            );
+        } else if prop_name == "_NET_WORKAREA" && req.format == 32 && req.data.len() >= 16 {
+            // 4× CARDINAL per desktop: x, y, width, height. Log
+            // the first desktop's quad; subsequent desktops are
+            // rare and the first is the one popup placement uses.
+            let x = u32::from_le_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
+            let y = u32::from_le_bytes([req.data[4], req.data[5], req.data[6], req.data[7]]);
+            let w = u32::from_le_bytes([req.data[8], req.data[9], req.data[10], req.data[11]]);
+            let h = u32::from_le_bytes([req.data[12], req.data[13], req.data[14], req.data[15]]);
+            log::info!(
+                "client {} _NET_WORKAREA on 0x{:x}: x={} y={} w={} h={} (desktop 0)",
+                client_id.0,
+                req.window.0,
+                x,
+                y,
+                w,
+                h,
             );
         }
     }
