@@ -650,10 +650,15 @@ exact failure mode v2 is designed to eliminate.
     (not just the damaged rect) against a CPU oracle. This is
     the load-bearing test for the buffer-age algorithm — if the
     BO-rotation history is wrong, unchanged regions show stale
-    pixels from prior generations and the diff catches it. Stage
-    2 must pass this with `full_redraw_fallback/sec` at near-zero
-    (a small number during BO warmup is acceptable; sustained
-    fallback indicates the algorithm is broken).
+    pixels from prior generations and the diff catches it.
+    **Fallback budget** (counted in frames, not per-second, since
+    the test is short and BO warmup biases a rate metric):
+    at most one `full_redraw_fallback` per scanout BO during the
+    initial warmup phase (one full redraw per BO is expected
+    while each BO acquires its first valid generation entry);
+    **zero sustained fallback** after every BO has a recorded
+    generation, for the remainder of the test. Any fallback past
+    warmup is a buffer-age bug.
   - Zero `vkQueueWaitIdle` calls on the hot path under that harness.
   - Cold-start session into a non-WM `xsetroot`-style flow: yserver
     comes up, root is cleared to a known color, the cursor renders,
@@ -872,8 +877,9 @@ before judging "fast enough" at any stage:
     from Stage 2** (the buffer-age algorithm depends on it as the
     safety net). Allowed during BO warmup (a freshly-acquired BO
     with no recorded last-present-generation), damage-history
-    loss (a pause that overflowed the ring), failed-flip recovery
-    (the BO's age advanced but the recorded history didn't), and
+    loss (a pause that overflowed the ring), failed-submit /
+    failed-flip recovery (present history is incomplete or the
+    BO's generation is unknown after a prior failure), and
     output reconfigure (mode change, hotplug). Expected
     **near-zero in steady-state clipped redraw**; sustained
     non-zero rates indicate either ring depth needs tuning or a
@@ -1078,7 +1084,7 @@ that follow.
 - `docs/status-archive-2026-05-13.md` — pre-v2 history.
 - Abandoned `render-convolution-filter` branch — T1-T4 Manual-redirect
   + convolution Phase 2 implementation; reference material for v2
-  when COMPOSITE comes back in stage 5.
+  when COMPOSITE comes back in Stage 4.
 
 ## Review checklist (codex)
 
