@@ -165,7 +165,58 @@ from.
       pick the matching one at composite time. RENDER's default
       filter is `Nearest`; defaulting to LINEAR is the wrong
       direction for pixel-art / 1:1 blits, so this is a correctness
-      gap, not just polish.
+      gap, not just polish. **Deferred** pending the v2 rendering-
+      model spec — picture/filter handling lands inside the new
+      `RenderEngine` rather than retrofitted on the current model.
+
+- [ ] **Compositor shadow margins render as opaque bars
+      (NameWindowPixmap → BadAlloc).** Diagnosed 2026-05-15 from
+      a fresh `xfce.xtrace`. Visible as thin perpendicular dark
+      bars to the right and below xfce pop-up menus (any GTK
+      Client-Side-Decoration popup with alpha-shadow margins).
+      Same gap will affect every Manual-mode compositor: xfwm4,
+      picom's xrender backend, xcompmgr, compton.
+
+      **Five-step fault chain (xtrace evidence in parentheses):**
+
+      1. xfwm4 issues `RedirectSubwindows update=Manual(0x01)`
+         on root (xfce.xtrace, e.g. `005:<:0731`). Accepted by
+         the 2026-05-14 fix
+         (`feedback_composite_manual_redirect_trap`).
+      2. That fix registered the redirect *record* but **skipped**
+         `activate_redirect_backing_for`, so
+         `host_window_to_backing` stays empty for every redirected
+         window.
+      3. xfwm4 issues `NameWindowPixmap window=0x00d000f4
+         pixmap=0x0060043e` for the menu (depth-32, override-
+         redirect, 183×501) — xfce.xtrace `005:<:1d7c`.
+      4. yserver's `name_window_pixmap`
+         (`kms::backend::KmsBackend`, `backend.rs:10506`) looks up
+         `host_window_to_backing`, finds nothing → returns
+         `Err(NotFound)` → wire-level **BadAlloc** —
+         xfce.xtrace `005:>:1d7c:Error 11=Alloc: major=144,
+         minor=6, bad=0x0060043e`.
+      5. xfwm4 falls back to `CreatePicture pid=0x0060043f
+         drawable=0x00d000f4` — a picture **directly on the live
+         window** — xfce.xtrace `005:<:1d7e` — and composites
+         from it (`005:<:1d8b`). The live window only carries
+         visible RGB; the GTK CSD shadow-alpha that lives in the
+         offscreen backing is unreachable, so xfwm4 emits opaque
+         shadow-color pixels where the alpha gradient should
+         fade.
+
+      **Status:** the 2026-05-15 attempt to fix this in the
+      current rendering model (the abandoned
+      `render-convolution-filter` branch, T1-T4 of the Manual-
+      redirect plan) made the BadAlloc go away at the protocol
+      level but exposed the deeper structural mismatch — yserver's
+      scanout walks per-window mirrors and never displays root's
+      mirror, so the compositor's RENDER paint to root is
+      invisible. **Deferred** to the v2 rendering-model rewrite,
+      where COMPOSITE redirect collapses to "this window's storage
+      target moves" and the compositor's paint to root is
+      naturally what `SceneCompositor` consumes. See
+      `docs/superpowers/specs/rendering-model-v2.md` (TBD).
 - [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through
