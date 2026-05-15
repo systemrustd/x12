@@ -438,6 +438,47 @@ yserver-mate-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "mate log:    mate.log"'
 
+# xfce on yserver with x11trace recording the full X11 wire
+# protocol between clients and yserver. xfce-session connects to
+# the fake display `:8`; x11trace tunnels everything to yserver
+# on `:7` and dumps a human-readable per-request/per-event trace
+# to `xfce.xtrace`. Use to diff against an Xorg-side capture
+# (see `xfce-xorg-trace`) when debugging GTK popup placement,
+# rubber-band selection, or any "works on Xorg, broken on
+# yserver" client-side bug.
+yserver-xfce-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o xfce.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session xfce4-session --display :8 > xfce.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "x11trace:    xfce.xtrace";\
+        echo "xfce log:    xfce.log"'
+
+# Companion recipe: run thunar against the host Xorg through
+# x11trace, dumping the same protocol view to `thunar-xorg.xtrace`.
+# Diff against `xfce.xtrace` to spot which call sequence differs
+# (the path GTK takes for popup placement, rubber-band anchor,
+# whatever). Defaults to the current `$DISPLAY` (host Xorg); pass
+# `real=":1"` etc. to override.
+thunar-xorg-trace real="$DISPLAY":
+    bash -c '\
+        x11trace -d {{real}} -D :8 -n -o thunar-xorg.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        DISPLAY=:8 thunar;\
+        kill -TERM $xtrace_pid 2>/dev/null;\
+        echo "x11trace: thunar-xorg.xtrace"'
+
 # Release-mode mate with logging turned down to `warn`. Use this to
 # test whether pointer lag under hover is dominated by env_logger /
 # stderr formatting cost (observed at ~5% of CPU under debug+debug
