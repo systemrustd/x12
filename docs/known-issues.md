@@ -415,13 +415,6 @@ that the host hides for us.
       bg-pixmap content, with small black pixels at the very corners
       because the popup outer's bg isn't auto-filled there
       (default bg = None). Investigate `ParentRelative` bg forwarding.
-- [ ] **fvwm3 segfaults on host container resize / window close.**
-      Pre-existing fvwm3 bugs (reproduce without ynest changes).
-      Re-test after the next fvwm3 update.
-- [ ] **fvwm: apps disappear after host container resize.** Original
-      Phase 3.2 observation. Separate symptom from the segfault above
-      — sometimes apps just vanish from the WM's view rather than
-      crashing it. Pre-existing.
 - [ ] **openbox frame chrome.** Frame title bars / labels / buttons
       don't draw under openbox even after the Phase 3.4 atom fix;
       clients render correctly inside the frames. Suspect: openbox
@@ -581,3 +574,10 @@ WM smoke testing.
       classifier in `BackendEventSink::handle_backend_event` to
       drop the WARN noise from ynest-host error replies. No host
       server on the KMS path.
+- [ ] **fvwm3 segfaults on host container resize / window close.**
+      Triggered by ynest-host window resize. yserver KMS doesn't
+      currently support output resize at all, so this code path is
+      not reachable. Pre-existing fvwm3 bug independent of yserver.
+- [ ] **fvwm: apps disappear after host container resize.** Same
+      ynest-host-resize trigger as the segfault above. Not
+      reachable on KMS-direct.
