@@ -3202,17 +3202,6 @@ fn handle_mit_shm_put_image(
     let Some(target) = target else {
         return Ok(RequestOutcome::Handled);
     };
-    let Some(stride_bytes) = zpixmap_expected_len(req.src_width, req.src_height, req.depth) else {
-        return emit_x11_error_with_minor(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            req.shmseg,
-            u16::from(shm::PUT_IMAGE),
-            MIT_SHM_MAJOR_OPCODE,
-        );
-    };
     let snapshot: Vec<u8> = {
         let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
             return emit_x11_error_with_minor(
@@ -3225,10 +3214,17 @@ fn handle_mit_shm_put_image(
                 MIT_SHM_MAJOR_OPCODE,
             );
         };
-        let bytes = segment.as_slice();
-        let start = req.offset as usize;
-        let end = start.saturating_add(stride_bytes);
-        if end > bytes.len() {
+        let Some(extracted) = extract_shm_zpixmap_region(
+            segment.as_slice(),
+            req.offset,
+            req.total_width,
+            req.total_height,
+            req.src_x,
+            req.src_y,
+            req.src_width,
+            req.src_height,
+            req.depth,
+        ) else {
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -3238,8 +3234,8 @@ fn handle_mit_shm_put_image(
                 u16::from(shm::PUT_IMAGE),
                 MIT_SHM_MAJOR_OPCODE,
             );
-        }
-        bytes[start..end].to_vec()
+        };
+        extracted
     };
     backend.clear_clip_rectangles(origin)?;
     backend.put_image(
@@ -7534,17 +7530,112 @@ fn handle_put_image(
 /// `depth`, returning `None` for unsupported depths or arithmetic
 /// overflow. Mirrors `nested::zpixmap_expected_len`.
 fn zpixmap_expected_len(width: u16, height: u16, depth: u8) -> Option<usize> {
-    let stride_bytes: usize = match depth {
-        24 | 32 => {
-            let stride_bits = usize::from(width).checked_mul(32)?;
-            stride_bits.div_ceil(32).checked_mul(4)?
+    let stride_bytes = zpixmap_row_stride(width, depth)?;
+    stride_bytes.checked_mul(usize::from(height))
+}
+
+/// Bytes per scanline for X11 ZPixmap of `width` pixels at `depth`,
+/// padded to the server's bitmap_scanline_pad of 32 bits.
+fn zpixmap_row_stride(width: u16, depth: u8) -> Option<usize> {
+    match depth {
+        24 | 32 => usize::from(width).checked_mul(4),
+        8 => usize::from(width).div_ceil(4).checked_mul(4),
+        4 => usize::from(width).div_ceil(8).checked_mul(4),
+        1 => usize::from(width).div_ceil(32).checked_mul(4),
+        _ => None,
+    }
+}
+
+/// Extract a tightly-packed `src_width × src_height × bpp(depth)`
+/// region from an MIT-SHM ZPixmap buffer laid out as `total_width ×
+/// total_height` with the server's standard scanline padding. The
+/// caller passes the full shm segment in `bytes`; `offset` is the
+/// byte offset to the START of the image (not the region).
+///
+/// Returns `None` if any computed offset would exceed `bytes.len()`,
+/// or the depth is unsupported, or any required arithmetic
+/// overflows. For `depth == 1` (bit-packed), `src_x` must be a
+/// multiple of 8 — non-byte-aligned bit extraction is not
+/// implemented; in practice all known clients use `src_x = 0` for
+/// bitmasks.
+fn extract_shm_zpixmap_region(
+    bytes: &[u8],
+    offset: u32,
+    total_width: u16,
+    total_height: u16,
+    src_x: i16,
+    src_y: i16,
+    src_width: u16,
+    src_height: u16,
+    depth: u8,
+) -> Option<Vec<u8>> {
+    if src_x < 0 || src_y < 0 {
+        return None;
+    }
+    let src_x = u32::try_from(src_x).ok()?;
+    let src_y = u32::try_from(src_y).ok()?;
+    // The region must fit inside the declared total image.
+    let src_x_end = src_x.checked_add(u32::from(src_width))?;
+    let src_y_end = src_y.checked_add(u32::from(src_height))?;
+    if src_x_end > u32::from(total_width) || src_y_end > u32::from(total_height) {
+        return None;
+    }
+
+    let total_stride = zpixmap_row_stride(total_width, depth)?;
+    let src_stride = zpixmap_row_stride(src_width, depth)?;
+
+    // Per-row leading-byte offset within the source row.
+    let src_x_bytes: usize = match depth {
+        1 => {
+            if src_x % 8 != 0 {
+                return None;
+            }
+            (src_x / 8) as usize
         }
-        8 => usize::from(width).div_ceil(4).checked_mul(4)?,
-        4 => usize::from(width).div_ceil(8).checked_mul(4)?,
-        1 => usize::from(width).div_ceil(32).checked_mul(4)?,
+        4 => {
+            if src_x % 2 != 0 {
+                return None;
+            }
+            (src_x / 2) as usize
+        }
+        8 => src_x as usize,
+        24 | 32 => (src_x as usize).checked_mul(4)?,
         _ => return None,
     };
-    stride_bytes.checked_mul(usize::from(height))
+
+    let base = usize::try_from(offset).ok()?;
+    // Bytes-per-source-row that actually carry image data (no trailing pad).
+    let row_bytes: usize = match depth {
+        24 | 32 => (src_width as usize).checked_mul(4)?,
+        8 => src_width as usize,
+        4 => (src_width as usize).div_ceil(2),
+        1 => (src_width as usize).div_ceil(8),
+        _ => return None,
+    };
+    if row_bytes > src_stride {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(src_stride.checked_mul(usize::from(src_height))?);
+    for r in 0..usize::from(src_height) {
+        let row_y = (src_y as usize).checked_add(r)?;
+        let row_start = base
+            .checked_add(row_y.checked_mul(total_stride)?)?
+            .checked_add(src_x_bytes)?;
+        let row_end = row_start.checked_add(row_bytes)?;
+        if row_end > bytes.len() {
+            return None;
+        }
+        out.extend_from_slice(&bytes[row_start..row_end]);
+        // Pad scanline to 32-bit boundary if needed (d1/d4/d8 with
+        // width not a multiple of the pad unit). Output buffer's
+        // row stride is `src_stride`; pad with zeros so downstream
+        // consumers see the standard ZPixmap layout.
+        if src_stride > row_bytes {
+            out.resize(out.len() + (src_stride - row_bytes), 0);
+        }
+    }
+    Some(out)
 }
 
 fn handle_image_text8(
@@ -11238,6 +11329,171 @@ mod tests {
         assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
         assert_eq!(state.composite_redirects.len(), 1);
     }
+
+    // ---------------- extract_shm_zpixmap_region ----------------
+    //
+    // The protocol-level byte-extraction for MIT-SHM PutImage. Until
+    // 2026-05-15 the handler ignored `total_width` / `src_x` /
+    // `src_y` and read a tightly-packed `src_width × src_height ×
+    // bpp` block at `offset`. That happens to be correct when the
+    // client sets `total == src` and `src_xy == 0` (the common
+    // case), but reads garbage when the client uploads a sub-region
+    // of a larger shm image. xfdesktop's thumbnail upload pattern
+    // and any cairo-padded surface trigger the latter, which
+    // manifests as horizontal-band corruption around the thumbnail.
+
+    fn d32_pixel(b: u8, g: u8, r: u8, a: u8) -> [u8; 4] {
+        // Wire byte order for a depth-32 ZPixmap is [B, G, R, A] —
+        // see the comment in `try_vk_put_image`.
+        [b, g, r, a]
+    }
+
+    #[test]
+    fn extract_d32_tight_packing_returns_input() {
+        // total == src, src_xy == 0 → output is exactly the input.
+        let mut bytes = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, x ^ y, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, 0, 4, 4, 32)
+            .expect("tight extraction succeeds");
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn extract_d32_subregion_of_larger_buffer() {
+        // 8×8 total, take 4×4 at (2, 2). The handler must read row 2
+        // bytes 8..24, row 3 bytes 8..24, etc. — NOT 64 contiguous
+        // bytes from offset 0, which is what the pre-fix handler
+        // did.
+        let mut bytes = Vec::new();
+        for y in 0..8u8 {
+            for x in 0..8u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, 0, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 8, 8, 2, 2, 4, 4, 32)
+            .expect("subregion extraction succeeds");
+        // Output must be the (2,2)..(6,6) tile, tightly packed.
+        let mut want = Vec::new();
+        for y in 2..6u8 {
+            for x in 2..6u8 {
+                want.extend_from_slice(&d32_pixel(x, y, 0, 0xFF));
+            }
+        }
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn extract_d32_total_wider_than_src() {
+        // 16×4 total, take 4×4 at (0, 0). Each src row must skip the
+        // unused 12 trailing pixels of the total row.
+        let mut bytes = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..16u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, 0, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 16, 4, 0, 0, 4, 4, 32)
+            .expect("wide-total extraction succeeds");
+        let mut want = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                want.extend_from_slice(&d32_pixel(x, y, 0, 0xFF));
+            }
+        }
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn extract_honors_offset() {
+        // Image starts partway into the shm segment.
+        let mut bytes = vec![0xAAu8; 16];
+        for y in 0..2u8 {
+            for x in 0..2u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, 0xFF, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 16, 2, 2, 0, 0, 2, 2, 32)
+            .expect("offset extraction succeeds");
+        assert_eq!(out, &bytes[16..]);
+    }
+
+    #[test]
+    fn extract_d8_padding_total_wider_than_src() {
+        // 6-wide total → 8 bytes/row (padded to 32-bit). Take a 5×2
+        // tile. Output stride is `((5 + 3) & ~3) = 8` bytes/row so
+        // we get 16 bytes; first 5 are image data, next 3 are pad.
+        let bytes: Vec<u8> = (0..16).map(|i| i as u8).collect();
+        let out = extract_shm_zpixmap_region(&bytes, 0, 6, 2, 0, 0, 5, 2, 8)
+            .expect("d8 extraction succeeds");
+        assert_eq!(out.len(), 16);
+        // Row 0 image bytes: 0..5 of the input; row 0 trailing pad: zero.
+        assert_eq!(&out[..5], &bytes[..5]);
+        assert_eq!(&out[5..8], &[0, 0, 0]);
+        // Row 1 image bytes: 8..13 of the input.
+        assert_eq!(&out[8..13], &bytes[8..13]);
+        assert_eq!(&out[13..16], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn extract_d8_src_x_offset() {
+        // 8-wide total → 8 bytes/row. Take a 4×1 tile at src_x=2.
+        let bytes: Vec<u8> = (0..8).map(|i| i as u8).collect();
+        let out = extract_shm_zpixmap_region(&bytes, 0, 8, 1, 2, 0, 4, 1, 8)
+            .expect("d8 src_x extraction succeeds");
+        // src_width=4 → src_stride=4 (already 32-bit aligned). Output is bytes 2..6.
+        assert_eq!(out, vec![2u8, 3, 4, 5]);
+    }
+
+    #[test]
+    fn extract_rejects_region_outside_total() {
+        let bytes = vec![0u8; 64];
+        // src_x + src_width > total_width
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, 2, 0, 4, 4, 32).is_none());
+        // src_y + src_height > total_height
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, 2, 4, 4, 32).is_none());
+    }
+
+    #[test]
+    fn extract_rejects_negative_src_xy() {
+        let bytes = vec![0u8; 64];
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, -1, 0, 4, 4, 32).is_none());
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, -1, 4, 4, 32).is_none());
+    }
+
+    #[test]
+    fn extract_rejects_offset_beyond_buffer() {
+        let bytes = vec![0u8; 16];
+        // 4×4 d32 = 64 bytes; only 16 available.
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, 0, 4, 4, 32).is_none());
+    }
+
+    #[test]
+    fn extract_rejects_unsupported_depth() {
+        let bytes = vec![0u8; 64];
+        assert!(extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, 0, 4, 4, 16).is_none());
+    }
+
+    #[test]
+    fn extract_d24_treats_padding_byte_as_image_data() {
+        // d24 on the wire is 4 bytes per pixel like d32; the 4th
+        // byte is undefined but transmitted. Extraction must copy
+        // all 4 bytes — the put_image backend stamps 0xFF later.
+        let mut bytes = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..2u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, 0xCC, 0x77));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 2, 2, 0, 0, 2, 2, 24)
+            .expect("d24 extraction succeeds");
+        assert_eq!(out, bytes);
+    }
+
+    // ---------------- end extract_shm_zpixmap_region ----------------
 
     #[test]
     fn redirect_invalid_mode_returns_bad_value() {
