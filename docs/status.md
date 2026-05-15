@@ -169,13 +169,13 @@ See `known-issues.md` for the full ticklist with detail. Highlights tracked here
 
 - [ ] **`disable_output` atomic EINVAL** — recurring shutdown warn; disarm path mitigates but per-property split is the real fix.
 - [x] **Composite Manual-mode (`update=1`) accepted** — fixed 2026-05-14: both modes register the redirect record; `activate_redirect_backing_for` is skipped (decoupling the record from backing allocation). Unblocks notification-area-applet, xfwm4, picom, xcompmgr. Hardware-confirmed on fuji.
-- [ ] **GTK file-manager popup offset + wrong rubber-band** — coordinate-translation bug; Caja (2026-05-13) and Thunar (2026-05-15) both affected, so not dual-screen specific.
-- [ ] **Caja wheel needs view-switch** — yserver event-delivery regression; 3 bisect candidates filed.
+- [x] **GTK file-manager popup offset** — fixed 2026-05-15 (`ea7c186`): XIQueryPointer reply put `same_screen` in `pad0`; correcting the field layout fixed Caja + Thunar.
+- [x] **Caja wheel needs view-switch** — largely fixed 2026-05-15 (`5583def`, `eb0bc12`): wired XI2 valuator scroll end-to-end (XIScrollClass + scroll valuators 2/3, XI_Motion-with-scroll-axis emission, per-event delta in Relative mode). Residual non-deterministic warm-up on the first GTK app per session filed in known-issues.
 - [x] **Color R↔B swap on JPEG backgrounds + saturated icons** — fixed 2026-05-14: `try_vk_put_image` now treats the wire as `[B,G,R,A]` per the advertised visual masks (matches `B8G8R8A8_UNORM`). Hardware-confirmed on fuji.
 - [x] **`minor_code = 0` hardcoded in extension error encoder** — fixed 2026-05-15: 76 extension-dispatcher call sites converted to `emit_x11_error_with_minor`. Composite, MIT-SHM (+ children), PRESENT, DRI3, GLX, RANDR, XI2/XKEYBOARD, RENDER now emit the real per-extension minor; core requests stay on `emit_x11_error` (minor=0 is spec-correct).
-- [ ] **Listener starvation under chatty clients** — single-threaded core loop's per-iteration read budget is unbounded; xfce4-panel couldn't complete X11 setup handshake while xfdesktop flooded QueryPointer.
-- [ ] **xfce4 text rendering broken** — may or may not be fixed by 3E; needs revalidation.
-- [ ] **XInput2 valuator scroll** — GTK apps that depend on XI2 axis events don't see the wheel until they fall back to core button-4/5.
+- [~] **Listener starvation under chatty clients** — not reproducible as of 2026-05-15. Single-threaded core loop's per-iteration read budget is still unbounded, so the underlying shape remains; revisit if a new starvation case shows up.
+- [x] **xfce4 text rendering** — fixed (3E text-run migration + downstream rework). Confirmed 2026-05-15.
+- [x] **XInput2 valuator scroll** — implemented 2026-05-15 (`5583def`, `eb0bc12`). See "Caja wheel needs view-switch" entry above.
 - [ ] **Per-glyph queue_wait_idle in `GlyphAtlas::intern`** — phase-5 scope but called out so 3E results aren't read as "text path is fully batched."
 
 ---
