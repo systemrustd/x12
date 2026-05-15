@@ -98,6 +98,7 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
                 event.time,
                 ROOT_WINDOW,
                 target_window,
+                ResourceId(0), // child=None; key events target the focus window directly
                 event.root_x,
                 event.root_y,
                 event.event_x,

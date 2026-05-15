@@ -386,6 +386,7 @@ pub fn pointer_event_fanout_to_state(
                 event.time,
                 ROOT_WINDOW,
                 nested_id,
+                ResourceId(0), // XI2 doesn't propagate; event=hit-target, so child=None
                 event.root_x,
                 event.root_y,
                 event_x,

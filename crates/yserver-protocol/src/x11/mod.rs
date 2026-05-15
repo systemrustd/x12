@@ -1710,6 +1710,7 @@ pub fn write_list_properties_reply(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_device_event(
     out: &mut Vec<u8>,
     byte_order: ClientByteOrder,
@@ -1720,6 +1721,7 @@ pub fn encode_xi2_device_event(
     time: u32,
     root: ResourceId,
     event: ResourceId,
+    child: ResourceId,
     root_x: i16,
     root_y: i16,
     event_x: i16,
@@ -1728,15 +1730,38 @@ pub fn encode_xi2_device_event(
     detail: u32,
     sourceid: u16,
 ) {
+    // Per the X.Org reference trace (thunar inside MATE, sampled
+    // 2026-05-15), XI2 Button events carry NO axis values: valuator
+    // mask is all-zero and no axisvalues follow. Only Motion events
+    // carry the X/Y axes. Per X11 spec, valuator events should reflect
+    // only the axes that actually changed since the last event; for
+    // Press/Release the cursor hasn't moved (libinput delivers
+    // motion+button as separate events), so the mask is empty.
+    //
+    // yserver previously sent X/Y axis values on every Press/Release
+    // to fix a caja rubber-band-from-(0,0) bug; the real cause was
+    // GDK reading axis values from preceding Motion events for the
+    // gesture anchor, and the Press-side axis values just happened
+    // to also work. Matching Xorg here lets thunar's tree-view
+    // expanders register subsequent clicks (GDK was treating the
+    // axis-bearing Press events differently from Xorg-style
+    // axis-free Presses).
+    let include_axes = evtype == 6; // XI_Motion only
+    let valuators_len_u16: u16 = if include_axes { 1 } else { 0 };
+    let valuator_mask: u32 = if include_axes { 0x0000_0003 } else { 0 };
+    // Tail layout: 4*FP1616(coords) + 12 (lens/sourceid/pad/flags) +
+    //   16 (mods) + 4 (group) + 4 (buttons mask) +
+    //   4*valuators_len_u16 (valuator mask) +
+    //   {2*FP3232 axisvalues if include_axes, else 0}.
+    let extra_bytes: u32 = 16 + 12 + 16 + 4 + 4 + 4 * u32::from(valuators_len_u16);
+    let axes_bytes: u32 = if include_axes { 16 } else { 0 };
+    let length_units = (extra_bytes + axes_bytes) / 4;
+
     let start = out.len();
     out.push(35); // GenericEvent
     out.push(major_opcode);
     write_u16(byte_order, out, sequence.0);
-    // length in 4-byte units beyond the 32-byte XGE header.
-    // Tail = 4*FP1616(coords) + 12 (lens/sourceid/pad/flags) + 16 (mods)
-    //      + 4 (group) + 4 (buttons mask) + 4 (valuators mask)
-    //      + 2*FP3232 (X/Y axisvalues, 8 bytes each) = 72 bytes = 18 units.
-    write_u32(byte_order, out, 18);
+    write_u32(byte_order, out, length_units);
 
     write_u16(byte_order, out, evtype);
     write_u16(byte_order, out, deviceid);
@@ -1744,7 +1769,7 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, detail);
     write_u32(byte_order, out, root.0);
     write_u32(byte_order, out, event.0);
-    write_u32(byte_order, out, 0); // child
+    write_u32(byte_order, out, child.0);
 
     // Coordinates are FP16.16
     write_u32(byte_order, out, (i32::from(root_x) << 16) as u32);
@@ -1753,69 +1778,60 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
     write_u16(byte_order, out, 1); // buttons_len: 1 u32 of button mask
-    write_u16(byte_order, out, 1); // valuators_len: 1 u32 of valuator mask
+    write_u16(byte_order, out, valuators_len_u16);
     write_u16(byte_order, out, sourceid);
     write_u16(byte_order, out, 0); // pad
     write_u32(byte_order, out, 0); // flags
 
-    // mods: base, latched, locked, effective
+    // mods: base, latched, locked, effective. Per XI2 / XKB spec these
+    // are KEYBOARD modifier bits only (Shift/Lock/Control/Mod1..Mod5 in
+    // bits 0..=7). The X11 KeyButMask `state` value passed in carries
+    // pointer-button bits in 8..=12 alongside modifier bits in 0..=7;
+    // mask down to the modifier byte so GDK doesn't see button bits
+    // leaking into mods.effective (which it ORs with the separate
+    // `buttons` mask to reconstruct GdkEvent.state — double-counting
+    // is harmless but writing button bits into modifier fields is
+    // spec-incorrect).
+    let modifier_bits = u32::from(state & 0x00FF);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, u32::from(state));
+    write_u32(byte_order, out, modifier_bits);
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
 
-    // X11 XInput2 spec: the `buttons` mask reports buttons that are
-    // pressed AFTER the event. For ButtonPress (4): the just-pressed
-    // button is now down ⇒ set its bit on top of `state`'s pre-event
-    // mask. For ButtonRelease (5): the just-released button is no
-    // longer down ⇒ clear its bit from `state`'s pre-event mask.
-    // For Motion (6) and crossings: the currently-held buttons —
-    // identical to `state`'s pre-event mask since motion doesn't
-    // change which buttons are pressed. Previously we wrote 0 for
-    // motion, which left GTK's XI2 backend believing no buttons were
-    // held during a drag while the `state` field said otherwise; the
-    // inconsistency tripped mate-panel's applet-drag state machine
-    // on release.
+    // X11 XInput2 `buttons` mask: bit N corresponds to button N (1-indexed).
+    // Bit 0 is reserved per spec and is always 0. Verified against real
+    // Xorg trace of thunar in MATE: ButtonPress shows buttons=0x00
+    // (pre-event, no buttons held), ButtonRelease shows buttons=0x02
+    // (pre-event, button 1 still held — bit 1, not bit 0).
     //
-    // `state` carries pre-event button state in bits 8..13 (Button1..5).
-    let pre_buttons: u32 = u32::from((state >> 8) & 0x1f);
-    let post_buttons = if evtype == 4 || evtype == 5 {
-        let bit: u32 = if (1..=5).contains(&detail) {
-            1 << (detail - 1)
-        } else {
-            0
-        };
-        if evtype == 4 {
-            pre_buttons | bit
-        } else {
-            pre_buttons & !bit
-        }
-    } else {
-        pre_buttons
-    };
-    write_u32(byte_order, out, post_buttons);
+    // The mask reports PRE-event button state — buttons held coming
+    // INTO this event. Same semantics for Press/Release/Motion/crossings.
+    // `state`'s KeyButMask carries the pre-event button state in
+    // bits 8..=12 (Button1..5); shift down by 7 to align state-bit-8
+    // (button 1) → mask-bit-1, and mask off the reserved bit-0.
+    let pre_buttons: u32 = u32::from((state >> 7) & 0x3e);
+    write_u32(byte_order, out, pre_buttons);
 
-    // Valuator mask: bits 0 (X) and 1 (Y) — master pointer always
-    // reports its absolute X/Y axes on Press/Release/Motion. GDK's
-    // XI2 backend reads these into GdkEventMotion's axis array;
-    // GtkGestureDrag uses the axis history to anchor the drag start.
-    // With valuators_len=0 (the previous encoding) GDK saw no axis
-    // data, the gesture anchor stayed at its initialized (0, 0),
-    // and a single press on caja-desktop produced a rubber-band
-    // selection from (0, 0) to the click point.
-    write_u32(byte_order, out, 0x0000_0003);
+    // Valuator mask (length = valuators_len_u16). Motion events carry
+    // the X/Y axes (mask = 0x03, bits 0 and 1); Press/Release/crossing
+    // events carry no axes (valuators_len = 0, no mask written).
+    if valuators_len_u16 > 0 {
+        write_u32(byte_order, out, valuator_mask);
+    }
+    if include_axes {
+        // Axis values: FP3232 (signed i32 integer + u32 fraction).
+        // Master pointer is in absolute mode; X/Y carry the
+        // root-relative position. Fraction is 0 because libinput
+        // reports integer coords post-clamp.
+        write_u32(byte_order, out, i32::from(root_x) as u32);
+        write_u32(byte_order, out, 0); // X fraction
+        write_u32(byte_order, out, i32::from(root_y) as u32);
+        write_u32(byte_order, out, 0); // Y fraction
+    }
 
-    // Axis values: FP3232 (signed i32 integer part + unsigned u32
-    // fraction). Master pointer is in absolute mode; X/Y carry the
-    // root-relative position.
-    write_u32(byte_order, out, i32::from(root_x) as u32);
-    write_u32(byte_order, out, 0); // X fraction
-    write_u32(byte_order, out, i32::from(root_y) as u32);
-    write_u32(byte_order, out, 0); // Y fraction
-
-    debug_assert_eq!(out.len() - start, 104);
+    debug_assert_eq!(out.len() - start, 32 + (length_units as usize) * 4);
 }
 
 /// Encode an XInput2 `XI_Motion` event carrying a scroll-axis update
@@ -1874,18 +1890,22 @@ pub fn encode_xi2_motion_with_scroll(
     write_u16(byte_order, out, 0); // pad
     write_u32(byte_order, out, 0); // flags
 
-    // mods
+    // mods: base, latched, locked, effective — KEYBOARD modifier bits
+    // only (0x00FF mask); button bits in state[8..=12] go into the
+    // separate `buttons` mask below, not mods.
+    let modifier_bits = u32::from(state & 0x00FF);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, u32::from(state));
+    write_u32(byte_order, out, modifier_bits);
 
     out.extend_from_slice(&[0; 4]); // group
 
-    // Button mask reflects current button state (pre-event for motion
-    // = same as state). State bits 8..13 are Button1..5.
-    let post_buttons: u32 = u32::from((state >> 8) & 0x1f);
-    write_u32(byte_order, out, post_buttons);
+    // Button mask: PRE-event buttons held. Bit N corresponds to button
+    // N (1-indexed); bit 0 is reserved per X11 spec. State bits 8..=12
+    // are Button1..5; shift down 7 to align state-bit-8 → mask-bit-1.
+    let pre_buttons: u32 = u32::from((state >> 7) & 0x3e);
+    write_u32(byte_order, out, pre_buttons);
 
     // Valuator mask: bits 0 (X), 1 (Y), and the scroll axis.
     let mask: u32 = 0x3 | (1u32 << u32::from(scroll_axis));
@@ -2004,11 +2024,14 @@ pub fn encode_xi2_crossing_event(
     out.push(u8::from(matches!(evtype, 9 | 10))); // focus
     write_u16(byte_order, out, 1); // buttons_len
 
-    // mods: base, latched, locked, effective
+    // mods: base, latched, locked, effective — KEYBOARD modifier bits
+    // only (0x00FF mask); button bits in state[8..=12] go into the
+    // separate `buttons` mask below, not mods.
+    let modifier_bits = u32::from(state & 0x00FF);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, u32::from(state));
+    write_u32(byte_order, out, modifier_bits);
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
     write_u32(byte_order, out, 0); // button mask
@@ -3143,24 +3166,25 @@ mod tests {
     }
 
     #[test]
-    fn xi2_device_event_has_expected_wire_size() {
+    fn xi2_motion_event_carries_axes() {
         let mut out = Vec::new();
         encode_xi2_device_event(
             &mut out,
             ClientByteOrder::LittleEndian,
             SequenceNumber(7),
             137,
-            4,
+            6, // XI_Motion
             2,
             123,
             ResourceId(0x100),
             ResourceId(0x200),
+            ResourceId(0x300),
             1,
             2,
             3,
             4,
             5,
-            1,
+            0, // detail = 0 for motion
             2,
         );
 
@@ -3178,6 +3202,42 @@ mod tests {
         assert_eq!(u32::from_le_bytes(out[92..96].try_into().unwrap()), 0);
         // Y axis integer part at offset 96: passed as root_y = 2.
         assert_eq!(u32::from_le_bytes(out[96..100].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn xi2_button_event_has_no_axes() {
+        // Matches the Xorg reference: XI_ButtonPress / XI_ButtonRelease
+        // carry valuators_len=0, no valuator mask, no axisvalues.
+        // Sampled from thunar-inside-MATE 2026-05-15.
+        let mut out = Vec::new();
+        encode_xi2_device_event(
+            &mut out,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            137,
+            4, // XI_ButtonPress
+            2,
+            123,
+            ResourceId(0x100),
+            ResourceId(0x200),
+            ResourceId(0x300),
+            1,
+            2,
+            3,
+            4,
+            5,
+            1,
+            2,
+        );
+
+        // 84 bytes (pre-valuator layout, valuators_len=0 means no
+        // mask u32 and no axisvalues) = 84 total.
+        assert_eq!(out.len(), 84);
+        assert_eq!(&out[0..4], &[35, 137, 7, 0]);
+        // length units: (84 - 32) / 4 = 13.
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 13);
+        // valuators_len at offset 50 (right after buttons_len at 48): 0.
+        assert_eq!(u16::from_le_bytes(out[50..52].try_into().unwrap()), 0);
     }
 
     #[test]

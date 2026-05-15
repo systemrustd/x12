@@ -1480,6 +1480,7 @@ fn pointer_event_fanout_inner(
                 event.time,
                 crate::resources::ROOT_WINDOW,
                 nested_id,
+                ResourceId(0), // XI2 doesn't propagate; child=None for hit-target events
                 event.root_x,
                 event.root_y,
                 event_x,
