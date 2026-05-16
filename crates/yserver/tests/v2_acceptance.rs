@@ -288,3 +288,142 @@ fn v2_render_composite_no_gc_clip_leak() {
         }
     }
 }
+
+/// Stage 3d v1-bug-fix gate (plan §3d): v1's
+/// `try_vk_render_composite_glyphs` reads but **ignores** the dst
+/// picture's clip (`kms::backend.rs:5313`); v2 must honour it via
+/// per-rect scissoring. The test stamps two 4×4 white glyphs at
+/// dst (0, 0) and (4, 0) onto an 8×4 blue pixmap with the picture
+/// clip set to the top-left 4×4 rect. Result: left half painted
+/// white; right half stays blue. v1 would paint both glyphs.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_composite_glyphs_clip_intersects_picture() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // 8×4 dst pixmap pre-filled with blue (pixel 0xFF0000FF).
+    let dst_pix = b.create_pixmap(None, 32, 8, 4).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 4)
+        .expect("fill_rectangle pre");
+
+    // SolidFill source: opaque premultiplied white (R=G=B=A=0xFFFF).
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some(PictureHandle)");
+
+    // Dst picture wrapping the pixmap.
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+
+    // Picture clip: top-left 4×4 only.
+    // Wire body for render_set_picture_clip_rectangles: picture(4)
+    // + clip_x_origin(INT16) + clip_y_origin(INT16) + N×rectangles
+    // (INT16 x, INT16 y, CARD16 w, CARD16 h).
+    let mut clip_body: Vec<u8> = Vec::new();
+    clip_body.extend_from_slice(&dst_pic.as_raw().to_le_bytes());
+    clip_body.extend_from_slice(&i16::to_le_bytes(0)); // clip_x_origin
+    clip_body.extend_from_slice(&i16::to_le_bytes(0)); // clip_y_origin
+    clip_body.extend_from_slice(&i16::to_le_bytes(0)); // rect.x
+    clip_body.extend_from_slice(&i16::to_le_bytes(0)); // rect.y
+    clip_body.extend_from_slice(&u16::to_le_bytes(4)); // rect.w
+    clip_body.extend_from_slice(&u16::to_le_bytes(4)); // rect.h
+    b.render_set_picture_clip_rectangles(None, dst_pic.as_raw(), &clip_body)
+        .expect("set_picture_clip_rectangles");
+
+    // Glyphset with one 4×4 A8 glyph at id=1 (all 0xFF alpha,
+    // x_off=4 so consecutive glyphs sit edge-to-edge).
+    // RENDER_FMT_A8 = the standard a8 picture format id (depends
+    // on the server's PictFormat catalogue; the backend's
+    // render_create_glyphset matches on ynest_format constants).
+    let gs = b
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .expect("glyphset")
+        .expect("Some");
+
+    // render_add_glyphs body shape (from parse_add_glyphs):
+    // body_tail = n(u32) + n×id(u32) + n×info(12 bytes) +
+    // n×pixels(stride×h).
+    // info layout (per parse_add_glyphs): width(u16) height(u16)
+    // x(i16) y(i16) x_off(i16) y_off(i16) — 12 bytes.
+    // A8 stride for w=4: (4+3) & !3 = 4. Total pixel bytes = 4×4 = 16.
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // width
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // height
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(4)); // x_off
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+    add_body.extend_from_slice(&[0xFFu8; 16]); // pixels: 4×4 all opaque
+    b.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("add_glyphs");
+
+    // CompositeGlyphs8 items: one element with count=2 glyphs id=1
+    // (pen starts at dx=0,dy=0, glyph 1 stamps at (0,0), pen
+    // advances to (4,0), glyph 2 stamps at (4,0)).
+    // Element header: count(u8) + 3 pad + dx(i16) + dy(i16) = 8 bytes.
+    // Then 2 × 1-byte ids = 2 bytes, padded to 4. Total 12 bytes.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[2u8, 0, 0, 0]); // count + pad
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dx
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dy
+    items.extend_from_slice(&[1u8, 1, 0, 0]); // 2 ids + pad
+
+    b.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        3,  // Over
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0, // mask_fmt — unused
+        gs.as_raw(),
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 8, 4, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+
+    // Left half (x=0..4): glyph painted white over blue with
+    // premul srcover (atlas alpha 0xFF, foreground white) →
+    // result white. Right half (x=4..8): clip excluded the glyph
+    // → blue preserved. If v1's _clip-unused bug were present,
+    // both halves would be white.
+    for y in 0..4 {
+        for x in 0..4u32 {
+            let off = (y * 8 + x as usize) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0xFF, 0xFF, 0xFF],
+                "left half should be white at ({x},{y}); got {:?}",
+                &out[off..off + 4],
+            );
+        }
+        for x in 4..8u32 {
+            let off = (y * 8 + x as usize) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "right half should stay blue at ({x},{y}) — picture clip honoured; got {:?}",
+                &out[off..off + 4],
+            );
+        }
+    }
+}

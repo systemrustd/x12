@@ -75,6 +75,11 @@ impl TextRunTarget for DrawableImage {
 /// `GlyphAtlas::intern` enforces this via its inline upload path;
 /// v2's `RenderEngine::image_text` enforces it via same-queue
 /// submission ordering between the upload CB and this draw CB.
+///
+/// Single-scissor convenience wrapper that scopes the draws to the
+/// full target extent. Callers that need per-rect picture-clip
+/// scissoring (Stage 3d `render_composite_glyphs`) should reach for
+/// [`record_text_run_scissored`] instead.
 pub fn record_text_run<T: TextRunTarget + ?Sized>(
     vk: &VkContext,
     cb: vk::CommandBuffer,
@@ -84,7 +89,39 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
     glyphs: &[TextGlyph],
     foreground: [f32; 4],
 ) -> Result<(), vk::Result> {
-    if glyphs.is_empty() || target.extent().width == 0 || target.extent().height == 0 {
+    let extent = target.extent();
+    let full = [vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent,
+    }];
+    record_text_run_scissored(vk, cb, target, atlas, pipeline, glyphs, foreground, &full)
+}
+
+/// Per-rect-scissored sibling to [`record_text_run`]. Issues one
+/// `cmd_set_scissor` + glyph-draw batch per element of `scissors`
+/// inside a single render pass. Used by Stage 3d's
+/// `composite_glyphs` to honour picture clip rectangles (plan §4 —
+/// per-rect scissoring, not v1's union-bbox shortcut, which also
+/// fixes v1's latent `_clip unused` bug).
+///
+/// If `scissors` is empty the function returns without recording
+/// any draw (matches "every clip rect culled" semantics in
+/// `RenderEngine::render_composite`).
+pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    target: &mut T,
+    atlas: TextAtlas,
+    pipeline: &TextPipeline,
+    glyphs: &[TextGlyph],
+    foreground: [f32; 4],
+    scissors: &[vk::Rect2D],
+) -> Result<(), vk::Result> {
+    if glyphs.is_empty()
+        || scissors.is_empty()
+        || target.extent().width == 0
+        || target.extent().height == 0
+    {
         return Ok(());
     }
 
@@ -132,15 +169,11 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let scissor = [render_area];
-
     unsafe {
         crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
         crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
-        crate::vk_count!(cmd_set_scissor);
-        device.cmd_set_scissor(cb, 0, &scissor);
         crate::vk_count!(cmd_bind_pipeline);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
         crate::vk_count!(cmd_bind_descriptor_sets);
@@ -153,34 +186,39 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
             &[],
         );
 
-        for g in glyphs {
-            if g.entry.w == 0 || g.entry.h == 0 {
-                continue;
+        for scissor_rect in scissors {
+            let scissor = [*scissor_rect];
+            crate::vk_count!(cmd_set_scissor);
+            device.cmd_set_scissor(cb, 0, &scissor);
+            for g in glyphs {
+                if g.entry.w == 0 || g.entry.h == 0 {
+                    continue;
+                }
+                let pc = TextPushConsts::new(
+                    [g.dst_x as f32, g.dst_y as f32],
+                    [g.entry.w as f32, g.entry.h as f32],
+                    [extent.width as f32, extent.height as f32],
+                    [
+                        g.entry.atlas_x as f32 / atlas_extent.width as f32,
+                        g.entry.atlas_y as f32 / atlas_extent.height as f32,
+                    ],
+                    [
+                        g.entry.w as f32 / atlas_extent.width as f32,
+                        g.entry.h as f32 / atlas_extent.height as f32,
+                    ],
+                    foreground,
+                );
+                crate::vk_count!(cmd_push_constants);
+                device.cmd_push_constants(
+                    cb,
+                    pipeline.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                crate::vk_count!(cmd_draw);
+                device.cmd_draw(cb, 4, 1, 0, 0);
             }
-            let pc = TextPushConsts::new(
-                [g.dst_x as f32, g.dst_y as f32],
-                [g.entry.w as f32, g.entry.h as f32],
-                [extent.width as f32, extent.height as f32],
-                [
-                    g.entry.atlas_x as f32 / atlas_extent.width as f32,
-                    g.entry.atlas_y as f32 / atlas_extent.height as f32,
-                ],
-                [
-                    g.entry.w as f32 / atlas_extent.width as f32,
-                    g.entry.h as f32 / atlas_extent.height as f32,
-                ],
-                foreground,
-            );
-            crate::vk_count!(cmd_push_constants);
-            device.cmd_push_constants(
-                cb,
-                pipeline.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                pc.as_bytes(),
-            );
-            crate::vk_count!(cmd_draw);
-            device.cmd_draw(cb, 4, 1, 0, 0);
         }
 
         crate::vk_count!(cmd_end_rendering);

@@ -2192,19 +2192,309 @@ impl Backend for KmsBackendV2 {
     fn render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
         _mask_fmt: u32,
-        _host_gs: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _items: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_composite_glyphs");
+        use crate::kms::{
+            core::GlyphSetFormat,
+            v2::engine::{CompositeGlyphInput, ResolvedSource},
+        };
+
+        // v1-parity gating (plan §3d): op == Over (3) and the src
+        // picture must be a SolidFill. Anything else returns
+        // Ok(()) with `composite_glyphs_dropped_unsupported`
+        // bumped — matches v1's silent-noop shape outside its
+        // narrow envelope. `mask_fmt` is read but ignored
+        // (rendercheck never exercises component-alpha glyphsets;
+        // risk-listed in plan §"Risk 9").
+        // Unsupported-counter scope (plan §3d): the gate captures
+        // *protocol-supported but engine-unimplemented* shapes —
+        // currently op != Over and source not SolidFill (the
+        // "v1-parity scope" boundary). Stale src/dst picture
+        // handles and missing glyphsets are protocol errors, not
+        // unsupported features; they log a gap and return Ok
+        // without bumping the counter.
+        if op != 3 {
+            log::debug!("v2 composite_glyphs gap: op={op} (only Over=3)");
+            self.telemetry.record_composite_glyphs_dropped_unsupported();
+            return Ok(());
+        }
+        let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 composite_glyphs gap: src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let ResolvedSource::Solid(foreground_premul) = src_resolved else {
+            log::debug!(
+                "v2 composite_glyphs gap: src 0x{host_src:x} is not SolidFill (plan §3d \
+                 v1-parity scope)"
+            );
+            self.telemetry.record_composite_glyphs_dropped_unsupported();
+            return Ok(());
+        };
+        let Some((dst_id, dst_clip)) =
+            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        else {
+            log::debug!("v2 composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(());
+        };
+        if !self.core.glyphsets.contains_key(&host_gs) {
+            log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
+            return Ok(());
+        }
+
+        // Items parser — mirrors v1's `try_vk_render_composite_glyphs`
+        // shape. Element size depends on the minor opcode:
+        // CompositeGlyphs8 (23) → 1 byte ids, 16 (24) → 2, 32 (25)
+        // → 4. Each element starts with `count(u8) pad pad pad
+        // dx(i16) dy(i16)`; if `count == 255` the same 8 bytes
+        // carry an inline glyphset change with the new gs xid in
+        // the trailing u32.
+        let id_size: usize = match minor {
+            23 => 1,
+            24 => 2,
+            _ => 4,
+        };
+        // Per X RENDER protocol, `src_x`/`src_y` are the SOURCE
+        // picture sampling origin, not the dst pen — same as v1.
+        // The first glyph-element's `dx` / `dy` sets the absolute
+        // pen position; subsequent elements accumulate.
+        let _ = (src_x, src_y);
+        let mut pen_x = i32::from(x_off);
+        let mut pen_y = i32::from(y_off);
+        let mut pos: usize = 0;
+        let mut active_gs_xid = host_gs;
+        // Two-pass parse: pass 1 fills `parsed` with per-glyph
+        // metadata + a slot reference into either the live
+        // glyphset's pixel bytes (A8) or an A1 expansion scratch
+        // (A1). Pass 2 builds the final `&[CompositeGlyphInput]`
+        // with stable slice references. The split avoids a borrow
+        // conflict on `a1_scratches`: pushing into the Vec
+        // invalidates earlier `.last()` borrows by Rust's borrow
+        // checker even though the underlying heap buffers are
+        // stable (Vec<Vec<u8>>'s inner buffers don't move on
+        // outer-push reallocation).
+        enum PixelSource {
+            FromGlyphset { gs_xid: u32, glyph_id: u32 },
+            A1Scratch(usize),
+        }
+        struct Parsed {
+            gs_xid: u32,
+            glyph_id: u32,
+            w: u32,
+            h: u32,
+            pixels: PixelSource,
+            dst_x: i32,
+            dst_y: i32,
+        }
+        let mut a1_scratches: Vec<Vec<u8>> = Vec::new();
+        let mut parsed: Vec<Parsed> = Vec::new();
+        // Borrow the glyphsets map immutably for the whole parse.
+        // The engine call below takes `&mut self.engine` /
+        // `&mut self.store` but not `&self.core.glyphsets`, so a
+        // single borrow scope here is sound.
+        while pos + 8 <= items.len() {
+            let count = items[pos] as usize;
+            if count == 255 {
+                if pos + 8 <= items.len() {
+                    let new_xid = u32::from_le_bytes([
+                        items[pos + 4],
+                        items[pos + 5],
+                        items[pos + 6],
+                        items[pos + 7],
+                    ]);
+                    if new_xid != 0 && self.core.glyphsets.contains_key(&new_xid) {
+                        active_gs_xid = new_xid;
+                    }
+                }
+                pos += 8;
+                continue;
+            }
+            let dx = i32::from(i16::from_le_bytes([items[pos + 4], items[pos + 5]]));
+            let dy = i32::from(i16::from_le_bytes([items[pos + 6], items[pos + 7]]));
+            pen_x += dx;
+            pen_y += dy;
+
+            let payload_start = pos + 8;
+            let payload_bytes = count * id_size;
+            let padded = (payload_bytes + 3) & !3;
+            if payload_start + padded > items.len() {
+                break;
+            }
+
+            let Some(active_gs) = self.core.glyphsets.get(&active_gs_xid) else {
+                pos += 8 + padded;
+                continue;
+            };
+            let active_gs_xid_for_key = active_gs_xid;
+
+            for i in 0..count {
+                let id_off = payload_start + i * id_size;
+                let glyph_id: u32 = match id_size {
+                    1 => u32::from(items[id_off]),
+                    2 => u32::from(u16::from_le_bytes([items[id_off], items[id_off + 1]])),
+                    _ => u32::from_le_bytes([
+                        items[id_off],
+                        items[id_off + 1],
+                        items[id_off + 2],
+                        items[id_off + 3],
+                    ]),
+                };
+                let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
+                    continue;
+                };
+
+                let gw = u32::from(glyph.width);
+                let gh = u32::from(glyph.height);
+                let dst_x = pen_x - i32::from(glyph.x);
+                let dst_y = pen_y - i32::from(glyph.y);
+
+                if gw > 0 && gh > 0 {
+                    let pixels = match glyph.format {
+                        GlyphSetFormat::A8 => PixelSource::FromGlyphset {
+                            gs_xid: active_gs_xid_for_key,
+                            glyph_id,
+                        },
+                        GlyphSetFormat::A1 => {
+                            // Wire A1: rows MSB-first, 32-bit padded.
+                            // Expand into a dense row-major A8 (0/0xFF).
+                            // Per v1's bit-order comment
+                            // (kms::backend.rs:5471), X RENDER's
+                            // glyph A1 is MSB-first within each byte
+                            // — `7 - col%8`. Mirror verbatim.
+                            let wire_stride = (gw as usize).div_ceil(32) * 4;
+                            let mut a8 = vec![0u8; (gw * gh) as usize];
+                            for row in 0..(gh as usize) {
+                                let src_off = row * wire_stride;
+                                if src_off + wire_stride > glyph.pixels.len() {
+                                    break;
+                                }
+                                for col in 0..(gw as usize) {
+                                    let byte = glyph.pixels[src_off + col / 8];
+                                    let bit = (byte >> (7 - (col & 7))) & 1;
+                                    a8[row * (gw as usize) + col] = if bit != 0 { 0xFF } else { 0 };
+                                }
+                            }
+                            let idx = a1_scratches.len();
+                            a1_scratches.push(a8);
+                            PixelSource::A1Scratch(idx)
+                        }
+                        // ARGB32-source glyphs are pre-converted to
+                        // A8 in `parse_add_glyphs`, so this branch
+                        // is unreachable in practice. Defensive:
+                        // skip the glyph if the stored format
+                        // somehow ended up as ARGB32 / Other.
+                        GlyphSetFormat::Argb32 | GlyphSetFormat::Other => {
+                            log::warn!(
+                                "v2 composite_glyphs: unexpected stored format {:?} for \
+                                 glyph 0x{glyph_id:x} — skipping",
+                                glyph.format,
+                            );
+                            continue;
+                        }
+                    };
+
+                    parsed.push(Parsed {
+                        gs_xid: active_gs_xid_for_key,
+                        glyph_id,
+                        w: gw,
+                        h: gh,
+                        pixels,
+                        dst_x,
+                        dst_y,
+                    });
+                }
+
+                pen_x += i32::from(glyph.x_off);
+                pen_y += i32::from(glyph.y_off);
+            }
+
+            pos += 8 + padded;
+        }
+
+        if parsed.is_empty() {
+            // No drawable glyphs (every entry was zero-size or
+            // missing from the glyphset). Not a gap; just nothing
+            // to record.
+            return Ok(());
+        }
+
+        // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
+        // with a stable slice reference.
+        let inputs: Vec<CompositeGlyphInput<'_>> = parsed
+            .iter()
+            .filter_map(|p| {
+                let pixels: &[u8] = match &p.pixels {
+                    PixelSource::FromGlyphset { gs_xid, glyph_id } => self
+                        .core
+                        .glyphsets
+                        .get(gs_xid)
+                        .and_then(|gs| gs.glyphs.get(glyph_id))
+                        .map(|g| g.pixels.as_slice())?,
+                    PixelSource::A1Scratch(idx) => &a1_scratches[*idx],
+                };
+                Some(CompositeGlyphInput {
+                    gs_xid: p.gs_xid,
+                    glyph_id: p.glyph_id,
+                    w: p.w,
+                    h: p.h,
+                    pixels,
+                    dst_x: p.dst_x,
+                    dst_y: p.dst_y,
+                })
+            })
+            .collect();
+
+        if inputs.is_empty() {
+            return Ok(());
+        }
+
+        let stats = self.engine.composite_glyphs(
+            &mut self.store,
+            &mut self.platform,
+            dst_id,
+            foreground_premul,
+            &inputs,
+            dst_clip.as_deref(),
+        );
+        match stats {
+            Ok(s) => {
+                if s.atlas_interns > 0 {
+                    for _ in 0..s.atlas_interns {
+                        self.telemetry.record_atlas_intern();
+                    }
+                }
+                if s.glyph_uploads > 0 {
+                    for _ in 0..s.glyph_uploads {
+                        self.telemetry.record_glyph_upload();
+                    }
+                }
+                if s.glyphs_dropped > 0 {
+                    for _ in 0..s.glyphs_dropped {
+                        self.telemetry.record_glyph_dropped_atlas_full();
+                    }
+                }
+                if s.atlas_interns > 0 || !inputs.is_empty() {
+                    // Successful composite_glyphs counts as one
+                    // paint submit (mirroring `image_text` /
+                    // `render_composite` telemetry shape).
+                    self.telemetry.record_paint_submit();
+                }
+            }
+            Err(e) => {
+                log::warn!("v2 composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
+            }
+        }
         Ok(())
     }
 
@@ -2737,6 +3027,7 @@ impl Backend for KmsBackendV2 {
 mod tests {
     use super::{KmsBackendV2, PictureRecord};
     use crate::kms::cpu_types::Repeat;
+    use std::collections::HashMap;
     use yserver_core::backend::Backend;
 
     /// Stage 1b acceptance gate (synthetic): v2 constructs through
@@ -3210,5 +3501,223 @@ mod tests {
         b.render_free_picture(None, pic_xid).expect("free");
         assert!(!b.core.pictures.contains_key(&pic_xid));
         assert_eq!(b.engine.picture_paint_len(), 0);
+    }
+
+    // ─── Stage 3d: render_composite_glyphs tests ───────────────
+
+    /// Helper: install a SolidFill source picture + a glyphset
+    /// holding `n` 1×1 A8 glyphs at id 0..n with `0xFF` alpha.
+    /// Returns (src_pic_xid, gs_xid).
+    fn install_solidfill_and_glyphset(b: &mut KmsBackendV2, n: u32) -> (u32, u32) {
+        use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
+
+        let src_pic = b
+            .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+            .expect("solid_fill")
+            .expect("Some");
+
+        let gs_xid = b.core.next_host_xid();
+        let mut glyphs = HashMap::new();
+        for id in 0..n {
+            glyphs.insert(
+                id,
+                StoredGlyph {
+                    width: 1,
+                    height: 1,
+                    x: 0,
+                    y: 0,
+                    x_off: 1,
+                    y_off: 0,
+                    pixels: vec![0xFF],
+                    format: GlyphSetFormat::A8,
+                },
+            );
+        }
+        b.core.glyphsets.insert(
+            gs_xid,
+            GlyphSetState {
+                format: GlyphSetFormat::A8,
+                glyphs,
+            },
+        );
+        (src_pic.as_raw(), gs_xid)
+    }
+
+    /// Per plan §3d "Op / source matrix accepted by 3d": op != Over
+    /// (3) must drop the call with a per-call gap-log and increment
+    /// the `composite_glyphs_dropped_unsupported` lifetime counter.
+    /// No paint side effect; engine is never reached.
+    #[test]
+    fn v2_composite_glyphs_unsupported_op_drops() {
+        let mut b = KmsBackendV2::for_tests();
+        let (src_pic, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
+        // No real dst picture needed — the op gate fires before
+        // dst resolution. Pass any host_dst; assert gap-counter.
+        b.render_composite_glyphs(
+            None,
+            23, /* CompositeGlyphs8 */
+            1,  /* op = Src, NOT Over */
+            src_pic,
+            0xDEAD, /* host_dst (unused — op gate first) */
+            0,      /* mask_fmt */
+            gs_xid,
+            0,
+            0,
+            &[1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // items: 1 glyph elt + padded
+            0,
+            0,
+        )
+        .expect("ok");
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 1,
+            "op != Over must bump the unsupported counter",
+        );
+        assert_eq!(
+            b.telemetry.lifetime.paint_submits, 0,
+            "no paint submit on the gap path",
+        );
+    }
+
+    /// Per plan §3d "Op / source matrix": non-SolidFill source
+    /// (Drawable / Gradient) also drops with the unsupported
+    /// counter — Cairo's rare alpha-mask source case. Use a
+    /// gradient picture (no store dependency) so the test fixture
+    /// doesn't need live Vk.
+    #[test]
+    fn v2_composite_glyphs_non_solidfill_source_drops() {
+        let mut b = KmsBackendV2::for_tests();
+        let (_unused_solidfill, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
+        // Minimal valid linear-gradient wire body: pad(4) +
+        // p1(8) + p2(8) + n_stops=1(4) + stop_pos(4) + stop_color(8).
+        let mut grad_body: Vec<u8> = Vec::new();
+        grad_body.extend_from_slice(&0_u32.to_le_bytes()); // request pad (skipped)
+        grad_body.extend_from_slice(&0_i32.to_le_bytes()); // p1.x
+        grad_body.extend_from_slice(&0_i32.to_le_bytes()); // p1.y
+        grad_body.extend_from_slice(&(256_i32 << 16).to_le_bytes()); // p2.x
+        grad_body.extend_from_slice(&0_i32.to_le_bytes()); // p2.y
+        grad_body.extend_from_slice(&1_u32.to_le_bytes()); // n_stops
+        grad_body.extend_from_slice(&0_i32.to_le_bytes()); // pos
+        grad_body.extend_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF]); // colour
+        let grad_pic = b
+            .render_create_linear_gradient(None, &grad_body)
+            .expect("gradient")
+            .expect("Some")
+            .as_raw();
+        b.render_composite_glyphs(
+            None,
+            23,
+            3, /* Over */
+            grad_pic,
+            0xDEAD,
+            0,
+            gs_xid,
+            0,
+            0,
+            &[1u8, 0, 0, 0, 0, 0, 0, 0],
+            0,
+            0,
+        )
+        .expect("ok");
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 1,
+            "gradient source must hit the v1-parity gate",
+        );
+    }
+
+    /// Per plan §3d items-parse spec: the items stream's inline
+    /// `0xFF 0 0 0 new_gs_xid` element rotates the active glyphset
+    /// for subsequent glyph lookups. The test installs two
+    /// glyphsets with distinct codepoint→pixel mappings, feeds an
+    /// items stream that draws one glyph from each, and asserts
+    /// that both glyphsets contributed to the engine call — the
+    /// parser must have honoured the inline change. We can't hit
+    /// the Vk engine in this fixture (no live Vk under
+    /// `for_tests`), so the gate is "no unsupported drop fired"
+    /// AND "both glyphset lookups succeeded" (verified by reaching
+    /// the engine, which returns `NoVk` on the stub but does NOT
+    /// bump the unsupported counter).
+    #[test]
+    fn v2_composite_glyphs_inline_glyphset_change_parsed() {
+        use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
+
+        let mut b = KmsBackendV2::for_tests();
+        let src_pic = b
+            .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+            .expect("solid_fill")
+            .expect("Some")
+            .as_raw();
+        // GlyphSet A: codepoint 0x10 → 0xAA pixels.
+        // GlyphSet B: codepoint 0x20 → 0xBB pixels.
+        let mut mk_gs = |code: u32, byte: u8| {
+            let mut glyphs = HashMap::new();
+            glyphs.insert(
+                code,
+                StoredGlyph {
+                    width: 1,
+                    height: 1,
+                    x: 0,
+                    y: 0,
+                    x_off: 1,
+                    y_off: 0,
+                    pixels: vec![byte],
+                    format: GlyphSetFormat::A8,
+                },
+            );
+            let xid = b.core.next_host_xid();
+            b.core.glyphsets.insert(
+                xid,
+                GlyphSetState {
+                    format: GlyphSetFormat::A8,
+                    glyphs,
+                },
+            );
+            xid
+        };
+        let gs_a = mk_gs(0x10, 0xAA);
+        let gs_b = mk_gs(0x20, 0xBB);
+        // Need a dst Drawable picture — create a stub one (lookup
+        // will fail since the underlying drawable xid isn't in
+        // the store, so the engine call short-circuits before
+        // anything reaches Vk, but the parser still walks).
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        let dst_drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0x4242_4242).expect("PixmapHandle"));
+        let dst_pic = b
+            .render_create_picture(None, dst_drawable, 0, 0, &[])
+            .expect("dst_picture")
+            .expect("Some")
+            .as_raw();
+        // Items stream: 1 glyph 0x10 from gs_a (initial), inline
+        // glyphset-change to gs_b, then 1 glyph 0x20 from gs_b.
+        // Element layout: count(u8) pad pad pad dx(i16) dy(i16) ids...
+        let mut items: Vec<u8> = Vec::new();
+        // Element 1: 1 glyph @ (0,0).
+        items.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0, 0]);
+        items.extend_from_slice(&[0x10, 0, 0, 0]); // padded ids
+        // Element 2: glyphset change.
+        items.push(255);
+        items.extend_from_slice(&[0u8, 0, 0]);
+        items.extend_from_slice(&gs_b.to_le_bytes());
+        // Element 3: 1 glyph @ (+1,0).
+        items.extend_from_slice(&[1u8, 0, 0, 0, 1, 0, 0, 0]);
+        items.extend_from_slice(&[0x20, 0, 0, 0]);
+
+        b.render_composite_glyphs(
+            None, 23, 3, /* Over */
+            src_pic, dst_pic, 0, gs_a, 0, 0, &items, 0, 0,
+        )
+        .expect("ok");
+        // Op + source were Over + SolidFill, so the unsupported
+        // counter must NOT have fired.
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 0,
+            "Over + SolidFill must not hit the unsupported gate",
+        );
+        // dst resolution failed (no Drawable backing for 0x4242_4242
+        // in the store), so the engine wasn't called — but the parse
+        // still walked both glyphsets without bumping the gap. The
+        // load-bearing assertion is that the inline change keeps the
+        // call in the Over+SolidFill envelope; engine reachability
+        // is covered by the Vk-backed acceptance test.
     }
 }

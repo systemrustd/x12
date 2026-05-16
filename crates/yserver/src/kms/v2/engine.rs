@@ -58,7 +58,9 @@ use crate::kms::{
         glyph::{AtlasEntry, GlyphKey},
         ops::{
             render::CompositeTarget,
-            text::{TextAtlas, TextGlyph, TextRunTarget, record_text_run},
+            text::{
+                TextAtlas, TextGlyph, TextRunTarget, record_text_run, record_text_run_scissored,
+            },
         },
         render_pipeline::{RenderPipelineCache, SolidColorImage},
         text_pipeline::TextPipeline,
@@ -1680,6 +1682,334 @@ impl RenderEngine {
         Ok(stats)
     }
 
+    // ── Op: composite_glyphs (Stage 3d) ─────────────────────────
+
+    /// Record a RENDER `CompositeGlyphs` against `dst`. Backend
+    /// wrapper (`KmsBackendV2::render_composite_glyphs`) is
+    /// responsible for: (a) gating on `op == Over` + SolidFill
+    /// source (plan §3d "v1-parity scope"), (b) parsing the
+    /// `items` glyph-element stream including the inline `0xFF 0
+    /// mask_fmt new_gs` glyphset-change form, (c) looking up
+    /// each glyph from `KmsCore.glyphsets`, (d) host-side A1→A8
+    /// expansion. By the time we reach the engine, each input is a
+    /// dense A8 bitmap + a dst position + a glyphset xid that
+    /// keys it in the engine's atlas.
+    ///
+    /// `foreground_rgba` is the SolidFill source's premultiplied
+    /// colour (the text pipeline shader multiplies it by the
+    /// sampled atlas alpha — same blend state as 3a's image_text).
+    ///
+    /// `clip_rects` is the dst picture's clip set, already
+    /// pre-shifted by the picture's `clip_x` / `clip_y` origin
+    /// (Stage 3b). `None` paints the full dst; passing an empty
+    /// slice paints nothing. Per plan §4, the engine emits one
+    /// `cmd_set_scissor` + glyph-draw batch per clip rect — this
+    /// is the v1-bug-fix: v1's `try_vk_render_composite_glyphs`
+    /// reads the dst picture clip but ignores it
+    /// (`kms::backend.rs:5313`).
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `UnknownDrawable` if `dst_id` is missing.
+    /// - `Vk(...)` for any CB / submit failure. Atlas-upload
+    ///   failures drop the affected glyph and bump
+    ///   `stats.glyphs_dropped`; only catastrophic failures (CB
+    ///   alloc, draw-record) propagate.
+    /// - `RendererFailed` if `platform.renderer_failed`.
+    pub(crate) fn composite_glyphs(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst_id: DrawableId,
+        foreground_rgba: [f32; 4],
+        glyphs: &[CompositeGlyphInput<'_>],
+        clip_rects: Option<&[Rectangle16]>,
+    ) -> Result<ImageTextStats, RenderError> {
+        let mut stats = ImageTextStats::default();
+        if glyphs.is_empty() {
+            return Ok(stats);
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        let (dst_extent, dst_format) = {
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (d.storage.extent, d.storage.format)
+        };
+        // Text pipeline is built for B8G8R8A8_UNORM; same gate as
+        // v1's `try_vk_render_composite_glyphs` and v2's
+        // `image_text`.
+        if dst_format != vk::Format::B8G8R8A8_UNORM {
+            log::warn!(
+                "v2 composite_glyphs: dst xid={:?} has format {:?}; text pipeline only \
+                 supports B8G8R8A8_UNORM — dropping run",
+                store.get(dst_id).map(|d| d.xid),
+                dst_format,
+            );
+            return Ok(stats);
+        }
+
+        // Lazy-init atlas + pipeline (same path as image_text).
+        if inner.glyph_atlas.is_none() {
+            match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
+                Ok(a) => inner.glyph_atlas = Some(a),
+                Err(e) => {
+                    log::error!("v2 composite_glyphs: V2GlyphAtlas::new failed: {e:?}");
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+        if inner.text_pipeline.is_none() {
+            let atlas_view = inner.glyph_atlas.as_ref().expect("just built").image_view();
+            match TextPipeline::new(
+                Arc::clone(&inner.vk),
+                vk::Format::B8G8R8A8_UNORM,
+                atlas_view,
+            ) {
+                Ok(p) => inner.text_pipeline = Some(p),
+                Err(e) => {
+                    log::error!("v2 composite_glyphs: TextPipeline::new failed: {e:?}");
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+
+        // Resolve / upload each glyph. Atlas key is
+        // `(gs_xid, glyph_id)` (v1's `font_xid = gs_xid`
+        // convention); image_text and composite_glyphs share the
+        // same key namespace — both come from `KmsCore.next_host_xid()`.
+        let mut glyphs_to_draw: Vec<TextGlyph> = Vec::with_capacity(glyphs.len());
+        let mut damage_min_x = i32::MAX;
+        let mut damage_min_y = i32::MAX;
+        let mut damage_max_x = i32::MIN;
+        let mut damage_max_y = i32::MIN;
+        for g in glyphs {
+            let key = GlyphKey {
+                font_xid: g.gs_xid,
+                codepoint: g.glyph_id,
+            };
+            let entry =
+                if let Some(hit) = inner.glyph_atlas.as_ref().expect("just built").lookup(key) {
+                    hit
+                } else {
+                    let Some((atlas_x, atlas_y)) = inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .pack(g.w, g.h)
+                    else {
+                        inner
+                            .glyph_atlas
+                            .as_mut()
+                            .expect("just built")
+                            .note_full_once();
+                        stats.glyphs_dropped += 1;
+                        continue;
+                    };
+                    if g.w == 0 || g.h == 0 {
+                        let e = AtlasEntry {
+                            atlas_x: 0,
+                            atlas_y: 0,
+                            w: 0,
+                            h: 0,
+                            pen_left: 0,
+                            pen_top: 0,
+                        };
+                        inner
+                            .glyph_atlas
+                            .as_mut()
+                            .expect("just built")
+                            .insert_entry(key, e);
+                        continue;
+                    }
+                    stats.atlas_interns += 1;
+                    let upload_bytes = u64::from(g.w) * u64::from(g.h);
+                    let staging = StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?;
+                    let copy_len = (g.w as usize) * (g.h as usize);
+                    let src_slice = if g.pixels.len() >= copy_len {
+                        &g.pixels[..copy_len]
+                    } else {
+                        log::warn!(
+                            "v2 composite_glyphs: glyph pixels {} < {} expected; dropping",
+                            g.pixels.len(),
+                            copy_len,
+                        );
+                        stats.glyphs_dropped += 1;
+                        continue;
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_slice.as_ptr(),
+                            staging.mapped.as_ptr(),
+                            copy_len,
+                        );
+                    }
+                    let (cb, ticket) = begin_op_cb(inner, platform)?;
+                    let staging_buffer = staging.buffer;
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .record_upload(cb, staging_buffer, atlas_x, atlas_y, g.w, g.h);
+                    end_and_submit_op(inner, platform, cb, &ticket)?;
+                    stats.glyph_uploads += 1;
+                    inner.submitted.push_back(SubmittedOp {
+                        cb,
+                        ticket: ticket.clone(),
+                        staging: Some(staging),
+                        scratch: None,
+                        atlas_ticket: None,
+                        descriptor_arena: None,
+                    });
+                    inner.atlas_last_upload_ticket = Some(ticket);
+                    let e = AtlasEntry {
+                        atlas_x,
+                        atlas_y,
+                        w: g.w,
+                        h: g.h,
+                        pen_left: 0,
+                        pen_top: 0,
+                    };
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .insert_entry(key, e);
+                    e
+                };
+            if entry.w == 0 || entry.h == 0 {
+                continue;
+            }
+            damage_min_x = damage_min_x.min(g.dst_x);
+            damage_min_y = damage_min_y.min(g.dst_y);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_x = g.dst_x.saturating_add(entry.w as i32);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_y = g.dst_y.saturating_add(entry.h as i32);
+            damage_max_x = damage_max_x.max(max_x);
+            damage_max_y = damage_max_y.max(max_y);
+            glyphs_to_draw.push(TextGlyph {
+                entry,
+                dst_x: g.dst_x,
+                dst_y: g.dst_y,
+            });
+        }
+
+        if glyphs_to_draw.is_empty() {
+            return Ok(stats);
+        }
+
+        // Build the picture-clip scissor list. None → full extent.
+        // Empty slice → nothing to paint (matches render_composite
+        // semantics).
+        let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
+            None => vec![vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: dst_extent,
+            }],
+            Some(cr) => {
+                let mut out = Vec::with_capacity(cr.len());
+                for r in cr {
+                    if r.width == 0 || r.height == 0 {
+                        continue;
+                    }
+                    let x0 = i32::from(r.x).max(0);
+                    let y0 = i32::from(r.y).max(0);
+                    let x1 = (i32::from(r.x) + i32::from(r.width))
+                        .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
+                    let y1 = (i32::from(r.y) + i32::from(r.height))
+                        .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    out.push(vk::Rect2D {
+                        offset: vk::Offset2D { x: x0, y: y0 },
+                        extent: vk::Extent2D {
+                            #[allow(clippy::cast_sign_loss)]
+                            width: (x1 - x0) as u32,
+                            #[allow(clippy::cast_sign_loss)]
+                            height: (y1 - y0) as u32,
+                        },
+                    });
+                }
+                if out.is_empty() {
+                    // Every clip rect was outside dst — nothing to paint.
+                    return Ok(stats);
+                }
+                out
+            }
+        };
+
+        let atlas_extent = inner.glyph_atlas.as_ref().expect("ensured").extent();
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let drawable = store.get_mut(dst_id).expect("checked");
+        let mut adapter = StorageTextTarget {
+            extent: drawable.storage.extent,
+            image: drawable.storage.image,
+            image_view: drawable.storage.image_view,
+            current_layout: drawable.storage.current_layout,
+        };
+        let result = record_text_run_scissored(
+            &inner.vk,
+            cb,
+            &mut adapter,
+            TextAtlas {
+                extent: atlas_extent,
+            },
+            inner.text_pipeline.as_ref().expect("ensured"),
+            &glyphs_to_draw,
+            foreground_rgba,
+            &clip_scissors,
+        );
+        drawable.storage.current_layout = adapter.current_layout;
+        result?;
+
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(dst_id, ticket.clone());
+        // Damage = glyph-bbox union ∩ dst extent. Per-rect clip is
+        // honoured by the scissored draws; the damage record uses
+        // the broader union since post-paint state is unchanged
+        // outside any covered glyph rect anyway.
+        if damage_max_x > damage_min_x && damage_max_y > damage_min_y {
+            let dx = damage_min_x.max(0);
+            let dy = damage_min_y.max(0);
+            let w = u32::try_from(damage_max_x - dx).unwrap_or(0);
+            let h = u32::try_from(damage_max_y - dy).unwrap_or(0);
+            if w > 0 && h > 0 {
+                store.damage(
+                    dst_id,
+                    clamp_rect(
+                        vk::Rect2D {
+                            offset: vk::Offset2D { x: dx, y: dy },
+                            extent: vk::Extent2D {
+                                width: w,
+                                height: h,
+                            },
+                        },
+                        dst_extent,
+                    ),
+                );
+            }
+        }
+        let atlas_ticket = inner.atlas_last_upload_ticket.clone();
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: None,
+            scratch: None,
+            atlas_ticket,
+            descriptor_arena: None,
+        });
+
+        Ok(stats)
+    }
+
     // ── Op: render_composite (Stage 3c) ─────────────────────────
 
     /// Record a RENDER `Composite` against `dst`. `src` and `mask`
@@ -2410,6 +2740,34 @@ pub(crate) struct PreparedGlyph {
     pub h: usize,
     pub pixels: Vec<u8>,
     pub codepoint: u32,
+}
+
+/// Single glyph input to [`RenderEngine::composite_glyphs`]. The
+/// backend wrapper resolves glyphset xid + glyph id via
+/// `KmsCore.glyphsets`, expands A1 bitmaps host-side to dense A8,
+/// and computes the per-glyph dst position from the items stream's
+/// running pen + glyph metrics. Lifetimes: `pixels` is borrowed
+/// from `KmsCore.glyphsets[gs_xid].glyphs[glyph_id].pixels` (or a
+/// caller-owned A1→A8 scratch); the engine copies it into a per-
+/// glyph `StagingBuffer` on intern, so the borrow only needs to
+/// outlive the engine call itself.
+pub(crate) struct CompositeGlyphInput<'a> {
+    /// Glyphset xid the glyph came from (atlas key namespace).
+    pub gs_xid: u32,
+    /// Glyph id within the glyphset (atlas key codepoint).
+    pub glyph_id: u32,
+    /// Glyph width / height. 0×0 entries cache an empty entry and
+    /// skip the upload (space glyphs after pen-only adjustment).
+    pub w: u32,
+    pub h: u32,
+    /// Dense A8 bitmap, row-major `w × h`. Caller is responsible
+    /// for A1→A8 expansion + ARGB32→A8 alpha-extract (the latter
+    /// is done in `parse_add_glyphs` for storage; the former is
+    /// per-call because v1 stores A1 raw and expands at draw time).
+    pub pixels: &'a [u8],
+    /// Dst-space top-left corner for the glyph quad.
+    pub dst_x: i32,
+    pub dst_y: i32,
 }
 
 /// Telemetry surface for one [`RenderEngine::image_text`] call.
