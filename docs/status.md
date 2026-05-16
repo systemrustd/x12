@@ -702,9 +702,74 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       (`cursor_paths_do_not_log_gaps`) asserts the closure.
       228 lib + 18 ignored v2 Vk + 8 v2_acceptance tests green
       under lavapipe.
+    - [ ] **3f.6 — subwindow scene composition.** *Stage 3
+      close blocker, found 2026-05-16 during xterm/xclock
+      hardware smoke.* Both xterm and xclock paint into a
+      child window (xterm: `0x100015` under top-level
+      `0x10000c`; xclock: `0x10000b` under `0x10000a`);
+      v2's `build_scene` only iterates `core.top_level_order`,
+      so descendants' storage never reaches scanout — visible
+      result is whatever Vk left in the parent's storage at
+      allocate (black). The spec § scene-layering item 2 says
+      "top-level windows + descendants in z-order"; Stage 2d
+      shipped subwindow bookkeeping (`create_subwindow`,
+      `map_subwindow`, `scene_participating` flips,
+      `mark_scene_structure_dirty`) but `build_scene` never
+      grew the recurse — the gap was hidden by Stage 2's
+      synthetic acceptance (single Backend method against one
+      pixmap; no parent/child topology) + Stage 2's hardware
+      smoke being xsetroot (root-only, no top-level needed).
+      Scope:
+      - `WindowGeometryV2` grows `parent: Option<u32>`;
+        `create_subwindow` records the passed-in parent.
+      - `build_scene` walks top-level → mapped +
+        `scene_participating` descendants, projecting each
+        through accumulated parent offsets into output coords.
+      - `change_subwindow_attributes` ports v1's body verbatim
+        (`backend.rs:9449-9470`): store `bg_pixel` / `bg_pixmap`
+        into the window record; currently logged as a v2 gap.
+      - New window storage cleared to `bg_pixel` on allocate +
+        on configure resize so freshly-mapped windows have a
+        defined initial colour (v1 does this; v2 currently
+        leaves storage as fresh-Vk-undefined).
+      - Vk-backed acceptance test: paint into a child window,
+        scene blit shows the child contents at the parent
+        offset.
+      Sizing: ~300-500 LoC + tests, 1 focused session.
+    - [ ] **3f.7 — input dispatch.** *Stage 3 close blocker,
+      found 2026-05-16 during xterm hardware smoke.* v2 logs
+      `on_host_input not yet implemented` on first libinput
+      event; the libinput→client-event-queue routing has never
+      been assigned to a v2 substage (the spec mentions input
+      as a `PlatformBackend` primitive only; not in 2/3/4/5
+      checklists). Realistically belongs in Stage 2 (substrate)
+      but landed here because it surfaced now. Scope:
+      - Port `on_host_input` (~38 LoC), `cook_host_key`
+        (~17 LoC), `process_pointer_absolute` (~38 LoC),
+        `process_pointer_button` (~152 LoC) verbatim from v1
+        (`backend.rs:6494-6885`, `:8945-8982`).
+      - Port the helper cluster: `dispatch_motion_event`,
+        `emit_crossing` / `emit_motion_only` / `emit_pointer`,
+        `event_relative_coords`, `update_pointer_window`,
+        `window_under_cursor`, `serialize_modifiers`. v1 uses
+        `self.windows` for hit-testing; v2 uses `windows_v2`
+        — needs the subwindow tree from 3f.6 to hit-test
+        children correctly.
+      - HW cursor calls (`hw_cursor_active` / `hw_cursor_move`
+        / `hw_cursor_refresh`) no-op'd in v2 per spec § I7
+        (HW cursor plane reintroduces as a SceneCompositor
+        strategy, Stage 5 territory).
+      - Acceptance: xterm under no-WM receives KeyPress +
+        ButtonPress + MotionNotify; xclock cursor-tracking
+        updates correctly.
+      Sizing: ~800-1200 LoC incl. helpers + tests, 1-2 focused
+      sessions. **Depends on 3f.6** (subwindow tree for hit-
+      testing).
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
-      capture diff. Stage 3 close.
+      capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**
+      — neither rendercheck nor any matrix client can reach
+      its first paint without subwindow composition + input.
 - [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom

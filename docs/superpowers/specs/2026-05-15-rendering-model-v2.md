@@ -671,6 +671,34 @@ exact failure mode v2 is designed to eliminate.
 
 ### Stage 3 — RENDER + glyphs coverage
 
+> **Amendment (2026-05-16, mid-Stage-3-close).** Two
+> structural gaps surfaced during 3f hardware smoke that were
+> not on any earlier stage's checklist. Both are real-app
+> blockers and have been retro-fitted as 3f.6 / 3f.7
+> substages (see the per-stage plan and `status.md`):
+>
+> 1. **Subwindow scene composition.** §"SceneCompositor" /
+>    layering item 2 names "top-level windows + descendants"
+>    but Stage 2d only landed top-level traversal in
+>    `build_scene`. xterm / xclock / most real apps paint into
+>    a child window, so they were invisible under v2.
+>    Synthetic acceptance + xsetroot-only hardware smoke hid
+>    this — the original stage plans should have called out
+>    a multi-window topology test as part of Stage 2's
+>    acceptance.
+> 2. **Input event dispatch.** The spec mentions input only
+>    as a `PlatformBackend` primitive ("Input event polling").
+>    The routing from libinput events to per-client X11 event
+>    queues was never assigned to any v2 substage —
+>    `on_host_input` stayed as a logged-gap stub through 2a/2f
+>    and all of 3. Belongs in Stage 2 conceptually (substrate);
+>    retro-fitted into 3f.7. Future stage plans should treat
+>    "substrate" as including input, not just paint.
+>
+> Lesson for future stages: acceptance harnesses must include
+> a representative real-app shape, not only synthetic Backend-
+> trait drivers, even when the stage is correctness-first.
+
 - Add the RENDER pipelines on the same Vk substrate built in Stage 2:
   `render_composite`, `render_fill_rectangles`, `render_trapezoids`,
   `render_triangles`, `render_composite_glyphs`.
