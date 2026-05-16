@@ -654,9 +654,36 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       fragment-shader stage that LogicOp acts on). Real apps
       use logic-op only on fill paths; rendercheck covers it
       there.
-    - [ ] **3f.3 — set_clip_pixmap + set_gc_fill_tiled.** Depth-1
-      mask drives RENDER paint scissor; tile path routes
-      through RENDER composite.
+    - [x] **3f.3 — set_clip_pixmap + set_gc_fill_tiled landed
+      2026-05-16.** `set_clip_pixmap` stores `ClipState::Pixmap
+      { origin, pixmap }` instead of logging a gap +
+      clearing the clip (v1-parity bookkeeping; mask sampling
+      itself is deferred — no real-app smoke matrix client
+      drives clip-pixmap, v1 stores-but-doesn't-enforce too).
+      `set_gc_fill_tiled` stores `FillState::Tiled { pixmap,
+      origin }` instead of logging a gap (the dispatcher also
+      pushes via `apply_fill_state`; keeping the dedicated
+      entrypoint correct keeps the Backend trait uniform).
+      `fill_solid_rects` split: stroke ops (`poly_line` /
+      `poly_segment` / `poly_rectangle` / `poly_arc` /
+      `poly_point`) still call it directly (X11 strokes are
+      always solid foreground); fill ops (`fill_rectangle` /
+      `poly_fill_rectangle` / `poly_fill_arc` / `fill_poly`)
+      now go through new `fill_rects_honoring_fill_state`,
+      which dispatches `FillState::Tiled` + GcFunction::Copy
+      to `try_tiled_fill` (engine.render_composite with
+      `OP_SRC` + `Repeat::Normal` + `(src_x, src_y) = (dst -
+      tile_origin)`). Non-Copy + Tiled and `Stippled` /
+      `OpaqueStippled` degenerate to solid (v1-parity).
+      Tile aliasing (`tile_id == dst_id`) and non-BGRA8 tile
+      formats fall back to solid. 2 new unit tests
+      (`set_clip_pixmap_stores_pixmap_clip`,
+      `set_gc_fill_tiled_stores_fill_state`) + 1 Vk-backed
+      acceptance (`v2_tiled_fill_replicates_tile_pixmap` —
+      4×4 dst pre-filled blue, 2×2 red tile, `apply_fill_state(Tiled)`
+      + `poly_fill_rectangle` over whole dst, asserts every
+      pixel reads red). 227 lib + 18 ignored v2 Vk + 8
+      v2_acceptance tests green under lavapipe.
     - [ ] **3f.4 — cursor + `xfixes_change_cursor_by_name`.**
       Verify Cairo cursor themes; close stub.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app

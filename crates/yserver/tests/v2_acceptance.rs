@@ -23,7 +23,7 @@
 #![cfg(target_os = "linux")]
 
 use yserver::kms::v2::KmsBackendV2;
-use yserver_core::backend::{AnyHandle, Backend, DrawState};
+use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState};
 use yserver_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
@@ -592,4 +592,73 @@ fn v2_render_trapezoids_renders_filled_rect() {
         "outside trap should stay blue (got {:?})",
         &out[0..4],
     );
+}
+
+/// Stage 3f.3 acceptance: a `Tiled` fill driven through
+/// `apply_fill_state` + `poly_fill_rectangle` replicates the tile
+/// pixmap across the destination via the engine's RENDER composite
+/// path (`OP_SRC`, `Repeat::Normal`). e16 popup chrome paint
+/// depends on this exact shape.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_tiled_fill_replicates_tile_pixmap() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // 2×2 tile pixmap pre-filled with red.
+    let tile = b.create_pixmap(None, 32, 2, 2).expect("tile pixmap");
+    b.fill_rectangle(None, tile.as_raw(), 0xFFFF_0000, 0, 0, 2, 2)
+        .expect("tile fill red");
+
+    // 4×4 dst pre-filled with blue so untouched pixels are visibly
+    // distinct from the tile colour.
+    let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    b.fill_rectangle(None, dst.as_raw(), 0xFF00_00FF, 0, 0, 4, 4)
+        .expect("dst pre-fill blue");
+
+    // Activate Tiled fill state with origin (0, 0).
+    b.apply_fill_state(
+        None,
+        &FillState::Tiled {
+            pixmap: tile,
+            origin: (0, 0),
+        },
+    )
+    .expect("apply Tiled fill");
+
+    // poly_fill_rectangle over the whole 4×4 dst — fg ignored for
+    // tiled fill; the tile colour is what lands.
+    let rect_bytes = {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&u16::to_le_bytes(4));
+        buf.extend_from_slice(&u16::to_le_bytes(4));
+        buf
+    };
+    b.poly_fill_rectangle(None, dst.as_raw(), 0x0000_0000, &rect_bytes)
+        .expect("poly_fill_rectangle tiled");
+
+    let out = b
+        .get_image(None, dst.as_raw(), 2, 0, 0, 4, 4, !0)
+        .expect("get_image")
+        .expect("Some");
+    // Every pixel should now be red (tile colour), not the blue
+    // pre-fill. BGRA8 wire bytes: [B=0, G=0, R=0xFF, A=0xFF].
+    for (i, px) in out.chunks_exact(4).enumerate() {
+        assert_eq!(
+            &px[0..4],
+            &[0x00, 0x00, 0xFF, 0xFF],
+            "tile-filled pixel {i} must be red (got {:?})",
+            &px[0..4]
+        );
+    }
+
+    // Reset fill state so trailing test wiring doesn't inherit it.
+    b.set_gc_fill_solid(None).expect("reset solid");
 }

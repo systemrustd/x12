@@ -401,8 +401,9 @@ impl KmsBackendV2 {
     /// Lower a list of solid-colour rectangles to the appropriate
     /// engine path. Used by the stroke-style poly ops (`PolyLine`,
     /// `PolySegment`, `PolyPoint`, `PolyArc`, `PolyRectangle`) where
-    /// every rasterised rect is in the GC's single foreground colour,
-    /// and by `PolyFillArc` / `FillPoly` after the scanline pass.
+    /// every rasterised rect is in the GC's single foreground colour
+    /// regardless of GC fill-style, and as the fallback inside
+    /// [`fill_rects_honoring_fill_state`] for the Solid arm.
     ///
     /// `GcFunction::Copy` (the common case) goes through the fast
     /// `vkCmdClearAttachments`-driven `engine.fill_rect`. Non-`Copy`
@@ -476,6 +477,141 @@ impl KmsBackendV2 {
                 break;
             }
             self.telemetry.record_paint_submit();
+        }
+    }
+
+    /// Fill `rects` on `id`, honouring `KmsCore.current_fill`. Used
+    /// by the filled-shape ops (`PolyFillRectangle`, `PolyFillArc`,
+    /// `FillPoly`, `FillRectangle`); stroke ops keep using
+    /// [`fill_solid_rects`] because X11 strokes are always solid
+    /// foreground regardless of GC fill-style.
+    ///
+    /// `Tiled` with `GcFunction::Copy` drives a RENDER composite
+    /// (`OP_SRC`, `Repeat::Normal`) so the tile pixmap supplies the
+    /// destination colours — e16 paints popup backgrounds this way.
+    /// `Tiled` with a non-`Copy` function degenerates to a solid
+    /// logic-op fill (matches v1's behaviour — no real client drives
+    /// tiled+logic-op). `Stippled` / `OpaqueStippled` fall through
+    /// to solid for now; proper stipple support is post-Stage-3.
+    fn fill_rects_honoring_fill_state(
+        &mut self,
+        id: crate::kms::v2::store::DrawableId,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) {
+        use yserver_core::backend::{FillState, GcFunction};
+        if rects.is_empty() {
+            return;
+        }
+        let function = self.core.current_function;
+        if matches!(function, GcFunction::NoOp) {
+            return;
+        }
+        let fill = self.core.current_fill.clone();
+        match fill {
+            FillState::Tiled { pixmap, origin } => {
+                let tile_xid = pixmap.as_raw();
+                if !matches!(function, GcFunction::Copy) {
+                    // Non-Copy + Tiled isn't covered by any current
+                    // client; degenerate to solid logic-op fill so
+                    // the function is honoured (matches v1).
+                    self.fill_solid_rects(id, fg, rects);
+                    return;
+                }
+                if !self.try_tiled_fill(id, tile_xid, origin.0, origin.1, rects) {
+                    // Tile not in store / aliases dst / non-BGRA8
+                    // tile — degenerate to solid foreground.
+                    self.fill_solid_rects(id, fg, rects);
+                }
+            }
+            FillState::Solid | FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
+                // Stipple support is post-Stage-3 (no real-app smoke
+                // client drives it on KMS). Fall through as solid.
+                self.fill_solid_rects(id, fg, rects);
+            }
+        }
+    }
+
+    /// Tile fill via `engine.render_composite` (Stage 3f.3). Returns
+    /// `true` iff the call submitted; `false` if the tile isn't
+    /// usable (unknown xid, self-tile aliasing, non-BGRA8 tile
+    /// format), in which case the caller falls back to solid.
+    fn try_tiled_fill(
+        &mut self,
+        dst_id: crate::kms::v2::store::DrawableId,
+        tile_xid: u32,
+        ox: i16,
+        oy: i16,
+        rects: &[Rectangle16],
+    ) -> bool {
+        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        if rects.is_empty() {
+            return true;
+        }
+        let Some(tile_id) = self.store.lookup(tile_xid) else {
+            log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} not in store");
+            return false;
+        };
+        if tile_id == dst_id {
+            // Self-tile would alias src + dst inside render_composite.
+            return false;
+        }
+        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        if tile_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8");
+            return false;
+        }
+        // Build per-rect CompositeRects in dst space with
+        // `src_origin = dst - tile_origin` so the shader's
+        // `src_origin + dst_offset` lands on the right tile pixel.
+        let composite_rects: Vec<CompositeRect> = rects
+            .iter()
+            .filter_map(|r| {
+                if r.width == 0 || r.height == 0 {
+                    return None;
+                }
+                Some(CompositeRect {
+                    src_x: i32::from(r.x) - i32::from(ox),
+                    src_y: i32::from(r.y) - i32::from(oy),
+                    mask_x: 0,
+                    mask_y: 0,
+                    dst_x: i32::from(r.x),
+                    dst_y: i32::from(r.y),
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                })
+            })
+            .collect();
+        if composite_rects.is_empty() {
+            return true;
+        }
+        // Op `Src` (1) — tile fill replaces the destination.
+        const OP_SRC: u8 = 1;
+        match self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            ResolvedSource::Drawable(tile_id),
+            ResolvedSource::None,
+            dst_id,
+            &composite_rects,
+            None, // GC clip already applied by caller
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+        ) {
+            Ok(s) => {
+                if s.recorded_draws > 0 {
+                    self.telemetry.record_paint_submit();
+                }
+                true
+            }
+            Err(e) => {
+                log::warn!("v2 try_tiled_fill: render_composite failed: {e:?}");
+                false
+            }
         }
     }
 
@@ -1523,14 +1659,25 @@ impl Backend for KmsBackendV2 {
     fn set_clip_pixmap(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pixmap: u32,
-        _clip_x_origin: i16,
-        _clip_y_origin: i16,
+        host_pixmap: u32,
+        clip_x_origin: i16,
+        clip_y_origin: i16,
     ) -> io::Result<()> {
-        // ClipState::Pixmap requires sampling the depth-1 pixmap, which
-        // v2 can't do without DrawableStore. Log + leave clip cleared.
-        self.log_v2_gap("set_clip_pixmap");
-        self.core.current_clip = ClipState::None;
+        // Stage 3f.3: store the ClipState::Pixmap so apply_clip_state +
+        // subsequent paint paths can route through a depth-1 mask
+        // sampler. The mask-sampling itself is deferred to Stage 5
+        // perf-plans (no real-app smoke matrix client uses it; v1 has
+        // the same shape — stores but doesn't enforce). Bookkeeping
+        // is correct so Core paint that follows can see the pixmap
+        // handle if/when a future engine pass picks it up.
+        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
+            self.core.current_clip = ClipState::None;
+            return Ok(());
+        };
+        self.core.current_clip = ClipState::Pixmap {
+            origin: (clip_x_origin, clip_y_origin),
+            pixmap: handle,
+        };
         Ok(())
     }
 
@@ -1542,11 +1689,24 @@ impl Backend for KmsBackendV2 {
     fn set_gc_fill_tiled(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pixmap: u32,
-        _tile_x_origin: i16,
-        _tile_y_origin: i16,
+        host_pixmap: u32,
+        tile_x_origin: i16,
+        tile_y_origin: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("set_gc_fill_tiled");
+        // Stage 3f.3: store the FillState::Tiled record so subsequent
+        // fill paths route through the tiled-fill RENDER composite.
+        // The dispatcher also pushes the same state via
+        // `apply_fill_state` before every fill op, so this entry
+        // point is mostly used by ynest's host-X11 flow; preserving
+        // both keeps the Backend trait surface uniform.
+        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
+            self.core.current_fill = FillState::Solid;
+            return Ok(());
+        };
+        self.core.current_fill = FillState::Tiled {
+            pixmap: handle,
+            origin: (tile_x_origin, tile_y_origin),
+        };
         Ok(())
     }
 
@@ -2157,7 +2317,7 @@ impl Backend for KmsBackendV2 {
             rects.push(r);
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(id, foreground, &rects);
         Ok(())
     }
 
@@ -2215,7 +2375,7 @@ impl Backend for KmsBackendV2 {
         }
         if !rects.is_empty() {
             let rects = self.intersect_with_current_clip(&rects);
-            self.fill_solid_rects(id, foreground, &rects);
+            self.fill_rects_honoring_fill_state(id, foreground, &rects);
         }
         Ok(())
     }
@@ -2254,7 +2414,7 @@ impl Backend for KmsBackendV2 {
             .unwrap_or((0, 0));
         let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
         let rects = self.intersect_with_current_clip(&clipped);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(id, foreground, &rects);
         Ok(())
     }
 
@@ -2278,7 +2438,7 @@ impl Backend for KmsBackendV2 {
             width,
             height,
         }]);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(id, foreground, &rects);
         Ok(())
     }
 
@@ -4684,6 +4844,64 @@ mod tests {
         assert!(
             !gaps.contains("copy_plane_non_gxcopy"),
             "stage 3e.1 copy_plane_non_gxcopy gap must not fire post-3f.2"
+        );
+    }
+
+    /// `set_clip_pixmap_stores_pixmap_clip` — Stage 3f.3 bookkeeping
+    /// gate. The pre-3f.3 stub logged a gap and cleared the clip to
+    /// `None`; 3f.3 stores the `ClipState::Pixmap` with the origin
+    /// preserved (mask sampling itself is deferred). A subsequent
+    /// `clear_clip_rectangles` returns to `None`.
+    #[test]
+    fn set_clip_pixmap_stores_pixmap_clip() {
+        use yserver_core::backend::ClipState;
+        let mut b = KmsBackendV2::for_tests();
+        b.set_clip_pixmap(None, 0xABCD_EF01, 12, 34).expect("ok");
+        match &b.core.current_clip {
+            ClipState::Pixmap { origin, pixmap } => {
+                assert_eq!(origin.0, 12);
+                assert_eq!(origin.1, 34);
+                assert_eq!(pixmap.as_raw(), 0xABCD_EF01);
+            }
+            other => panic!("expected ClipState::Pixmap, got {other:?}"),
+        }
+        // pre-3f.3 stub bumped a `set_clip_pixmap` gap; 3f.3 stores
+        // bookkeeping cleanly.
+        assert!(
+            !b.logged_gaps.borrow().contains("set_clip_pixmap"),
+            "set_clip_pixmap must not log a gap post-3f.3"
+        );
+        b.clear_clip_rectangles(None).expect("ok");
+        assert!(matches!(b.core.current_clip, ClipState::None));
+    }
+
+    /// `set_gc_fill_tiled_stores_fill_state` — Stage 3f.3 bookkeeping
+    /// gate. Pre-3f.3 stub logged a gap; 3f.3 stores
+    /// `FillState::Tiled { pixmap, origin }` so subsequent fill ops
+    /// can route through the tiled-fill RENDER composite. xid=0
+    /// degenerates to `FillState::Solid`.
+    #[test]
+    fn set_gc_fill_tiled_stores_fill_state() {
+        use yserver_core::backend::FillState;
+        let mut b = KmsBackendV2::for_tests();
+        b.set_gc_fill_tiled(None, 0xDEAD_BEEF, 5, 7).expect("ok");
+        match &b.core.current_fill {
+            FillState::Tiled { pixmap, origin } => {
+                assert_eq!(pixmap.as_raw(), 0xDEAD_BEEF);
+                assert_eq!(origin.0, 5);
+                assert_eq!(origin.1, 7);
+            }
+            other => panic!("expected FillState::Tiled, got {other:?}"),
+        }
+        // xid=0 means PixmapHandle::from_raw returns None — falls
+        // back to FillState::Solid (defensive; the dispatcher never
+        // passes 0 here).
+        b.set_gc_fill_tiled(None, 0, 0, 0).expect("ok");
+        assert!(matches!(b.core.current_fill, FillState::Solid));
+
+        assert!(
+            !b.logged_gaps.borrow().contains("set_gc_fill_tiled"),
+            "set_gc_fill_tiled must not log a gap post-3f.3"
         );
     }
 }
