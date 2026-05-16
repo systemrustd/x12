@@ -220,6 +220,41 @@ impl RegionSet {
     pub(crate) fn clear(&mut self) {
         self.rects.clear();
     }
+
+    /// Bounding rect over every rect in the set. Returns `None`
+    /// if the set is empty. Stage 2e uses this for the
+    /// buffer-age repaint scissor — we don't yet split the
+    /// scissor per-rect; Stage 5 may tighten if profiling shows
+    /// over-paint matters.
+    pub(crate) fn bounding_rect(&self) -> Option<vk::Rect2D> {
+        let mut iter = self.rects.iter().copied();
+        let first = iter.next()?;
+        let mut x0 = first.offset.x;
+        let mut y0 = first.offset.y;
+        let mut x1 = first.offset.x.saturating_add_unsigned(first.extent.width);
+        let mut y1 = first.offset.y.saturating_add_unsigned(first.extent.height);
+        for r in iter {
+            x0 = x0.min(r.offset.x);
+            y0 = y0.min(r.offset.y);
+            x1 = x1.max(r.offset.x.saturating_add_unsigned(r.extent.width));
+            y1 = y1.max(r.offset.y.saturating_add_unsigned(r.extent.height));
+        }
+        Some(vk::Rect2D {
+            offset: vk::Offset2D { x: x0, y: y0 },
+            extent: vk::Extent2D {
+                width: u32::try_from((x1 - x0).max(0)).unwrap_or(0),
+                height: u32::try_from((y1 - y0).max(0)).unwrap_or(0),
+            },
+        })
+    }
+
+    /// Clone — used by snapshot/ack capture paths. The
+    /// `derive(Clone)` already covers this; this method is just
+    /// a name for readability at call sites.
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> RegionSet {
+        self.clone()
+    }
 }
 
 // ────────────────────────────────────────────────────────────────

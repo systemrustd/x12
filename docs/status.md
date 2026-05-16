@@ -158,9 +158,25 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     integration tests passing under lavapipe.
     Hardware smoke for first-visible-scanout pending — Stage 2f
     user-run smoke covers it.
-  - [ ] **2e — Buffer-age clipping + I6b retirement + failed-flip
-    recovery.** Output-level damage snapshot/ack;
-    transactional generation advance with separate 9a/9b paths.
+  - [x] **2e — Buffer-age clipping + I6b retirement + failed-flip
+    recovery.** Landed 2026-05-16. `BufferAgeRing` per output,
+    `pick_repaint_region` algorithm (full-redraw fallback on
+    invalidated BO / fresh BO / history loss; clipped repaint
+    otherwise). `OutputSceneState` tracks
+    `scene_structure_damage` + `pending_repaint_after_failed_submit`
+    as `RegionSet`s with the transactional snapshot/ack rule
+    (codex round 2 point 2). v2-specific `record_compose_v2`
+    function forks v1's `record_and_present_composite` to add
+    `loadOp=LOAD` + clip-region scissor for buffer-age paths.
+    9a (queue-submit failed) and 9b (atomic-commit failed)
+    recovery paths share descriptor-pool slot release + repaint
+    deferral; only 9b invalidates the BO's content tracking.
+    `handle_page_flip_complete` subtracts submitted snapshots
+    from live state (post-submit damage survives) and pushes
+    output damage onto the history ring.
+    6 new unit tests for ring trim / history-window math /
+    repaint picker fallback cases. Stage 2f's synthetic harness
+    is the load-bearing buffer-age oracle test (deferred).
   - [ ] **2f — Telemetry + acceptance harness + hardware smoke.**
     Counters wired per spec § "Required counters"; synthetic
     acceptance binary; user-run hardware smoke on bee + fuji.

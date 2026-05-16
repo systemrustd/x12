@@ -63,14 +63,15 @@ use ash::vk;
 
 use super::{
     platform::{FenceTicket, PlatformBackend},
-    store::{DamageSnapshot, DrawableKind, DrawableStore},
+    store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
 };
 use crate::kms::{
     core::KmsCore,
     scheduler::composite_pool_ring::CompositePoolRing,
     vk::{
-        compositor::{CompositeDraw, CompositeScene, PresentError, record_and_present_composite},
-        pipeline::{CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
+        compositor::{CompositeDraw, CompositeScene, PresentError},
+        pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
+        scanout::{BoPhase, ScanoutBo},
     },
 };
 
@@ -82,16 +83,83 @@ use crate::kms::{
 /// in-flight compose; popped front on page-flip-complete.
 struct PendingAck {
     bo_idx: usize,
+    generation: u64,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
     drawable_snapshots: Vec<DamageSnapshot>,
     /// Engine fence ticket for the source drawables touched by
-    /// the compose. Stage 2e wires this into compose-read
-    /// consumer tracking; Stage 2d holds it so prior paint
-    /// work keeps its inner alive past compose-record time.
-    #[allow(dead_code)]
+    /// the compose. Per cross-cutting §5: every consumer that
+    /// reads OR writes a drawable touches the ticket; this is
+    /// the compose-read side.
     ticket: Option<FenceTicket>,
+    /// Output-level damage submitted in this frame (codex
+    /// round 2 point 1). Subtracted from
+    /// `output.scene_structure_damage` +
+    /// `output.pending_repaint_after_failed_submit` on
+    /// retirement. Damage that arrived between submit and
+    /// retirement is NOT in this snapshot — it survives.
+    submitted_output_damage: RegionSet,
+    submitted_scene_structure_damage: RegionSet,
+    submitted_failed_repaint: RegionSet,
+}
+
+/// Ring of recent output-damage regions keyed by generation.
+/// Depth = max(scanout_bo_count) + 1 per Stage 2 plan
+/// cross-cutting §"BufferAgeRing".
+pub(crate) struct BufferAgeRing {
+    entries: VecDeque<(u64, RegionSet)>,
+    depth: usize,
+}
+
+impl BufferAgeRing {
+    fn new(depth: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(depth + 1),
+            depth,
+        }
+    }
+
+    /// Push `(gen, region)`. Trims to `depth` entries.
+    fn push(&mut self, generation: u64, region: RegionSet) {
+        self.entries.push_back((generation, region));
+        while self.entries.len() > self.depth {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Check whether every generation in `(last_gen+1, frame_gen)`
+    /// (exclusive on both sides — those are the intervening
+    /// generations between the BO's last present and the
+    /// frame we're about to render) is in the ring.
+    fn contains_all(&self, last_gen: u64, frame_gen: u64) -> bool {
+        if frame_gen <= last_gen {
+            return true; // shouldn't happen but bail safe
+        }
+        let want_count = (frame_gen - last_gen - 1) as usize;
+        if want_count == 0 {
+            // No intervening frames; the BO's content + current
+            // damage covers it.
+            return true;
+        }
+        let mut found = 0usize;
+        for &(g, _) in &self.entries {
+            if g > last_gen && g < frame_gen {
+                found += 1;
+            }
+        }
+        found >= want_count
+    }
+
+    /// Union all damage regions in `(last_gen+1, frame_gen)` into
+    /// `dst`.
+    fn union_history_into(&self, last_gen: u64, frame_gen: u64, dst: &mut RegionSet) {
+        for (g, r) in &self.entries {
+            if *g > last_gen && *g < frame_gen {
+                dst.union_with(r);
+            }
+        }
+    }
 }
 
 struct OutputSceneState {
@@ -101,6 +169,21 @@ struct OutputSceneState {
     /// `pool_slots[i]`. Released to the ring on flip retirement.
     pool_slots: VecDeque<usize>,
     pending_acks: VecDeque<PendingAck>,
+    /// Buffer-age damage history (Stage 2e).
+    damage_history: BufferAgeRing,
+    /// Monotonic per-output generation. Advances only on a
+    /// successful flip (transactional commit per codex round 2
+    /// point 2).
+    current_generation: u64,
+    /// Scene-structure damage in output coords. Accumulated by
+    /// `mark_scene_structure_damage(region)`; subtracted on
+    /// retirement using the snapshot captured at submit time.
+    scene_structure_damage: RegionSet,
+    /// Repaint pending from prior failed submit/flip. Folded
+    /// into the next tick's output damage.
+    pending_repaint_after_failed_submit: RegionSet,
+    /// Output extent — cached for full-output fallback regions.
+    output_extent: vk::Extent2D,
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -154,14 +237,30 @@ impl SceneCompositor {
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
         let mut outputs = Vec::with_capacity(platform.outputs.len());
-        for i in 0..platform.outputs.len() {
+        for (i, layout) in platform.outputs.iter().enumerate() {
             let ring = CompositePoolRing::new(Arc::clone(&vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
                 .map_err(SceneError::Vk)?;
+            // Ring depth = max BO count + 1. Scanout pools are
+            // 3 deep (matches v1); +1 buys edge safety per Stage 2
+            // plan cross-cutting §"BufferAgeRing".
+            let bo_depth = platform
+                .scanout_pools
+                .get(i)
+                .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
+                .unwrap_or(3);
             outputs.push(OutputSceneState {
                 output_idx: i,
                 pool_ring: ring,
                 pool_slots: VecDeque::with_capacity(4),
                 pending_acks: VecDeque::with_capacity(4),
+                damage_history: BufferAgeRing::new(bo_depth + 1),
+                current_generation: 0,
+                scene_structure_damage: RegionSet::new(),
+                pending_repaint_after_failed_submit: RegionSet::new(),
+                output_extent: vk::Extent2D {
+                    width: u32::from(layout.width),
+                    height: u32::from(layout.height),
+                },
             });
         }
         Ok(Self {
@@ -192,9 +291,31 @@ impl SceneCompositor {
 
     /// Mark the scene as needing a redraw. Cheap bool flip;
     /// callable from any mutation path that wants the next
-    /// tick to fire. Idempotent.
+    /// tick to fire. Idempotent. **Coarse**: adds a full-output
+    /// rect to every output's scene_structure_damage. Stage 3+
+    /// can call [`mark_scene_structure_damage_rect`] for
+    /// rectangle-precise tracking.
     pub(crate) fn mark_scene_structure_dirty(&mut self) {
         self.scene_structure_dirty = true;
+        if let Some(inner) = self.inner.as_mut() {
+            for o in &mut inner.outputs {
+                let extent = o.output_extent;
+                o.scene_structure_damage.add(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                });
+            }
+        }
+    }
+
+    /// Region-precise scene-structure damage (Stage 3+).
+    pub(crate) fn mark_scene_structure_damage_rect(&mut self, output_idx: usize, r: vk::Rect2D) {
+        self.scene_structure_dirty = true;
+        if let Some(inner) = self.inner.as_mut()
+            && let Some(o) = inner.outputs.get_mut(output_idx)
+        {
+            o.scene_structure_damage.add(r);
+        }
     }
 
     /// Drain in-flight compose work before tear-down. Best-effort
@@ -278,21 +399,38 @@ impl SceneCompositor {
         let Some(state) = inner.outputs.get_mut(output_idx) else {
             return;
         };
-        // Pop the matching ack. We assume FIFO: the oldest pending
-        // ack matches the just-retired flip. Stage 2e tightens
-        // this with explicit (output_idx, generation) keys.
         if let Some(ack) = state.pending_acks.pop_front() {
+            // Ack each per-drawable damage snapshot. Snapshots
+            // from paint that landed after the tick's peek
+            // survive (per I5 epoch semantics).
             for snap in ack.drawable_snapshots {
                 store.ack_presentation_damage(snap);
             }
+            // Subtract the submitted output-damage snapshots
+            // from live state (codex round 2 point 1). Damage
+            // that arrived between submit and retirement
+            // (map/unmap/cursor-move while flip in flight) is
+            // NOT in the snapshots and therefore survives,
+            // driving the next tick.
+            state
+                .scene_structure_damage
+                .subtract(&ack.submitted_scene_structure_damage);
+            state
+                .pending_repaint_after_failed_submit
+                .subtract(&ack.submitted_failed_repaint);
+            // Push this frame's output damage onto the
+            // buffer-age history ring keyed by its generation.
+            state
+                .damage_history
+                .push(ack.generation, ack.submitted_output_damage);
             // Release the matching pool slot.
             if let Some(slot) = state.pool_slots.pop_front() {
                 state.pool_ring.release(slot);
             }
-            // Record present generation on the BO (Stage 2e
-            // wires the buffer-age algorithm against this).
-            let g = platform.record_present(output_idx, retire.presented_bo_idx);
-            platform.commit_bo_present(output_idx, retire.presented_bo_idx, g);
+            // Commit the BO's new last_present_generation in the
+            // platform (the buffer-age pick uses this on next
+            // acquire).
+            platform.commit_bo_present(output_idx, retire.presented_bo_idx, ack.generation);
         } else {
             log::debug!(
                 "v2 scene: page-flip-complete on output {output_idx} \
@@ -314,24 +452,50 @@ fn tick_one_output(
     platform: &mut PlatformBackend,
     windows_v2: &super::backend::WindowsV2Map,
 ) -> Result<bool, SceneError> {
-    // 1. Acquire next BO. None means all BOs in flight.
+    // 1. Snapshot live output state so we can fold cleanly
+    //    into pending_ack later (codex round 2 point 2 —
+    //    transactional generation advance).
+    let (scene_structure_snap, failed_repaint_snap, frame_gen, first_frame) = {
+        let s = inner.outputs.get(output_idx).expect("range");
+        (
+            s.scene_structure_damage.snapshot(),
+            s.pending_repaint_after_failed_submit.snapshot(),
+            s.current_generation + 1,
+            s.current_generation == 0,
+        )
+    };
+
+    // 2. Build the scene + collect projected presentation damage.
+    let (scene, snapshots, projected_damage) =
+        build_scene(core, store, windows_v2, output_idx, platform);
+    let mut output_damage = projected_damage;
+    output_damage.union_with(&scene_structure_snap);
+    output_damage.union_with(&failed_repaint_snap);
+
+    // 3. Empty-damage fast path (after first frame).
+    if output_damage.is_empty() && !first_frame {
+        return Ok(false);
+    }
+
+    // 4. Acquire BO.
     let token = match platform.acquire_scanout_bo(output_idx) {
         Some(t) => t,
         None => return Ok(false),
     };
-    // 2. Build the scene. Bottom-to-top: root → top-level windows
-    //    in z-order → cursor (skipped Stage 2d).
-    let (scene, snapshots) = build_scene(core, store, windows_v2, output_idx, platform);
-    if scene.draws.is_empty() && all_zero(scene.bg_color) {
-        // Nothing visible. Skip compose entirely.
-        return Ok(false);
-    }
 
-    // 3. Acquire a descriptor-pool slot for this frame.
-    let state = inner
-        .outputs
-        .get_mut(output_idx)
-        .expect("output_idx in range");
+    // 5. Pick repaint region via buffer-age algorithm.
+    let extent = inner.outputs[output_idx].output_extent;
+    let repaint = pick_repaint_region(
+        token.last_present_generation,
+        token.content_invalidated,
+        frame_gen,
+        &output_damage,
+        &inner.outputs[output_idx].damage_history,
+        extent,
+    );
+
+    // 6. Acquire descriptor-pool slot.
+    let state = inner.outputs.get_mut(output_idx).expect("range");
     let slot = match state.pool_ring.acquire() {
         Some(s) => s,
         None => {
@@ -343,10 +507,7 @@ fn tick_one_output(
     };
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
-    // 4. Record + present. Reuses v1's helper for the heavy
-    //    lifting (record CB into bo.vk_transfer.command_buffer +
-    //    queue_submit2 with signal_semaphore = bo.vk_semaphore +
-    //    export_sync_file + submit_flip_with_fences atomic).
+    // 7. Record + submit + flip via the v2 clipped compose path.
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -354,7 +515,7 @@ fn tick_one_output(
         .ok_or(SceneError::NoVk)?;
     let layout = &platform.outputs[output_idx];
     let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
-    record_and_present_composite(
+    let compose_result = record_compose_v2(
         &inner.vk,
         &platform.device,
         &layout.output,
@@ -362,32 +523,98 @@ fn tick_one_output(
         &inner.pipeline,
         descriptor_pool,
         &scene,
-    )?;
+        repaint,
+    );
 
-    // 5. Touch render-fence on every source drawable. Stage 2c's
-    //    paint ops already touch it for the writer side; this
-    //    closes the reader side per cross-cutting §5.
-    // Note: scene's draws don't carry the drawable id directly;
-    // we use the snapshots' ids (one per drawable that contributed
-    // a sampleable view). Stage 2d skips the FenceTicket plumbing
-    // for compose-read — it's a Stage 2e concern (load-bearing
-    // there for buffer-age correctness across BO rotation). For
-    // 2d's full-redraw-every-tick path, the touch_render_fence
-    // is correctness-equivalent to skipping it because every tick
-    // reads every drawable anyway.
-    for snap in &snapshots {
-        let _ = snap;
-        // Stage 2e: `store.touch_render_fence(snap.id, ticket.clone())`.
+    let state = inner.outputs.get_mut(output_idx).expect("range");
+    match compose_result {
+        Ok(()) => {
+            state.pool_slots.push_back(slot);
+            state.pending_acks.push_back(PendingAck {
+                bo_idx: token.bo_idx,
+                generation: frame_gen,
+                drawable_snapshots: snapshots,
+                ticket: None,
+                submitted_output_damage: output_damage,
+                submitted_scene_structure_damage: scene_structure_snap,
+                submitted_failed_repaint: failed_repaint_snap,
+            });
+            state.current_generation = frame_gen;
+            Ok(true)
+        }
+        Err(e) => {
+            match &e {
+                PresentError::Io(_) => {
+                    // 9b — atomic commit failed after queue
+                    // submit succeeded. BO contents indeterminate.
+                    platform.invalidate_bo(output_idx, token.bo_idx);
+                    log::warn!(
+                        "v2 scene: atomic commit failed for output {output_idx} \
+                         (bo {}): {e}; BO invalidated",
+                        token.bo_idx,
+                    );
+                }
+                _ => {
+                    // 9a — queue submit failed. BO not written.
+                    log::warn!(
+                        "v2 scene: queue submit failed for output {output_idx} \
+                         (bo {}): {e}",
+                        token.bo_idx,
+                    );
+                }
+            }
+            // Both failure paths share the same recovery: release
+            // the descriptor-pool slot, fold the repaint into
+            // pending_repaint_after_failed_submit, do NOT push a
+            // pending_ack, do NOT advance current_generation.
+            // Re-borrow `state` after the platform.invalidate_bo
+            // call (which took &mut platform).
+            let state = inner.outputs.get_mut(output_idx).expect("range");
+            state.pool_ring.release(slot);
+            if let Some(br) = output_damage.bounding_rect() {
+                state.pending_repaint_after_failed_submit.add(br);
+            }
+            Err(SceneError::Present(e))
+        }
     }
+}
 
-    // 6. Park pending ack.
-    state.pool_slots.push_back(slot);
-    state.pending_acks.push_back(PendingAck {
-        bo_idx: token.bo_idx,
-        drawable_snapshots: snapshots,
-        ticket: None,
-    });
-    Ok(true)
+/// Pick the repaint region for the upcoming compose. Returns
+/// `Repaint::Full` for fallback paths and `Repaint::Clipped` for
+/// the buffer-age steady state.
+fn pick_repaint_region(
+    bo_last_gen: Option<u64>,
+    bo_invalidated: bool,
+    frame_gen: u64,
+    current_damage: &RegionSet,
+    history: &BufferAgeRing,
+    extent: vk::Extent2D,
+) -> Repaint {
+    if bo_invalidated {
+        return Repaint::Full(extent);
+    }
+    let Some(last) = bo_last_gen else {
+        return Repaint::Full(extent);
+    };
+    if !history.contains_all(last, frame_gen) {
+        return Repaint::Full(extent);
+    }
+    let mut repaint = current_damage.clone();
+    history.union_history_into(last, frame_gen, &mut repaint);
+    match repaint.bounding_rect() {
+        Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
+        _ => Repaint::Full(extent),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Repaint {
+    /// Full-output redraw with `loadOp=CLEAR`. Fallback path.
+    Full(vk::Extent2D),
+    /// Damaged-region-only redraw with `loadOp=LOAD`. The
+    /// rectangle is the bounding box of the buffer-age repaint
+    /// set — Stage 5 may split per-rect for tighter clipping.
+    Clipped(vk::Rect2D),
 }
 
 fn all_zero(c: [f32; 4]) -> bool {
@@ -412,7 +639,7 @@ fn build_scene(
     windows_v2: &super::backend::WindowsV2Map,
     output_idx: usize,
     platform: &PlatformBackend,
-) -> (CompositeScene, Vec<DamageSnapshot>) {
+) -> (CompositeScene, Vec<DamageSnapshot>, RegionSet) {
     let bg = core
         .bg_pixel
         .map(super::engine::decode_x11_pixel_bgra)
@@ -425,6 +652,7 @@ fn build_scene(
 
     let mut draws: Vec<CompositeDraw> = Vec::new();
     let mut snapshots: Vec<DamageSnapshot> = Vec::new();
+    let mut projected = RegionSet::new();
     for &host_xid in &core.top_level_order {
         let Some(geom) = windows_v2.get(&host_xid) else {
             continue;
@@ -473,11 +701,20 @@ fn build_scene(
             src_size: [1.0, 1.0],
             alpha_passthrough: false,
         });
-        // Peek damage. Always peek (Stage 2d full-redraw doesn't
-        // use the snapshot for clipping; threading it now lets
-        // 2e bolt buffer-age clipping without touching the
-        // scene-assembly loop).
+        // Peek damage + project to output coords. The snapshot
+        // is captured for retirement-ack; its region (projected
+        // through the entry transform — Stage 2e single-output
+        // transform is just (dx, dy) offset) feeds output damage.
         if let Some(snap) = store.peek_presentation_damage(id) {
+            for r in snap.region.rects() {
+                projected.add(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: r.offset.x + dx,
+                        y: r.offset.y + dy,
+                    },
+                    extent: r.extent,
+                });
+            }
             snapshots.push(snap);
         }
     }
@@ -485,7 +722,303 @@ fn build_scene(
         bg_color: bg,
         draws,
     };
-    (scene, snapshots)
+    (scene, snapshots, projected)
+}
+
+// ────────────────────────────────────────────────────────────────
+// v2 compose recorder — fork of v1's `record_and_present_composite`
+// with buffer-age (loadOp=LOAD + per-frame scissor) support.
+//
+// Why fork: v1 always uses `loadOp=CLEAR` against the full BO,
+// which is incompatible with buffer-age repaint (any region outside
+// the clear gets clobbered to bg_color). v2 needs `LOAD` on the
+// clipped path so unaltered regions retain their prior-generation
+// content. The submission shape, fence handshake, and atomic-flip
+// handling stay identical to v1.
+// ────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn record_compose_v2(
+    vk: &crate::kms::vk::device::VkContext,
+    drm: &crate::drm::Device,
+    output: &crate::drm::modeset::Output,
+    bo: &mut ScanoutBo,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+) -> Result<(), PresentError> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    if bo.state.phase != BoPhase::Free {
+        return Err(PresentError::WrongPhase(bo.state.phase));
+    }
+    let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
+    bo.state.transition_to_recording();
+
+    // Allocate descriptor sets — same shape as v1.
+    let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
+    for draw in &scene.draws {
+        let layouts = [pipeline.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
+            Err(e) => {
+                log::warn!(
+                    "v2 compose: descriptor allocation failed ({e:?}) at draw {} of {}",
+                    descriptors.len(),
+                    scene.draws.len(),
+                );
+                break;
+            }
+        };
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(draw.image_view)
+            .sampler(pipeline.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
+        descriptors.push(set);
+    }
+
+    // Record.
+    record_v2_command_buffer(vk, bo, pipeline, scene, &descriptors, repaint)?;
+
+    // Submit. Same shape as v1: signal bo.vk_semaphore for the
+    // KMS IN_FENCE_FD handoff; null fence.
+    let cb = bo.vk_transfer.command_buffer;
+    let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+    let sig_info = [vk::SemaphoreSubmitInfo::default()
+        .semaphore(bo.vk_semaphore)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+    let submit = [vk::SubmitInfo2::default()
+        .command_buffer_infos(&cb_info)
+        .signal_semaphore_infos(&sig_info)];
+    unsafe {
+        crate::vk_count!(queue_submit2);
+        crate::vk_count!(submit_compositor);
+        vk.device
+            .queue_submit2(vk.graphics_queue, &submit, vk::Fence::null())?;
+    }
+
+    // Export SYNC_FD + atomic flip — same as v1.
+    let fd = bo
+        .export_signaled_fd()
+        .map_err(PresentError::Vk)?
+        .into_raw_fd();
+    bo.state.transition_to_submitted(fd);
+
+    let mut out_fence: i32 = -1;
+    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
+    {
+        Ok(()) => {
+            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
+                // SAFETY: `reclaimed` was inserted by
+                // `transition_to_submitted` above.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
+                // SAFETY: same fd we just inserted.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            bo.state = crate::kms::vk::scanout::BoState::default();
+            Err(PresentError::Io(e))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_v2_command_buffer(
+    vk: &crate::kms::vk::device::VkContext,
+    bo: &ScanoutBo,
+    pipeline: &CompositorPipeline,
+    scene: &CompositeScene,
+    descriptors: &[vk::DescriptorSet],
+    repaint: Repaint,
+) -> Result<(), PresentError> {
+    let device = &vk.device;
+    let cb = bo.vk_transfer.command_buffer;
+
+    let (load_op, render_area, old_layout) = match repaint {
+        Repaint::Full(extent) => (
+            vk::AttachmentLoadOp::CLEAR,
+            vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent,
+            },
+            vk::ImageLayout::UNDEFINED,
+        ),
+        Repaint::Clipped(_) => (
+            vk::AttachmentLoadOp::LOAD,
+            vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: vk::Extent2D {
+                    width: bo.width,
+                    height: bo.height,
+                },
+            },
+            // LOAD requires the previous layout to be valid; the
+            // BO has been through a prior present which left it
+            // at GENERAL (KMS scanout layout). Transition from
+            // GENERAL → COLOR_ATTACHMENT_OPTIMAL with a full
+            // memory barrier so prior writes are visible.
+            vk::ImageLayout::GENERAL,
+        ),
+    };
+    let scissor = match repaint {
+        Repaint::Full(extent) => vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        },
+        Repaint::Clipped(rect) => rect,
+    };
+
+    unsafe {
+        device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        crate::vk_count!(begin_command_buffer);
+        device.begin_command_buffer(cb, &begin)?;
+
+        let to_color_src_access = if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
+            // LOAD: previous KMS scanout left the BO in GENERAL.
+            // The kernel "consumed" the BO contents via the page
+            // flip; we now need the GPU to read+write them. Pair
+            // ALL_COMMANDS + empty source access (no prior GPU
+            // work to drain — the scanout completes before the
+            // pageflip event fires) with COLOR_ATTACHMENT_OUTPUT
+            // + WRITE on the dst.
+            vk::AccessFlags2::empty()
+        } else {
+            vk::AccessFlags2::empty()
+        };
+        let to_color = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(to_color_src_access)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(old_layout)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(bo.vk_image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let to_color_arr = [to_color];
+        let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
+        device.cmd_pipeline_barrier2(cb, &to_color_dep);
+
+        let color_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(bo.vk_image_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: scene.bg_color,
+                },
+            })];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .color_attachments(&color_attachment);
+        crate::vk_count!(cmd_begin_rendering);
+        device.cmd_begin_rendering(cb, &rendering_info);
+
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            #[allow(clippy::cast_precision_loss)]
+            width: bo.width as f32,
+            #[allow(clippy::cast_precision_loss)]
+            height: bo.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        crate::vk_count!(cmd_set_viewport);
+        device.cmd_set_viewport(cb, 0, &viewport);
+        crate::vk_count!(cmd_set_scissor);
+        device.cmd_set_scissor(cb, 0, &[scissor]);
+
+        #[allow(clippy::cast_precision_loss)]
+        let viewport_size = [bo.width as f32, bo.height as f32];
+        let mut last_pipeline: Option<vk::Pipeline> = None;
+        for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
+            let pl = pipeline.pipeline_for(draw.alpha_passthrough);
+            if last_pipeline != Some(pl) {
+                crate::vk_count!(cmd_bind_pipeline);
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
+                last_pipeline = Some(pl);
+            }
+            let sets = [descriptors[i]];
+            crate::vk_count!(cmd_bind_descriptor_sets);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.pipeline_layout,
+                0,
+                &sets,
+                &[],
+            );
+            let push = CompositePushConsts {
+                dst_origin: draw.dst_origin,
+                dst_size: draw.dst_size,
+                viewport: viewport_size,
+                src_origin: draw.src_origin,
+                src_size: draw.src_size,
+            };
+            crate::vk_count!(cmd_push_constants);
+            device.cmd_push_constants(
+                cb,
+                pipeline.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push.as_bytes(),
+            );
+            crate::vk_count!(cmd_draw);
+            device.cmd_draw(cb, 4, 1, 0, 0);
+        }
+
+        crate::vk_count!(cmd_end_rendering);
+        device.cmd_end_rendering(cb);
+
+        // Transition to GENERAL for KMS scanout.
+        let to_scanout = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(bo.vk_image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let to_scanout_arr = [to_scanout];
+        let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
+        crate::vk_count!(cmd_pipeline_barrier2);
+        device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
+
+        crate::vk_count!(end_command_buffer);
+        device.end_command_buffer(cb)?;
+    }
+    let _ = render_area;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -514,5 +1047,117 @@ mod tests {
         assert!(scene.scene_structure_dirty);
         scene.mark_scene_structure_dirty();
         assert!(scene.scene_structure_dirty);
+    }
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    fn extent(w: u32, h: u32) -> vk::Extent2D {
+        vk::Extent2D {
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn buffer_age_ring_trims_to_depth() {
+        let mut ring = BufferAgeRing::new(3);
+        for g in 1..=5 {
+            let mut r = RegionSet::new();
+            r.add(rect(0, 0, 4, 4));
+            ring.push(g, r);
+        }
+        assert_eq!(ring.entries.len(), 3);
+        // Oldest entries trimmed: 1, 2 gone; 3, 4, 5 remain.
+        let gens: Vec<u64> = ring.entries.iter().map(|(g, _)| *g).collect();
+        assert_eq!(gens, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn buffer_age_contains_all_strict_window() {
+        let mut ring = BufferAgeRing::new(4);
+        let mut r = RegionSet::new();
+        r.add(rect(0, 0, 4, 4));
+        ring.push(3, r.clone());
+        ring.push(4, r.clone());
+        // BO last_gen=2, frame_gen=5 → intervening gens 3, 4.
+        assert!(ring.contains_all(2, 5));
+        // BO last_gen=2, frame_gen=6 → needs 3, 4, 5 — 5 missing.
+        assert!(!ring.contains_all(2, 6));
+        // No intervening gens (frame_gen == last_gen+1).
+        assert!(ring.contains_all(2, 3));
+    }
+
+    #[test]
+    fn pick_repaint_invalidated_bo_full_redraw() {
+        let history = BufferAgeRing::new(4);
+        let mut damage = RegionSet::new();
+        damage.add(rect(0, 0, 10, 10));
+        let p = pick_repaint_region(Some(5), true, 6, &damage, &history, extent(800, 600));
+        assert!(matches!(p, Repaint::Full(_)));
+    }
+
+    #[test]
+    fn pick_repaint_fresh_bo_full_redraw() {
+        let history = BufferAgeRing::new(4);
+        let mut damage = RegionSet::new();
+        damage.add(rect(0, 0, 10, 10));
+        let p = pick_repaint_region(None, false, 1, &damage, &history, extent(800, 600));
+        assert!(matches!(p, Repaint::Full(_)));
+    }
+
+    #[test]
+    fn pick_repaint_history_loss_full_redraw() {
+        let mut history = BufferAgeRing::new(4);
+        // Insert only gen 3 (missing 4, 5).
+        let mut r = RegionSet::new();
+        r.add(rect(0, 0, 4, 4));
+        history.push(3, r);
+        let mut damage = RegionSet::new();
+        damage.add(rect(0, 0, 10, 10));
+        let p = pick_repaint_region(Some(2), false, 6, &damage, &history, extent(800, 600));
+        // Need 3, 4, 5 — only have 3.
+        assert!(matches!(p, Repaint::Full(_)));
+    }
+
+    #[test]
+    fn pick_repaint_clipped_when_history_complete() {
+        let mut history = BufferAgeRing::new(4);
+        let mut h3 = RegionSet::new();
+        h3.add(rect(10, 10, 5, 5));
+        history.push(3, h3);
+        let mut h4 = RegionSet::new();
+        h4.add(rect(50, 50, 8, 8));
+        history.push(4, h4);
+        let mut current = RegionSet::new();
+        current.add(rect(0, 0, 3, 3));
+        let p = pick_repaint_region(Some(2), false, 5, &current, &history, extent(800, 600));
+        match p {
+            Repaint::Clipped(rect) => {
+                // Bounding rect should cover (0,0) to (58, 58).
+                assert_eq!(rect.offset, vk::Offset2D { x: 0, y: 0 });
+                assert_eq!(rect.extent.width, 58);
+                assert_eq!(rect.extent.height, 58);
+            }
+            Repaint::Full(_) => panic!("expected clipped"),
+        }
+    }
+
+    #[test]
+    fn pick_repaint_clipped_empty_damage_falls_back_to_full() {
+        // If everything matches up but current_damage is empty
+        // and history is empty, bounding rect is None → full
+        // redraw fallback.
+        let history = BufferAgeRing::new(4);
+        let empty = RegionSet::new();
+        let p = pick_repaint_region(Some(2), false, 3, &empty, &history, extent(800, 600));
+        assert!(matches!(p, Repaint::Full(_)));
     }
 }
