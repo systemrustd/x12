@@ -41,10 +41,16 @@ use std::{collections::VecDeque, ptr::NonNull, sync::Arc};
 use ash::vk;
 
 use super::{
+    glyph_atlas::V2GlyphAtlas,
     platform::{FenceTicket, PlatformBackend},
     store::{DrawableId, DrawableStore},
 };
-use crate::kms::vk::device::VkContext;
+use crate::kms::vk::{
+    device::VkContext,
+    glyph::{AtlasEntry, GlyphKey},
+    ops::text::{TextAtlas, TextGlyph, TextRunTarget, record_text_run},
+    text_pipeline::TextPipeline,
+};
 
 // ────────────────────────────────────────────────────────────────
 // Errors
@@ -83,13 +89,21 @@ impl From<vk::Result> for RenderError {
 struct SubmittedOp {
     cb: vk::CommandBuffer,
     ticket: FenceTicket,
-    /// Per-op staging buffer (only for `put_image`). Destroyed
-    /// only after the fence signals; dropping it earlier would
-    /// race the GPU's TRANSFER_READ.
+    /// Per-op staging buffer (only for `put_image` and Stage 3a
+    /// glyph upload). Destroyed only after the fence signals;
+    /// dropping it earlier would race the GPU's TRANSFER_READ.
     staging: Option<StagingBuffer>,
     /// Per-op scratch image (only for `copy_area` self-overlap
     /// path). Destroyed only after the fence signals.
     scratch: Option<ScratchImage>,
+    /// Stage 3a: cloned `atlas_last_upload_ticket` snapshot.
+    /// Atlas-sampling ops (text runs, RENDER glyphs in Stage 3d)
+    /// stash the engine's then-current upload ticket here so the
+    /// atlas image + the upload's staging buffer can't retire
+    /// before the consume CB has executed. Same-queue submission
+    /// order is the GPU dependency; this Arc keeps CPU-side
+    /// destruction gated on retirement of both submissions.
+    atlas_ticket: Option<FenceTicket>,
 }
 
 /// One-shot device-local image used by `copy_area`'s same-image
@@ -215,6 +229,23 @@ struct RenderEngineInner {
     /// [`RenderEngine::poll_retired`] (called periodically by
     /// `KmsBackendV2` and at shutdown).
     submitted: VecDeque<SubmittedOp>,
+    /// Stage 3a: glyph atlas. Lazy — first text run pays the
+    /// 16 MiB R8 allocation. `None` until first image_text op.
+    glyph_atlas: Option<V2GlyphAtlas>,
+    /// Stage 3a: text pipeline (TextRunTarget descriptor bound to
+    /// the atlas image view). Lazy — built once after the atlas
+    /// is constructed. The pipeline's descriptor set references
+    /// the atlas image view permanently; the atlas image's
+    /// long-lived ownership makes this safe.
+    text_pipeline: Option<TextPipeline>,
+    /// Stage 3a: latest atlas-upload ticket. Cloned onto every
+    /// atlas-consuming SubmittedOp (text runs, RENDER glyphs in
+    /// Stage 3d) so the upload's per-call staging buffer and the
+    /// atlas image stay alive on the CPU side until both upload
+    /// and consume have retired. None when no upload has happened
+    /// in the current session (atlas freshly created or every
+    /// upload already retired).
+    atlas_last_upload_ticket: Option<FenceTicket>,
 }
 
 impl RenderEngine {
@@ -232,6 +263,9 @@ impl RenderEngine {
             inner: Some(RenderEngineInner {
                 vk,
                 submitted: VecDeque::new(),
+                glyph_atlas: None,
+                text_pipeline: None,
+                atlas_last_upload_ticket: None,
             }),
         })
     }
@@ -422,6 +456,7 @@ impl RenderEngine {
             ticket,
             staging: None,
             scratch: None,
+            atlas_ticket: None,
         });
         Ok(())
     }
@@ -639,6 +674,7 @@ impl RenderEngine {
                 ticket,
                 staging: None,
                 scratch: Some(scratch),
+                atlas_ticket: None,
             });
             return Ok(());
         }
@@ -735,6 +771,7 @@ impl RenderEngine {
             ticket,
             staging: None,
             scratch: None,
+            atlas_ticket: None,
         });
         Ok(())
     }
@@ -886,6 +923,7 @@ impl RenderEngine {
             ticket,
             staging: Some(staging),
             scratch: None,
+            atlas_ticket: None,
         });
         Ok(())
     }
@@ -1018,9 +1056,379 @@ impl RenderEngine {
             ticket,
             staging: Some(staging),
             scratch: None,
+            atlas_ticket: None,
         });
 
         Ok(out)
+    }
+
+    // ── Op: image_text (Stage 3a) ───────────────────────────────
+
+    /// One glyph the caller hands to [`RenderEngine::image_text`].
+    /// CPU-side pre-rasterised by FreeType so the engine doesn't
+    /// touch FreeType state. `pixels` is row-major, tightly packed
+    /// (no row padding) — width × height alpha bytes.
+    ///
+    /// The pen-left/pen-top offsets are applied to `dst_x` /
+    /// `dst_y` by the caller, so the engine just packs the glyph
+    /// and queues a draw at the supplied destination coords.
+    /// Stage 3a: drive a single text run against `target`'s
+    /// storage. CPU-side glyph rasterisation is the caller's
+    /// concern (KmsBackendV2 wraps the v1 FreeType path); the
+    /// engine takes the resulting [`PreparedGlyph`] slice, interns
+    /// each into the atlas, and records one TextPipeline draw
+    /// covering the whole run.
+    ///
+    /// `font_xid` keys the glyph cache so the same codepoint
+    /// rendered at two different font sizes ends up at two atlas
+    /// slots. `foreground_rgba` is the GC foreground in [0..1].
+    /// Damage is recorded on the target at the union of glyph
+    /// bounding boxes.
+    ///
+    /// Returns telemetry counts the caller feeds to the v2 backend
+    /// telemetry sink: how many distinct atlas interns happened
+    /// (= miss count this run), how many glyph uploads were
+    /// submitted (= same as interns today; collapses if later
+    /// coalesced), and how many glyphs were dropped due to
+    /// atlas-full.
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `UnknownDrawable` when `target` isn't in `store`.
+    /// - `Vk(...)` for any CB / submit failure. Best-effort: an
+    ///   upload that fails partway is logged and the affected
+    ///   glyph is dropped; only catastrophic failures (text-run
+    ///   CB allocation, atlas init) propagate.
+    pub(crate) fn image_text(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        target: DrawableId,
+        font_xid: u32,
+        foreground_rgba: [f32; 4],
+        rendered: &[PreparedGlyph],
+    ) -> Result<ImageTextStats, RenderError> {
+        let mut stats = ImageTextStats::default();
+        if rendered.is_empty() {
+            return Ok(stats);
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        if store.get(target).is_none() {
+            return Err(RenderError::UnknownDrawable(target));
+        }
+        // Mirror format gate matches v1's check — the text
+        // pipeline is built for B8G8R8A8_UNORM, so depth-1/8
+        // storage can't be a text-run target.
+        let target_format = store.get(target).expect("checked above").storage.format;
+        if target_format != vk::Format::B8G8R8A8_UNORM {
+            log::warn!(
+                "v2 image_text: target xid={:?} has format {:?}; text pipeline only supports \
+                 B8G8R8A8_UNORM — dropping run",
+                store.get(target).map(|d| d.xid),
+                target_format,
+            );
+            return Ok(stats);
+        }
+
+        // Lazy-init atlas + pipeline. The first text run pays the
+        // 16 MiB R8 allocation; subsequent runs reuse.
+        if inner.glyph_atlas.is_none() {
+            match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
+                Ok(a) => inner.glyph_atlas = Some(a),
+                Err(e) => {
+                    log::error!("v2 image_text: V2GlyphAtlas::new failed: {e:?}");
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+        if inner.text_pipeline.is_none() {
+            let atlas_view = inner.glyph_atlas.as_ref().expect("just built").image_view();
+            match TextPipeline::new(
+                Arc::clone(&inner.vk),
+                vk::Format::B8G8R8A8_UNORM,
+                atlas_view,
+            ) {
+                Ok(p) => inner.text_pipeline = Some(p),
+                Err(e) => {
+                    log::error!("v2 image_text: TextPipeline::new failed: {e:?}");
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+
+        // Resolve each glyph: cache hit, fresh upload, or drop.
+        // Track dst-bounding box for the damage hook.
+        let mut glyphs_to_draw: Vec<TextGlyph> = Vec::with_capacity(rendered.len());
+        let mut damage_min_x = i32::MAX;
+        let mut damage_min_y = i32::MAX;
+        let mut damage_max_x = i32::MIN;
+        let mut damage_max_y = i32::MIN;
+        for g in rendered {
+            let key = GlyphKey {
+                font_xid,
+                codepoint: g.codepoint,
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let w_u = g.w as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let h_u = g.h as u32;
+            // Cache hit fast path.
+            let entry =
+                if let Some(hit) = inner.glyph_atlas.as_ref().expect("just built").lookup(key) {
+                    hit
+                } else {
+                    // Pack + upload.
+                    let Some((atlas_x, atlas_y)) = inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .pack(w_u, h_u)
+                    else {
+                        // Atlas full: drop the glyph, advance pen via
+                        // caller's tracking, log once + bump stats.
+                        inner
+                            .glyph_atlas
+                            .as_mut()
+                            .expect("just built")
+                            .note_full_once();
+                        stats.glyphs_dropped += 1;
+                        continue;
+                    };
+                    if w_u == 0 || h_u == 0 {
+                        // Zero-area glyph (space): cache degenerate
+                        // entry so future runs short-circuit; no upload.
+                        let e = AtlasEntry {
+                            atlas_x: 0,
+                            atlas_y: 0,
+                            w: 0,
+                            h: 0,
+                            pen_left: 0,
+                            pen_top: 0,
+                        };
+                        inner
+                            .glyph_atlas
+                            .as_mut()
+                            .expect("just built")
+                            .insert_entry(key, e);
+                        continue;
+                    }
+                    stats.atlas_interns += 1;
+                    // Each upload owns its own staging slice for the
+                    // CB's lifetime (Stage 3 plan §"Cross-cutting" §3).
+                    let upload_bytes = (w_u as u64) * (h_u as u64);
+                    let staging = StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?;
+                    // SAFETY: staging.size ≥ upload_bytes ≥ pixels.len()
+                    // (per the pre-condition that PreparedGlyph.pixels
+                    // is row-major w×h). mapped is host-coherent.
+                    let copy_len = (w_u as usize) * (h_u as usize);
+                    let src_slice = if g.pixels.len() >= copy_len {
+                        &g.pixels[..copy_len]
+                    } else {
+                        log::warn!(
+                            "v2 image_text: glyph pixels {} < {} expected; dropping",
+                            g.pixels.len(),
+                            copy_len,
+                        );
+                        stats.glyphs_dropped += 1;
+                        continue;
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_slice.as_ptr(),
+                            staging.mapped.as_ptr(),
+                            copy_len,
+                        );
+                    }
+                    // Submit a one-shot upload CB.
+                    let (cb, ticket) = begin_op_cb(inner, platform)?;
+                    let staging_buffer = staging.buffer;
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .record_upload(cb, staging_buffer, atlas_x, atlas_y, w_u, h_u);
+                    end_and_submit_op(inner, platform, cb, &ticket)?;
+                    stats.glyph_uploads += 1;
+                    // Park the upload's CB + staging on submitted; the
+                    // ticket signals when the upload retires.
+                    inner.submitted.push_back(SubmittedOp {
+                        cb,
+                        ticket: ticket.clone(),
+                        staging: Some(staging),
+                        scratch: None,
+                        atlas_ticket: None,
+                    });
+                    inner.atlas_last_upload_ticket = Some(ticket);
+                    let e = AtlasEntry {
+                        atlas_x,
+                        atlas_y,
+                        w: w_u,
+                        h: h_u,
+                        pen_left: 0,
+                        pen_top: 0,
+                    };
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("just built")
+                        .insert_entry(key, e);
+                    e
+                };
+            if entry.w == 0 || entry.h == 0 {
+                continue;
+            }
+            // Project glyph bbox into damage tracker (storage-local
+            // coords, pen offsets already applied by caller).
+            damage_min_x = damage_min_x.min(g.dst_x);
+            damage_min_y = damage_min_y.min(g.dst_y);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_x = g.dst_x.saturating_add(entry.w as i32);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_y = g.dst_y.saturating_add(entry.h as i32);
+            damage_max_x = damage_max_x.max(max_x);
+            damage_max_y = damage_max_y.max(max_y);
+            glyphs_to_draw.push(TextGlyph {
+                entry,
+                dst_x: g.dst_x,
+                dst_y: g.dst_y,
+            });
+        }
+
+        if glyphs_to_draw.is_empty() {
+            return Ok(stats);
+        }
+
+        // Atlas geometry is fixed for the engine's lifetime; cache
+        // a local copy here so the draw recorder doesn't borrow the
+        // engine.
+        let atlas_extent = inner.glyph_atlas.as_ref().expect("ensured above").extent();
+
+        // Record the text-run draw on the target.
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let drawable = store
+            .get_mut(target)
+            .expect("checked at entry — store didn't mutate");
+        let mut adapter = StorageTextTarget {
+            extent: drawable.storage.extent,
+            image: drawable.storage.image,
+            image_view: drawable.storage.image_view,
+            current_layout: drawable.storage.current_layout,
+        };
+        let result = record_text_run(
+            &inner.vk,
+            cb,
+            &mut adapter,
+            TextAtlas {
+                extent: atlas_extent,
+            },
+            inner.text_pipeline.as_ref().expect("ensured above"),
+            &glyphs_to_draw,
+            foreground_rgba,
+        );
+        // Propagate adapter's tracked layout back into the
+        // Drawable's storage state — record_text_run flips it to
+        // SHADER_READ_ONLY_OPTIMAL on success.
+        drawable.storage.current_layout = adapter.current_layout;
+        result?;
+
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(target, ticket.clone());
+        // Damage = union of glyph dst-bboxes. Always non-empty
+        // here since glyphs_to_draw is non-empty above.
+        if damage_max_x > damage_min_x && damage_max_y > damage_min_y {
+            let dx = damage_min_x.max(0);
+            let dy = damage_min_y.max(0);
+            let w = u32::try_from(damage_max_x - dx).unwrap_or(0);
+            let h = u32::try_from(damage_max_y - dy).unwrap_or(0);
+            if w > 0 && h > 0 {
+                store.damage(
+                    target,
+                    vk::Rect2D {
+                        offset: vk::Offset2D { x: dx, y: dy },
+                        extent: vk::Extent2D {
+                            width: w,
+                            height: h,
+                        },
+                    },
+                );
+            }
+        }
+        // Stage 3 plan §"Cross-cutting" §3: clone the atlas's
+        // most-recent upload ticket onto this consume op so the
+        // upload's staging buffer + the atlas itself can't drop
+        // until both upload and consume retire. Same-queue
+        // submission order is the GPU dependency.
+        let atlas_ticket = inner.atlas_last_upload_ticket.clone();
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: None,
+            scratch: None,
+            atlas_ticket,
+        });
+
+        Ok(stats)
+    }
+}
+
+/// CPU-rasterised glyph the caller hands to
+/// [`RenderEngine::image_text`]. Mirrors v1's `RenderedGlyph`
+/// shape, but living in the v2 engine module so the public type
+/// surface is self-contained. `pixels` is row-major tightly
+/// packed, `w × h` alpha bytes (FreeType `BITMAP_GRAY`).
+#[derive(Debug)]
+pub(crate) struct PreparedGlyph {
+    pub dst_x: i32,
+    pub dst_y: i32,
+    pub w: usize,
+    pub h: usize,
+    pub pixels: Vec<u8>,
+    pub codepoint: u32,
+}
+
+/// Telemetry surface for one [`RenderEngine::image_text`] call.
+/// Caller (KmsBackendV2) feeds these into the telemetry sink so
+/// `atlas_intern/s`, `glyph_uploads/s`, and the lifetime
+/// `glyphs_dropped_atlas_full` counter all stay accurate.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ImageTextStats {
+    pub atlas_interns: u32,
+    pub glyph_uploads: u32,
+    pub glyphs_dropped: u32,
+}
+
+/// Adapter implementing [`TextRunTarget`] over a v2 `Drawable`'s
+/// storage fields. Built by [`RenderEngine::image_text`]; layout
+/// changes performed by the recorder are read back into the
+/// Drawable's storage by the caller.
+struct StorageTextTarget {
+    extent: vk::Extent2D,
+    image: vk::Image,
+    image_view: vk::ImageView,
+    current_layout: vk::ImageLayout,
+}
+
+impl TextRunTarget for StorageTextTarget {
+    fn vk_image(&self) -> vk::Image {
+        self.image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout
+    }
+    fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.current_layout = layout;
     }
 }
 
@@ -2091,5 +2499,280 @@ mod tests {
         let mut out = vec![0u8; 4];
         unpack_to_staging(&src, src_extent, 0, 0, 1, 1, 24, out.as_mut_ptr()).unwrap();
         assert_eq!(out, vec![0x10, 0x20, 0x30, 0xFF]);
+    }
+
+    // ── Stage 3a Vk-backed integration tests ────────────────────
+
+    /// Helper: allocate a depth-32 storage and return a registered
+    /// DrawableId. Mirrors the pattern Stage 2c tests use.
+    fn alloc_drawable_3a(
+        platform: &PlatformBackend,
+        store: &mut DrawableStore,
+        xid: u32,
+        w: u16,
+        h: u16,
+    ) -> DrawableId {
+        let storage = platform
+            .allocate_drawable_storage(w, h, 32)
+            .expect("alloc storage");
+        store
+            .allocate(
+                xid,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .expect("store allocate")
+    }
+
+    /// Build a `PreparedGlyph` with `w × h` filled bytes (the
+    /// fill byte is 0xFF so the shader paints solid foreground).
+    fn build_glyph(codepoint: u32, dst_x: i32, dst_y: i32, w: usize, h: usize) -> PreparedGlyph {
+        PreparedGlyph {
+            dst_x,
+            dst_y,
+            w,
+            h,
+            pixels: vec![0xFF_u8; w * h],
+            codepoint,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn image_text_run_records_damage_on_target() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let id = alloc_drawable_3a(&platform, &mut store, 0x1, 64, 32);
+        // Two glyphs spanning x=[10..22] × y=[5..17].
+        let glyphs = vec![
+            build_glyph(u32::from(b'A'), 10, 5, 6, 12),
+            build_glyph(u32::from(b'B'), 16, 5, 6, 12),
+        ];
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                id,
+                7,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+            )
+            .expect("image_text");
+        assert_eq!(stats.atlas_interns, 2);
+        assert_eq!(stats.glyph_uploads, 2);
+        assert_eq!(stats.glyphs_dropped, 0);
+
+        // Damage union covers the two glyph quads.
+        let d = store.get(id).expect("drawable");
+        let rects: Vec<vk::Rect2D> = d.protocol_damage.rects().to_vec();
+        assert!(!rects.is_empty(), "protocol damage should be set");
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for r in rects {
+            min_x = min_x.min(r.offset.x);
+            min_y = min_y.min(r.offset.y);
+            max_x = max_x.max(r.offset.x + r.extent.width as i32);
+            max_y = max_y.max(r.offset.y + r.extent.height as i32);
+        }
+        assert!(min_x <= 10);
+        assert!(min_y <= 5);
+        assert!(max_x >= 22);
+        assert!(max_y >= 17);
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn atlas_intern_uses_fence_ticket() {
+        // After image_text submits, the engine's submitted queue
+        // grows by exactly one upload op + one consume op per fresh
+        // intern. Each is in-flight until drain.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let id = alloc_drawable_3a(&platform, &mut store, 0x1, 16, 16);
+
+        assert_eq!(engine.pending_count(), 0);
+        let glyphs = vec![build_glyph(0xA0A0, 1, 1, 4, 4)];
+        engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                id,
+                1,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+            )
+            .expect("ok");
+        // One upload + one consume.
+        assert!(engine.pending_count() >= 2);
+        engine.drain_all(&platform);
+        assert_eq!(engine.pending_count(), 0);
+    }
+
+    /// **Load-bearing per codex round 1**: two back-to-back glyph
+    /// uploads with distinct keys must not corrupt each other's
+    /// atlas pixels. v1's shared persistent staging would clobber
+    /// A when B's memcpy lands while A's GPU read is in flight; the
+    /// v2 per-upload arena slice rules that out.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn atlas_back_to_back_upload_no_corruption() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
+
+        // Pre-clear the target to black.
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                target,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 32,
+                        height: 32,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .expect("clear");
+
+        // Two glyphs with distinguishable solid-alpha rectangles.
+        // The text shader does `foreground × atlas.r`; with
+        // 0xFF-filled atlas and white foreground, the dst quads
+        // come out (B=0xFF, G=0xFF, R=0xFF, A=0xFF).
+        let glyphs = vec![
+            build_glyph(u32::from(b'A'), 1, 1, 4, 4),
+            build_glyph(u32::from(b'B'), 10, 1, 4, 4),
+        ];
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                target,
+                42,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+            )
+            .expect("image_text");
+        assert_eq!(stats.atlas_interns, 2);
+
+        // Read back: both quads should be white; pixels between
+        // them should be the original black.
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                target,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 32,
+                        height: 32,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        let pixel_at = |x: usize, y: usize| {
+            let off = (y * 32 + x) * 4;
+            (out[off], out[off + 1], out[off + 2], out[off + 3])
+        };
+        // A's quad: (1..5, 1..5).
+        for y in 1..5 {
+            for x in 1..5 {
+                let (b, g, r, _a) = pixel_at(x, y);
+                assert_eq!(
+                    (b, g, r),
+                    (0xFF, 0xFF, 0xFF),
+                    "glyph A quad pixel ({x},{y}) corrupted: ({b:#x},{g:#x},{r:#x})",
+                );
+            }
+        }
+        // B's quad: (10..14, 1..5).
+        for y in 1..5 {
+            for x in 10..14 {
+                let (b, g, r, _a) = pixel_at(x, y);
+                assert_eq!(
+                    (b, g, r),
+                    (0xFF, 0xFF, 0xFF),
+                    "glyph B quad pixel ({x},{y}) corrupted: ({b:#x},{g:#x},{r:#x})",
+                );
+            }
+        }
+        // Between the quads (7, 2) should still be black.
+        let (b, g, r, _a) = pixel_at(7, 2);
+        assert_eq!(
+            (b, g, r),
+            (0x00, 0x00, 0x00),
+            "between-quad pixel (7,2) should be background black; got ({b:#x},{g:#x},{r:#x})"
+        );
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn atlas_full_drops_glyph_and_increments_counter() {
+        // Drive the atlas to exhaustion via the engine's image_text
+        // pipeline. 4096² atlas; two 2049×2049 glyphs don't both
+        // fit — the second exceeds the remaining vertical room.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 4, 4);
+        // First glyph fits.
+        let g0 = build_glyph(1, 0, 0, 2049, 2049);
+        let g1 = build_glyph(2, 0, 0, 2049, 2049);
+
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                target,
+                1,
+                [1.0, 1.0, 1.0, 1.0],
+                &[g0],
+            )
+            .expect("first image_text");
+        assert_eq!(stats.atlas_interns, 1);
+        assert_eq!(stats.glyphs_dropped, 0);
+
+        let stats2 = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                target,
+                1,
+                [1.0, 1.0, 1.0, 1.0],
+                &[g1],
+            )
+            .expect("second image_text");
+        assert_eq!(stats2.atlas_interns, 0);
+        assert_eq!(stats2.glyphs_dropped, 1);
+
+        engine.drain_all(&platform);
     }
 }

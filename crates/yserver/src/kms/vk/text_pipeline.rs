@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use super::{device::VkContext, glyph::GlyphAtlas};
+use super::device::VkContext;
 
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
@@ -120,10 +120,16 @@ impl From<vk::Result> for TextPipelineError {
 }
 
 impl TextPipeline {
+    /// Build the text pipeline against the supplied glyph-atlas
+    /// image view. The atlas image view is captured into the
+    /// pipeline's single descriptor set at construction time; the
+    /// atlas image itself must outlive the pipeline. Stage 3a's v2
+    /// glyph atlas uses this directly; v1 passes its
+    /// `GlyphAtlas::image_view()`.
     pub fn new(
         vk: Arc<VkContext>,
         color_format: vk::Format,
-        atlas: &GlyphAtlas,
+        atlas_image_view: vk::ImageView,
     ) -> Result<Self, TextPipelineError> {
         let device = &vk.device;
 
@@ -300,7 +306,7 @@ impl TextPipeline {
             }
         };
         let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(atlas.image_view())
+            .image_view(atlas_image_view)
             .sampler(sampler)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [vk::WriteDescriptorSet::default()

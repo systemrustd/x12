@@ -1767,7 +1767,7 @@ impl KmsBackend {
                 match crate::kms::vk::text_pipeline::TextPipeline::new(
                     Arc::clone(vkctx),
                     ash::vk::Format::B8G8R8A8_UNORM,
-                    atlas,
+                    atlas.image_view(),
                 ) {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -4252,7 +4252,7 @@ impl KmsBackend {
         let Some(mirror) = mirror else {
             return false;
         };
-        let atlas = self.glyph_atlas.as_ref().expect("checked above");
+        let atlas_extent = self.glyph_atlas.as_ref().expect("checked above").extent();
         let pipeline = self.text_pipeline.as_ref().expect("checked above");
 
         match self
@@ -4262,7 +4262,9 @@ impl KmsBackend {
                     vk,
                     cb,
                     mirror,
-                    atlas,
+                    vk_text::TextAtlas {
+                        extent: atlas_extent,
+                    },
                     pipeline,
                     &glyphs_to_draw,
                     foreground_rgba,
@@ -5530,7 +5532,7 @@ impl KmsBackend {
         let Some(mirror) = mirror else {
             return false;
         };
-        let atlas = self.glyph_atlas.as_ref().expect("checked above");
+        let atlas_extent = self.glyph_atlas.as_ref().expect("checked above").extent();
         let pipeline = self.text_pipeline.as_ref().expect("checked above");
 
         match self
@@ -5540,7 +5542,9 @@ impl KmsBackend {
                     vk,
                     cb,
                     mirror,
-                    atlas,
+                    vk_text::TextAtlas {
+                        extent: atlas_extent,
+                    },
                     pipeline,
                     &glyphs_to_draw,
                     foreground_premul,

@@ -374,6 +374,155 @@ impl KmsBackendV2 {
             },
         );
     }
+
+    // ── Stage 3a: Core-text helpers ─────────────────────────────
+
+    /// FreeType rasterise + atlas dispatch for one text run.
+    /// Used by `image_text8/16` and `poly_text8/16`. Per Stage 3
+    /// plan §"Cross-cutting" §4: Core ops consult GC clip only —
+    /// here we don't push the GC clip into the RENDER pipeline
+    /// because the text pipeline doesn't honour scissor (lives in
+    /// Stage 3e). v1's path has the same limitation; promoted to
+    /// a Risk item rather than blocking 3a.
+    fn render_text_chars_v2(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        x: i32,
+        y: i32,
+        text: &[char],
+    ) -> io::Result<()> {
+        use crate::kms::v2::engine::PreparedGlyph;
+
+        let Some(font_xid) = self.core.current_font else {
+            return Ok(());
+        };
+        let Some(target_id) = self.store.lookup(host_xid) else {
+            return Ok(());
+        };
+        // Rasterise glyphs in a tight FreeType-borrow scope so the
+        // subsequent &mut self engine call doesn't conflict.
+        let mut rendered: Vec<PreparedGlyph> = Vec::with_capacity(text.len());
+        let mut cursor_x = x;
+        {
+            let Some(fs) = self.core.fonts.get(&font_xid) else {
+                return Ok(());
+            };
+            let face = fs.face.borrow();
+            let char_cache = &fs.char_info_cache;
+            for &ch in text {
+                let Some(ci) = char_cache.get(&ch) else {
+                    cursor_x = cursor_x.saturating_add(6);
+                    continue;
+                };
+                let _ = face
+                    .0
+                    .load_char(ch as usize, freetype::face::LoadFlag::RENDER);
+                let glyph = face.0.glyph();
+                let bitmap = glyph.bitmap();
+                if bitmap.width() > 0 && bitmap.rows() > 0 {
+                    let w = bitmap.width() as usize;
+                    let h = bitmap.rows() as usize;
+                    let stride = bitmap.pitch();
+                    let buf = bitmap.buffer();
+                    let mut pixels = vec![0u8; w * h];
+                    for row in 0..h {
+                        let src = if stride >= 0 {
+                            row * stride as usize
+                        } else {
+                            (h - 1 - row) * (stride as isize).unsigned_abs()
+                        };
+                        pixels[row * w..row * w + w].copy_from_slice(&buf[src..src + w]);
+                    }
+                    rendered.push(PreparedGlyph {
+                        dst_x: cursor_x + glyph.bitmap_left(),
+                        dst_y: y - glyph.bitmap_top(),
+                        w,
+                        h,
+                        pixels,
+                        codepoint: ch as u32,
+                    });
+                }
+                cursor_x = cursor_x.saturating_add(ci.character_width as i32);
+            }
+        }
+        if rendered.is_empty() {
+            return Ok(());
+        }
+        let foreground_rgba = [
+            ((foreground >> 16) & 0xFF) as f32 / 255.0,
+            ((foreground >> 8) & 0xFF) as f32 / 255.0,
+            (foreground & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+        match self.engine.image_text(
+            &mut self.store,
+            &mut self.platform,
+            target_id,
+            font_xid,
+            foreground_rgba,
+            &rendered,
+        ) {
+            Ok(stats) => {
+                for _ in 0..stats.atlas_interns {
+                    self.telemetry.record_atlas_intern();
+                }
+                for _ in 0..stats.glyph_uploads {
+                    self.telemetry.record_glyph_upload();
+                }
+                for _ in 0..stats.glyphs_dropped {
+                    self.telemetry.record_glyph_dropped_atlas_full();
+                }
+                if stats.atlas_interns > 0 || !rendered.is_empty() {
+                    self.telemetry.record_paint_submit();
+                }
+            }
+            Err(e) => {
+                log::warn!("v2 image_text: engine error xid={host_xid:#x}: {e:?} — dropping run");
+            }
+        }
+        Ok(())
+    }
+
+    /// `image_text8/16` background-fill helper. Lowers the
+    /// per-call rect to an `engine.fill_rect` op via the same
+    /// path `fill_rectangle` (Stage 2c) uses, so the bg drawn
+    /// here lives on the same storage as the glyph quads.
+    fn fill_text_background(
+        &mut self,
+        host_xid: u32,
+        background: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> io::Result<()> {
+        use crate::kms::v2::engine::decode_x11_pixel_bgra;
+
+        if w <= 0 || h <= 0 {
+            return Ok(());
+        }
+        let Some(target_id) = self.store.lookup(host_xid) else {
+            return Ok(());
+        };
+        let color = decode_x11_pixel_bgra(background);
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D {
+                width: u32::try_from(w).unwrap_or(0),
+                height: u32::try_from(h).unwrap_or(0),
+            },
+        };
+        if let Err(e) =
+            self.engine
+                .fill_rect(&mut self.store, &mut self.platform, target_id, rect, color)
+        {
+            log::warn!("v2 image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
+        } else {
+            self.telemetry.record_paint_submit();
+        }
+        Ok(())
+    }
 }
 
 /// Map a host-visual descriptor to a depth for the storage
@@ -827,14 +976,33 @@ impl Backend for KmsBackendV2 {
     fn open_font(
         &mut self,
         _origin: Option<OriginContext>,
-        _name: &str,
+        name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)> {
-        self.log_v2_gap("open_font");
-        Err(io::Error::other("v2: open_font not yet implemented"))
+        // Same body as v1. `KmsCore` already owns `FontLoader` +
+        // `fonts` (it's protocol-bookkeeping per the v2 spec); the
+        // backend just wraps the resulting freetype handle in a
+        // `FontState` entry against a freshly-allocated xid.
+        use std::cell::RefCell;
+
+        use crate::kms::core::{FontState, FreetypeFace};
+        let (face, metrics, char_cache) = self.core.font_loader.open_font(name)?;
+        let host_xid = self.core.next_host_xid();
+        let handle = FontHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other("failed to create font handle"))?;
+        self.core.fonts.insert(
+            host_xid,
+            FontState {
+                handle: host_xid,
+                face: RefCell::new(FreetypeFace(face)),
+                metrics: metrics.clone(),
+                char_info_cache: char_cache,
+            },
+        );
+        Ok((handle, metrics))
     }
 
-    fn close_font(&mut self, _origin: Option<OriginContext>, _host_xid: u32) -> io::Result<()> {
-        self.log_v2_gap("close_font");
+    fn close_font(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.core.fonts.remove(&host_xid);
         Ok(())
     }
 
@@ -1318,49 +1486,221 @@ impl Backend for KmsBackendV2 {
     fn poly_text8(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_text8");
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM8.
+        // Each TEXTITEM8 is `len(u8) delta(i8) chars(len)` for len
+        // in 0..=254, or `255 font_id(u32 BE)` for a font change.
+        // No inter-item padding.
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut items = &body[12..];
+        let mut cursor_x = x;
+        while items.len() >= 2 {
+            let len = items[0];
+            if len == 255 {
+                if items.len() < 5 {
+                    break;
+                }
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.core.current_font = Some(font_xid);
+                items = &items[5..];
+                continue;
+            }
+            let delta = items[1] as i8;
+            let len = len as usize;
+            if items.len() < 2 + len {
+                break;
+            }
+            let text = &items[2..2 + len];
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
+            if !text.is_empty() {
+                let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
+                self.render_text_chars_v2(host_xid, foreground, cursor_x, y, &chars)?;
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
+                    let advance: i32 = text
+                        .iter()
+                        .map(|&b| {
+                            font_state
+                                .char_info_cache
+                                .get(&(b as char))
+                                .map(|ci| ci.character_width as i32)
+                                .unwrap_or(6)
+                        })
+                        .sum();
+                    cursor_x = cursor_x.saturating_add(advance);
+                }
+            }
+            items = &items[2 + len..];
+        }
         Ok(())
     }
 
     fn poly_text16(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_text16");
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM16.
+        // Each TEXTITEM16 is `len(u8) delta(i8) chars(2*len)` (chars
+        // are CHAR2B, big-endian) for len in 0..=254, or `255
+        // font_id(u32 BE)` for a font change.
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut cursor_x = x;
+        let mut items = &body[12..];
+        while items.len() >= 2 {
+            let len = items[0];
+            if len == 255 {
+                if items.len() < 5 {
+                    break;
+                }
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.core.current_font = Some(font_xid);
+                items = &items[5..];
+                continue;
+            }
+            let delta = items[1] as i8;
+            let len = len as usize;
+            let needed = 2 + 2 * len;
+            if items.len() < needed {
+                break;
+            }
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
+            let mut chars = Vec::with_capacity(len);
+            for i in 0..len {
+                let codepoint = u16::from_be_bytes([items[2 + 2 * i], items[2 + 2 * i + 1]]) as u32;
+                chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+            }
+            if !chars.is_empty() {
+                self.render_text_chars_v2(host_xid, foreground, cursor_x, y, &chars)?;
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
+                    cursor_x = cursor_x.saturating_add(
+                        chars
+                            .iter()
+                            .map(|ch| {
+                                font_state
+                                    .char_info_cache
+                                    .get(ch)
+                                    .map(|ci| ci.character_width as i32)
+                                    .unwrap_or(6)
+                            })
+                            .sum::<i32>(),
+                    );
+                }
+            }
+            items = &items[needed..];
+        }
         Ok(())
     }
 
     fn image_text8(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _background: u32,
-        _text_len: u8,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("image_text8");
-        Ok(())
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + string(text_len)
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+
+        // Background rect from font metrics (ascent + descent).
+        // Stage 3a: lower this to a single fill_rect via the
+        // engine (Stage 2c op); GC-clip intersection is the
+        // backend's concern (current_clip stored on KmsCore).
+        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
+            let total_width: i32 = body[12..]
+                .iter()
+                .take(text_len as usize)
+                .map(|&b| {
+                    font_state
+                        .char_info_cache
+                        .get(&(b as char))
+                        .map(|ci| ci.character_width as i32)
+                        .unwrap_or(6)
+                })
+                .sum();
+            let ascent = font_state.metrics.font_ascent as i32;
+            let descent = font_state.metrics.font_descent as i32;
+            let bg_x = x;
+            let bg_y = y - ascent;
+            let bg_w = total_width.max(0);
+            let bg_h = (ascent + descent).max(0);
+            self.fill_text_background(host_xid, background, bg_x, bg_y, bg_w, bg_h)?;
+        }
+
+        let end = (12usize + text_len as usize).min(body.len());
+        let text = &body[12..end];
+        let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
+        self.render_text_chars_v2(host_xid, foreground, x, y, &chars)
     }
 
     fn image_text16(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _background: u32,
-        _text_len: u8,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("image_text16");
-        Ok(())
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut chars = Vec::with_capacity(text_len as usize);
+        let mut pos = 12usize;
+        for _ in 0..text_len {
+            if pos + 2 > body.len() {
+                break;
+            }
+            let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
+            pos += 2;
+            chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+        }
+
+        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
+            let total_width: i32 = chars
+                .iter()
+                .map(|ch| {
+                    font_state
+                        .char_info_cache
+                        .get(ch)
+                        .map(|ci| ci.character_width as i32)
+                        .unwrap_or(6)
+                })
+                .sum();
+            let ascent = font_state.metrics.font_ascent as i32;
+            let descent = font_state.metrics.font_descent as i32;
+            let bg_x = x;
+            let bg_y = y - ascent;
+            let bg_w = total_width.max(0);
+            let bg_h = (ascent + descent).max(0);
+            self.fill_text_background(host_xid, background, bg_x, bg_y, bg_w, bg_h)?;
+        }
+
+        self.render_text_chars_v2(host_xid, foreground, x, y, &chars)
     }
 
     // ── RENDER ──────────────────────────────────────────────────
@@ -1874,5 +2214,46 @@ mod tests {
         assert_eq!(b.xid_map().get(&0x0040_1234), Some(&ResourceId(0x4242)));
         b.unregister_host_window(0x0040_1234);
         assert!(b.xid_map().get(&0x0040_1234).is_none());
+    }
+
+    /// Stage 3a per plan §3a: a `poly_text8` wire body that
+    /// carries `[text₀, font-change, text₁]` should:
+    /// 1. dispatch the first text run with the original
+    ///    `current_font` value (or None);
+    /// 2. swap `core.current_font` on the inline change item;
+    /// 3. dispatch the second text run with the new font.
+    ///
+    /// Without a real FontState entry the engine call short-
+    /// circuits in `render_text_chars_v2` (no font → no work),
+    /// but the side-effect we care about — `current_font`
+    /// rotating to the inline-change xid by the end of the parse
+    /// — is observable on the backend after the call returns.
+    #[test]
+    fn v2_poly_text8_font_change_advances_current_font() {
+        let mut b = KmsBackendV2::for_tests();
+        // Body shape (drawable=4, gc=4, x=2, y=2, items=…):
+        // header = 12 bytes; first item = `len(1) delta(1) "X"`
+        // = 3 bytes; font-change item = `255 + 4 BE bytes` = 5
+        // bytes; second item = `len(1) delta(1) "Y"` = 3 bytes.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&[0, 0, 0, 0]); // drawable
+        body.extend_from_slice(&[0, 0, 0, 0]); // gc
+        body.extend_from_slice(&(0_i16).to_le_bytes()); // x
+        body.extend_from_slice(&(0_i16).to_le_bytes()); // y
+        // First TEXTITEM8 — single 'X' glyph.
+        body.extend_from_slice(&[1u8, 0u8, b'X']);
+        // Font-change item — switch to xid 0xDEAD_BEEF.
+        body.push(255);
+        body.extend_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+        // Second TEXTITEM8 — single 'Y' glyph.
+        body.extend_from_slice(&[1u8, 0u8, b'Y']);
+
+        assert_eq!(b.core.current_font, None);
+        b.poly_text8(None, 0xABCD_EF01, 0x000000, &body)
+            .expect("poly_text8 ok");
+        // After the parse, current_font should reflect the inline
+        // change. The parse runs the second text item with this
+        // font value in scope.
+        assert_eq!(b.core.current_font, Some(0xDEAD_BEEF));
     }
 }

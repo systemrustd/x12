@@ -323,15 +323,37 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     sites in 3c). Landed 2026-05-16 (`5d88295`). Counter
     storage + `record_*` hooks + emitter line additions; no
     call sites yet. Pure additions; no v1 path touched.
-  - [ ] **3a-atlas+text** — port `GlyphAtlas` off v1's
-    persistent staging buffer (per-upload arena slice owned
-    by `SubmittedOp` + `atlas_last_upload_ticket` for CPU
-    lifetime); port `TextPipeline`; `DrawableImageRef` adapter
-    over v1's `record_text_run`; `RenderEngine::image_text`
-    method; `KmsBackendV2` `open_font`/`close_font` delegation
-    to `KmsCore`; `image_text8`/`image_text16` + `poly_text8`/
-    `poly_text16` decoders (`0xFF` font-change items
-    supported). Back-to-back upload race test load-bearing.
+  - [x] **3a-atlas+text** — landed 2026-05-16. New
+    `kms::v2::glyph_atlas::V2GlyphAtlas` forks v1's atlas to
+    drop the persistent staging buffer; each upload owns its
+    own `StagingBuffer` slice for the lifetime of its
+    `SubmittedOp` (`FenceTicket`-gated). `RenderEngine` grows
+    `glyph_atlas` + `text_pipeline` + `atlas_last_upload_ticket`;
+    every atlas-sampling op clones the latest upload ticket
+    onto its own `SubmittedOp.atlas_ticket` (CPU-side lifetime
+    gate; same-graphics-queue submission ordering is the GPU
+    dependency). `record_text_run` generalized to a
+    `TextRunTarget` trait so both v1 `DrawableImage` and v2's
+    `StorageTextTarget` (a borrow over v2's `Drawable` storage
+    fields) flow through the same recorder. `KmsBackendV2`
+    `open_font` / `close_font` mirror v1's body (KmsCore owns
+    FontLoader + fonts already); `image_text8`/`image_text16`
+    parse + lower a background fill via `engine.fill_rect`
+    then call `engine.image_text`; `poly_text8`/`poly_text16`
+    iterate TextItem8/16 with inline `0xFF` font-change items
+    rotating `core.current_font`. Telemetry sites:
+    `record_atlas_intern` / `record_glyph_upload` /
+    `record_glyph_dropped_atlas_full` driven from the engine's
+    returned `ImageTextStats`. 5 new tests (1 logic + 4
+    Vk-backed under lavapipe): back-to-back-upload-no-
+    corruption (load-bearing per codex round 1),
+    image_text_run_records_damage, atlas_intern_uses_fence_ticket,
+    atlas_full_drops_glyph_and_increments_counter,
+    v2_poly_text8_font_change_advances_current_font. All
+    211 yserver lib tests + 9 ignored Vk tests pass under
+    lavapipe; clippy clean. Application smoke (xeyes/xclock
+    on hardware) deferred to a follow-up run; FreeType-path
+    real-app text gates at 3f.
   - [ ] **3b — picture records + pipelines.** Promote every
     `render_create_*` / `render_change_picture` /
     `render_set_picture_*` stub; lazy-build

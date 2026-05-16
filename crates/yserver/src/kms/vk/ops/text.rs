@@ -12,7 +12,7 @@ use ash::vk;
 
 use crate::kms::vk::{
     device::VkContext,
-    glyph::{AtlasEntry, GlyphAtlas},
+    glyph::AtlasEntry,
     target::DrawableImage,
     text_pipeline::{TextPipeline, TextPushConsts},
 };
@@ -26,25 +26,73 @@ pub struct TextGlyph {
     pub dst_y: i32,
 }
 
+/// Atlas geometry the text-run recorder needs to convert
+/// `AtlasEntry` integer coords into normalized sample coords.
+/// v1 passes its `&GlyphAtlas` directly; v2 builds one of these
+/// from its `V2GlyphAtlas::extent()`.
+#[derive(Clone, Copy)]
+pub struct TextAtlas {
+    pub extent: vk::Extent2D,
+}
+
+/// The minimal "paint-target" surface that
+/// [`record_text_run`] needs. v1's `DrawableImage` and v2's
+/// `Drawable` storage both implement this; the recorder doesn't
+/// care which one is behind it (Stage 3 plan §"Cross-cutting" §1).
+pub trait TextRunTarget {
+    fn vk_image(&self) -> vk::Image;
+    fn vk_image_view(&self) -> vk::ImageView;
+    fn extent(&self) -> vk::Extent2D;
+    fn current_layout(&self) -> vk::ImageLayout;
+    fn set_current_layout(&mut self, layout: vk::ImageLayout);
+}
+
+impl TextRunTarget for DrawableImage {
+    fn vk_image(&self) -> vk::Image {
+        self.vk_image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.vk_image_view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout()
+    }
+    fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.set_current_layout(layout);
+    }
+}
+
 /// Record a text run into `target`. `foreground` is the GC's RGB
 /// foreground in `[0..1]`; the shader multiplies it by the
 /// sampled atlas alpha. Mirror is left in
 /// `SHADER_READ_ONLY_OPTIMAL` on return.
-pub fn record_text_run(
+///
+/// The atlas image referenced by `pipeline`'s descriptor set must
+/// be in `SHADER_READ_ONLY_OPTIMAL` at submission time. v1's
+/// `GlyphAtlas::intern` enforces this via its inline upload path;
+/// v2's `RenderEngine::image_text` enforces it via same-queue
+/// submission ordering between the upload CB and this draw CB.
+pub fn record_text_run<T: TextRunTarget + ?Sized>(
     vk: &VkContext,
     cb: vk::CommandBuffer,
-    target: &mut DrawableImage,
-    atlas: &GlyphAtlas,
+    target: &mut T,
+    atlas: TextAtlas,
     pipeline: &TextPipeline,
     glyphs: &[TextGlyph],
     foreground: [f32; 4],
 ) -> Result<(), vk::Result> {
-    if glyphs.is_empty() || target.extent.width == 0 || target.extent.height == 0 {
+    if glyphs.is_empty() || target.extent().width == 0 || target.extent().height == 0 {
         return Ok(());
     }
 
     let device = &vk.device;
     let old_layout = target.current_layout();
+    let extent = target.extent();
+    let target_image = target.vk_image();
+    let target_view = target.vk_image_view();
 
     let to_color = [vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -55,7 +103,7 @@ pub fn record_text_run(
         )
         .old_layout(old_layout)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .image(target.vk_image)
+        .image(target_image)
         .subresource_range(color_subresource_range())];
     let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color);
     crate::vk_count!(cmd_pipeline_barrier2);
@@ -63,10 +111,10 @@ pub fn record_text_run(
 
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
-        extent: target.extent,
+        extent,
     };
     let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(target.vk_image_view)
+        .image_view(target_view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)];
@@ -75,12 +123,12 @@ pub fn record_text_run(
         .layer_count(1)
         .color_attachments(&color_attachment);
 
-    let atlas_extent = atlas.extent();
+    let atlas_extent = atlas.extent;
     let viewport = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: target.extent.width as f32,
-        height: target.extent.height as f32,
+        width: extent.width as f32,
+        height: extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
@@ -112,7 +160,7 @@ pub fn record_text_run(
             let pc = TextPushConsts::new(
                 [g.dst_x as f32, g.dst_y as f32],
                 [g.entry.w as f32, g.entry.h as f32],
-                [target.extent.width as f32, target.extent.height as f32],
+                [extent.width as f32, extent.height as f32],
                 [
                     g.entry.atlas_x as f32 / atlas_extent.width as f32,
                     g.entry.atlas_y as f32 / atlas_extent.height as f32,
@@ -146,7 +194,7 @@ pub fn record_text_run(
         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
         .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .image(target.vk_image)
+        .image(target_image)
         .subresource_range(color_subresource_range())];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
     crate::vk_count!(cmd_pipeline_barrier2);
