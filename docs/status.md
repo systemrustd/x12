@@ -480,11 +480,53 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       still bails to 3e. 216 lib tests + 15 ignored v2-engine Vk
       tests + 4 v2_acceptance tests all green under lavapipe;
       clippy pedantic clean for the touched lines.
-  - [ ] **3d — `render_composite_glyphs` + glyphsets.**
-    v1-parity scope (Over + SolidFill source +
-    A8/A1/ARGB32-as-A8 glyphsets); fixes v1's latent
-    "_clip unused" bug for the dst picture clip; broader op /
-    source coverage risk-listed for a post-Stage-3 follow-up.
+  - [x] **3d — `render_composite_glyphs` + glyphsets.** Landed
+    2026-05-16. v1-parity scope: PictOp Over + SolidFill source
+    + A8/A1/ARGB32-as-A8 glyphsets. Fixes v1's latent
+    `_clip unused` bug (`kms::backend.rs:5313`) — the dst picture
+    clip is now honoured via per-rect scissoring, plan §4.
+
+    `record_text_run` factored into a single-scissor convenience
+    wrapper + `record_text_run_scissored` that takes a
+    `&[vk::Rect2D]` slice. Same `cmd_begin_rendering` →
+    loop `set_scissor` + glyph-draw batches → `cmd_end_rendering`
+    shape; v1's existing `record_text_run` site stays at
+    full-extent scissor via the wrapper. New
+    `RenderEngine::composite_glyphs` mirrors `image_text`'s
+    atlas-intern path (same key namespace, atlas_last_upload_ticket
+    discipline, FenceTicket-gated per-glyph staging buffers); the
+    new `CompositeGlyphInput` borrows pre-A8 glyph pixels from
+    `KmsCore.glyphsets` or a per-call A1→A8 scratch.
+    `KmsBackendV2::render_composite_glyphs` parses the items
+    stream (8-byte elements + inline `0xFF 0 0 0 new_gs_xid`
+    glyphset-change form, ids 1/2/4 bytes per CompositeGlyphs8/16/32
+    minor), looks up each glyph from `core.glyphsets`, A1→A8
+    expands per v1's MSB-first bit order, then calls into the
+    engine. Two-pass parse avoids a borrow conflict on the
+    A1-expansion Vec (the inner Vec<u8>'s heap buffers are stable
+    through outer-Vec pushes, but the borrow checker doesn't
+    track that — pass 1 fills the scratch + records indices, pass
+    2 resolves slices). Gate: op != Over OR source not SolidFill
+    bumps `composite_glyphs_dropped_unsupported`; stale handles
+    (picture / glyphset / dst drawable) log gap + return Ok
+    without bumping (protocol errors, not unsupported features).
+    Telemetry sites: atlas_intern, glyph_uploads,
+    glyphs_dropped_atlas_full, paint_submits — same shape as
+    image_text.
+
+    3 unit tests: `v2_composite_glyphs_unsupported_op_drops`,
+    `v2_composite_glyphs_non_solidfill_source_drops` (uses a
+    LinearGradient source so the gate fires at the source-type
+    check, not a stale-handle path),
+    `v2_composite_glyphs_inline_glyphset_change_parsed` (asserts
+    Over+SolidFill stays in-envelope when the items stream
+    rotates the active glyphset mid-run). 1 Vk-backed
+    acceptance: `v2_composite_glyphs_clip_intersects_picture` —
+    paints two 4×4 white glyphs across an 8×4 blue dst with a
+    4×4 top-left clip; asserts left half white, right half blue.
+    This is the v1-bug-fix gate — v1 paints both glyphs.
+    219 lib tests + 15 ignored v2-engine Vk tests + 5
+    v2_acceptance tests all green under lavapipe.
   - [ ] **3e — trapezoids + triangles + `copy_plane`.**
   - [ ] **3f — Core remainder + GC.function + planemask +
     acceptance.** Real-app matrix on hardware, bee 30-min
