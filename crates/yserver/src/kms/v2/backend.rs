@@ -1774,16 +1774,56 @@ fn resolve_picture_for_render(
             *component_alpha,
         )),
         PictureRecord::LinearGradient {
-            repeat, transform, ..
+            repeat,
+            transform,
+            stops,
+            ..
         }
         | PictureRecord::RadialGradient {
-            repeat, transform, ..
-        } => Some((
-            ResolvedSource::Gradient(host_pic),
-            *repeat,
-            *transform,
-            false,
-        )),
+            repeat,
+            transform,
+            stops,
+            ..
+        } => {
+            // Stage 3f.12 fallback: real gradient LUT sampling is
+            // Stage-3e territory and never landed. The full
+            // `kms::vk::gradient::GradientPicture` infra is built
+            // and used by v1, but v2's `render_composite` bailed on
+            // any gradient src/mask with a logged gap.
+            //
+            // Concrete pain: every Cairo widget background under
+            // GTK uses a gradient. Caja's offscreen render-buffer
+            // stayed mostly unpainted, so the eventual `CopyArea`
+            // to the on-screen window propagated UNDEFINED Vk
+            // content (visually black with widget-rect islands).
+            //
+            // Pragmatic fallback: collapse the gradient to its
+            // first-stop colour (premultiplied) and route through
+            // the SolidFill path that already works. Loses the
+            // gradient shading — most GTK gradients are mild
+            // light-to-lighter so a flat first-stop colour is
+            // visually acceptable — but every widget bg gets a
+            // real solid colour instead of UNDEFINED black. Full
+            // gradient correctness is tracked as a separate
+            // Stage-5 polish item; this unblocks the hardware
+            // smoke matrix.
+            let premul = if let Some(stop) = stops.first() {
+                // Stops are straight-alpha 16-bit per channel.
+                // SolidFill::premul expects premultiplied
+                // 0..1 floats. Premultiply: c' = c * (a / 65535).
+                let a = f32::from(stop.a) / 65535.0;
+                let r = (f32::from(stop.r) / 65535.0) * a;
+                let g = (f32::from(stop.g) / 65535.0) * a;
+                let b = (f32::from(stop.b) / 65535.0) * a;
+                [r, g, b, a]
+            } else {
+                // Defensive: zero-stop gradient is meaningless;
+                // pick fully transparent so the source contributes
+                // nothing rather than black.
+                [0.0, 0.0, 0.0, 0.0]
+            };
+            Some((ResolvedSource::Solid(premul), *repeat, *transform, false))
+        }
     }
 }
 
@@ -5523,13 +5563,16 @@ mod tests {
         );
     }
 
-    /// Per plan §3d "Op / source matrix": non-SolidFill source
-    /// (Drawable / Gradient) also drops with the unsupported
-    /// counter — Cairo's rare alpha-mask source case. Use a
-    /// gradient picture (no store dependency) so the test fixture
-    /// doesn't need live Vk.
+    /// Stage 3f.12: gradient src is no longer a "drop" — it
+    /// collapses to a SolidFill of the first stop's premultiplied
+    /// colour (real LUT sampling is still post-3f.5 work). The
+    /// composite_glyphs path now accepts gradient sources; the
+    /// `composite_glyphs_dropped_unsupported` counter stays at 0.
+    /// Cairo glyph rendering with gradient bg/fg therefore paints
+    /// (with the gradient flattened to its start colour) rather
+    /// than dropping entirely.
     #[test]
-    fn v2_composite_glyphs_non_solidfill_source_drops() {
+    fn v2_composite_glyphs_gradient_source_collapses_to_solidfill() {
         let mut b = KmsBackendV2::for_tests();
         let (_unused_solidfill, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
         // Minimal valid linear-gradient wire body: pad(4) +
@@ -5564,8 +5607,8 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(
-            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 1,
-            "gradient source must hit the v1-parity gate",
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 0,
+            "gradient src must collapse to SolidFill (not drop)",
         );
     }
 
