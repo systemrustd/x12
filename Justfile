@@ -413,10 +413,7 @@ yserver-v2-xsetroot-hw log="info":
         yserver_pid=$!;\
         for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 1; done;\
         sleep 1;\
-        for c in red green blue yellow magenta cyan white black red green blue; do\
-            DISPLAY=:7 xsetroot -solid "$c";\
-            sleep 1;\
-        done;\
+        for c in red green blue yellow magenta cyan white black red green blue; do DISPLAY=:7 xsetroot -solid "$c"; sleep 1; done;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log"'
