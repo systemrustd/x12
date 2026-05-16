@@ -85,9 +85,9 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
   green: v1 unchanged, v2 boots through capability queries +
   logs gaps on first paint.
 
-### In progress
+### Done (continued)
 
-- [~] **Stage 2 — minimal-Vk correct baseline.** Plan landed
+- [x] **Stage 2 — minimal-Vk correct baseline.** Plan landed
   2026-05-16 (`88d3f3d`) after three codex review rounds; six
   substages 2a–2f. Cross-cutting concepts: two-sync-object model
   (FenceTicket for CPU lifetime + per-ScanoutBo export semaphore
@@ -177,7 +177,7 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     6 new unit tests for ring trim / history-window math /
     repaint picker fallback cases. Stage 2f's synthetic harness
     is the load-bearing buffer-age oracle test (deferred).
-  - [~] **2f — Telemetry + acceptance harness + hardware smoke.**
+  - [x] **2f — Telemetry + acceptance harness + hardware smoke.**
     **Telemetry + acceptance landed 2026-05-16**:
     `kms::v2::telemetry::Telemetry` owns per-second counter
     bucket + lifetime aggregates per spec §"Required counters".
@@ -242,13 +242,48 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     only submit when we know KMS will accept; tracked for the
     perf-plans cycle on top of v2.
 
-    **Pending**: user-run hardware smoke on bee + fuji
-    (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`) — the
-    Stage 2 close gate. Now genuinely actionable post-xkb_proxy
-    fix: xfce-session, xfwm4, xfdesktop should get past
-    handshake and start mapping windows. Real Stage 3 gaps
-    (RENDER / glyphs / cursor) will surface as the next
-    triage layer.
+    **Hardware smoke on bee — green 2026-05-16.**
+    `YSERVER_RENDER_MODEL=v2 just yserver-v2-xsetroot-hw` on
+    bee (RDNA2 / RADV, 2560x1440) cycles through 11 solid
+    colors with `xsetroot -solid <color>`. Two hardware-only
+    bugs surfaced + fixed during the run:
+      - `bc6718a` — **per-output flip-pending gate.** On RADV
+        at 2560x1440, mate-session's connect-flurry fires
+        composite-after-composite faster than vblank; KMS only
+        allows one pending atomic commit per CRTC and returns
+        EBUSY on each subsequent submit. The 9b recovery path
+        invalidated every BO faster than they could retire, so
+        no BO ever landed → frozen at the boot frame. Fix
+        skips `tick_one_output` when `state.pending_acks` is
+        non-empty; scene_structure_dirty stays set so the next
+        tick (post page-flip-complete) picks up deferred
+        damage. KMS submit rate is now structurally bounded to
+        one flip per vblank per output.
+      - `3d90a0c` — **empty-scene Clipped/LOAD bug.** With the
+        flip-pending gate in place, compose ran cleanly (9
+        composite_submits/s + 9 frame_present/s) but the
+        screen stayed black after xsetroot. Buffer-age picked
+        `Clipped` (loadOp=LOAD) once the history ring had
+        enough generations; `scene.draws` was empty (xsetroot
+        only mutates root.background_pixel — no top-level
+        windows), so LOAD preserved each BO's pre-update black
+        and we drew nothing on top of it. Force `Repaint::Full`
+        whenever the scene has zero draw entries so loadOp=CLEAR
+        paints the current `bg_color`. Stage 4's root storage
+        makes the empty-scene case rare again.
+
+    **Real client smoke** (xterm/xeyes/xdpyinfo/xsetroot)
+    requires the `xkb_proxy` fix from `b001911`. Without it,
+    Xlib clients abort at the XKEYBOARD UseExtension
+    handshake; with it, xdpyinfo returns a full reply and
+    xsetroot drives `bg_color` flips per the bee result above.
+
+    **Stage 2 effectively closed.** mate/xfce/xfwm4 will not
+    paint until Stage 3 (RENDER + glyphs + fonts) lands —
+    they abort during their first open_font /
+    render_create_picture calls and never reach
+    set_container_background_pixel-equivalent paint paths.
+    That's expected per spec; Stage 2's job was the substrate.
 
 ### Pending
 - [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on
