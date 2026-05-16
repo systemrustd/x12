@@ -34,8 +34,10 @@ use crate::{
     kms::{
         core::KmsCore,
         v2::{
-            engine::RenderEngine, platform::PlatformBackend, scene::SceneCompositor,
-            store::DrawableStore,
+            engine::{RenderEngine, decode_x11_pixel_bgra},
+            platform::PlatformBackend,
+            scene::SceneCompositor,
+            store::{DrawableKind, DrawableStore},
         },
     },
 };
@@ -59,12 +61,18 @@ pub struct KmsBackendV2 {
     /// from `&self` paths (capability accessors that log gaps).
     logged_gaps: RefCell<HashSet<&'static str>>,
 
-    /// Future v2 components — zero-sized stubs through Stage 2a.
-    /// Stages 2b/2c/2d replace these with real types.
-    #[allow(dead_code)]
-    store: DrawableStore,
-    #[allow(dead_code)]
-    engine: RenderEngine,
+    /// v2's storage layer (Stage 2b). Tracks every drawable's
+    /// VkImage + refcount + damage + retirement-fence; allocated
+    /// via `PlatformBackend::allocate_drawable_storage`.
+    pub(crate) store: DrawableStore,
+    /// v2's paint engine (Stage 2c). Drives `fill_rect`,
+    /// `put_image`, `get_image` directly into `DrawableStore`
+    /// storage; consumed by every `Backend` paint method on this
+    /// backend.
+    pub(crate) engine: RenderEngine,
+    /// v2's scene compositor — still stubbed through Stage 2c.
+    /// Stage 2d fills it in with the blit pipeline + first
+    /// visible composed scanout.
     #[allow(dead_code)]
     scene: SceneCompositor,
 }
@@ -97,18 +105,21 @@ impl KmsBackendV2 {
         let platform = PlatformBackend::open_with_commit(device_path, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let core = KmsCore::new(fb_w, fb_h)?;
+        let engine = RenderEngine::new(&platform)
+            .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
         log::info!(
             "yserver(v2): KmsBackendV2 boot — {} output(s), {fb_w}x{fb_h} virtual screen; \
-             paint paths stubbed pending Stages 2b–2e, expect 'v2: <method> not yet \
-             implemented' warns on first client paint",
+             Stage 2c engine live (fill/put_image/get_image); scene compose stubbed \
+             pending Stage 2d, expect 'v2: <method> not yet implemented' warns for \
+             non-Stage-2c paint ops on first client request",
             platform.outputs.len(),
         );
         Ok(Self {
             core,
             platform,
             logged_gaps: RefCell::new(HashSet::new()),
-            store: DrawableStore::stub(),
-            engine: RenderEngine::stub(),
+            store: DrawableStore::new(),
+            engine,
             scene: SceneCompositor::stub(),
         })
     }
@@ -124,7 +135,7 @@ impl KmsBackendV2 {
             core: KmsCore::for_tests(),
             platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
-            store: DrawableStore::stub(),
+            store: DrawableStore::new(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
         }
@@ -208,6 +219,15 @@ impl KmsBackendV2 {
     /// Propagates the first per-output `drm::modeset::disable_output`
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
+        // Drain in-flight paint submits before the platform's
+        // `device_wait_idle` + pool destruction so the engine's
+        // CB / staging book-keeping reclaims its handles against
+        // the still-live pool. Otherwise CBs would leak (the pool
+        // destroy frees them anyway, but the engine's
+        // `submitted` deque keeps stale entries it'd touch on a
+        // subsequent `poll_retired` — making shutdown order
+        // observable).
+        self.engine.drain_all(&self.platform);
         self.platform.disable_output()
     }
 
@@ -492,17 +512,42 @@ impl Backend for KmsBackendV2 {
     fn create_pixmap(
         &mut self,
         _origin: Option<OriginContext>,
-        _depth: u8,
-        _width: u16,
-        _height: u16,
+        depth: u8,
+        width: u16,
+        height: u16,
     ) -> io::Result<PixmapHandle> {
-        self.log_v2_gap("create_pixmap");
         let xid = self.core.next_host_xid();
+        // Stage 2c: allocate real backing storage. The engine
+        // needs a live VkContext to paint into; on the test
+        // fixture the platform's `allocate_drawable_storage`
+        // returns `ERROR_INITIALIZATION_FAILED` and we fall back
+        // to logging a gap + returning the bare xid (tests that
+        // don't paint still get a stable handle).
+        match self
+            .platform
+            .allocate_drawable_storage(width, height, depth)
+        {
+            Ok(storage) => {
+                if let Err(e) =
+                    self.store
+                        .allocate(xid, DrawableKind::Pixmap, depth, false, storage)
+                {
+                    log::warn!("v2 create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",);
+                }
+            }
+            Err(vk_err) => {
+                // Test fixture path — no Vk available.
+                self.log_v2_gap("create_pixmap_no_vk");
+                let _ = vk_err;
+            }
+        }
         PixmapHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_pixmap: xid was 0"))
     }
 
-    fn free_pixmap(&mut self, _origin: Option<OriginContext>, _host_xid: u32) -> io::Result<()> {
-        self.log_v2_gap("free_pixmap");
+    fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.decref(&mut self.platform, id);
+        }
         Ok(())
     }
 
@@ -712,31 +757,88 @@ impl Backend for KmsBackendV2 {
     fn put_image(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _depth: u8,
-        _width: u16,
-        _height: u16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _data: &[u8],
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        data: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("put_image");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("put_image_unknown_xid");
+            return Ok(());
+        };
+        // GC clipping is honoured upstream by `clear_clip_rectangles`
+        // when the dispatcher zeroes the clip (the MIT-SHM /
+        // ImageText callers do this); Stage 2c's engine ignores
+        // the GC's clip rectangles otherwise. Stage 3 plugs
+        // RENDER + planemask + GC.function back in.
+        if !matches!(
+            self.core.current_function,
+            yserver_core::backend::GcFunction::Copy,
+        ) {
+            self.log_v2_gap("put_image_non_gxcopy");
+        }
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            id,
+            ash::vk::Offset2D {
+                x: i32::from(dst_x),
+                y: i32::from(dst_y),
+            },
+            ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            data,
+            depth,
+        ) {
+            log::warn!("v2 put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
+        }
         Ok(())
     }
 
     fn get_image(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _format: u8,
-        _x: i16,
-        _y: i16,
-        _width: u16,
-        _height: u16,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        self.log_v2_gap("get_image");
-        Ok(None)
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("get_image_unknown_xid");
+            return Ok(None);
+        };
+        let depth = match self.store.get(id) {
+            Some(d) => d.depth,
+            None => return Ok(None),
+        };
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(x),
+                y: i32::from(y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        match self
+            .engine
+            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+        {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) => {
+                log::warn!("v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",);
+                Ok(None)
+            }
+        }
     }
 
     fn poly_line(
@@ -799,11 +901,41 @@ impl Backend for KmsBackendV2 {
     fn poly_fill_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _rectangles: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        rectangles: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_fill_rectangle");
+        // Each X11 Rectangle is 8 bytes: { i16 x, i16 y, u16 w, u16 h }.
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_fill_rectangle_unknown_xid");
+            return Ok(());
+        };
+        let color = decode_x11_pixel_bgra(foreground);
+        for chunk in rectangles.chunks_exact(8) {
+            let x = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let y = i16::from_le_bytes([chunk[2], chunk[3]]);
+            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(x),
+                    y: i32::from(y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(w),
+                    height: u32::from(h),
+                },
+            };
+            if let Err(e) =
+                self.engine
+                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+            {
+                log::warn!(
+                    "v2 poly_fill_rectangle: engine.fill_rect failed for xid {host_xid:#x}: {e:?}",
+                );
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -833,14 +965,34 @@ impl Backend for KmsBackendV2 {
     fn fill_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _x: i16,
-        _y: i16,
-        _width: u16,
-        _height: u16,
+        host_xid: u32,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        self.log_v2_gap("fill_rectangle");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("fill_rectangle_unknown_xid");
+            return Ok(());
+        };
+        let color = decode_x11_pixel_bgra(foreground);
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(x),
+                y: i32::from(y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        if let Err(e) = self
+            .engine
+            .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+        {
+            log::warn!("v2 fill_rectangle: engine.fill_rect failed for xid {host_xid:#x}: {e:?}",);
+        }
         Ok(())
     }
 
@@ -1309,14 +1461,18 @@ mod tests {
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
     /// implemented' gap." Verify dedup — same op logs once even
-    /// when called multiple times. (We can't easily intercept
-    /// `log::warn!` here without a logger fixture, but we can
-    /// assert the dedup set's bookkeeping by re-calling the gap
-    /// helper via a paint method.)
+    /// when called multiple times.
+    ///
+    /// Stage 2c wired fill_rectangle / put_image to real engine
+    /// calls; against `for_tests` (no Vk) those reach the engine,
+    /// surface `NoVk`, and log under a different name. The dedup
+    /// behaviour is unchanged: each gap-name fires once per
+    /// session. copy_area is still a logged-gap stub (Stage 2d
+    /// territory).
     #[test]
     fn v2_paint_stub_returns_ok_and_dedups_gap() {
         let mut b = KmsBackendV2::for_tests();
-        // First call logs.
+        // First call logs (xid is unknown → `*_unknown_xid` gap).
         assert!(b.put_image(None, 0x1234, 24, 16, 16, 0, 0, &[0; 4]).is_ok());
         // Subsequent calls also return Ok and don't crash.
         for _ in 0..5 {
@@ -1324,12 +1480,12 @@ mod tests {
             assert!(b.copy_area(None, 0x1234, 0x5678, 0, 0, 0, 0, 4, 4).is_ok());
             assert!(b.fill_rectangle(None, 0x1234, 0, 0, 0, 4, 4).is_ok());
         }
-        // Dedup set tracks per-method names; put_image, copy_area,
-        // fill_rectangle should each appear exactly once.
         let logged = b.logged_gaps.borrow();
-        assert!(logged.contains("put_image"));
+        // Unknown-xid path for the wired ops; `copy_area` keeps
+        // its Stage-1b stub name until Stage 2d wires it.
+        assert!(logged.contains("put_image_unknown_xid"));
+        assert!(logged.contains("fill_rectangle_unknown_xid"));
         assert!(logged.contains("copy_area"));
-        assert!(logged.contains("fill_rectangle"));
     }
 
     /// Spec: "boots far enough to service GetGeometry / InternAtom".

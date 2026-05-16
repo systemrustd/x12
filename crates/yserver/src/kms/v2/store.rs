@@ -86,6 +86,28 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
+    /// Production constructor — Vk handles owned by `PlatformBackend::
+    /// allocate_drawable_storage`. Initial layout is `UNDEFINED`;
+    /// transitions tracked thereafter via
+    /// [`Drawable::record_layout_transition`].
+    pub(crate) fn new_server_owned(
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        image_view: vk::ImageView,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Self {
+        Self {
+            image,
+            memory,
+            image_view,
+            extent,
+            format,
+            current_layout: vk::ImageLayout::UNDEFINED,
+            is_test_stub: false,
+        }
+    }
+
     /// Test-only constructor with null Vk handles. Used by
     /// unit tests that exercise refcount / damage / snapshot
     /// logic without needing a live VkContext.

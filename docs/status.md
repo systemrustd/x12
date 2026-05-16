@@ -122,9 +122,21 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     production paths flow uniform. 14 new unit tests; backend
     wiring of allocation methods (create_pixmap etc.) lands
     incrementally across Stages 2c–2d.
-  - [ ] **2c — RenderEngine minimal (fill / put_image / get_image).**
-    Three Vk paint ops via v2-native RenderBatch; offscreen
-    acceptance via CPU-oracle round-trip. Not yet started.
+  - [x] **2c — RenderEngine minimal (fill / put_image / get_image).**
+    Landed 2026-05-16. Three Vk paint ops on the v2 path:
+    `vkCmdClearAttachments`-driven fill_rect; staging-buffer
+    `vkCmdCopyBufferToImage` put_image (depths 1/8/24/32 with
+    MSB-first depth-1 unpack); synchronous `vkCmdCopyImageToBuffer`
+    get_image. Each op self-contained — one CB + one
+    FenceTicket per op (per-batch coalescing deferred to Stage 5);
+    `submitted` deque retires on signal; `get_image` is the only
+    `wait` path. `create_pixmap`/`free_pixmap`/`fill_rectangle`/
+    `poly_fill_rectangle`/`put_image`/`get_image` wired through
+    KmsBackendV2 → engine → store. Offscreen acceptance: 3
+    Vk-backed roundtrip tests (depth-32 PutImage→GetImage,
+    fill→GetImage, PutImage-then-fill) passing under lavapipe.
+    11 logic-only unit tests for byte-stride math + clipping.
+    v1 path unchanged.
   - [ ] **2d — copy_area + scene graph + blit pipeline.** First
     visible composed scanout; full-redraw every tick (no buffer-
     age yet).

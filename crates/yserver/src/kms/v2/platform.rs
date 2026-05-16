@@ -50,6 +50,7 @@ use crate::{
     drm,
     kms::{
         backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
+        v2::store::Storage,
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
@@ -555,6 +556,180 @@ impl PlatformBackend {
         }
         fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
         fds
+    }
+
+    /// VkContext accessor for the engine. Returns `None` on the
+    /// test fixture (`for_tests`) where Vk init is skipped.
+    pub(crate) fn vk(&self) -> Option<&Arc<VkContext>> {
+        self.vk.as_ref()
+    }
+
+    /// `OpsCommandPool` handle for the engine. `None` on the test
+    /// fixture. Engine allocates per-op CBs from this pool.
+    pub(crate) fn ops_command_pool_handle(&self) -> Option<vk::CommandPool> {
+        self.ops_command_pool.as_ref().map(OpsCommandPool::handle)
+    }
+
+    // ── Storage allocation (Stage 2c) ───────────────────────────
+
+    /// Map an X11 drawable depth to its v2 storage format. Mirrors
+    /// `DrawableImage::format_for_pixmap_depth` (v1) so the two
+    /// don't drift.
+    #[must_use]
+    pub(crate) fn format_for_depth(depth: u8) -> vk::Format {
+        match depth {
+            1 | 8 => vk::Format::R8_UNORM,
+            24 | 32 => vk::Format::B8G8R8A8_UNORM,
+            other => {
+                log::warn!(
+                    "v2 PlatformBackend::format_for_depth: unhandled depth {other} → \
+                     defaulting to B8G8R8A8_UNORM",
+                );
+                vk::Format::B8G8R8A8_UNORM
+            }
+        }
+    }
+
+    /// Allocate a fresh server-owned [`Storage`] for the
+    /// [`DrawableStore`]. DEVICE_LOCAL memory; tiling=OPTIMAL;
+    /// usage covers Stage 2c (TRANSFER_SRC/DST, COLOR_ATTACHMENT,
+    /// SAMPLED). Initial layout = `UNDEFINED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ERROR_INITIALIZATION_FAILED` if Vk is not
+    /// available (test fixture). Propagates `vkCreateImage` /
+    /// `vkAllocateMemory` / `vkBindImageMemory` /
+    /// `vkCreateImageView` failures.
+    pub(crate) fn allocate_drawable_storage(
+        &self,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> Result<Storage, vk::Result> {
+        let vk = self
+            .vk
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let format = Self::format_for_depth(depth);
+        let extent = vk::Extent2D {
+            width: u32::from(width.max(1)),
+            height: u32::from(height.max(1)),
+        };
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::SAMPLED,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { vk.device.create_image(&image_info, None)? };
+
+        let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+        let mem_props = unsafe {
+            vk.instance
+                .get_physical_device_memory_properties(vk.physical_device)
+        };
+        let memory_type_index = (0..mem_props.memory_type_count).find(|&i| {
+            mem_reqs.memory_type_bits & (1 << i) != 0
+                && mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        });
+        let Some(mt) = memory_type_index else {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        };
+
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mt)
+            .push_next(&mut dedicated);
+        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { vk.device.destroy_image(image, None) };
+                return Err(e);
+            }
+        };
+        if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                vk.device.free_memory(memory, None);
+                vk.device.destroy_image(image, None);
+            }
+            return Err(e);
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe {
+                    vk.device.free_memory(memory, None);
+                    vk.device.destroy_image(image, None);
+                }
+                return Err(e);
+            }
+        };
+
+        Ok(Storage::new_server_owned(
+            image, memory, view, extent, format,
+        ))
+    }
+
+    /// Submit a paint command buffer with `signal_fence`. Stage 2c
+    /// covers paint-only submits (no KMS sync semaphore); Stage 2d's
+    /// compose path adds the semaphore parameter.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `vkQueueSubmit2` failures. Sets `renderer_failed`
+    /// on Err so the next op surfaces the condition.
+    pub(crate) fn submit_paint_cb(
+        &mut self,
+        cb: vk::CommandBuffer,
+        signal_fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let Some(vk) = self.vk.as_ref() else {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        crate::vk_count!(queue_submit2);
+        match unsafe {
+            vk.device
+                .queue_submit2(vk.graphics_queue, &submit, signal_fence)
+        } {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.renderer_failed = true;
+                Err(e)
+            }
+        }
     }
 
     // ── I6a: FenceTicket primitives ─────────────────────────────
