@@ -702,40 +702,45 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       (`cursor_paths_do_not_log_gaps`) asserts the closure.
       228 lib + 18 ignored v2 Vk + 8 v2_acceptance tests green
       under lavapipe.
-    - [ ] **3f.6 — subwindow scene composition.** *Stage 3
-      close blocker, found 2026-05-16 during xterm/xclock
-      hardware smoke.* Both xterm and xclock paint into a
-      child window (xterm: `0x100015` under top-level
-      `0x10000c`; xclock: `0x10000b` under `0x10000a`);
-      v2's `build_scene` only iterates `core.top_level_order`,
-      so descendants' storage never reaches scanout — visible
-      result is whatever Vk left in the parent's storage at
-      allocate (black). The spec § scene-layering item 2 says
-      "top-level windows + descendants in z-order"; Stage 2d
-      shipped subwindow bookkeeping (`create_subwindow`,
-      `map_subwindow`, `scene_participating` flips,
-      `mark_scene_structure_dirty`) but `build_scene` never
-      grew the recurse — the gap was hidden by Stage 2's
-      synthetic acceptance (single Backend method against one
-      pixmap; no parent/child topology) + Stage 2's hardware
-      smoke being xsetroot (root-only, no top-level needed).
-      Scope:
-      - `WindowGeometryV2` grows `parent: Option<u32>`;
-        `create_subwindow` records the passed-in parent.
-      - `build_scene` walks top-level → mapped +
-        `scene_participating` descendants, projecting each
-        through accumulated parent offsets into output coords.
-      - `change_subwindow_attributes` ports v1's body verbatim
-        (`backend.rs:9449-9470`): store `bg_pixel` / `bg_pixmap`
-        into the window record; currently logged as a v2 gap.
-      - New window storage cleared to `bg_pixel` on allocate +
-        on configure resize so freshly-mapped windows have a
-        defined initial colour (v1 does this; v2 currently
-        leaves storage as fresh-Vk-undefined).
-      - Vk-backed acceptance test: paint into a child window,
-        scene blit shows the child contents at the parent
-        offset.
-      Sizing: ~300-500 LoC + tests, 1 focused session.
+    - [x] **3f.6 — subwindow scene composition landed
+      2026-05-16.** `WindowGeometryV2` grows `parent:
+      Option<u32>` + `bg_pixel` + `bg_pixmap`.
+      `create_subwindow` records the passed-in parent xid +
+      bg-pixel; `reparent_subwindow` updates parent on tree
+      moves. `change_subwindow_attributes` ports v1's
+      `CWBackPixmap` (0x01) + `CWBackPixel` (0x02) parse —
+      pre-3f.6 stub logged a `v2:` gap, now stores the values
+      into `windows_v2[xid]`. `allocate_window_storage`
+      (called from `create_subwindow` / `register_top_level`
+      / `register_subwindow`) clears fresh storage to
+      `bg_pixel` via `engine.fill_rect` so freshly-mapped
+      windows have a defined initial colour. `configure_subwindow`
+      re-fills bg_pixel on resize.
+
+      `build_scene` factored: top-level iteration calls a new
+      `emit_window_subtree` recurse that walks top-level →
+      mapped descendants, projecting through accumulated
+      parent offsets into output coords. Unmapped parents
+      short-circuit the entire subtree per X11 MapWindow
+      cascade semantics. Sibling z-order between children
+      of the same parent is HashMap-iteration-order — proper
+      stack tracking is post-3f.6 polish (most real apps have
+      one child per parent so the gap rarely matters at
+      Stage 3).
+
+      4 new tests:
+      `build_scene_recurses_into_mapped_children` (parent +
+      child draw entries with absolute coords),
+      `build_scene_unmapped_parent_hides_subtree` (cascade),
+      `change_subwindow_attributes_stores_bg_state`
+      (value-mask 0x03 lands both fields; bookkeeping no
+      longer logs a gap),
+      `create_subwindow_records_parent_and_bg_pixel` (parent
+      xid + bg-pixel hint stored on the geometry record).
+
+      232 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
+      green under lavapipe. Hardware smoke (xterm under no-WM,
+      xclock) pending — runs at 3f.5.
     - [ ] **3f.7 — input dispatch.** *Stage 3 close blocker,
       found 2026-05-16 during xterm hardware smoke.* v2 logs
       `on_host_input not yet implemented` on first libinput

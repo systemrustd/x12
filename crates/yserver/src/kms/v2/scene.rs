@@ -663,15 +663,25 @@ fn all_zero(c: [f32; 4]) -> bool {
 /// Walk window tree, build the per-output scene + collect damage
 /// snapshots.
 ///
-/// Stage 2d simplifications:
+/// Stage 3f.6 lifted the Stage 2d "top-level only" simplification:
+/// the recurse below walks each top-level → mapped + scene-
+/// participating descendants, accumulating parent offsets into
+/// absolute (root-space) coords before projecting onto the output.
+/// xterm / xclock / any real app that paints into a child window
+/// needs this — the bare top-level traversal showed only the
+/// parent's (typically unpainted) storage on scanout.
+///
+/// Still-deferred simplifications:
 /// - Skip the root storage entirely — bg_pixel is the clear color
 ///   (`scene.bg_color`). `bg_pixmap` would need a sample-from-pixmap
 ///   that uses the same blit pipeline as windows, deferred to
-///   Stage 3 alongside the rest of the root content pipeline.
-/// - Top-level windows only, no descendants. Z-order is
-///   `core.top_level_order` (back-to-front). Subwindow draws land
-///   when Stage 3 generalises window-tree compositing.
-/// - Cursor skipped (no cursor storage in Stage 2d).
+///   Stage 4 alongside the rest of the root content pipeline.
+/// - Sibling z-order between children of the same parent is
+///   HashMap-iteration-order (windows_v2's underlying
+///   `HashMap<u32, WindowGeometryV2>`). Proper stack-order tracking
+///   is post-3f.6. Most real apps (xterm, xclock) have one child
+///   per parent so the ordering rarely matters at Stage 3.
+/// - Cursor skipped (no cursor storage in v2 until Stage 4).
 fn build_scene(
     core: &KmsCore,
     store: &mut DrawableStore,
@@ -692,76 +702,132 @@ fn build_scene(
     let mut draws: Vec<CompositeDraw> = Vec::new();
     let mut snapshots: Vec<DamageSnapshot> = Vec::new();
     let mut projected = RegionSet::new();
-    for &host_xid in &core.top_level_order {
-        let Some(geom) = windows_v2.get(&host_xid) else {
-            continue;
-        };
-        if !geom.mapped {
-            continue;
-        }
-        let Some(id) = store.lookup(host_xid) else {
-            continue;
-        };
-        let Some(drawable) = store.get(id) else {
-            continue;
-        };
-        if !drawable.scene_participating {
-            // Manual-redirected backings, unmapped windows.
-            continue;
-        }
-        if !matches!(drawable.kind, DrawableKind::Window) {
-            continue;
-        }
-        let image_view = drawable.storage.image_view;
-        if image_view == vk::ImageView::null() {
-            continue;
-        }
-        // Project window geometry into output-local coords.
-        let dx = i32::from(geom.x) - layout_x0;
-        let dy = i32::from(geom.y) - layout_y0;
-        // Trivial reject if the window doesn't intersect the
-        // output at all.
-        let win_w = i32::from(geom.width);
-        let win_h = i32::from(geom.height);
-        if dx + win_w <= 0
-            || dy + win_h <= 0
-            || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
-            || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX)
-        {
-            continue;
-        }
-        draws.push(CompositeDraw {
-            image_view,
-            #[allow(clippy::cast_precision_loss)]
-            dst_origin: [dx as f32, dy as f32],
-            #[allow(clippy::cast_precision_loss)]
-            dst_size: [win_w as f32, win_h as f32],
-            src_origin: [0.0, 0.0],
-            src_size: [1.0, 1.0],
-            alpha_passthrough: false,
-        });
-        // Peek damage + project to output coords. The snapshot
-        // is captured for retirement-ack; its region (projected
-        // through the entry transform — Stage 2e single-output
-        // transform is just (dx, dy) offset) feeds output damage.
-        if let Some(snap) = store.peek_presentation_damage(id) {
-            for r in snap.region.rects() {
-                projected.add(vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: r.offset.x + dx,
-                        y: r.offset.y + dy,
-                    },
-                    extent: r.extent,
-                });
-            }
-            snapshots.push(snap);
-        }
+    for &top_xid in &core.top_level_order {
+        emit_window_subtree(
+            top_xid,
+            0,
+            0,
+            store,
+            windows_v2,
+            layout_x0,
+            layout_y0,
+            layout_w,
+            layout_h,
+            &mut draws,
+            &mut snapshots,
+            &mut projected,
+        );
     }
     let scene = CompositeScene {
         bg_color: bg,
         draws,
     };
     (scene, snapshots, projected)
+}
+
+/// Stage 3f.6 recurse: emit a CompositeDraw entry for `host_xid` if
+/// it's mapped + scene-participating + has live storage, then recurse
+/// into mapped descendants with accumulated parent offsets.
+///
+/// Coordinates: `parent_abs_x` / `parent_abs_y` are the absolute
+/// (root-space) origin of this window's parent. The window's own
+/// position (`geom.x`, `geom.y`) is parent-relative per X11, so the
+/// window's absolute origin is `parent_abs + geom`. We project onto
+/// the output by subtracting the output's layout origin.
+///
+/// A child is only visible if every ancestor in the chain is mapped;
+/// `unmapped` short-circuits the entire subtree (matches X11
+/// MapWindow semantics — an unmapped parent hides all descendants).
+#[allow(clippy::too_many_arguments)]
+fn emit_window_subtree(
+    host_xid: u32,
+    parent_abs_x: i32,
+    parent_abs_y: i32,
+    store: &mut DrawableStore,
+    windows_v2: &super::backend::WindowsV2Map,
+    layout_x0: i32,
+    layout_y0: i32,
+    layout_w: u32,
+    layout_h: u32,
+    draws: &mut Vec<CompositeDraw>,
+    snapshots: &mut Vec<DamageSnapshot>,
+    projected: &mut RegionSet,
+) {
+    let Some(geom) = windows_v2.get(&host_xid) else {
+        return;
+    };
+    if !geom.mapped {
+        // X11: an unmapped window (and entire subtree) is invisible.
+        return;
+    }
+    let abs_x = parent_abs_x + i32::from(geom.x);
+    let abs_y = parent_abs_y + i32::from(geom.y);
+
+    // Emit a draw entry for this window if it has live storage that
+    // participates in the scene.
+    if let Some(id) = store.lookup(host_xid)
+        && let Some(drawable) = store.get(id)
+        && drawable.scene_participating
+        && matches!(drawable.kind, DrawableKind::Window)
+        && drawable.storage.image_view != vk::ImageView::null()
+    {
+        let image_view = drawable.storage.image_view;
+        // Project onto output-local coords.
+        let dx = abs_x - layout_x0;
+        let dy = abs_y - layout_y0;
+        let win_w = i32::from(geom.width);
+        let win_h = i32::from(geom.height);
+        // Trivial reject only if the window doesn't intersect the
+        // output at all.
+        let intersects = !(dx + win_w <= 0
+            || dy + win_h <= 0
+            || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
+            || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+        if intersects {
+            draws.push(CompositeDraw {
+                image_view,
+                #[allow(clippy::cast_precision_loss)]
+                dst_origin: [dx as f32, dy as f32],
+                #[allow(clippy::cast_precision_loss)]
+                dst_size: [win_w as f32, win_h as f32],
+                src_origin: [0.0, 0.0],
+                src_size: [1.0, 1.0],
+                alpha_passthrough: false,
+            });
+            if let Some(snap) = store.peek_presentation_damage(id) {
+                for r in snap.region.rects() {
+                    projected.add(vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: r.offset.x + dx,
+                            y: r.offset.y + dy,
+                        },
+                        extent: r.extent,
+                    });
+                }
+                snapshots.push(snap);
+            }
+        }
+    }
+
+    // Recurse into mapped descendants. Sibling z-order is HashMap
+    // iteration order (see fn-level comment) — proper stack tracking
+    // is post-3f.6.
+    let children: Vec<u32> = windows_v2
+        .iter()
+        .filter_map(|(xid, g)| {
+            if g.parent == Some(host_xid) {
+                Some(*xid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for child_xid in children {
+        emit_window_subtree(
+            child_xid, abs_x, abs_y, store, windows_v2, layout_x0, layout_y0, layout_w, layout_h,
+            draws, snapshots, projected,
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1198,5 +1264,150 @@ mod tests {
         let empty = RegionSet::new();
         let p = pick_repaint_region(Some(2), false, 3, &empty, &history, extent(800, 600));
         assert!(matches!(p, Repaint::Full(_)));
+    }
+
+    // ── Stage 3f.6: subwindow scene traversal ─────────────────────
+
+    fn alloc_stub_window(
+        store: &mut DrawableStore,
+        windows_v2: &mut super::super::backend::WindowsV2Map,
+        xid: u32,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        parent: Option<u32>,
+        mapped: bool,
+    ) {
+        // for_tests_null gives null image handles; build_scene
+        // rejects null views. Use a non-zero sentinel handle so the
+        // traversal test exercises the recurse logic. The handle
+        // never gets passed to Vk because the test never composes.
+        let mut storage = super::super::store::Storage::for_tests_null(
+            extent(u32::from(w), u32::from(h)),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        // SAFETY: Vk handle types are opaque u64s; constructing a
+        // sentinel doesn't touch the driver. The `is_test_stub`
+        // flag on Storage means Drop won't try to destroy these.
+        storage.image_view = ash::vk::Handle::from_raw(u64::from(xid) | 0xFF00_0000);
+        store
+            .allocate(xid, DrawableKind::Window, 32, mapped, storage)
+            .expect("stub allocate");
+        windows_v2.insert(
+            xid,
+            super::super::backend::WindowGeometryV2 {
+                x,
+                y,
+                width: w,
+                height: h,
+                depth: 32,
+                mapped,
+                parent,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+    }
+
+    /// Stage 3f.6 — `build_scene` walks top-level → mapped
+    /// descendants and produces draw entries in absolute coords.
+    /// Top-level at (50, 60), child at (10, 20) relative → child
+    /// emits at output coords (60, 80).
+    #[test]
+    fn build_scene_recurses_into_mapped_children() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Top-level @ (50, 60), 200×100.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Child @ (10, 20) relative to top-level, 40×30.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x101,
+            10,
+            20,
+            40,
+            30,
+            Some(0x100),
+            true,
+        );
+
+        let (scene, _snaps, _proj) = build_scene(&core, &mut store, &windows_v2, 0, &platform);
+        assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
+
+        // Top-level at output (50, 60) since output layout origin is (0,0).
+        let top = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_size[0] == 200.0 && d.dst_size[1] == 100.0)
+            .expect("top-level draw present");
+        assert_eq!(top.dst_origin, [50.0, 60.0]);
+
+        // Child at absolute (60, 80) = top (50, 60) + child rel (10, 20).
+        let child = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_size[0] == 40.0 && d.dst_size[1] == 30.0)
+            .expect("child draw present");
+        assert_eq!(child.dst_origin, [60.0, 80.0]);
+    }
+
+    /// Stage 3f.6 — unmapped parent hides the entire subtree per
+    /// X11 MapWindow cascade semantics. Child stays scene-
+    /// participating but doesn't render because its ancestor is
+    /// unmapped.
+    #[test]
+    fn build_scene_unmapped_parent_hides_subtree() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x200,
+            10,
+            10,
+            100,
+            100,
+            None,
+            false, /* parent NOT mapped */
+        );
+        core.top_level_order.push(0x200);
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x201,
+            0,
+            0,
+            50,
+            50,
+            Some(0x200),
+            true, /* child IS mapped, but parent isn't */
+        );
+
+        let (scene, _snaps, _proj) = build_scene(&core, &mut store, &windows_v2, 0, &platform);
+        assert!(
+            scene.draws.is_empty(),
+            "unmapped parent must short-circuit subtree (got {} draws)",
+            scene.draws.len()
+        );
     }
 }

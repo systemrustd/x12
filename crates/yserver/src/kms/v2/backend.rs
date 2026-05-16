@@ -56,6 +56,15 @@ use crate::{
 /// Risk 3: a parallel `windows_v2` map on `KmsBackendV2` (NOT on
 /// `KmsCore` — v1 doesn't need it). Stage 4 may collapse into
 /// `KmsCore.windows` when `WindowState` splits.
+///
+/// Stage 3f.6 grows `parent`: subwindows record their parent xid so
+/// `build_scene` can recurse top-level → descendants with accumulated
+/// offsets. `None` marks top-levels (parent is root, not tracked
+/// in `windows_v2`). The `bg_pixel` / `bg_pixmap` slots carry
+/// per-window background attributes set via
+/// `change_subwindow_attributes`; the bg-pixel is painted into
+/// storage at allocate + configure resize so freshly-mapped windows
+/// have a defined initial colour.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WindowGeometryV2 {
     pub(crate) x: i16,
@@ -64,6 +73,9 @@ pub(crate) struct WindowGeometryV2 {
     pub(crate) height: u16,
     pub(crate) depth: u8,
     pub(crate) mapped: bool,
+    pub(crate) parent: Option<u32>,
+    pub(crate) bg_pixel: Option<u32>,
+    pub(crate) bg_pixmap: Option<u32>,
 }
 
 pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
@@ -616,7 +628,11 @@ impl KmsBackendV2 {
     }
 
     /// Allocate v2 storage + windows_v2 entry for a host xid.
-    /// Idempotent against duplicate xids (logs + skips).
+    /// Idempotent against duplicate xids (logs + skips). `parent`
+    /// is `Some(parent_xid)` for subwindows + `None` for top-levels
+    /// (parent = root, not tracked in `windows_v2`). The
+    /// `bg_pixel` slot is what gets painted into fresh storage —
+    /// `None` leaves it Vk-undefined (depth-1 / depth-8 masks).
     fn allocate_window_storage(
         &mut self,
         host_xid: u32,
@@ -625,10 +641,13 @@ impl KmsBackendV2 {
         width: u16,
         height: u16,
         depth: u8,
+        parent: Option<u32>,
+        bg_pixel: Option<u32>,
     ) {
         if self.windows_v2.contains_key(&host_xid) {
             return;
         }
+        let mut storage_allocated = false;
         match self
             .platform
             .allocate_drawable_storage(width.max(1), height.max(1), depth)
@@ -648,6 +667,7 @@ impl KmsBackendV2 {
                 }
                 self.telemetry.record_storage_allocation();
                 self.telemetry.record_image_view_create();
+                storage_allocated = true;
             }
             Err(e) => {
                 // No Vk fixture (`for_tests`) → storage allocation
@@ -666,8 +686,38 @@ impl KmsBackendV2 {
                 height,
                 depth,
                 mapped: false,
+                parent,
+                bg_pixel,
+                bg_pixmap: None,
             },
         );
+        // Stage 3f.6: clear newly-allocated storage to `bg_pixel`
+        // so freshly-mapped windows have a defined colour. v1 does
+        // this at the same hook (`create_subwindow`). Skips when
+        // storage wasn't allocated (test fixture) or when there's
+        // no bg_pixel (caller didn't pass one — depth-1/8 mask
+        // pixmaps or windows with bg=None).
+        if storage_allocated
+            && let Some(pixel) = bg_pixel
+            && let Some(id) = self.store.lookup(host_xid)
+        {
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::from(width.max(1)),
+                    height: u32::from(height.max(1)),
+                },
+            };
+            let color = decode_x11_pixel_bgra(pixel);
+            if let Err(e) =
+                self.engine
+                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+            {
+                log::debug!(
+                    "v2 allocate_window_storage: initial bg_pixel fill failed for xid {host_xid:#x}: {e:?}"
+                );
+            }
+        }
     }
 
     // ── Stage 3a: Core-text helpers ─────────────────────────────
@@ -1247,19 +1297,39 @@ impl Backend for KmsBackendV2 {
     fn create_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_parent: WindowHandle,
+        host_parent: WindowHandle,
         x: i16,
         y: i16,
         width: u16,
         height: u16,
         _border_width: u16,
         visual: HostSubwindowVisual,
-        _background_pixel: Option<u32>,
-        _background_pixmap: Option<u32>,
+        background_pixel: Option<u32>,
+        background_pixmap: Option<u32>,
     ) -> io::Result<WindowHandle> {
         let xid = self.core.next_host_xid();
         let depth = depth_for_visual(visual);
-        self.allocate_window_storage(xid, x, y, width.max(1), height.max(1), depth);
+        let parent_xid = host_parent.as_raw();
+        // Stage 3f.6: record the parent xid so `build_scene` can
+        // recurse the tree. `bg_pixel` is passed into
+        // `allocate_window_storage`, which paints it into the fresh
+        // storage; bg_pixmap is stored as metadata for now (proper
+        // pixmap-bg support is a Stage 4-ish item).
+        self.allocate_window_storage(
+            xid,
+            x,
+            y,
+            width.max(1),
+            height.max(1),
+            depth,
+            Some(parent_xid),
+            background_pixel,
+        );
+        if let Some(bg_pix) = background_pixmap
+            && let Some(geom) = self.windows_v2.get_mut(&xid)
+        {
+            geom.bg_pixmap = Some(bg_pix);
+        }
         self.scene.mark_scene_structure_dirty();
         WindowHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_subwindow: xid was 0"))
     }
@@ -1333,6 +1403,7 @@ impl Backend for KmsBackendV2 {
         let new_h = geom.height.max(1);
         let depth = geom.depth;
         let scene_participating = geom.mapped;
+        let bg_pixel = geom.bg_pixel;
         if size_changed && let Some(old_id) = self.store.lookup(host_xid) {
             // Allocate fresh storage, decref the old. Stage 2d
             // doesn't preserve content across resize — clients
@@ -1351,6 +1422,34 @@ impl Backend for KmsBackendV2 {
                         log::warn!(
                             "v2 configure_subwindow: store.allocate failed for xid {host_xid:#x}: {e:?}",
                         );
+                    } else {
+                        // Stage 3f.6: clear the fresh storage to
+                        // bg_pixel so resize doesn't leave Vk-
+                        // undefined content visible until the
+                        // client's next repaint.
+                        if let Some(pixel) = bg_pixel
+                            && let Some(id) = self.store.lookup(host_xid)
+                        {
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(new_w),
+                                    height: u32::from(new_h),
+                                },
+                            };
+                            let color = decode_x11_pixel_bgra(pixel);
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                id,
+                                rect,
+                                color,
+                            ) {
+                                log::debug!(
+                                    "v2 configure_subwindow: bg_pixel fill on resize failed for xid {host_xid:#x}: {e:?}"
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -1368,13 +1467,25 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
         host_xid: u32,
-        _host_parent: u32,
+        host_parent: u32,
         x: i16,
         y: i16,
     ) -> io::Result<()> {
+        // Stage 3f.6: update the parent xid so build_scene's
+        // descendant traversal sees the new tree shape on the next
+        // tick. A `host_parent` of 0 (or any xid not in
+        // `windows_v2` — typically root, 0x100) means the window
+        // becomes a top-level under root; we record `None` so the
+        // recurse treats it as a top-level entry.
+        let parent = if host_parent == 0 || !self.windows_v2.contains_key(&host_parent) {
+            None
+        } else {
+            Some(host_parent)
+        };
         if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
+            geom.parent = parent;
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
@@ -1383,11 +1494,31 @@ impl Backend for KmsBackendV2 {
     fn change_subwindow_attributes(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _value_mask: u32,
-        _values: &[u32],
+        host_xid: u32,
+        value_mask: u32,
+        values: &[u32],
     ) -> io::Result<()> {
-        self.log_v2_gap("change_subwindow_attributes");
+        // Stage 3f.6: v1-shape parse of the CWA value-mask.
+        // CWBackPixmap (0x01) and CWBackPixel (0x02) are the two
+        // we honour today — they decide what fresh / cleared regions
+        // of the window storage look like. Other CW bits
+        // (CWBorderPixel, CWBitGravity, CWEventMask, etc.) flow
+        // through other Backend methods or get folded into broader
+        // window state; storing only what `windows_v2` needs.
+        let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        let mut idx = 0;
+        if value_mask & 0x01 != 0 && idx < values.len() {
+            // CWBackPixmap. 0 = None / inherit-from-parent.
+            let v = values[idx];
+            geom.bg_pixmap = if v == 0 { None } else { Some(v) };
+            idx += 1;
+        }
+        if value_mask & 0x02 != 0 && idx < values.len() {
+            // CWBackPixel — opaque ARGB-or-XRGB pixel value.
+            geom.bg_pixel = Some(values[idx]);
+        }
         Ok(())
     }
 
@@ -1416,7 +1547,9 @@ impl Backend for KmsBackendV2 {
         // start at 1x1 (Stage 2 plan compromise) and resize on
         // first configure_subwindow.
         if !self.windows_v2.contains_key(&host_xid) {
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32);
+            // Top-level: parent = None (root), no bg_pixel known yet
+            // (set later via change_subwindow_attributes).
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32, None, None);
         }
         if !self.core.top_level_order.contains(&host_xid) {
             self.core.top_level_order.push(host_xid);
@@ -1433,7 +1566,17 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         self.core.xid_map.insert(host_xid, nested_id);
         if !self.windows_v2.contains_key(&host_xid) {
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32);
+            // register_subwindow doesn't carry parent xid (Backend
+            // trait doesn't expose it here — the trait shape was
+            // built around v1's flat windows table). Parent is set
+            // when `create_subwindow` fires for the same host_xid
+            // (it's the entry point that knows the parent). If
+            // register_subwindow runs first (e.g. ynest's wire
+            // ordering), we'll get `None` and the scene treats this
+            // window as a top-level until a `create_subwindow`
+            // catches up. Matches v1's "no parent tracking" status
+            // — v1 simply doesn't compose children either.
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32, None, None);
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
@@ -4966,5 +5109,92 @@ mod tests {
                 "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
             );
         }
+    }
+
+    /// Stage 3f.6 close: `change_subwindow_attributes` stores
+    /// `bg_pixel` + `bg_pixmap` into the v2 window record instead of
+    /// logging a gap. value_mask=0x03 (CWBackPixmap + CWBackPixel)
+    /// with values [pixmap_xid, pixel] lands both. value_mask=0x02
+    /// alone lands the pixel only. value_mask=0x01 with pixmap=0
+    /// resolves to bg_pixmap=None per X11 semantics.
+    #[test]
+    fn change_subwindow_attributes_stores_bg_state() {
+        let mut b = KmsBackendV2::for_tests();
+        // Seed a window in windows_v2 directly (allocate fails on
+        // for_tests because there's no Vk; geometry insert still
+        // works in production via the no-Vk branch).
+        b.windows_v2.insert(
+            0xCAFE_BABE,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 32,
+                mapped: false,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+
+        // CWBackPixmap (0x01) + CWBackPixel (0x02), values =
+        // [0xABCD_1234, 0xFF0000FF].
+        b.change_subwindow_attributes(None, 0xCAFE_BABE, 0x03, &[0xABCD_1234, 0xFF00_00FF])
+            .expect("ok");
+        let geom = b.windows_v2[&0xCAFE_BABE];
+        assert_eq!(geom.bg_pixmap, Some(0xABCD_1234));
+        assert_eq!(geom.bg_pixel, Some(0xFF00_00FF));
+
+        // CWBackPixmap=0 → None (inherit-from-parent). bg_pixel
+        // stays as the previous value (CWBackPixel bit clear).
+        b.change_subwindow_attributes(None, 0xCAFE_BABE, 0x01, &[0])
+            .expect("ok");
+        let geom = b.windows_v2[&0xCAFE_BABE];
+        assert_eq!(geom.bg_pixmap, None);
+        assert_eq!(geom.bg_pixel, Some(0xFF00_00FF));
+
+        // The pre-3f.6 stub bumped a `change_subwindow_attributes`
+        // gap; 3f.6 stores bookkeeping cleanly.
+        assert!(
+            !b.logged_gaps
+                .borrow()
+                .contains("change_subwindow_attributes"),
+            "change_subwindow_attributes must not log a gap post-3f.6"
+        );
+    }
+
+    /// Stage 3f.6 — `create_subwindow` records the parent xid + the
+    /// background-pixel hint so subsequent `build_scene` traversals
+    /// can reach the new window and an initial bg_pixel fill can
+    /// run. Engine fill itself returns `NoVk` on the test fixture;
+    /// the load-bearing observable is the geometry record.
+    #[test]
+    fn create_subwindow_records_parent_and_bg_pixel() {
+        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+        let mut b = KmsBackendV2::for_tests();
+        let parent = WindowHandle::from_raw(0x1234_5678).unwrap();
+        let child = b
+            .create_subwindow(
+                None,
+                parent,
+                10,
+                20,
+                100,
+                50,
+                0,
+                HostSubwindowVisual::CopyFromParent,
+                Some(0xFF11_2233),
+                None,
+            )
+            .expect("create_subwindow");
+        let geom = b.windows_v2[&child.as_raw()];
+        assert_eq!(geom.parent, Some(0x1234_5678));
+        assert_eq!(geom.bg_pixel, Some(0xFF11_2233));
+        assert_eq!(geom.x, 10);
+        assert_eq!(geom.y, 20);
+        assert_eq!(geom.width, 100);
+        assert_eq!(geom.height, 50);
+        assert!(!geom.mapped, "mapped is set later via map_subwindow");
     }
 }
