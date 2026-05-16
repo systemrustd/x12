@@ -15,7 +15,12 @@
 //! `v2: <method> not yet implemented` warn line per opcode. No
 //! real-app gates land at this stage — those wait for Stage 3.
 
-use std::{any::Any, cell::RefCell, collections::HashSet, io};
+use std::{
+    any::Any,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use yserver_core::{
     backend::{
@@ -41,6 +46,22 @@ use crate::{
         },
     },
 };
+
+/// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
+/// Risk 3: a parallel `windows_v2` map on `KmsBackendV2` (NOT on
+/// `KmsCore` — v1 doesn't need it). Stage 4 may collapse into
+/// `KmsCore.windows` when `WindowState` splits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WindowGeometryV2 {
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) depth: u8,
+    pub(crate) mapped: bool,
+}
+
+pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
@@ -70,11 +91,15 @@ pub struct KmsBackendV2 {
     /// storage; consumed by every `Backend` paint method on this
     /// backend.
     pub(crate) engine: RenderEngine,
-    /// v2's scene compositor — still stubbed through Stage 2c.
-    /// Stage 2d fills it in with the blit pipeline + first
-    /// visible composed scanout.
-    #[allow(dead_code)]
-    scene: SceneCompositor,
+    /// v2's scene compositor — real per Stage 2d.
+    pub(crate) scene: SceneCompositor,
+    /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
+    /// need it). Keyed by host xid; mutated by
+    /// `register_top_level` / `register_subwindow` /
+    /// `create_subwindow` / `configure_subwindow` /
+    /// `map_subwindow` / `unmap_subwindow` /
+    /// `destroy_subwindow`.
+    pub(crate) windows_v2: WindowsV2Map,
 }
 
 impl KmsBackendV2 {
@@ -107,11 +132,13 @@ impl KmsBackendV2 {
         let core = KmsCore::new(fb_w, fb_h)?;
         let engine = RenderEngine::new(&platform)
             .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
+        let scene = SceneCompositor::new(&platform)
+            .map_err(|e| io::Error::other(format!("v2 SceneCompositor::new failed: {e:?}")))?;
         log::info!(
             "yserver(v2): KmsBackendV2 boot — {} output(s), {fb_w}x{fb_h} virtual screen; \
-             Stage 2c engine live (fill/put_image/get_image); scene compose stubbed \
-             pending Stage 2d, expect 'v2: <method> not yet implemented' warns for \
-             non-Stage-2c paint ops on first client request",
+             Stage 2c engine + Stage 2d scene live (full-redraw, no buffer-age); \
+             expect 'v2: <method> not yet implemented' warns for ops outside \
+             Stage 2c/2d on first client request",
             platform.outputs.len(),
         );
         Ok(Self {
@@ -120,7 +147,8 @@ impl KmsBackendV2 {
             logged_gaps: RefCell::new(HashSet::new()),
             store: DrawableStore::new(),
             engine,
-            scene: SceneCompositor::stub(),
+            scene,
+            windows_v2: WindowsV2Map::new(),
         })
     }
 
@@ -138,6 +166,7 @@ impl KmsBackendV2 {
             store: DrawableStore::new(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
+            windows_v2: WindowsV2Map::new(),
         }
     }
 
@@ -196,17 +225,25 @@ impl KmsBackendV2 {
         self.platform.take_input_ctx()
     }
 
-    /// Initial composite + flip. v2's compositor is stubbed
-    /// until Stage 2d; log + Ok so `lib.rs`'s pre-loop composite
-    /// call doesn't fail the boot.
+    /// Initial composite + flip. v2's SceneCompositor records
+    /// one compose CB per output and atomic-flips. On a fresh
+    /// boot the scene typically has no mapped windows yet, so
+    /// this paints the `bg_pixel` clear color and flips.
     ///
     /// # Errors
     ///
-    /// Stage 2a never errors; Stage 2d wires the real compose
-    /// path.
+    /// Returns the first per-output Vk / DRM failure; subsequent
+    /// outputs still attempted.
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
-        self.log_v2_gap("composite_and_flip");
-        Ok(())
+        match self.scene.tick(
+            &self.core,
+            &mut self.store,
+            &mut self.platform,
+            &self.windows_v2,
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(io::Error::other(format!("v2 composite_and_flip: {e:?}"))),
+        }
     }
 
     /// Post-loop teardown — delegates to PlatformBackend, which
@@ -219,15 +256,12 @@ impl KmsBackendV2 {
     /// Propagates the first per-output `drm::modeset::disable_output`
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
-        // Drain in-flight paint submits before the platform's
-        // `device_wait_idle` + pool destruction so the engine's
-        // CB / staging book-keeping reclaims its handles against
-        // the still-live pool. Otherwise CBs would leak (the pool
-        // destroy frees them anyway, but the engine's
-        // `submitted` deque keeps stale entries it'd touch on a
-        // subsequent `poll_retired` — making shutdown order
-        // observable).
+        // Drain in-flight paint + compose submits before the
+        // platform's `device_wait_idle` + pool destruction so
+        // each subsystem's book-keeping reclaims its handles
+        // against the still-live pool.
         self.engine.drain_all(&self.platform);
+        self.scene.drain_all(&self.platform);
         self.platform.disable_output()
     }
 
@@ -237,6 +271,76 @@ impl KmsBackendV2 {
     fn log_v2_gap(&self, method: &'static str) {
         if self.logged_gaps.borrow_mut().insert(method) {
             log::warn!("v2: {method} not yet implemented — paint or composite operation skipped");
+        }
+    }
+
+    /// Allocate v2 storage + windows_v2 entry for a host xid.
+    /// Idempotent against duplicate xids (logs + skips).
+    fn allocate_window_storage(
+        &mut self,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) {
+        if self.windows_v2.contains_key(&host_xid) {
+            return;
+        }
+        match self
+            .platform
+            .allocate_drawable_storage(width.max(1), height.max(1), depth)
+        {
+            Ok(storage) => {
+                if let Err(e) = self.store.allocate(
+                    host_xid,
+                    DrawableKind::Window,
+                    depth,
+                    false, // becomes true on map_subwindow
+                    storage,
+                ) {
+                    log::warn!(
+                        "v2 allocate_window_storage: store.allocate failed for xid {host_xid:#x}: {e:?}",
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                // No Vk fixture (`for_tests`) → storage allocation
+                // returns ERROR_INITIALIZATION_FAILED. Tracking
+                // the geometry without storage is fine; the scene
+                // tick filters out null image-views.
+                log::debug!("v2 allocate_window_storage: no Vk for xid {host_xid:#x}: {e:?}",);
+            }
+        }
+        self.windows_v2.insert(
+            host_xid,
+            WindowGeometryV2 {
+                x,
+                y,
+                width,
+                height,
+                depth,
+                mapped: false,
+            },
+        );
+    }
+}
+
+/// Map a host-visual descriptor to a depth for the storage
+/// allocator. Stage 2d picks BGRA32 for `CopyFromParent` (the
+/// default visual is depth-24 ARGB-equivalent in our advertised
+/// pixel format) and honours an explicit depth otherwise.
+fn depth_for_visual(visual: HostSubwindowVisual) -> u8 {
+    match visual {
+        HostSubwindowVisual::CopyFromParent => 32,
+        HostSubwindowVisual::Explicit { depth, .. } => {
+            if depth == 0 {
+                32
+            } else {
+                depth
+            }
         }
     }
 }
@@ -323,21 +427,45 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
-        // v2 never submits a flip in Stage 1b, so this fires only if
-        // the kernel sends a spurious completion (shouldn't happen).
-        self.log_v2_gap("on_page_flip_ready");
+        // Walk every output, retire whichever has a pending flip.
+        // The platform's `on_page_flip_complete` returns `None` for
+        // outputs without a pending BO, so this is safe to call
+        // unconditionally per-output.
+        let n = self.platform.outputs.len();
+        for output_idx in 0..n {
+            self.scene
+                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform);
+        }
+        // Sweep retired engine submits + retired drawables now
+        // that their fences may have signaled.
+        self.engine.poll_retired(&self.platform);
+        self.store.poll_pending_retire(&mut self.platform);
     }
 
     fn mark_dirty(&mut self) {
-        // No compositor to drive — silent no-op (skip the dedup
-        // logger; mark_dirty fires on every protocol mutation and
-        // would spam).
+        // Bump the scene-structure dirty bit; the next
+        // `maybe_composite` will tick the compositor. Silent —
+        // mark_dirty fires on every protocol mutation, so log
+        // dedup would not help.
+        self.scene.mark_scene_structure_dirty();
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
-        // Same reasoning as mark_dirty: would fire every core-loop
-        // iteration. Silent no-op.
-        Ok(())
+        if !self.scene.scene_structure_dirty {
+            return Ok(());
+        }
+        match self.scene.tick(
+            &self.core,
+            &mut self.store,
+            &mut self.platform,
+            &self.windows_v2,
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                log::warn!("v2 maybe_composite: scene.tick failed: {e:?}");
+                Ok(())
+            }
+        }
     }
 
     fn dump_scanout(&mut self) {
@@ -357,62 +485,135 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
         _host_parent: WindowHandle,
-        _x: i16,
-        _y: i16,
-        _width: u16,
-        _height: u16,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
         _border_width: u16,
-        _visual: HostSubwindowVisual,
+        visual: HostSubwindowVisual,
         _background_pixel: Option<u32>,
         _background_pixmap: Option<u32>,
     ) -> io::Result<WindowHandle> {
-        self.log_v2_gap("create_subwindow");
         let xid = self.core.next_host_xid();
+        let depth = depth_for_visual(visual);
+        self.allocate_window_storage(xid, x, y, width.max(1), height.max(1), depth);
+        self.scene.mark_scene_structure_dirty();
         WindowHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_subwindow: xid was 0"))
     }
 
     fn destroy_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
     ) -> io::Result<()> {
-        self.log_v2_gap("destroy_subwindow");
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.decref(&mut self.platform, id);
+        }
+        self.windows_v2.remove(&host_xid);
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
-    fn map_subwindow(&mut self, _origin: Option<OriginContext>, _host_xid: u32) -> io::Result<()> {
-        self.log_v2_gap("map_subwindow");
+    fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+            geom.mapped = true;
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.set_scene_participating(id, true);
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
-    fn unmap_subwindow(
-        &mut self,
-        _origin: Option<OriginContext>,
-        _host_xid: u32,
-    ) -> io::Result<()> {
-        self.log_v2_gap("unmap_subwindow");
+    fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+            geom.mapped = false;
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.set_scene_participating(id, false);
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
     fn configure_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _config: HostSubwindowConfig,
+        host_xid: u32,
+        config: HostSubwindowConfig,
     ) -> io::Result<()> {
-        self.log_v2_gap("configure_subwindow");
+        let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
+            // Window not tracked — log + skip (e.g., configure
+            // before register). v1 tolerates this.
+            return Ok(());
+        };
+        let mut size_changed = false;
+        if let Some(x) = config.x {
+            geom.x = x;
+        }
+        if let Some(y) = config.y {
+            geom.y = y;
+        }
+        if let Some(w) = config.width
+            && w != geom.width
+        {
+            geom.width = w;
+            size_changed = true;
+        }
+        if let Some(h) = config.height
+            && h != geom.height
+        {
+            geom.height = h;
+            size_changed = true;
+        }
+        let new_w = geom.width.max(1);
+        let new_h = geom.height.max(1);
+        let depth = geom.depth;
+        let scene_participating = geom.mapped;
+        if size_changed && let Some(old_id) = self.store.lookup(host_xid) {
+            // Allocate fresh storage, decref the old. Stage 2d
+            // doesn't preserve content across resize — clients
+            // are expected to repaint after configure anyway
+            // (X11 semantics).
+            self.store.decref(&mut self.platform, old_id);
+            match self.platform.allocate_drawable_storage(new_w, new_h, depth) {
+                Ok(storage) => {
+                    if let Err(e) = self.store.allocate(
+                        host_xid,
+                        DrawableKind::Window,
+                        depth,
+                        scene_participating,
+                        storage,
+                    ) {
+                        log::warn!(
+                            "v2 configure_subwindow: store.allocate failed for xid {host_xid:#x}: {e:?}",
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 configure_subwindow: alloc storage failed for xid {host_xid:#x}: {e:?}",
+                    );
+                }
+            }
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
     fn reparent_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _host_parent: u32,
-        _x: i16,
-        _y: i16,
+        x: i16,
+        y: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("reparent_subwindow");
+        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+            geom.x = x;
+            geom.y = y;
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
@@ -447,6 +648,17 @@ impl Backend for KmsBackendV2 {
         // Bookkeeping mutation — same shape as v1. The XID map is in
         // KmsCore and shared.
         self.core.xid_map.insert(host_xid, nested_id);
+        // Top-level visible-window tracking for the scene
+        // assembler. register_top_level doesn't carry geometry;
+        // start at 1x1 (Stage 2 plan compromise) and resize on
+        // first configure_subwindow.
+        if !self.windows_v2.contains_key(&host_xid) {
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32);
+        }
+        if !self.core.top_level_order.contains(&host_xid) {
+            self.core.top_level_order.push(host_xid);
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
@@ -457,6 +669,10 @@ impl Backend for KmsBackendV2 {
         host_xid: u32,
     ) -> io::Result<()> {
         self.core.xid_map.insert(host_xid, nested_id);
+        if !self.windows_v2.contains_key(&host_xid) {
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32);
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
