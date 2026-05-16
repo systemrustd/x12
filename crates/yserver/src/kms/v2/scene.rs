@@ -510,14 +510,28 @@ fn tick_one_output(
 
     // 5. Pick repaint region via buffer-age algorithm.
     let extent = inner.outputs[output_idx].output_extent;
-    let repaint = pick_repaint_region(
-        token.last_present_generation,
-        token.content_invalidated,
-        frame_gen,
-        &output_damage,
-        &inner.outputs[output_idx].damage_history,
-        extent,
-    );
+    let repaint = if scene.draws.is_empty() {
+        // Scene is just the bg_color clear (no top-levels, no
+        // cursor, etc.). The Clipped/LOAD path would preserve
+        // each BO's prior-generation content — including a
+        // pre-`bg_pixel`-update black — and never re-clear it.
+        // Force Full so loadOp=CLEAR paints the current
+        // `bg_color` across the whole BO. Stage 4 introduces
+        // root storage which makes the entry list non-empty
+        // even on blank desktops; until then, "scene is the
+        // clear color" is structurally common and must always
+        // refresh.
+        Repaint::Full(extent)
+    } else {
+        pick_repaint_region(
+            token.last_present_generation,
+            token.content_invalidated,
+            frame_gen,
+            &output_damage,
+            &inner.outputs[output_idx].damage_history,
+            extent,
+        )
+    };
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
