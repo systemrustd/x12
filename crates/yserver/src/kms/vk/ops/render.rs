@@ -26,6 +26,37 @@ use ash::vk;
 
 use crate::kms::vk::{device::VkContext, render_pipeline::RenderPushConsts, target::DrawableImage};
 
+/// Minimal paint-target surface that [`record_render_composite`]
+/// reads / mutates. Lets the recorder operate against either v1's
+/// `DrawableImage` (per-window mirror) or v2's `Drawable` storage
+/// (via an adapter) without depending on either type's full shape.
+/// Stage 3 plan §"Cross-cutting" §1.
+pub trait CompositeTarget {
+    fn vk_image(&self) -> vk::Image;
+    fn vk_image_view(&self) -> vk::ImageView;
+    fn extent(&self) -> vk::Extent2D;
+    fn current_layout(&self) -> vk::ImageLayout;
+    fn set_current_layout(&mut self, layout: vk::ImageLayout);
+}
+
+impl CompositeTarget for DrawableImage {
+    fn vk_image(&self) -> vk::Image {
+        self.vk_image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.vk_image_view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout()
+    }
+    fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.set_current_layout(layout);
+    }
+}
+
 /// One Composite request sub-rect. `src_x`/`src_y` and
 /// `mask_x`/`mask_y` are the source / mask space pixel offsets
 /// corresponding to `dst_x`/`dst_y`; the fragment shader applies the
@@ -76,10 +107,10 @@ pub struct CompositeAttrs {
 /// the caller's clear sequence, the white-mask scratch is
 /// transitioned once at backend init and stays put).
 #[allow(clippy::too_many_arguments)]
-pub fn record_render_composite(
+pub fn record_render_composite<T: CompositeTarget + ?Sized>(
     vk: &VkContext,
     cb: vk::CommandBuffer,
-    dst: &mut DrawableImage,
+    dst: &mut T,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set: vk::DescriptorSet,
@@ -87,12 +118,15 @@ pub fn record_render_composite(
     rects: &[CompositeRect],
     clip_scissor: vk::Rect2D,
 ) -> Result<(), vk::Result> {
-    if rects.is_empty() || dst.extent.width == 0 || dst.extent.height == 0 {
+    let extent = dst.extent();
+    if rects.is_empty() || extent.width == 0 || extent.height == 0 {
         return Ok(());
     }
 
     let device = &vk.device;
     let old_layout = dst.current_layout();
+    let dst_image = dst.vk_image();
+    let dst_view = dst.vk_image_view();
 
     let to_color = [vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -103,7 +137,7 @@ pub fn record_render_composite(
         )
         .old_layout(old_layout)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .image(dst.vk_image)
+        .image(dst_image)
         .subresource_range(color_subresource_range())];
     let to_color_dep = vk::DependencyInfo::default().image_memory_barriers(&to_color);
     crate::vk_count!(cmd_pipeline_barrier2);
@@ -111,10 +145,10 @@ pub fn record_render_composite(
 
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
-        extent: dst.extent,
+        extent,
     };
     let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(dst.vk_image_view)
+        .image_view(dst_view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)];
@@ -126,8 +160,8 @@ pub fn record_render_composite(
     let viewport = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: dst.extent.width as f32,
-        height: dst.extent.height as f32,
+        width: extent.width as f32,
+        height: extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
@@ -141,12 +175,12 @@ pub fn record_render_composite(
         offset: clip_scissor.offset,
         extent: vk::Extent2D {
             width: clip_scissor.extent.width.min(
-                dst.extent
+                extent
                     .width
                     .saturating_sub(clip_scissor.offset.x.max(0) as u32),
             ),
             height: clip_scissor.extent.height.min(
-                dst.extent
+                extent
                     .height
                     .saturating_sub(clip_scissor.offset.y.max(0) as u32),
             ),
@@ -172,7 +206,7 @@ pub fn record_render_composite(
             &[],
         );
 
-        let dst_vp = [dst.extent.width as f32, dst.extent.height as f32];
+        let dst_vp = [extent.width as f32, extent.height as f32];
         let src_extent_px = [
             attrs.src_extent.width as f32,
             attrs.src_extent.height as f32,
@@ -219,7 +253,7 @@ pub fn record_render_composite(
         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
         .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .image(dst.vk_image)
+        .image(dst_image)
         .subresource_range(color_subresource_range())];
     let to_read_dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
     crate::vk_count!(cmd_pipeline_barrier2);

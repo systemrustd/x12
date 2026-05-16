@@ -49,11 +49,19 @@ use super::{
     platform::{FenceTicket, PlatformBackend},
     store::{DrawableId, DrawableStore},
 };
-use crate::kms::vk::{
-    device::VkContext,
-    glyph::{AtlasEntry, GlyphKey},
-    ops::text::{TextAtlas, TextGlyph, TextRunTarget, record_text_run},
-    text_pipeline::TextPipeline,
+use crate::kms::{
+    scheduler::batch_descriptor_arena::BatchDescriptorArena,
+    vk::{
+        device::VkContext,
+        dst_readback::DstReadback,
+        glyph::{AtlasEntry, GlyphKey},
+        ops::{
+            render::CompositeTarget,
+            text::{TextAtlas, TextGlyph, TextRunTarget, record_text_run},
+        },
+        render_pipeline::{RenderPipelineCache, SolidColorImage},
+        text_pipeline::TextPipeline,
+    },
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -108,6 +116,13 @@ struct SubmittedOp {
     /// order is the GPU dependency; this Arc keeps CPU-side
     /// destruction gated on retirement of both submissions.
     atlas_ticket: Option<FenceTicket>,
+    /// Stage 3c: per-op descriptor arena holding the descriptor
+    /// pool that backs the RENDER pipeline descriptor set this CB
+    /// references. Released (pools destroyed) on retirement; this
+    /// is the v2 mirror of v1's `PaintBatch::descriptor_arena`
+    /// retire path. Most ops (fill / put_image / copy_area / text
+    /// runs) don't need this and leave it `None`.
+    descriptor_arena: Option<BatchDescriptorArena>,
 }
 
 /// One-shot device-local image used by `copy_area`'s same-image
@@ -217,6 +232,75 @@ impl Drop for StagingBuffer {
 }
 
 // ────────────────────────────────────────────────────────────────
+// Stage 3c: drawable view cache (plan §1).
+//
+// A Drawable can be sampled in three roles (source / mask /
+// alpha-only) with different sampler + swizzle bindings. Keying
+// the cache on `DrawableId` alone would over-share; keying on
+// `(DrawableId, SamplerConfig, SwizzleClass)` gives the same
+// `Drawable` a separate cached view per role. Eviction is driven
+// by drawable retirement (see `Drawable` lifecycle in
+// `DrawableStore`); no LRU.
+// ────────────────────────────────────────────────────────────────
+
+/// Sampler configuration the cache key cares about. Filter is
+/// `Nearest` only in Stage 3 (per spec § "Out of scope"); the
+/// address mode mirrors the four X RENDER `Repeat` values.
+#[allow(
+    dead_code,
+    reason = "Variants are populated by Stage 3c's render_composite path"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SamplerConfig {
+    /// `Repeat::None` — clamp-to-border at picture edges (or
+    /// `REPEAT_PAD` for synthetic 1×1 sources; see render plan §3c).
+    Clamp,
+    /// `Repeat::Normal` — wrap.
+    Repeat,
+    /// `Repeat::Pad` — clamp-to-edge.
+    Pad,
+    /// `Repeat::Reflect` — mirrored repeat.
+    Reflect,
+}
+
+/// Swizzle bucket for the cached view. Distinguishes the three
+/// formats v2 supports for RENDER sources / masks (per plan §3b
+/// `RenderEngine adds`):
+///
+/// - `RgbaIdent` — depth-32 BGRA picture: regular `(b, g, r, a)`
+///   sample.
+/// - `AlphaOnlyR8` — R8 storage sampled as an alpha mask;
+///   swizzle `(0, 0, 0, R)` so the shader's `.a` returns the
+///   alpha byte.
+/// - `BgraNoAlpha` — depth-24 BGRA picture (r8g8b8 / x8r8g8b8):
+///   swizzle `(IDENT, IDENT, IDENT, ONE)` so the shader sees
+///   alpha = 1 per X RENDER's "alpha defaults to 1 when missing"
+///   rule.
+#[allow(
+    dead_code,
+    reason = "Variants are populated by Stage 3c's render_composite path"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SwizzleClass {
+    RgbaIdent,
+    AlphaOnlyR8,
+    BgraNoAlpha,
+}
+
+/// Cached `vk::ImageView` for a `(DrawableId, SamplerConfig,
+/// SwizzleClass)` triple. The engine destroys these on Drawable
+/// retire (signalled by `DrawableStore::poll_pending_retire`).
+/// The underlying `Drawable.storage.image` lifetime gates view
+/// validity.
+#[allow(
+    dead_code,
+    reason = "Built and consumed by Stage 3c's render_composite path"
+)]
+pub(crate) struct CachedDrawableView {
+    pub(crate) view: vk::ImageView,
+}
+
+// ────────────────────────────────────────────────────────────────
 // RenderEngine
 // ────────────────────────────────────────────────────────────────
 
@@ -258,6 +342,34 @@ struct RenderEngineInner {
     /// in the current session (atlas freshly created or every
     /// upload already retired).
     atlas_last_upload_ticket: Option<FenceTicket>,
+    /// Stage 3c: lazy-built RENDER `Composite` pipeline cache.
+    /// Adopted wholesale from v1. Pipelines compile on first use
+    /// of each `(op, dst_format, dst_has_alpha, component_alpha)`
+    /// key. `None` until the first `render_composite` call.
+    render_pipelines: Option<RenderPipelineCache>,
+    /// Stage 3c: 1×1 BGRA8 source scratch for `SolidFill` source.
+    /// `record_solid_color_clear` rewrites the texel inside each
+    /// composite CB before sampling. Lazy.
+    solid_src_image: Option<SolidColorImage>,
+    /// Stage 3c: 1×1 BGRA8 mask scratch for `SolidFill` mask.
+    /// Same shape as `solid_src_image`. Lazy.
+    solid_mask_image: Option<SolidColorImage>,
+    /// Stage 3c: 1×1 BGRA8 mask scratch cleared once to opaque
+    /// white. Bound as `mask_tex` for Composite calls without a
+    /// mask — `mask.a == 1.0` makes the multiplication a no-op
+    /// and keeps the shader / descriptor layout uniform. Lazy
+    /// (pays one allocation + one-shot clear at first
+    /// `render_composite`).
+    white_mask_image: Option<SolidColorImage>,
+    /// Stage 3c: `Disjoint` / `Conjoint` shader-side blend reads
+    /// the current dst into this scratch before the draw samples
+    /// it. Lazy.
+    dst_readback: Option<DstReadback>,
+    /// Stage 3c: drawable view cache (plan §1). Keyed by
+    /// `(DrawableId, SamplerConfig, SwizzleClass)`. Views are
+    /// destroyed on Drawable retire; the engine's
+    /// `notify_drawable_retired` hook prunes matching entries.
+    drawable_view_cache: HashMap<(DrawableId, SamplerConfig, SwizzleClass), CachedDrawableView>,
 }
 
 impl RenderEngine {
@@ -279,6 +391,12 @@ impl RenderEngine {
                 glyph_atlas: None,
                 text_pipeline: None,
                 atlas_last_upload_ticket: None,
+                render_pipelines: None,
+                solid_src_image: None,
+                solid_mask_image: None,
+                white_mask_image: None,
+                dst_readback: None,
+                drawable_view_cache: HashMap::new(),
             }),
         })
     }
@@ -322,6 +440,13 @@ impl RenderEngine {
             }
             // staging drops at end of scope → destroys Vk handles.
             drop(op.staging.take());
+            // Stage 3c: release the per-op descriptor pool, if any.
+            // `BatchDescriptorArena` owns its pools through the
+            // `BatchResource::release` path; plain Drop leaks them.
+            if let Some(arena) = op.descriptor_arena.take() {
+                use crate::kms::scheduler::paint_batch::BatchResource;
+                Box::new(arena).release(&inner.vk);
+            }
         }
     }
 
@@ -344,6 +469,10 @@ impl RenderEngine {
                 device.free_command_buffers(pool, &[op.cb]);
             }
             drop(op.staging.take());
+            if let Some(arena) = op.descriptor_arena.take() {
+                use crate::kms::scheduler::paint_batch::BatchResource;
+                Box::new(arena).release(&inner.vk);
+            }
         }
     }
 
@@ -371,6 +500,125 @@ impl RenderEngine {
     #[cfg(test)]
     pub(crate) fn picture_paint_len(&self) -> usize {
         self.inner.as_ref().map_or(0, |i| i.picture_paint.len())
+    }
+
+    /// Stage 3c: how many cached drawable views the engine
+    /// currently holds. Test-only — used to assert eviction on
+    /// drawable retire.
+    #[cfg(test)]
+    pub(crate) fn drawable_view_cache_len(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.drawable_view_cache.len())
+    }
+
+    /// Stage 3c: whether the lazy-built RENDER pipeline cache has
+    /// been constructed. Test-only — used to assert the lazy
+    /// build trigger.
+    #[cfg(test)]
+    pub(crate) fn render_pipelines_built(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|i| i.render_pipelines.is_some())
+    }
+
+    /// Stage 3c: lazy-initialize RENDER paint assets — pipeline
+    /// cache + 1×1 SolidFill / SolidMask / WhiteMask scratches +
+    /// `DstReadback`. Idempotent. Called by `render_composite`
+    /// and `render_fill_rectangles` on first paint; v1 builds
+    /// these eagerly at backend construction, but the v2 engine
+    /// is constructed before its first composite request so
+    /// paying the cost on first use (typically warmup) is fine.
+    ///
+    /// The `white_mask_image` requires a one-shot clear-to-white
+    /// CB to seed its texel; the recorded clear synchronously
+    /// drains via `run_one_shot_op` so the texel is present
+    /// before the first sample.
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `Vk(...)` for any underlying Vk failure during pipeline
+    ///   cache / scratch image / readback construction or the
+    ///   one-shot white-clear submit.
+    pub(crate) fn ensure_render_assets(
+        &mut self,
+        platform: &PlatformBackend,
+    ) -> Result<(), RenderError> {
+        use crate::kms::vk::render_pipeline::record_solid_color_clear;
+
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+
+        if inner.render_pipelines.is_none() {
+            let cache = RenderPipelineCache::new(Arc::clone(&inner.vk)).map_err(|e| {
+                log::error!("v2 ensure_render_assets: RenderPipelineCache::new failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            inner.render_pipelines = Some(cache);
+        }
+        if inner.solid_src_image.is_none() {
+            let s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
+                log::error!("v2 ensure_render_assets: solid_src SolidColorImage failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            inner.solid_src_image = Some(s);
+        }
+        if inner.solid_mask_image.is_none() {
+            let s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
+                log::error!("v2 ensure_render_assets: solid_mask SolidColorImage failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            inner.solid_mask_image = Some(s);
+        }
+        if inner.white_mask_image.is_none() {
+            let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
+                log::error!("v2 ensure_render_assets: white_mask SolidColorImage failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            let pool = platform.ops_command_pool_handle().ok_or_else(|| {
+                log::error!("v2 ensure_render_assets: no ops_command_pool for white-clear");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool, |vk, cb| {
+                record_solid_color_clear(vk, cb, &mut s, [1.0, 1.0, 1.0, 1.0]);
+                Ok(())
+            })
+            .map_err(|e| {
+                log::error!("v2 ensure_render_assets: white-clear submit failed: {e:?}");
+                RenderError::Vk(e)
+            })?;
+            inner.white_mask_image = Some(s);
+        }
+        if inner.dst_readback.is_none() {
+            inner.dst_readback = Some(DstReadback::new(Arc::clone(&inner.vk)));
+        }
+        Ok(())
+    }
+
+    /// Stage 3c: invalidate any cached drawable views referencing
+    /// `id`. Called by `KmsBackendV2` after a drawable has actually
+    /// retired (storage destroyed); evicting earlier would leave
+    /// dangling Vk handles since `vk::ImageView`'s underlying image
+    /// is gone.
+    pub(crate) fn notify_drawable_retired(&mut self, id: DrawableId) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let device = &inner.vk.device;
+        inner.drawable_view_cache.retain(|(d, _, _), cached| {
+            if *d != id {
+                return true;
+            }
+            unsafe {
+                device.destroy_image_view(cached.view, None);
+            }
+            false
+        });
     }
 
     // ── Op: fill_rect ───────────────────────────────────────────
@@ -490,6 +738,7 @@ impl RenderEngine {
             staging: None,
             scratch: None,
             atlas_ticket: None,
+            descriptor_arena: None,
         });
         Ok(())
     }
@@ -708,6 +957,7 @@ impl RenderEngine {
                 staging: None,
                 scratch: Some(scratch),
                 atlas_ticket: None,
+                descriptor_arena: None,
             });
             return Ok(());
         }
@@ -805,6 +1055,7 @@ impl RenderEngine {
             staging: None,
             scratch: None,
             atlas_ticket: None,
+            descriptor_arena: None,
         });
         Ok(())
     }
@@ -957,6 +1208,7 @@ impl RenderEngine {
             staging: Some(staging),
             scratch: None,
             atlas_ticket: None,
+            descriptor_arena: None,
         });
         Ok(())
     }
@@ -1090,6 +1342,7 @@ impl RenderEngine {
             staging: Some(staging),
             scratch: None,
             atlas_ticket: None,
+            descriptor_arena: None,
         });
 
         Ok(out)
@@ -1296,6 +1549,7 @@ impl RenderEngine {
                         staging: Some(staging),
                         scratch: None,
                         atlas_ticket: None,
+                        descriptor_arena: None,
                     });
                     inner.atlas_last_upload_ticket = Some(ticket);
                     let e = AtlasEntry {
@@ -1404,6 +1658,7 @@ impl RenderEngine {
             staging: None,
             scratch: None,
             atlas_ticket,
+            descriptor_arena: None,
         });
 
         Ok(stats)
@@ -1464,6 +1719,28 @@ struct StorageTextTarget {
 }
 
 impl TextRunTarget for StorageTextTarget {
+    fn vk_image(&self) -> vk::Image {
+        self.image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout
+    }
+    fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.current_layout = layout;
+    }
+}
+
+// Stage 3c: `record_render_composite` takes the same minimal
+// paint-target surface as `record_text_run`. Impl `CompositeTarget`
+// on the same adapter so v2's RENDER paint sites can hand the
+// recorder a borrow over a `Drawable`'s storage fields.
+impl CompositeTarget for StorageTextTarget {
     fn vk_image(&self) -> vk::Image {
         self.image
     }
