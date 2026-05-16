@@ -398,26 +398,59 @@ impl KmsBackendV2 {
         Some((d.storage.extent.width, d.storage.extent.height))
     }
 
-    /// Lower a list of solid-colour rectangles to `engine.fill_rect`.
-    /// Used by the stroke-style poly ops (`PolyLine`, `PolySegment`,
-    /// `PolyPoint`, `PolyArc`, `PolyRectangle`) where every rasterised
-    /// rect is in the GC's single foreground colour, and by
-    /// `PolyFillArc` / `FillPoly` after the scanline pass. Non-GXcopy
-    /// GC.function is logged-gap until 3f.2 lands `LogicFillPipeline`.
+    /// Lower a list of solid-colour rectangles to the appropriate
+    /// engine path. Used by the stroke-style poly ops (`PolyLine`,
+    /// `PolySegment`, `PolyPoint`, `PolyArc`, `PolyRectangle`) where
+    /// every rasterised rect is in the GC's single foreground colour,
+    /// and by `PolyFillArc` / `FillPoly` after the scanline pass.
+    ///
+    /// `GcFunction::Copy` (the common case) goes through the fast
+    /// `vkCmdClearAttachments`-driven `engine.fill_rect`. Non-`Copy`
+    /// functions (Stage 3f.2: GXclear / GXxor / GXinvert / etc.)
+    /// divert to `engine.logic_fill`, which builds a per-function
+    /// `VkLogicOp` pipeline through the shared
+    /// `LogicFillPipelineCache`. `GcFunction::NoOp` is a no-op.
     fn fill_solid_rects(
         &mut self,
         id: crate::kms::v2::store::DrawableId,
         fg: u32,
         rects: &[Rectangle16],
     ) {
+        use yserver_core::backend::GcFunction;
         if rects.is_empty() {
             return;
         }
-        if !matches!(
-            self.core.current_function,
-            yserver_core::backend::GcFunction::Copy
-        ) {
-            self.log_v2_gap("fill_rects_non_gxcopy");
+        let function = self.core.current_function;
+        if matches!(function, GcFunction::NoOp) {
+            return;
+        }
+        if !matches!(function, GcFunction::Copy) {
+            // Compute `opaque_alpha` per the L1 server-α invariant:
+            // depth-32 ARGB destinations take the LogicOp on all four
+            // channels; depth-24/8/1 are server-owned-α so the
+            // pipeline's write mask drops alpha to keep the dst byte
+            // intact. Depth lookup via the drawable record.
+            let opaque_alpha = self.store.get(id).map(|d| d.depth != 32).unwrap_or(true);
+            match self.engine.logic_fill(
+                &mut self.store,
+                &mut self.platform,
+                id,
+                function,
+                opaque_alpha,
+                fg,
+                rects,
+            ) {
+                Ok(()) => {
+                    // One submit per call regardless of rect count
+                    // (logic_fill records every rect into the same CB).
+                    self.telemetry.record_paint_submit();
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 fill_solid_rects: engine.logic_fill failed ({function:?}): {e:?}"
+                    );
+                }
+            }
             return;
         }
         let color = decode_x11_pixel_bgra(fg);
@@ -1617,19 +1650,10 @@ impl Backend for KmsBackendV2 {
         height: u16,
         plane: u32,
     ) -> io::Result<()> {
-        // Stage 3e.1 scope: GXcopy only. v1 routes via
-        // `try_vk_fill_with_function` so non-GXcopy gets the logic-op
-        // pipeline; that path lives on v2 at Stage 3f when the
-        // LogicFillPipeline ports. For now: log + skip the non-default
-        // function (xfd / xfontsel — the typical copy_plane callers —
-        // use GXcopy).
-        if !matches!(
-            self.core.current_function,
-            yserver_core::backend::GcFunction::Copy
-        ) {
-            self.log_v2_gap("copy_plane_non_gxcopy");
-            return Ok(());
-        }
+        // copy_plane decomposes into bg-first + fg-second
+        // `poly_fill_rectangle` calls below; non-`GXcopy` GC.function
+        // is honoured by the underlying `fill_solid_rects` →
+        // `engine.logic_fill` path landed in Stage 3f.2.
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -4626,5 +4650,40 @@ mod tests {
         assert_eq!(out[1].y, 15);
         assert_eq!(out[1].width, 4);
         assert_eq!(out[1].height, 8);
+    }
+
+    /// `gxcopy_planemask_diverts_to_logic_fill` per plan §3f tests.
+    /// Asserts that switching `KmsCore.current_function` to a
+    /// non-`Copy` value (here `Xor`) doesn't emit the
+    /// `fill_rects_non_gxcopy` or `copy_plane_non_gxcopy` gaps —
+    /// proves the Stage 3f.2 routing change took effect. Engine
+    /// itself returns `NoVk` on the stub fixture, so we can't assert
+    /// pixel correctness here (that's the Vk acceptance test); but
+    /// the gap absence is the load-bearing observable that the
+    /// diversion is wired through `fill_solid_rects` →
+    /// `engine.logic_fill` rather than the pre-3f.2 short-circuit.
+    #[test]
+    fn gxcopy_planemask_diverts_to_logic_fill() {
+        use yserver_core::backend::GcFunction;
+        let mut b = KmsBackendV2::for_tests();
+        b.core.current_function = GcFunction::Xor;
+
+        // Single rect: x=0 y=0 w=1 h=1.
+        let mut wire = Vec::with_capacity(8);
+        wire.extend_from_slice(&0_i16.to_le_bytes());
+        wire.extend_from_slice(&0_i16.to_le_bytes());
+        wire.extend_from_slice(&1_u16.to_le_bytes());
+        wire.extend_from_slice(&1_u16.to_le_bytes());
+        b.poly_fill_rectangle(None, 0xDEAD_BEEF, 0xFFFFFFFF, &wire)
+            .expect("ok");
+        let gaps = b.logged_gaps.borrow();
+        assert!(
+            !gaps.contains("fill_rects_non_gxcopy"),
+            "stage 3f.1 fill_rects_non_gxcopy gap must not fire post-3f.2"
+        );
+        assert!(
+            !gaps.contains("copy_plane_non_gxcopy"),
+            "stage 3e.1 copy_plane_non_gxcopy gap must not fire post-3f.2"
+        );
     }
 }

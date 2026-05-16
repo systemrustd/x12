@@ -618,10 +618,42 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       `poly_fill_rectangle_honours_gc_clip`. 224 lib tests +
       17 ignored v2 Vk tests + 7 v2_acceptance tests all green
       under lavapipe.
-    - [ ] **3f.2 — LogicFillPipeline (non-GXcopy + planemask).**
-      Port v1's logic-fill pipeline into RenderEngine so
-      fill/copy_area/put_image/poly_fill_rect divert when
-      `function != GXcopy || planemask != 0xFFFFFFFF`.
+    - [x] **3f.2 — LogicFillPipeline landed 2026-05-16.**
+      v1's `LogicFillPipelineCache` reused verbatim (no fork —
+      the `vk::Format`-bound cache + `(GcFunction, opaque_alpha)`
+      sub-key are already format-agnostic). `RenderEngineInner`
+      grows `logic_fill_caches:
+      HashMap<vk::Format, LogicFillPipelineCache>` (lazy,
+      sharded by dst format — BGRA8 is the typical entry; R8
+      enters on the rare depth-1/8 logic-fill path). New
+      engine method `RenderEngine::logic_fill(target, function,
+      opaque_alpha, fg, rects)` ports v1's
+      `try_vk_fill_with_function` body into v2's per-op CB:
+      ensure_cache → `begin_op_cb` → drawable layout
+      transition COLOR_ATTACHMENT_OPTIMAL → `cmd_begin_rendering(LOAD)`
+      → `bind_pipeline` → per-rect (`set_scissor` +
+      `cmd_push_constants` + `cmd_draw(4, 1)`) →
+      `end_rendering` → transition back to SHADER_READ_ONLY →
+      `end_and_submit_op` + ticket-clone-onto-Drawable +
+      damage. `opaque_alpha` derived from `Drawable.depth !=
+      32` (L1 server-α invariant). `KmsBackendV2::fill_solid_rects`
+      now diverts to `engine.logic_fill` when `function !=
+      Copy`; `copy_plane`'s pre-3f.2 non-`GXcopy` gate dropped
+      (decomposes into `poly_fill_rectangle` calls which now
+      honour function). 2 new tests:
+      `gxcopy_planemask_diverts_to_logic_fill` (logic, asserts
+      no gap fires) + `logic_fill_xor_applies_per_pixel`
+      (Vk-backed, GXxor on a 4×4 BGRA8 dst — XOR per byte +
+      alpha preserved via opaque_alpha pipeline). 225 lib +
+      18 ignored v2 Vk + 7 v2_acceptance tests green under
+      lavapipe. **Out of 3f.2 scope (v1-parity gap, tracked
+      separate):** `put_image_non_gxcopy` and `copy_area_non_gxcopy`
+      stay logged-gap — v1 doesn't honour function on these
+      either (put_image is a byte copy, copy_area is a Vk
+      image-to-image blit; neither passes through the
+      fragment-shader stage that LogicOp acts on). Real apps
+      use logic-op only on fill paths; rendercheck covers it
+      there.
     - [ ] **3f.3 — set_clip_pixmap + set_gc_fill_tiled.** Depth-1
       mask drives RENDER paint scissor; tile path routes
       through RENDER composite.

@@ -415,6 +415,17 @@ struct RenderEngineInner {
     /// destroyed on Drawable retire; the engine's
     /// `notify_drawable_retired` hook prunes matching entries.
     drawable_view_cache: HashMap<(DrawableId, SamplerConfig, SwizzleClass), CachedDrawableView>,
+    /// Stage 3f.2: per-`vk::Format` `LogicFillPipelineCache`. Built
+    /// lazily on first non-`GXcopy` fill against a given dst format.
+    /// The inner cache already keys its pipelines by
+    /// `(GcFunction, opaque_alpha)`; we shard by `vk::Format` because
+    /// each pipeline is bound to a single color attachment format at
+    /// build time. Typical sessions only ever hold the
+    /// `B8G8R8A8_UNORM` entry; R8 dst (depth 1/8) ops paint via
+    /// `put_image` rather than fill, so the R8 branch only fires for
+    /// rendercheck's `copy_plane` corner.
+    logic_fill_caches:
+        HashMap<vk::Format, crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache>,
 }
 
 impl RenderEngine {
@@ -445,6 +456,7 @@ impl RenderEngine {
                 trap_pipeline: None,
                 mask_scratch: None,
                 drawable_view_cache: HashMap::new(),
+                logic_fill_caches: HashMap::new(),
             }),
         })
     }
@@ -819,6 +831,282 @@ impl RenderEngine {
         end_and_submit_op(inner, platform, cb, &ticket)?;
         store.touch_render_fence(target, ticket.clone());
         store.damage(target, rect);
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: None,
+            scratch: None,
+            atlas_ticket: None,
+            descriptor_arena: None,
+        });
+        Ok(())
+    }
+
+    // ── Op: logic_fill (Stage 3f.2) ─────────────────────────────
+
+    /// Lazy-build a `LogicFillPipelineCache` for `color_format`.
+    /// Each cache instance is bound to a single attachment format
+    /// at construction; we shard by format so a session that paints
+    /// to both BGRA8 and R8 dst formats only pays per-format pipeline
+    /// compile cost. The inner cache further keys by `(function,
+    /// opaque_alpha)` so all 16 X11 GC functions × {opaque, ARGB}
+    /// share one pipeline-layout.
+    fn ensure_logic_fill_cache(
+        &mut self,
+        platform: &PlatformBackend,
+        color_format: vk::Format,
+    ) -> Result<(), RenderError> {
+        use crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache;
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        if inner.logic_fill_caches.contains_key(&color_format) {
+            return Ok(());
+        }
+        let cache =
+            LogicFillPipelineCache::new(Arc::clone(&inner.vk), color_format).map_err(|e| {
+                log::error!(
+                    "v2 ensure_logic_fill_cache: LogicFillPipelineCache::new failed: {e:?}"
+                );
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        inner.logic_fill_caches.insert(color_format, cache);
+        Ok(())
+    }
+
+    /// Solid-fill `rects` in `target` through a `VkLogicOp` pipeline
+    /// matching `function`. Ports v1's `try_vk_fill_with_function`
+    /// non-`GXcopy` path into a v2-shape per-op CB.
+    ///
+    /// `opaque_alpha = true` is the depth-24 (server-owned α) path:
+    /// the pipeline's color blend write mask drops alpha so the
+    /// `VkLogicOp` only mutates RGB and the destination's existing
+    /// alpha byte is left intact (L1 server-α invariant). `false` is
+    /// the depth-32 ARGB path — LogicOp applies to all four channels
+    /// per X11 semantics.
+    ///
+    /// `fg` is the X11 wire pixel value (top byte alpha for depth 32,
+    /// ignored for depth 24). The recorder unpacks it identically to
+    /// v1's `try_vk_fill_with_function`. `GXclear`-class functions
+    /// (Clear / Set / Invert / etc.) ignore `fg` semantically; the
+    /// fragment shader still receives it but `VkLogicOp` overrides
+    /// the output.
+    ///
+    /// # Errors
+    ///
+    /// `UnknownDrawable` if `target` is missing; `NoVk` on the stub
+    /// engine; `Vk` for any underlying Vulkan failure.
+    pub(crate) fn logic_fill(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        target: DrawableId,
+        function: yserver_core::backend::GcFunction,
+        opaque_alpha: bool,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) -> Result<(), RenderError> {
+        use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
+        use yserver_core::backend::GcFunction;
+
+        if rects.is_empty() {
+            return Ok(());
+        }
+        if matches!(function, GcFunction::NoOp) {
+            return Ok(());
+        }
+
+        let format = {
+            let d = store
+                .get(target)
+                .ok_or(RenderError::UnknownDrawable(target))?;
+            d.storage.format
+        };
+        self.ensure_logic_fill_cache(platform, format)?;
+
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        let cache = inner
+            .logic_fill_caches
+            .get_mut(&format)
+            .expect("ensured above");
+        let pipeline = cache.get(function, opaque_alpha).map_err(|e| {
+            log::warn!("v2 logic_fill: pipeline build failed for {function:?}: {e:?}");
+            RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })?;
+        let pipeline_layout = cache.pipeline_layout();
+
+        let Some(drawable) = store.get_mut(target) else {
+            return Err(RenderError::UnknownDrawable(target));
+        };
+        let extent = drawable.storage.extent;
+        let image_view = drawable.storage.image_view;
+
+        // Unpack the X11 wire pixel. Same shape as v1's
+        // `try_vk_fill_with_function`: R8_UNORM dst (depth 1 / 8)
+        // takes fg in color[0]; BGRA8_UNORM dst takes BGR in 0..3.
+        // Alpha forced opaque — the pipeline's write mask handles
+        // the opaque-alpha policy.
+        let color = if format == vk::Format::R8_UNORM {
+            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
+        } else {
+            [
+                ((fg >> 16) & 0xFF) as f32 / 255.0,
+                ((fg >> 8) & 0xFF) as f32 / 255.0,
+                (fg & 0xFF) as f32 / 255.0,
+                1.0,
+            ]
+        };
+
+        // Clamp each rect to dst extent + drop empties up-front, so
+        // the recorder's per-rect scissor + draw never sees a bogus
+        // rect. Mirrors v1's pre-record clamp loop.
+        let vk_rects: Vec<vk::Rect2D> = rects
+            .iter()
+            .filter_map(|r| {
+                let x0 = i32::from(r.x).max(0);
+                let y0 = i32::from(r.y).max(0);
+                let x1 = (i32::from(r.x).saturating_add(i32::from(r.width)))
+                    .min(i32::try_from(extent.width).unwrap_or(i32::MAX));
+                let y1 = (i32::from(r.y).saturating_add(i32::from(r.height)))
+                    .min(i32::try_from(extent.height).unwrap_or(i32::MAX));
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                Some(vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                })
+            })
+            .collect();
+        if vk_rects.is_empty() {
+            return Ok(());
+        }
+
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let device = &inner.vk.device;
+
+        // Transition target → COLOR_ATTACHMENT_OPTIMAL. Same producer
+        // mask shape as fill_rect (SHADER_SAMPLED_READ + TRANSFER_WRITE
+        // + COLOR_ATTACHMENT_WRITE) so a prior compose-read / put_image
+        // / paint drains correctly per cross-cutting §2.
+        drawable.record_layout_transition(
+            &inner.vk,
+            cb,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        );
+
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        let color_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(image_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .color_attachments(&color_attachment);
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            #[allow(clippy::cast_precision_loss)]
+            width: extent.width as f32,
+            #[allow(clippy::cast_precision_loss)]
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+
+        let dst_vp = [
+            #[allow(clippy::cast_precision_loss)]
+            {
+                extent.width as f32
+            },
+            #[allow(clippy::cast_precision_loss)]
+            {
+                extent.height as f32
+            },
+        ];
+        let damage_rects: Vec<vk::Rect2D> = vk_rects.clone();
+        unsafe {
+            device.cmd_begin_rendering(cb, &rendering_info);
+            device.cmd_set_viewport(cb, 0, &viewport);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+
+            for r in &vk_rects {
+                let scissor = [*r];
+                device.cmd_set_scissor(cb, 0, &scissor);
+                let pc = LogicFillPushConsts {
+                    dst_origin: [
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            r.offset.x as f32
+                        },
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            r.offset.y as f32
+                        },
+                    ],
+                    dst_size: [
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            r.extent.width as f32
+                        },
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            r.extent.height as f32
+                        },
+                    ],
+                    viewport: dst_vp,
+                    _pad: [0.0, 0.0],
+                    fg_color: color,
+                };
+                device.cmd_push_constants(
+                    cb,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                device.cmd_draw(cb, 4, 1, 0, 0);
+            }
+            device.cmd_end_rendering(cb);
+        }
+
+        drawable.record_layout_transition(
+            &inner.vk,
+            cb,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        );
+
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(target, ticket.clone());
+        for r in &damage_rects {
+            store.damage(target, *r);
+        }
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
@@ -4204,6 +4492,111 @@ mod tests {
             assert_eq!(px[1], 0x00, "G");
             assert_eq!(px[2], 0xFF, "R");
             assert_eq!(px[3], 0xFF, "A");
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    /// Stage 3f.2: `engine.logic_fill` applies the per-`GcFunction`
+    /// `VkLogicOp` per pixel. Drives `Xor` against a pre-loaded BGRA8
+    /// pattern; expects each component to be the pre-load XOR'd with
+    /// the fg byte. Alpha is preserved via the `opaque_alpha=true`
+    /// pipeline (L1 server-α invariant on depth-24).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn logic_fill_xor_applies_per_pixel() {
+        use yserver_core::backend::GcFunction;
+
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        // 4x4 BGRA8 pixmap. Store BGRA wire bytes B, G, R, A.
+        let storage = platform.allocate_drawable_storage(4, 4, 24).expect("alloc");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                24,
+                false,
+                storage,
+            )
+            .unwrap();
+
+        // Load every pixel with [B=0x20, G=0x40, R=0x80, A=0xFF].
+        let mut pre = vec![0u8; 4 * 4 * 4];
+        for px in pre.chunks_exact_mut(4) {
+            px[0] = 0x20;
+            px[1] = 0x40;
+            px[2] = 0x80;
+            px[3] = 0xFF;
+        }
+        engine
+            .put_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Offset2D::default(),
+                vk::Extent2D {
+                    width: 4,
+                    height: 4,
+                },
+                &pre,
+                32,
+            )
+            .expect("put_image");
+
+        // XOR with fg pixel 0x00FFFFFF (X11 wire = AARRGGBB: A=0,
+        // R=0xFF, G=0xFF, B=0xFF). The recorder's `BGRA8_UNORM`
+        // branch puts R/G/B into [0]/[1]/[2] of `fg_color`; the
+        // logic-op output then targets the BGRA8 attachment in the
+        // same channel order, so post-XOR every component reads as
+        // `pre ^ 0xFF`.
+        let rect = Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        engine
+            .logic_fill(
+                &mut store,
+                &mut platform,
+                id,
+                GcFunction::Xor,
+                /* opaque_alpha */ true,
+                /* fg */ 0x00FF_FFFF,
+                &[rect],
+            )
+            .expect("logic_fill");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        for px in out.chunks_exact(4) {
+            assert_eq!(px[0], 0x20 ^ 0xFF, "B (XOR pre 0x20 with fg 0xFF)");
+            assert_eq!(px[1], 0x40 ^ 0xFF, "G (XOR pre 0x40 with fg 0xFF)");
+            assert_eq!(px[2], 0x80 ^ 0xFF, "R (XOR pre 0x80 with fg 0xFF)");
+            // opaque_alpha=true: alpha channel mask drops alpha from
+            // the LogicOp, so the destination's pre-load 0xFF is
+            // preserved.
+            assert_eq!(px[3], 0xFF, "A preserved by opaque_alpha mask");
         }
 
         engine.drain_all(&platform);
