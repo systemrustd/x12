@@ -285,10 +285,73 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     set_container_background_pixel-equivalent paint paths.
     That's expected per spec; Stage 2's job was the substrate.
 
-### Pending
-- [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on
-  the Vk substrate; text path. First stage where real-app smoke
-  is meaningful. Specific counter gates per workload.
+### In progress
+
+- [~] **Stage 3 — RENDER + glyphs coverage.** Plan landed
+  2026-05-16 (`142cda8`) after four codex review rounds; six
+  substages 3a–3f.
+
+  Plan: `docs/superpowers/plans/2026-05-16-stage-3.md`.
+
+  Cross-cutting concepts: atlas-fence ownership (drops v1's
+  per-glyph `queue_wait_idle` by routing uploads through
+  per-call `BatchUploadArena` slices owned by `SubmittedOp`,
+  with same-graphics-queue submission ordering as the GPU
+  dependency and `atlas_last_upload_ticket` cloned onto every
+  consume for CPU lifetime); picture-record split between
+  `KmsCore` and `RenderEngine`; clipping-domain separation
+  (RENDER ops consult picture clip only; Core ops consult GC
+  clip only; per-rect scissoring for multi-rect clips
+  replaces v1's union-bbox); damage op-aware override for
+  destructive PictOps + `GXclear`-class GC.functions;
+  `drawable_view_cache` keyed on
+  `(DrawableId, SamplerConfig, SwizzleClass)`.
+
+  Acceptance gates: rendercheck parity, real-app smoke matrix
+  (xterm/xclock/xeyes/gedit/MATE/xfce4/xfd + xterm-tail
+  terminal-text load), bee 30-min stability run, fuji perf
+  gates split into correctness-hard-fail (no
+  `vk_queue_wait_idle/s` outside `get_image`,
+  `composite_glyphs_dropped_unsupported == 0` across smoke
+  matrix unless whitelisted, etc.) and headroom-observed-and-
+  recorded (≤ 2× v1 envelope per workload).
+
+  - [x] **3a-telemetry primer** — `atlas_intern/s`,
+    `glyph_uploads/s`, `glyphs_dropped_atlas_full` (lifetime),
+    `composite_glyphs_dropped_unsupported` (lifetime + per-s,
+    sites wired in 3d), `disjoint_readback_count` (per-s,
+    sites in 3c). Landed 2026-05-16 (`5d88295`). Counter
+    storage + `record_*` hooks + emitter line additions; no
+    call sites yet. Pure additions; no v1 path touched.
+  - [ ] **3a-atlas+text** — port `GlyphAtlas` off v1's
+    persistent staging buffer (per-upload arena slice owned
+    by `SubmittedOp` + `atlas_last_upload_ticket` for CPU
+    lifetime); port `TextPipeline`; `DrawableImageRef` adapter
+    over v1's `record_text_run`; `RenderEngine::image_text`
+    method; `KmsBackendV2` `open_font`/`close_font` delegation
+    to `KmsCore`; `image_text8`/`image_text16` + `poly_text8`/
+    `poly_text16` decoders (`0xFF` font-change items
+    supported). Back-to-back upload race test load-bearing.
+  - [ ] **3b — picture records + pipelines.** Promote every
+    `render_create_*` / `render_change_picture` /
+    `render_set_picture_*` stub; lazy-build
+    `RenderPipelineCache` + SolidFill / DstReadback /
+    white-mask scratch images on `RenderEngine`; gradient
+    parsing.
+  - [ ] **3c — `render_composite` + `render_fill_rectangles`.**
+    Standard PictOps + Saturate + Disjoint/Conjoint shader
+    blend; per-rect picture-clip scissoring; self-composite
+    aliasing routed through arena scratch.
+  - [ ] **3d — `render_composite_glyphs` + glyphsets.**
+    v1-parity scope (Over + SolidFill source +
+    A8/A1/ARGB32-as-A8 glyphsets); fixes v1's latent
+    "_clip unused" bug for the dst picture clip; broader op /
+    source coverage risk-listed for a post-Stage-3 follow-up.
+  - [ ] **3e — trapezoids + triangles + `copy_plane`.**
+  - [ ] **3f — Core remainder + GC.function + planemask +
+    acceptance.** Real-app matrix on hardware, bee 30-min
+    stability run, fuji perf captures (v1 baseline taken
+    fresh in same session). Stage 3 close.
 - [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom
@@ -320,9 +383,10 @@ here for awareness during stage planning:
   warn; disarm path mitigates but per-property split is the real
   fix. Survives the rewrite (lives in `PlatformBackend`'s
   shutdown sequence).
-- [ ] **Per-glyph queue_wait_idle in `GlyphAtlas::intern`** —
-  v1-era TODO. Gets folded into v2's `RenderEngine` rewrite
-  during Stage 3.
+- [~] **Per-glyph queue_wait_idle in `GlyphAtlas::intern`** —
+  v1-era TODO. Stage 3 plan §3a removes the persistent staging
+  buffer + per-upload wait by routing through arena slices
+  owned by `SubmittedOp`. Landed when 3a-atlas+text commits.
 - [ ] **AMD-specific investigation** — bee + adapta-mate-cc
   catastrophic mouse lag. Independent of model choice (submit-
   rate bound). Tackled via separate perf plans built on v2; see
