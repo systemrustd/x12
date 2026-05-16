@@ -1,0 +1,294 @@
+//! Per-second telemetry counters for v2 (Stage 2f).
+//!
+//! Per rendering-model-v2 spec §"Required counters / log lines"
+//! and Stage 2 plan §"Acceptance discipline". The Stage-3+ perf
+//! gates (no `vkQueueWaitIdle` on hot path; queue_submit2 rate
+//! ≤ v1 baseline; damage_fraction noticeably <1.0 on window-drag;
+//! sustained `full_redraw_fallback == 0`) are only enforceable
+//! if v2 emits the named counters that let us judge them.
+//!
+//! Emission shape: per-second summary line under
+//! `YSERVER_LOOP_TELEMETRY=1`, parsable by grep+awk. Each counter
+//! is a simple monotonic accumulator; the per-second emitter
+//! resets per-second-window state on each emit. Counter sites are
+//! the [`Telemetry::record_*`] methods called by the engine,
+//! scene, and platform layers.
+
+#![allow(
+    dead_code,
+    reason = "Counter accessors are consumed by Stage 3+ perf gates + harness"
+)]
+
+use std::time::Instant;
+
+/// Single-second accumulator. Reset on every emission tick.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Bucket {
+    pub(crate) paint_submits: u64,
+    pub(crate) composite_submits: u64,
+    pub(crate) one_shot_submits: u64,
+    pub(crate) queue_submit2: u64,
+    pub(crate) vk_queue_wait_idle: u64,
+    pub(crate) cpu_fence_wait_ns: u64,
+    pub(crate) cpu_fence_wait_count: u64,
+    pub(crate) damaged_pixels: u64,
+    pub(crate) output_pixels: u64,
+    pub(crate) scene_entries_visited: u64,
+    pub(crate) scene_entries_drawn: u64,
+    pub(crate) full_redraw_fallback: u64,
+    pub(crate) storage_allocations: u64,
+    pub(crate) descriptor_allocations: u64,
+    pub(crate) image_view_creates: u64,
+    pub(crate) frame_present_count: u64,
+    pub(crate) missed_pageflips: u64,
+    pub(crate) gpu_render_ns: u64,
+    pub(crate) compose_cb_record_ns: u64,
+    pub(crate) frames_with_compose: u64,
+}
+
+/// v2 telemetry state. One per `KmsBackendV2`. Counter sites
+/// call `record_*` directly; the emitter ticks once per second
+/// from the core loop (driven through `maybe_emit`).
+pub(crate) struct Telemetry {
+    enabled: bool,
+    last_emit: Instant,
+    bucket: Bucket,
+    /// Lifetime-aggregate counts (not reset per-emit). Useful
+    /// for the acceptance harness which compares totals after
+    /// driving a test sequence.
+    pub(crate) lifetime: Bucket,
+}
+
+impl Telemetry {
+    /// Construct. Reads `YSERVER_LOOP_TELEMETRY` once at boot to
+    /// decide whether the per-second emitter actually logs.
+    /// Counter sites always update — the cost of an `+= 1` is
+    /// trivial, and tests check `lifetime.*` regardless of the
+    /// env var.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let enabled = matches!(
+            std::env::var_os("YSERVER_LOOP_TELEMETRY")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("1" | "true" | "yes" | "on")
+        );
+        Self {
+            enabled,
+            last_emit: Instant::now(),
+            bucket: Bucket::default(),
+            lifetime: Bucket::default(),
+        }
+    }
+
+    /// Tick the emitter; if ≥ 1s has elapsed, print the
+    /// per-second summary and reset the bucket. Safe to call
+    /// every core-loop iteration — no-op when below threshold.
+    pub(crate) fn maybe_emit(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_emit);
+        if dt < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let b = self.bucket;
+        let denom = b.frames_with_compose.max(1);
+        let avg_compose_cb_ns = b.compose_cb_record_ns / denom;
+        let avg_gpu_render_ns = b.gpu_render_ns / denom;
+        let damage_fraction = if b.output_pixels > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            (b.damaged_pixels as f64 / b.output_pixels as f64)
+        } else {
+            0.0
+        };
+        log::info!(
+            "v2_telemetry: paint_submits/s={} composite_submits/s={} \
+             one_shot_submits/s={} queue_submit2/s={} \
+             vk_queue_wait_idle/s={} cpu_fence_wait_ns/s={} \
+             cpu_fence_wait_count/s={} damage_fraction={damage_fraction:.3} \
+             scene_entries_visited={} scene_entries_drawn={} \
+             full_redraw_fallback/s={} storage_allocations/s={} \
+             descriptor_allocations/s={} image_view_creates/s={} \
+             frame_present_count/s={} missed_pageflips/s={} \
+             avg_gpu_render_ns={avg_gpu_render_ns} \
+             avg_compose_cb_record_ns={avg_compose_cb_ns}",
+            b.paint_submits,
+            b.composite_submits,
+            b.one_shot_submits,
+            b.queue_submit2,
+            b.vk_queue_wait_idle,
+            b.cpu_fence_wait_ns,
+            b.cpu_fence_wait_count,
+            b.scene_entries_visited,
+            b.scene_entries_drawn,
+            b.full_redraw_fallback,
+            b.storage_allocations,
+            b.descriptor_allocations,
+            b.image_view_creates,
+            b.frame_present_count,
+            b.missed_pageflips,
+        );
+        self.bucket = Bucket::default();
+        self.last_emit = now;
+    }
+
+    /// Whether emission is enabled. Tests use this to decide
+    /// whether to assert lifetime counts.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    // ── Counter sites ───────────────────────────────────────────
+
+    pub(crate) fn record_paint_submit(&mut self) {
+        self.bucket.paint_submits += 1;
+        self.bucket.queue_submit2 += 1;
+        self.lifetime.paint_submits += 1;
+        self.lifetime.queue_submit2 += 1;
+    }
+
+    pub(crate) fn record_composite_submit(&mut self) {
+        self.bucket.composite_submits += 1;
+        self.bucket.queue_submit2 += 1;
+        self.bucket.frames_with_compose += 1;
+        self.lifetime.composite_submits += 1;
+        self.lifetime.queue_submit2 += 1;
+        self.lifetime.frames_with_compose += 1;
+    }
+
+    pub(crate) fn record_one_shot_submit(&mut self) {
+        self.bucket.one_shot_submits += 1;
+        self.bucket.queue_submit2 += 1;
+        self.lifetime.one_shot_submits += 1;
+        self.lifetime.queue_submit2 += 1;
+    }
+
+    pub(crate) fn record_vk_queue_wait_idle(&mut self) {
+        self.bucket.vk_queue_wait_idle += 1;
+        self.lifetime.vk_queue_wait_idle += 1;
+    }
+
+    pub(crate) fn record_fence_wait(&mut self, ns: u64) {
+        self.bucket.cpu_fence_wait_ns = self.bucket.cpu_fence_wait_ns.saturating_add(ns);
+        self.bucket.cpu_fence_wait_count += 1;
+        self.lifetime.cpu_fence_wait_ns = self.lifetime.cpu_fence_wait_ns.saturating_add(ns);
+        self.lifetime.cpu_fence_wait_count += 1;
+    }
+
+    pub(crate) fn record_damage_pixels(&mut self, damaged: u64, output: u64) {
+        self.bucket.damaged_pixels = self.bucket.damaged_pixels.saturating_add(damaged);
+        self.bucket.output_pixels = self.bucket.output_pixels.saturating_add(output);
+        self.lifetime.damaged_pixels = self.lifetime.damaged_pixels.saturating_add(damaged);
+        self.lifetime.output_pixels = self.lifetime.output_pixels.saturating_add(output);
+    }
+
+    pub(crate) fn record_scene_entries(&mut self, visited: u64, drawn: u64) {
+        self.bucket.scene_entries_visited =
+            self.bucket.scene_entries_visited.saturating_add(visited);
+        self.bucket.scene_entries_drawn = self.bucket.scene_entries_drawn.saturating_add(drawn);
+        self.lifetime.scene_entries_visited =
+            self.lifetime.scene_entries_visited.saturating_add(visited);
+        self.lifetime.scene_entries_drawn = self.lifetime.scene_entries_drawn.saturating_add(drawn);
+    }
+
+    pub(crate) fn record_full_redraw_fallback(&mut self) {
+        self.bucket.full_redraw_fallback += 1;
+        self.lifetime.full_redraw_fallback += 1;
+    }
+
+    pub(crate) fn record_storage_allocation(&mut self) {
+        self.bucket.storage_allocations += 1;
+        self.lifetime.storage_allocations += 1;
+    }
+
+    pub(crate) fn record_descriptor_allocations(&mut self, n: u64) {
+        self.bucket.descriptor_allocations = self.bucket.descriptor_allocations.saturating_add(n);
+        self.lifetime.descriptor_allocations =
+            self.lifetime.descriptor_allocations.saturating_add(n);
+    }
+
+    pub(crate) fn record_image_view_create(&mut self) {
+        self.bucket.image_view_creates += 1;
+        self.lifetime.image_view_creates += 1;
+    }
+
+    pub(crate) fn record_frame_present(&mut self) {
+        self.bucket.frame_present_count += 1;
+        self.lifetime.frame_present_count += 1;
+    }
+
+    pub(crate) fn record_missed_pageflip(&mut self) {
+        self.bucket.missed_pageflips += 1;
+        self.lifetime.missed_pageflips += 1;
+    }
+
+    pub(crate) fn record_compose_cb_record_ns(&mut self, ns: u64) {
+        self.bucket.compose_cb_record_ns = self.bucket.compose_cb_record_ns.saturating_add(ns);
+        self.lifetime.compose_cb_record_ns = self.lifetime.compose_cb_record_ns.saturating_add(ns);
+    }
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_accumulate_in_bucket_and_lifetime() {
+        let mut t = Telemetry::new();
+        t.record_paint_submit();
+        t.record_paint_submit();
+        t.record_composite_submit();
+        t.record_one_shot_submit();
+        assert_eq!(t.lifetime.paint_submits, 2);
+        assert_eq!(t.lifetime.composite_submits, 1);
+        assert_eq!(t.lifetime.one_shot_submits, 1);
+        // All three increment queue_submit2 too.
+        assert_eq!(t.lifetime.queue_submit2, 4);
+        assert_eq!(t.bucket.queue_submit2, 4);
+    }
+
+    #[test]
+    fn fence_wait_aggregates_ns_and_count() {
+        let mut t = Telemetry::new();
+        t.record_fence_wait(1_000);
+        t.record_fence_wait(2_500);
+        assert_eq!(t.lifetime.cpu_fence_wait_ns, 3_500);
+        assert_eq!(t.lifetime.cpu_fence_wait_count, 2);
+    }
+
+    #[test]
+    fn maybe_emit_resets_bucket_after_log() {
+        let mut t = Telemetry::new();
+        t.record_paint_submit();
+        t.bucket.compose_cb_record_ns = 100;
+        // Simulate >1s elapsed by adjusting last_emit.
+        t.last_emit = Instant::now() - std::time::Duration::from_secs(2);
+        // Force enabled so emit body actually runs the reset
+        // (logging is suppressed when env var unset, but bucket
+        // reset still happens).
+        t.enabled = true;
+        t.maybe_emit();
+        assert_eq!(t.bucket.paint_submits, 0);
+        assert_eq!(t.bucket.compose_cb_record_ns, 0);
+        // Lifetime preserved.
+        assert_eq!(t.lifetime.paint_submits, 1);
+    }
+
+    #[test]
+    fn vk_queue_wait_idle_counted_separately() {
+        let mut t = Telemetry::new();
+        t.record_vk_queue_wait_idle();
+        t.record_vk_queue_wait_idle();
+        assert_eq!(t.lifetime.vk_queue_wait_idle, 2);
+        // Target zero in steady state — the gate is "lifetime
+        // count stays at 0 except inside get_image".
+    }
+}

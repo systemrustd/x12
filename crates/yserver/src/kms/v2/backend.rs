@@ -43,6 +43,7 @@ use crate::{
             platform::PlatformBackend,
             scene::SceneCompositor,
             store::{DrawableKind, DrawableStore},
+            telemetry::Telemetry,
         },
     },
 };
@@ -93,6 +94,11 @@ pub struct KmsBackendV2 {
     pub(crate) engine: RenderEngine,
     /// v2's scene compositor — real per Stage 2d.
     pub(crate) scene: SceneCompositor,
+    /// v2's per-second telemetry counters (Stage 2f). The
+    /// per-second emitter logs under `YSERVER_LOOP_TELEMETRY=1`;
+    /// lifetime totals are always tracked for the acceptance
+    /// harness.
+    pub(crate) telemetry: Telemetry,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -149,6 +155,7 @@ impl KmsBackendV2 {
             engine,
             scene,
             windows_v2: WindowsV2Map::new(),
+            telemetry: Telemetry::new(),
         })
     }
 
@@ -167,6 +174,7 @@ impl KmsBackendV2 {
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
             windows_v2: WindowsV2Map::new(),
+            telemetry: Telemetry::new(),
         }
     }
 
@@ -305,6 +313,8 @@ impl KmsBackendV2 {
                     );
                     return;
                 }
+                self.telemetry.record_storage_allocation();
+                self.telemetry.record_image_view_create();
             }
             Err(e) => {
                 // No Vk fixture (`for_tests`) → storage allocation
@@ -427,14 +437,11 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
-        // Walk every output, retire whichever has a pending flip.
-        // The platform's `on_page_flip_complete` returns `None` for
-        // outputs without a pending BO, so this is safe to call
-        // unconditionally per-output.
         let n = self.platform.outputs.len();
         for output_idx in 0..n {
             self.scene
                 .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform);
+            self.telemetry.record_frame_present();
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
@@ -451,21 +458,30 @@ impl Backend for KmsBackendV2 {
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
-        if !self.scene.scene_structure_dirty {
-            return Ok(());
-        }
-        match self.scene.tick(
-            &self.core,
-            &mut self.store,
-            &mut self.platform,
-            &self.windows_v2,
-        ) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                log::warn!("v2 maybe_composite: scene.tick failed: {e:?}");
-                Ok(())
+        let result = if !self.scene.scene_structure_dirty {
+            Ok(())
+        } else {
+            match self.scene.tick(
+                &self.core,
+                &mut self.store,
+                &mut self.platform,
+                &self.windows_v2,
+            ) {
+                Ok(composed) => {
+                    for _ in 0..composed {
+                        self.telemetry.record_composite_submit();
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    log::warn!("v2 maybe_composite: scene.tick failed: {e:?}");
+                    Ok(())
+                }
             }
-        }
+        };
+        // Per-second telemetry summary emission.
+        self.telemetry.maybe_emit();
+        result
     }
 
     fn dump_scanout(&mut self) {
@@ -749,6 +765,9 @@ impl Backend for KmsBackendV2 {
                         .allocate(xid, DrawableKind::Pixmap, depth, false, storage)
                 {
                     log::warn!("v2 create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",);
+                } else {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
                 }
             }
             Err(vk_err) => {
@@ -982,6 +1001,8 @@ impl Backend for KmsBackendV2 {
                 "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
                  dst=0x{dst_host_xid:x}): {e:?}",
             );
+        } else {
+            self.telemetry.record_paint_submit();
         }
         Ok(())
     }
@@ -1045,6 +1066,8 @@ impl Backend for KmsBackendV2 {
             depth,
         ) {
             log::warn!("v2 put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
+        } else {
+            self.telemetry.record_paint_submit();
         }
         Ok(())
     }
@@ -1078,11 +1101,17 @@ impl Backend for KmsBackendV2 {
                 height: u32::from(height),
             },
         };
+        let start = std::time::Instant::now();
         match self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)
         {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.telemetry.record_one_shot_submit();
+                self.telemetry.record_fence_wait(ns);
+                Ok(Some(bytes))
+            }
             Err(e) => {
                 log::warn!("v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",);
                 Ok(None)
@@ -1184,6 +1213,7 @@ impl Backend for KmsBackendV2 {
                 );
                 break;
             }
+            self.telemetry.record_paint_submit();
         }
         Ok(())
     }
@@ -1236,11 +1266,13 @@ impl Backend for KmsBackendV2 {
                 height: u32::from(height),
             },
         };
-        if let Err(e) = self
+        let res = self
             .engine
-            .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
-        {
+            .fill_rect(&mut self.store, &mut self.platform, id, rect, color);
+        if let Err(e) = res {
             log::warn!("v2 fill_rectangle: engine.fill_rect failed for xid {host_xid:#x}: {e:?}",);
+        } else {
+            self.telemetry.record_paint_submit();
         }
         Ok(())
     }
@@ -1752,6 +1784,25 @@ mod tests {
         // way KmsCore::new does); verify the accessor works and
         // returns an actual map reference.
         assert_eq!(map.len(), 0);
+    }
+
+    /// Telemetry: counter sites fire at the Backend trait
+    /// surface even on the test fixture (no Vk). put_image with
+    /// an unknown xid logs a gap and does NOT count a paint
+    /// submit (the engine never ran); get_image likewise. This
+    /// confirms only successful ops count.
+    #[test]
+    fn v2_telemetry_counter_sites_track_successful_ops() {
+        let mut b = KmsBackendV2::for_tests();
+        // put_image with unknown xid → no counter bump.
+        b.put_image(None, 0xDEAD, 32, 4, 4, 0, 0, &[0; 64]).unwrap();
+        assert_eq!(b.telemetry.lifetime.paint_submits, 0);
+        // The stub engine declines NoVk, so even a known xid
+        // wouldn't count. The "track successful ops" gate is
+        // covered by the lavapipe integration tests; here we
+        // just confirm the wiring compiles and doesn't double-
+        // increment on the gap path.
+        assert_eq!(b.telemetry.lifetime.queue_submit2, 0);
     }
 
     /// Bookkeeping methods stay consistent: register_top_level

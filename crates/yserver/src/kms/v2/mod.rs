@@ -12,5 +12,6 @@ pub(crate) mod engine;
 pub(crate) mod platform;
 pub(crate) mod scene;
 pub(crate) mod store;
+pub(crate) mod telemetry;
 
 pub use backend::KmsBackendV2;

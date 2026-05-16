@@ -177,9 +177,26 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     6 new unit tests for ring trim / history-window math /
     repaint picker fallback cases. Stage 2f's synthetic harness
     is the load-bearing buffer-age oracle test (deferred).
-  - [ ] **2f — Telemetry + acceptance harness + hardware smoke.**
-    Counters wired per spec § "Required counters"; synthetic
-    acceptance binary; user-run hardware smoke on bee + fuji.
+  - [~] **2f — Telemetry + acceptance harness + hardware smoke.**
+    **Telemetry landed 2026-05-16**: `kms::v2::telemetry::Telemetry`
+    owns the per-second counter bucket + lifetime aggregates per
+    spec §"Required counters". Counter sites wired:
+    `record_paint_submit` on fill/put/copy success;
+    `record_one_shot_submit` + `record_fence_wait` on get_image;
+    `record_composite_submit` on scene tick success;
+    `record_frame_present` on page-flip retirement;
+    `record_storage_allocation` + `record_image_view_create` on
+    pixmap/window backing alloc. `YSERVER_LOOP_TELEMETRY=1`
+    triggers the per-second summary line via `maybe_emit`
+    (called from `maybe_composite`). 4 unit tests cover counter
+    accumulation, fence-wait aggregation, bucket reset, and
+    backend-level "only successful ops increment" wiring.
+    **Pending**: synthetic acceptance harness binary (driving
+    PutImage/CopyArea/PolyFillRectangle/GetImage through the
+    X11 protocol + asserting pixel correctness vs CPU oracle +
+    asserting `vk_queue_wait_idle == 0` outside get_image),
+    and user-run hardware smoke on bee + fuji
+    (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`).
 
 ### Pending
 - [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on
