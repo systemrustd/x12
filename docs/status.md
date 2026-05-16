@@ -137,9 +137,20 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     fill→GetImage, PutImage-then-fill) passing under lavapipe.
     11 logic-only unit tests for byte-stride math + clipping.
     v1 path unchanged.
-  - [ ] **2d — copy_area + scene graph + blit pipeline.** First
-    visible composed scanout; full-redraw every tick (no buffer-
-    age yet).
+  - [~] **2d — copy_area + scene graph + blit pipeline.**
+    **Part 1 landed 2026-05-16** (`6151e34`): RenderEngine
+    `copy_area` with the disjoint-image path (vkCmdCopyImage)
+    and the src==dst scratch-image path (overlap-safe). Wired
+    on KmsBackendV2. 2 Vk-backed acceptance tests under lavapipe
+    (disjoint + self-overlap) passing.
+    **Part 2 pending**: SceneCompositor real with v1's
+    `CompositorPipeline` reuse, window-storage lifecycle on
+    KmsBackendV2 (`register_top_level` / `map_subwindow` /
+    `configure_subwindow` / `destroy_subwindow`), root storage
+    allocation, compose tick with damage-projection snapshots
+    (full-redraw every tick), atomic flip with IN_FENCE_FD,
+    on_page_flip_ready wiring. First visible composed scanout
+    is the part-2 acceptance gate.
   - [ ] **2e — Buffer-age clipping + I6b retirement + failed-flip
     recovery.** Output-level damage snapshot/ack;
     transactional generation advance with separate 9a/9b paths.
