@@ -15,7 +15,7 @@
 //! `v2: <method> not yet implemented` warn line per opcode. No
 //! real-app gates land at this stage — those wait for Stage 3.
 
-use std::{any::Any, cell::RefCell, collections::HashSet, io, sync::Arc};
+use std::{any::Any, cell::RefCell, collections::HashSet, io};
 
 use yserver_core::{
     backend::{
@@ -32,7 +32,6 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 use crate::{
     drm,
     kms::{
-        backend::{OutputLayout, platform_init},
         core::KmsCore,
         v2::{
             engine::RenderEngine, platform::PlatformBackend, scene::SceneCompositor,
@@ -41,37 +40,27 @@ use crate::{
     },
 };
 
-/// Stage 1b sibling backend. Shares `KmsCore` with `KmsBackend`;
-/// every paint / scene / RENDER op is a logged gap.
+/// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
+/// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
+/// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
+/// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
+/// log gaps until those substages land.
 pub struct KmsBackendV2 {
     /// Shared protocol-bookkeeping state. Identical to v1's
     /// `KmsBackend.core` — same struct, same construction path.
     pub(crate) core: KmsCore,
 
-    // DRM / output / libinput state. For Stage 1b these are
-    // duplicated from KmsBackend's layout so basic lifecycle hooks
-    // (poll_fds, fb_dimensions) work. In Stage 2 the equivalents
-    // move into `PlatformBackend`.
-    #[allow(dead_code)]
-    device: Arc<drm::Device>,
-    #[allow(dead_code)]
-    render_node_fd: Option<std::os::fd::OwnedFd>,
-    #[allow(dead_code)]
-    render_node_path: Option<std::path::PathBuf>,
-    outputs: Vec<OutputLayout>,
-    fb_w: u16,
-    fb_h: u16,
-    input_ctx: Option<crate::input::SendContext>,
+    /// Real DRM/KMS/libinput/Vulkan owner per Stage 2a. Replaced
+    /// the flat field set Stage 1b carried.
+    pub(crate) platform: PlatformBackend,
 
     /// Once-per-method dedup set for `v2: <method> not yet
     /// implemented` warnings. `RefCell` to keep the helper callable
     /// from `&self` paths (capability accessors that log gaps).
     logged_gaps: RefCell<HashSet<&'static str>>,
 
-    /// Future v2 components — zero-sized stubs in Stage 1b. Stage 2
-    /// replaces these with real types.
-    #[allow(dead_code)]
-    platform: PlatformBackend,
+    /// Future v2 components — zero-sized stubs through Stage 2a.
+    /// Stages 2b/2c/2d replace these with real types.
     #[allow(dead_code)]
     store: DrawableStore,
     #[allow(dead_code)]
@@ -81,15 +70,18 @@ pub struct KmsBackendV2 {
 }
 
 impl KmsBackendV2 {
-    /// Real-DRM constructor. Mirrors the platform-init half of
-    /// `KmsBackend::open`; skips all Vulkan / pipeline / scanout
-    /// bring-up since v2's paint paths are stubbed.
+    /// Real-DRM-real-Vk constructor. Per Stage 2a, the platform
+    /// layer (DRM device, output layouts, libinput, VkContext,
+    /// ops command pool, fence pool, per-output scanout pools)
+    /// is real; v2's `DrawableStore` / `RenderEngine` /
+    /// `SceneCompositor` are still stubs and paint paths log
+    /// gaps.
     ///
     /// # Errors
     ///
-    /// Propagates DRM / output discovery / libinput init failures
-    /// from [`platform_init`], plus FontLoader / XKB init failures
-    /// from [`KmsCore::new`].
+    /// Propagates DRM / Vk / libinput init failures from
+    /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
+    /// init failures from `KmsCore::new`.
     pub fn open(device_path: &str) -> io::Result<Self> {
         Self::open_with_commit(device_path, drm::modeset::commit_modeset)
     }
@@ -102,83 +94,36 @@ impl KmsBackendV2 {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let crate::kms::backend::PlatformInit {
-            device,
-            render_node_fd,
-            render_node_path,
-            layouts,
-            fb_w,
-            fb_h,
-            input_ctx,
-        } = platform_init(device_path, commit)?;
+        let platform = PlatformBackend::open_with_commit(device_path, commit)?;
+        let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let core = KmsCore::new(fb_w, fb_h)?;
         log::info!(
             "yserver(v2): KmsBackendV2 boot — {} output(s), {fb_w}x{fb_h} virtual screen; \
-             paint paths stubbed, expect 'v2: <method> not yet implemented' warns on first \
-             client paint",
-            layouts.len(),
+             paint paths stubbed pending Stages 2b–2e, expect 'v2: <method> not yet \
+             implemented' warns on first client paint",
+            platform.outputs.len(),
         );
         Ok(Self {
             core,
-            device,
-            render_node_fd,
-            render_node_path,
-            outputs: layouts,
-            fb_w,
-            fb_h,
-            input_ctx,
+            platform,
             logged_gaps: RefCell::new(HashSet::new()),
-            platform: PlatformBackend::stub(),
             store: DrawableStore::stub(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
         })
     }
 
-    /// Headless test seed. Single 800×600 stub output; no Vulkan;
-    /// no real DRM device. Mirrors `KmsBackend::for_tests` in shape
-    /// so unit tests that drive v2 through `process_request` get a
-    /// stable fixture.
+    /// Headless test seed. Single 800×600 stub output; no
+    /// Vulkan; no real DRM device. Mirrors `KmsBackend::for_tests`
+    /// in shape so unit tests that drive v2 through
+    /// `process_request` get a stable fixture.
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
         Self {
             core: KmsCore::for_tests(),
-            device: Arc::new(drm::Device::for_tests().expect("test drm device")),
-            render_node_fd: None,
-            render_node_path: None,
-            outputs: vec![OutputLayout {
-                output: crate::drm::modeset::Output {
-                    connector: ::drm::control::from_u32(1).unwrap(),
-                    connector_name: "test".to_string(),
-                    crtc: ::drm::control::from_u32(1).unwrap(),
-                    plane: ::drm::control::from_u32(1).unwrap(),
-                    // SAFETY: tests never pass this mode to DRM; it is only
-                    // present to satisfy the struct shape.
-                    mode: unsafe { std::mem::zeroed() },
-                    picked: crate::drm::modeset::Mode {
-                        name: "test".to_string(),
-                        width: 800,
-                        height: 600,
-                        vrefresh: 60,
-                        preferred: true,
-                    },
-                    plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
-                    plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
-                },
-                swapchain: crate::drm::Swapchain::empty_for_tests(),
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                damage: crate::kms::scheduler::damage::OutputDamageState::new(),
-                composite_pools: None,
-            }],
-            fb_w: 800,
-            fb_h: 600,
-            input_ctx: None,
+            platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
-            platform: PlatformBackend::stub(),
             store: DrawableStore::stub(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
@@ -190,7 +135,7 @@ impl KmsBackendV2 {
     /// (capability advertisement, `ServerState::with_randr_outputs`).
     #[must_use]
     pub fn fb_dimensions(&self) -> (u16, u16) {
-        (self.fb_w, self.fb_h)
+        self.platform.fb_dimensions()
     }
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
@@ -198,11 +143,12 @@ impl KmsBackendV2 {
     pub fn randr_outputs(&self) -> Vec<yserver_core::randr::RandrOutput> {
         use std::collections::HashMap;
         use yserver_core::randr::RandrOutput;
-        let n = self.outputs.len();
+        let n = self.platform.outputs.len();
         let mut mode_ids: HashMap<(u16, u16, u32), u32> = HashMap::new();
         #[allow(clippy::cast_possible_truncation)]
         let mut next_mode_id: u32 = (2 * n + 1) as u32;
-        self.outputs
+        self.platform
+            .outputs
             .iter()
             .enumerate()
             .map(|(i, layout)| {
@@ -236,42 +182,33 @@ impl KmsBackendV2 {
     /// Mirrors `KmsBackend::take_input_ctx`.
     #[must_use]
     pub fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
-        self.input_ctx.take()
+        self.platform.take_input_ctx()
     }
 
-    /// Initial composite + flip. v2 has no compositor — log gap +
-    /// return Ok so `lib.rs`'s pre-loop composite call doesn't fail
-    /// the boot.
+    /// Initial composite + flip. v2's compositor is stubbed
+    /// until Stage 2d; log + Ok so `lib.rs`'s pre-loop composite
+    /// call doesn't fail the boot.
+    ///
+    /// # Errors
+    ///
+    /// Stage 2a never errors; Stage 2d wires the real compose
+    /// path.
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
         self.log_v2_gap("composite_and_flip");
         Ok(())
     }
 
-    /// Post-loop output disarm. v2 doesn't have scanout pools yet,
-    /// so this is the simple form: walk outputs, ask DRM to disable
-    /// each. Mirrors the bottom of `KmsBackend::disable_output`.
+    /// Post-loop teardown — delegates to PlatformBackend, which
+    /// disables each output and disarms scanout pools whose
+    /// disable failed (matching v1's behaviour to avoid leaking
+    /// framebuffers KMS may still hold).
     ///
     /// # Errors
     ///
     /// Propagates the first per-output `drm::modeset::disable_output`
-    /// failure; logged but subsequent outputs still attempted.
+    /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
-        let mut first_err: Option<io::Error> = None;
-        for layout in &self.outputs {
-            if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
-                log::warn!(
-                    "v2 disable_output: failed for {}: {e}",
-                    layout.output.connector_name,
-                );
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        self.platform.disable_output()
     }
 
     /// Once-per-method dedup helper. Each `method` name produces
@@ -389,17 +326,9 @@ impl Backend for KmsBackendV2 {
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // DRM fd for page-flip events; libinput fd if the input
-        // context is still owned by us (after `take_input_ctx`
-        // libinput goes through the dedicated thread). Mirrors
-        // KmsBackend's poll_fds shape so the core loop's poller
-        // registers the same fd inventory.
-        use std::os::fd::{AsFd, AsRawFd};
-        let mut fds = Vec::with_capacity(2);
-        if let Some(ctx) = self.input_ctx.as_ref() {
-            fds.push((ctx.fd(), BackendFdKind::Libinput));
-        }
-        fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
-        fds
+        // context is still owned by us. Delegates to
+        // PlatformBackend.
+        self.platform.poll_fds()
     }
 
     // ── Subwindow lifecycle ─────────────────────────────────────
