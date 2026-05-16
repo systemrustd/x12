@@ -4806,6 +4806,17 @@ impl KmsBackend {
             .as_ref()
             .expect("checked above")
             .image_view();
+        // IDENTITY-swizzle view for the COLOR_ATTACHMENT binding;
+        // Vulkan requires identity on framebuffer attachments
+        // (VUID-VkFramebufferCreateInfo-pAttachments-00891). The
+        // `mask_view` above carries an `a=R` swizzle for the
+        // composite-side sample. Same fix as v2 — see kms::v2::
+        // engine::render_traps_or_tris comment.
+        let mask_attachment_view = self
+            .mask_scratch
+            .as_ref()
+            .expect("checked above")
+            .attachment_view();
         let mask_extent = self.mask_scratch.as_ref().expect("checked above").extent();
         let mask_image = self.mask_scratch.as_ref().expect("checked above").image();
 
@@ -5100,7 +5111,9 @@ impl KmsBackend {
                     },
                 };
                 let color_attachment = ash::vk::RenderingAttachmentInfo::default()
-                    .image_view(mask_view)
+                    // IDENTITY-swizzle view for the attachment binding;
+                    // see mask_attachment_view doc above.
+                    .image_view(mask_attachment_view)
                     .image_layout(ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(ash::vk::AttachmentLoadOp::CLEAR)
                     .store_op(ash::vk::AttachmentStoreOp::STORE)

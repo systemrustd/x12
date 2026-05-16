@@ -58,12 +58,14 @@ impl From<vk::Result> for MaskScratchError {
 struct RetiredMaskScratchImage {
     image: vk::Image,
     view: vk::ImageView,
+    attachment_view: vk::ImageView,
     image_memory: vk::DeviceMemory,
 }
 
 impl BatchResource for RetiredMaskScratchImage {
     fn release(self: Box<Self>, vk: &VkContext) {
         unsafe {
+            vk.device.destroy_image_view(self.attachment_view, None);
             vk.device.destroy_image_view(self.view, None);
             vk.device.destroy_image(self.image, None);
             vk.device.free_memory(self.image_memory, None);
@@ -74,7 +76,20 @@ impl BatchResource for RetiredMaskScratchImage {
 pub struct MaskScratch {
     vk: Arc<VkContext>,
     image: vk::Image,
+    /// Sampled view, with `a=R` swizzle so the composite shader's
+    /// `mask_sample.a` returns the R8 coverage. Bound as
+    /// `COMBINED_IMAGE_SAMPLER` in the descriptor set.
     view: vk::ImageView,
+    /// Attachment view, with **IDENTITY swizzle** so the trap
+    /// rasterize's fragment write to the R component lands
+    /// correctly. Vulkan requires identity swizzle on framebuffer
+    /// attachment views (`VUID-VkFramebufferCreateInfo-pAttachments-00891`).
+    /// lavapipe is lenient about this — it accepts the swizzled view
+    /// either way — but Intel and RADV reject the write or produce
+    /// undefined results, surfacing as "the rasterize wrote nothing"
+    /// in the subsequent sampler read. Bound as `COLOR_ATTACHMENT`
+    /// in `cmd_begin_rendering`.
+    attachment_view: vk::ImageView,
     image_memory: vk::DeviceMemory,
     extent: vk::Extent2D,
     current_layout: vk::ImageLayout,
@@ -89,11 +104,12 @@ impl MaskScratch {
             width: 256,
             height: 256,
         };
-        let (image, view, image_memory) = allocate_image(&vk, extent)?;
+        let (image, view, attachment_view, image_memory) = allocate_image(&vk, extent)?;
         Ok(Self {
             vk,
             image,
             view,
+            attachment_view,
             image_memory,
             extent,
             current_layout: vk::ImageLayout::UNDEFINED,
@@ -106,6 +122,12 @@ impl MaskScratch {
 
     pub fn image_view(&self) -> vk::ImageView {
         self.view
+    }
+
+    /// IDENTITY-swizzle view for use as a color attachment. See the
+    /// struct field doc for the spec rationale.
+    pub fn attachment_view(&self) -> vk::ImageView {
+        self.attachment_view
     }
 
     /// Raw `vk::Image` handle. Needed by the GPU trap-rasterize path
@@ -156,16 +178,18 @@ impl MaskScratch {
             width: self.extent.width.max(width).next_power_of_two().max(256),
             height: self.extent.height.max(height).next_power_of_two().max(256),
         };
-        let (image, view, image_memory) = allocate_image(&self.vk, new_extent)?;
+        let (image, view, attachment_view, image_memory) = allocate_image(&self.vk, new_extent)?;
         // Allocation succeeded — past here the function MUST NOT fail.
         let old_image = std::mem::replace(&mut self.image, image);
         let old_view = std::mem::replace(&mut self.view, view);
+        let old_attachment_view = std::mem::replace(&mut self.attachment_view, attachment_view);
         let old_memory = std::mem::replace(&mut self.image_memory, image_memory);
         self.extent = new_extent;
         self.current_layout = vk::ImageLayout::UNDEFINED;
         Ok(Some(Box::new(RetiredMaskScratchImage {
             image: old_image,
             view: old_view,
+            attachment_view: old_attachment_view,
             image_memory: old_memory,
         })))
     }
@@ -175,6 +199,9 @@ impl Drop for MaskScratch {
     fn drop(&mut self) {
         unsafe {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
+            self.vk
+                .device
+                .destroy_image_view(self.attachment_view, None);
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
             self.vk.device.free_memory(self.image_memory, None);
@@ -185,7 +212,7 @@ impl Drop for MaskScratch {
 fn allocate_image(
     vk: &VkContext,
     extent: vk::Extent2D,
-) -> Result<(vk::Image, vk::ImageView, vk::DeviceMemory), MaskScratchError> {
+) -> Result<(vk::Image, vk::ImageView, vk::ImageView, vk::DeviceMemory), MaskScratchError> {
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(vk::Format::R8_UNORM)
@@ -244,12 +271,12 @@ fn allocate_image(
         }
         return Err(e.into());
     }
+    // Sampled view: swizzle so `.a` samples R — same convention the
+    // Composite shader already uses for R8 mask drawables.
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk::Format::R8_UNORM)
-        // Swizzle so .a samples R — same convention the Composite
-        // shader already uses for R8 mask drawables.
         .components(vk::ComponentMapping {
             r: vk::ComponentSwizzle::ZERO,
             g: vk::ComponentSwizzle::ZERO,
@@ -267,7 +294,40 @@ fn allocate_image(
             return Err(e.into());
         }
     };
-    Ok((image, view, memory))
+    // Attachment view: IDENTITY swizzle so the trap rasterize's R
+    // fragment write lands at the R component. Vulkan spec requires
+    // IDENTITY on color attachment views
+    // (VUID-VkFramebufferCreateInfo-pAttachments-00891); a swizzled
+    // view here yields undefined behaviour on real GPU drivers
+    // (Intel: writes lost; RADV: similar). lavapipe accepts the
+    // swizzled view as both, which is why this latent bug shipped
+    // through 3e.2.
+    let attachment_view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(vk::Format::R8_UNORM)
+        // Identity by default — no .components() call needed; setting
+        // explicitly keeps the contract visible at the create site.
+        .components(vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::IDENTITY,
+        })
+        .subresource_range(color_subresource_range());
+    let attachment_view = match unsafe { vk.device.create_image_view(&attachment_view_info, None) }
+    {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe {
+                vk.device.destroy_image_view(view, None);
+                vk.device.free_memory(memory, None);
+                vk.device.destroy_image(image, None);
+            }
+            return Err(e.into());
+        }
+    };
+    Ok((image, view, attachment_view, memory))
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {

@@ -594,6 +594,230 @@ fn v2_render_trapezoids_renders_filled_rect() {
     );
 }
 
+/// Repro for the xeyes "pupils missing" hardware-smoke bug
+/// reported 2026-05-16. xeyes paints:
+///   1. Trapezoids op=Over src=<SolidFill white> at the eye region
+///   2. Trapezoids op=Over src=<SolidFill black> at a smaller
+///      pupil region inside it
+/// On hardware the eye whites render correctly but the black
+/// pupils never appear. v1's PaintBatch coalesces multiple paints
+/// into ONE CB with in-CB barriers; v2's per-op CB shape means each
+/// `render_trapezoids` call has its own CB. Both CBs share the
+/// engine's single 1×1 `solid_src_image` scratch — CB1 clears it
+/// to white + samples, CB2 clears it to black + samples. Hypothesis:
+/// the cross-CB barrier on `solid_src_image` either isn't strong
+/// enough to prevent CB2's clear from racing CB1's sample, or some
+/// other piece of state is shared without proper sync.
+///
+/// Test: 16×16 dst pre-filled green; an 8×8 axis-aligned white
+/// trap, then a 4×4 axis-aligned black trap inside it. The final
+/// dst should read:
+///   - black at the centre (inside both traps)
+///   - white between (inside white but outside black)
+///   - green at corners (outside both traps)
+/// If the second paint loses its black source (race on
+/// `solid_src_image`), the centre will read white or undefined.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_back_to_back_trapezoids_different_solidfill_colors() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst_pix = b.create_pixmap(None, 32, 16, 16).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    // Pre-fill green: 0xFF00FF00 ARGB. BGRA wire bytes:
+    // B=0, G=0xFF, R=0, A=0xFF.
+    b.fill_rectangle(None, dst_xid, 0xFF00FF00, 0, 0, 16, 16)
+        .expect("pre-fill green");
+
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst_pic")
+        .expect("Some");
+
+    // White SolidFill: RGBA(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF).
+    let white_src = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill white")
+        .expect("Some");
+    // Black SolidFill: RGBA(0, 0, 0, 0xFFFF).
+    let black_src = b
+        .render_create_solid_fill(None, [0, 0, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid_fill black")
+        .expect("Some");
+
+    // Helper: build an axis-aligned trapezoid wire blob (40 bytes
+    // per trap, 16.16 fixed-point).
+    let trap_bytes = |top: i32, bot: i32, left: i32, right: i32| -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::with_capacity(40);
+        let fields: [i32; 10] = [
+            top << 16,
+            bot << 16,
+            left << 16,
+            top << 16,
+            left << 16,
+            bot << 16,
+            right << 16,
+            top << 16,
+            right << 16,
+            bot << 16,
+        ];
+        for f in fields {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
+    };
+
+    // 8×8 white trap at (4..12, 4..12) — analogous to xeyes' eye
+    // white.
+    b.render_trapezoids(
+        None,
+        3, // Over
+        white_src.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        &trap_bytes(4, 12, 4, 12),
+        0,
+        0,
+    )
+    .expect("render_trapezoids white");
+
+    // 4×4 black trap at (6..10, 6..10) — analogous to xeyes' pupil
+    // inside the eye.
+    b.render_trapezoids(
+        None,
+        3, // Over
+        black_src.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        &trap_bytes(6, 10, 6, 10),
+        0,
+        0,
+    )
+    .expect("render_trapezoids black");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 16, 16, !0)
+        .expect("get_image")
+        .expect("Some");
+
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 16 + x) * 4;
+        [out[off], out[off + 1], out[off + 2], out[off + 3]]
+    };
+
+    // Centre (8, 8): inside black trap → must read black.
+    assert_eq!(
+        pixel(8, 8),
+        [0x00, 0x00, 0x00, 0xFF],
+        "centre must be black (pupil): {:?} — if white, the second \
+         render_trapezoids' SolidFill source was lost (shared \
+         solid_src_image race?)",
+        pixel(8, 8),
+    );
+    // (5, 5): inside white but outside black → must read white.
+    assert_eq!(
+        pixel(5, 5),
+        [0xFF, 0xFF, 0xFF, 0xFF],
+        "(5,5) must be white (eye): got {:?}",
+        pixel(5, 5),
+    );
+    // (1, 1): outside both → must stay green.
+    assert_eq!(
+        pixel(1, 1),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "(1,1) must stay green (root bg): got {:?}",
+        pixel(1, 1),
+    );
+}
+
+/// Diagnostic: same trap geometry shape as
+/// v2_render_trapezoids_renders_filled_rect but with a LARGE bbox
+/// (covering most of mask_scratch's 256×256 default extent). If
+/// this passes while the 4×4 variant fails, the bug is
+/// bbox-size-vs-mask-extent ratio — Intel rasterizer culls tiny
+/// quads in big viewports. The fix would be to size the viewport
+/// to the bbox, not the full mask.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_trapezoids_large_bbox_repro() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // 200×200 dst pre-filled blue.
+    let dst_pix = b.create_pixmap(None, 32, 200, 200).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 200, 200)
+        .expect("fill pre-blue");
+
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid_fill red")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst_pic")
+        .expect("Some");
+
+    // Big axis-aligned trap: 100×100 inside the 200×200 dst.
+    let mut traps: Vec<u8> = Vec::with_capacity(40);
+    let fields: [i32; 10] = [
+        50 << 16,
+        150 << 16,
+        50 << 16,
+        50 << 16,
+        50 << 16,
+        150 << 16,
+        150 << 16,
+        50 << 16,
+        150 << 16,
+        150 << 16,
+    ];
+    for v in fields {
+        traps.extend_from_slice(&v.to_le_bytes());
+    }
+    b.render_trapezoids(
+        None,
+        3,
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        &traps,
+        0,
+        0,
+    )
+    .expect("render_trapezoids");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 200, 200, !0)
+        .expect("get_image")
+        .expect("Some");
+    // Center pixel (100, 100) — well inside trap (50..150, 50..150).
+    let off = (100 * 200 + 100) * 4;
+    assert_eq!(
+        &out[off..off + 4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "center should be red (got {:?})",
+        &out[off..off + 4],
+    );
+}
+
 /// Stage 3f.3 acceptance: a `Tiled` fill driven through
 /// `apply_fill_state` + `poly_fill_rectangle` replicates the tile
 /// pixmap across the destination via the engine's RENDER composite

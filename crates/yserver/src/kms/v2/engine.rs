@@ -3167,6 +3167,20 @@ impl RenderEngine {
                 })?
         };
         let mask_image = inner.mask_scratch.as_ref().expect("ensured").image();
+        // Two distinct views on mask_scratch: the IDENTITY-swizzle
+        // `attachment_view` for the rasterize-side write (Vulkan
+        // VUID-VkFramebufferCreateInfo-pAttachments-00891 requires
+        // identity on attachments), and the `a=R`-swizzled `view`
+        // for the composite-side sample (so `mask_sample.a` reads the
+        // R8 coverage). Sharing one swizzled view across both —
+        // the pre-3f-bug-fix behaviour — works under lavapipe but
+        // silently produces nothing on Intel / RADV. See xeyes pupil
+        // bug 2026-05-16.
+        let mask_attachment_view = inner
+            .mask_scratch
+            .as_ref()
+            .expect("ensured")
+            .attachment_view();
         let mask_view = inner.mask_scratch.as_ref().expect("ensured").image_view();
         let mask_extent = inner.mask_scratch.as_ref().expect("ensured").extent();
 
@@ -3183,6 +3197,18 @@ impl RenderEngine {
         // composed with the user transform below. `None` for
         // Drawable / Solid sources.
         let mut src_picture_xform: Option<vk_render::AffineXform> = None;
+        // Stage 3f.14 bug-fix (xeyes pupil-missing repro): mirrors
+        // `render_composite`'s synthetic-1×1 handling. SolidFill
+        // sources allocate `solid_src_image` at 1×1; the fragment
+        // shader's `apply_repeat` with `REPEAT_NONE` returns 0 for
+        // any tex_coord outside `[0, 1)`, which on stricter drivers
+        // (Intel / RADV; lavapipe is lenient) yields all-zero src
+        // everywhere except exactly one pixel. The trap composite
+        // then has `src × mask = 0` and paints nothing. Force
+        // `REPEAT_PAD` for synthetic 1×1 scratches so the single
+        // texel covers the whole rect — matching
+        // `render_composite`'s `src_is_synthetic_1x1` override.
+        let mut src_is_synthetic_1x1 = false;
         let (src_view, src_extent) = match src {
             ResolvedSource::Drawable(id) => {
                 let info =
@@ -3202,6 +3228,7 @@ impl RenderEngine {
             }
             ResolvedSource::Solid(color) => {
                 src_clear_color = Some(color);
+                src_is_synthetic_1x1 = true;
                 (
                     solid_src_view,
                     vk::Extent2D {
@@ -3405,7 +3432,9 @@ impl RenderEngine {
             },
         };
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(mask_view)
+            // Use the IDENTITY-swizzle view as the color attachment;
+            // the swizzled `mask_view` is for sample-side use only.
+            .image_view(mask_attachment_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -3484,14 +3513,20 @@ impl RenderEngine {
             Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
             None => user_src_xform,
         };
+        // Synthetic 1×1 scratches use PAD so the single texel
+        // covers the whole rect (xeyes pupil-missing fix). The
+        // mask scratch is sampled within bbox — REPEAT_NONE
+        // outside returns 0 which is what `needs_full_dst`
+        // requires.
+        let effective_src_repeat = if src_is_synthetic_1x1 {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        } else {
+            crate::kms::backend::repeat_to_shader_const(src_repeat)
+        };
         let attrs = vk_render::CompositeAttrs {
             src_extent,
             mask_extent,
-            // Source repeat per protocol; mask is the analytic
-            // coverage scratch sampled within bbox — REPEAT_NONE
-            // outside returns 0 which is what `needs_full_dst`
-            // requires.
-            src_repeat: crate::kms::backend::repeat_to_shader_const(src_repeat),
+            src_repeat: effective_src_repeat,
             mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
             src_xform: combined_src_xform,
             mask_xform: vk_render::AffineXform::IDENTITY,
