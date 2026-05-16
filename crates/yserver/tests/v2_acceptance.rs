@@ -23,7 +23,8 @@
 #![cfg(target_os = "linux")]
 
 use yserver::kms::v2::KmsBackendV2;
-use yserver_core::backend::Backend;
+use yserver_core::backend::{AnyHandle, Backend};
+use yserver_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
 /// 1. create_pixmap (depth=32, 8×8)
@@ -196,4 +197,94 @@ fn v2_telemetry_lifetime_after_sequence() {
         t.lifetime.cpu_fence_wait_count, 1,
         "one fence wait per get_image"
     );
+}
+
+/// Stage 3c.3 acceptance: RENDER paint paths must NOT consult the
+/// ambient GC clip (`KmsCore.current_clip`). Set a restrictive
+/// 1×1 GC clip rectangle, then drive a `render_composite` whose
+/// picture clip is `None`; the result must paint the full dst
+/// rect — proof that the GC clip didn't leak into the RENDER
+/// pipeline (plan §4 cross-cutting rule).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_composite_no_gc_clip_leak() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // 4×4 dst pixmap pre-filled with blue (pixel 0xFF0000FF).
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
+        .expect("fill_rectangle pre");
+
+    // RENDER picture wrapping the pixmap, no value-mask.
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+    // SolidFill source: opaque red (premul wire u16 RGBA:
+    // R=0xFFFF, G=0, B=0, A=0xFFFF — little-endian per channel).
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF])
+        .expect("render_create_solid_fill")
+        .expect("Some(PictureHandle)");
+
+    // Restrictive GC clip: only (0, 0) 1×1.
+    let mut rects = Vec::new();
+    rects.extend_from_slice(&i16::to_le_bytes(0));
+    rects.extend_from_slice(&i16::to_le_bytes(0));
+    rects.extend_from_slice(&u16::to_le_bytes(1));
+    rects.extend_from_slice(&u16::to_le_bytes(1));
+    b.set_clip_rectangles(
+        None,
+        Some(ClipRectangles {
+            ordering: 0,
+            x_origin: 0,
+            y_origin: 0,
+            rectangles: rects,
+        }),
+    )
+    .expect("set_clip_rectangles");
+
+    // Composite covers the full 4×4 dst — the picture's clip is
+    // None (no `render_set_picture_clip_rectangles` call), so the
+    // engine should paint everywhere. If the backend leaked the GC
+    // clip into the RENDER path, only (0, 0) would be painted.
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        4,
+    )
+    .expect("render_composite");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+    // Every pixel must be red BGRA = [0, 0, 0xFF, 0xFF].
+    for y in 0..4 {
+        for x in 0..4 {
+            let off = (y * 4 + x) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "GC clip leaked into RENDER paint at ({x},{y})",
+            );
+        }
+    }
 }

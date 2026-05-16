@@ -366,6 +366,17 @@ struct RenderEngineInner {
     /// the current dst into this scratch before the draw samples
     /// it. Lazy.
     dst_readback: Option<DstReadback>,
+    /// Stage 3c.3: self-alias scratch. When the resolved source
+    /// (or mask) picture wraps the same backing as the destination
+    /// (`src.drawable_id() == dst_id`), we copy dst into this
+    /// scratch before the composite pass and bind its view as the
+    /// `src_tex` / `mask_tex` descriptor instead of dst's own
+    /// drawable view. Vulkan can't sample an image while it's bound
+    /// as a color attachment in the same draw; the scratch breaks
+    /// the alias. Reuses [`DstReadback`]'s growable per-format
+    /// scratch shape — identical Vk requirements (sampled image +
+    /// dst-format swizzle for no-alpha picture formats).
+    src_alias_readback: Option<DstReadback>,
     /// Stage 3c: drawable view cache (plan §1). Keyed by
     /// `(DrawableId, SamplerConfig, SwizzleClass)`. Views are
     /// destroyed on Drawable retire; the engine's
@@ -397,6 +408,7 @@ impl RenderEngine {
                 solid_mask_image: None,
                 white_mask_image: None,
                 dst_readback: None,
+                src_alias_readback: None,
                 drawable_view_cache: HashMap::new(),
             }),
         })
@@ -597,6 +609,9 @@ impl RenderEngine {
         }
         if inner.dst_readback.is_none() {
             inner.dst_readback = Some(DstReadback::new(Arc::clone(&inner.vk)));
+        }
+        if inner.src_alias_readback.is_none() {
+            inner.src_alias_readback = Some(DstReadback::new(Arc::clone(&inner.vk)));
         }
         Ok(())
     }
@@ -1777,21 +1792,15 @@ impl RenderEngine {
         };
         let needs_dst_readback = std_op.needs_dst_readback();
 
-        // Self-alias guards (Risk 13). Source self-alias is real
-        // (apps occasionally `Composite(src=dst, dst=dst)` as a
-        // copy-with-blend); the scratch routing lands in 3c.3
-        // alongside the acceptance test. Mask self-alias is rare;
-        // both bail with a gap log here.
+        // Stage 3c.3 self-alias (Risk 13). When src and/or mask
+        // resolve to the same backing as dst, Vulkan can't sample
+        // the image while it's bound as a color attachment in the
+        // same draw. Route through `src_alias_readback`: copy dst →
+        // scratch before the composite pass, bind the scratch view
+        // as `src_tex` / `mask_tex` in place of dst's drawable view.
         let src_self_alias = matches!(src, ResolvedSource::Drawable(id) if id == dst_id);
         let mask_self_alias = matches!(mask, ResolvedSource::Drawable(id) if id == dst_id);
-        if src_self_alias || mask_self_alias {
-            log::debug!(
-                "v2 render_composite gap: self-alias (src={} mask={}); 3c.3 scratch path deferred",
-                src_self_alias,
-                mask_self_alias
-            );
-            return Ok(stats);
-        }
+        let self_alias_used = src_self_alias || mask_self_alias;
 
         // Pre-flight gradient bail. Stage 3e wires GradientPicture
         // LUT build through `picture_paint`.
@@ -1800,6 +1809,33 @@ impl RenderEngine {
             log::debug!("v2 render_composite gap: gradient source/mask (Stage 3e territory)");
             return Ok(stats);
         }
+
+        // Pre-allocate the alias scratch + extract its sampleable
+        // view before resolving src/mask. The scratch grows on
+        // demand; the view is stable until the next grow (which
+        // can't happen mid-call). `record_copy_from` runs inside
+        // the per-op CB later — this is just the resource ensure.
+        let src_alias_view = if self_alias_used {
+            let rb = inner.src_alias_readback.as_mut().expect("ensured");
+            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                .map_err(|e| {
+                    log::warn!("v2 render_composite: src_alias_readback ensure failed: {e:?}");
+                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                })?;
+            match rb.view(dst_format, dst_has_alpha) {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => {
+                    log::warn!("v2 render_composite: src_alias_readback view None — skipping");
+                    return Ok(stats);
+                }
+                Err(e) => {
+                    log::warn!("v2 render_composite: src_alias_readback view build failed: {e:?}");
+                    return Ok(stats);
+                }
+            }
+        } else {
+            None
+        };
 
         // Resolve src view + extent + (optional) clear colour.
         let solid_src_view = inner
@@ -1823,78 +1859,96 @@ impl RenderEngine {
         let mut src_is_synthetic_1x1 = false;
         let mut mask_is_synthetic_1x1 = false;
 
-        let (src_view, src_extent) = match src {
-            ResolvedSource::Drawable(id) => {
-                let info =
-                    drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
-                let class = swizzle_class_for(info.format, info.depth);
-                let sampler = sampler_config_for_repeat(src_repeat);
-                let view = ensure_drawable_view(
-                    &inner.vk,
-                    &mut inner.drawable_view_cache,
-                    id,
-                    info.image,
-                    info.format,
-                    sampler,
-                    class,
-                )?;
-                (view, info.extent)
-            }
-            ResolvedSource::Solid(color) => {
-                src_clear_color = Some(color);
-                src_is_synthetic_1x1 = true;
-                (
-                    solid_src_view,
-                    vk::Extent2D {
-                        width: 1,
-                        height: 1,
-                    },
-                )
-            }
-            ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
-            ResolvedSource::None => {
-                log::debug!("v2 render_composite gap: src is None (protocol requires src)");
-                return Ok(stats);
+        let (src_view, src_extent) = if src_self_alias {
+            // Route through the alias scratch. The scratch matches
+            // dst's format + extent; sampler config (repeat mode) is
+            // baked into the pipeline shader path, not the view —
+            // see plan §3c "self-aliasing".
+            (
+                src_alias_view.expect("set when self_alias_used"),
+                dst_extent,
+            )
+        } else {
+            match src {
+                ResolvedSource::Drawable(id) => {
+                    let info = drawable_for_render_view(store, id)
+                        .ok_or(RenderError::UnknownDrawable(id))?;
+                    let class = swizzle_class_for(info.format, info.depth);
+                    let sampler = sampler_config_for_repeat(src_repeat);
+                    let view = ensure_drawable_view(
+                        &inner.vk,
+                        &mut inner.drawable_view_cache,
+                        id,
+                        info.image,
+                        info.format,
+                        sampler,
+                        class,
+                    )?;
+                    (view, info.extent)
+                }
+                ResolvedSource::Solid(color) => {
+                    src_clear_color = Some(color);
+                    src_is_synthetic_1x1 = true;
+                    (
+                        solid_src_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
+                ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+                ResolvedSource::None => {
+                    log::debug!("v2 render_composite gap: src is None (protocol requires src)");
+                    return Ok(stats);
+                }
             }
         };
-        let (mask_view, mask_extent) = match mask {
-            ResolvedSource::Drawable(id) => {
-                let info =
-                    drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
-                let class = swizzle_class_for(info.format, info.depth);
-                let sampler = sampler_config_for_repeat(mask_repeat);
-                let view = ensure_drawable_view(
-                    &inner.vk,
-                    &mut inner.drawable_view_cache,
-                    id,
-                    info.image,
-                    info.format,
-                    sampler,
-                    class,
-                )?;
-                (view, info.extent)
-            }
-            ResolvedSource::Solid(color) => {
-                mask_clear_color = Some(color);
-                mask_is_synthetic_1x1 = true;
-                (
-                    solid_mask_view,
-                    vk::Extent2D {
-                        width: 1,
-                        height: 1,
-                    },
-                )
-            }
-            ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
-            ResolvedSource::None => {
-                mask_is_synthetic_1x1 = true;
-                (
-                    white_mask_view,
-                    vk::Extent2D {
-                        width: 1,
-                        height: 1,
-                    },
-                )
+        let (mask_view, mask_extent) = if mask_self_alias {
+            (
+                src_alias_view.expect("set when self_alias_used"),
+                dst_extent,
+            )
+        } else {
+            match mask {
+                ResolvedSource::Drawable(id) => {
+                    let info = drawable_for_render_view(store, id)
+                        .ok_or(RenderError::UnknownDrawable(id))?;
+                    let class = swizzle_class_for(info.format, info.depth);
+                    let sampler = sampler_config_for_repeat(mask_repeat);
+                    let view = ensure_drawable_view(
+                        &inner.vk,
+                        &mut inner.drawable_view_cache,
+                        id,
+                        info.image,
+                        info.format,
+                        sampler,
+                        class,
+                    )?;
+                    (view, info.extent)
+                }
+                ResolvedSource::Solid(color) => {
+                    mask_clear_color = Some(color);
+                    mask_is_synthetic_1x1 = true;
+                    (
+                        solid_mask_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
+                ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+                ResolvedSource::None => {
+                    mask_is_synthetic_1x1 = true;
+                    (
+                        white_mask_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
             }
         };
 
@@ -2038,6 +2092,23 @@ impl RenderEngine {
         if let Some(c) = mask_clear_color {
             let solid = inner.solid_mask_image.as_mut().expect("ensured");
             record_solid_color_clear(&inner.vk, cb, solid, c);
+        }
+
+        // Stage 3c.3 self-alias: copy dst → alias scratch so the
+        // composite pass samples the snapshot rather than the live
+        // attachment. Must precede `record_render_composite`'s
+        // dst→COLOR_ATTACHMENT transition. `record_copy_from`
+        // restores dst to `dst_current` after the copy, so the
+        // subsequent COLOR_ATTACHMENT barrier sees the same
+        // oldLayout it would have without the scratch path.
+        if self_alias_used {
+            let dst_current = {
+                let d = store.get(dst_id).expect("checked");
+                d.storage.current_layout
+            };
+            let rb = inner.src_alias_readback.as_mut().expect("ensured");
+            rb.record_copy_from(cb, dst_image, dst_current, dst_format, dst_extent);
+            stats.used_src_alias_scratch = true;
         }
 
         // Disjoint/Conjoint: copy current dst → readback scratch
@@ -2190,6 +2261,11 @@ pub(crate) struct CompositeStats {
     /// `dst_readback` path. Used to wire the
     /// `disjoint_readback_count` telemetry counter.
     pub used_dst_readback: bool,
+    /// Whether the op took the Stage 3c.3 self-alias path
+    /// (`src.drawable_id() == dst_id`, or same for mask). Tests
+    /// assert this surfaces the scratch route; v1 had no observable
+    /// signal for this case (the bug it was hiding).
+    pub used_src_alias_scratch: bool,
     /// Total `vkCmdDraw` calls issued (rects × clip-rect
     /// intersections). Used by the acceptance harness to assert
     /// per-rect-scissor splits.
@@ -3755,6 +3831,514 @@ mod tests {
         assert_eq!(stats2.atlas_interns, 0);
         assert_eq!(stats2.glyphs_dropped, 1);
 
+        engine.drain_all(&platform);
+    }
+
+    // ── Stage 3c.3 acceptance tests ─────────────────────────────
+    //
+    // Engine-direct RENDER paint oracles. Each test allocates one
+    // or two Vk-backed drawables, drives `render_composite` /
+    // `render_fill_rectangles` through `RenderEngine`, then
+    // round-trips via `get_image` and asserts pixel-level
+    // correctness against a CPU oracle. The seventh acceptance
+    // test (`render_composite_no_gc_clip_leak`) lives in
+    // `tests/v2_acceptance.rs` because the "no GC clip leak"
+    // property is a Backend-trait invariant (engine has no GC
+    // clip notion).
+
+    /// Allocate a Vk-backed depth-32 pixmap and pre-fill it with
+    /// `color` via the engine's fill_rect path. Returns the
+    /// store DrawableId.
+    fn alloc_filled_pixmap(
+        platform: &mut PlatformBackend,
+        store: &mut DrawableStore,
+        engine: &mut RenderEngine,
+        xid: u32,
+        w: u16,
+        h: u16,
+        color_bgra_premul: [f32; 4],
+    ) -> DrawableId {
+        let storage = platform
+            .allocate_drawable_storage(w, h, 32)
+            .expect("alloc storage");
+        let id = store
+            .allocate(
+                xid,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .expect("store.allocate");
+        engine
+            .fill_rect(
+                store,
+                platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: u32::from(w),
+                        height: u32::from(h),
+                    },
+                },
+                color_bgra_premul,
+            )
+            .expect("pre-fill");
+        id
+    }
+
+    fn full_rect(w: u32, h: u32) -> crate::kms::vk::ops::render::CompositeRect {
+        crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_over_renders_alpha_blended() {
+        // 50%-alpha red (premultiplied: r=0.5, a=0.5) Over opaque
+        // green. Over: out = src + dst * (1 - src.a).
+        //   out.b = 0 + 0 * 0.5 = 0
+        //   out.g = 0 + 1 * 0.5 = 0.5 → 0x80
+        //   out.r = 0.5 + 0 * 0.5 = 0.5 → 0x80
+        //   out.a = 0.5 + 1 * 0.5 = 1.0 → 0xFF
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            4,
+            4,
+            [0.0, 1.0, 0.0, 1.0], // opaque green
+        );
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                3,                                           // Over
+                ResolvedSource::Solid([0.5, 0.0, 0.0, 0.5]), // 50% red premul
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite");
+        assert_eq!(stats.recorded_draws, 1);
+        assert!(!stats.used_dst_readback);
+        assert!(!stats.used_src_alias_scratch);
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        // Centre pixel (1, 1): BGRA = [0, 0x80, 0x80, 0xFF] (±1).
+        let off = (4 + 1) * 4;
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        assert!(near(out[off], 0x00), "B at centre: got {:#x}", out[off]);
+        assert!(
+            near(out[off + 1], 0x80),
+            "G at centre: got {:#x}",
+            out[off + 1]
+        );
+        assert!(
+            near(out[off + 2], 0x80),
+            "R at centre: got {:#x}",
+            out[off + 2]
+        );
+        assert!(
+            near(out[off + 3], 0xFF),
+            "A at centre: got {:#x}",
+            out[off + 3]
+        );
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_picture_clip_per_rect() {
+        // Two disjoint clip rects with a hole between them; one
+        // composite covering the union bbox must paint inside both
+        // rects AND leave the hole untouched. Exercises plan §4's
+        // per-rect scissoring against v1's union-bbox shortcut.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            8,
+            4,
+            [0.0, 0.0, 1.0, 1.0], // RGBA: opaque blue
+        );
+        // Two clip rects with a 2-wide hole at x=3..=4.
+        let clip = vec![
+            Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 4,
+            },
+            Rectangle16 {
+                x: 5,
+                y: 0,
+                width: 3,
+                height: 4,
+            },
+        ];
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1,                                           // Src
+                ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]), // RGBA: opaque red
+                ResolvedSource::None,
+                dst,
+                &[full_rect(8, 4)],
+                Some(&clip),
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite");
+        // One src rect × two clip rects = 2 draw calls.
+        assert_eq!(stats.recorded_draws, 2, "per-rect scissoring");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        // BGRA layout: B at +0, R at +2.
+        for y in 0..4 {
+            for x in 0..8u32 {
+                let off = (y * 8 + x as usize) * 4;
+                let in_clip = (0..3).contains(&x) || (5..8).contains(&x);
+                if in_clip {
+                    assert_eq!(out[off + 2], 0xFF, "R painted at ({x},{y})");
+                    assert_eq!(out[off], 0x00, "B cleared at ({x},{y})");
+                } else {
+                    // Hole (x=3..=4): original blue.
+                    assert_eq!(out[off], 0xFF, "B preserved at ({x},{y})");
+                    assert_eq!(out[off + 2], 0x00, "R untouched at ({x},{y})");
+                }
+            }
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_solid_fill_source_path() {
+        // SolidFill source over (op=Src) an unrelated start colour —
+        // every dst pixel must equal the source's premul colour.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            4,
+            4,
+            [0.0, 0.0, 0.0, 1.0], // opaque black
+        );
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1,                                             // Src
+                ResolvedSource::Solid([0.25, 0.5, 0.75, 1.0]), // RGBA premul
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite");
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        // Storage BGRA bytes for RGBA(0.25, 0.5, 0.75, 1.0):
+        // B=0.75→0xC0, G=0.5→0x80, R=0.25→0x40, A=1→0xFF.
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 1;
+        for px in out.chunks_exact(4) {
+            assert!(near(px[0], 0xC0), "B: {:#x}", px[0]);
+            assert!(near(px[1], 0x80), "G: {:#x}", px[1]);
+            assert!(near(px[2], 0x40), "R: {:#x}", px[2]);
+            assert!(near(px[3], 0xFF), "A: {:#x}", px[3]);
+        }
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_disjoint_clear_uses_readback() {
+        // PictOp 16 = DisjointClear; `needs_dst_readback` returns
+        // true for ops ≥ 13 (Saturate + Disjoint/Conjoint families).
+        // `CompositeStats.used_dst_readback` is the engine's signal.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            4,
+            4,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                16, // DisjointClear
+                ResolvedSource::Solid([0.0, 0.0, 0.0, 1.0]),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite");
+        assert!(
+            stats.used_dst_readback,
+            "Disjoint family must drive the readback path",
+        );
+        assert_eq!(stats.recorded_draws, 1);
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_self_alias() {
+        // src == dst: pre-fill with a vertical gradient, then
+        // Composite(Over, dst, NoMask, dst). Over with itself on
+        // opaque alpha yields self exactly (out = src + dst*(1-1) =
+        // src). Without the scratch path the GPU samples a region
+        // as it writes it — undefined behaviour; with it, the
+        // result must be bit-identical to the pre-fill.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        // Allocate + PutImage a distinct pattern (per-pixel unique).
+        let storage = platform.allocate_drawable_storage(8, 4, 32).expect("alloc");
+        let dst = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .expect("alloc");
+        let mut src_bytes = vec![0u8; 8 * 4 * 4];
+        for y in 0u8..4 {
+            for x in 0u8..8 {
+                let off = (usize::from(y) * 8 + usize::from(x)) * 4;
+                src_bytes[off] = x * 0x20; // B
+                src_bytes[off + 1] = y * 0x40; // G
+                src_bytes[off + 2] = (x + y) * 0x10; // R
+                src_bytes[off + 3] = 0xFF; // A (opaque)
+            }
+        }
+        engine
+            .put_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Offset2D::default(),
+                vk::Extent2D {
+                    width: 8,
+                    height: 4,
+                },
+                &src_bytes,
+                32,
+            )
+            .expect("put_image");
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                3, // Over
+                ResolvedSource::Drawable(dst),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(8, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite");
+        assert!(
+            stats.used_src_alias_scratch,
+            "src == dst must route through the alias scratch",
+        );
+        assert_eq!(stats.recorded_draws, 1);
+
+        let after = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        assert_eq!(
+            after, src_bytes,
+            "Over(self, NoMask, self) must equal self bit-identical",
+        );
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_fill_rectangles_src_clears_to_color() {
+        // render_fill_rectangles(op=Src, premul colour) — every
+        // pixel in the rect must equal the premul colour.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            4,
+            4,
+            [0.0, 0.0, 0.0, 1.0],
+        );
+        let stats = engine
+            .render_fill_rectangles(
+                &mut store,
+                &mut platform,
+                1,                    // Src
+                [1.0, 0.0, 0.0, 1.0], // RGBA: opaque red premul
+                dst,
+                &[full_rect(4, 4)],
+                None,
+            )
+            .expect("render_fill_rectangles");
+        assert_eq!(stats.recorded_draws, 1);
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        // BGRA: B=0, G=0, R=0xFF, A=0xFF.
+        for px in out.chunks_exact(4) {
+            assert_eq!(&px[..4], &[0x00, 0x00, 0xFF, 0xFF]);
+        }
         engine.drain_all(&platform);
     }
 }
