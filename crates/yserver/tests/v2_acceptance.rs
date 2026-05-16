@@ -859,6 +859,109 @@ fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
     }
 }
 
+/// Regression for the xeyes-resize bug (2026-05-16): the user
+/// resizes the xeyes window larger; the new bigger eyes paint
+/// correctly but the OLD small-eye-white pixels at the original
+/// (smaller) positions remain visible in the upper-left of the
+/// window. Indicates the storage isn't being cleared on resize, or
+/// the clear doesn't cover the full new extent.
+///
+/// Test: create a 16×16 window, paint a red rect inside it,
+/// configure to 64×64, then get_image the new (bigger) storage at
+/// position (5, 5) — where the old red would still live if the
+/// resize-fill didn't run. Expect the safe-default depth-32 colour
+/// (transparent black), not red.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_subwindow_resize_clears_old_paint() {
+    use yserver_core::{
+        backend::WindowHandle,
+        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+    };
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Create depth-32 child window at 16×16 with no bg attributes.
+    // 3f.14's allocate_window_storage fills it with transparent-
+    // black on creation.
+    let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
+    let child = b
+        .create_subwindow(
+            None,
+            parent,
+            0,
+            0,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create_subwindow");
+    let xid = child.as_raw();
+
+    // Paint red into the 16×16 window so the "old paint" exists.
+    // Foreground 0xFFFF0000 = ARGB(0xFF, R=0xFF, G=0, B=0).
+    b.fill_rectangle(None, xid, 0xFFFF0000, 0, 0, 16, 16)
+        .expect("paint red");
+
+    // Resize to 64×64 via configure_subwindow. This is the path
+    // v2's WMs (e16 / fvwm / etc.) drive on window-frame resize.
+    b.configure_subwindow(
+        None,
+        xid,
+        HostSubwindowConfig {
+            x: None,
+            y: None,
+            width: Some(64),
+            height: Some(64),
+            border_width: None,
+            stack_mode: None,
+            sibling: None,
+        },
+    )
+    .expect("configure_subwindow resize");
+
+    // Read back the resized storage at (5, 5) — inside the OLD
+    // 16×16 region. Pre-3f.14 / pre-fix: still red (leftover old
+    // paint). 3f.14 expectation: depth-32 safe default
+    // (transparent black, BGRA = [0, 0, 0, 0]).
+    let out = b
+        .get_image(None, xid, 2, 0, 0, 64, 64, !0)
+        .expect("get_image")
+        .expect("Some");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 64 + x) * 4;
+        [out[off], out[off + 1], out[off + 2], out[off + 3]]
+    };
+    // (5, 5) is well-inside the old 16×16 footprint.
+    assert_eq!(
+        pixel(5, 5),
+        [0x00, 0x00, 0x00, 0x00],
+        "post-resize storage at (5,5) must be cleared to safe-default \
+         transparent black (got {:?}); old red would mean the resize-fill \
+         didn't cover this position",
+        pixel(5, 5),
+    );
+    // (30, 30) is outside the old footprint, well inside the new.
+    assert_eq!(
+        pixel(30, 30),
+        [0x00, 0x00, 0x00, 0x00],
+        "post-resize storage at (30,30) must also be cleared (got {:?})",
+        pixel(30, 30),
+    );
+}
+
 /// Diagnostic: same trap geometry shape as
 /// v2_render_trapezoids_renders_filled_rect but with a LARGE bbox
 /// (covering most of mask_scratch's 256×256 default extent). If

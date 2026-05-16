@@ -530,6 +530,18 @@ impl DrawableStore {
     /// Drop one reference. If refcount hits zero, decide
     /// retirement: synchronous-destroy if no fence is
     /// pending; otherwise park in `pending_retire`.
+    ///
+    /// **xid detachment on PendingFence**: when the storage parks
+    /// because of an in-flight GPU ticket, the `by_xid` mapping is
+    /// removed immediately. The drawable stays alive in `entries`
+    /// (and `pending_retire`) until the ticket signals, but the
+    /// xid is now free for re-allocation — needed by, e.g.,
+    /// `configure_subwindow`'s resize path which calls
+    /// `decref` then `allocate(same_xid, …)`. Without this
+    /// detachment the re-allocate would fail with `XidInUse` and
+    /// the caller would silently keep the old (now-orphaned) storage.
+    /// Id-based access stays valid (any in-flight op captured the id
+    /// before this point), so this only affects xid-based lookups.
     pub(crate) fn decref(
         &mut self,
         platform: &mut PlatformBackend,
@@ -554,6 +566,11 @@ impl DrawableStore {
             self.destroy_now(platform, id);
             RetireDecision::Destroyed
         } else {
+            // Detach from xid map so the xid is free for re-alloc
+            // (configure_subwindow resize). entries[id] persists for
+            // pending_retire poll.
+            let xid = drawable.xid;
+            self.by_xid.remove(&xid);
             self.pending_retire.push(id);
             RetireDecision::PendingFence
         }
