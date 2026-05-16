@@ -4482,20 +4482,53 @@ impl Backend for KmsBackendV2 {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        // Stub: 0 keysyms per code, count codes. Stage 2 wires real
-        // xkbcommon-derived keysym tables.
-        self.log_v2_gap("get_keyboard_mapping");
-        let _ = (first_keycode, count);
-        Ok((0, Vec::new()))
+        // Stage 3f.7 follow-up: port v1's body verbatim. KmsCore
+        // carries `xkb_keymap` so the lookup works on both backends.
+        // The pre-fix stub returned 0 keysyms per code, which made
+        // xterm think every key was dead — typing into xterm worked
+        // for cursor movement but Enter/letters were swallowed.
+        //
+        // X11 GetKeyboardMapping: per keycode, return a flat row of
+        // keysyms across shift levels (unshifted / shifted /
+        // mode-switch-unshifted / mode-switch-shifted). Apps combine
+        // the keycode with the modifier bits in the event's `state`
+        // field to pick the right slot.
+        const LEVELS: usize = 4;
+        let max_kc = u16::from(first_keycode) + u16::from(count);
+        let mut flat = Vec::with_capacity(usize::from(count) * LEVELS);
+        for kc in u16::from(first_keycode)..max_kc {
+            let xkb_kc = xkbcommon::xkb::Keycode::new(u32::from(kc));
+            for level in 0..LEVELS as u32 {
+                let syms = self
+                    .core
+                    .xkb_keymap
+                    .0
+                    .key_get_syms_by_level(xkb_kc, 0, level);
+                flat.push(syms.first().map_or(0, |s| s.raw()));
+            }
+        }
+        Ok((LEVELS as u8, flat))
     }
 
     fn get_modifier_mapping(
         &mut self,
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
-        // Stub: 0 keycodes per modifier.
-        self.log_v2_gap("get_modifier_mapping");
-        Ok((0, Vec::new()))
+        // v1-parity conventional defaults. 8 rows × 4 keycodes:
+        // Shift(0x32,0x3E), Lock(0x42), Control(0x25,0x69),
+        // Mod1(0x40,0x6C), Mod2(0x4D), Mod3(0x73),
+        // Mod4(0x85,0x86), Mod5(empty).
+        let data: Vec<u8> = vec![
+            0x32, 0x3E, 0, 0, // Shift
+            0x42, 0, 0, 0, // Lock
+            0x25, 0x69, 0, 0, // Control
+            0x40, 0x6C, 0, 0, // Mod1
+            0x4D, 0, 0, 0, // Mod2
+            0x73, 0, 0, 0, // Mod3
+            0x85, 0x86, 0, 0, // Mod4
+            0, 0, 0, 0, // Mod5
+        ];
+        Ok((4, data))
     }
 }
 
