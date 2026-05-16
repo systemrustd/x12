@@ -1624,11 +1624,31 @@ impl Backend for KmsBackendV2 {
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _body: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
-        self.log_v2_gap("xkb_proxy");
-        Ok(None)
+        // Mirror v1's xkb_proxy verbatim — pure protocol
+        // bookkeeping using the shared `KmsCore.xkb_keymap`.
+        // Without this, Xlib clients abort at the XKEYBOARD
+        // UseExtension handshake, so no real-app smoke is
+        // possible. The behaviour-level fix is identical to v1
+        // (reply minors get bodies, void minors return None).
+        use crate::kms::xkb as xkb_replies;
+        let reply = match minor {
+            0 => Some(xkb_replies::reply_use_extension()),
+            6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
+            8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
+            10 => Some(xkb_replies::reply_get_compat_map()),
+            17 => Some(xkb_replies::reply_get_names(&self.core.xkb_keymap.0)),
+            24 => Some(xkb_replies::reply_get_device_info()),
+            4 | 12 | 13 | 15 | 19 | 21 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
+            1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
+            _ => {
+                log::debug!("v2 xkb: unknown minor {minor}, no reply sent");
+                None
+            }
+        };
+        Ok(reply)
     }
 
     fn xfixes_change_cursor_by_name(
