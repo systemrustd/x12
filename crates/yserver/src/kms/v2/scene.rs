@@ -203,6 +203,26 @@ struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
     outputs: Vec<OutputSceneState>,
+    /// Stage 3f.8: software cursor sprite. Registered once at
+    /// backend init via `register_cursor`; appended to the scene
+    /// draw list at top-of-z by `build_scene`. `None` until
+    /// registered (test fixtures don't bother). The real cursor
+    /// theme + `define_cursor` wiring stays Stage 4 territory; this
+    /// is just a default-arrow fallback so hardware smoke has
+    /// visible pointer feedback.
+    cursor: Option<CursorEntry>,
+}
+
+/// Stage 3f.8 cursor sprite registration. The sprite lives as a
+/// regular [`DrawableStore`] entry (a `Pixmap` kind with a synthetic
+/// xid) so its lifetime + Vk-handle destruction flow through the
+/// same paths as any other drawable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorEntry {
+    pub(crate) id: super::store::DrawableId,
+    pub(crate) extent: vk::Extent2D,
+    pub(crate) hot_x: i16,
+    pub(crate) hot_y: i16,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -268,9 +288,21 @@ impl SceneCompositor {
                 vk,
                 pipeline,
                 outputs,
+                cursor: None,
             }),
             scene_structure_dirty: true,
         })
+    }
+
+    /// Stage 3f.8: register the software cursor sprite after the
+    /// backend has uploaded its pixel data. Idempotent — a later
+    /// `define_cursor` flow (Stage 4) can swap the entry. Drops to
+    /// a no-op on the stub fixture.
+    pub(crate) fn register_cursor(&mut self, entry: CursorEntry) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.cursor = Some(entry);
+            self.scene_structure_dirty = true;
+        }
     }
 
     /// Test fixture / Stage-1b-era stub. Construct via
@@ -492,7 +524,7 @@ fn tick_one_output(
 
     // 2. Build the scene + collect projected presentation damage.
     let (scene, snapshots, projected_damage) =
-        build_scene(core, store, windows_v2, output_idx, platform);
+        build_scene(core, store, windows_v2, output_idx, platform, inner.cursor);
     let mut output_damage = projected_damage;
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
@@ -681,13 +713,16 @@ fn all_zero(c: [f32; 4]) -> bool {
 ///   `HashMap<u32, WindowGeometryV2>`). Proper stack-order tracking
 ///   is post-3f.6. Most real apps (xterm, xclock) have one child
 ///   per parent so the ordering rarely matters at Stage 3.
-/// - Cursor skipped (no cursor storage in v2 until Stage 4).
+/// - Cursor: Stage 3f.8 appends a default-arrow sprite at top of
+///   z when `cursor` is `Some`. Real theme support + per-window
+///   `define_cursor` wiring stays Stage 4.
 fn build_scene(
     core: &KmsCore,
     store: &mut DrawableStore,
     windows_v2: &super::backend::WindowsV2Map,
     output_idx: usize,
     platform: &PlatformBackend,
+    cursor: Option<CursorEntry>,
 ) -> (CompositeScene, Vec<DamageSnapshot>, RegionSet) {
     let bg = core
         .bg_pixel
@@ -718,6 +753,51 @@ fn build_scene(
             &mut projected,
         );
     }
+
+    // Stage 3f.8: append the cursor sprite at top of z. Coordinates
+    // are output-local: `core.cursor_x` / `core.cursor_y` are
+    // root-space, and we subtract the output layout origin (the
+    // same projection windows go through above). `alpha_passthrough`
+    // is `true` so the sprite's alpha channel actually blends
+    // against the underlying composite instead of force-opaque.
+    if let Some(cur) = cursor
+        && let Some(drawable) = store.get(cur.id)
+        && drawable.storage.image_view != vk::ImageView::null()
+    {
+        let cw = i32::try_from(cur.extent.width).unwrap_or(i32::MAX);
+        let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
+        let dx = (core.cursor_x as i32) - i32::from(cur.hot_x) - layout_x0;
+        let dy = (core.cursor_y as i32) - i32::from(cur.hot_y) - layout_y0;
+        let visible = !(dx + cw <= 0
+            || dy + ch <= 0
+            || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
+            || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+        if visible {
+            draws.push(CompositeDraw {
+                image_view: drawable.storage.image_view,
+                #[allow(clippy::cast_precision_loss)]
+                dst_origin: [dx as f32, dy as f32],
+                #[allow(clippy::cast_precision_loss)]
+                dst_size: [cw as f32, ch as f32],
+                src_origin: [0.0, 0.0],
+                src_size: [1.0, 1.0],
+                alpha_passthrough: true,
+            });
+            // Cursor damage so the next tick covers the sprite
+            // rect even when no other draws contributed.
+            projected.add(vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: dx.max(0),
+                    y: dy.max(0),
+                },
+                extent: vk::Extent2D {
+                    width: u32::try_from(cw).unwrap_or(0),
+                    height: u32::try_from(ch).unwrap_or(0),
+                },
+            });
+        }
+    }
+
     let scene = CompositeScene {
         bg_color: bg,
         draws,
@@ -1348,7 +1428,8 @@ mod tests {
             true,
         );
 
-        let (scene, _snaps, _proj) = build_scene(&core, &mut store, &windows_v2, 0, &platform);
+        let (scene, _snaps, _proj) =
+            build_scene(&core, &mut store, &windows_v2, 0, &platform, None);
         assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
 
         // Top-level at output (50, 60) since output layout origin is (0,0).
@@ -1403,11 +1484,74 @@ mod tests {
             true, /* child IS mapped, but parent isn't */
         );
 
-        let (scene, _snaps, _proj) = build_scene(&core, &mut store, &windows_v2, 0, &platform);
+        let (scene, _snaps, _proj) =
+            build_scene(&core, &mut store, &windows_v2, 0, &platform, None);
         assert!(
             scene.draws.is_empty(),
             "unmapped parent must short-circuit subtree (got {} draws)",
             scene.draws.len()
+        );
+    }
+
+    /// Stage 3f.8 — when `cursor` is `Some`, `build_scene` emits an
+    /// additional top-of-z draw entry at the cursor's
+    /// hot-spot-adjusted position. The entry is the LAST element of
+    /// `draws` (last = topmost in z-order) and has
+    /// `alpha_passthrough=true` so the sprite's alpha actually
+    /// blends.
+    #[test]
+    fn build_scene_appends_cursor_draw_at_top_of_z() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // One mapped top-level so we can verify "cursor is on top".
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            0,
+            0,
+            400,
+            300,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Allocate a stub cursor storage entry (synthetic xid).
+        let mut storage = super::super::store::Storage::for_tests_null(
+            extent(16, 16),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        // SAFETY: opaque u64 Vk handle for the cursor's view; the
+        // stub Storage's `is_test_stub` flag means Drop won't free
+        // it.
+        storage.image_view = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        let cursor_id = store
+            .allocate(0xCAFE_0001, DrawableKind::Pixmap, 32, false, storage)
+            .expect("alloc cursor stub");
+
+        core.cursor_x = 50.0;
+        core.cursor_y = 60.0;
+        let cursor = CursorEntry {
+            id: cursor_id,
+            extent: extent(16, 16),
+            hot_x: 0,
+            hot_y: 0,
+        };
+
+        let (scene, _snaps, _proj) =
+            build_scene(&core, &mut store, &windows_v2, 0, &platform, Some(cursor));
+        // 1 top-level + 1 cursor = 2.
+        assert_eq!(scene.draws.len(), 2);
+        let cursor_draw = scene.draws.last().expect("cursor draw");
+        assert_eq!(cursor_draw.dst_origin, [50.0, 60.0]);
+        assert_eq!(cursor_draw.dst_size, [16.0, 16.0]);
+        assert!(
+            cursor_draw.alpha_passthrough,
+            "cursor must blend (sprite has transparent border)"
         );
     }
 }

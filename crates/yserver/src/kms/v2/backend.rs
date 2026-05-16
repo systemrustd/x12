@@ -166,7 +166,7 @@ impl KmsBackendV2 {
              Stage 2c/2d on first client request",
             platform.outputs.len(),
         );
-        Ok(Self {
+        let mut b = Self {
             core,
             platform,
             logged_gaps: RefCell::new(HashSet::new()),
@@ -175,7 +175,61 @@ impl KmsBackendV2 {
             scene,
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
-        })
+        };
+        // Stage 3f.8: bake the default-arrow software cursor.
+        // Best-effort — a failure logs + leaves the cursor invisible
+        // (matches pre-3f.8 behaviour, no regression).
+        if let Err(e) = b.init_cursor_sprite() {
+            log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
+        }
+        Ok(b)
+    }
+
+    /// Stage 3f.8: allocate the default cursor sprite (16×16 black
+    /// triangle, hotspot (0,0)) as a Pixmap-kind Drawable + upload
+    /// the pixel data via `engine.put_image`. Registers the result
+    /// on `SceneCompositor` so `build_scene` appends it at top of
+    /// z. One-time setup; subsequent `define_cursor` flows (Stage 4)
+    /// can replace the entry.
+    fn init_cursor_sprite(&mut self) -> io::Result<()> {
+        const CW: u16 = 16;
+        const CH: u16 = 16;
+        let xid = self.core.next_host_xid();
+        let storage = self
+            .platform
+            .allocate_drawable_storage(CW, CH, 32)
+            .map_err(|e| io::Error::other(format!("cursor storage: {e:?}")))?;
+        let id = self
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 32, false, storage)
+            .map_err(|e| io::Error::other(format!("cursor store.allocate: {e:?}")))?;
+        let bytes = default_cursor_sprite_bgra();
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            id,
+            ash::vk::Offset2D::default(),
+            ash::vk::Extent2D {
+                width: u32::from(CW),
+                height: u32::from(CH),
+            },
+            &bytes,
+            32,
+        ) {
+            return Err(io::Error::other(format!("cursor put_image: {e:?}")));
+        }
+        self.scene
+            .register_cursor(crate::kms::v2::scene::CursorEntry {
+                id,
+                extent: ash::vk::Extent2D {
+                    width: u32::from(CW),
+                    height: u32::from(CH),
+                },
+                hot_x: 0,
+                hot_y: 0,
+            });
+        log::info!("v2: software cursor sprite registered ({CW}x{CH})");
+        Ok(())
     }
 
     /// Test fixture with live Vulkan attached. Falls back to the
@@ -1501,6 +1555,44 @@ fn resolve_dst_picture_for_render(
     };
     let id = store.lookup(*host_xid)?;
     Some((id, clip.clone()))
+}
+
+/// Stage 3f.8: 16×16 BGRA8 default-arrow cursor sprite. Hotspot
+/// at (0, 0). The shape is a filled right-triangle pointing
+/// down-right — sized so the tip falls on the click point and the
+/// rest extends into the screen. Pixels: opaque black inside,
+/// fully transparent outside. Stage 4 swaps this for whatever
+/// `define_cursor` / `xfixes_change_cursor_by_name` selects.
+fn default_cursor_sprite_bgra() -> Vec<u8> {
+    const W: usize = 16;
+    const H: usize = 16;
+    let mut bytes = vec![0u8; W * H * 4];
+    let set = |bytes: &mut [u8], x: usize, y: usize, b: u8, g: u8, r: u8, a: u8| {
+        let off = (y * W + x) * 4;
+        bytes[off] = b;
+        bytes[off + 1] = g;
+        bytes[off + 2] = r;
+        bytes[off + 3] = a;
+    };
+    // 12-row arrow body. Each row y has y+1 black pixels starting
+    // at x=0, capped at 10 to leave room for the "tail" rows 10/11.
+    for y in 0..12 {
+        let row_w = y.min(10) + 1;
+        for x in 0..row_w {
+            set(&mut bytes, x, y, 0x00, 0x00, 0x00, 0xFF);
+        }
+    }
+    // 1-px white outline on the diagonal edge for visibility
+    // against dark backgrounds (xfwm4 root, terminal black bg).
+    for y in 0..12 {
+        let edge_x = y.min(10);
+        // Pixel to the right of the diagonal — white outline.
+        let ox = edge_x + 1;
+        if ox < W && y < H {
+            set(&mut bytes, ox, y, 0xFF, 0xFF, 0xFF, 0xFF);
+        }
+    }
+    bytes
 }
 
 fn depth_for_visual(visual: HostSubwindowVisual) -> u8 {

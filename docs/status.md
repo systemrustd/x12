@@ -777,13 +777,47 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       238 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
       green under lavapipe; clippy clean.
 
-      Known Stage-4 cursor gap: yserver doesn't draw a cursor
-      to the scanout in v2 yet (per spec § scene-layering item 4
-      "Cursor — always on top" + 3f.4 closure note "Pixel
-      rasterisation + scene blit is Stage 4"). Input events
-      flow correctly under hardware smoke; the cursor itself
-      is invisible. Tracked separately under Stage 4 cursor
-      scene-layer work.
+      Software cursor lands as 3f.8 below so hardware smoke has
+      visible pointer feedback; the full theme/`define_cursor`
+      pipeline stays Stage 4.
+    - [x] **3f.8 — software cursor sprite landed 2026-05-16.**
+      Stage-4 preview so the user has visible pointer feedback
+      during 3f.5 smoke. `SceneCompositorInner` grows
+      `cursor: Option<CursorEntry>`; `SceneCompositor::register_cursor`
+      records a (DrawableId, extent, hotspot) tuple. `build_scene`
+      grows a `cursor: Option<CursorEntry>` parameter; when
+      `Some`, appends a top-of-z `CompositeDraw` at
+      `(cursor_x - hot_x, cursor_y - hot_y)` with
+      `alpha_passthrough=true` so the sprite's transparent
+      border actually blends.
+
+      `KmsBackendV2::init_cursor_sprite` (called from `open`)
+      allocates a 16×16 BGRA8 Pixmap-kind Drawable, uploads a
+      baked default-arrow sprite (12-row right-triangle, black
+      fill, 1-px white diagonal outline) via `engine.put_image`,
+      and registers it on the scene. Best-effort — failure
+      logs + leaves the cursor invisible (no regression).
+
+      Full theme support + per-window `define_cursor` swap-in +
+      `xfixes_change_cursor_by_name` integration stays Stage 4.
+      `process_pointer_absolute` already calls
+      `scene.mark_scene_structure_dirty` on every motion so the
+      cursor draw refreshes per tick.
+
+      1 new unit test
+      (`build_scene_appends_cursor_draw_at_top_of_z` —
+      cursor draw is the last `scene.draws` entry at the
+      expected position with `alpha_passthrough=true`).
+
+      239 lib + 18 ignored v2 Vk + 8 v2_acceptance tests green
+      under lavapipe; clippy clean.
+
+      Bonus fix in the same range: v2's `get_keyboard_mapping`
+      and `get_modifier_mapping` stubs were returning empty
+      tables. Hardware smoke after 3f.7 showed xterm taking
+      pointer events but dropping every keypress because xlib
+      saw zero keysyms per code; v1's body ported verbatim
+      (commit `6b0ffb6`).
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
       capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**
