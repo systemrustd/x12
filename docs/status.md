@@ -68,16 +68,25 @@ be the substrate that makes reaching that goal possible.
 
 Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 
+### Done
+
+- [x] **Stage 1a — `KmsCore` extraction.** Landed 2026-05-16
+  (`56ad631`). ~30 protocol-bookkeeping fields moved from
+  `KmsBackend` into a new `KmsCore` struct. Pure refactor; v1
+  behaviour bit-identical. Hardware smoke green
+  (`just yserver-xfce-hw` confirms no regression).
+- [x] **Stage 1b — `KmsBackendV2` skeleton + startup selector.**
+  Landed 2026-05-16 (`982f1eb`). Sibling backend embedding the
+  same `KmsCore`; all 118 `Backend` trait methods stubbed with
+  once-per-method `v2: <method> not yet implemented` warn.
+  `YSERVER_RENDER_MODEL=v1` (default) → `KmsBackend`;
+  `=v2` → `KmsBackendV2`. Wires `kms::dispatch::KmsBackendKind`
+  selector + shared `platform_init` helper. Hardware smoke
+  green: v1 unchanged, v2 boots through capability queries +
+  logs gaps on first paint.
+
 ### Pending
 
-- [ ] **Stage 1a — `KmsCore` extraction.** Behavior-preserving
-  move of protocol-bookkeeping state into a shared struct. Pure
-  refactor. Gates: tests green, clippy clean, hardware smoke
-  green under `v1`.
-- [ ] **Stage 1b — `KmsBackendV2` skeleton + startup selector.**
-  Stub `v2` impl behind `YSERVER_RENDER_MODEL=v2`; default `v1`
-  remains bit-identical. `=v2` boots, errors on first paint with
-  a logged gap.
 - [ ] **Stage 2 — minimal-Vk correct baseline.** Whole vertical
   slice in Vk: `PlatformBackend` real, `DrawableStore` real,
   `RenderEngine` minimal (fill / copy / put_image), `SceneCompositor`
