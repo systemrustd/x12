@@ -299,7 +299,7 @@ fn resolve_render_pic_with_gradient_xid(
 /// Translate a [`Repeat`] enum value to the integer constant the
 /// `render.frag.glsl` shader expects (matches the protocol numbering;
 /// see `render_pipeline::REPEAT_*`).
-fn repeat_to_shader_const(repeat: Repeat) -> i32 {
+pub(crate) fn repeat_to_shader_const(repeat: Repeat) -> i32 {
     use crate::kms::vk::render_pipeline::{REPEAT_NONE, REPEAT_NORMAL, REPEAT_PAD, REPEAT_REFLECT};
     match repeat {
         Repeat::None => REPEAT_NONE,
@@ -326,7 +326,7 @@ fn repeat_to_shader_const(repeat: Repeat) -> i32 {
 /// and matches the per-family-port strict-acceptance relaxation.
 /// Compose two affine 2×3 transforms. The result satisfies
 /// `compose(A, B) * v == A * (B * v)` when `v` is `(x, y, 1)`.
-fn compose_affines(
+pub(crate) fn compose_affines(
     a: crate::kms::vk::ops::render::AffineXform,
     b: crate::kms::vk::ops::render::AffineXform,
 ) -> crate::kms::vk::ops::render::AffineXform {
@@ -361,7 +361,7 @@ fn compose_affines(
     }
 }
 
-fn pixman_transform_to_affine(
+pub(crate) fn pixman_transform_to_affine(
     transform: Option<&PictTransform>,
     _src_extent: ash::vk::Extent2D,
 ) -> crate::kms::vk::ops::render::AffineXform {
@@ -5227,7 +5227,7 @@ impl KmsBackend {
                     descriptor_set,
                     &attrs,
                     &rects,
-                    scissor,
+                    &[scissor],
                 );
                 // gpu-trap T2 P2 fix-up: advance MaskScratch's
                 // CPU-tracked layout to SHADER_READ_ONLY_OPTIMAL ONLY
@@ -6262,7 +6262,7 @@ impl KmsBackend {
                     descriptor_set,
                     &attrs,
                     rects,
-                    scissor,
+                    &[scissor],
                 )
             });
         match result {

@@ -50,6 +50,7 @@ use super::{
     store::{DrawableId, DrawableStore},
 };
 use crate::kms::{
+    cpu_types::{PictTransform, Rectangle16, Repeat},
     scheduler::batch_descriptor_arena::BatchDescriptorArena,
     vk::{
         device::VkContext,
@@ -1662,6 +1663,661 @@ impl RenderEngine {
         });
 
         Ok(stats)
+    }
+
+    // ── Op: render_composite (Stage 3c) ─────────────────────────
+
+    /// Record a RENDER `Composite` against `dst`. `src` and `mask`
+    /// are pre-resolved by the backend wrapper from the protocol
+    /// `PictureRecord`. `rects` are pre-decoded composite quads
+    /// in dst coords; `clip_rects` is the dst picture's clip set,
+    /// already pre-shifted by the picture's `clip_x` / `clip_y`
+    /// origin (Stage 3b's `set_picture_clip_rectangles` site does
+    /// the shift). Passing `None` for `clip_rects` paints the
+    /// full dst extent; passing an empty slice paints nothing.
+    ///
+    /// Stage 3c scope (per plan §3c):
+    /// - Standard PictOps 0..=12 + Saturate (13) via fixed-function
+    ///   blend; Disjoint (16..=27) + Conjoint (32..=43) via the
+    ///   shader-side `dst_readback` blend.
+    /// - Per-rect picture-clip scissoring — one draw call per
+    ///   clip-rect intersection, **NOT** v1's union-bbox shortcut.
+    /// - Self-aliasing (`src.drawable_id() == Some(dst_id)`):
+    ///   handled via Stage 2d's [`allocate_scratch_image`] —
+    ///   copy dst → scratch first, sample scratch_view.
+    /// - Component-alpha pass through to the pipeline cache key.
+    ///
+    /// Deliberate v1 deviations / out-of-scope-for-3c gaps:
+    /// - **Gradient sources**: gap log + bail (Stage 3e wires
+    ///   gradient LUT build via `picture_paint`).
+    /// - **Mask self-alias** (`mask.drawable_id() == Some(dst_id)`):
+    ///   gap log + bail. Real apps don't hit this; if rendercheck
+    ///   spots a case, fold into 3e alongside the gradient work.
+    /// - **No ambient `current_clip` consultation** — RENDER ops
+    ///   consult picture clip only (plan §4); the GC's
+    ///   `current_clip` lives outside the engine call.
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `UnknownDrawable` if `dst_id` is missing from `store`.
+    /// - `Vk(...)` for any underlying pipeline / submit failure.
+    /// - `RendererFailed` when `platform.renderer_failed`.
+    ///
+    /// Out-of-scope gating (unknown op, gradient source, mask
+    /// self-alias, unsupported dst format) returns `Ok` with
+    /// `recorded_draws = 0` — the op silently no-ops, matching
+    /// v1's `try_vk_render_composite` shape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_composite(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        src: ResolvedSource,
+        mask: ResolvedSource,
+        dst_id: DrawableId,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        clip_rects: Option<&[Rectangle16]>,
+        src_repeat: Repeat,
+        mask_repeat: Repeat,
+        src_transform: Option<PictTransform>,
+        mask_transform: Option<PictTransform>,
+        mask_component_alpha: bool,
+    ) -> Result<CompositeStats, RenderError> {
+        use crate::kms::vk::{
+            ops::render as vk_render,
+            render_pipeline::{StdPictOp, record_solid_color_clear},
+        };
+
+        let mut stats = CompositeStats::default();
+        if rects.is_empty() {
+            return Ok(stats);
+        }
+
+        // Lazy-init RENDER assets.
+        self.ensure_render_assets(platform)?;
+
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+
+        // Resolve dst metadata (depth, format, extent, image).
+        let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+                d.depth,
+            )
+        };
+        if dst_extent.width == 0 || dst_extent.height == 0 {
+            return Ok(stats);
+        }
+        if !matches!(
+            dst_format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
+        ) {
+            log::debug!(
+                "v2 render_composite gap: dst format {dst_format:?} not BGRA/R8 (dst id={dst_id:?})"
+            );
+            return Ok(stats);
+        }
+        let dst_has_alpha = dst_format == vk::Format::R8_UNORM || dst_depth == 32;
+
+        // Map the protocol op byte to the pipeline cache's enum.
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            log::debug!("v2 render_composite gap: unsupported op {op} (dst id={dst_id:?})");
+            return Ok(stats);
+        };
+        let needs_dst_readback = std_op.needs_dst_readback();
+
+        // Self-alias guards (Risk 13). Source self-alias is real
+        // (apps occasionally `Composite(src=dst, dst=dst)` as a
+        // copy-with-blend); the scratch routing lands in 3c.3
+        // alongside the acceptance test. Mask self-alias is rare;
+        // both bail with a gap log here.
+        let src_self_alias = matches!(src, ResolvedSource::Drawable(id) if id == dst_id);
+        let mask_self_alias = matches!(mask, ResolvedSource::Drawable(id) if id == dst_id);
+        if src_self_alias || mask_self_alias {
+            log::debug!(
+                "v2 render_composite gap: self-alias (src={} mask={}); 3c.3 scratch path deferred",
+                src_self_alias,
+                mask_self_alias
+            );
+            return Ok(stats);
+        }
+
+        // Pre-flight gradient bail. Stage 3e wires GradientPicture
+        // LUT build through `picture_paint`.
+        if matches!(src, ResolvedSource::Gradient(_)) || matches!(mask, ResolvedSource::Gradient(_))
+        {
+            log::debug!("v2 render_composite gap: gradient source/mask (Stage 3e territory)");
+            return Ok(stats);
+        }
+
+        // Resolve src view + extent + (optional) clear colour.
+        let solid_src_view = inner
+            .solid_src_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let solid_mask_view = inner
+            .solid_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let white_mask_view = inner
+            .white_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+
+        let mut src_clear_color: Option<[f32; 4]> = None;
+        let mut mask_clear_color: Option<[f32; 4]> = None;
+        let mut src_is_synthetic_1x1 = false;
+        let mut mask_is_synthetic_1x1 = false;
+
+        let (src_view, src_extent) = match src {
+            ResolvedSource::Drawable(id) => {
+                let info =
+                    drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
+                let class = swizzle_class_for(info.format, info.depth);
+                let sampler = sampler_config_for_repeat(src_repeat);
+                let view = ensure_drawable_view(
+                    &inner.vk,
+                    &mut inner.drawable_view_cache,
+                    id,
+                    info.image,
+                    info.format,
+                    sampler,
+                    class,
+                )?;
+                (view, info.extent)
+            }
+            ResolvedSource::Solid(color) => {
+                src_clear_color = Some(color);
+                src_is_synthetic_1x1 = true;
+                (
+                    solid_src_view,
+                    vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                )
+            }
+            ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+            ResolvedSource::None => {
+                log::debug!("v2 render_composite gap: src is None (protocol requires src)");
+                return Ok(stats);
+            }
+        };
+        let (mask_view, mask_extent) = match mask {
+            ResolvedSource::Drawable(id) => {
+                let info =
+                    drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
+                let class = swizzle_class_for(info.format, info.depth);
+                let sampler = sampler_config_for_repeat(mask_repeat);
+                let view = ensure_drawable_view(
+                    &inner.vk,
+                    &mut inner.drawable_view_cache,
+                    id,
+                    info.image,
+                    info.format,
+                    sampler,
+                    class,
+                )?;
+                (view, info.extent)
+            }
+            ResolvedSource::Solid(color) => {
+                mask_clear_color = Some(color);
+                mask_is_synthetic_1x1 = true;
+                (
+                    solid_mask_view,
+                    vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                )
+            }
+            ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+            ResolvedSource::None => {
+                mask_is_synthetic_1x1 = true;
+                (
+                    white_mask_view,
+                    vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                )
+            }
+        };
+
+        // Build (or look up) the pipeline.
+        let pipeline = inner
+            .render_pipelines
+            .as_mut()
+            .expect("ensured")
+            .get(std_op, dst_format, dst_has_alpha, mask_component_alpha)
+            .map_err(|e| {
+                log::warn!("v2 render_composite: pipeline build failed for op {op}: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        let pipeline_layout = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .pipeline_layout();
+
+        // dst_readback for Disjoint/Conjoint: ensure the scratch
+        // exists at dst's extent + format.
+        let dst_readback_view = if needs_dst_readback {
+            let rb = inner.dst_readback.as_mut().expect("ensured");
+            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                .map_err(|e| {
+                    log::warn!("v2 render_composite: dst readback ensure failed: {e:?}");
+                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                })?;
+            match rb.view(dst_format, dst_has_alpha) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    log::warn!("v2 render_composite: dst readback view None — skipping");
+                    return Ok(stats);
+                }
+                Err(e) => {
+                    log::warn!("v2 render_composite: dst readback view build failed: {e:?}");
+                    return Ok(stats);
+                }
+            }
+        } else {
+            white_mask_view
+        };
+
+        // Per-op descriptor arena: pool lives until SubmittedOp
+        // retires (CB holds descriptor set references).
+        let mut arena = BatchDescriptorArena::new(Arc::clone(&inner.vk));
+        let descriptor_set = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .allocate_descriptor_for_views_into(
+                &mut arena,
+                src_view,
+                mask_view,
+                dst_readback_view,
+            )?;
+
+        // Synthetic 1×1 scratches use PAD so the single texel
+        // covers the whole rect. Otherwise honour the user repeat.
+        let effective_src_repeat = if src_is_synthetic_1x1 {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        } else {
+            crate::kms::backend::repeat_to_shader_const(src_repeat)
+        };
+        let effective_mask_repeat = if mask_is_synthetic_1x1 {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        } else {
+            crate::kms::backend::repeat_to_shader_const(mask_repeat)
+        };
+
+        // Affine transforms — picture-side is identity for Stage 3c
+        // (no gradient axis projection yet; Drawable sources have
+        // no intrinsic transform).
+        let user_src_xform =
+            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
+        let user_mask_xform =
+            crate::kms::backend::pixman_transform_to_affine(mask_transform.as_ref(), mask_extent);
+
+        let attrs = vk_render::CompositeAttrs {
+            src_extent,
+            mask_extent,
+            src_repeat: effective_src_repeat,
+            mask_repeat: effective_mask_repeat,
+            src_xform: user_src_xform,
+            mask_xform: user_mask_xform,
+        };
+
+        // Build clip scissor list. None / empty → single
+        // full-extent scissor (full dst paint). Multi-rect clips
+        // pass the rects through so `record_render_composite` can
+        // emit one draw call per intersection (plan §4).
+        let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
+            None => vec![vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: dst_extent,
+            }],
+            Some(cr) => {
+                let mut out = Vec::with_capacity(cr.len());
+                for r in cr {
+                    if r.width == 0 || r.height == 0 {
+                        continue;
+                    }
+                    let x0 = i32::from(r.x).max(0);
+                    let y0 = i32::from(r.y).max(0);
+                    let x1 = (i32::from(r.x) + i32::from(r.width))
+                        .min(i32::from(dst_extent.width as u16).max(0));
+                    let y1 = (i32::from(r.y) + i32::from(r.height))
+                        .min(i32::from(dst_extent.height as u16).max(0));
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    out.push(vk::Rect2D {
+                        offset: vk::Offset2D { x: x0, y: y0 },
+                        extent: vk::Extent2D {
+                            #[allow(clippy::cast_sign_loss)]
+                            width: (x1 - x0) as u32,
+                            #[allow(clippy::cast_sign_loss)]
+                            height: (y1 - y0) as u32,
+                        },
+                    });
+                }
+                if out.is_empty() {
+                    // Every clip rect fell outside the dst — nothing to paint.
+                    return Ok(stats);
+                }
+                out
+            }
+        };
+
+        // Record the CB.
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let device = &inner.vk.device;
+
+        // Clear synthetic scratches (their texels become the
+        // source/mask sample). `record_solid_color_clear`
+        // transitions them to SHADER_READ_ONLY internally.
+        if let Some(c) = src_clear_color {
+            let solid = inner.solid_src_image.as_mut().expect("ensured");
+            record_solid_color_clear(&inner.vk, cb, solid, c);
+        }
+        if let Some(c) = mask_clear_color {
+            let solid = inner.solid_mask_image.as_mut().expect("ensured");
+            record_solid_color_clear(&inner.vk, cb, solid, c);
+        }
+
+        // Disjoint/Conjoint: copy current dst → readback scratch
+        // before the composite pass samples it. The scratch keeps
+        // its own layout-tracker on `DstReadback`; the source dst
+        // is in SHADER_READ_ONLY here (every paint op restores it
+        // before returning).
+        if needs_dst_readback {
+            let rb = inner.dst_readback.as_mut().expect("ensured");
+            let dst_current = {
+                let d = store.get(dst_id).expect("checked");
+                d.storage.current_layout
+            };
+            rb.record_copy_from(cb, dst_image, dst_current, dst_format, dst_extent);
+            stats.used_dst_readback = true;
+        }
+
+        // Hand the dst storage to the recorder as a CompositeTarget.
+        // record_render_composite will flip it to COLOR_ATTACHMENT
+        // and back; we then propagate the tracked layout into the
+        // Drawable's storage so subsequent ops see the right
+        // oldLayout in their barriers.
+        let mut adapter = {
+            let d = store.get_mut(dst_id).expect("checked");
+            StorageCompositeTarget {
+                extent: dst_extent,
+                image: dst_image,
+                image_view: dst_view,
+                current_layout: d.storage.current_layout,
+            }
+        };
+        vk_render::record_render_composite(
+            &inner.vk,
+            cb,
+            &mut adapter,
+            pipeline,
+            pipeline_layout,
+            descriptor_set,
+            &attrs,
+            rects,
+            &clip_scissors,
+        )?;
+        // Reflect the recorder's layout-mutation back into the
+        // Drawable.
+        {
+            let d = store.get_mut(dst_id).expect("checked");
+            d.storage.current_layout = adapter.current_layout;
+        }
+        let _ = device; // silence unused if we add no further raw ops.
+
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(dst_id, ticket.clone());
+        // Damage hook: union of rect bboxes intersected with
+        // clip_scissors (plan §5 default rule).
+        for cr in rects {
+            #[allow(clippy::cast_possible_wrap)]
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: cr.dst_x,
+                    y: cr.dst_y,
+                },
+                extent: vk::Extent2D {
+                    width: cr.width,
+                    height: cr.height,
+                },
+            };
+            store.damage(dst_id, clamp_rect(rect, dst_extent));
+        }
+
+        stats.recorded_draws = u32::try_from(rects.len() * clip_scissors.len()).unwrap_or(u32::MAX);
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: None,
+            scratch: None,
+            atlas_ticket: None,
+            descriptor_arena: Some(arena),
+        });
+        Ok(stats)
+    }
+
+    // ── Op: render_fill_rectangles (Stage 3c) ───────────────────
+
+    /// X RENDER `FillRectangles`: paint `rects` with a single
+    /// premultiplied colour using PictOp `op`. Per plan §3c
+    /// "Scope", this is `render_composite(op, SolidFill(color),
+    /// NoMask, dst, ...)` — one composite with N rects.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`render_composite`].
+    pub(crate) fn render_fill_rectangles(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        color: [f32; 4],
+        dst_id: DrawableId,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        clip_rects: Option<&[Rectangle16]>,
+    ) -> Result<CompositeStats, RenderError> {
+        self.render_composite(
+            store,
+            platform,
+            op,
+            ResolvedSource::Solid(color),
+            ResolvedSource::None,
+            dst_id,
+            rects,
+            clip_rects,
+            Repeat::Pad,
+            Repeat::Pad,
+            None,
+            None,
+            false,
+        )
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Stage 3c support: source resolution + drawable view cache.
+// ────────────────────────────────────────────────────────────────
+
+/// Picture source resolved against `KmsCore.pictures` by the
+/// backend wrapper. The engine doesn't read protocol records
+/// directly; the wrapper hands it one of these.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResolvedSource {
+    /// Picture wraps a drawable; the engine samples its storage.
+    Drawable(DrawableId),
+    /// `RenderCreateSolidFill` source: a single premultiplied
+    /// RGBA colour. Pipeline samples from a 1×1 scratch cleared
+    /// to this colour per call.
+    Solid([f32; 4]),
+    /// Gradient placeholder (linear / radial). Stage 3c bails;
+    /// 3e wires LUT build through `RenderEngine.picture_paint`.
+    Gradient(u32),
+    /// No mask (only valid as `mask`). Bound to the engine's
+    /// white-mask scratch so `mask.a == 1.0` makes the blend a
+    /// no-op.
+    None,
+}
+
+/// Telemetry surface for one [`RenderEngine::render_composite`]
+/// or [`RenderEngine::render_fill_rectangles`] call. The wrapper
+/// pushes these into the per-second / lifetime telemetry sinks.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CompositeStats {
+    /// Whether the op took the `Disjoint`/`Conjoint` shader-side
+    /// `dst_readback` path. Used to wire the
+    /// `disjoint_readback_count` telemetry counter.
+    pub used_dst_readback: bool,
+    /// Total `vkCmdDraw` calls issued (rects × clip-rect
+    /// intersections). Used by the acceptance harness to assert
+    /// per-rect-scissor splits.
+    pub recorded_draws: u32,
+}
+
+/// Snapshot of a drawable's view-relevant metadata. Lives only
+/// long enough to build a `vk::ImageView` against it.
+struct DrawableViewInfo {
+    image: vk::Image,
+    extent: vk::Extent2D,
+    format: vk::Format,
+    depth: u8,
+}
+
+fn drawable_for_render_view(store: &DrawableStore, id: DrawableId) -> Option<DrawableViewInfo> {
+    let d = store.get(id)?;
+    Some(DrawableViewInfo {
+        image: d.storage.image,
+        extent: d.storage.extent,
+        format: d.storage.format,
+        depth: d.depth,
+    })
+}
+
+fn sampler_config_for_repeat(r: Repeat) -> SamplerConfig {
+    match r {
+        Repeat::None => SamplerConfig::Clamp,
+        Repeat::Normal => SamplerConfig::Repeat,
+        Repeat::Pad => SamplerConfig::Pad,
+        Repeat::Reflect => SamplerConfig::Reflect,
+    }
+}
+
+fn swizzle_class_for(format: vk::Format, depth: u8) -> SwizzleClass {
+    match (format, depth) {
+        (vk::Format::R8_UNORM, _) => SwizzleClass::AlphaOnlyR8,
+        (vk::Format::B8G8R8A8_UNORM, 24) => SwizzleClass::BgraNoAlpha,
+        _ => SwizzleClass::RgbaIdent,
+    }
+}
+
+/// Lookup/build a `vk::ImageView` for `id` with the given
+/// (sampler, swizzle) classification. The cache key splits on
+/// SamplerConfig so a Repeat=None vs Repeat=Pad sample of the
+/// same drawable doesn't share — Stage 3c uses Nearest only, so
+/// sampler is "address mode" rather than full sampler state.
+/// Address mode actually lives in the pipeline cache's sampler
+/// (one shared linear sampler) — the cache split is therefore
+/// over-engineered for 3c but matches the plan's published
+/// (DrawableId, SamplerConfig, SwizzleClass) key, leaving room
+/// for Stage 5's per-address-mode sampler splits without a
+/// cache-shape rewrite.
+fn ensure_drawable_view(
+    vk: &VkContext,
+    cache: &mut HashMap<(DrawableId, SamplerConfig, SwizzleClass), CachedDrawableView>,
+    id: DrawableId,
+    image: vk::Image,
+    format: vk::Format,
+    sampler: SamplerConfig,
+    class: SwizzleClass,
+) -> Result<vk::ImageView, vk::Result> {
+    let key = (id, sampler, class);
+    if let Some(c) = cache.get(&key) {
+        return Ok(c.view);
+    }
+    let components = match class {
+        SwizzleClass::RgbaIdent => vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::IDENTITY,
+        },
+        SwizzleClass::AlphaOnlyR8 => vk::ComponentMapping {
+            r: vk::ComponentSwizzle::ZERO,
+            g: vk::ComponentSwizzle::ZERO,
+            b: vk::ComponentSwizzle::ZERO,
+            a: vk::ComponentSwizzle::R,
+        },
+        SwizzleClass::BgraNoAlpha => vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::ONE,
+        },
+    };
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(components)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        );
+    let view = unsafe { vk.device.create_image_view(&info, None)? };
+    cache.insert(key, CachedDrawableView { view });
+    Ok(view)
+}
+
+/// Adapter implementing [`CompositeTarget`] over a v2 `Drawable`'s
+/// storage fields. Built per-call by `render_composite`; the
+/// recorder mutates `current_layout` and the caller reflects it
+/// back into the Drawable's storage on success.
+struct StorageCompositeTarget {
+    extent: vk::Extent2D,
+    image: vk::Image,
+    image_view: vk::ImageView,
+    current_layout: vk::ImageLayout,
+}
+
+impl CompositeTarget for StorageCompositeTarget {
+    fn vk_image(&self) -> vk::Image {
+        self.image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout
+    }
+    fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.current_layout = layout;
     }
 }
 

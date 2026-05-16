@@ -720,6 +720,84 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
 /// allocator. Stage 2d picks BGRA32 for `CopyFromParent` (the
 /// default visual is depth-24 ARGB-equivalent in our advertised
 /// pixel format) and honours an explicit depth otherwise.
+/// Stage 3c: walk a `PictureRecord` and resolve it into the
+/// engine's `ResolvedSource` plus the per-picture sampler attrs
+/// (`repeat`, `transform`, `component_alpha`). Source-only
+/// variants (`SolidFill`, gradients) carry no backing drawable;
+/// `Drawable` resolves the host xid through `DrawableStore`.
+///
+/// Returns `None` if the picture xid isn't recorded or the
+/// drawable backing has gone away. The engine treats this as a
+/// gap and silently no-ops (matches v1's
+/// `resolve_render_pic_with_gradient_xid` shape).
+fn resolve_picture_for_render(
+    core: &KmsCore,
+    store: &crate::kms::v2::store::DrawableStore,
+    host_pic: u32,
+) -> Option<(
+    crate::kms::v2::engine::ResolvedSource,
+    Repeat,
+    Option<PictTransform>,
+    bool, // component_alpha
+)> {
+    use crate::kms::v2::engine::ResolvedSource;
+    match core.pictures.get(&host_pic)? {
+        PictureRecord::Drawable {
+            host_xid,
+            repeat,
+            transform,
+            component_alpha,
+            ..
+        } => {
+            let id = store.lookup(*host_xid)?;
+            Some((
+                ResolvedSource::Drawable(id),
+                *repeat,
+                *transform,
+                *component_alpha,
+            ))
+        }
+        PictureRecord::SolidFill {
+            premul,
+            repeat,
+            component_alpha,
+        } => Some((
+            ResolvedSource::Solid(*premul),
+            *repeat,
+            None,
+            *component_alpha,
+        )),
+        PictureRecord::LinearGradient {
+            repeat, transform, ..
+        }
+        | PictureRecord::RadialGradient {
+            repeat, transform, ..
+        } => Some((
+            ResolvedSource::Gradient(host_pic),
+            *repeat,
+            *transform,
+            false,
+        )),
+    }
+}
+
+/// Stage 3c: dst picture resolution. RENDER paint ops require
+/// the dst to be a `PictureRecord::Drawable` (you can't paint
+/// into a SolidFill or a Gradient). Returns the resolved
+/// `DrawableId` plus the picture's clip rectangles (already
+/// pre-shifted by `clip_x` / `clip_y` per Stage 3b).
+fn resolve_dst_picture_for_render(
+    core: &KmsCore,
+    store: &crate::kms::v2::store::DrawableStore,
+    host_pic: u32,
+) -> Option<(crate::kms::v2::store::DrawableId, Option<Vec<Rectangle16>>)> {
+    let PictureRecord::Drawable { host_xid, clip, .. } = core.pictures.get(&host_pic)? else {
+        return None;
+    };
+    let id = store.lookup(*host_xid)?;
+    Some((id, clip.clone()))
+}
+
 fn depth_for_visual(visual: HostSubwindowVisual) -> u8 {
     match visual {
         HostSubwindowVisual::CopyFromParent => 32,
@@ -2034,20 +2112,80 @@ impl Backend for KmsBackendV2 {
     fn render_composite(
         &mut self,
         _origin: Option<OriginContext>,
-        _op: u8,
-        _host_src: u32,
-        _host_mask: u32,
-        _host_dst: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _mask_x: i16,
-        _mask_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
+        op: u8,
+        host_src: u32,
+        host_mask: u32,
+        host_dst: u32,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_composite");
+        use crate::kms::v2::engine::ResolvedSource;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 render_composite gap: host_src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
+            (ResolvedSource::None, Repeat::None, None, false)
+        } else {
+            let Some(t) = resolve_picture_for_render(&self.core, &self.store, host_mask) else {
+                log::debug!("v2 render_composite gap: host_mask 0x{host_mask:x} not resolvable");
+                return Ok(());
+            };
+            t
+        };
+        let Some((dst_id, dst_clip)) =
+            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        else {
+            log::debug!("v2 render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture");
+            return Ok(());
+        };
+
+        let rect = crate::kms::vk::ops::render::CompositeRect {
+            src_x: i32::from(src_x),
+            src_y: i32::from(src_y),
+            mask_x: i32::from(mask_x),
+            mask_y: i32::from(mask_y),
+            dst_x: i32::from(dst_x),
+            dst_y: i32::from(dst_y),
+            width: u32::from(width),
+            height: u32::from(height),
+        };
+        let stats = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            src_resolved,
+            mask_resolved,
+            dst_id,
+            std::slice::from_ref(&rect),
+            dst_clip.as_deref(),
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+        );
+        if let Ok(s) = stats {
+            if s.recorded_draws > 0 {
+                self.telemetry.record_paint_submit();
+            }
+            if s.used_dst_readback {
+                self.telemetry.record_disjoint_readback();
+            }
+        } else if let Err(e) = stats {
+            log::warn!("v2 render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
+        }
         Ok(())
     }
 
@@ -2073,14 +2211,75 @@ impl Backend for KmsBackendV2 {
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_dst: u32,
-        _op: u8,
-        _color: [u8; 8],
-        _rects: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        host_dst: u32,
+        op: u8,
+        color: [u8; 8],
+        rects: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_fill_rectangles");
+        let Some((dst_id, dst_clip)) =
+            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        else {
+            log::debug!(
+                "v2 render_fill_rectangles gap: host_dst 0x{host_dst:x} not a Drawable picture"
+            );
+            return Ok(());
+        };
+
+        // X RENDER XRenderColor is wire-premultiplied (rendercheck
+        // main.c:337-345); pass through unchanged.
+        let color_premul = [
+            f32::from(u16::from_le_bytes([color[0], color[1]])) / 65535.0,
+            f32::from(u16::from_le_bytes([color[2], color[3]])) / 65535.0,
+            f32::from(u16::from_le_bytes([color[4], color[5]])) / 65535.0,
+            f32::from(u16::from_le_bytes([color[6], color[7]])) / 65535.0,
+        ];
+
+        let mut decoded: Vec<crate::kms::vk::ops::render::CompositeRect> =
+            Vec::with_capacity(rects.len() / 8);
+        for chunk in rects.chunks_exact(8) {
+            let rx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(x_off);
+            let ry = i16::from_le_bytes([chunk[2], chunk[3]]).saturating_add(y_off);
+            let rw = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let rh = u16::from_le_bytes([chunk[6], chunk[7]]);
+            if rw == 0 || rh == 0 {
+                continue;
+            }
+            decoded.push(crate::kms::vk::ops::render::CompositeRect {
+                src_x: 0,
+                src_y: 0,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: i32::from(rx),
+                dst_y: i32::from(ry),
+                width: u32::from(rw),
+                height: u32::from(rh),
+            });
+        }
+        if decoded.is_empty() {
+            return Ok(());
+        }
+
+        let stats = self.engine.render_fill_rectangles(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            color_premul,
+            dst_id,
+            &decoded,
+            dst_clip.as_deref(),
+        );
+        if let Ok(s) = stats {
+            if s.recorded_draws > 0 {
+                self.telemetry.record_paint_submit();
+            }
+            if s.used_dst_readback {
+                self.telemetry.record_disjoint_readback();
+            }
+        } else if let Err(e) = stats {
+            log::warn!("v2 render_fill_rectangles: engine returned {e:?} on dst 0x{host_dst:x}");
+        }
         Ok(())
     }
 

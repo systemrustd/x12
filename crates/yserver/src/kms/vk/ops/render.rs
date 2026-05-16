@@ -116,10 +116,10 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
     descriptor_set: vk::DescriptorSet,
     attrs: &CompositeAttrs,
     rects: &[CompositeRect],
-    clip_scissor: vk::Rect2D,
+    clip_scissors: &[vk::Rect2D],
 ) -> Result<(), vk::Result> {
     let extent = dst.extent();
-    if rects.is_empty() || extent.width == 0 || extent.height == 0 {
+    if rects.is_empty() || clip_scissors.is_empty() || extent.width == 0 || extent.height == 0 {
         return Ok(());
     }
 
@@ -165,35 +165,11 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    // Clamp the caller's clip scissor to the render area. The
-    // unclipped path passes `Extent2D { width: u32::MAX, height:
-    // u32::MAX }` (build_render_composite_inputs) which trips
-    // Vulkan validation (`offset.x + extent.width` overflow), and
-    // some drivers (lavapipe) silently drop the draw when that
-    // happens.
-    let scissor = [vk::Rect2D {
-        offset: clip_scissor.offset,
-        extent: vk::Extent2D {
-            width: clip_scissor.extent.width.min(
-                extent
-                    .width
-                    .saturating_sub(clip_scissor.offset.x.max(0) as u32),
-            ),
-            height: clip_scissor.extent.height.min(
-                extent
-                    .height
-                    .saturating_sub(clip_scissor.offset.y.max(0) as u32),
-            ),
-        },
-    }];
-
     unsafe {
         crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
         crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
-        crate::vk_count!(cmd_set_scissor);
-        device.cmd_set_scissor(cb, 0, &scissor);
         crate::vk_count!(cmd_bind_pipeline);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
         crate::vk_count!(cmd_bind_descriptor_sets);
@@ -215,31 +191,62 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
             attrs.mask_extent.width as f32,
             attrs.mask_extent.height as f32,
         ];
-        for r in rects {
-            let pc = RenderPushConsts {
-                dst_origin: [r.dst_x as f32, r.dst_y as f32],
-                dst_size: [r.width as f32, r.height as f32],
-                viewport: dst_vp,
-                src_origin: [r.src_x as f32, r.src_y as f32],
-                mask_origin: [r.mask_x as f32, r.mask_y as f32],
-                src_extent: src_extent_px,
-                mask_extent: mask_extent_px,
-                repeat_modes: [attrs.src_repeat, attrs.mask_repeat],
-                src_xform_row0: attrs.src_xform.row0,
-                src_xform_row1: attrs.src_xform.row1,
-                mask_xform_row0: attrs.mask_xform.row0,
-                mask_xform_row1: attrs.mask_xform.row1,
-            };
-            crate::vk_count!(cmd_push_constants);
-            device.cmd_push_constants(
-                cb,
-                pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                pc.as_bytes(),
-            );
-            crate::vk_count!(cmd_draw);
-            device.cmd_draw(cb, 4, 1, 0, 0);
+
+        // Plan §4: one draw call per clip-rect intersection. Set
+        // scissor, issue every rect's draw, set next scissor, ...
+        // Multi-rect picture clips (regions with holes) are
+        // honoured exactly rather than via v1's union-bbox shortcut.
+        //
+        // Each clip_scissor is clamped to the render area so the
+        // unclipped path can pass `Extent2D { width: u32::MAX,
+        // height: u32::MAX }` without tripping Vulkan validation
+        // (`offset.x + extent.width` overflow), which some drivers
+        // (lavapipe) handle by silently dropping the draw.
+        for cs in clip_scissors {
+            let clamped = [vk::Rect2D {
+                offset: cs.offset,
+                extent: vk::Extent2D {
+                    width: cs
+                        .extent
+                        .width
+                        .min(extent.width.saturating_sub(cs.offset.x.max(0) as u32)),
+                    height: cs
+                        .extent
+                        .height
+                        .min(extent.height.saturating_sub(cs.offset.y.max(0) as u32)),
+                },
+            }];
+            if clamped[0].extent.width == 0 || clamped[0].extent.height == 0 {
+                continue;
+            }
+            crate::vk_count!(cmd_set_scissor);
+            device.cmd_set_scissor(cb, 0, &clamped);
+            for r in rects {
+                let pc = RenderPushConsts {
+                    dst_origin: [r.dst_x as f32, r.dst_y as f32],
+                    dst_size: [r.width as f32, r.height as f32],
+                    viewport: dst_vp,
+                    src_origin: [r.src_x as f32, r.src_y as f32],
+                    mask_origin: [r.mask_x as f32, r.mask_y as f32],
+                    src_extent: src_extent_px,
+                    mask_extent: mask_extent_px,
+                    repeat_modes: [attrs.src_repeat, attrs.mask_repeat],
+                    src_xform_row0: attrs.src_xform.row0,
+                    src_xform_row1: attrs.src_xform.row1,
+                    mask_xform_row0: attrs.mask_xform.row0,
+                    mask_xform_row1: attrs.mask_xform.row1,
+                };
+                crate::vk_count!(cmd_push_constants);
+                device.cmd_push_constants(
+                    cb,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc.as_bytes(),
+                );
+                crate::vk_count!(cmd_draw);
+                device.cmd_draw(cb, 4, 1, 0, 0);
+            }
         }
 
         crate::vk_count!(cmd_end_rendering);
