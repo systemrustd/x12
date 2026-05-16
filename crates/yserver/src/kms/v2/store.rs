@@ -577,11 +577,23 @@ impl DrawableStore {
     }
 
     /// Internal: destroy storage and remove from maps.
+    ///
+    /// Only removes the `by_xid[xid]` mapping if it currently
+    /// points to **this** DrawableId. Necessary because
+    /// `decref → PendingFence` already detaches the xid map and
+    /// the same xid may have been re-allocated (e.g.
+    /// `configure_subwindow`'s resize: decref → alloc with same
+    /// xid → new DrawableId installed). When the parked old
+    /// drawable's fence eventually signals and destroy_now runs,
+    /// a blanket `by_xid.remove(xid)` would nuke the NEW
+    /// drawable's lookup, "orphaning" the resized window.
     fn destroy_now(&mut self, platform: &mut PlatformBackend, id: DrawableId) {
         let Some(mut drawable) = self.entries.remove(&id) else {
             return;
         };
-        self.by_xid.remove(&drawable.xid);
+        if self.by_xid.get(&drawable.xid).copied() == Some(id) {
+            self.by_xid.remove(&drawable.xid);
+        }
         drawable.storage.destroy(platform);
         // last_render_ticket drops here; its Rc inner refcount
         // ensures the underlying fence handle stays alive until
@@ -901,6 +913,52 @@ mod tests {
         // No ticket attached → treated as signaled → destroyed.
         assert!(s.lookup(0x1).is_none());
         assert_eq!(s.pending_retire_count(), 0);
+    }
+
+    /// xeyes resize bug: decref → PendingFence + re-allocate the
+    /// same xid + later destroy_now of the old drawable MUST NOT
+    /// remove `by_xid[xid]` (which now maps to the NEW drawable).
+    /// Pre-fix: blanket `by_xid.remove(drawable.xid)` in destroy_now
+    /// orphaned the new storage when the old fence eventually
+    /// signaled.
+    #[test]
+    fn decref_then_realloc_then_retire_keeps_new_xid_mapping() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        // Allocate old; force into pending_retire (simulates an
+        // unsignaled ticket). We can't construct a real FenceTicket
+        // in the test fixture, so we manually push.
+        let old_id = s
+            .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        s.entries.get_mut(&old_id).unwrap().refcount = 0;
+        // Mimic decref → PendingFence: park + detach xid.
+        s.pending_retire.push(old_id);
+        s.by_xid.remove(&0x42);
+        // Re-allocate the SAME xid with fresh storage.
+        let new_id = s
+            .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        assert_ne!(old_id, new_id, "store mints a fresh DrawableId");
+        assert_eq!(
+            s.lookup(0x42),
+            Some(new_id),
+            "by_xid now points to the new drawable",
+        );
+        // Now retire the old drawable. No real ticket attached, so
+        // poll_pending_retire treats it as signaled → destroy_now.
+        s.poll_pending_retire(&mut platform);
+        // The new drawable's xid mapping MUST survive.
+        assert_eq!(
+            s.lookup(0x42),
+            Some(new_id),
+            "destroy_now of old drawable preserves new xid mapping",
+        );
+        assert!(
+            s.get(new_id).is_some(),
+            "new drawable still alive in entries",
+        );
+        assert!(s.get(old_id).is_none(), "old drawable destroyed",);
     }
 
     #[test]

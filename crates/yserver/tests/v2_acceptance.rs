@@ -936,10 +936,20 @@ fn v2_subwindow_resize_clears_old_paint() {
     // 16×16 region. Pre-3f.14 / pre-fix: still red (leftover old
     // paint). 3f.14 expectation: depth-32 safe default
     // (transparent black, BGRA = [0, 0, 0, 0]).
+    //
+    // get_image waits on its internal fence, which lets the
+    // OLD storage's pending_retire entry actually retire via
+    // destroy_now. The decref-PendingFence path detached
+    // `by_xid[xid]` for the old drawable; the new storage's
+    // allocate re-installed it. When the old storage's
+    // destroy_now fires inside this get_image's drain, it MUST
+    // NOT remove `by_xid[xid]` (which now points to the NEW
+    // drawable). Pre-fix: destroy_now blindly removed the xid
+    // mapping → new storage orphaned → get_image returns None.
     let out = b
         .get_image(None, xid, 2, 0, 0, 64, 64, !0)
-        .expect("get_image")
-        .expect("Some");
+        .expect("get_image returned Err (storage orphaned by destroy_now?)")
+        .expect("Some — by_xid[xid] resolved");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
         let off = (y * 64 + x) * 4;
         [out[off], out[off + 1], out[off + 2], out[off + 3]]
