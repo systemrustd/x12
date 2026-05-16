@@ -1736,6 +1736,26 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
 /// drawable backing has gone away. The engine treats this as a
 /// gap and silently no-ops (matches v1's
 /// `resolve_render_pic_with_gradient_xid` shape).
+/// Stage 3f.13 glyph fallback: pull the first stop's premultiplied
+/// RGBA from a gradient picture record. Returns `None` if `host_pic`
+/// isn't a gradient or has zero stops. Used by `composite_glyphs`
+/// when a gradient source needs a solid-fill approximation — the
+/// glyph paint path only knows how to sample a single colour, so a
+/// proper LUT-sampled gradient on glyphs would need a separate
+/// pipeline (deferred past Stage 3).
+fn first_stop_premul_of_gradient(core: &KmsCore, host_pic: u32) -> Option<[f32; 4]> {
+    let stop = match core.pictures.get(&host_pic)? {
+        PictureRecord::LinearGradient { stops, .. }
+        | PictureRecord::RadialGradient { stops, .. } => stops.first()?,
+        _ => return None,
+    };
+    let a = f32::from(stop.a) / 65535.0;
+    let r = (f32::from(stop.r) / 65535.0) * a;
+    let g = (f32::from(stop.g) / 65535.0) * a;
+    let b = (f32::from(stop.b) / 65535.0) * a;
+    Some([r, g, b, a])
+}
+
 fn resolve_picture_for_render(
     core: &KmsCore,
     store: &crate::kms::v2::store::DrawableStore,
@@ -1774,55 +1794,24 @@ fn resolve_picture_for_render(
             *component_alpha,
         )),
         PictureRecord::LinearGradient {
-            repeat,
-            transform,
-            stops,
-            ..
+            repeat, transform, ..
         }
         | PictureRecord::RadialGradient {
-            repeat,
-            transform,
-            stops,
-            ..
+            repeat, transform, ..
         } => {
-            // Stage 3f.12 fallback: real gradient LUT sampling is
-            // Stage-3e territory and never landed. The full
-            // `kms::vk::gradient::GradientPicture` infra is built
-            // and used by v1, but v2's `render_composite` bailed on
-            // any gradient src/mask with a logged gap.
-            //
-            // Concrete pain: every Cairo widget background under
-            // GTK uses a gradient. Caja's offscreen render-buffer
-            // stayed mostly unpainted, so the eventual `CopyArea`
-            // to the on-screen window propagated UNDEFINED Vk
-            // content (visually black with widget-rect islands).
-            //
-            // Pragmatic fallback: collapse the gradient to its
-            // first-stop colour (premultiplied) and route through
-            // the SolidFill path that already works. Loses the
-            // gradient shading — most GTK gradients are mild
-            // light-to-lighter so a flat first-stop colour is
-            // visually acceptable — but every widget bg gets a
-            // real solid colour instead of UNDEFINED black. Full
-            // gradient correctness is tracked as a separate
-            // Stage-5 polish item; this unblocks the hardware
-            // smoke matrix.
-            let premul = if let Some(stop) = stops.first() {
-                // Stops are straight-alpha 16-bit per channel.
-                // SolidFill::premul expects premultiplied
-                // 0..1 floats. Premultiply: c' = c * (a / 65535).
-                let a = f32::from(stop.a) / 65535.0;
-                let r = (f32::from(stop.r) / 65535.0) * a;
-                let g = (f32::from(stop.g) / 65535.0) * a;
-                let b = (f32::from(stop.b) / 65535.0) * a;
-                [r, g, b, a]
-            } else {
-                // Defensive: zero-stop gradient is meaningless;
-                // pick fully transparent so the source contributes
-                // nothing rather than black.
-                [0.0, 0.0, 0.0, 0.0]
-            };
-            Some((ResolvedSource::Solid(premul), *repeat, *transform, false))
+            // Stage 3f.13: full LUT sampling. The engine-side
+            // `GradientPicture` was built at create time and lives
+            // in `engine.picture_paint[host_pic]`; engine looks it
+            // up by xid. If the engine-side build failed (test
+            // fixture with no Vk, or allocation error), the engine
+            // logs a gap and skips the paint — no first-stop
+            // collapse fallback.
+            Some((
+                ResolvedSource::Gradient(host_pic),
+                *repeat,
+                *transform,
+                false,
+            ))
         }
     }
 }
@@ -3946,13 +3935,32 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 composite_glyphs gap: src 0x{host_src:x} not resolvable");
             return Ok(());
         };
-        let ResolvedSource::Solid(foreground_premul) = src_resolved else {
-            log::debug!(
-                "v2 composite_glyphs gap: src 0x{host_src:x} is not SolidFill (plan §3d \
-                 v1-parity scope)"
-            );
-            self.telemetry.record_composite_glyphs_dropped_unsupported();
-            return Ok(());
+        let foreground_premul = match src_resolved {
+            ResolvedSource::Solid(c) => c,
+            // Stage 3f.13: glyph paint path is still SolidFill-only
+            // (matches v1's try_vk_render_composite_glyphs). For a
+            // gradient source, collapse to first-stop premul — same
+            // shape as the pre-3f.13 fallback, just scoped here
+            // instead of in `resolve_picture_for_render`. No
+            // counter bump: gradient-on-glyphs is now considered
+            // "best effort handled" rather than "unsupported".
+            ResolvedSource::Gradient(grad_xid) => {
+                first_stop_premul_of_gradient(&self.core, grad_xid).unwrap_or_else(|| {
+                    log::debug!(
+                        "v2 composite_glyphs: gradient src 0x{grad_xid:x} \
+                         has no stops — treating as transparent"
+                    );
+                    [0.0, 0.0, 0.0, 0.0]
+                })
+            }
+            ResolvedSource::Drawable(_) | ResolvedSource::None => {
+                log::debug!(
+                    "v2 composite_glyphs gap: src 0x{host_src:x} is not SolidFill / Gradient \
+                     (plan §3d v1-parity scope)"
+                );
+                self.telemetry.record_composite_glyphs_dropped_unsupported();
+                return Ok(());
+            }
         };
         let Some((dst_id, dst_clip)) =
             resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
@@ -4611,6 +4619,37 @@ impl Backend for KmsBackendV2 {
             return Ok(None);
         };
         let picture_xid = self.core.next_host_xid();
+        // Stage 3f.13: build the LUT eagerly so the first
+        // render_composite against this picture has it ready. The
+        // record + the engine's GradientPicture have parallel
+        // lifetimes — render_free_picture drops both. Build
+        // failure (no Vk on test fixture, or allocation error) is
+        // non-fatal: the record still lands; render_composite
+        // logs a gap if it can't find the LUT. This keeps the
+        // logic-test fixture (no live Vk) usable without forcing
+        // every gradient-create test through lavapipe.
+        let engine_stops: Vec<crate::kms::vk::gradient::Stop> = stops
+            .iter()
+            .map(|s| crate::kms::vk::gradient::Stop {
+                pos: s.pos,
+                r: s.r,
+                g: s.g,
+                b: s.b,
+                a: s.a,
+            })
+            .collect();
+        if let Err(e) = self.engine.build_and_insert_linear_gradient(
+            &self.platform,
+            picture_xid,
+            (p1x, p1y),
+            (p2x, p2y),
+            &engine_stops,
+        ) {
+            log::debug!(
+                "v2 render_create_linear_gradient: engine build failed (xid=0x{picture_xid:x}): \
+                 {e:?} — record stored; paint will fall back to gap-log"
+            );
+        }
         self.core.pictures.insert(
             picture_xid,
             PictureRecord::LinearGradient {
@@ -4645,6 +4684,31 @@ impl Backend for KmsBackendV2 {
             return Ok(None);
         };
         let picture_xid = self.core.next_host_xid();
+        // Stage 3f.13: build the radial LUT (256×256 BGRA) eagerly.
+        // See `render_create_linear_gradient` for failure-mode
+        // rationale.
+        let engine_stops: Vec<crate::kms::vk::gradient::Stop> = stops
+            .iter()
+            .map(|s| crate::kms::vk::gradient::Stop {
+                pos: s.pos,
+                r: s.r,
+                g: s.g,
+                b: s.b,
+                a: s.a,
+            })
+            .collect();
+        if let Err(e) = self.engine.build_and_insert_radial_gradient(
+            &self.platform,
+            picture_xid,
+            (icx, icy, ir),
+            (ocx, ocy, or_),
+            &engine_stops,
+        ) {
+            log::debug!(
+                "v2 render_create_radial_gradient: engine build failed (xid=0x{picture_xid:x}): \
+                 {e:?} — record stored; paint will fall back to gap-log"
+            );
+        }
         self.core.pictures.insert(
             picture_xid,
             PictureRecord::RadialGradient {
@@ -5010,7 +5074,7 @@ impl Backend for KmsBackendV2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{KmsBackendV2, PictureRecord};
+    use super::{KmsBackendV2, PictureRecord, resolve_picture_for_render};
     use crate::kms::cpu_types::Repeat;
     use std::collections::HashMap;
     use yserver_core::backend::Backend;
@@ -5431,6 +5495,71 @@ mod tests {
             }
             other => panic!("expected LinearGradient, got {other:?}"),
         }
+    }
+
+    /// Stage 3f.13: `render_create_linear_gradient` returns a
+    /// resolved `ResolvedSource::Gradient(xid)` from
+    /// `resolve_picture_for_render` (not a SolidFill collapse).
+    /// Logic-only — engine-side LUT build is a Vk path and lives
+    /// in the engine's Vk-backed tests; here we just assert the
+    /// resolve shape changed correctly.
+    #[test]
+    fn v2_linear_gradient_resolves_as_gradient_source() {
+        use crate::kms::v2::engine::ResolvedSource;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p1.x
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p1.y
+        body.extend_from_slice(&(256_i32 << 16).to_le_bytes()); // p2.x
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p2.y
+        body.extend_from_slice(&1_u32.to_le_bytes()); // n_stops
+        body.extend_from_slice(&0_i32.to_le_bytes()); // pos
+        body.extend_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF]); // colour (R=1, A=1)
+        let pic = b
+            .render_create_linear_gradient(None, &body)
+            .expect("create gradient")
+            .expect("Some");
+
+        let (resolved, _, _, _) =
+            resolve_picture_for_render(&b.core, &b.store, pic.as_raw()).expect("resolve");
+        match resolved {
+            ResolvedSource::Gradient(xid) => assert_eq!(xid, pic.as_raw()),
+            other => panic!("expected Gradient, got {other:?}"),
+        }
+    }
+
+    /// Stage 3f.13: `render_free_picture` for a gradient drops both
+    /// the picture record and the engine-side `picture_paint` slot.
+    /// Logic-only — the engine slot count is the observable signal
+    /// (`engine.picture_paint_len()`). On the test fixture (no Vk)
+    /// the build itself logs a debug + skips, so the engine slot
+    /// stays at 0 throughout; the gate is "free_picture doesn't
+    /// leave a stale slot behind" which still asserts non-zero in
+    /// production but zero in test. We assert the lifecycle path
+    /// instead: create, free, ensure picture record is gone.
+    #[test]
+    fn v2_gradient_free_picture_drops_record() {
+        let mut b = KmsBackendV2::for_tests();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&(128_i32 << 16).to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF]);
+        let pic = b
+            .render_create_linear_gradient(None, &body)
+            .expect("create gradient")
+            .expect("Some");
+        let xid = pic.as_raw();
+        assert!(b.core.pictures.contains_key(&xid));
+        b.render_free_picture(None, xid).expect("free");
+        assert!(!b.core.pictures.contains_key(&xid));
+        assert_eq!(b.engine.picture_paint_len(), 0);
     }
 
     /// `render_set_picture_clip_rectangles` parses + stores rects

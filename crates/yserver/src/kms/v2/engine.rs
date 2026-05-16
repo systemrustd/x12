@@ -545,13 +545,93 @@ impl RenderEngine {
     /// Stage 3b: drop any GPU-side state cached for `host_pic`.
     /// `KmsBackendV2::render_free_picture` calls this after
     /// removing the picture record from `KmsCore.pictures`. Stage
-    /// 3b's `PicturePaintState::Empty` carries no Vk resources so
-    /// the call is a HashMap::remove; Stage 3c gradients get the
-    /// same teardown site for their LUT image.
+    /// 3f.13's `PicturePaintState::Gradient` drops its
+    /// [`GradientPicture`] (image / view / memory) on remove.
     pub(crate) fn picture_paint_remove(&mut self, host_pic: u32) {
         if let Some(inner) = self.inner.as_mut() {
             inner.picture_paint.remove(&host_pic);
         }
+    }
+
+    /// Stage 3f.13: build the LUT for a `RenderCreateLinearGradient`
+    /// picture and stash it on the engine's `picture_paint` map.
+    /// Subsequent `render_composite` calls referencing `host_pic`
+    /// as src or mask sample this LUT instead of falling back to
+    /// the 3f.12 first-stop SolidFill collapse.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoVk` on the test fixture; `Vk` if the LUT image /
+    /// view / memory allocation fails.
+    pub(crate) fn build_and_insert_linear_gradient(
+        &mut self,
+        platform: &PlatformBackend,
+        host_pic: u32,
+        p1: (i32, i32),
+        p2: (i32, i32),
+        stops: &[crate::kms::vk::gradient::Stop],
+    ) -> Result<(), RenderError> {
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        let pool = platform
+            .ops_command_pool_handle()
+            .ok_or(RenderError::NoVk)?;
+        let gradient = crate::kms::vk::gradient::GradientPicture::new_linear(
+            inner.vk.clone(),
+            pool,
+            p1,
+            p2,
+            stops,
+        )
+        .map_err(|e| match e {
+            crate::kms::vk::gradient::GradientError::Vk(r) => RenderError::Vk(r),
+            crate::kms::vk::gradient::GradientError::NoMemoryType => {
+                RenderError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            }
+        })?;
+        inner
+            .picture_paint
+            .insert(host_pic, PicturePaintState::Gradient(gradient));
+        Ok(())
+    }
+
+    /// Stage 3f.13: radial-gradient companion of
+    /// [`build_and_insert_linear_gradient`]. Sizes the LUT image
+    /// at `RADIAL_SIDE × RADIAL_SIDE` and renders the two-circle
+    /// radial CPU-side, then uploads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoVk` on the test fixture; `Vk` on allocation
+    /// failure.
+    pub(crate) fn build_and_insert_radial_gradient(
+        &mut self,
+        platform: &PlatformBackend,
+        host_pic: u32,
+        inner_circle: (i32, i32, i32),
+        outer_circle: (i32, i32, i32),
+        stops: &[crate::kms::vk::gradient::Stop],
+    ) -> Result<(), RenderError> {
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        let pool = platform
+            .ops_command_pool_handle()
+            .ok_or(RenderError::NoVk)?;
+        let gradient = crate::kms::vk::gradient::GradientPicture::new_radial(
+            inner.vk.clone(),
+            pool,
+            inner_circle,
+            outer_circle,
+            stops,
+        )
+        .map_err(|e| match e {
+            crate::kms::vk::gradient::GradientError::Vk(r) => RenderError::Vk(r),
+            crate::kms::vk::gradient::GradientError::NoMemoryType => {
+                RenderError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            }
+        })?;
+        inner
+            .picture_paint
+            .insert(host_pic, PicturePaintState::Gradient(gradient));
+        Ok(())
     }
 
     /// Stage 3b test helper: how many picture-paint entries are
@@ -2489,14 +2569,6 @@ impl RenderEngine {
         let mask_self_alias = matches!(mask, ResolvedSource::Drawable(id) if id == dst_id);
         let self_alias_used = src_self_alias || mask_self_alias;
 
-        // Pre-flight gradient bail. Stage 3e wires GradientPicture
-        // LUT build through `picture_paint`.
-        if matches!(src, ResolvedSource::Gradient(_)) || matches!(mask, ResolvedSource::Gradient(_))
-        {
-            log::debug!("v2 render_composite gap: gradient source/mask (Stage 3e territory)");
-            return Ok(stats);
-        }
-
         // Pre-allocate the alias scratch + extract its sampleable
         // view before resolving src/mask. The scratch grows on
         // demand; the view is stable until the next grow (which
@@ -2545,6 +2617,11 @@ impl RenderEngine {
         let mut mask_clear_color: Option<[f32; 4]> = None;
         let mut src_is_synthetic_1x1 = false;
         let mut mask_is_synthetic_1x1 = false;
+        // Stage 3f.13: gradient picture's dst-pixel → LUT-pixel
+        // affine, composed with the user `RenderSetPictureTransform`
+        // below. `None` for Drawable / Solid sources.
+        let mut src_picture_xform: Option<vk_render::AffineXform> = None;
+        let mut mask_picture_xform: Option<vk_render::AffineXform> = None;
 
         let (src_view, src_extent) = if src_self_alias {
             // Route through the alias scratch. The scratch matches
@@ -2584,7 +2661,19 @@ impl RenderEngine {
                         },
                     )
                 }
-                ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+                ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
+                    Some(PicturePaintState::Gradient(g)) => {
+                        src_picture_xform = Some(g.axis_projection);
+                        (g.image_view(), g.extent())
+                    }
+                    None => {
+                        log::debug!(
+                            "v2 render_composite gap: gradient picture 0x{xid:x} \
+                             missing from engine.picture_paint (LUT build likely failed)"
+                        );
+                        return Ok(stats);
+                    }
+                },
                 ResolvedSource::None => {
                     log::debug!("v2 render_composite gap: src is None (protocol requires src)");
                     return Ok(stats);
@@ -2625,7 +2714,19 @@ impl RenderEngine {
                         },
                     )
                 }
-                ResolvedSource::Gradient(_) => unreachable!("pre-flighted above"),
+                ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
+                    Some(PicturePaintState::Gradient(g)) => {
+                        mask_picture_xform = Some(g.axis_projection);
+                        (g.image_view(), g.extent())
+                    }
+                    None => {
+                        log::debug!(
+                            "v2 render_composite gap: gradient mask picture 0x{xid:x} \
+                             missing from engine.picture_paint (LUT build likely failed)"
+                        );
+                        return Ok(stats);
+                    }
+                },
                 ResolvedSource::None => {
                     mask_is_synthetic_1x1 = true;
                     (
@@ -2706,21 +2807,34 @@ impl RenderEngine {
             crate::kms::backend::repeat_to_shader_const(mask_repeat)
         };
 
-        // Affine transforms — picture-side is identity for Stage 3c
-        // (no gradient axis projection yet; Drawable sources have
-        // no intrinsic transform).
+        // Affine transforms. For Drawable / Solid sources the
+        // picture-side transform is identity. For gradient sources
+        // (Stage 3f.13) the gradient picture's `axis_projection`
+        // maps dst-pixel → LUT-pixel; compose with the user's
+        // `RenderSetPictureTransform` so the user-defined
+        // dst-space → picture-space mapping applies first, then
+        // the gradient projection. Matches v1's `compose_affines(
+        // intrinsic, user)` shape.
         let user_src_xform =
             crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
         let user_mask_xform =
             crate::kms::backend::pixman_transform_to_affine(mask_transform.as_ref(), mask_extent);
+        let combined_src_xform = match src_picture_xform {
+            Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
+            None => user_src_xform,
+        };
+        let combined_mask_xform = match mask_picture_xform {
+            Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_mask_xform),
+            None => user_mask_xform,
+        };
 
         let attrs = vk_render::CompositeAttrs {
             src_extent,
             mask_extent,
             src_repeat: effective_src_repeat,
             mask_repeat: effective_mask_repeat,
-            src_xform: user_src_xform,
-            mask_xform: user_mask_xform,
+            src_xform: combined_src_xform,
+            mask_xform: combined_mask_xform,
         };
 
         // Build clip scissor list. None / empty → single
@@ -3013,15 +3127,11 @@ impl RenderEngine {
         };
         let needs_dst_readback = std_op.needs_dst_readback();
 
-        // Self-alias / gradient gates — same shape as
-        // render_composite. The trap path doesn't yet support src
-        // self-alias scratch routing or gradient sources.
+        // Self-alias gate — the trap path doesn't yet route src
+        // through the alias scratch (rare in real-world trap
+        // workloads; see plan §3e.2 out-of-scope list).
         if matches!(src, ResolvedSource::Drawable(id) if id == dst_id) {
             log::debug!("v2 render_traps_or_tris gap: src self-alias (out of scope for 3e.2)");
-            return Ok(stats);
-        }
-        if matches!(src, ResolvedSource::Gradient(_)) {
-            log::debug!("v2 render_traps_or_tris gap: gradient source (Stage 3e gradient TBD)");
             return Ok(stats);
         }
 
@@ -3069,6 +3179,10 @@ impl RenderEngine {
             .expect("ensured")
             .image_view();
         let mut src_clear_color: Option<[f32; 4]> = None;
+        // Stage 3f.13: gradient picture's intrinsic dst→LUT xform,
+        // composed with the user transform below. `None` for
+        // Drawable / Solid sources.
+        let mut src_picture_xform: Option<vk_render::AffineXform> = None;
         let (src_view, src_extent) = match src {
             ResolvedSource::Drawable(id) => {
                 let info =
@@ -3096,7 +3210,19 @@ impl RenderEngine {
                     },
                 )
             }
-            ResolvedSource::Gradient(_) => unreachable!("pre-flighted"),
+            ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
+                Some(PicturePaintState::Gradient(g)) => {
+                    src_picture_xform = Some(g.axis_projection);
+                    (g.image_view(), g.extent())
+                }
+                None => {
+                    log::debug!(
+                        "v2 render_traps_or_tris gap: gradient picture 0x{xid:x} \
+                         missing from engine.picture_paint (LUT build likely failed)"
+                    );
+                    return Ok(stats);
+                }
+            },
             ResolvedSource::None => {
                 log::debug!("v2 render_traps_or_tris gap: src None");
                 return Ok(stats);
@@ -3348,6 +3474,16 @@ impl RenderEngine {
             stats.used_dst_readback = true;
         }
 
+        // Stage 3f.13: compose the gradient picture's intrinsic
+        // axis projection with the user `RenderSetPictureTransform`
+        // for gradient sources; identity-composed for Drawable /
+        // Solid sources.
+        let user_src_xform =
+            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
+        let combined_src_xform = match src_picture_xform {
+            Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
+            None => user_src_xform,
+        };
         let attrs = vk_render::CompositeAttrs {
             src_extent,
             mask_extent,
@@ -3357,10 +3493,7 @@ impl RenderEngine {
             // requires.
             src_repeat: crate::kms::backend::repeat_to_shader_const(src_repeat),
             mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
-            src_xform: crate::kms::backend::pixman_transform_to_affine(
-                src_transform.as_ref(),
-                src_extent,
-            ),
+            src_xform: combined_src_xform,
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
 
@@ -3677,16 +3810,18 @@ pub(crate) struct ImageTextStats {
 /// placeholder variant; Stage 3c adds `Gradient(GradientPicture)`
 /// (the v1-side LUT-image type) when the first `render_composite`
 /// against a gradient picture lazy-builds it.
-#[allow(
-    dead_code,
-    reason = "Variant set fills out in Stage 3c when gradients render"
-)]
-#[derive(Debug)]
+/// Note: `GradientPicture` carries raw Vk handles + an `Arc<VkContext>`
+/// and doesn't implement `Debug`, so this enum stays Debug-free.
 pub(crate) enum PicturePaintState {
-    /// Reserved slot — the picture record exists in `KmsCore`,
-    /// but no GPU-side state has been built yet. Stage 3b leaves
-    /// every entry in this state.
-    Empty,
+    /// GPU-side state for a `LinearGradient` / `RadialGradient`
+    /// picture record. The wrapped [`GradientPicture`] owns its
+    /// image / view / memory; dropping it (via
+    /// [`RenderEngine::picture_paint_remove`] on `RenderFreePicture`)
+    /// destroys the Vk resources. Built eagerly at
+    /// `render_create_linear_gradient` / `render_create_radial_gradient`
+    /// time so the first `render_composite` against the gradient
+    /// has the LUT ready.
+    Gradient(crate::kms::vk::gradient::GradientPicture),
 }
 
 /// Adapter implementing [`TextRunTarget`] over a v2 `Drawable`'s
@@ -5521,6 +5656,280 @@ mod tests {
             assert!(near(px[2], 0x40), "R: {:#x}", px[2]);
             assert!(near(px[3], 0xFF), "A: {:#x}", px[3]);
         }
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_linear_gradient_horizontal_two_stop() {
+        // 256×1 dst pre-filled black; Composite Src + LinearGradient
+        // source (p1=(0,0), p2=(256,0)<<16) with two stops:
+        //   pos=0   black (0,0,0,1)
+        //   pos=0xFFFFFFFF white (1,1,1,1)
+        // Stage 3f.13 wires the LUT path — pixel n should read
+        // roughly (n, n, n, 0xFF) ± a couple of units (NEAREST
+        // sampler + LUT rounding).
+        use crate::kms::vk::gradient::Stop;
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            256,
+            1,
+            [0.0, 0.0, 0.0, 1.0],
+        );
+
+        let grad_xid = 0xABBA_FACE_u32;
+        engine
+            .build_and_insert_linear_gradient(
+                &platform,
+                grad_xid,
+                (0, 0),
+                (256_i32 << 16, 0),
+                &[
+                    Stop {
+                        pos: 0,
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0xFFFF,
+                    },
+                    Stop {
+                        pos: i32::MAX,
+                        r: 0xFFFF,
+                        g: 0xFFFF,
+                        b: 0xFFFF,
+                        a: 0xFFFF,
+                    },
+                ],
+            )
+            .expect("build gradient");
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1, // Src — copy source to dst, no blend
+                ResolvedSource::Gradient(grad_xid),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(256, 1)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite gradient");
+        assert_eq!(stats.recorded_draws, 1);
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 256,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        // Sample several points along the ramp; tolerate ±4 due to
+        // NEAREST sampler + 8-bit LUT quantisation + premultiplied
+        // colour conversion. Direction-of-travel + monotonicity is
+        // the strong gate (rules out the 3f.12 first-stop collapse,
+        // which would read 0 at every x).
+        let bgra = |x: usize| (out[x * 4], out[x * 4 + 1], out[x * 4 + 2], out[x * 4 + 3]);
+        let (b0, g0, r0, _a0) = bgra(0);
+        let (bm, gm, rm, _am) = bgra(128);
+        let (b255, g255, r255, _a255) = bgra(255);
+        // x=0 is near-black; x=255 is near-white; x=128 sits between.
+        assert!(b0 <= 4 && g0 <= 4 && r0 <= 4, "x=0 BGRA={:?}", bgra(0));
+        assert!(
+            b255 >= 0xF0 && g255 >= 0xF0 && r255 >= 0xF0,
+            "x=255 BGRA={:?}",
+            bgra(255),
+        );
+        assert!(
+            (0x40..=0xC0).contains(&bm)
+                && (0x40..=0xC0).contains(&gm)
+                && (0x40..=0xC0).contains(&rm),
+            "x=128 BGRA={:?} (expected mid-grey)",
+            bgra(128),
+        );
+
+        // Cleanup so the gradient image is freed in this drain.
+        engine.picture_paint_remove(grad_xid);
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_radial_gradient_centred() {
+        // 64×64 dst, radial gradient centred at (32,32) inner_r=0
+        // outer_r=32, stops black→white. Center pixel should be
+        // dark (t near 0 = first stop = black); border pixel should
+        // be near-white.
+        use crate::kms::vk::gradient::Stop;
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            64,
+            64,
+            [0.5, 0.5, 0.5, 1.0],
+        );
+
+        let grad_xid = 0xDEAD_BEEF_u32;
+        engine
+            .build_and_insert_radial_gradient(
+                &platform,
+                grad_xid,
+                (32_i32 << 16, 32_i32 << 16, 0),
+                (32_i32 << 16, 32_i32 << 16, 32_i32 << 16),
+                &[
+                    Stop {
+                        pos: 0,
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0xFFFF,
+                    },
+                    Stop {
+                        pos: i32::MAX,
+                        r: 0xFFFF,
+                        g: 0xFFFF,
+                        b: 0xFFFF,
+                        a: 0xFFFF,
+                    },
+                ],
+            )
+            .expect("build radial");
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1, // Src
+                ResolvedSource::Gradient(grad_xid),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(64, 64)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite radial");
+        assert_eq!(stats.recorded_draws, 1);
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        let bgra = |x: usize, y: usize| {
+            let off = (y * 64 + x) * 4;
+            (out[off], out[off + 1], out[off + 2], out[off + 3])
+        };
+        // Centre near-black, edge near-white.
+        let (bc, gc, rc, _ac) = bgra(32, 32);
+        assert!(
+            bc < 0x40 && gc < 0x40 && rc < 0x40,
+            "centre BGRA={:?} (expected dark)",
+            bgra(32, 32),
+        );
+        // Corner is outside the unit circle for an inscribed
+        // radial — pick a point on the rim instead (x=62, y=32 →
+        // r ≈ 30/32).
+        let (be, ge, re_, _ae) = bgra(62, 32);
+        assert!(
+            be > 0xC0 && ge > 0xC0 && re_ > 0xC0,
+            "rim BGRA={:?} (expected near-white)",
+            bgra(62, 32),
+        );
+
+        engine.picture_paint_remove(grad_xid);
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_missing_gradient_picture_is_gap() {
+        // Engine receives a ResolvedSource::Gradient(xid) for an
+        // xid that has no picture_paint entry (LUT build failed or
+        // dropped early). Must return stats with recorded_draws=0,
+        // log a debug gap, and NOT panic.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            4,
+            4,
+            [0.0, 0.0, 0.0, 1.0],
+        );
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1, // Src
+                ResolvedSource::Gradient(0xC0FF_EE00),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+            )
+            .expect("render_composite Ok even on missing gradient");
+        assert_eq!(stats.recorded_draws, 0);
         engine.drain_all(&platform);
     }
 
