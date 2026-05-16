@@ -152,7 +152,7 @@ fn read_mirror_pixel_for_plane(rb: &MirrorReadback, depth: u8, x: usize, y: usiz
 
 /// Convert an X11 24-bit pixel (0xRRGGBB) to a Pixman Color.
 /// Append 1×1 rects covering a Bresenham line from (x0,y0) to (x1,y1).
-fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Vec<Rectangle16>) {
+pub(crate) fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Vec<Rectangle16>) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -183,7 +183,7 @@ fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Vec<Rectangle
 
 /// Scanline fill a polygon (even-odd rule).  Edges are pairs of i32
 /// vertices.  Output is a Vec of 1-pixel-tall horizontal Rectangle16 spans.
-fn scanline_fill_polygon(verts: &[(i32, i32)], out: &mut Vec<Rectangle16>) {
+pub(crate) fn scanline_fill_polygon(verts: &[(i32, i32)], out: &mut Vec<Rectangle16>) {
     if verts.len() < 3 {
         return;
     }
@@ -229,7 +229,7 @@ fn scanline_fill_polygon(verts: &[(i32, i32)], out: &mut Vec<Rectangle16>) {
 /// to clip on its own but in our build a partially-out-of-bounds rect
 /// (especially with negative x/y) can segfault; pre-clipping is the cheap
 /// defensive workaround.
-fn clip_rects_to_image(rects: &[Rectangle16], iw: i32, ih: i32) -> Vec<Rectangle16> {
+pub(crate) fn clip_rects_to_image(rects: &[Rectangle16], iw: i32, ih: i32) -> Vec<Rectangle16> {
     let mut out = Vec::with_capacity(rects.len());
     for r in rects {
         let x1 = (r.x as i32).max(0);
@@ -431,7 +431,7 @@ struct RenderedGlyph {
 // `LogicFillPipelineCache` for non-Copy functions.
 
 /// Parse a packed pair of i16 values (2 bytes each) from a byte slice.
-fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
+pub(crate) fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
     if offset + 4 > data.len() {
         return None;
     }
@@ -441,7 +441,7 @@ fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
 }
 
 /// Parse a packed rectangle (x:i16, y:i16, w:u16, h:u16) from a byte slice.
-fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
+pub(crate) fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
     if offset + 8 > data.len() {
         return None;
     }

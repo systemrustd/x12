@@ -590,10 +590,46 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     4×4 trap with `Over` + SolidFill source, interior red over a
     blue dst). 221 lib + 15 ignored v2-engine Vk + 7
     v2_acceptance tests all green under lavapipe.
-  - [ ] **3f — Core remainder + GC.function + planemask +
-    acceptance.** Real-app matrix on hardware, bee 30-min
-    stability run, fuji perf captures (v1 baseline taken
-    fresh in same session). Stage 3 close.
+  - [~] **3f — Core remainder + GC.function + planemask +
+    acceptance.** Substaged for incremental landing.
+    - [x] **3f.1 — poly_* + fill_poly + poly_fill_arc landed
+      2026-05-16.** `poly_line` / `poly_segment` /
+      `poly_rectangle` / `poly_arc` / `poly_point` /
+      `poly_fill_arc` / `fill_poly` all real on KmsBackendV2.
+      `bresenham_segment` / `scanline_fill_polygon` /
+      `clip_rects_to_image` / `read_i16_pair` / `read_rect`
+      promoted from v1's free fns to `pub(crate)` and reused
+      verbatim — wire-byte parsing + rasterisation is
+      v1-identical, so rendercheck results carry across. v2
+      grows `current_clip_rects_in_dst_space` +
+      `intersect_with_current_clip` (mirrors v1) +
+      `drawable_dims_v2` + `fill_solid_rects`; the latter is
+      the shared "lower a list of solid rects to
+      `engine.fill_rect`" lowering, with non-GXcopy
+      `GcFunction` logged as a gap until 3f.2 lands
+      `LogicFillPipeline`. **v1 latent bug fixed in v2 (codex
+      plan §4):** v2's `fill_rectangle` + `poly_fill_rectangle`
+      now intersect with `KmsCore.current_clip` before
+      submitting; v1 has the same call path but bypasses the
+      clip helper, so Core paint silently overflows the GC
+      clip there. 3 new unit tests:
+      `poly_line_origin_mode_offsets_correctly`,
+      `fill_poly_scanline_correctness`,
+      `poly_fill_rectangle_honours_gc_clip`. 224 lib tests +
+      17 ignored v2 Vk tests + 7 v2_acceptance tests all green
+      under lavapipe.
+    - [ ] **3f.2 — LogicFillPipeline (non-GXcopy + planemask).**
+      Port v1's logic-fill pipeline into RenderEngine so
+      fill/copy_area/put_image/poly_fill_rect divert when
+      `function != GXcopy || planemask != 0xFFFFFFFF`.
+    - [ ] **3f.3 — set_clip_pixmap + set_gc_fill_tiled.** Depth-1
+      mask drives RENDER paint scissor; tile path routes
+      through RENDER composite.
+    - [ ] **3f.4 — cursor + `xfixes_change_cursor_by_name`.**
+      Verify Cairo cursor themes; close stub.
+    - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
+      smoke matrix, bee 30-min stability, fuji v1/v2 perf
+      capture diff. Stage 3 close.
 - [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom

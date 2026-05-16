@@ -324,6 +324,128 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Decode the wire-packed clip rectangle list (`Vec<u8>` of
+    /// i16 x, i16 y, u16 w, u16 h tuples) into `Rectangle16`s in
+    /// dst-coords (with the GC clip-origin already added). Returns
+    /// `None` when the current GC clip is `None`. `Pixmap`-clip is
+    /// returned as `None` for now — Stage 3f.3 promotes the
+    /// pixmap-mask path; until then the clip is passed through
+    /// (matches v1's pre-promotion behaviour).
+    fn current_clip_rects_in_dst_space(&self) -> Option<Vec<Rectangle16>> {
+        let ClipState::Rectangles { origin, rects } = &self.core.current_clip else {
+            return None;
+        };
+        let bytes = &rects.rectangles;
+        let mut out = Vec::with_capacity(bytes.len() / 8);
+        for chunk in bytes.chunks_exact(8) {
+            let cx = i32::from(i16::from_le_bytes([chunk[0], chunk[1]])) + i32::from(origin.0);
+            let cy = i32::from(i16::from_le_bytes([chunk[2], chunk[3]])) + i32::from(origin.1);
+            let cw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
+            let ch = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
+            if cw <= 0 || ch <= 0 {
+                continue;
+            }
+            out.push(Rectangle16 {
+                x: cx.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                y: cy.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                width: cw.min(i32::from(u16::MAX)) as u16,
+                height: ch.min(i32::from(u16::MAX)) as u16,
+            });
+        }
+        Some(out)
+    }
+
+    /// Intersect each rect in `rects` against the current GC clip.
+    /// Mirrors v1's helper byte-for-byte. Returns `rects` unchanged
+    /// when no clip is active.
+    pub(crate) fn intersect_with_current_clip(&self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
+        let Some(clip_rects) = self.current_clip_rects_in_dst_space() else {
+            return rects.to_vec();
+        };
+        let mut out = Vec::with_capacity(rects.len());
+        for r in rects {
+            let rx0 = i32::from(r.x);
+            let ry0 = i32::from(r.y);
+            let rx1 = rx0 + i32::from(r.width);
+            let ry1 = ry0 + i32::from(r.height);
+            for c in &clip_rects {
+                let cx0 = i32::from(c.x);
+                let cy0 = i32::from(c.y);
+                let cx1 = cx0 + i32::from(c.width);
+                let cy1 = cy0 + i32::from(c.height);
+                let ix0 = rx0.max(cx0);
+                let iy0 = ry0.max(cy0);
+                let ix1 = rx1.min(cx1);
+                let iy1 = ry1.min(cy1);
+                if ix0 < ix1 && iy0 < iy1 {
+                    out.push(Rectangle16 {
+                        x: ix0 as i16,
+                        y: iy0 as i16,
+                        width: (ix1 - ix0) as u16,
+                        height: (iy1 - iy0) as u16,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Storage dimensions for a host xid, in pixels. `None` if the
+    /// drawable is unknown.
+    fn drawable_dims_v2(&self, host_xid: u32) -> Option<(u32, u32)> {
+        let id = self.store.lookup(host_xid)?;
+        let d = self.store.get(id)?;
+        Some((d.storage.extent.width, d.storage.extent.height))
+    }
+
+    /// Lower a list of solid-colour rectangles to `engine.fill_rect`.
+    /// Used by the stroke-style poly ops (`PolyLine`, `PolySegment`,
+    /// `PolyPoint`, `PolyArc`, `PolyRectangle`) where every rasterised
+    /// rect is in the GC's single foreground colour, and by
+    /// `PolyFillArc` / `FillPoly` after the scanline pass. Non-GXcopy
+    /// GC.function is logged-gap until 3f.2 lands `LogicFillPipeline`.
+    fn fill_solid_rects(
+        &mut self,
+        id: crate::kms::v2::store::DrawableId,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) {
+        if rects.is_empty() {
+            return;
+        }
+        if !matches!(
+            self.core.current_function,
+            yserver_core::backend::GcFunction::Copy
+        ) {
+            self.log_v2_gap("fill_rects_non_gxcopy");
+            return;
+        }
+        let color = decode_x11_pixel_bgra(fg);
+        for r in rects {
+            if r.width == 0 || r.height == 0 {
+                continue;
+            }
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(r.x),
+                    y: i32::from(r.y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                },
+            };
+            if let Err(e) =
+                self.engine
+                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+            {
+                log::warn!("v2 fill_solid_rects: engine.fill_rect failed: {e:?}");
+                break;
+            }
+            self.telemetry.record_paint_submit();
+        }
+    }
+
     /// Allocate v2 storage + windows_v2 entry for a host xid.
     /// Idempotent against duplicate xids (logs + skips).
     fn allocate_window_storage(
@@ -1742,57 +1864,250 @@ impl Backend for KmsBackendV2 {
     fn poly_line(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _coordinate_mode: u8,
-        _points: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        coordinate_mode: u8,
+        points: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_line");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_line_unknown_xid");
+            return Ok(());
+        };
+        // coordinate_mode 0 = Origin (absolute), 1 = Previous
+        // (each point is a delta from the previous).
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        let mut prev: Option<(i32, i32)> = None;
+        let mut offset = 0;
+        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
+            offset += 4;
+            let (xi, yi) = if coordinate_mode == 1 {
+                if let Some((px, py)) = prev {
+                    (px + i32::from(x), py + i32::from(y))
+                } else {
+                    (i32::from(x), i32::from(y))
+                }
+            } else {
+                (i32::from(x), i32::from(y))
+            };
+            if let Some((px, py)) = prev {
+                crate::kms::backend::bresenham_segment(px, py, xi, yi, &mut rects);
+            }
+            prev = Some((xi, yi));
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
     fn poly_segment(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _segments: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        segments: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_segment");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_segment_unknown_xid");
+            return Ok(());
+        };
+        // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16).
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        let mut offset = 0;
+        while offset + 8 <= segments.len() {
+            let Some((x1, y1)) = crate::kms::backend::read_i16_pair(segments, offset) else {
+                break;
+            };
+            let Some((x2, y2)) = crate::kms::backend::read_i16_pair(segments, offset + 4) else {
+                break;
+            };
+            offset += 8;
+            crate::kms::backend::bresenham_segment(
+                i32::from(x1),
+                i32::from(y1),
+                i32::from(x2),
+                i32::from(y2),
+                &mut rects,
+            );
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
     fn poly_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _rectangles: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        rectangles: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_rectangle");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_rectangle_unknown_xid");
+            return Ok(());
+        };
+        // Rectangle outlines: 4 thin (1-px) rects per input rect.
+        let mut rects = Vec::new();
+        let mut offset = 0;
+        while offset + 8 <= rectangles.len() {
+            let Some(r) = crate::kms::backend::read_rect(rectangles, offset) else {
+                break;
+            };
+            offset += 8;
+            if r.width == 0 || r.height == 0 {
+                continue;
+            }
+            // top edge
+            rects.push(Rectangle16 {
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: 1,
+            });
+            // bottom edge
+            rects.push(Rectangle16 {
+                x: r.x,
+                y: r.y.wrapping_add(r.height as i16).wrapping_sub(1),
+                width: r.width,
+                height: 1,
+            });
+            // left edge
+            rects.push(Rectangle16 {
+                x: r.x,
+                y: r.y,
+                width: 1,
+                height: r.height,
+            });
+            // right edge
+            rects.push(Rectangle16 {
+                x: r.x.wrapping_add(r.width as i16).wrapping_sub(1),
+                y: r.y,
+                width: 1,
+                height: r.height,
+            });
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
     fn poly_arc(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _arcs: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        arcs: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_arc");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_arc_unknown_xid");
+            return Ok(());
+        };
+        // Each arc: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
+        // Partial-angle arcs are treated as full ellipses (matches v1;
+        // angle-mask refinement is a follow-up). The outline is drawn by
+        // scanline: top/bottom rows emit the full horizontal span (caps);
+        // intermediate rows emit two side connectors bridging the
+        // previous row's left/right edges to this row's edges.
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        for chunk in arcs.chunks_exact(12) {
+            let ax = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+            let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
+            let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
+            let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
+            if aw <= 0 || ah <= 0 {
+                continue;
+            }
+            let cx = f64::from(ax) + f64::from(aw) * 0.5;
+            let cy = f64::from(ay) + f64::from(ah) * 0.5;
+            let rx = f64::from(aw) * 0.5;
+            let ry = f64::from(ah) * 0.5;
+
+            let row_at = |py: i32| -> Option<(i32, i32)> {
+                let dy = (f64::from(py) + 0.5 - cy) / ry;
+                if dy.abs() > 1.0 {
+                    return None;
+                }
+                let dx = (1.0 - dy * dy).sqrt() * rx;
+                let x0 = (cx - dx).floor() as i32;
+                let x1 = (cx + dx).ceil() as i32;
+                Some((x0, x1))
+            };
+
+            let mut prev: Option<(i32, i32)> = None;
+            for py in ay..ay + ah {
+                let Some((x0, x1)) = row_at(py) else {
+                    prev = None;
+                    continue;
+                };
+                let next = row_at(py + 1);
+                let cap = prev.is_none() || next.is_none();
+                if cap {
+                    rects.push(Rectangle16 {
+                        x: x0 as i16,
+                        y: py as i16,
+                        width: (x1 - x0 + 1) as u16,
+                        height: 1,
+                    });
+                } else {
+                    let (px0, px1) = prev.unwrap();
+                    let l_lo = px0.min(x0);
+                    let l_hi = px0.max(x0);
+                    rects.push(Rectangle16 {
+                        x: l_lo as i16,
+                        y: py as i16,
+                        width: (l_hi - l_lo + 1) as u16,
+                        height: 1,
+                    });
+                    let r_lo = px1.min(x1);
+                    let r_hi = px1.max(x1);
+                    rects.push(Rectangle16 {
+                        x: r_lo as i16,
+                        y: py as i16,
+                        width: (r_hi - r_lo + 1) as u16,
+                        height: 1,
+                    });
+                }
+                prev = Some((x0, x1));
+            }
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
     fn poly_point(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _coordinate_mode: u8,
-        _points: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        coordinate_mode: u8,
+        points: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_point");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_point_unknown_xid");
+            return Ok(());
+        };
+        let mut rects = Vec::new();
+        let mut prev = (0i32, 0i32);
+        let mut first = true;
+        let mut offset = 0;
+        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
+            offset += 4;
+            let (xi, yi) = if coordinate_mode == 1 && !first {
+                (prev.0 + i32::from(x), prev.1 + i32::from(y))
+            } else {
+                (i32::from(x), i32::from(y))
+            };
+            first = false;
+            prev = (xi, yi);
+            rects.push(Rectangle16 {
+                x: xi.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                y: yi.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                width: 1,
+                height: 1,
+            });
+        }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
@@ -1808,56 +2123,114 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("poly_fill_rectangle_unknown_xid");
             return Ok(());
         };
-        let color = decode_x11_pixel_bgra(foreground);
-        for chunk in rectangles.chunks_exact(8) {
-            let x = i16::from_le_bytes([chunk[0], chunk[1]]);
-            let y = i16::from_le_bytes([chunk[2], chunk[3]]);
-            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
-            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
-            let rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D {
-                    x: i32::from(x),
-                    y: i32::from(y),
-                },
-                extent: ash::vk::Extent2D {
-                    width: u32::from(w),
-                    height: u32::from(h),
-                },
-            };
-            if let Err(e) =
-                self.engine
-                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
-            {
-                log::warn!(
-                    "v2 poly_fill_rectangle: engine.fill_rect failed for xid {host_xid:#x}: {e:?}",
-                );
+        let mut rects = Vec::new();
+        let mut offset = 0;
+        while offset + 8 <= rectangles.len() {
+            let Some(r) = crate::kms::backend::read_rect(rectangles, offset) else {
                 break;
-            }
-            self.telemetry.record_paint_submit();
+            };
+            offset += 8;
+            rects.push(r);
         }
+        let rects = self.intersect_with_current_clip(&rects);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
     fn poly_fill_arc(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _arcs: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        arcs: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("poly_fill_arc");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("poly_fill_arc_unknown_xid");
+            return Ok(());
+        };
+        // Each arc is 12 bytes: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
+        // Partial arcs fall back to a full-ellipse fill (matches v1; xeyes /
+        // xclock-style apps draw full circles).
+        let (img_w, img_h) = self
+            .drawable_dims_v2(host_xid)
+            .map(|(w, h)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        for chunk in arcs.chunks_exact(12) {
+            let ax = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+            let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
+            let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
+            let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
+            if aw <= 0 || ah <= 0 {
+                continue;
+            }
+            let cx = f64::from(ax) + f64::from(aw) * 0.5;
+            let cy = f64::from(ay) + f64::from(ah) * 0.5;
+            let rx = f64::from(aw) * 0.5;
+            let ry = f64::from(ah) * 0.5;
+            let y_start = ay.max(0);
+            let y_end = (ay + ah).min(img_h);
+            for py in y_start..y_end {
+                let dy = (f64::from(py) + 0.5 - cy) / ry;
+                if dy.abs() > 1.0 {
+                    continue;
+                }
+                let dx = (1.0 - dy * dy).sqrt() * rx;
+                let x0 = (cx - dx).floor().max(0.0) as i32;
+                let x1 = (cx + dx).ceil().min(f64::from(img_w)) as i32;
+                if x1 <= x0 {
+                    continue;
+                }
+                rects.push(Rectangle16 {
+                    x: x0 as i16,
+                    y: py as i16,
+                    width: (x1 - x0) as u16,
+                    height: 1,
+                });
+            }
+        }
+        if !rects.is_empty() {
+            let rects = self.intersect_with_current_clip(&rects);
+            self.fill_solid_rects(id, foreground, &rects);
+        }
         Ok(())
     }
 
     fn fill_poly(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _coord_mode: u8,
-        _points: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        coord_mode: u8,
+        points: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("fill_poly");
+        let Some(id) = self.store.lookup(host_xid) else {
+            self.log_v2_gap("fill_poly_unknown_xid");
+            return Ok(());
+        };
+        // i16 vertex pairs. coord_mode 0 = Origin (absolute), 1 = Previous.
+        let mut verts: Vec<(i32, i32)> = Vec::with_capacity(points.len() / 4);
+        let mut offset = 0;
+        let mut last = (0i32, 0i32);
+        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
+            offset += 4;
+            let (xi, yi) = if coord_mode == 1 && !verts.is_empty() {
+                (last.0 + i32::from(x), last.1 + i32::from(y))
+            } else {
+                (i32::from(x), i32::from(y))
+            };
+            verts.push((xi, yi));
+            last = (xi, yi);
+        }
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
+        let (img_w, img_h) = self
+            .drawable_dims_v2(host_xid)
+            .map(|(w, h)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
+        let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
+        let rects = self.intersect_with_current_clip(&clipped);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
@@ -1875,25 +2248,13 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("fill_rectangle_unknown_xid");
             return Ok(());
         };
-        let color = decode_x11_pixel_bgra(foreground);
-        let rect = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D {
-                x: i32::from(x),
-                y: i32::from(y),
-            },
-            extent: ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
-        };
-        let res = self
-            .engine
-            .fill_rect(&mut self.store, &mut self.platform, id, rect, color);
-        if let Err(e) = res {
-            log::warn!("v2 fill_rectangle: engine.fill_rect failed for xid {host_xid:#x}: {e:?}",);
-        } else {
-            self.telemetry.record_paint_submit();
-        }
+        let rects = self.intersect_with_current_clip(&[Rectangle16 {
+            x,
+            y,
+            width,
+            height,
+        }]);
+        self.fill_solid_rects(id, foreground, &rects);
         Ok(())
     }
 
@@ -4103,5 +4464,167 @@ mod tests {
         // load-bearing assertion is that the inline change keeps the
         // call in the Over+SolidFill envelope; engine reachability
         // is covered by the Vk-backed acceptance test.
+    }
+
+    // ─── Stage 3f.1: poly_* + fill_poly logic tests ────────────
+
+    /// `poly_line_origin_mode_offsets_correctly` per plan §3f tests.
+    /// Build a 3-point path under both Origin (absolute) and
+    /// Previous (delta) coordinate modes; assert the produced
+    /// rasterised-pixel set is the same. Drives Bresenham via the
+    /// public crate-level helper.
+    #[test]
+    fn poly_line_origin_mode_offsets_correctly() {
+        use crate::kms::{
+            backend::{bresenham_segment, read_i16_pair},
+            cpu_types::Rectangle16,
+        };
+
+        // Path: (10, 10) → (10, 13) → (13, 13) — an L shape.
+        let absolute_pts: [(i16, i16); 3] = [(10, 10), (10, 13), (13, 13)];
+        // Same path under Previous mode: first pt absolute, then deltas.
+        let delta_pts: [(i16, i16); 3] = [(10, 10), (0, 3), (3, 0)];
+
+        let rasterise = |points: &[u8], mode: u8| -> Vec<Rectangle16> {
+            let mut rects: Vec<Rectangle16> = Vec::new();
+            let mut prev: Option<(i32, i32)> = None;
+            let mut offset = 0;
+            while let Some((x, y)) = read_i16_pair(points, offset) {
+                offset += 4;
+                let (xi, yi) = if mode == 1 {
+                    if let Some((px, py)) = prev {
+                        (px + i32::from(x), py + i32::from(y))
+                    } else {
+                        (i32::from(x), i32::from(y))
+                    }
+                } else {
+                    (i32::from(x), i32::from(y))
+                };
+                if let Some((px, py)) = prev {
+                    bresenham_segment(px, py, xi, yi, &mut rects);
+                }
+                prev = Some((xi, yi));
+            }
+            rects
+        };
+
+        let pack = |pts: &[(i16, i16)]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(pts.len() * 4);
+            for (x, y) in pts {
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+            }
+            out
+        };
+
+        let abs_rects = rasterise(&pack(&absolute_pts), 0);
+        let prev_rects = rasterise(&pack(&delta_pts), 1);
+
+        // Both modes must produce the same rasterised pixel set.
+        let to_set = |rs: &[Rectangle16]| -> std::collections::BTreeSet<(i16, i16)> {
+            rs.iter().map(|r| (r.x, r.y)).collect()
+        };
+        assert_eq!(to_set(&abs_rects), to_set(&prev_rects));
+        // Sanity: pixel set covers the L's expected vertices.
+        let set = to_set(&abs_rects);
+        for p in [(10, 10), (10, 13), (13, 13)] {
+            assert!(set.contains(&p), "missing endpoint {p:?}");
+        }
+    }
+
+    /// `fill_poly_scanline_correctness` per plan §3f tests. A 5-point
+    /// convex polygon (axis-aligned diamond) round-trips through
+    /// `scanline_fill_polygon` and produces the expected horizontal
+    /// span set. Even-odd-rule fill, half-open scanline range.
+    #[test]
+    fn fill_poly_scanline_correctness() {
+        use crate::kms::{backend::scanline_fill_polygon, cpu_types::Rectangle16};
+
+        // Square with one mid-edge vertex injected — still convex,
+        // and 5 distinct vertices as the test name advertises. Vertex
+        // list: (0,0) (4,0) (4,2) (4,4) (0,4) — a 4×4 square with an
+        // extra vertex on the right edge. Filled region is rows
+        // y ∈ [0, 4) with x ∈ [0, 4) at each row.
+        let verts = [(0, 0), (4, 0), (4, 2), (4, 4), (0, 4)];
+        let mut rects: Vec<Rectangle16> = Vec::new();
+        scanline_fill_polygon(&verts, &mut rects);
+
+        // Collect (y, x_start, x_end) per row. Each row should be a
+        // single span; we union rects on shared y if needed.
+        let mut rows: std::collections::BTreeMap<i16, (i16, i16)> =
+            std::collections::BTreeMap::new();
+        for r in &rects {
+            let x_start = r.x;
+            let x_end = r.x + r.width as i16;
+            rows.entry(r.y)
+                .and_modify(|cur| {
+                    cur.0 = cur.0.min(x_start);
+                    cur.1 = cur.1.max(x_end);
+                })
+                .or_insert((x_start, x_end));
+        }
+        // Expected: rows 0..=3 each span x ∈ [0, 4). Row 4 is the
+        // top edge of the polygon under half-open [y0, y1) semantics
+        // — no horizontal scan crosses it.
+        for y in 0..4 {
+            let span = rows.get(&y).copied().unwrap_or_else(|| {
+                panic!("row {y} missing");
+            });
+            assert_eq!(span, (0, 4), "row {y} span");
+        }
+        assert!(!rows.contains_key(&4), "row 4 must not be filled");
+    }
+
+    /// Sanity: the v2 GC-clip intersection helper matches v1's shape.
+    /// A single source rect clipped against a 2-rect clip yields the
+    /// 2 expected intersection rectangles in dst space (clip origin
+    /// already applied).
+    #[test]
+    fn poly_fill_rectangle_honours_gc_clip() {
+        use crate::kms::cpu_types::Rectangle16;
+        use yserver_core::backend::ClipState;
+        use yserver_protocol::x11::ClipRectangles;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Two 4×8 clip rects side-by-side starting at (5, 5), with
+        // clip origin (10, 10) → effective dst-coord rects at
+        // (15, 15)-(19, 23) and (25, 15)-(29, 23).
+        let mut wire: Vec<u8> = Vec::new();
+        for (x, y, w, h) in [(5_i16, 5_i16, 4_u16, 8_u16), (15, 5, 4, 8)] {
+            wire.extend_from_slice(&x.to_le_bytes());
+            wire.extend_from_slice(&y.to_le_bytes());
+            wire.extend_from_slice(&w.to_le_bytes());
+            wire.extend_from_slice(&h.to_le_bytes());
+        }
+        b.core.current_clip = ClipState::Rectangles {
+            origin: (10, 10),
+            rects: ClipRectangles {
+                ordering: 0,
+                x_origin: 0,
+                y_origin: 0,
+                rectangles: wire,
+            },
+        };
+
+        // Single source rect that spans both clip rects horizontally
+        // and overflows top + bottom of the clip vertically.
+        let src = [Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }];
+        let out = b.intersect_with_current_clip(&src);
+        assert_eq!(out.len(), 2);
+        // First intersection — left clip rect after origin shift.
+        assert_eq!(out[0].x, 15);
+        assert_eq!(out[0].y, 15);
+        assert_eq!(out[0].width, 4);
+        assert_eq!(out[0].height, 8);
+        // Second intersection — right clip rect after origin shift.
+        assert_eq!(out[1].x, 25);
+        assert_eq!(out[1].y, 15);
+        assert_eq!(out[1].width, 4);
+        assert_eq!(out[1].height, 8);
     }
 }
