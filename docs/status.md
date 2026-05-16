@@ -424,10 +424,46 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     + 9 Vk-backed ignored tests pass under lavapipe; clippy
     clean. Application smoke unchanged (3b doesn't draw); RENDER
     paint apps stay broken until 3c.
-  - [ ] **3c — `render_composite` + `render_fill_rectangles`.**
+  - [~] **3c — `render_composite` + `render_fill_rectangles`.**
     Standard PictOps + Saturate + Disjoint/Conjoint shader
     blend; per-rect picture-clip scissoring; self-composite
     aliasing routed through arena scratch.
+    - **3c.1 landed 2026-05-16 (`bcca8a3`)** — foundation only.
+      `RenderEngineInner` grows `render_pipelines`,
+      `solid_src_image`, `solid_mask_image`, `white_mask_image`,
+      `dst_readback`, `drawable_view_cache` slots (lazy);
+      `ensure_render_assets` builds them on first paint;
+      `notify_drawable_retired` evicts cached views;
+      `SubmittedOp.descriptor_arena` retires per-op pools.
+      `record_render_composite` is now generic over a new
+      `CompositeTarget` trait (impl'd for v1's `DrawableImage`
+      and v2's `StorageTextTarget`). No new dispatch. v1 paths
+      bit-identical.
+    - **3c.2 landed 2026-05-16 (`ccac8c9`)** — paint bodies +
+      wiring + telemetry. `RenderEngine::render_composite` /
+      `render_fill_rectangles` are real: lazy ensure-assets,
+      pipeline cache lookup, view cache for src/mask, synthetic
+      1×1 scratch clears, dst_readback for Disjoint/Conjoint,
+      per-rect picture-clip scissor (plan §4 deviation from v1's
+      union-bbox shortcut — `record_render_composite` now takes
+      a scissor slice). `KmsBackendV2::render_composite` /
+      `render_fill_rectangles` resolve picture records from
+      `KmsCore.pictures` and dispatch; `disjoint_readback_count`
+      telemetry primer wired live. Three `kms::backend` helpers
+      (`repeat_to_shader_const` / `compose_affines` /
+      `pixman_transform_to_affine`) promoted to `pub(crate)` so
+      v2 reuses verbatim.
+    - **3c.3 remaining** — self-alias scratch routing for
+      `src == dst` (currently a gap log + bail) + 7 Vk-backed
+      acceptance tests under lavapipe (`render_composite_over_
+      renders_alpha_blended`, `_picture_clip_per_rect`,
+      `_no_gc_clip_leak`, `_solid_fill_source_path`,
+      `_disjoint_clear_uses_readback`, `_self_alias`,
+      `render_fill_rectangles_src_clears_to_color`) + substage
+      close. Tests gate the per-rect-scissor + readback +
+      self-alias paths; gradient source still bails to 3e.
+    216 lib tests + 9 ignored v2-engine Vk tests pass under
+    lavapipe after each intermediate landing.
   - [ ] **3d — `render_composite_glyphs` + glyphsets.**
     v1-parity scope (Over + SolidFill source +
     A8/A1/ARGB32-as-A8 glyphsets); fixes v1's latent
