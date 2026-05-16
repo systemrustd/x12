@@ -887,6 +887,38 @@ impl KmsBackendV2 {
     /// `PolySegment`, `PolyPoint`, `PolyArc`, `PolyRectangle`) where
     /// every rasterised rect is in the GC's single foreground colour
     /// regardless of GC fill-style, and as the fallback inside
+    /// Stage 3f.11: apply X11 ConfigureWindow `stack_mode` to a
+    /// top-level window's position in `core.top_level_order`.
+    /// Implements Above (0/2/4) and Below (1/3) per v1's behaviour
+    /// — TopIf/BottomIf/Opposite collapse to Above/Below without
+    /// the conditional check (sufficient for marco / fvwm /
+    /// xterm-popup workloads). No-op for windows that aren't in
+    /// `top_level_order` (subwindows; restack of a subwindow is
+    /// deferred until we track per-parent sibling stack order).
+    fn restack_top_level(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
+        let stack = &mut self.core.top_level_order;
+        if !stack.contains(&host_xid) {
+            // Subwindow restack — siblings aren't ordered in v2 yet.
+            // Future work; tracked in `status.md` § 3f.11.
+            return;
+        }
+        stack.retain(|&x| x != host_xid);
+        let sibling_pos = sibling.and_then(|sib| stack.iter().position(|&x| x == sib));
+        match stack_mode {
+            // Above: place above sibling, or at top if no sibling.
+            0 | 2 | 4 => match sibling_pos {
+                Some(sp) => stack.insert(sp + 1, host_xid),
+                None => stack.push(host_xid),
+            },
+            // Below: place below sibling, or at bottom if no sibling.
+            1 | 3 => match sibling_pos {
+                Some(sp) => stack.insert(sp, host_xid),
+                None => stack.insert(0, host_xid),
+            },
+            _ => stack.push(host_xid),
+        }
+    }
+
     /// [`fill_rects_honoring_fill_state`] for the Solid arm.
     ///
     /// `GcFunction::Copy` (the common case) goes through the fast
@@ -2176,6 +2208,18 @@ impl Backend for KmsBackendV2 {
                     );
                 }
             }
+        }
+        // Stage 3f.11: honour `stack_mode` for top-level windows.
+        // marco lowers caja-desktop via `ConfigureWindow stack_mode=
+        // Below` so the wallpaper-and-icons window stays beneath
+        // every other top-level; without this, the most-recently-
+        // registered top-level ends up on top in `top_level_order`,
+        // and caja-desktop occludes mate-panel + every floating
+        // window. Subwindow stack order is not yet tracked (post-
+        // 3f.11 polish — `build_scene` recurse uses HashMap iter
+        // order for siblings under the same parent).
+        if let Some(stack_mode) = config.stack_mode {
+            self.restack_top_level(host_xid, stack_mode, config.sibling);
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
@@ -6275,6 +6319,43 @@ mod tests {
         assert_eq!(geom.parent, Some(0xC0FFEE));
         assert_eq!(geom.x, 30);
         assert_eq!(geom.y, 10);
+    }
+
+    /// Stage 3f.11: `restack_top_level` with `stack_mode=Below` and
+    /// no sibling lowers a top-level to the BOTTOM of
+    /// `core.top_level_order`. Reproduces marco's "lower caja-
+    /// desktop" call so the wallpaper window stays beneath panels.
+    #[test]
+    fn restack_below_no_sibling_moves_to_bottom() {
+        let mut b = KmsBackendV2::for_tests();
+        b.core.top_level_order = vec![0x1000, 0x2000, 0x3000];
+        // 0x3000 is the most recently registered (top of stack).
+        // Marco's Lower-Below request should move it to position 0.
+        b.restack_top_level(0x3000, 1, None);
+        assert_eq!(b.core.top_level_order, vec![0x3000, 0x1000, 0x2000]);
+    }
+
+    /// Stage 3f.11: `restack_top_level` with `stack_mode=Above` and
+    /// no sibling raises a top-level to the TOP of
+    /// `core.top_level_order`.
+    #[test]
+    fn restack_above_no_sibling_moves_to_top() {
+        let mut b = KmsBackendV2::for_tests();
+        b.core.top_level_order = vec![0x1000, 0x2000, 0x3000];
+        b.restack_top_level(0x1000, 0, None);
+        assert_eq!(b.core.top_level_order, vec![0x2000, 0x3000, 0x1000]);
+    }
+
+    /// Stage 3f.11: subwindow restack (xid not in
+    /// `top_level_order`) is currently a no-op — sibling stack
+    /// ordering for children isn't tracked yet.
+    #[test]
+    fn restack_subwindow_is_noop() {
+        let mut b = KmsBackendV2::for_tests();
+        b.core.top_level_order = vec![0x1000, 0x2000];
+        // 0xCAFE isn't in top_level_order → no-op.
+        b.restack_top_level(0xCAFE, 1, None);
+        assert_eq!(b.core.top_level_order, vec![0x1000, 0x2000]);
     }
 
     /// Stage 3f.11: reparenting back to root re-adds to
