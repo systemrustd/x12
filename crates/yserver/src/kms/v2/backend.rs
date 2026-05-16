@@ -2515,6 +2515,49 @@ impl Backend for KmsBackendV2 {
                 } else {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
+                    // Stage 3f.14 follow-on: clear the fresh pixmap
+                    // storage to a known-zero value. X11 says new
+                    // pixmaps are undefined content, but Vk
+                    // DEVICE_LOCAL memory is *fully* undefined —
+                    // random GPU-recycled bytes. Real X servers tend
+                    // to get away with this because system allocators
+                    // zero pages, but our Vk allocator doesn't.
+                    //
+                    // Concrete repro (mate + marco + xeyes resize):
+                    // xeyes creates a fresh depth-24 pixmap, sets a
+                    // SHAPE clip matching its eye outlines, draws
+                    // the eyes (only the shape-clipped area gets
+                    // paint), then Present-Pixmaps the whole pixmap
+                    // to the window. The non-eye area of the pixmap
+                    // still holds undefined Vk bytes; Present copies
+                    // it verbatim → visible garbage in the window.
+                    //
+                    // Cleared values: depth-32 transparent black
+                    // (0,0,0,0) — premul no-op for compositing;
+                    // depth-1 / depth-8 / depth-24 opaque black
+                    // (0,0,0,1) — matches "uninitialised pixel = 0"
+                    // which clients typically assume.
+                    if let Some(id) = self.store.lookup(xid) {
+                        let color = default_window_init_color(depth);
+                        let rect = ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D::default(),
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(width.max(1)),
+                                height: u32::from(height.max(1)),
+                            },
+                        };
+                        if let Err(e) = self.engine.fill_rect(
+                            &mut self.store,
+                            &mut self.platform,
+                            id,
+                            rect,
+                            color,
+                        ) {
+                            log::debug!(
+                                "v2 create_pixmap: initial fill failed for xid {xid:#x}: {e:?}"
+                            );
+                        }
+                    }
                 }
             }
             Err(vk_err) => {

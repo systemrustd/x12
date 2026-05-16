@@ -972,6 +972,61 @@ fn v2_subwindow_resize_clears_old_paint() {
     );
 }
 
+/// Stage 3f.14 follow-on: fresh pixmaps must read back as
+/// transparent-black (depth-32) or opaque-black (depth-24),
+/// NOT random Vk-undefined bytes.
+///
+/// Repro for the xeyes-resize artifact on mate + marco: xeyes
+/// creates a depth-24 offscreen pixmap, sets a SHAPE clip
+/// matching the eye outlines, paints eyes (only shape-clipped
+/// pixels get content), then Present-Pixmaps the whole pixmap
+/// to the window. Pre-fix: the non-eye-shape pixels of the
+/// pixmap held undefined Vk memory → visible garbage in the
+/// window. Post-fix: depth-appropriate safe-default clear on
+/// create.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_fresh_pixmap_reads_back_zero() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let pix32 = b.create_pixmap(None, 32, 16, 16).expect("depth-32 pixmap");
+    let pix24 = b.create_pixmap(None, 24, 16, 16).expect("depth-24 pixmap");
+
+    let out32 = b
+        .get_image(None, pix32.as_raw(), 2, 0, 0, 16, 16, !0)
+        .expect("get_image depth-32")
+        .expect("Some");
+    let out24 = b
+        .get_image(None, pix24.as_raw(), 2, 0, 0, 16, 16, !0)
+        .expect("get_image depth-24")
+        .expect("Some");
+
+    // depth-32 = transparent black (premul no-op).
+    for (i, px) in out32.chunks_exact(4).enumerate() {
+        assert_eq!(
+            &px[0..4],
+            &[0, 0, 0, 0],
+            "fresh depth-32 pixmap pixel #{i} should be (0,0,0,0); got {:?}",
+            &px[0..4],
+        );
+    }
+    // depth-24 = opaque black.
+    for (i, px) in out24.chunks_exact(4).enumerate() {
+        assert_eq!(
+            &px[0..4],
+            &[0, 0, 0, 0xFF],
+            "fresh depth-24 pixmap pixel #{i} should be (0,0,0,0xFF); got {:?}",
+            &px[0..4],
+        );
+    }
+}
+
 /// Diagnostic: same trap geometry shape as
 /// v2_render_trapezoids_renders_filled_rect but with a LARGE bbox
 /// (covering most of mask_scratch's 256×256 default extent). If
