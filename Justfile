@@ -449,6 +449,22 @@ yserver-xterm-only-hw log="debug":
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log: yserver-hw.log"'
 
+# No-WM hw smoke: just xterm against yserver. Lets us tell whether
+# fvwm3 specifically is the blocker or whether the compositor / input
+# pipeline itself is broken on hw. Without a WM xterm won't get a
+# frame, but it should still render its own content + the cursor
+# should track the mouse.
+yserver-xclock-only-hw log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 xclock -update 1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log"'
+
 yserver-e16-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
