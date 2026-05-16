@@ -141,6 +141,35 @@ from.
 
 ## Drawing / rendering artifacts
 
+- [ ] **xeyes resize-DOWN artefact on v2 + mate + marco
+      (2026-05-17, open).** Continuous-drag-shrink leaves xeyes
+      with eye geometry sized for a *wider* window than what's
+      now displayed — eye 2 visibly cut off at the right edge.
+      Resize-UP works clean after the 2026-05-17 fix chain
+      (MaskScratch swizzle + trap-shader AA + xid-detach +
+      pixmap zero-fill). Two hypotheses, neither confirmed:
+      1. xeyes' eye-geometry state stale during rapid drag —
+         pixmap dims caught up but draw geometry didn't. Verify
+         by stopping the drag and waiting 2-3 seconds before
+         dumping the scanout; if the eyes settle to correct
+         smaller shape, it's an xeyes-side race.
+      2. v2 scene compositor blits the wrong storage — perhaps
+         a pending-ack carrying an old DrawableId. Less likely
+         given the test coverage, but worth re-checking the
+         `pending_acks` capture path.
+      Also visible (orthogonal): many `render_composite gap:
+      host_src 0x40xxxx not resolvable` lines from marco's
+      decoration compositing, depending on `name_window_pixmap`
+      stubbed `Err` on v2 (Stage 4). Real fix is Stage 4 — the
+      gaps aren't a v2 regression, but the noise complicates
+      diagnosis here.
+- [ ] **MATE panel flicker on v2 (2026-05-17, open).** Reported
+      with the resize-down session above; not yet diagnosed.
+      Could share a root cause with the xeyes shrink bug (rapid
+      configure_subwindow on panel applet activity) or be its
+      own scene-damage issue. Worth capturing a focused
+      x11trace + RUST_LOG=debug session when picked up.
+
 - [ ] **Per-client GC mirroring** (Phase 3.7 task #26). The shared
       host GC creates subtle bugs when GC state leaks between clients.
       Phase 3.7's fill-style fix needed careful "reset to Solid after
@@ -154,20 +183,17 @@ from.
       off-screen / fully behind another) is the proper fix and is
       deferred. Re-open if a real validation scenario demonstrates a
       backing-store gap.
-- [ ] **KMS: `render_set_picture_filter` is currently a no-op.**
-      With pixman removed, `render_set_picture_filter`
-      (`crates/yserver/src/kms/backend.rs:12392`) accepts the request
-      but ignores the filter — the Vk Composite shader uses a fixed
-      `LINEAR` sampler. Clients that request `Nearest` /
-      `Convolution` / `Best` get LINEAR regardless. To honor the
-      request: store filter on `PictureState::Drawable`, create
-      multiple samplers per filter mode in `RenderPipelineCache`,
-      pick the matching one at composite time. RENDER's default
-      filter is `Nearest`; defaulting to LINEAR is the wrong
-      direction for pixel-art / 1:1 blits, so this is a correctness
-      gap, not just polish. **Deferred** pending the v2 rendering-
-      model spec — picture/filter handling lands inside the new
-      `RenderEngine` rather than retrofitted on the current model.
+- [ ] **`render_set_picture_filter` honoured only as Nearest.**
+      v1: `render_set_picture_filter`
+      (`crates/yserver/src/kms/backend.rs:12392`) accepts the
+      request but ignores the filter — Vk Composite shader uses
+      a fixed sampler. v2: filter is stored on
+      `PictureRecord::Drawable` (3b) but the engine still
+      samples Nearest regardless of the requested filter
+      (`Bilinear` / `Convolution` deferred per spec § "Out of
+      scope" — Stage 5 perf work). Clients that depend on
+      `Bilinear` for picture-source scaling see Nearest output.
+      Stage 3 status quo per the Stage 3 plan §"Non-goals" #8.
 
 - [ ] **Compositor shadow margins render as opaque bars
       (NameWindowPixmap → BadAlloc).** Diagnosed 2026-05-15 from

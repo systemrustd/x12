@@ -28,15 +28,33 @@ Cross-cutting bugs and followups that don't fit a stage live in
   standard list, NameWindowPixmap diagnosis docs, Justfile xtrace
   `rm`, picom validation harness.
 - Active dev branch: `rendering-model-v2`, off
-  `graphics-followups`. v2 spec at base; Stages 1a/1b/2a–2f/3a/3b
-  landed on top (see "Done" / "In progress" below for commit
-  hashes). `YSERVER_RENDER_MODEL=v2` is the **boot default**
-  (Stage 1b dispatch wiring); v1 still selectable via
-  `YSERVER_RENDER_MODEL=v1`.
+  `graphics-followups`. v2 spec at base; Stages 1a/1b/2a–2f and
+  3a through 3f.14 landed on top (see "Done" / "In progress"
+  below for commit hashes). `YSERVER_RENDER_MODEL=v2` is the
+  **boot default** as of `3afa5bd` (2026-05-17 — previously the
+  status doc claimed v2 default but `dispatch.rs` had v1 as the
+  fallthrough; three smoke sessions silently tested v1). v1
+  still selectable via `YSERVER_RENDER_MODEL=v1`.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
   parallel-implementation lessons. Don't ship anything from there.
+
+### What runs on v2 today (after 3f.14 + hardware-smoke fixes)
+
+- xeyes pupils render correctly (post-`dae5769` MaskScratch
+  IDENTITY attachment view).
+- xeyes eye whites render without horizontal stripes (post-
+  `e76a6f6` trap-shader AA off-by-0.5).
+- Cairo / GTK gradient widget backgrounds render with actual
+  ramps, not first-stop flat colour (3f.13).
+- Fresh pixmaps read back as zero (3f.14 + `fcd2521` —
+  Vk DEVICE_LOCAL no longer surfaces recycled GPU memory
+  through SHAPE-clipped client drawing).
+- xeyes resize-UP renders cleanly (post-`3afa5bd` xid-detach
+  + `fcd2521` pixmap clear).
+- xeyes resize-DOWN still shows artefacts — see "Open follow-up
+  from 2026-05-17 smoke" below.
 
 ### What runs on v2 today (after 3b)
 
@@ -1072,42 +1090,41 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       `v2_composite_glyphs_non_solidfill_source_drops` →
       `v2_composite_glyphs_gradient_source_collapses_to_solidfill`
       (counter stays at 0 since gradient now flows through).
-    - [ ] **3f.13 — full gradient LUT sampling (post-3f.5
-      polish).** Wire v1's `GradientPicture` (linear +
-      radial, already in tree at `kms/vk/gradient.rs`) into
-      v2's `engine.render_composite`:
-      - `render_create_linear_gradient` /
-        `render_create_radial_gradient` lazy-build a
-        `GradientPicture` and store on
-        `engine.picture_paint[xid]`.
-      - `render_composite` checks
-        `ResolvedSource::Gradient(xid)` (which currently
-        unreachable due to the 3f.12 collapse — needs
-        reinstatement once LUT path exists), binds the
-        gradient view + push-constants the
-        `axis_projection` affine, samples in the fragment
-        shader.
-      - `render_free_picture` drops the gradient entry via
-        the existing `engine.picture_paint_remove` hook.
-      Sizing: ~300-500 LoC porting + tests. Not blocking
-      3f.5 — fallback covers GTK.
-    - [ ] **3f.14 — bg_pixmap tiling + window-storage-on-
-      pool-take init.** Two related items uncovered by the
-      fvwm3 hardware smoke + MATE drag artifacts:
-      - `set_container_background_pixmap` copies the pixmap
-        once at (0,0); X11 says bg_pixmap **tiles**. fvwm3's
-        floral wallpaper covered only the top-left because
-        of this. Quick fix: iterate copy_area across root
-        extent at pixmap-stride origins, or route through
-        the existing tiled-fill RENDER composite (3f.3).
-      - Window storage taken from the pixmap pool with stale
-        content (caja's window during drag showed widget-rect
-        islands on black). When `windows_v2[xid].bg_pixel`
-        is None, fresh storage is left at whatever the pool
-        returned. Should either always-zero on take, or fill
-        with a safe default (transparent black for depth-32,
-        opaque black for depth-24).
-      Sizing: ~60-100 LoC + 2-3 tests.
+    - [x] **3f.13 — full gradient LUT sampling landed
+      2026-05-16 (`5031e39`).** v1's `GradientPicture` (linear
+      256×1, radial 256×256) wired into v2's
+      `engine.render_composite` + `render_traps_or_tris`.
+      `render_create_linear_gradient` /
+      `render_create_radial_gradient` eagerly build a
+      `GradientPicture` and store on
+      `engine.picture_paint[xid]`; `ResolvedSource::Gradient`
+      arms bind the gradient image_view + extent and compose
+      the `axis_projection` affine with the user transform.
+      `render_free_picture` drops the entry via the existing
+      `picture_paint_remove` hook. `composite_glyphs` path
+      keeps the 3f.12 first-stop SolidFill collapse — glyph
+      pipeline is SolidFill-only — but no longer bumps
+      `composite_glyphs_dropped_unsupported` (factored into
+      `first_stop_premul_of_gradient` helper). 5 new tests (3
+      Vk-backed: linear ramp pixel-correctness, radial centre+
+      rim, missing-picture gap; 2 logic: resolve-as-gradient,
+      free-drops-record). Fuji hw-smoke confirmed gradient
+      rendering by user 2026-05-16.
+    - [x] **3f.14 — bg_pixmap tiling + window-storage init
+      landed 2026-05-16 (`408e197`).** Two fixes from post-
+      3f.10 smoke:
+      - `set_container_background_pixmap` routes through
+        `engine.render_composite` with `OP_SRC + Repeat::Normal`
+        across full root extent (single submit), not a single
+        copy_area at (0,0). fvwm3 wallpaper now tiles edge-to-
+        edge.
+      - `default_window_init_color(depth)` paints fresh window
+        storage when `bg_pixel == None` (caja drag artefact
+        from 3f.10 pool-take). Depth-32 → transparent black
+        (premul no-op for compositing); other depths → opaque
+        black. Applied in both `allocate_window_storage` and
+        the `configure_subwindow` resize path.
+      3 new tests (2 Vk-backed, 1 logic).
     - [ ] **3f.15 — submit aggregation for stroke ops
       (post-3f.5 polish, may slip to Stage 5).** fvwm3 drag
       stutter + caja apparent "hang" both trace back to
@@ -1117,6 +1134,120 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       submit-rate-bound perf class. Stage-3-close-acceptable
       if Stage 3f.5 hardware smoke shows the choppiness is
       tolerable; Stage 5 owns the real fix.
+
+  ### Shared-Vk and v2-storage fixes landed 2026-05-16/17
+  ### (from xeyes-on-mate-marco hardware smoke)
+
+  All Vk path; v1 and v2 share the underlying code (shaders +
+  `MaskScratch` + `DrawableStore`). xeyes was the load-bearing
+  reproducer — it exercises every weak point: SolidFill traps,
+  shape-clipped offscreen pixmaps, Present-Pixmap, and rapid
+  resize via the WM frame.
+
+    - [x] **MaskScratch IDENTITY attachment view (`dae5769`).**
+      `MaskScratch` viewed its R8 image with `a=R` swizzle for
+      the composite-side mask sample. The SAME view was bound as
+      a color attachment for the trap rasterize phase. Vulkan
+      VUID-VkFramebufferCreateInfo-pAttachments-00891 requires
+      IDENTITY swizzle on attachment views; lavapipe is lenient,
+      Intel + RADV strict — the rasterize writes were undefined
+      (typically zero) → mask sampled 0 → trap composite added
+      nothing to dst. xeyes' pupils never appeared on hardware;
+      eye whites (different geometry / coverage) sometimes did.
+      Fix: two views on the same image — `view` (a=R swizzle)
+      for sampling, `attachment_view` (IDENTITY) for the
+      attachment binding. Wired in both v2 (`engine.rs`) and v1
+      (`kms/backend.rs`). 3 new acceptance tests
+      (back-to-back-trap-different-SolidFill, large-bbox, single
+      trap).
+    - [x] **Synthetic-1×1 `REPEAT_PAD` override in
+      `render_traps_or_tris` (same commit).** Mirrors
+      `render_composite`'s existing override. SolidFill sources
+      with `Repeat::None` were sampling a 1×1 src image with
+      shader-side `REPEAT_NONE` — UV outside `[0, 1]` returns 0
+      from `apply_repeat`. Fragments at `dst_offset > 0` zeroed
+      the source; the composite added nothing. Latent — only
+      surfaced once the MaskScratch swizzle fix made the
+      rasterized mask non-zero.
+    - [x] **`trap.frag.glsl` horizontal-edge AA off-by-0.5
+      (`e76a6f6`).** `c_top = clamp(p.y - top, 0, 1)` was the
+      formula; should be `clamp(0.5 + (p.y - top), 0, 1)` to
+      match the slanted-edge convention (pixel center on edge =
+      0.5 coverage). Adjacent stacked traps sharing a non-
+      integer Y boundary (xeyes' eye whites are 16 such
+      trapezoids) under-covered the shared row by ~0.7. Visible
+      as horizontal stripes inside the eye whites. Same shader
+      shipped with v1; v1 had the bug too. Regression test
+      `v2_adjacent_trapezoids_share_horizontal_boundary_cleanly`.
+    - [x] **`decref → PendingFence` detaches `by_xid` (`5027cc2`).**
+      When the parked drawable's xid mapping stayed alive,
+      `configure_subwindow`'s `decref → alloc(same_xid)` got
+      `XidInUse` → silently kept old storage. xeyes resize
+      visibly broken.
+    - [x] **`destroy_now` only removes `by_xid` if still mapped
+      to this id (`4115fc8`).** Follow-on to 5027cc2. When the
+      parked old drawable's fence finally signaled,
+      `destroy_now`'s blanket `by_xid.remove(xid)` nuked the NEW
+      drawable's xid mapping. Scene then couldn't find the
+      resized window storage; stale prior content surfaced.
+    - [x] **`detach_xid` runs unconditionally on resize
+      (`3afa5bd`).** A Picture wrapping a window holds an extra
+      refcount on the backing drawable; `decref` returned
+      `StillReferenced` and left `by_xid` intact. Re-alloc
+      failed with `XidInUse`. New `DrawableStore::detach_xid`
+      removes the mapping without touching refcount;
+      `configure_subwindow` calls it before the
+      decref + allocate sequence. Picture's next
+      `store.lookup(xid)` returns the NEW DrawableId (matches
+      X11 RENDER semantics).
+    - [x] **`create_pixmap` zero-fills new storage (`fcd2521`).**
+      X11 leaves pixmap content "undefined" but real X servers
+      get away with it because system allocators zero pages.
+      Vk DEVICE_LOCAL memory is fully undefined (random
+      recycled GPU bytes). xeyes uses SHAPE-clipped drawing
+      into an offscreen pixmap; the non-eye-shape pixels of the
+      pixmap held garbage; Present-Pixmap copied that to the
+      window storage; massive visible noise around the eyes.
+      Fix: `engine.fill_rect` on every `create_pixmap` with
+      `default_window_init_color(depth)`. Regression test
+      `v2_fresh_pixmap_reads_back_zero`.
+    - [x] **Dispatch default flipped to v2 (`3afa5bd`).** Status
+      doc claimed v2 was the boot default but `dispatch.rs`
+      had v1 as the fallthrough. Three consecutive hardware-
+      smoke sessions silently tested v1 because the `yserver-*-hw`
+      Justfile recipes don't set `YSERVER_RENDER_MODEL`. Now:
+      unset / empty → v2; `=v1` is the explicit fallback.
+
+  ### Open follow-up from 2026-05-17 smoke (not yet diagnosed)
+
+    - [ ] **xeyes resize-DOWN artefact on mate + marco.**
+      Resize-UP works clean after the above fixes. Resize-DOWN
+      shows xeyes with eyes drawn for a *wider* geometry than
+      the current window — eye 2 visibly cut off at the right
+      edge. No new v2 warnings during the shrink other than
+      marco's existing COMPOSITE-related gaps (`name_window_
+      pixmap` stubbed `Err`, Stage 4 territory). Two
+      hypotheses, neither confirmed:
+      1. xeyes internal state stale — its eye geometry trails
+         the pixmap dims on rapid drag-shrink. Would be an
+         xeyes-side race; verify by stopping the drag and
+         waiting 2-3 seconds before dumping the scanout (if the
+         eyes resolve to the correct smaller shape, it's this).
+      2. v2 scene compositor blits stale storage / mismatched
+         storage extent vs window geom. The `decref → detach →
+         alloc` chain seems correct but might still have a
+         pending-ack path that captures the old DrawableId.
+      Also visible during the shrink: many `render_composite
+      gap: host_src 0x40xxxx not resolvable` lines from marco's
+      decoration compositing — depends on `name_window_pixmap`
+      (stubbed `Err` on v2). Real fix is Stage 4; the noise
+      isn't a v2 regression.
+    - [ ] **MATE panel flicker on v2.** Reported during the
+      same session, not yet diagnosed. Could share a root cause
+      with the xeyes-shrink bug (rapid configure_subwindow on
+      panel applet activity) or be its own scene-damage issue.
+      Worth capturing a focused trace+log when picked up.
+
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix (xterm / xclock / xeyes / gedit / MATE /
       xfce4 / xfd), bee 30-min stability, fuji v1/v2 perf
@@ -1128,8 +1259,8 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 
   ### Stage 3f planning-gap retrospective
 
-  Three substages landed during 3f close that were NOT in
-  the original Stage 3 plan:
+  Substages landed during 3f close that were NOT in the
+  original Stage 3 plan:
   - **3f.6 subwindow scene composition** — spec
     §scene-layering item 2 ("top-level + descendants") was
     deferred to Stage 4 in our stage plan; the cursor-trail
@@ -1139,10 +1270,33 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     only listed input as a `PlatformBackend` primitive.
   - **3f.13 full gradient LUT** — Stage 3c.2 comment
     promised 3e, but 3e's plan didn't include it.
+  - **MaskScratch + trap-shader fixes (2026-05-17)** — the
+    Vk-spec attachment-swizzle violation + AA off-by-0.5
+    were latent v1+v2 bugs in shared shader/Vk code that
+    lavapipe accepted but Intel/RADV rejected. Stage 3a
+    landed `MaskScratch` shape verbatim from v1; no
+    cross-check against the Vk spec or against multi-driver
+    hardware caught the swizzle issue. xeyes was the first
+    real-app that exercised the trap path enough to surface
+    it.
+  - **DrawableStore xid-detach semantics on PendingFence /
+    refcount > 1 (2026-05-17)** — Stage 2b's `decref` was
+    designed for the simple "refcount → 0 → destroy" case.
+    Resize-with-Picture-refcount and resize-with-in-flight-
+    fence weren't planned; both surfaced via xeyes on mate
+    + marco. The fix split (5027cc2 + 4115fc8 + 3afa5bd) is
+    iterative because each layer of the bug only became
+    visible after the prior was addressed.
 
   Common pattern: spec-correct invariant got deferred / lost
-  in stage planning. Future stages: an explicit "spec
-  invariant coverage" checklist per stage would catch these.
+  in stage planning; or Vk-spec-correct code wasn't verified
+  against strict drivers because lavapipe was lenient. Future
+  stages: an explicit "spec invariant coverage" checklist
+  per stage (X11 + Vk both) would catch these. Lavapipe
+  smoke is *necessary but not sufficient*; real-GPU smoke
+  (Intel KBL or fuji minimum, RDNA2 / bee for the strictest
+  driver coverage) needs to gate stage close, not be
+  reserved for the final acceptance pass.
 - [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom
