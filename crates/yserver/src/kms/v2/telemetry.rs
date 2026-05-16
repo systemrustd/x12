@@ -44,6 +44,27 @@ pub struct Bucket {
     pub gpu_render_ns: u64,
     pub compose_cb_record_ns: u64,
     pub frames_with_compose: u64,
+    // ── Stage 3a glyph/text counters ─────────────────────────
+    /// Glyphs successfully interned into the atlas during the
+    /// window. One `intern` call that returns `Some(entry)`
+    /// without a cache hit increments this.
+    pub atlas_intern: u64,
+    /// Glyph upload CBs submitted to the graphics queue.
+    /// Mirrors `atlas_intern` for the miss path; cache-hit
+    /// interns don't touch this. Useful for distinguishing
+    /// atlas-cache-hit vs miss rate.
+    pub glyph_uploads: u64,
+    /// Glyphs the run dropped because the atlas was full. Per
+    /// Stage 3 plan § 3a: this is a **lifetime** counter only on
+    /// the `Telemetry.lifetime` view; the bucket field exists for
+    /// the maybe_emit log line but typically reads zero — the
+    /// load-bearing fact is whether the value ever became
+    /// non-zero, which the lifetime view captures.
+    pub glyphs_dropped_atlas_full: u64,
+    // ── Stage 3d RENDER glyph counters (wire sites land in 3d;
+    //    Stage 3a only adds the storage). ────────────────────
+    pub composite_glyphs_dropped_unsupported: u64,
+    pub disjoint_readback_count: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -112,6 +133,10 @@ impl Telemetry {
              full_redraw_fallback/s={} storage_allocations/s={} \
              descriptor_allocations/s={} image_view_creates/s={} \
              frame_present_count/s={} missed_pageflips/s={} \
+             atlas_intern/s={} glyph_uploads/s={} \
+             glyphs_dropped_atlas_full(lifetime)={} \
+             composite_glyphs_dropped_unsupported(lifetime)={} \
+             disjoint_readback_count/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns}",
             b.paint_submits,
@@ -129,6 +154,11 @@ impl Telemetry {
             b.image_view_creates,
             b.frame_present_count,
             b.missed_pageflips,
+            b.atlas_intern,
+            b.glyph_uploads,
+            self.lifetime.glyphs_dropped_atlas_full,
+            self.lifetime.composite_glyphs_dropped_unsupported,
+            b.disjoint_readback_count,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -228,6 +258,47 @@ impl Telemetry {
         self.bucket.compose_cb_record_ns = self.bucket.compose_cb_record_ns.saturating_add(ns);
         self.lifetime.compose_cb_record_ns = self.lifetime.compose_cb_record_ns.saturating_add(ns);
     }
+
+    // ── Stage 3a counter sites ──────────────────────────────────
+
+    /// Bumped on every successful `intern` that pushed a new
+    /// entry (cache miss). Cache hits do NOT increment this.
+    pub(crate) fn record_atlas_intern(&mut self) {
+        self.bucket.atlas_intern += 1;
+        self.lifetime.atlas_intern += 1;
+    }
+
+    /// Bumped on every glyph upload CB submitted to the queue.
+    /// Today matches `atlas_intern` 1:1 (per-glyph upload); kept
+    /// distinct so Stage 5's batched-upload work can keep the
+    /// intern rate honest while collapsing `glyph_uploads`.
+    pub(crate) fn record_glyph_upload(&mut self) {
+        self.bucket.glyph_uploads += 1;
+        self.bucket.queue_submit2 += 1;
+        self.lifetime.glyph_uploads += 1;
+        self.lifetime.queue_submit2 += 1;
+    }
+
+    /// Bumped when a text run skips a glyph because the atlas is
+    /// full (post-eviction would refuse the pack). Lifetime
+    /// counter only — Stage 3 plan §"Non-goals" §6: "drop the
+    /// glyph + log once + counter."
+    pub(crate) fn record_glyph_dropped_atlas_full(&mut self) {
+        self.bucket.glyphs_dropped_atlas_full += 1;
+        self.lifetime.glyphs_dropped_atlas_full += 1;
+    }
+
+    // ── Stage 3d counter sites (sites wired in 3d) ──────────────
+
+    pub(crate) fn record_composite_glyphs_dropped_unsupported(&mut self) {
+        self.bucket.composite_glyphs_dropped_unsupported += 1;
+        self.lifetime.composite_glyphs_dropped_unsupported += 1;
+    }
+
+    pub(crate) fn record_disjoint_readback(&mut self) {
+        self.bucket.disjoint_readback_count += 1;
+        self.lifetime.disjoint_readback_count += 1;
+    }
 }
 
 impl Default for Telemetry {
@@ -290,5 +361,33 @@ mod tests {
         assert_eq!(t.lifetime.vk_queue_wait_idle, 2);
         // Target zero in steady state — the gate is "lifetime
         // count stays at 0 except inside get_image".
+    }
+
+    #[test]
+    fn atlas_counters_disjoint_from_paint_submits() {
+        let mut t = Telemetry::new();
+        t.record_atlas_intern();
+        t.record_atlas_intern();
+        t.record_glyph_upload();
+        t.record_glyph_upload();
+        t.record_glyph_dropped_atlas_full();
+        // intern is logical (cache miss) — does NOT bump queue_submit2.
+        assert_eq!(t.lifetime.atlas_intern, 2);
+        // glyph upload bumps queue_submit2 (one CB per upload).
+        assert_eq!(t.lifetime.glyph_uploads, 2);
+        assert_eq!(t.lifetime.queue_submit2, 2);
+        assert_eq!(t.lifetime.glyphs_dropped_atlas_full, 1);
+        // No paint_submits side effect from atlas activity.
+        assert_eq!(t.lifetime.paint_submits, 0);
+    }
+
+    #[test]
+    fn stage3d_counters_lifetime_track() {
+        let mut t = Telemetry::new();
+        t.record_composite_glyphs_dropped_unsupported();
+        t.record_disjoint_readback();
+        t.record_disjoint_readback();
+        assert_eq!(t.lifetime.composite_glyphs_dropped_unsupported, 1);
+        assert_eq!(t.lifetime.disjoint_readback_count, 2);
     }
 }
