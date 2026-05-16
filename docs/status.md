@@ -527,7 +527,69 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     This is the v1-bug-fix gate — v1 paints both glyphs.
     219 lib tests + 15 ignored v2-engine Vk tests + 5
     v2_acceptance tests all green under lavapipe.
-  - [ ] **3e — trapezoids + triangles + `copy_plane`.**
+  - [x] **3e — trapezoids + triangles + `copy_plane`.** Landed
+    2026-05-16 in two substages.
+
+    **3e.1 — copy_plane (`dc3853d`).** GXcopy scope: pull src wire
+    bytes via `engine.get_image`, classify each pixel by
+    `(pixel & plane) != 0` into fg/bg rect lists, drive
+    `poly_fill_rectangle` bg-first then fg. Depths 1/8/24/32
+    supported via per-depth wire row-stride + pixel extraction
+    (MSB-first bit unpacker for depth-1). Non-GXcopy logs a gap +
+    skips (Stage 3f LogicFillPipeline). xfd/xfontsel are the
+    canonical callers and both use GXcopy.
+
+    **3e.2 — trapezoids + triangles (TrapPipeline port).** New
+    `trap_pipeline: Option<TrapPipeline>` + `mask_scratch:
+    Option<MaskScratch>` slots on `RenderEngineInner`, lazy-init
+    via `ensure_trap_assets`. New engine method
+    `render_traps_or_tris(prim_kind, instance_data, instance_count,
+    bbox, ...)` ports v1's `try_vk_render_traps_or_tris`
+    (kms/backend.rs:4500) into v2's per-op CB shape:
+      1. Allocate per-call `StagingBuffer::new_with_usage(...,
+         VERTEX_BUFFER)` (sibling to the existing `TRANSFER_*`
+         constructor) sized for `instance_count × stride`; memcpy
+         the wrapper-cooked instance bytes in.
+      2. `mask_scratch.ensure_image_size_returning_old(bbox_w,
+         bbox_h)` — retired old image currently dropped on the
+         floor (same shape as `dst_readback` grow-leak; flagged
+         in the `mask_scratch` doc note for Stage 5 polish).
+      3. Trap rasterize phase inside the CB:
+         mask → COLOR_ATTACHMENT, `begin_rendering(mask_view,
+         LOAD_OP_CLEAR)` at `(0,0)..(bbox_w, bbox_h)`, bind
+         trap-or-tri sibling pipeline + vertex buffer, push
+         `TrapDrawPushConsts`, set viewport + scissor, draw
+         `(4, instance_count)`, end_rendering, mask
+         → SHADER_READ_ONLY.
+      4. Composite phase: `needs_full_dst` op set (Clear/Src/etc.
+         and every Disjoint/Conjoint variant) drives a full-dst
+         draw with `mask_off = -bbox`; other ops draw only the
+         bbox. dst_readback snapshot fires for Disjoint/Conjoint.
+         Goes through the existing `record_render_composite` with
+         the scratch view bound as `mask_tex`, `REPEAT_NONE` so
+         out-of-bbox samples yield mask=0. Per-rect picture-clip
+         scissoring (plan §4) honoured at the composite stage.
+      5. Push the `SubmittedOp` with the instance buffer in
+         `staging` so its retirement releases the upload buffer.
+
+    Out-of-scope at 3e.2: gradient sources (Stage 3e gradient
+    work is risk-listed for follow-up), src self-alias scratch
+    (rare in trap workloads), all the broader op coverage
+    Disjoint/Conjoint already accepts via the existing pipeline.
+
+    Backend wiring: `KmsBackendV2::render_trapezoids` /
+    `render_triangles_op` decode wire bytes (40 B traps; 24 B
+    triangles via minor 11/12/13 dispatch), apply `(x_off, y_off)`
+    in 16.16 fixed-point, compute bbox via the existing
+    `trapezoid_bbox` / `triangle_bbox` helpers, pre-pack instance
+    data, and call into the engine.
+
+    Tests: 2 unit (`trapezoid_decoder_x11_wire_layout`,
+    `triangle_to_trap_degenerate`) + 1 Vk-backed acceptance
+    (`v2_render_trapezoids_renders_filled_rect` — axis-aligned
+    4×4 trap with `Over` + SolidFill source, interior red over a
+    blue dst). 221 lib + 15 ignored v2-engine Vk + 7
+    v2_acceptance tests all green under lavapipe.
   - [ ] **3f — Core remainder + GC.function + planemask +
     acceptance.** Real-app matrix on hardware, bee 30-min
     stability run, fuji perf captures (v1 baseline taken
