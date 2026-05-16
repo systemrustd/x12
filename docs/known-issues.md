@@ -323,6 +323,39 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
+- [ ] **v2 atomic-commit ENOMEM storm → VK_ERROR_DEVICE_LOST
+      cascade (bee, RADV, 2560×1440).** Hardware smoke
+      2026-05-16: after a minute or two of xterm interaction,
+      KMS atomic commits start returning ENOMEM
+      (`Cannot allocate memory (os error 12)`) in long bursts.
+      The v2 scene tick's 9b recovery path runs cleanly per
+      attempt — invalidates the BO, releases the descriptor-pool
+      slot, defers repaint — but new attempts keep firing each
+      tick and ENOMEM keeps coming. Eventually the GPU context
+      is lost (`radv/amdgpu: The CS has been cancelled because
+      the context is lost`, `vkQueueSubmit() failed
+      (VK_ERROR_DEVICE_LOST)`), an in-flight FenceTicket is
+      dropped unsignaled, `platform.renderer_failed` flips
+      true, and every subsequent paint + compose silently
+      drops. The screen freezes at the last successful frame
+      (cursor "disappears", windows stop updating, but the
+      process keeps running).
+      Hypotheses to chase: (a) KMS framebuffer-handle leak on
+      the failed-commit path — `invalidate_bo` doesn't release
+      the BO's `fb_id` handle, so each retry creates a fresh
+      one and exhausts kernel resources; (b) GEM/dmabuf
+      accumulation per failed commit; (c) some other resource
+      the v2 commit recovery path doesn't drain.
+      Diagnostic next steps: drmModeGetFB2 / drm-fbs sysfs to
+      see fb_id count over time during the storm; add an
+      `fb_id_create / fb_id_destroy` counter to v2 telemetry;
+      compare with v1's commit-recovery path which doesn't
+      exhibit this on the same hardware.
+      Not blocking 3f.5 — 3f.6/3f.7/3f.8 unlocked the visual
+      side. Tracked as its own perf/correctness item; likely
+      Stage-5 territory but may need a quick fb-handle-leak
+      patch sooner if it makes bee unusable.
+
 - [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
       treat any arc as a full ellipse regardless of `angle1`/`angle2`.
       Fine for xeyes (full circles) but anything that draws actual

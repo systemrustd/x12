@@ -211,6 +211,14 @@ struct SceneCompositorInner {
     /// is just a default-arrow fallback so hardware smoke has
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
+    /// Stage 3f.8: cursor position at the previous build_scene
+    /// call, in root-space output coords. Carried so the next
+    /// tick can damage the OLD cursor rect (otherwise buffer-age
+    /// clipped/LOAD path leaves the prior cursor pixels in the
+    /// scanout BO — visible as a "trail" while the pointer
+    /// moves). Updated to the current cursor position every time
+    /// build_scene emits a cursor draw entry.
+    cursor_prev_pos: Option<(i32, i32)>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -289,6 +297,7 @@ impl SceneCompositor {
                 pipeline,
                 outputs,
                 cursor: None,
+                cursor_prev_pos: None,
             }),
             scene_structure_dirty: true,
         })
@@ -523,8 +532,22 @@ fn tick_one_output(
     };
 
     // 2. Build the scene + collect projected presentation damage.
-    let (scene, snapshots, projected_damage) =
-        build_scene(core, store, windows_v2, output_idx, platform, inner.cursor);
+    let (scene, snapshots, projected_damage, new_cursor_pos) = build_scene(
+        core,
+        store,
+        windows_v2,
+        output_idx,
+        platform,
+        inner.cursor,
+        inner.cursor_prev_pos,
+    );
+    // Stage 3f.8 trail elimination: stash the new cursor pos so
+    // the next tick can damage it as the prior rect. Only update
+    // when build_scene actually emitted a cursor draw (otherwise
+    // the prev pos stays as-is and we'll re-damage it next time).
+    if let Some(p) = new_cursor_pos {
+        inner.cursor_prev_pos = Some(p);
+    }
     let mut output_damage = projected_damage;
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
@@ -723,7 +746,13 @@ fn build_scene(
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
-) -> (CompositeScene, Vec<DamageSnapshot>, RegionSet) {
+    cursor_prev_pos: Option<(i32, i32)>,
+) -> (
+    CompositeScene,
+    Vec<DamageSnapshot>,
+    RegionSet,
+    Option<(i32, i32)>,
+) {
     let bg = core
         .bg_pixel
         .map(super::engine::decode_x11_pixel_bgra)
@@ -760,18 +789,52 @@ fn build_scene(
     // same projection windows go through above). `alpha_passthrough`
     // is `true` so the sprite's alpha channel actually blends
     // against the underlying composite instead of force-opaque.
+    //
+    // Trail elimination: also damage the PRIOR cursor rect so the
+    // buffer-age clipped/LOAD path re-blits over those pixels
+    // (otherwise the sprite stays at its previous position because
+    // loadOp=LOAD preserves whatever the prior frame composed
+    // there).
+    let mut new_cursor_pos: Option<(i32, i32)> = None;
     if let Some(cur) = cursor
         && let Some(drawable) = store.get(cur.id)
         && drawable.storage.image_view != vk::ImageView::null()
     {
         let cw = i32::try_from(cur.extent.width).unwrap_or(i32::MAX);
         let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
+        let layout_w_i = i32::try_from(layout_w).unwrap_or(i32::MAX);
+        let layout_h_i = i32::try_from(layout_h).unwrap_or(i32::MAX);
+
+        let add_cursor_damage = |projected: &mut RegionSet, dx: i32, dy: i32| {
+            // Clip the cursor rect to the output before adding to
+            // damage. RegionSet uses u32 widths so negative offsets
+            // need clamping; off-output rects must be skipped
+            // entirely (they don't contribute to scanout damage).
+            let x0 = dx.max(0);
+            let y0 = dy.max(0);
+            let x1 = (dx + cw).min(layout_w_i);
+            let y1 = (dy + ch).min(layout_h_i);
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            projected.add(vk::Rect2D {
+                offset: vk::Offset2D { x: x0, y: y0 },
+                extent: vk::Extent2D {
+                    width: u32::try_from(x1 - x0).unwrap_or(0),
+                    height: u32::try_from(y1 - y0).unwrap_or(0),
+                },
+            });
+        };
+
+        // Damage the previous cursor rect (if any) so prior pixels
+        // get redrawn.
+        if let Some((prev_x, prev_y)) = cursor_prev_pos {
+            add_cursor_damage(&mut projected, prev_x, prev_y);
+        }
+
         let dx = (core.cursor_x as i32) - i32::from(cur.hot_x) - layout_x0;
         let dy = (core.cursor_y as i32) - i32::from(cur.hot_y) - layout_y0;
-        let visible = !(dx + cw <= 0
-            || dy + ch <= 0
-            || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
-            || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+        let visible = !(dx + cw <= 0 || dy + ch <= 0 || dx >= layout_w_i || dy >= layout_h_i);
         if visible {
             draws.push(CompositeDraw {
                 image_view: drawable.storage.image_view,
@@ -783,18 +846,10 @@ fn build_scene(
                 src_size: [1.0, 1.0],
                 alpha_passthrough: true,
             });
-            // Cursor damage so the next tick covers the sprite
-            // rect even when no other draws contributed.
-            projected.add(vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: dx.max(0),
-                    y: dy.max(0),
-                },
-                extent: vk::Extent2D {
-                    width: u32::try_from(cw).unwrap_or(0),
-                    height: u32::try_from(ch).unwrap_or(0),
-                },
-            });
+            // Damage the new cursor rect so the next tick covers it
+            // even when no other draws contributed.
+            add_cursor_damage(&mut projected, dx, dy);
+            new_cursor_pos = Some((dx, dy));
         }
     }
 
@@ -802,7 +857,7 @@ fn build_scene(
         bg_color: bg,
         draws,
     };
-    (scene, snapshots, projected)
+    (scene, snapshots, projected, new_cursor_pos)
 }
 
 /// Stage 3f.6 recurse: emit a CompositeDraw entry for `host_xid` if
@@ -1428,8 +1483,8 @@ mod tests {
             true,
         );
 
-        let (scene, _snaps, _proj) =
-            build_scene(&core, &mut store, &windows_v2, 0, &platform, None);
+        let (scene, _snaps, _proj, _new_cursor) =
+            build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
         assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
 
         // Top-level at output (50, 60) since output layout origin is (0,0).
@@ -1484,8 +1539,8 @@ mod tests {
             true, /* child IS mapped, but parent isn't */
         );
 
-        let (scene, _snaps, _proj) =
-            build_scene(&core, &mut store, &windows_v2, 0, &platform, None);
+        let (scene, _snaps, _proj, _new_cursor) =
+            build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
         assert!(
             scene.draws.is_empty(),
             "unmapped parent must short-circuit subtree (got {} draws)",
@@ -1542,8 +1597,15 @@ mod tests {
             hot_y: 0,
         };
 
-        let (scene, _snaps, _proj) =
-            build_scene(&core, &mut store, &windows_v2, 0, &platform, Some(cursor));
+        let (scene, _snaps, _proj, _new_cursor) = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            Some(cursor),
+            None,
+        );
         // 1 top-level + 1 cursor = 2.
         assert_eq!(scene.draws.len(), 2);
         let cursor_draw = scene.draws.last().expect("cursor draw");
