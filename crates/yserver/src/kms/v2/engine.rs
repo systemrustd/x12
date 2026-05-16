@@ -87,6 +87,27 @@ struct SubmittedOp {
     /// only after the fence signals; dropping it earlier would
     /// race the GPU's TRANSFER_READ.
     staging: Option<StagingBuffer>,
+    /// Per-op scratch image (only for `copy_area` self-overlap
+    /// path). Destroyed only after the fence signals.
+    scratch: Option<ScratchImage>,
+}
+
+/// One-shot device-local image used by `copy_area`'s same-image
+/// overlap path (Stage 2d). Destroyed only after the owning op's
+/// fence signals.
+struct ScratchImage {
+    vk: Arc<VkContext>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl Drop for ScratchImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
+        }
+    }
 }
 
 /// One-shot host-visible buffer used for `put_image` upload or
@@ -400,6 +421,320 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
+            scratch: None,
+        });
+        Ok(())
+    }
+
+    // ── Op: copy_area (Stage 2d) ────────────────────────────────
+
+    /// Copy `src_rect` from `src` into `dst` at `dst_pos`. The
+    /// disjoint case is a straight `vkCmdCopyImage`. When
+    /// `src == dst`, a same-image overlap is detected and routed
+    /// through a scratch-image via `vkCmdCopyImage` twice (per
+    /// Stage 2 plan §"copy_area" subcase). Stage 2's slow scratch
+    /// path is acceptable — apps that hit it (xterm scroll
+    /// without compositor) need glyphs to be relevant anyway,
+    /// landing in Stage 3.
+    ///
+    /// # Errors
+    ///
+    /// `UnknownDrawable` if either id is missing; `Vk` for
+    /// any Vk failure; `NoVk` on the stub engine.
+    pub(crate) fn copy_area(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        src: DrawableId,
+        dst: DrawableId,
+        src_rect: vk::Rect2D,
+        dst_pos: vk::Offset2D,
+    ) -> Result<(), RenderError> {
+        if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
+            return Ok(());
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        // Read src + dst metadata first (without holding a mutable
+        // borrow into store across both transitions).
+        let (src_image, src_extent, src_format) = {
+            let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
+            (d.storage.image, d.storage.extent, d.storage.format)
+        };
+        let (dst_extent, dst_format) = {
+            let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
+            (d.storage.extent, d.storage.format)
+        };
+        if src_format != dst_format {
+            return Err(RenderError::UnsupportedDepth(0));
+        }
+
+        // Clamp src_rect to src extent.
+        let src_rect = clamp_rect(src_rect, src_extent);
+        // Project to dst: compute the dst rect (clamped to dst extent).
+        let dst_pos_clamped = vk::Offset2D {
+            x: dst_pos.x.max(0),
+            y: dst_pos.y.max(0),
+        };
+        let copy_w = u32::try_from(
+            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.x))
+                + i32::try_from(src_rect.extent.width).unwrap_or(0))
+            .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX))
+                - dst_pos_clamped.x,
+        )
+        .unwrap_or(0)
+        .min(src_rect.extent.width);
+        let copy_h = u32::try_from(
+            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.y))
+                + i32::try_from(src_rect.extent.height).unwrap_or(0))
+            .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX))
+                - dst_pos_clamped.y,
+        )
+        .unwrap_or(0)
+        .min(src_rect.extent.height);
+        if copy_w == 0 || copy_h == 0 {
+            return Ok(());
+        }
+        let dst_rect = vk::Rect2D {
+            offset: dst_pos_clamped,
+            extent: vk::Extent2D {
+                width: copy_w,
+                height: copy_h,
+            },
+        };
+
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let device = &inner.vk.device;
+
+        if src == dst {
+            // Same-image overlap path: scratch image at copy_w ×
+            // copy_h, format matches src.
+            let scratch =
+                allocate_scratch_image(&inner.vk.clone(), platform, copy_w, copy_h, src_format)?;
+            // src → TRANSFER_SRC; scratch starts UNDEFINED →
+            // TRANSFER_DST.
+            {
+                let src_d = store.get_mut(src).expect("src missing post-lookup");
+                src_d.record_layout_transition(
+                    &inner.vk,
+                    cb,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                        | vk::AccessFlags2::TRANSFER_WRITE
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_READ,
+                );
+            }
+            // scratch UNDEFINED → TRANSFER_DST_OPTIMAL.
+            barrier_to_layout(
+                device,
+                cb,
+                scratch.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            );
+            // Copy src_rect → scratch (offset 0,0).
+            let region1 = [vk::ImageCopy::default()
+                .src_subresource(color_layers())
+                .src_offset(vk::Offset3D {
+                    x: src_rect.offset.x,
+                    y: src_rect.offset.y,
+                    z: 0,
+                })
+                .dst_subresource(color_layers())
+                .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .extent(vk::Extent3D {
+                    width: copy_w,
+                    height: copy_h,
+                    depth: 1,
+                })];
+            unsafe {
+                device.cmd_copy_image(
+                    cb,
+                    src_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    scratch.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region1,
+                );
+            }
+            // scratch TRANSFER_DST → TRANSFER_SRC.
+            barrier_to_layout(
+                device,
+                cb,
+                scratch.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
+            // src → TRANSFER_DST (it's also dst).
+            {
+                let d = store.get_mut(src).expect("src missing");
+                d.record_layout_transition(
+                    &inner.vk,
+                    cb,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+            }
+            // Copy scratch → src at dst_rect.
+            let region2 = [vk::ImageCopy::default()
+                .src_subresource(color_layers())
+                .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .dst_subresource(color_layers())
+                .dst_offset(vk::Offset3D {
+                    x: dst_rect.offset.x,
+                    y: dst_rect.offset.y,
+                    z: 0,
+                })
+                .extent(vk::Extent3D {
+                    width: copy_w,
+                    height: copy_h,
+                    depth: 1,
+                })];
+            unsafe {
+                device.cmd_copy_image(
+                    cb,
+                    scratch.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region2,
+                );
+            }
+            // src → SHADER_READ_ONLY.
+            {
+                let d = store.get_mut(src).expect("src missing");
+                d.record_layout_transition(
+                    &inner.vk,
+                    cb,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                );
+            }
+            end_and_submit_op(inner, platform, cb, &ticket)?;
+            store.touch_render_fence(src, ticket.clone());
+            store.damage(src, dst_rect);
+            inner.submitted.push_back(SubmittedOp {
+                cb,
+                ticket,
+                staging: None,
+                scratch: Some(scratch),
+            });
+            return Ok(());
+        }
+
+        // Disjoint-image path: src → TRANSFER_SRC, dst → TRANSFER_DST.
+        {
+            let d = store.get_mut(src).expect("src missing");
+            d.record_layout_transition(
+                &inner.vk,
+                cb,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+                    | vk::AccessFlags2::TRANSFER_WRITE
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
+        }
+        {
+            let d = store.get_mut(dst).expect("dst missing");
+            d.record_layout_transition(
+                &inner.vk,
+                cb,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+                    | vk::AccessFlags2::TRANSFER_WRITE
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            );
+        }
+        let region = [vk::ImageCopy::default()
+            .src_subresource(color_layers())
+            .src_offset(vk::Offset3D {
+                x: src_rect.offset.x,
+                y: src_rect.offset.y,
+                z: 0,
+            })
+            .dst_subresource(color_layers())
+            .dst_offset(vk::Offset3D {
+                x: dst_rect.offset.x,
+                y: dst_rect.offset.y,
+                z: 0,
+            })
+            .extent(vk::Extent3D {
+                width: copy_w,
+                height: copy_h,
+                depth: 1,
+            })];
+        unsafe {
+            let dst_image = store.get(dst).expect("dst missing").storage.image;
+            device.cmd_copy_image(
+                cb,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            );
+        }
+        // Return src + dst to SHADER_READ_ONLY.
+        {
+            let d = store.get_mut(src).expect("src missing");
+            d.record_layout_transition(
+                &inner.vk,
+                cb,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            );
+        }
+        {
+            let d = store.get_mut(dst).expect("dst missing");
+            d.record_layout_transition(
+                &inner.vk,
+                cb,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            );
+        }
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(src, ticket.clone());
+        store.touch_render_fence(dst, ticket.clone());
+        store.damage(dst, dst_rect);
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: None,
+            scratch: None,
         });
         Ok(())
     }
@@ -550,6 +885,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: Some(staging),
+            scratch: None,
         });
         Ok(())
     }
@@ -681,6 +1017,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: Some(staging),
+            scratch: None,
         });
 
         Ok(out)
@@ -752,6 +1089,112 @@ fn end_and_submit_op(
     platform.submit_paint_cb(cb, ticket.fence())?;
     let _ = device;
     Ok(())
+}
+
+fn color_layers() -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1)
+}
+
+/// Single-image-layout barrier helper for scratch images that
+/// `Drawable::record_layout_transition` can't touch (the scratch
+/// isn't a tracked drawable).
+#[allow(clippy::too_many_arguments)]
+fn barrier_to_layout(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) {
+    let b = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        )];
+    let dep = vk::DependencyInfo::default().image_memory_barriers(&b);
+    unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+}
+
+/// Allocate a scratch image for `copy_area`'s overlap path.
+/// Device-local, OPTIMAL tiling, TRANSFER_SRC|TRANSFER_DST usage.
+/// Caller is responsible for adopting it into the op's
+/// `SubmittedOp.scratch` so it retires on the fence.
+fn allocate_scratch_image(
+    vk: &Arc<VkContext>,
+    _platform: &PlatformBackend,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ScratchImage, RenderError> {
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { vk.device.create_image(&info, None)? };
+    let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+    let mem_props = unsafe {
+        vk.instance
+            .get_physical_device_memory_properties(vk.physical_device)
+    };
+    let Some(mt) = (0..mem_props.memory_type_count).find(|&i| {
+        mem_reqs.memory_type_bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }) else {
+        unsafe { vk.device.destroy_image(image, None) };
+        return Err(RenderError::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    };
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mt);
+    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(RenderError::Vk(e));
+        }
+    };
+    if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(RenderError::Vk(e));
+    }
+    Ok(ScratchImage {
+        vk: Arc::clone(vk),
+        image,
+        memory,
+    })
 }
 
 fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
@@ -1333,6 +1776,223 @@ mod tests {
             assert_eq!(px[1], 0x00, "G");
             assert_eq!(px[2], 0xFF, "R");
             assert_eq!(px[3], 0xFF, "A");
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn copy_area_disjoint_pixmaps_round_trip() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage_src = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+        let src = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage_src,
+            )
+            .unwrap();
+        let dst = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage_dst,
+            )
+            .unwrap();
+
+        // Fill src with red.
+        let red = decode_x11_pixel_bgra(0xFF_FF_00_00);
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                red,
+            )
+            .unwrap();
+        // Fill dst with blue.
+        let blue = decode_x11_pixel_bgra(0xFF_00_00_FF);
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                blue,
+            )
+            .unwrap();
+        // Copy src into dst at (4, 0).
+        engine
+            .copy_area(
+                &mut store,
+                &mut platform,
+                src,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D { x: 4, y: 0 },
+            )
+            .unwrap();
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .unwrap();
+        // Left half (0..4) should be blue (B=0xFF, G=0, R=0, A=0xFF).
+        for y in 0..4 {
+            for x in 0..4 {
+                let off = (y * 8 + x) * 4;
+                assert_eq!(&out[off..off + 4], &[0xFF, 0x00, 0x00, 0xFF], "left blue");
+            }
+        }
+        // Right half (4..8) should be red (B=0, G=0, R=0xFF, A=0xFF).
+        for y in 0..4 {
+            for x in 4..8 {
+                let off = (y * 8 + x) * 4;
+                assert_eq!(&out[off..off + 4], &[0x00, 0x00, 0xFF, 0xFF], "right red");
+            }
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn copy_area_self_overlap_scratch_path() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage = platform.allocate_drawable_storage(8, 1, 32).unwrap();
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .unwrap();
+
+        // PutImage a horizontal gradient: 8 pixels each with a
+        // distinct red value.
+        let mut src = vec![0u8; 8 * 4];
+        for x in 0..8 {
+            let off = x * 4;
+            src[off] = 0x00; // B
+            src[off + 1] = 0x00; // G
+            src[off + 2] = (x as u8) * 0x20; // R
+            src[off + 3] = 0xFF; // A
+        }
+        engine
+            .put_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Offset2D::default(),
+                vk::Extent2D {
+                    width: 8,
+                    height: 1,
+                },
+                &src,
+                32,
+            )
+            .unwrap();
+        // Copy (0..4) → (2..6) (overlap; scratch path engages).
+        engine
+            .copy_area(
+                &mut store,
+                &mut platform,
+                id,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 1,
+                    },
+                },
+                vk::Offset2D { x: 2, y: 0 },
+            )
+            .unwrap();
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .unwrap();
+        // Expected R-channel sequence: [0, 0x20, 0, 0x20, 0x40, 0x60, 0xC0, 0xE0]
+        // After copy of (0..4) → (2..6):
+        //   col 0: original (R=0)
+        //   col 1: original (R=0x20)
+        //   col 2: src col 0 (R=0)
+        //   col 3: src col 1 (R=0x20)
+        //   col 4: src col 2 (R=0x40)
+        //   col 5: src col 3 (R=0x60)
+        //   col 6: original col 6 (R=0xC0)
+        //   col 7: original col 7 (R=0xE0)
+        let expected_r = [0x00, 0x20, 0x00, 0x20, 0x40, 0x60, 0xC0, 0xE0];
+        for (x, &exp) in expected_r.iter().enumerate() {
+            let off = x * 4 + 2;
+            assert_eq!(
+                out[off], exp,
+                "R at col {x} (got {:#x}, want {exp:#x})",
+                out[off]
+            );
         }
 
         engine.drain_all(&platform);

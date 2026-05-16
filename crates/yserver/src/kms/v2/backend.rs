@@ -724,16 +724,49 @@ impl Backend for KmsBackendV2 {
     fn copy_area(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        self.log_v2_gap("copy_area");
+        let (Some(src), Some(dst)) = (
+            self.store.lookup(src_host_xid),
+            self.store.lookup(dst_host_xid),
+        ) else {
+            self.log_v2_gap("copy_area_unknown_xid");
+            return Ok(());
+        };
+        let src_rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(src_x),
+                y: i32::from(src_y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        let dst_pos = ash::vk::Offset2D {
+            x: i32::from(dst_x),
+            y: i32::from(dst_y),
+        };
+        if let Err(e) = self.engine.copy_area(
+            &mut self.store,
+            &mut self.platform,
+            src,
+            dst,
+            src_rect,
+            dst_pos,
+        ) {
+            log::warn!(
+                "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
+                 dst=0x{dst_host_xid:x}): {e:?}",
+            );
+        }
         Ok(())
     }
 
@@ -1481,11 +1514,12 @@ mod tests {
             assert!(b.fill_rectangle(None, 0x1234, 0, 0, 0, 4, 4).is_ok());
         }
         let logged = b.logged_gaps.borrow();
-        // Unknown-xid path for the wired ops; `copy_area` keeps
-        // its Stage-1b stub name until Stage 2d wires it.
+        // Unknown-xid path for the wired ops; all three log the
+        // `_unknown_xid` variant since the test xids aren't in
+        // the store fixture.
         assert!(logged.contains("put_image_unknown_xid"));
         assert!(logged.contains("fill_rectangle_unknown_xid"));
-        assert!(logged.contains("copy_area"));
+        assert!(logged.contains("copy_area_unknown_xid"));
     }
 
     /// Spec: "boots far enough to service GetGeometry / InternAtom".
