@@ -108,6 +108,26 @@ impl Storage {
         }
     }
 
+    /// Stage 3f.10: pool-take constructor. Reuses a recycled
+    /// `PooledPixmapImage` triple (image + memory + view) +
+    /// inherits the pool entry's tracked layout so subsequent
+    /// ops transition from the right source state.
+    pub(crate) fn from_pooled(
+        pooled: crate::kms::vk::pixmap_pool::PooledPixmapImage,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Self {
+        Self {
+            image: pooled.image,
+            memory: pooled.memory,
+            image_view: pooled.view,
+            extent,
+            format,
+            current_layout: pooled.current_layout,
+            is_test_stub: false,
+        }
+    }
+
     /// Test-only constructor with null Vk handles. Used by
     /// unit tests that exercise refcount / damage / snapshot
     /// logic without needing a live VkContext.
@@ -128,6 +148,11 @@ impl Storage {
     /// `DrawableStore` after the last consumer has released
     /// the drawable AND its `FenceTicket` is signaled. No-op
     /// for test stubs.
+    ///
+    /// Stage 3f.10: try the pixmap pool first. Eligible-size
+    /// entries (`PixmapPool::eligible(key)` — typically ≤128×128)
+    /// are returned for recycle; ineligible or pool-full entries
+    /// fall through to synchronous destroy.
     fn destroy(&mut self, platform: &PlatformBackend) {
         if self.is_test_stub {
             return;
@@ -141,6 +166,43 @@ impl Storage {
             );
             return;
         };
+        // Pool-return path: only attempt for non-null handles and
+        // when the platform has a pool wired (production path).
+        if self.image != vk::Image::null()
+            && self.image_view != vk::ImageView::null()
+            && self.memory != vk::DeviceMemory::null()
+            && let Some(pool) = platform.pixmap_pool.as_ref()
+        {
+            let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
+                width: self.extent.width,
+                height: self.extent.height,
+                format: self.format,
+            };
+            let entry = crate::kms::vk::pixmap_pool::PooledPixmapImage {
+                image: self.image,
+                view: self.image_view,
+                memory: self.memory,
+                current_layout: self.current_layout,
+            };
+            match pool.try_return(key, entry) {
+                Ok(()) => {
+                    // Pool adopted the handles. Null them so the
+                    // fallthrough destroy below skips this entry.
+                    self.image = vk::Image::null();
+                    self.image_view = vk::ImageView::null();
+                    self.memory = vk::DeviceMemory::null();
+                    return;
+                }
+                Err(returned) => {
+                    // Bucket full / ineligible — restore handles
+                    // from the entry that was rejected (try_return
+                    // gives them back) and fall through to destroy.
+                    self.image = returned.image;
+                    self.image_view = returned.view;
+                    self.memory = returned.memory;
+                }
+            }
+        }
         unsafe {
             if self.image_view != vk::ImageView::null() {
                 vk.device.destroy_image_view(self.image_view, None);
@@ -894,5 +956,37 @@ mod tests {
             },
         });
         assert!(r.is_empty());
+    }
+
+    /// Stage 3f.10: `Storage::from_pooled` inherits the pool
+    /// entry's tracked layout so the next `record_layout_transition`
+    /// issues a correct `old_layout` barrier (not the
+    /// `UNDEFINED` that a fresh allocate would imply). Pool entries
+    /// also keep the size + format the key was built for.
+    #[test]
+    fn storage_from_pooled_inherits_layout_and_dims() {
+        use crate::kms::vk::pixmap_pool::PooledPixmapImage;
+        // Sentinel non-null handles — Storage::from_pooled just
+        // copies them; nothing dereferences a real Vk image here.
+        let pooled = PooledPixmapImage {
+            image: ash::vk::Handle::from_raw(0x1000_0001),
+            view: ash::vk::Handle::from_raw(0x1000_0002),
+            memory: ash::vk::Handle::from_raw(0x1000_0003),
+            current_layout: ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let extent = ash::vk::Extent2D {
+            width: 32,
+            height: 64,
+        };
+        let format = ash::vk::Format::B8G8R8A8_UNORM;
+        let s = Storage::from_pooled(pooled, extent, format);
+        assert_eq!(s.extent.width, 32);
+        assert_eq!(s.extent.height, 64);
+        assert_eq!(s.format, format);
+        assert_eq!(
+            s.current_layout,
+            ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+        assert!(!s.is_test_stub);
     }
 }

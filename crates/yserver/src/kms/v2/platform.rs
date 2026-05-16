@@ -373,6 +373,15 @@ pub(crate) struct PlatformBackend {
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
 
+    /// Stage 3f.10: recycled `(image, view, memory)` triples for
+    /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
+    /// `try_take` / `try_return` API + bucket-cap + size-cap
+    /// logic is backend-agnostic. Bypassed by the test fixture
+    /// (`for_tests`) and on `for_tests_with_vk` (the harness
+    /// constructs `RenderEngine` directly without going through
+    /// `open_with_commit`).
+    pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
+
     /// Per-output scanout BO pool. `None` if a particular
     /// output's allocation failed (rare; e.g. RADV/gfx8 quirks).
     /// Stage 2c+ paint paths skip output indices with `None`
@@ -449,6 +458,21 @@ impl PlatformBackend {
 
         let fence_pool = FencePool::new(Arc::clone(&vk));
 
+        // Stage 3f.10: pixmap pool reuses v1's allocator verbatim.
+        // MATE / xfce4 / GTK widgets churn ~90 pixmap allocs/sec;
+        // without this every CreatePixmap pays a full
+        // create_image + allocate_memory + bind + create_view cycle.
+        // Registers with the GLOBAL_LATEST_POOL hook so the main-
+        // loop telemetry path can sample hit/miss counters even
+        // though v2 doesn't own the telemetry-emit cadence directly.
+        let pixmap_pool = {
+            let p = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
+                &vk,
+            )));
+            crate::kms::vk::pixmap_pool::register_for_telemetry(&p);
+            Some(p)
+        };
+
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
         let mut scanout_pools = Vec::with_capacity(layouts.len());
         let mut bo_generations = Vec::with_capacity(layouts.len());
@@ -494,6 +518,7 @@ impl PlatformBackend {
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            pixmap_pool,
             scanout_pools,
             bo_generations,
             next_present_generation: 0,
@@ -544,6 +569,7 @@ impl PlatformBackend {
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
+            pixmap_pool: None,
             scanout_pools: vec![None],
             bo_generations: vec![Vec::new()],
             next_present_generation: 0,
@@ -645,6 +671,21 @@ impl PlatformBackend {
             width: u32::from(width.max(1)),
             height: u32::from(height.max(1)),
         };
+
+        // Stage 3f.10: try the recycle pool before falling through to
+        // a fresh Vk allocate. v1's pool keys on
+        // (width, height, format); the usage flag set is constant
+        // across all server-owned pixmaps (matches v1).
+        if let Some(pool) = self.pixmap_pool.as_ref() {
+            let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
+                width: extent.width,
+                height: extent.height,
+                format,
+            };
+            if let Some(pooled) = pool.try_take(key) {
+                return Ok(Storage::from_pooled(pooled, extent, format));
+            }
+        }
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -959,6 +1000,14 @@ impl PlatformBackend {
             unsafe {
                 let _ = vk.device.device_wait_idle();
             }
+        }
+
+        // Stage 3f.10: drain the pixmap pool so the recycled
+        // image/memory/view triples don't leak through the
+        // VkContext destruction path. Safe to drain here: every
+        // in-flight CB has been waited on by device_wait_idle.
+        if let Some(pool) = self.pixmap_pool.as_ref() {
+            pool.drain();
         }
 
         let mut first_err: Option<io::Error> = None;

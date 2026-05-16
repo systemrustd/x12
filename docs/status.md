@@ -948,6 +948,54 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         `copy_area` which doesn't honour X11 bg_pixmap
         tiling. v1-parity for now; proper tiling is a
         follow-up.
+    - [x] **3f.10 — port v1's PixmapPool to v2 landed
+      2026-05-16.** MATE hardware-smoke (post-3f.9) showed
+      ~90 pixmap allocate/free cycles per second (3447
+      CreatePixmap + 3422 FreePixmap over 38 s). Without a
+      pool, every CreatePixmap pays a full
+      `vkCreateImage` + `vkAllocateMemory` + `vkBindImageMemory`
+      + `vkCreateImageView` cycle, freed symmetrically per
+      `FreePixmap`. v1's `kms::vk::pixmap_pool::PixmapPool`
+      already has the right shape — bucket-cap=32,
+      max_pooled_dim=128, keyed by (w, h, format), thread-safe
+      Mutex internals — and ported verbatim:
+      - `PlatformBackend` grows
+        `pixmap_pool: Option<Arc<PixmapPool>>` (None on the
+        test fixture; Some on `open_with_commit`).
+        `register_for_telemetry` runs so the existing
+        `GLOBAL_LATEST_POOL` telemetry hook also surfaces v2
+        pool stats.
+      - `Storage` grows a `from_pooled` constructor that
+        adopts a recycled (image, view, memory) triple +
+        inherits the pool entry's tracked `current_layout`
+        so the next op's barrier issues the correct
+        `old_layout`.
+      - `PlatformBackend::allocate_drawable_storage` tries
+        `pool.try_take(key)` before falling through to fresh
+        Vk allocate.
+      - `Storage::destroy` tries `pool.try_return(key, entry)`
+        before destroying handles; bucket-full / ineligible
+        falls through to synchronous destroy.
+      - `PlatformBackend::disable_output` calls `pool.drain()`
+        after `device_wait_idle` so recycled triples don't
+        leak across VkContext teardown.
+
+      1 new unit test
+      (`storage_from_pooled_inherits_layout_and_dims` —
+      pool-take inherits SHADER_READ_ONLY_OPTIMAL not the
+      fresh-alloc UNDEFINED). Pool-internal logic was already
+      tested in `kms::vk::pixmap_pool::tests` from v1.
+
+      240 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
+      green under lavapipe; clippy clean. Hardware smoke
+      gate: pool telemetry counters (`total_takes_hit`,
+      `total_takes_miss`) under MATE should show high hit
+      rate after 30 s of GTK churn — Stage 3f.5 will capture.
+
+      Out-of-scope: pool stats are not yet emitted on v2's
+      per-second telemetry line. `GLOBAL_LATEST_POOL` hook is
+      registered, so the existing v1 emitter sees them too;
+      a v2-side per-second emitter line is post-3f.5 polish.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
       capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**
