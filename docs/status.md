@@ -85,14 +85,57 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
   green: v1 unchanged, v2 boots through capability queries +
   logs gaps on first paint.
 
-### Pending
+### In progress
 
-- [ ] **Stage 2 — minimal-Vk correct baseline.** Whole vertical
-  slice in Vk: `PlatformBackend` real, `DrawableStore` real,
-  `RenderEngine` minimal (fill / copy / put_image), `SceneCompositor`
-  minimal (z-order blit, buffer-age clipped redraw with full-redraw
-  fallback). Synthetic acceptance (no real apps yet — Stage 2
-  doesn't paint text).
+- [~] **Stage 2 — minimal-Vk correct baseline.** Plan landed
+  2026-05-16 (`88d3f3d`) after three codex review rounds; six
+  substages 2a–2f. Cross-cutting concepts: two-sync-object model
+  (FenceTicket for CPU lifetime + per-ScanoutBo export semaphore
+  for KMS IN_FENCE_FD), image-layout state machine per drawable,
+  compose-after-paint via same-queue submit order + in-CB barrier
+  (zero `vkQueueWaitIdle` on hot path), v2-native RenderBatch
+  (not v1's PaintBatch), compose-read consumer tracking on
+  FenceTicket Rc.
+  - [x] **2a — PlatformBackend real.** Landed 2026-05-16
+    (`6f3f423`). Real DRM/Vk/libinput owner replaces the flat
+    field set from Stage 1b. FenceTicket + FencePool (recyclable
+    VkFence allocator), per-BO BoGenerationEntry tracking
+    (last_present_generation + content_invalidated) parallel to
+    ScanoutBoPool's BoState, ScanoutBoToken + PageFlipRetirement
+    + invalidate_bo + record_present + commit_bo_present hooks.
+    KmsBackendV2 delegates fb_dimensions/randr_outputs/take_input_ctx/
+    disable_output/poll_fds through it. Paint paths still log
+    gaps; v1 untouched. 11 v2 unit tests + 297 yserver tests green;
+    clippy clean.
+  - [x] **2b — DrawableStore real.** Landed 2026-05-16
+    (`4bda93d`). Real storage + lifetime + damage bookkeeping:
+    DrawableId/DrawableKind, Storage (Vk image + layout tracker),
+    RegionSet, Drawable with refcount + scene_participating + the
+    two damage lists per I5 + presentation_damage_epoch for
+    snapshot/ack + last_render_ticket for I6a retirement. allocate
+    / lookup / incref / decref → RetireDecision,
+    set_scene_participating (clears unpresented presentation
+    damage + bumps epoch per codex round 1 point 5), damage,
+    peek/ack_presentation_damage with the epoch-survival rule,
+    touch_render_fence, poll_pending_retire. Storage allocation
+    split from metadata so test fixtures (no VkContext) and
+    production paths flow uniform. 14 new unit tests; backend
+    wiring of allocation methods (create_pixmap etc.) lands
+    incrementally across Stages 2c–2d.
+  - [ ] **2c — RenderEngine minimal (fill / put_image / get_image).**
+    Three Vk paint ops via v2-native RenderBatch; offscreen
+    acceptance via CPU-oracle round-trip. Not yet started.
+  - [ ] **2d — copy_area + scene graph + blit pipeline.** First
+    visible composed scanout; full-redraw every tick (no buffer-
+    age yet).
+  - [ ] **2e — Buffer-age clipping + I6b retirement + failed-flip
+    recovery.** Output-level damage snapshot/ack;
+    transactional generation advance with separate 9a/9b paths.
+  - [ ] **2f — Telemetry + acceptance harness + hardware smoke.**
+    Counters wired per spec § "Required counters"; synthetic
+    acceptance binary; user-run hardware smoke on bee + fuji.
+
+### Pending
 - [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on
   the Vk substrate; text path. First stage where real-app smoke
   is meaningful. Specific counter gates per workload.
