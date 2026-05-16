@@ -392,6 +392,35 @@ yserver-mate mode="1024x768" log="trace":
 #
 # Closing xterm terminates the recipe; yserver is then SIGTERMed and
 # the DRM master is released cleanly.
+# Stage 2 v2 hardware smoke. The only DE-style stack mostly DOES
+# NOT work on v2 today because v2 has no RENDER/glyphs/fonts (those
+# are Stage 3) — mate-session, xfce-session, xfwm4 all abort
+# during their early open_font / render_create_picture calls. The
+# minimum smoke that v2 CAN currently produce on real hardware is
+# a screen-fill via `xsetroot -solid`, which only touches
+# set_container_background_pixel + ClearArea — pure Stage 2c/2d
+# path with no Stage 3 dependencies. Expect: screen visibly
+# flashes through the listed colors, telemetry shows
+# composite_submits matched 1:1 by frame_present_count,
+# vk_queue_wait_idle/s=0 holds, zero atomic commit failures
+# (with the bc6718a per-output flip-pending gate in place).
+yserver-v2-xsetroot-hw log="info":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+        YSERVER_RENDER_MODEL=v2 YSERVER_LOOP_TELEMETRY=1 \
+        target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 1; done;\
+        sleep 1;\
+        for c in red green blue yellow magenta cyan white black red green blue; do\
+            DISPLAY=:7 xsetroot -solid "$c";\
+            sleep 1;\
+        done;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log"'
+
 yserver-fvwm3-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
