@@ -818,6 +818,136 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       pointer events but dropping every keypress because xlib
       saw zero keysyms per code; v1's body ported verbatim
       (commit `6b0ffb6`).
+
+      *Post-3f.8 hardware smoke surfaced two follow-up bugs
+      that 3f.9 (below) fixes — the cursor trail and the
+      ENOMEM → DEVICE_LOST cascade. The bare-3f.8 cursor draw
+      is correct in isolation but unsound at scene level
+      without root storage; the buffer-age clipped/LOAD path
+      left prior cursor pixels in inter-window gaps, and the
+      failed-commit path was leaking pinned resources.*
+    - [x] **3f.9 — scene + commit recovery + root storage
+      landed 2026-05-16 (codex review/fix).** Three root-cause
+      fixes for the post-3f.8 hardware-smoke regressions, all
+      under the v2 spec's invariants:
+
+      - **Root storage promoted forward.** Spec §scene-
+        layering item 1 ("Root storage — always") was deferred
+        to Stage 4 in our stage plans but the cursor-trail
+        diagnosis proved the deferral was unsound under
+        buffer-age clipping. `KmsBackendV2::init_root_storage`
+        allocates a virtual-screen-extent BGRA8 drawable as
+        `DrawableKind::Root`, fills it with `bg_pixel`, and
+        marks it scene-participating. `build_scene` now
+        prepends a root-layer `CompositeDraw` at the bottom
+        of z before walking top-levels. `set_container_background_pixel`
+        / `set_container_background_pixmap` repaint root
+        storage via `engine.fill_rect` /
+        `engine.copy_area` instead of just mutating
+        `core.bg_pixel`. The cursor trail is gone because
+        there are no longer gap regions between scene draws —
+        root covers everything, so the buffer-age repaint
+        re-blits the area behind the prior cursor every tick.
+        Means 3f.6's "trail fix" via prior-rect damage was
+        the wrong layer; the right layer was the missing
+        scene-layering bottom entry.
+
+      - **`FenceTicket` false-positive leak detection.**
+        `FenceTicketInner::drop` previously checked only the
+        `signaled_cache` bool, which is set explicitly via
+        `poll_signaled`/`update_signaled` calls. Tickets that
+        dropped signaled-but-stale-cache logged
+        `FenceTicket: leaked unsignaled fence ... renderer_failed
+        will be set` and flipped `platform.renderer_failed =
+        true` — once that happens, every engine + scene op
+        returns `RendererFailed` and the screen freezes.
+        Fix: drop falls back to
+        `vk.device.get_fence_status(self.fence)` when the
+        cache says false, and updates the cache. This was the
+        proximate cause of the "screen freezes after a couple
+        minutes" symptom in the post-3f.8 logs.
+
+      - **Failed-atomic-commit BO recovery.** The pre-3f.9
+        recovery path did `bo.state = BoState::default()`
+        immediately after a failed flip — but the GPU had
+        already executed `queue_submit2` writing into that
+        BO. Next `acquire_scanout_bo` could hand back the
+        same BO for recording while GPU writes were still in
+        flight, and the OUT_FENCE_PTR (defensively set to
+        `-1`, but some drivers/kernels do write it alongside
+        an error) was never closed. Under RADV/bee this
+        accumulated sync_file fds in the kernel until
+        atomic-commit started returning ENOMEM, which the
+        prior recovery path then busy-looped retrying, which
+        eventually triggered the GPU context-lost
+        (`VK_ERROR_DEVICE_LOST`).
+        Fix:
+        - `record_compose_v2` takes a `signal_fence` (the
+          compose fence) + signals `gpu_submitted: &mut bool`
+          to the caller. Stops resetting BoState on failure.
+        - New `failed_submit_bos: VecDeque<FailedSubmitBo>`
+          per `OutputSceneState` parks each
+          (bo_idx, pool_slot, compose_ticket) so the BO + the
+          descriptor-pool slot survive the failed flip.
+        - New `retire_failed_submit_bos` polls each ticket
+          every tick; once signaled, calls the new
+          `platform.recycle_failed_submit_bo(output_idx, bo_idx)`
+          helper (which resets `BoState` properly) and
+          releases the pool slot.
+        - `next_submit_retry_at` adds a 100 ms commit-retry
+          back-off so we don't spin re-submitting in the
+          failure window (with `TODO(stage-5 perf)` note for
+          per-driver tuning).
+        - Defensive: closes `out_fence` if the kernel returns
+          one alongside the error.
+
+      Additional polish landed in the same diff:
+      - **`do_dump_scanout_v2`** (~150 LoC): real PPM
+        readback via Vk staging buffer + image-to-buffer
+        copy; was a `log_v2_gap` before. `yserver-v2-scanout-<n>-out<i>.ppm`
+        per dump.
+      - **`drain_page_flip_events`**: drains DRM events and
+        returns per-output indices; `on_page_flip_ready` only
+        ticks the outputs that actually flipped (was looping
+        over all outputs blindly).
+      - **`SceneCompositor::wake_for_damage`** (cheap dirty
+        bit) vs **`mark_scene_structure_dirty`** (full-output
+        rect) split — cursor motion + `mark_dirty` use the
+        cheap path; map/unmap/configure/restack/redirect/
+        root-background changes use the coarse path.
+      - **`add_projected_damage`** helper clips to output
+        extent before adding to `RegionSet` (was missing —
+        could push out-of-bounds rects into the scissor list).
+      - **Compose fence threading**: `PendingAck.ticket` was
+        `None` before. Now a real `FenceTicket` is stored and
+        `touch_render_fence` runs against every sampled
+        drawable so retire can't free them mid-compose. This
+        closes a latent I6a hole.
+      - **Telemetry additions**: `compose_cb_record_ns`,
+        `damage_pixels`, `scene_entries`,
+        `full_redraw_fallback`, `descriptor_allocations`,
+        `missed_pageflip`. Most listed as "Required counters"
+        in the spec's perf gates section but never wired.
+
+      239 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
+      green; clippy clean. Hardware smoke green per
+      user-report (cursor tracks, server no longer locks up).
+
+      Open follow-ups:
+      - **No unit tests for the failed-submit recovery
+        path** — `retire_failed_submit_bos`,
+        `recycle_failed_submit_bo`, the back-off gate all
+        landed without coverage. Hard to test without a
+        fault-injection harness, but a synthetic "atomic
+        commit fails N times" test would catch regressions.
+      - **100 ms back-off is hardcoded** with `TODO(stage-5
+        perf)` — should become a tunable + observable via
+        `commit_retry_backoff_ms` telemetry counter for
+        per-driver tuning.
+      - **`set_container_background_pixmap`** uses
+        `copy_area` which doesn't honour X11 bg_pixmap
+        tiling. v1-parity for now; proper tiling is a
+        follow-up.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
       capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**

@@ -1710,7 +1710,6 @@ pub fn write_list_properties_reply(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_device_event(
     out: &mut Vec<u8>,
     byte_order: ClientByteOrder,

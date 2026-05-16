@@ -49,7 +49,7 @@ use crate::{
             engine::{RenderEngine, decode_x11_pixel_bgra},
             platform::PlatformBackend,
             scene::SceneCompositor,
-            store::{DrawableKind, DrawableStore},
+            store::{DrawableKind, DrawableStore, Storage},
             telemetry::Telemetry,
         },
     },
@@ -176,6 +176,7 @@ impl KmsBackendV2 {
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
         };
+        b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
         // Best-effort — a failure logs + leaves the cursor invisible
         // (matches pre-3f.8 behaviour, no regression).
@@ -260,6 +261,7 @@ impl KmsBackendV2 {
         // scanout pool on the test fixture).
         base.engine = crate::kms::v2::engine::RenderEngine::new(&base.platform)
             .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: RenderEngine: {e:?}")))?;
+        base.init_root_storage();
         Ok(base)
     }
 
@@ -270,7 +272,7 @@ impl KmsBackendV2 {
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
-        Self {
+        let mut b = Self {
             core: KmsCore::for_tests(),
             platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
@@ -279,6 +281,61 @@ impl KmsBackendV2 {
             scene: SceneCompositor::stub(),
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
+        };
+        b.init_root_storage();
+        b
+    }
+
+    fn init_root_storage(&mut self) {
+        let root_xid = self.core.window_id;
+        if self.store.lookup(root_xid).is_some() {
+            return;
+        }
+        let width = self.platform.fb_w.max(1);
+        let height = self.platform.fb_h.max(1);
+        let storage = match self.platform.allocate_drawable_storage(width, height, 32) {
+            Ok(storage) => {
+                self.telemetry.record_storage_allocation();
+                self.telemetry.record_image_view_create();
+                storage
+            }
+            Err(e) => {
+                log::debug!("v2 init_root_storage: no Vk, using stub root storage: {e:?}");
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                    },
+                    PlatformBackend::format_for_depth(32),
+                )
+            }
+        };
+        let id = match self
+            .store
+            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("v2 init_root_storage: store.allocate failed: {e:?}");
+                return;
+            }
+        };
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        if let Err(e) = self.engine.fill_rect(
+            &mut self.store,
+            &mut self.platform,
+            id,
+            rect,
+            decode_x11_pixel_bgra(self.core.bg_pixel.unwrap_or(0x0050_5050)),
+        ) && self.platform.vk.is_some()
+        {
+            log::warn!("v2 init_root_storage: initial root fill failed: {e:?}");
         }
     }
 
@@ -359,6 +416,7 @@ impl KmsBackendV2 {
             &mut self.store,
             &mut self.platform,
             &self.windows_v2,
+            &mut self.telemetry,
         ) {
             Ok(_) => Ok(()),
             Err(e) => Err(io::Error::other(format!("v2 composite_and_flip: {e:?}"))),
@@ -652,11 +710,7 @@ impl KmsBackendV2 {
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;
-            // HW cursor parked in v2 per I7; mark the scene dirty so
-            // any pending paint races out on the next tick. Cursor
-            // scene blit is Stage 4 — until then this is effectively
-            // a no-op for visible pixels.
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
         }
         self.dispatch_motion_event(server_state);
     }
@@ -1475,6 +1529,167 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
     }
 }
 
+fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::kms::vk::{ops::run_one_shot_op, scanout::BoPhase};
+
+    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+        return Err(io::Error::other("no vulkan context"));
+    };
+    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+        return Err(io::Error::other("no ops command pool"));
+    };
+
+    let preferred = [
+        BoPhase::OnScreen,
+        BoPhase::Pending,
+        BoPhase::Submitted,
+        BoPhase::Recording,
+    ];
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    for (pool_idx, pool) in backend.platform.scanout_pools.iter().enumerate() {
+        let Some(pool) = pool.as_ref() else {
+            continue;
+        };
+        for phase in preferred {
+            if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == phase) {
+                chosen.push((pool_idx, bo_idx));
+                break;
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return Err(io::Error::other("no non-Free scanout bo found"));
+    }
+
+    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+    let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut wrote_any = false;
+    let mut last_err: Option<io::Error> = None;
+
+    for (pool_idx, bo_idx) in chosen {
+        let Some(pool) = backend
+            .platform
+            .scanout_pools
+            .get_mut(pool_idx)
+            .and_then(|p| p.as_mut())
+        else {
+            continue;
+        };
+        let Some(bo) = pool.bos.get_mut(bo_idx) else {
+            continue;
+        };
+        let width = bo.width;
+        let height = bo.height;
+        let pitch = bo.pitch;
+        let image = bo.vk_image;
+        let staging_buffer = bo.vk_transfer.staging_buffer;
+        let staging_mapped = bo.vk_transfer.staging_mapped;
+        let staging_size = bo.vk_transfer.staging_size;
+
+        let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+            let pre = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(ash::vk::ImageLayout::GENERAL)
+                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
+
+            let region = [ash::vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    ash::vk::ImageSubresourceLayers::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(ash::vk::Offset3D::default())
+                .image_extent(ash::vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            unsafe {
+                crate::vk_count!(cmd_copy_image_to_buffer);
+                vk.device.cmd_copy_image_to_buffer(
+                    cb,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging_buffer,
+                    &region,
+                );
+            }
+
+            let post = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+                .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(ash::vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
+            crate::vk_count!(cmd_pipeline_barrier2);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
+            Ok(())
+        });
+
+        if let Err(e) = run_result {
+            backend.platform.renderer_failed = true;
+            let err = io::Error::other(format!("scanout copy submit: {e:?}"));
+            log::warn!("v2 do_dump_scanout: output {pool_idx} failed: {err}");
+            last_err = Some(err);
+            continue;
+        }
+
+        let path = format!("./yserver-v2-scanout-{run}-out{pool_idx}.ppm");
+        let raw =
+            unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), staging_size as usize) };
+        use std::io::Write;
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
+        let mut row_buf = vec![0u8; (width * 3) as usize];
+        for y in 0..height as usize {
+            let row_start = y * pitch as usize;
+            for x in 0..width as usize {
+                let pi = row_start + x * 4;
+                let dst = x * 3;
+                row_buf[dst] = raw[pi + 2];
+                row_buf[dst + 1] = raw[pi + 1];
+                row_buf[dst + 2] = raw[pi];
+            }
+            file.write_all(&row_buf)?;
+        }
+        log::info!("v2 do_dump_scanout: wrote {path} ({width}x{height})");
+        wrote_any = true;
+    }
+
+    if wrote_any {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| io::Error::other("scanout dump failed")))
+    }
+}
+
 /// Map a host-visual descriptor to a depth for the storage
 /// allocator. Stage 2d picks BGRA32 for `CopyFromParent` (the
 /// default visual is depth-24 ARGB-equivalent in our advertised
@@ -1720,11 +1935,20 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
-        let n = self.platform.outputs.len();
-        for output_idx in 0..n {
-            self.scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform);
-            self.telemetry.record_frame_present();
+        let flipped = match self.platform.drain_page_flip_events() {
+            Ok(flipped) => flipped,
+            Err(e) => {
+                log::warn!("v2: drain_page_flip_events failed: {e}");
+                return;
+            }
+        };
+        for output_idx in flipped {
+            if self
+                .scene
+                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
+            {
+                self.telemetry.record_frame_present();
+            }
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
@@ -1733,11 +1957,10 @@ impl Backend for KmsBackendV2 {
     }
 
     fn mark_dirty(&mut self) {
-        // Bump the scene-structure dirty bit; the next
-        // `maybe_composite` will tick the compositor. Silent —
-        // mark_dirty fires on every protocol mutation, so log
-        // dedup would not help.
-        self.scene.mark_scene_structure_dirty();
+        // Wake the compositor without inventing full-output damage.
+        // Paint paths already record per-drawable presentation
+        // damage, and cursor motion is projected by build_scene.
+        self.scene.wake_for_damage();
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
@@ -1749,6 +1972,7 @@ impl Backend for KmsBackendV2 {
                 &mut self.store,
                 &mut self.platform,
                 &self.windows_v2,
+                &mut self.telemetry,
             ) {
                 Ok(composed) => {
                     for _ in 0..composed {
@@ -1768,7 +1992,9 @@ impl Backend for KmsBackendV2 {
     }
 
     fn dump_scanout(&mut self) {
-        self.log_v2_gap("dump_scanout");
+        if let Err(e) = do_dump_scanout_v2(self) {
+            log::warn!("v2 dump_scanout: {e}");
+        }
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -2252,11 +2478,29 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         pixel: u32,
     ) -> io::Result<()> {
-        // Bookkeeping mutation — store the request in KmsCore so a
-        // later v2 SceneCompositor can paint root with the right
-        // colour. No paint side-effect in Stage 1b.
         self.core.bg_pixel = Some(pixel);
         self.core.bg_pixmap = None;
+        if let Some(id) = self.store.lookup(self.core.window_id) {
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: u32::from(self.platform.fb_w.max(1)),
+                    height: u32::from(self.platform.fb_h.max(1)),
+                },
+            };
+            if let Err(e) = self.engine.fill_rect(
+                &mut self.store,
+                &mut self.platform,
+                id,
+                rect,
+                decode_x11_pixel_bgra(pixel),
+            ) {
+                log::warn!("v2 set_container_background_pixel: root fill failed: {e:?}");
+            } else {
+                self.telemetry.record_paint_submit();
+            }
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
@@ -2265,10 +2509,33 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        // Same shape as set_container_background_pixel. The handle
-        // is opaque to v2 today — Stage 2 wires real backing storage.
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
+        if let (Some(src), Some(dst)) = (
+            self.store.lookup(host_pixmap_xid),
+            self.store.lookup(self.core.window_id),
+        ) {
+            let src_extent = self.store.get(src).map(|d| d.storage.extent);
+            if let Some(extent) = src_extent {
+                match self.engine.copy_area(
+                    &mut self.store,
+                    &mut self.platform,
+                    src,
+                    dst,
+                    ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D::default(),
+                        extent,
+                    },
+                    ash::vk::Offset2D::default(),
+                ) {
+                    Ok(()) => self.telemetry.record_paint_submit(),
+                    Err(e) => {
+                        log::warn!("v2 set_container_background_pixmap: root copy failed: {e:?}");
+                    }
+                }
+            }
+        }
+        self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 

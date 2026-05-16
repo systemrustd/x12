@@ -323,38 +323,43 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
-- [ ] **v2 atomic-commit ENOMEM storm → VK_ERROR_DEVICE_LOST
-      cascade (bee, RADV, 2560×1440).** Hardware smoke
-      2026-05-16: after a minute or two of xterm interaction,
-      KMS atomic commits start returning ENOMEM
-      (`Cannot allocate memory (os error 12)`) in long bursts.
-      The v2 scene tick's 9b recovery path runs cleanly per
-      attempt — invalidates the BO, releases the descriptor-pool
-      slot, defers repaint — but new attempts keep firing each
-      tick and ENOMEM keeps coming. Eventually the GPU context
-      is lost (`radv/amdgpu: The CS has been cancelled because
-      the context is lost`, `vkQueueSubmit() failed
-      (VK_ERROR_DEVICE_LOST)`), an in-flight FenceTicket is
-      dropped unsignaled, `platform.renderer_failed` flips
-      true, and every subsequent paint + compose silently
-      drops. The screen freezes at the last successful frame
-      (cursor "disappears", windows stop updating, but the
-      process keeps running).
-      Hypotheses to chase: (a) KMS framebuffer-handle leak on
-      the failed-commit path — `invalidate_bo` doesn't release
-      the BO's `fb_id` handle, so each retry creates a fresh
-      one and exhausts kernel resources; (b) GEM/dmabuf
-      accumulation per failed commit; (c) some other resource
-      the v2 commit recovery path doesn't drain.
-      Diagnostic next steps: drmModeGetFB2 / drm-fbs sysfs to
-      see fb_id count over time during the storm; add an
-      `fb_id_create / fb_id_destroy` counter to v2 telemetry;
-      compare with v1's commit-recovery path which doesn't
-      exhibit this on the same hardware.
-      Not blocking 3f.5 — 3f.6/3f.7/3f.8 unlocked the visual
-      side. Tracked as its own perf/correctness item; likely
-      Stage-5 territory but may need a quick fb-handle-leak
-      patch sooner if it makes bee unusable.
+- [x] **v2 atomic-commit ENOMEM storm → VK_ERROR_DEVICE_LOST
+      cascade (bee, RADV, 2560×1440).** *Resolved 2026-05-16
+      via Stage 3f.9 (root-cause attribution turned out to be
+      different from the original guess).* The cascade had
+      two upstream causes, neither of which was the
+      conjectured fb_id leak:
+      1. **`FenceTicket` false-positive leak on drop.** The
+         pre-3f.9 drop path checked only `signaled_cache`,
+         which is set explicitly via `poll_signaled` /
+         `update_signaled` calls. Tickets that dropped
+         signaled-but-stale-cache logged "leaked unsignaled
+         fence" + flipped `renderer_failed = true`, freezing
+         compose. Fix: drop falls back to
+         `vk.device.get_fence_status(...)` when the cache
+         says false.
+      2. **Failed-atomic-commit BO state reset.** The
+         pre-3f.9 recovery did `bo.state =
+         BoState::default()` immediately after a failed
+         flip, but the GPU had already executed
+         `queue_submit2` writing into that BO. The next
+         `acquire_scanout_bo` could re-record into a still-
+         being-written BO; OUT_FENCE_PTR (defensively `-1`
+         but sometimes written by the kernel anyway) was
+         never closed. This accumulated sync_file fds in the
+         kernel until ENOMEM, which the prior recovery path
+         busy-looped retrying. Fix: park failed-submit BOs
+         in `OutputSceneState.failed_submit_bos` along with
+         the compose fence; `retire_failed_submit_bos` polls
+         each tick and calls
+         `platform.recycle_failed_submit_bo` once signaled.
+         Also adds a 100 ms commit-retry back-off so we
+         don't spin under driver pressure.
+      User-reported hardware smoke post-fix: cursor tracks
+      cleanly, server no longer locks up. Status.md §3f.9
+      has the full diff scope + open follow-ups (no unit
+      tests for the recovery path, back-off is hardcoded,
+      `set_container_background_pixmap` doesn't tile).
 
 - [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
       treat any arc as a full ellipse regardless of `angle1`/`angle2`.

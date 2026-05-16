@@ -64,6 +64,7 @@ use ash::vk;
 use super::{
     platform::{FenceTicket, PlatformBackend},
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
+    telemetry::Telemetry,
 };
 use crate::kms::{
     core::KmsCore,
@@ -102,6 +103,12 @@ struct PendingAck {
     submitted_output_damage: RegionSet,
     submitted_scene_structure_damage: RegionSet,
     submitted_failed_repaint: RegionSet,
+}
+
+struct FailedSubmitBo {
+    bo_idx: usize,
+    pool_slot: usize,
+    ticket: FenceTicket,
 }
 
 /// Ring of recent output-damage regions keyed by generation.
@@ -169,6 +176,11 @@ struct OutputSceneState {
     /// `pool_slots[i]`. Released to the ring on flip retirement.
     pool_slots: VecDeque<usize>,
     pending_acks: VecDeque<PendingAck>,
+    /// GPU-submitted frames whose atomic commit was rejected.
+    /// Keep both BO and descriptor-pool slot alive until the
+    /// compose fence signals, then recycle them locally because
+    /// no page-flip-complete will arrive for these frames.
+    failed_submit_bos: VecDeque<FailedSubmitBo>,
     /// Buffer-age damage history (Stage 2e).
     damage_history: BufferAgeRing,
     /// Monotonic per-output generation. Advances only on a
@@ -184,6 +196,10 @@ struct OutputSceneState {
     pending_repaint_after_failed_submit: RegionSet,
     /// Output extent — cached for full-output fallback regions.
     output_extent: vk::Extent2D,
+    /// Backoff after atomic-commit failures. Without this, a failed
+    /// commit can be retried once per core-loop iteration and flood
+    /// KMS/RADV until the GPU context is lost.
+    next_submit_retry_at: Option<std::time::Instant>,
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -231,6 +247,14 @@ pub(crate) struct CursorEntry {
     pub(crate) extent: vk::Extent2D,
     pub(crate) hot_x: i16,
     pub(crate) hot_y: i16,
+}
+
+struct SceneBuild {
+    scene: CompositeScene,
+    snapshots: Vec<DamageSnapshot>,
+    sampled_ids: Vec<super::store::DrawableId>,
+    projected_damage: RegionSet,
+    new_cursor_pos: Option<(i32, i32)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -281,6 +305,7 @@ impl SceneCompositor {
                 pool_ring: ring,
                 pool_slots: VecDeque::with_capacity(4),
                 pending_acks: VecDeque::with_capacity(4),
+                failed_submit_bos: VecDeque::with_capacity(4),
                 damage_history: BufferAgeRing::new(bo_depth + 1),
                 current_generation: 0,
                 scene_structure_damage: RegionSet::new(),
@@ -289,6 +314,7 @@ impl SceneCompositor {
                     width: u32::from(layout.width),
                     height: u32::from(layout.height),
                 },
+                next_submit_retry_at: None,
             });
         }
         Ok(Self {
@@ -331,11 +357,19 @@ impl SceneCompositor {
     }
 
     /// Mark the scene as needing a redraw. Cheap bool flip;
-    /// callable from any mutation path that wants the next
-    /// tick to fire. Idempotent. **Coarse**: adds a full-output
-    /// rect to every output's scene_structure_damage. Stage 3+
-    /// can call [`mark_scene_structure_damage_rect`] for
-    /// rectangle-precise tracking.
+    /// callable from any mutation path that wants the next tick
+    /// to inspect drawable/cursor damage. This deliberately does
+    /// NOT add output damage: protocol paint is already represented
+    /// by per-drawable presentation damage, and cursor motion is
+    /// projected by `build_scene`.
+    pub(crate) fn wake_for_damage(&mut self) {
+        self.scene_structure_dirty = true;
+    }
+
+    /// Mark scene structure as changed. This is the coarse fallback
+    /// for map/unmap/configure/restack/redirect/root-background
+    /// transitions where old/new visibility cannot yet be expressed
+    /// as a narrower rect.
     pub(crate) fn mark_scene_structure_dirty(&mut self) {
         self.scene_structure_dirty = true;
         if let Some(inner) = self.inner.as_mut() {
@@ -393,6 +427,7 @@ impl SceneCompositor {
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
         windows_v2: &super::backend::WindowsV2Map,
+        telemetry: &mut Telemetry,
     ) -> Result<usize, SceneError> {
         let Some(inner) = self.inner.as_mut() else {
             return Err(SceneError::NoVk);
@@ -403,7 +438,9 @@ impl SceneCompositor {
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
         for output_idx in 0..n_outputs {
-            match tick_one_output(inner, output_idx, core, store, platform, windows_v2) {
+            match tick_one_output(
+                inner, output_idx, core, store, platform, windows_v2, telemetry,
+            ) {
                 Ok(true) => composed += 1,
                 Ok(false) => {} // skipped (no BO / empty scene)
                 Err(e) => {
@@ -430,15 +467,15 @@ impl SceneCompositor {
         output_idx: usize,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-    ) {
+    ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
-            return;
+            return false;
         };
         let Some(retire) = platform.on_page_flip_complete(output_idx) else {
-            return;
+            return false;
         };
         let Some(state) = inner.outputs.get_mut(output_idx) else {
-            return;
+            return false;
         };
         if let Some(ack) = state.pending_acks.pop_front() {
             // Ack each per-drawable damage snapshot. Snapshots
@@ -472,11 +509,13 @@ impl SceneCompositor {
             // platform (the buffer-age pick uses this on next
             // acquire).
             platform.commit_bo_present(output_idx, retire.presented_bo_idx, ack.generation);
+            true
         } else {
             log::debug!(
                 "v2 scene: page-flip-complete on output {output_idx} \
                  with no pending ack — startup flush or spurious event",
             );
+            false
         }
     }
 }
@@ -485,6 +524,29 @@ impl SceneCompositor {
 // Per-output compose tick body
 // ────────────────────────────────────────────────────────────────
 
+fn retire_failed_submit_bos(
+    state: &mut OutputSceneState,
+    output_idx: usize,
+    platform: &mut PlatformBackend,
+    vk: &crate::kms::vk::device::VkContext,
+) {
+    let mut remaining = VecDeque::with_capacity(state.failed_submit_bos.len());
+    while let Some(failed) = state.failed_submit_bos.pop_front() {
+        if failed.ticket.poll_signaled(vk) {
+            platform.recycle_failed_submit_bo(output_idx, failed.bo_idx);
+            state.pool_ring.release(failed.pool_slot);
+            log::debug!(
+                "v2 scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
+                failed.bo_idx,
+                failed.pool_slot,
+            );
+        } else {
+            remaining.push_back(failed);
+        }
+    }
+    state.failed_submit_bos = remaining;
+}
+
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
@@ -492,6 +554,7 @@ fn tick_one_output(
     store: &mut DrawableStore,
     platform: &mut PlatformBackend,
     windows_v2: &super::backend::WindowsV2Map,
+    telemetry: &mut Telemetry,
 ) -> Result<bool, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -512,8 +575,15 @@ fn tick_one_output(
     //    `maybe_composite` calls us — wasted cycles bounded
     //    here.
     {
-        let s = inner.outputs.get(output_idx).expect("range");
+        let vk = Arc::clone(&inner.vk);
+        let s = inner.outputs.get_mut(output_idx).expect("range");
+        retire_failed_submit_bos(s, output_idx, platform, vk.as_ref());
         if !s.pending_acks.is_empty() {
+            return Ok(false);
+        }
+        if let Some(deadline) = s.next_submit_retry_at
+            && std::time::Instant::now() < deadline
+        {
             return Ok(false);
         }
     }
@@ -532,7 +602,7 @@ fn tick_one_output(
     };
 
     // 2. Build the scene + collect projected presentation damage.
-    let (scene, snapshots, projected_damage, new_cursor_pos) = build_scene(
+    let built = build_scene(
         core,
         store,
         windows_v2,
@@ -545,12 +615,16 @@ fn tick_one_output(
     // the next tick can damage it as the prior rect. Only update
     // when build_scene actually emitted a cursor draw (otherwise
     // the prev pos stays as-is and we'll re-damage it next time).
-    if let Some(p) = new_cursor_pos {
+    if let Some(p) = built.new_cursor_pos {
         inner.cursor_prev_pos = Some(p);
     }
-    let mut output_damage = projected_damage;
+    let mut output_damage = built.projected_damage;
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
+    telemetry.record_scene_entries(
+        u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX),
+        u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX),
+    );
 
     // 3. Empty-damage fast path (after first frame).
     if output_damage.is_empty() && !first_frame {
@@ -565,7 +639,7 @@ fn tick_one_output(
 
     // 5. Pick repaint region via buffer-age algorithm.
     let extent = inner.outputs[output_idx].output_extent;
-    let repaint = if scene.draws.is_empty() {
+    let repaint = if built.scene.draws.is_empty() {
         // Scene is just the bg_color clear (no top-levels, no
         // cursor, etc.). The Clipped/LOAD path would preserve
         // each BO's prior-generation content — including a
@@ -587,6 +661,21 @@ fn tick_one_output(
             extent,
         )
     };
+    match repaint {
+        Repaint::Full(extent) => {
+            telemetry.record_full_redraw_fallback();
+            telemetry.record_damage_pixels(
+                u64::from(extent.width) * u64::from(extent.height),
+                u64::from(extent.width) * u64::from(extent.height),
+            );
+        }
+        Repaint::Clipped(rect) => {
+            telemetry.record_damage_pixels(
+                u64::from(rect.extent.width) * u64::from(rect.extent.height),
+                u64::from(extent.width) * u64::from(extent.height),
+            );
+        }
+    }
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
@@ -602,6 +691,9 @@ fn tick_one_output(
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
     // 7. Record + submit + flip via the v2 clipped compose path.
+    let compose_ticket = platform
+        .acquire_fence_ticket()
+        .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -609,6 +701,8 @@ fn tick_one_output(
         .ok_or(SceneError::NoVk)?;
     let layout = &platform.outputs[output_idx];
     let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+    let mut gpu_submitted = false;
+    let record_start = std::time::Instant::now();
     let compose_result = record_compose_v2(
         &inner.vk,
         &platform.device,
@@ -616,19 +710,29 @@ fn tick_one_output(
         bo,
         &inner.pipeline,
         descriptor_pool,
-        &scene,
+        &built.scene,
         repaint,
+        compose_ticket.fence(),
+        &mut gpu_submitted,
     );
+    let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    telemetry.record_compose_cb_record_ns(record_ns);
+    telemetry
+        .record_descriptor_allocations(u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX));
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
         Ok(()) => {
+            state.next_submit_retry_at = None;
+            for id in &built.sampled_ids {
+                store.touch_render_fence(*id, compose_ticket.clone());
+            }
             state.pool_slots.push_back(slot);
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
-                drawable_snapshots: snapshots,
-                ticket: None,
+                drawable_snapshots: built.snapshots,
+                ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
                 submitted_scene_structure_damage: scene_structure_snap,
                 submitted_failed_repaint: failed_repaint_snap,
@@ -639,9 +743,15 @@ fn tick_one_output(
         Err(e) => {
             match &e {
                 PresentError::Io(_) => {
+                    if gpu_submitted {
+                        for id in &built.sampled_ids {
+                            store.touch_render_fence(*id, compose_ticket.clone());
+                        }
+                    }
                     // 9b — atomic commit failed after queue
                     // submit succeeded. BO contents indeterminate.
                     platform.invalidate_bo(output_idx, token.bo_idx);
+                    telemetry.record_missed_pageflip();
                     log::warn!(
                         "v2 scene: atomic commit failed for output {output_idx} \
                          (bo {}): {e}; BO invalidated",
@@ -657,16 +767,36 @@ fn tick_one_output(
                     );
                 }
             }
-            // Both failure paths share the same recovery: release
-            // the descriptor-pool slot, fold the repaint into
-            // pending_repaint_after_failed_submit, do NOT push a
-            // pending_ack, do NOT advance current_generation.
+            // Both failure paths fold repaint forward and do NOT
+            // push a pending_ack or advance current_generation.
+            // If the GPU submission happened, keep the scanout BO
+            // and descriptor-pool slot alive until the compose
+            // fence signals: KMS rejected the flip, so no page-flip
+            // event will retire those resources for us.
             // Re-borrow `state` after the platform.invalidate_bo
             // call (which took &mut platform).
             let state = inner.outputs.get_mut(output_idx).expect("range");
-            state.pool_ring.release(slot);
+            // TODO(stage-5 perf): the 100 ms commit-retry back-off is
+            // hardcoded. Empirically picked to be wide enough that
+            // RADV/amdgpu releases pinned resources between attempts
+            // (16 ms / one vblank was too tight under the ENOMEM
+            // storm). Should become a tunable + observable via
+            // telemetry (e.g. `commit_retry_backoff_ms` counter) so
+            // per-driver tuning is possible without code edits.
+            state.next_submit_retry_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
             if let Some(br) = output_damage.bounding_rect() {
                 state.pending_repaint_after_failed_submit.add(br);
+            }
+            if gpu_submitted {
+                state.failed_submit_bos.push_back(FailedSubmitBo {
+                    bo_idx: token.bo_idx,
+                    pool_slot: slot,
+                    ticket: compose_ticket,
+                });
+            } else {
+                state.pool_ring.release(slot);
+                platform.recycle_failed_submit_bo(output_idx, token.bo_idx);
             }
             Err(SceneError::Present(e))
         }
@@ -747,16 +877,8 @@ fn build_scene(
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
-) -> (
-    CompositeScene,
-    Vec<DamageSnapshot>,
-    RegionSet,
-    Option<(i32, i32)>,
-) {
-    let bg = core
-        .bg_pixel
-        .map(super::engine::decode_x11_pixel_bgra)
-        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+) -> SceneBuild {
+    let bg = [0.0, 0.0, 0.0, 1.0];
     let layout = &platform.outputs[output_idx];
     let layout_x0 = layout.x;
     let layout_y0 = layout.y;
@@ -765,7 +887,44 @@ fn build_scene(
 
     let mut draws: Vec<CompositeDraw> = Vec::new();
     let mut snapshots: Vec<DamageSnapshot> = Vec::new();
+    let mut sampled_ids: Vec<super::store::DrawableId> = Vec::new();
     let mut projected = RegionSet::new();
+    if let Some(id) = store.lookup(core.window_id)
+        && let Some(drawable) = store.get(id)
+        && drawable.scene_participating
+        && matches!(drawable.kind, DrawableKind::Root)
+        && drawable.storage.image_view != vk::ImageView::null()
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let dst_origin = [-(layout_x0 as f32), -(layout_y0 as f32)];
+        #[allow(clippy::cast_precision_loss)]
+        let dst_size = [
+            drawable.storage.extent.width as f32,
+            drawable.storage.extent.height as f32,
+        ];
+        draws.push(CompositeDraw {
+            image_view: drawable.storage.image_view,
+            dst_origin,
+            dst_size,
+            src_origin: [0.0, 0.0],
+            src_size: [1.0, 1.0],
+            alpha_passthrough: false,
+        });
+        sampled_ids.push(id);
+        if let Some(snap) = store.peek_presentation_damage(id) {
+            for r in snap.region.rects() {
+                add_projected_damage(
+                    &mut projected,
+                    *r,
+                    -layout_x0,
+                    -layout_y0,
+                    layout_w,
+                    layout_h,
+                );
+            }
+            snapshots.push(snap);
+        }
+    }
     for &top_xid in &core.top_level_order {
         emit_window_subtree(
             top_xid,
@@ -779,6 +938,7 @@ fn build_scene(
             layout_h,
             &mut draws,
             &mut snapshots,
+            &mut sampled_ids,
             &mut projected,
         );
     }
@@ -846,6 +1006,7 @@ fn build_scene(
                 src_size: [1.0, 1.0],
                 alpha_passthrough: true,
             });
+            sampled_ids.push(cur.id);
             // Damage the new cursor rect so the next tick covers it
             // even when no other draws contributed.
             add_cursor_damage(&mut projected, dx, dy);
@@ -857,7 +1018,13 @@ fn build_scene(
         bg_color: bg,
         draws,
     };
-    (scene, snapshots, projected, new_cursor_pos)
+    SceneBuild {
+        scene,
+        snapshots,
+        sampled_ids,
+        projected_damage: projected,
+        new_cursor_pos,
+    }
 }
 
 /// Stage 3f.6 recurse: emit a CompositeDraw entry for `host_xid` if
@@ -886,6 +1053,7 @@ fn emit_window_subtree(
     layout_h: u32,
     draws: &mut Vec<CompositeDraw>,
     snapshots: &mut Vec<DamageSnapshot>,
+    sampled_ids: &mut Vec<super::store::DrawableId>,
     projected: &mut RegionSet,
 ) {
     let Some(geom) = windows_v2.get(&host_xid) else {
@@ -929,15 +1097,10 @@ fn emit_window_subtree(
                 src_size: [1.0, 1.0],
                 alpha_passthrough: false,
             });
+            sampled_ids.push(id);
             if let Some(snap) = store.peek_presentation_damage(id) {
                 for r in snap.region.rects() {
-                    projected.add(vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: r.offset.x + dx,
-                            y: r.offset.y + dy,
-                        },
-                        extent: r.extent,
-                    });
+                    add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
                 }
                 snapshots.push(snap);
             }
@@ -959,10 +1122,51 @@ fn emit_window_subtree(
         .collect();
     for child_xid in children {
         emit_window_subtree(
-            child_xid, abs_x, abs_y, store, windows_v2, layout_x0, layout_y0, layout_w, layout_h,
-            draws, snapshots, projected,
+            child_xid,
+            abs_x,
+            abs_y,
+            store,
+            windows_v2,
+            layout_x0,
+            layout_y0,
+            layout_w,
+            layout_h,
+            draws,
+            snapshots,
+            sampled_ids,
+            projected,
         );
     }
+}
+
+fn add_projected_damage(
+    projected: &mut RegionSet,
+    src: vk::Rect2D,
+    dx: i32,
+    dy: i32,
+    layout_w: u32,
+    layout_h: u32,
+) {
+    let layout_w_i = i32::try_from(layout_w).unwrap_or(i32::MAX);
+    let layout_h_i = i32::try_from(layout_h).unwrap_or(i32::MAX);
+    let x0 = (src.offset.x + dx).max(0);
+    let y0 = (src.offset.y + dy).max(0);
+    let x1 = (src.offset.x + dx)
+        .saturating_add_unsigned(src.extent.width)
+        .min(layout_w_i);
+    let y1 = (src.offset.y + dy)
+        .saturating_add_unsigned(src.extent.height)
+        .min(layout_h_i);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    projected.add(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from(x1 - x0).unwrap_or(0),
+            height: u32::try_from(y1 - y0).unwrap_or(0),
+        },
+    });
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -987,6 +1191,8 @@ fn record_compose_v2(
     descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,
     repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
 ) -> Result<(), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -1044,8 +1250,9 @@ fn record_compose_v2(
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_compositor);
         vk.device
-            .queue_submit2(vk.graphics_queue, &submit, vk::Fence::null())?;
+            .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
     }
+    *gpu_submitted = true;
 
     // Export SYNC_FD + atomic flip — same as v1.
     let fd = bo
@@ -1070,7 +1277,15 @@ fn record_compose_v2(
                 // SAFETY: same fd we just inserted.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            bo.state = crate::kms::vk::scanout::BoState::default();
+            if out_fence >= 0 {
+                // Defensive: OUT_FENCE_PTR should only be written
+                // on a successful atomic commit, but close it if a
+                // driver/kernel ever returns one alongside an error.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
+            }
+            // Leave the BO non-free. The command buffer was already
+            // submitted, so the caller must hold this BO until the
+            // compose fence signals and then recycle it explicitly.
             Err(PresentError::Io(e))
         }
     }
@@ -1272,9 +1487,10 @@ mod tests {
         let core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let mut platform = PlatformBackend::for_tests();
+        let mut telemetry = Telemetry::new();
         let windows = super::super::backend::WindowsV2Map::new();
         let err = scene
-            .tick(&core, &mut store, &mut platform, &windows)
+            .tick(&core, &mut store, &mut platform, &windows, &mut telemetry)
             .expect_err("stub must reject tick");
         assert!(matches!(err, SceneError::NoVk));
     }
@@ -1483,8 +1699,8 @@ mod tests {
             true,
         );
 
-        let (scene, _snaps, _proj, _new_cursor) =
-            build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
+        let built = build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
+        let scene = built.scene;
         assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
 
         // Top-level at output (50, 60) since output layout origin is (0,0).
@@ -1539,8 +1755,7 @@ mod tests {
             true, /* child IS mapped, but parent isn't */
         );
 
-        let (scene, _snaps, _proj, _new_cursor) =
-            build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
+        let scene = build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None).scene;
         assert!(
             scene.draws.is_empty(),
             "unmapped parent must short-circuit subtree (got {} draws)",
@@ -1597,7 +1812,7 @@ mod tests {
             hot_y: 0,
         };
 
-        let (scene, _snaps, _proj, _new_cursor) = build_scene(
+        let scene = build_scene(
             &core,
             &mut store,
             &windows_v2,
@@ -1605,7 +1820,8 @@ mod tests {
             &platform,
             Some(cursor),
             None,
-        );
+        )
+        .scene;
         // 1 top-level + 1 cursor = 2.
         assert_eq!(scene.draws.len(), 2);
         let cursor_draw = scene.draws.last().expect("cursor draw");

@@ -99,9 +99,9 @@ pub struct CompositorPipeline {
     /// draws bind this until L1 task A.16 flips the dial to
     /// alpha-pass-through.
     pub pipeline_opaque: vk::Pipeline,
-    /// Alpha-pass-through variant (`SRC_ALPHA_MODE = 1`). Cursor
-    /// + alpha-pixmap draws bind this today; window-mirror draws
-    /// switch to it post-A.16.
+    /// Alpha-pass-through variant (`SRC_ALPHA_MODE = 1`). Cursor +
+    /// alpha-pixmap draws bind this today; window-mirror draws switch
+    /// to it post-A.16.
     pub pipeline_passthrough: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,

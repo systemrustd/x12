@@ -1,11 +1,11 @@
 //! `DrawableStore` — drawable storage + lifetime + damage.
 //!
-//! Per rendering-model-v2 spec § "DrawableStore — drawable storage
-//! + lifetime" and Stage 2 plan substage 2b. Owns every drawable's
+//! Per rendering-model-v2 spec § "DrawableStore — drawable storage +
+//! lifetime" and Stage 2 plan substage 2b. Owns every drawable's
 //! storage handle, refcount, retirement-generation against I6a
-//! [`FenceTicket`]s, image-layout state, and the **two damage
-//! lists** per I5 (presentation damage with snapshot/ack
-//! semantics + protocol damage for the DAMAGE extension).
+//! [`FenceTicket`]s, image-layout state, and the **two damage lists**
+//! per I5 (presentation damage with snapshot/ack semantics + protocol
+//! damage for the DAMAGE extension).
 //!
 //! Stage 2b lands the structure + tests. KmsBackendV2 wires a
 //! handful of allocation paths through; full wiring (every

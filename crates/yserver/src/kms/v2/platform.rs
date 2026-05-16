@@ -54,7 +54,7 @@ use crate::{
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
-            scanout::{BoPhase, ScanoutBoPool},
+            scanout::{BoPhase, BoState, ScanoutBoPool},
         },
     },
 };
@@ -168,7 +168,19 @@ impl Drop for FenceTicketInner {
             log::error!("FenceTicketInner::drop: fence-pool mutex poisoned");
             return;
         };
-        if self.signaled_cache.load(Ordering::Acquire) {
+        let signaled = self.signaled_cache.load(Ordering::Acquire)
+            || match unsafe { pool.vk.device.get_fence_status(self.fence) } {
+                Ok(true) => {
+                    self.signaled_cache.store(true, Ordering::Release);
+                    true
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    log::warn!("FenceTicketInner::drop: get_fence_status: {e:?}");
+                    false
+                }
+            };
+        if signaled {
             pool.recycle(self.fence);
         } else {
             // Unsignaled drop: per the spec, recycling here
@@ -558,6 +570,23 @@ impl PlatformBackend {
         fds
     }
 
+    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<usize>> {
+        use ::drm::control::crtc;
+
+        let mut flipped: Vec<crtc::Handle> = Vec::new();
+        crate::drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
+
+        let mut output_indices = Vec::with_capacity(flipped.len());
+        for crtc in flipped {
+            let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
+                log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
+                continue;
+            };
+            output_indices.push(output_idx);
+        }
+        Ok(output_indices)
+    }
+
     /// VkContext accessor for the engine. Returns `None` on the
     /// test fixture (`for_tests`) where Vk init is skipped.
     pub(crate) fn vk(&self) -> Option<&Arc<VkContext>> {
@@ -793,6 +822,23 @@ impl PlatformBackend {
         }
     }
 
+    /// Recycle a scanout BO whose GPU work was submitted but whose
+    /// atomic commit was rejected. The caller must only invoke this
+    /// after the compose fence has signaled, otherwise the BO could
+    /// be rendered into again while the previous command buffer is
+    /// still writing it.
+    pub(crate) fn recycle_failed_submit_bo(&mut self, output_idx: usize, bo_idx: usize) {
+        let Some(bo) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .and_then(|pool| pool.bos.get_mut(bo_idx))
+        else {
+            return;
+        };
+        bo.state = BoState::default();
+    }
+
     /// Called by the SceneCompositor's tick after `present_scanout`
     /// returns Ok. Records that `bo_idx` is now pending the next
     /// page-flip-complete event for `output_idx`, and assigns the
@@ -871,6 +917,8 @@ impl PlatformBackend {
             .unwrap_or(true);
         if !logged_first {
             log::info!("v2: first pageflip complete on output {output_idx} (bo {presented})",);
+        } else {
+            log::debug!("v2: pageflip complete on output {output_idx} (bo {presented})",);
         }
         Some(PageFlipRetirement {
             retired_bo_idx: retired,
