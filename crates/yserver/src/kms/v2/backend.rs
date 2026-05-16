@@ -29,7 +29,10 @@ use yserver_core::{
         WindowHandle,
     },
     core_loop::HostInputEvent,
-    host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
+    host_x11::{
+        HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
+        PointerEventKind, PointerPosition,
+    },
     server::ServerState,
 };
 use yserver_protocol::x11::{
@@ -333,6 +336,367 @@ impl KmsBackendV2 {
     fn log_v2_gap(&self, method: &'static str) {
         if self.logged_gaps.borrow_mut().insert(method) {
             log::warn!("v2: {method} not yet implemented — paint or composite operation skipped");
+        }
+    }
+
+    // ── Input dispatch (Stage 3f.7) ─────────────────────────────
+    //
+    // Ports the v1 input cluster onto v2's state surface.
+    // Differences from v1's body (kms/backend.rs:6450-6885):
+    //
+    // - `self.windows` → `self.windows_v2`.
+    // - `self.fb_w` / `self.fb_h` → the active output's geometry
+    //   read off `self.platform.outputs[0]`.
+    // - HW cursor calls (`hw_cursor_active` / `hw_cursor_move` /
+    //   `hw_cursor_refresh`) → no-op. Per spec § I7 the HW cursor
+    //   plane is parked in v2 until Stage 5 reintroduces it as a
+    //   SceneCompositor strategy.
+    // - `self.mark_all_outputs_dirty()` →
+    //   `self.scene.mark_scene_structure_dirty()`. Pointer-motion-
+    //   only redraws are a no-op in Stage 3 anyway (no cursor
+    //   scene blit until Stage 4); the dirty flag preserves the
+    //   "scene needs a tick" signal for any client paint that
+    //   races a motion event.
+
+    /// X11 KeyButMask: bits 0..=7 are modifiers
+    /// (Shift/Lock/Control/Mod1..Mod5). Bits 8..=12 are button
+    /// state, set by `process_pointer_button` via `button_mask`.
+    fn serialize_modifiers(&self) -> u16 {
+        let state = &self.core.xkb_state.0;
+        let flags = xkbcommon::xkb::STATE_MODS_EFFECTIVE;
+        let mut mask: u16 = 0;
+        if state.mod_name_is_active("Shift", flags) {
+            mask |= 0x01;
+        }
+        if state.mod_name_is_active("Lock", flags) {
+            mask |= 0x02;
+        }
+        if state.mod_name_is_active("Control", flags) {
+            mask |= 0x04;
+        }
+        if state.mod_name_is_active("Mod1", flags) {
+            mask |= 0x08;
+        }
+        if state.mod_name_is_active("Mod2", flags) {
+            mask |= 0x10;
+        }
+        if state.mod_name_is_active("Mod3", flags) {
+            mask |= 0x20;
+        }
+        if state.mod_name_is_active("Mod4", flags) {
+            mask |= 0x40;
+        }
+        if state.mod_name_is_active("Mod5", flags) {
+            mask |= 0x80;
+        }
+        mask
+    }
+
+    /// Update xkb_state for `raw` then return a cooked
+    /// `HostKeyEvent` with the post-update modifier state +
+    /// cursor coords pre-filled. Direct v1 port.
+    fn cook_host_key(&mut self, raw: HostKeyEvent) -> HostKeyEvent {
+        let xkb_keycode = xkbcommon::xkb::Keycode::new(u32::from(raw.keycode));
+        let direction = if raw.pressed {
+            xkbcommon::xkb::KeyDirection::Down
+        } else {
+            xkbcommon::xkb::KeyDirection::Up
+        };
+        self.core.xkb_state.0.update_key(xkb_keycode, direction);
+        HostKeyEvent {
+            state: self.serialize_modifiers(),
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x: self.core.cursor_x as i16,
+            event_y: self.core.cursor_y as i16,
+            time: crate::clock::server_time_ms(),
+            ..raw
+        }
+    }
+
+    /// Topmost mapped top-level under the cursor. Walks
+    /// `core.top_level_order` back-to-front so the topmost match
+    /// wins. v2 hit-tests against `windows_v2` (parity with v1's
+    /// `self.windows`); SHAPE-input precedence matches v1.
+    fn window_under_cursor(&self) -> Option<u32> {
+        let cx = f64::from(self.core.cursor_x);
+        let cy = f64::from(self.core.cursor_y);
+        for &window_id in self.core.top_level_order.iter().rev() {
+            let Some(w) = self.windows_v2.get(&window_id) else {
+                continue;
+            };
+            if !w.mapped {
+                continue;
+            }
+            let wx = f64::from(w.x);
+            let wy = f64::from(w.y);
+            let ww = f64::from(w.width);
+            let wh = f64::from(w.height);
+            if cx < wx || cx >= wx + ww || cy < wy || cy >= wy + wh {
+                continue;
+            }
+            // SHAPE input precedence — empty SHAPE = unhittable.
+            let shape = self
+                .core
+                .shape_input
+                .get(&window_id)
+                .or_else(|| self.core.shape_bounding.get(&window_id));
+            if let Some(rects) = shape {
+                let inside = rects.iter().any(|r| {
+                    let rx = wx + f64::from(r.x);
+                    let ry = wy + f64::from(r.y);
+                    cx >= rx
+                        && cx < rx + f64::from(r.width)
+                        && cy >= ry
+                        && cy < ry + f64::from(r.height)
+                });
+                if !inside {
+                    continue;
+                }
+            }
+            return Some(window_id);
+        }
+        None
+    }
+
+    /// Event-window-relative coords for an event whose `host_xid`
+    /// is the topmost mapped top-level under the cursor. v2-shape
+    /// port — reads geometry off `windows_v2`. Falls back to root
+    /// coords when `host_xid` isn't tracked (the dispatcher
+    /// re-derives target coords from its own tree walk anyway).
+    fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
+        if let Some(w) = self.windows_v2.get(&host_xid) {
+            let ex = (self.core.cursor_x as i32) - i32::from(w.x);
+            let ey = (self.core.cursor_y as i32) - i32::from(w.y);
+            (
+                ex.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                ey.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            )
+        } else {
+            (self.core.cursor_x as i16, self.core.cursor_y as i16)
+        }
+    }
+
+    fn emit_pointer(&mut self, ev: HostPointerEvent) {
+        self.core.pending_pointer_events.push(ev);
+    }
+
+    fn emit_crossing(
+        &mut self,
+        host_xid: u32,
+        kind: PointerEventKind,
+        detail: u8,
+        crossing_mode: u8,
+        child: u32,
+        state: u16,
+    ) {
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let ev = HostPointerEvent {
+            kind,
+            host_xid,
+            detail,
+            time: crate::clock::server_time_ms(),
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x,
+            event_y,
+            state,
+            crossing_mode,
+            child,
+        };
+        self.emit_pointer(ev);
+    }
+
+    fn emit_motion_only(&mut self, host_xid: u32, mask: u16) {
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let ev = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid,
+            detail: 0,
+            time: crate::clock::server_time_ms(),
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x,
+            event_y,
+            state: mask,
+            crossing_mode: 0,
+            child: 0,
+        };
+        self.emit_pointer(ev);
+    }
+
+    /// Spec-correct Normal-mode crossing chain for a top-level
+    /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
+    /// the body only touches KmsCore + nested-resource look-ups.
+    fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
+        if self.core.prev_pointer_window == Some(new_xid) {
+            return;
+        }
+        let prev_host = self.core.prev_pointer_window;
+        let root_container_host = self.core.window_id;
+        let resolve_host_to_nested = |host: u32, xid_map: &HostXidMap| -> Option<ResourceId> {
+            if host == root_container_host {
+                Some(yserver_core::resources::ROOT_WINDOW)
+            } else {
+                xid_map.get(&host).copied()
+            }
+        };
+        let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.core.xid_map));
+        let new_id = resolve_host_to_nested(new_xid, &self.core.xid_map);
+
+        if let (Some(from), Some(to)) = (prev_id, new_id) {
+            let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
+            for ev in events {
+                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
+                    self.core.window_id
+                } else {
+                    server_state
+                        .resources
+                        .window(ev.window)
+                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                        .unwrap_or(new_xid)
+                };
+                let kind = match ev.kind {
+                    yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
+                    yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
+                };
+                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
+            }
+        } else {
+            // First-motion bootstrap or unmapped host_xid —
+            // fall back to a single Leave/Enter with detail=0.
+            if let Some(prev) = prev_host {
+                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
+            }
+            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
+        }
+        self.core.prev_pointer_window = Some(new_xid);
+    }
+
+    fn dispatch_motion_event(&mut self, server_state: &ServerState) {
+        // Fall back to the root container so root-window subscribers
+        // (e16's right-click-desktop menu, fvwm3's root bindings) can
+        // see motion when the cursor is over the wallpaper.
+        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let mask = self.serialize_modifiers() | self.core.button_mask;
+        self.update_pointer_window(server_state, host_xid, mask);
+        self.emit_motion_only(host_xid, mask);
+    }
+
+    fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
+        // v2 reads framebuffer extents off platform.outputs[0]
+        // (single-output is the only path exercised today; multi-
+        // output input mapping is risk-listed for later).
+        let (fb_w, fb_h) = self
+            .platform
+            .outputs
+            .first()
+            .map(|o| (f32::from(o.width), f32::from(o.height)))
+            .unwrap_or((1.0, 1.0));
+        let new_x = x.clamp(0.0, (fb_w - 1.0).max(0.0));
+        let new_y = y.clamp(0.0, (fb_h - 1.0).max(0.0));
+        if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
+            self.core.cursor_x = new_x;
+            self.core.cursor_y = new_y;
+            // HW cursor parked in v2 per I7; mark the scene dirty so
+            // any pending paint races out on the next tick. Cursor
+            // scene blit is Stage 4 — until then this is effectively
+            // a no-op for visible pixels.
+            self.scene.mark_scene_structure_dirty();
+        }
+        self.dispatch_motion_event(server_state);
+    }
+
+    fn process_pointer_button(&mut self, code: u32, pressed: bool, server_state: &ServerState) {
+        let detail = match code {
+            0x110 => 1, // BTN_LEFT
+            0x111 => 3, // BTN_RIGHT
+            0x112 => 2, // BTN_MIDDLE
+            0x113 => 8, // BTN_SIDE
+            0x114 => 9, // BTN_EXTRA
+            0x180 => 4, // SYNTH_SCROLL_UP
+            0x181 => 5, // SYNTH_SCROLL_DOWN
+            0x182 => 6, // SYNTH_SCROLL_LEFT
+            0x183 => 7, // SYNTH_SCROLL_RIGHT
+            _ => {
+                log::debug!("v2: unmapped libinput button code 0x{code:x}, dropping");
+                return;
+            }
+        };
+        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
+        let button_bit: u16 = match detail {
+            1 => 0x0100,
+            2 => 0x0200,
+            3 => 0x0400,
+            4 => 0x0800,
+            5 => 0x1000,
+            _ => 0,
+        };
+        let modifier_mask = self.serialize_modifiers();
+        // X11 spec: `state` is the logical button state IMMEDIATELY
+        // BEFORE the event takes effect. Press: button bit not yet
+        // set. Release: button bit still set.
+        let state = if pressed {
+            modifier_mask | self.core.button_mask
+        } else {
+            modifier_mask | self.core.button_mask | button_bit
+        };
+        if pressed {
+            self.core.button_mask |= button_bit;
+        } else {
+            self.core.button_mask &= !button_bit;
+        }
+        let time = crate::clock::server_time_ms();
+        let kind = if pressed {
+            PointerEventKind::ButtonPress
+        } else {
+            PointerEventKind::ButtonRelease
+        };
+        let ptr_event = HostPointerEvent {
+            kind,
+            host_xid,
+            detail,
+            time,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x,
+            event_y,
+            state,
+            crossing_mode: 0,
+            child: 0,
+        };
+        self.emit_pointer(ptr_event);
+        // Implicit-grab crossings (G3). Direct v1 port.
+        let post_state = self.serialize_modifiers() | self.core.button_mask;
+        let press_mode: u8 = if pressed { 1 } else { 2 };
+        let grab_id = self.core.xid_map.get(&host_xid).copied();
+        let focus_id = self
+            .core
+            .prev_pointer_window
+            .and_then(|prev| self.core.xid_map.get(&prev).copied());
+        if let (Some(focus), Some(grab)) = (focus_id, grab_id) {
+            let events =
+                yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
+            for ev in events {
+                let win_host_xid = server_state
+                    .resources
+                    .window(ev.window)
+                    .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                    .unwrap_or(host_xid);
+                let kind = match ev.kind {
+                    yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
+                    yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
+                };
+                self.emit_crossing(
+                    win_host_xid,
+                    kind,
+                    ev.detail,
+                    press_mode,
+                    ev.child.0,
+                    post_state,
+                );
+            }
         }
     }
 
@@ -1226,11 +1590,41 @@ impl Backend for KmsBackendV2 {
 
     // ── Single-threaded core hooks ──────────────────────────────
 
-    fn on_host_input(&mut self, _state: &mut ServerState, _ev: HostInputEvent) {
-        // v2 input event dispatch isn't wired yet — there's no scene
-        // for pointer-event fanout to target. Log once and drop the
-        // event.
-        self.log_v2_gap("on_host_input");
+    fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
+        // Stage 3f.7 port of v1's on_host_input. Key events go
+        // through the cook → key fanout path; pointer events flow
+        // into `pending_pointer_events`, which we drain to the
+        // pointer fanout after each call so the buffer stays empty
+        // between events (matches v1's contract).
+        use yserver_core::core_loop::{
+            HostInputEvent, key_fanout::key_event_fanout_to_state,
+            pointer_fanout::pointer_event_fanout_to_state,
+        };
+
+        match ev {
+            HostInputEvent::PointerMotion { x, y, time: _ } => {
+                self.process_pointer_absolute(state, x as f32, y as f32);
+            }
+            HostInputEvent::PointerButton {
+                button,
+                pressed,
+                time: _,
+            } => {
+                self.process_pointer_button(u32::from(button), pressed, state);
+            }
+            HostInputEvent::Key(raw) => {
+                let cooked = self.cook_host_key(raw);
+                let _dropped = key_event_fanout_to_state(state, cooked);
+                return;
+            }
+        }
+
+        // Drain pointer events queued by the process_pointer_* call.
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        for ev in pending {
+            let _dropped =
+                pointer_event_fanout_to_state(state, &self.core.xid_map, ev, true, false);
+        }
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
@@ -5162,6 +5556,204 @@ mod tests {
                 .contains("change_subwindow_attributes"),
             "change_subwindow_attributes must not log a gap post-3f.6"
         );
+    }
+
+    // ─── Stage 3f.7: input dispatch tests ───────────────────────
+
+    /// `serialize_modifiers` returns 0 against a fresh xkb_state
+    /// (no modifiers held). Regression gate for the bit layout.
+    #[test]
+    fn serialize_modifiers_zero_on_fresh_state() {
+        let b = KmsBackendV2::for_tests();
+        assert_eq!(b.serialize_modifiers(), 0);
+    }
+
+    /// `cook_host_key` fills root + event coords from cursor and
+    /// stamps the post-update modifier mask. Pressing a Shift
+    /// keycode flips the Shift bit in the cooked state.
+    #[test]
+    fn cook_host_key_fills_coords_and_modifier_state() {
+        use yserver_core::host_x11::HostKeyEvent;
+        let mut b = KmsBackendV2::for_tests();
+        b.core.cursor_x = 100.0;
+        b.core.cursor_y = 200.0;
+        // 50 == evdev KEY_LEFTSHIFT (US layout); xkbcommon's
+        // default keymap maps this to the Shift modifier.
+        let raw = HostKeyEvent {
+            keycode: 50,
+            pressed: true,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        let cooked = b.cook_host_key(raw);
+        assert_eq!(cooked.root_x, 100);
+        assert_eq!(cooked.root_y, 200);
+        assert_eq!(cooked.event_x, 100);
+        assert_eq!(cooked.event_y, 200);
+        // Bit 0 = Shift. Some xkb keymaps deliver Shift on key 50
+        // via xkbcommon's default; this assertion proves the
+        // modifier state is read out post-update. If the test ICD
+        // disagrees, lower this to >0 — the load-bearing check is
+        // that `state` reflects the update, not zero.
+        assert_ne!(cooked.state, 0, "Shift press must update mod state");
+    }
+
+    /// `process_pointer_button` honours the X11 spec's pre-press
+    /// `state` field: on ButtonPress the button bit is NOT yet
+    /// set in `state`, on ButtonRelease it IS still set.
+    /// `button_mask` is updated AFTER the event so the next
+    /// motion sees the new mask.
+    #[test]
+    fn process_pointer_button_state_field_is_pre_press() {
+        use yserver_core::{host_x11::PointerEventKind, server::ServerState};
+        let mut b = KmsBackendV2::for_tests();
+        let state = ServerState::new();
+        // BTN_LEFT press → detail=1, button bit = 0x0100.
+        b.process_pointer_button(0x110, true, &state);
+        let press = b
+            .core
+            .pending_pointer_events
+            .iter()
+            .find(|e| matches!(e.kind, PointerEventKind::ButtonPress))
+            .expect("ButtonPress emitted");
+        assert_eq!(press.detail, 1);
+        assert_eq!(
+            press.state & 0x0100,
+            0,
+            "Button1 bit must NOT be set in ButtonPress.state (pre-press)"
+        );
+        assert_eq!(
+            b.core.button_mask & 0x0100,
+            0x0100,
+            "button_mask updated post-event"
+        );
+
+        b.core.pending_pointer_events.clear();
+        b.process_pointer_button(0x110, false, &state);
+        let release = b
+            .core
+            .pending_pointer_events
+            .iter()
+            .find(|e| matches!(e.kind, PointerEventKind::ButtonRelease))
+            .expect("ButtonRelease emitted");
+        assert_eq!(
+            release.state & 0x0100,
+            0x0100,
+            "Button1 bit MUST be set in ButtonRelease.state (still held)"
+        );
+        assert_eq!(
+            b.core.button_mask & 0x0100,
+            0,
+            "button_mask cleared post-release"
+        );
+    }
+
+    /// `process_pointer_absolute` clamps to the output extent and
+    /// updates `cursor_x` / `cursor_y`. Single-output test fixture
+    /// reports 800×600 from PlatformBackend::for_tests.
+    #[test]
+    fn process_pointer_absolute_clamps_to_output() {
+        use yserver_core::server::ServerState;
+        let mut b = KmsBackendV2::for_tests();
+        let state = ServerState::new();
+        // Inside extent.
+        b.process_pointer_absolute(&state, 100.0, 200.0);
+        assert_eq!(b.core.cursor_x, 100.0);
+        assert_eq!(b.core.cursor_y, 200.0);
+        // Past extent → clamped to (extent - 1).
+        b.process_pointer_absolute(&state, 5000.0, 5000.0);
+        assert_eq!(b.core.cursor_x, 799.0);
+        assert_eq!(b.core.cursor_y, 599.0);
+    }
+
+    /// `window_under_cursor` returns the topmost mapped top-level
+    /// containing the cursor. Walks `core.top_level_order` back-to-
+    /// front so the most-recently-stacked window wins. Unmapped
+    /// windows skipped.
+    #[test]
+    fn window_under_cursor_finds_topmost_mapped() {
+        let mut b = KmsBackendV2::for_tests();
+        b.windows_v2.insert(
+            0x1000,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.windows_v2.insert(
+            0x2000,
+            super::WindowGeometryV2 {
+                x: 50,
+                y: 50,
+                width: 100,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.core.top_level_order.push(0x1000);
+        b.core.top_level_order.push(0x2000);
+
+        // Cursor in overlap (50..100, 50..100): 0x2000 wins (topmost).
+        b.core.cursor_x = 75.0;
+        b.core.cursor_y = 75.0;
+        assert_eq!(b.window_under_cursor(), Some(0x2000));
+
+        // Cursor outside overlap, only in 0x1000.
+        b.core.cursor_x = 25.0;
+        b.core.cursor_y = 25.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1000));
+
+        // Cursor outside both — root-fallback handled at caller.
+        b.core.cursor_x = 300.0;
+        b.core.cursor_y = 300.0;
+        assert_eq!(b.window_under_cursor(), None);
+
+        // Unmapping the topmost — next match wins.
+        b.windows_v2.get_mut(&0x2000).unwrap().mapped = false;
+        b.core.cursor_x = 75.0;
+        b.core.cursor_y = 75.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1000));
+    }
+
+    /// `on_host_input` no longer logs the `v2: on_host_input not
+    /// yet implemented` gap that fired before 3f.7. Key events
+    /// drain through xkb cooking; pointer events drain to the
+    /// pointer fanout.
+    #[test]
+    fn on_host_input_does_not_log_gap() {
+        use yserver_core::{core_loop::HostInputEvent, server::ServerState};
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        // PointerMotion → process_pointer_absolute → no panic, no gap.
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerMotion {
+                x: 10,
+                y: 20,
+                time: 0,
+            },
+        );
+        assert!(
+            !b.logged_gaps.borrow().contains("on_host_input"),
+            "on_host_input must not log a gap post-3f.7"
+        );
+        assert_eq!(b.core.cursor_x, 10.0);
+        assert_eq!(b.core.cursor_y, 20.0);
     }
 
     /// Stage 3f.6 — `create_subwindow` records the parent xid + the

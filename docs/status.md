@@ -741,35 +741,49 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       232 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
       green under lavapipe. Hardware smoke (xterm under no-WM,
       xclock) pending — runs at 3f.5.
-    - [ ] **3f.7 — input dispatch.** *Stage 3 close blocker,
-      found 2026-05-16 during xterm hardware smoke.* v2 logs
-      `on_host_input not yet implemented` on first libinput
-      event; the libinput→client-event-queue routing has never
-      been assigned to a v2 substage (the spec mentions input
-      as a `PlatformBackend` primitive only; not in 2/3/4/5
-      checklists). Realistically belongs in Stage 2 (substrate)
-      but landed here because it surfaced now. Scope:
-      - Port `on_host_input` (~38 LoC), `cook_host_key`
-        (~17 LoC), `process_pointer_absolute` (~38 LoC),
-        `process_pointer_button` (~152 LoC) verbatim from v1
-        (`backend.rs:6494-6885`, `:8945-8982`).
-      - Port the helper cluster: `dispatch_motion_event`,
-        `emit_crossing` / `emit_motion_only` / `emit_pointer`,
-        `event_relative_coords`, `update_pointer_window`,
-        `window_under_cursor`, `serialize_modifiers`. v1 uses
-        `self.windows` for hit-testing; v2 uses `windows_v2`
-        — needs the subwindow tree from 3f.6 to hit-test
-        children correctly.
+    - [x] **3f.7 — input dispatch landed 2026-05-16.**
+      `on_host_input` + `cook_host_key` +
+      `process_pointer_absolute` + `process_pointer_button` +
+      the 7-helper cluster (`serialize_modifiers`,
+      `window_under_cursor`, `event_relative_coords`,
+      `emit_pointer` / `emit_crossing` / `emit_motion_only`,
+      `update_pointer_window`, `dispatch_motion_event`) all
+      ported on `KmsBackendV2`. v1's body went over almost
+      verbatim — KmsCore-only helpers (xkb_state,
+      cursor_x/y, button_mask, pending_pointer_events,
+      xid_map) port byte-for-byte; the three v1-specific
+      touches got v2-shape substitutions:
+      - `self.windows` → `self.windows_v2` (uses the parent-
+        aware geometry record landed in 3f.6 for hit-testing).
+      - `self.fb_w` / `self.fb_h` → `self.platform.outputs[0]`
+        extent (single-output is the only path exercised;
+        multi-output input mapping is risk-listed for later).
       - HW cursor calls (`hw_cursor_active` / `hw_cursor_move`
-        / `hw_cursor_refresh`) no-op'd in v2 per spec § I7
-        (HW cursor plane reintroduces as a SceneCompositor
-        strategy, Stage 5 territory).
-      - Acceptance: xterm under no-WM receives KeyPress +
-        ButtonPress + MotionNotify; xclock cursor-tracking
-        updates correctly.
-      Sizing: ~800-1200 LoC incl. helpers + tests, 1-2 focused
-      sessions. **Depends on 3f.6** (subwindow tree for hit-
-      testing).
+        / `hw_cursor_refresh`) → no-op + `scene.mark_scene_structure_dirty`
+        per spec § I7 (HW cursor plane parked in v2 until
+        Stage 5 reintroduces it as a SceneCompositor
+        strategy).
+
+      6 new unit tests: `serialize_modifiers_zero_on_fresh_state`,
+      `cook_host_key_fills_coords_and_modifier_state`,
+      `process_pointer_button_state_field_is_pre_press`
+      (X11 spec pre-press `state` discipline + post-event
+      `button_mask` update),
+      `process_pointer_absolute_clamps_to_output`,
+      `window_under_cursor_finds_topmost_mapped`
+      (back-to-front walk + unmapped-skip),
+      `on_host_input_does_not_log_gap`.
+
+      238 lib + 18 ignored v2 Vk + 8 v2_acceptance tests
+      green under lavapipe; clippy clean.
+
+      Known Stage-4 cursor gap: yserver doesn't draw a cursor
+      to the scanout in v2 yet (per spec § scene-layering item 4
+      "Cursor — always on top" + 3f.4 closure note "Pixel
+      rasterisation + scene blit is Stage 4"). Input events
+      flow correctly under hardware smoke; the cursor itself
+      is invisible. Tracked separately under Stage 4 cursor
+      scene-layer work.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
       capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**
