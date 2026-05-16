@@ -198,9 +198,57 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     bytes. `KmsBackendV2::for_tests_with_vk` constructs a live-Vk
     fixture for these. 4 lib telemetry unit tests + 3 acceptance
     tests all green under lavapipe.
+
+    **vng smoke under Venus passthrough (2026-05-16)** —
+    `just yserver-v2` / `just yserver-v2-fvwm3-xterm` recipes
+    added, run via `-display egl-headless,gl=on` (headless) or
+    `gtk,gl=on` (when host has DISPLAY / Xwayland). Verified
+    end-to-end in vng:
+      - `driver_id=MESA_VENUS`, `1 scanout pools live`,
+        `first pageflip complete on output 0 (bo 0)` — Stage 2d
+        atomic-flip path lives on Venus-exported dma-buf scanout.
+      - `xdpyinfo` (post `xkb_proxy` fix, see below) returns a
+        full reply — 16 advertised extensions, depths, screen
+        info.
+      - `xsetroot -solid red`/`green` drives **7 composite_submits
+        + 7 frame_present_count in a 1s telemetry window**,
+        `vk_queue_wait_idle/s=0` holds throughout.
+      - **Stage 2e 9b atomic-commit-failed recovery fires live**
+        under back-to-back composes racing the vblank
+        (`atomic commit failed ... Device or resource busy; BO
+        invalidated`); the scene loop recovers cleanly and
+        keeps going. The recovery path is verified outside the
+        unit-test scaffolding.
+
+    **`xkb_proxy` wired in v2** (`b001911`, 2026-05-16). The
+    Stage-1b stub returned `Ok(None)` for every XKB minor
+    opcode, which kills any Xlib-based client at the XKEYBOARD
+    UseExtension handshake — verified: xterm, xeyes, xsetroot,
+    xdpyinfo all disconnected silently under the old stub.
+    Since `KmsCore.xkb_keymap` is shared with v1 and the
+    `kms::xkb::reply_*` helpers are `pub(super)`, v2 mirrors
+    v1's body verbatim. This was the hidden blocker for any
+    real-client smoke: without it, hardware smoke on bee + fuji
+    would have produced "boot + first pageflip" and nothing
+    more, identical to the pre-fix vng result.
+
+    **Known polish item (Stage 5 territory)**: under rapid
+    back-to-back composites the scene tick can pick a Free BO
+    and submit before the prior flip retires, causing KMS to
+    return EBUSY on the second `present_scanout` (9b path).
+    Recovery handles it correctly (BO invalidated + repaint
+    deferred) but the warning is noisy. Fix is to gate
+    `tick_one_output` on per-output flip-pending state so we
+    only submit when we know KMS will accept; tracked for the
+    perf-plans cycle on top of v2.
+
     **Pending**: user-run hardware smoke on bee + fuji
     (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`) — the
-    Stage 2 close gate.
+    Stage 2 close gate. Now genuinely actionable post-xkb_proxy
+    fix: xfce-session, xfwm4, xfdesktop should get past
+    handshake and start mapping windows. Real Stage 3 gaps
+    (RENDER / glyphs / cursor) will surface as the next
+    triage layer.
 
 ### Pending
 - [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on
