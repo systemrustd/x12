@@ -4420,6 +4420,27 @@ pub(crate) fn decode_x11_pixel_bgra(pixel: u32) -> [f32; 4] {
     [r, g, b, a]
 }
 
+/// L1 server-α invariant: depth-24 / depth-8 / depth-1 destinations
+/// are server-owned-α, so the stored alpha byte must read back as
+/// `0xFF` regardless of what the X11 pixel's upper byte happens to
+/// contain (typically `0x00` for `0x00RRGGBB` colour literals). The
+/// scene compositor binds `storage.image_view` (IDENTITY swizzle —
+/// required because the same view doubles as a colour attachment per
+/// VUID-VkFramebufferCreateInfo-pAttachments-00891) and runs window
+/// draws in `alpha_passthrough=true` mode, so a paint that leaves
+/// α=0 in storage renders as a fully-transparent window — the layer
+/// underneath leaks through. v1 forces this at every fill site
+/// (`kms/backend.rs:try_vk_solid_fill`); this helper is v2's
+/// equivalent.
+#[must_use]
+pub(crate) fn decode_x11_pixel_server_alpha(pixel: u32, depth: u8) -> [f32; 4] {
+    let mut c = decode_x11_pixel_bgra(pixel);
+    if depth != 32 {
+        c[3] = 1.0;
+    }
+    c
+}
+
 // ────────────────────────────────────────────────────────────────
 // Tests — logic-only (no live Vk).
 //

@@ -46,7 +46,7 @@ use crate::{
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
         v2::{
-            engine::{RenderEngine, decode_x11_pixel_bgra},
+            engine::{RenderEngine, decode_x11_pixel_server_alpha},
             platform::PlatformBackend,
             scene::SceneCompositor,
             store::{DrawableKind, DrawableStore, Storage},
@@ -580,7 +580,7 @@ impl KmsBackendV2 {
             &mut self.platform,
             id,
             rect,
-            decode_x11_pixel_bgra(self.core.bg_pixel.unwrap_or(0x0050_5050)),
+            decode_x11_pixel_server_alpha(self.core.bg_pixel.unwrap_or(0x0050_5050), 24),
         ) && self.platform.vk.is_some()
         {
             log::warn!("v2 init_root_storage: initial root fill failed: {e:?}");
@@ -1541,7 +1541,14 @@ impl KmsBackendV2 {
             }
             return;
         }
-        let color = decode_x11_pixel_bgra(fg);
+        // L1 server-α invariant: depth-24 dst stores alpha=0xFF
+        // regardless of the X11 pixel's upper byte. Without this,
+        // the scene compositor's alpha_passthrough=true draws read
+        // back α=0 (X-padding) and the window blends transparent —
+        // the layer underneath leaks through, panel renders white
+        // not teal. Matches v1's `try_vk_solid_fill` (kms/backend.rs:3512).
+        let depth = self.store.get(id).map(|d| d.depth).unwrap_or(24);
+        let color = decode_x11_pixel_server_alpha(fg, depth);
         // Stage 3f.15: coalesce N stroke rects into one CB + one
         // submit via engine.fill_rect_batch. PolySegment / PolyLine
         // / PolyRectangle fan-outs now pay O(1) submits per protocol
@@ -1796,8 +1803,10 @@ impl KmsBackendV2 {
         // (v1's create_subwindow behaviour); otherwise paint a
         // depth-appropriate safe default (3f.14).
         if storage_allocated && let Some(id) = self.store.lookup(host_xid) {
-            let color =
-                bg_pixel.map_or_else(|| default_window_init_color(depth), decode_x11_pixel_bgra);
+            let color = bg_pixel.map_or_else(
+                || default_window_init_color(depth),
+                |pixel| decode_x11_pixel_server_alpha(pixel, depth),
+            );
             let rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
                 extent: ash::vk::Extent2D {
@@ -1942,8 +1951,6 @@ impl KmsBackendV2 {
         w: i32,
         h: i32,
     ) -> io::Result<()> {
-        use crate::kms::v2::engine::decode_x11_pixel_bgra;
-
         if w <= 0 || h <= 0 {
             return Ok(());
         }
@@ -1952,7 +1959,12 @@ impl KmsBackendV2 {
         let Some(target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
-        let color = decode_x11_pixel_bgra(background);
+        // L1 server-α invariant per `fill_solid_rects` (see comment
+        // there): force α=1 on depth!=32 dsts so the scene
+        // compositor's alpha_passthrough path doesn't blend the
+        // text bg out.
+        let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
+        let color = decode_x11_pixel_server_alpha(background, depth);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
                 x: x + target.offset.0,
@@ -2878,7 +2890,7 @@ impl Backend for KmsBackendV2 {
                             // (matches `allocate_window_storage`).
                             let color = bg_pixel.map_or_else(
                                 || default_window_init_color(depth),
-                                decode_x11_pixel_bgra,
+                                |pixel| decode_x11_pixel_server_alpha(pixel, depth),
                             );
                             let rect = ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D::default(),
@@ -3705,12 +3717,16 @@ impl Backend for KmsBackendV2 {
                     height: u32::from(self.platform.fb_h.max(1)),
                 },
             };
+            // L1 server-α invariant: root storage is depth-24, so
+            // force the stored α byte to 0xFF for the scene
+            // compositor's pass-through draw to read opaque.
+            let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,
                 target.id,
                 rect,
-                decode_x11_pixel_bgra(pixel),
+                decode_x11_pixel_server_alpha(pixel, depth),
             ) {
                 log::warn!("v2 set_container_background_pixel: root fill failed: {e:?}");
             } else {
