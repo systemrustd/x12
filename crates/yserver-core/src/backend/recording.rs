@@ -88,6 +88,11 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    ReleaseRedirectedBacking(u32),
+    SetWindowSceneParticipation {
+        host_window: u32,
+        participating: bool,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -356,6 +361,28 @@ impl Backend for RecordingBackend {
     fn unregister_host_window(&mut self, host_xid: u32) {
         self.xid_map.remove(&host_xid);
         self.record(RecordedCall::UnregisterHostWindow(host_xid));
+    }
+
+    fn release_redirected_backing(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReleaseRedirectedBacking(backing.as_raw()));
+        Ok(())
+    }
+
+    fn set_window_scene_participation(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::SetWindowSceneParticipation {
+            host_window: host_window.as_raw(),
+            participating,
+        });
+        Ok(())
     }
 
     fn xid_map(&self) -> &HostXidMap {

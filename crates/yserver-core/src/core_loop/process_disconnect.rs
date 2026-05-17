@@ -288,17 +288,42 @@ pub(crate) fn teardown_redirect_for_window(
     backend: &mut dyn Backend,
     window: ResourceId,
 ) {
-    let Some(backing) = state
-        .resources
-        .window_mut(window)
-        .and_then(|w| w.redirected_backing.take())
-    else {
+    let (host_window, backing) = {
+        let Some(w) = state.resources.window_mut(window) else {
+            return;
+        };
+        (w.host_xid, w.redirected_backing.take())
+    };
+    let Some(backing) = backing else {
         return;
     };
     if let Err(err) = backend.release_redirected_backing(None, backing.host_pixmap) {
         log::warn!(
             "release_redirected_backing(0x{:x}) failed: {err}",
             backing.host_pixmap.as_raw()
+        );
+    }
+    // Restore W's scene-participation. The matching
+    // `activate_redirect_backing_for` in `process_request.rs` flipped
+    // it to false for Manual mode (and true for Automatic — a no-op
+    // restore in that case). Symmetric to the `UnredirectWindow` /
+    // `UnredirectSubwindows` arm in `process_request.rs`, which
+    // performs the same restore on the protocol path. Without this,
+    // an abnormal compositor disconnect (e.g. marco crashes mid
+    // session) leaves every Manually-redirected window with
+    // `scene_participating=false` — i.e. invisible — for the rest of
+    // the session.
+    let Some(host_window) = host_window else {
+        log::debug!(
+            "teardown_redirect_for_window(0x{:x}): no host_xid; skipping participation restore",
+            window.0
+        );
+        return;
+    };
+    if let Err(err) = backend.set_window_scene_participation(None, host_window, true) {
+        log::warn!(
+            "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, true) failed: {err}",
+            window.0
         );
     }
 }
@@ -391,11 +416,13 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
 
-    use yserver_protocol::x11::{ClientByteOrder, ClientId, CreatePixmapRequest, ResourceId};
+    use yserver_protocol::x11::{
+        ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
+    };
 
     use super::{destroy_zombie_resources, process_disconnect};
     use crate::{
-        backend::recording::RecordingBackend,
+        backend::recording::{RecordedCall, RecordingBackend},
         resources::ROOT_WINDOW,
         server::{ClientState, CompositeRedirectMode, RedirectRecord, ServerState},
     };
@@ -560,6 +587,94 @@ mod tests {
         assert_eq!(
             state.resources.resource_owner(ResourceId(0x0210_0001)),
             Some(ClientId(33)),
+        );
+    }
+
+    #[test]
+    fn disconnect_restores_window_scene_participation_after_manual_redirect_teardown() {
+        // Regression: when a compositor (e.g. marco) crashes mid-session
+        // while it had `RedirectSubwindows(root, Manual)` active, every
+        // window it had taken over stayed at `scene_participating=false`
+        // (set by `activate_redirect_backing_for` on the way in) and
+        // remained invisible until end-of-session. The disconnect-side
+        // teardown must mirror the symmetric `UnredirectSubwindows`
+        // protocol path and restore the windows' scene participation.
+        let mut state = ServerState::new();
+        let compositor = 9;
+        let window_owner = 10;
+        install_client(&mut state, compositor);
+        install_client(&mut state, window_owner);
+        // Create a top-level child W of the root, populate its
+        // host_xid and a synthetic redirected_backing (as if a
+        // Manual-mode `activate_redirect_backing_for` had run).
+        let window_id = ResourceId(0x00a0_0001);
+        let host_xid: u32 = 0xC0DE_0001;
+        let backing_xid: u32 = 0xBA51_0001;
+        state.resources.create_window(
+            ClientId(window_owner),
+            CreateWindowRequest {
+                depth: 24,
+                window: window_id,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state.resources.window_mut(window_id).unwrap();
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host_xid));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing_xid),
+                width: 100,
+                height: 100,
+                depth: 24,
+            });
+        }
+        // The compositor owns `RedirectSubwindows(root, Manual)`.
+        state.composite_redirects.insert(
+            (ROOT_WINDOW, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(compositor),
+            },
+        );
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(compositor));
+
+        // W's redirect state is cleared.
+        let w = state.resources.window(window_id).expect("W survives");
+        assert!(w.redirected_backing.is_none());
+        // The backend saw both the backing release and the
+        // participation restore — in that order.
+        let calls = backend.calls();
+        let release_idx = calls
+            .iter()
+            .position(
+                |c| matches!(c, RecordedCall::ReleaseRedirectedBacking(x) if *x == backing_xid),
+            )
+            .expect("release_redirected_backing recorded");
+        let restore_idx = calls
+            .iter()
+            .position(|c| {
+                matches!(
+                    c,
+                    RecordedCall::SetWindowSceneParticipation {
+                        host_window,
+                        participating: true,
+                    } if *host_window == host_xid
+                )
+            })
+            .expect("set_window_scene_participation(host, true) recorded");
+        assert!(
+            release_idx < restore_idx,
+            "release must precede participation restore; calls={calls:#?}",
         );
     }
 }
