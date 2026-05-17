@@ -141,6 +141,25 @@ from.
 
 ## Drawing / rendering artifacts
 
+- [ ] **Stage 4c follow-up: multi-output coord-space for
+      scene-structure damage rects.** `SceneCompositor::
+      mark_scene_structure_damage_rects` (4c.1, scene.rs:410)
+      clips each input rect by `output_extent` only, assuming
+      every output starts at origin (0, 0). Stage 4c.4 feeds it
+      screen-absolute rects from `window_absolute_rect`
+      (backend.rs:558). Under single-output (layout_x0 = layout_y0
+      = 0) screen-absolute ≡ output-local, so the clip is correct.
+      Under multi-output deployments with non-(0,0) layouts the
+      helper would clip in the wrong frame and a damage rect on
+      output 2+ would either be dropped (rect outside its
+      extent-from-origin) or land at the wrong screen offset.
+      Either: (a) add `layout_origin: vk::Offset2D` to
+      `OutputSceneState` and threading through `SceneCompositor::
+      new`, or (b) translate at the call site in
+      `set_window_scene_participation`. Not a regression vs the
+      4c.1 stub (same shape), but undocumented before this entry
+      and tracked here to surface when multi-output work begins.
+
 - [ ] **Stage 4c follow-up: `src_size = [1, 1]` after redirected W
       resizes past B's extent.** `build_scene`'s redirect-aware
       indirection (Stage 4c.3, commit `b9a9f3a`) emits

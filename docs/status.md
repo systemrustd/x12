@@ -1545,12 +1545,69 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     correctly on bee + fuji) lands at 4c close, once
     SceneCompositor mode-aware participation actually drives
     the scene walk through the backing.
-  - [ ] **Stage 4c — SceneCompositor I4 + Automatic-mode
-    storage routing.** `build_scene` resolves each entry's
-    source-storage through `redirected_target` so Automatic-W
-    blits from B. Mode-flip handler preserves backing +
-    aliases (no re-seed). First compositor-WM hardware-smoke
-    gate: mate-session + marco-with-compositing on bee + fuji.
+  - [~] **Stage 4c — SceneCompositor I4 + Automatic-mode
+    storage routing, code landed 2026-05-17.** Hardware-smoke
+    gate (4c.6) is user-driven and not yet run.
+    - **4c.1** (`b7bfc02` + `70f2bf1`): `SceneCompositor::
+      mark_scene_structure_damage_rects(&[vk::Rect2D])` —
+      per-output dispatch via factored `dispatch_clip_rects_to_
+      outputs` helper with per-output extent clipping. Real-
+      inner test covers the dispatch path; 4c.1 follow-up added
+      after code-quality review flagged stub-only coverage.
+    - **4c.2** (`ea5cd8a`): `KmsBackendV2::window_absolute_rect(
+      W_id) -> Option<vk::Rect2D>` — walks `windows_v2.parent`
+      chain accumulating (x, y), terminates at root or returns
+      None on dangling parent. Five unit tests.
+    - **4c.3** (`b9a9f3a`): `build_scene` source_id indirection.
+      Both root + window emission paths insert `source_id =
+      store.redirected_target(id).unwrap_or(id)`; `image_view`
+      sampled from `source_id`'s storage, `sampled_ids` push
+      `source_id`. Manual-W filtered upstream by
+      `scene_participating`; Automatic-W keeps in scene but
+      blits from B. W's geometry (`dst_*`) untouched.
+    - **4c.4** (`e7168bf`): v2 impls of
+      `set_window_scene_participation` (captures pre-flip rect
+      via 4c.2 helper, calls `store.set_scene_participating`,
+      fires `scene.mark_scene_structure_damage_rects(&[rect])`
+      always per the Cross-cutting transition table; coarse
+      `mark_scene_structure_dirty` fallback on `None` rect) +
+      `set_backing_scene_participation` (flag flip only, no
+      damage — W-side carries the geometric damage). Also
+      added `store.set_scene_participating(b_id, false)` to
+      `release_redirected_backing` per round-3 finding.
+    - **4c.5** (`e3326f4`): 4 no-Vk + 2 Vk-backed acceptance
+      tests for redirect routing + participation. Test rename:
+      `build_scene_uses_redirected_target_storage_when_set` →
+      `_automatic_redirect_keeps_window_via_backing_storage`
+      to align with Automatic-mode invariant framing. Four
+      protocol-level tests TODO'd at v2_acceptance.rs:2154-2178
+      (`v2_map_window_after_redirect_subwindows_keeps_manual_
+      participation`, `_map_subwindows_redirects_each_child`,
+      `_name_window_pixmap_on_unviewable_returns_bad_match`,
+      `_existing_alias_survives_window_unmap`) — need
+      `handle_composite_request` test scaffolding which doesn't
+      exist in yserver-core today.
+    - **4c.6 (HARDWARE SMOKE — USER OWNED, NOT YET RUN)**: 
+      `just yserver-mate-hw` with mate-session +
+      marco-with-compositing on bee + fuji. v2 is the boot
+      default since `3afa5bd`. Enable marco compositing in
+      MATE control center or `gsettings set
+      org.mate.Marco.general compositing-manager true`. Gate:
+      window decorations + drop shadows render correctly; no
+      `render_composite gap: host_src 0x... not resolvable`
+      lines from marco's compositor log.
+
+    Final reviewer assessment: READY_FOR_HARDWARE_SMOKE. 277
+    yserver lib + 22 ignored v2 Vk + 28 v2_acceptance tests
+    green under lavapipe. Two known follow-ups tracked in
+    `known-issues.md`:
+    - `src_size = [1, 1]` after redirected W resizes past B's
+      extent — could stretch B onto larger W rect (4c.3 limitation).
+    - Multi-output coord-space for scene-structure damage rects —
+      `mark_scene_structure_damage_rects` clips by extent
+      assuming origin (0, 0); under multi-output layouts the
+      clip would be in the wrong frame (not a regression vs the
+      4c.1 stub but now flagged).
   - [ ] **Stage 4d — Composite Overlay Window as first-class
     scene entry.** `cow_refcount: u32` in `KmsCore` (metadata
     only — no `DrawableId` per the spec's `KmsCore` scope
