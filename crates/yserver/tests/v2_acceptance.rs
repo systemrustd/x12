@@ -1727,6 +1727,169 @@ fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
     );
 }
 
+/// Plan §4b cross-cutting "Initial backing content": the backing
+/// captures W's pre-redirect contents (BEFORE
+/// `set_redirected_target` flips routing). Otherwise compositors
+/// that don't repaint immediately on first DamageNotify see a
+/// blank backing.
+///
+/// Test: paint a recognisable colour into W, then activate the
+/// redirect, then GetImage the backing. The backing must read as
+/// W's seeded colour, NOT zero / undefined.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_redirect_seed_copies_window_content() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    // Pre-fill W with red so the seed has something to copy.
+    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("seed W red");
+
+    let backing = b
+        .allocate_redirected_backing(None, w, 8, 8, 32)
+        .expect("allocate must succeed");
+    let bxid = backing.as_raw();
+
+    let img = b
+        .get_image(None, bxid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(
+        &img[..4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "backing's (0,0) must be red — seeded from W BEFORE \
+         set_redirected_target flipped routing (got {:?})",
+        &img[..4],
+    );
+}
+
+/// Plan §4b cross-cutting "Initial backing content" + "Per-
+/// hierarchy redirect": descendants of W also have their content
+/// copied into B at their position relative to W. Mirrors Xorg
+/// `composite/compalloc.c:556`.
+///
+/// Repro: parent W (16×16) red; child C (8×8) at (3, 4) inside W
+/// blue. Activate redirect on W. The backing must show red
+/// everywhere except the C-region at (3, 4)..(11, 12), which is
+/// blue. Pre-4b.5 (only W is seeded): the C-region reads red.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_redirect_seed_copies_descendants() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Top-level W under root, 16×16, depth-32.
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w_handle = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create W");
+    let w_xid = w_handle.as_raw();
+    // Child C at (3, 4) under W, 8×8.
+    let c_handle = b
+        .create_subwindow(
+            None,
+            w_handle,
+            3,
+            4,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create C");
+    let c_xid = c_handle.as_raw();
+
+    // Paint red into W, blue into C — each in its own storage.
+    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 16, 16)
+        .expect("seed W red");
+    b.fill_rectangle(None, c_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("seed C blue");
+
+    // Activate redirect on W. The backing must capture both W's
+    // red and C's blue (at C's position relative to W).
+    let backing = b
+        .allocate_redirected_backing(None, w_handle, 16, 16, 32)
+        .expect("allocate must succeed");
+    let bxid = backing.as_raw();
+
+    let img = b
+        .get_image(None, bxid, 2, 0, 0, 16, 16, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 16 + x) * 4;
+        [img[off], img[off + 1], img[off + 2], img[off + 3]]
+    };
+    // Outside C's footprint — W's red.
+    assert_eq!(
+        pixel(0, 0),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "(0, 0) outside C — W's red (got {:?})",
+        pixel(0, 0),
+    );
+    assert_eq!(
+        pixel(15, 0),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "(15, 0) outside C — W's red",
+    );
+    // Inside C's footprint — C's blue. C is at (3, 4)..(11, 12).
+    assert_eq!(
+        pixel(3, 4),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "(3, 4) C top-left — C's blue, NOT W's red (got {:?}). \
+         Pre-4b.5 the descendant seed-copy was missing so this read W's red.",
+        pixel(3, 4),
+    );
+    assert_eq!(
+        pixel(10, 11),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "(10, 11) C bottom-right — C's blue",
+    );
+    // Edge-of-C and just outside.
+    assert_eq!(
+        pixel(11, 4),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "(11, 4) just past C's right edge — W's red",
+    );
+}
+
 /// Plan §4b: a `NameWindowPixmap` alias keeps the backing alive
 /// past `release_redirected_backing` — the alias's FreePixmap
 /// is what eventually drops the storage.

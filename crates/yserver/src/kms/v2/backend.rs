@@ -532,6 +532,111 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Stage 4b.5 — seed the backing `b_id` with W's content and
+    /// each of W's mapped-or-unmapped descendants' content at the
+    /// descendant's accumulated `(x, y)` position relative to W.
+    /// Mirrors Xorg's behaviour at `composite/compalloc.c:556`.
+    ///
+    /// Called by `allocate_redirected_backing` BEFORE the route
+    /// flip so the copies read each window's own storage (not
+    /// post-redirect routed storage). Skips windows whose storage
+    /// isn't in the store (the protocol error case is logged in
+    /// the caller) and zero-extent storage (defensive — fresh
+    /// storage with 0×0 isn't useful as a copy source).
+    ///
+    /// The walk is depth-first and bounded by tree depth at
+    /// activation time only; this is the one-shot cost the plan's
+    /// Cross-cutting §"Per-hierarchy redirect" decision called
+    /// out as acceptable.
+    fn seed_backing_from_window(
+        &mut self,
+        w_xid: u32,
+        w_id: crate::kms::v2::store::DrawableId,
+        b_id: crate::kms::v2::store::DrawableId,
+    ) {
+        // 1. W itself at (0, 0).
+        let w_extent = self
+            .store
+            .get(w_id)
+            .map(|d| d.storage.extent)
+            .unwrap_or(ash::vk::Extent2D::default());
+        if w_extent.width != 0 && w_extent.height != 0 {
+            let src_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: w_extent,
+            };
+            if let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                w_id,
+                b_id,
+                src_rect,
+                ash::vk::Offset2D::default(),
+            ) {
+                log::warn!(
+                    "v2 seed_backing_from_window(0x{w_xid:x}): root copy_area failed: {e:?}",
+                );
+            } else {
+                self.telemetry.record_paint_submit();
+            }
+        }
+
+        // 2. Walk descendants. Collect to a Vec first to release
+        // the borrow on `windows_v2` before we call into the
+        // engine (which takes `&mut self.store`).
+        //
+        // Each Vec entry is (descendant_xid, descendant_x_in_W,
+        // descendant_y_in_W). The walk is a manual stack-driven
+        // DFS over `windows_v2.parent` — we can't recurse on
+        // `&mut self` easily because the inner `engine.copy_area`
+        // call also takes `&mut self.store` / `&mut self.platform`.
+        let mut to_seed: Vec<(u32, i32, i32)> = Vec::new();
+        let mut frontier: Vec<(u32, i32, i32)> = vec![(w_xid, 0, 0)];
+        while let Some((parent_xid, parent_dx, parent_dy)) = frontier.pop() {
+            for (xid, geom) in &self.windows_v2 {
+                if geom.parent == Some(parent_xid) {
+                    let abs_x = parent_dx + i32::from(geom.x);
+                    let abs_y = parent_dy + i32::from(geom.y);
+                    to_seed.push((*xid, abs_x, abs_y));
+                    frontier.push((*xid, abs_x, abs_y));
+                }
+            }
+        }
+        for (desc_xid, abs_x, abs_y) in to_seed {
+            let Some(desc_id) = self.store.lookup(desc_xid) else {
+                continue;
+            };
+            let desc_extent = self
+                .store
+                .get(desc_id)
+                .map(|d| d.storage.extent)
+                .unwrap_or(ash::vk::Extent2D::default());
+            if desc_extent.width == 0 || desc_extent.height == 0 {
+                continue;
+            }
+            let src_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: desc_extent,
+            };
+            let dst_pos = ash::vk::Offset2D { x: abs_x, y: abs_y };
+            if let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                desc_id,
+                b_id,
+                src_rect,
+                dst_pos,
+            ) {
+                log::warn!(
+                    "v2 seed_backing_from_window(0x{w_xid:x}): descendant 0x{desc_xid:x} \
+                     copy_area at ({abs_x}, {abs_y}) failed: {e:?}",
+                );
+            } else {
+                self.telemetry.record_paint_submit();
+            }
+        }
+    }
+
     /// Virtual-screen extent — mirrors `KmsBackend::fb_dimensions`.
     /// Called by `lib.rs` during the pre-`Box<dyn Backend>` setup
     /// (capability advertisement, `ServerState::with_randr_outputs`).
@@ -2792,40 +2897,17 @@ impl Backend for KmsBackendV2 {
         let backing = self.create_pixmap(origin, depth, width, height)?;
         let backing_xid = backing.as_raw();
 
-        // Seed-copy: W → B, BEFORE the route flip. Both ids are
-        // raw `DrawableId`s so the copy does NOT consult
-        // `resolve_paint_target` (which would B→B no-op once the
-        // route flip lands below). W must already exist in the
-        // store; if not, that's a protocol error upstream — log
-        // and skip the seed but keep going so the redirect
+        // Seed-copy: W → B (and every descendant of W into B at
+        // its position relative to W), BEFORE the route flip.
+        // Both ids are raw `DrawableId`s so the copies do NOT
+        // consult `resolve_paint_target` (which would B→B no-op
+        // once the route flip lands below). W must already exist
+        // in the store; if not, that's a protocol error upstream
+        // — log and skip the seed but keep going so the redirect
         // record still installs.
         if let (Some(w_id), Some(b_id)) = (self.store.lookup(w_xid), self.store.lookup(backing_xid))
         {
-            let w_extent = self
-                .store
-                .get(w_id)
-                .map(|d| d.storage.extent)
-                .unwrap_or(ash::vk::Extent2D::default());
-            if w_extent.width != 0 && w_extent.height != 0 {
-                let src_rect = ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
-                    extent: w_extent,
-                };
-                if let Err(e) = self.engine.copy_area(
-                    &mut self.store,
-                    &mut self.platform,
-                    w_id,
-                    b_id,
-                    src_rect,
-                    ash::vk::Offset2D::default(),
-                ) {
-                    log::warn!(
-                        "v2 allocate_redirected_backing(0x{w_xid:x}): seed copy_area failed: {e:?}",
-                    );
-                } else {
-                    self.telemetry.record_paint_submit();
-                }
-            }
+            self.seed_backing_from_window(w_xid, w_id, b_id);
             // Now flip routing — after this, paint against W
             // resolves to B via `resolve_paint_target`.
             self.store.set_redirected_target(w_id, Some(b_id));
