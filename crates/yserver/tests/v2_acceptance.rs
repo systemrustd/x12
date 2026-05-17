@@ -1365,3 +1365,183 @@ fn v2_poly_segment_coalesces_to_one_submit() {
         "queue_submit2 should also tick by exactly one for the batch",
     );
 }
+
+// ───── Stage 4a — resolve_paint_target via redirect routing ─────
+
+/// Allocate two pixmaps W and B, install `redirected_target(W) =
+/// Some(B)` via the test-only setter, then drive `fill_rectangle`
+/// against W's xid. Pre-4a: paint would land in W's storage.
+/// Post-4a: paint resolves through the redirect and lands in B.
+/// GetImage on both reads back the redirected colour from B (also
+/// resolved) and B (raw lookup); the same buffer in both cases.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_set_redirected_target_routes_fill_to_backing() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let bk_xid = b.create_pixmap(None, 32, 8, 8).expect("B").as_raw();
+    // Pre-fill W with red and B with blue so we can tell which one
+    // a subsequent paint actually hit.
+    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("seed W red");
+    b.fill_rectangle(None, bk_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("seed B blue");
+
+    // Install the redirect AFTER the seed fills so the seed paints
+    // landed in their respective storage (W has red, B has blue
+    // pre-redirect).
+    assert!(
+        b.test_set_redirected_target(w_xid, bk_xid),
+        "test_set_redirected_target failed — xids resolvable?",
+    );
+
+    // Paint green via W's xid. Under redirect this lands in B,
+    // overwriting the blue.
+    b.fill_rectangle(None, w_xid, 0xFF00FF00, 0, 0, 8, 8)
+        .expect("redirected fill");
+
+    // GetImage on B's xid (raw, no redirect on a Pixmap) returns
+    // the green — the redirected fill landed here.
+    let img_b = b
+        .get_image(None, bk_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image B")
+        .expect("Some B bytes");
+    assert_eq!(
+        &img_b[..4],
+        &[0x00, 0xFF, 0x00, 0xFF],
+        "B's (0,0) must read green (BGRA) after the redirected fill",
+    );
+
+    // GetImage on W's xid ALSO resolves through the redirect per
+    // Risk 1, so it reads the same green from B — NOT the seeded
+    // red on W's own storage.
+    let img_w = b
+        .get_image(None, w_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image W")
+        .expect("Some W bytes");
+    assert_eq!(
+        &img_w[..4],
+        &[0x00, 0xFF, 0x00, 0xFF],
+        "GetImage(W) under redirect must read from B (green), \
+         not the leaf storage (still red)",
+    );
+}
+
+/// Set up parent-W with a sub-child C at position (2, 3). Redirect
+/// W to backing B. A fill rect at (1, 1, 4, 4) against C's xid must
+/// land at (3, 4, 4, 4) in B — the C-relative offset accumulated
+/// through `resolve_paint_target`. Tests the descendant-offset
+/// path end-to-end through the Backend trait.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Create depth-32 W under root, 16×16; then C at (2, 3) under
+    // W, 8×8. allocate_window_storage will fill both with the
+    // depth-32 safe default (transparent black).
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create W");
+    let w_xid = w.as_raw();
+    let c = b
+        .create_subwindow(
+            None,
+            w,
+            2,
+            3,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create C");
+    let c_xid = c.as_raw();
+
+    // Allocate B (a pixmap) for the backing storage. Seed it black
+    // so the post-fill check can detect green-at-offset.
+    let bk_xid = b.create_pixmap(None, 32, 16, 16).expect("B").as_raw();
+    b.fill_rectangle(None, bk_xid, 0xFF000000, 0, 0, 16, 16)
+        .expect("seed B black");
+
+    // Install the redirect W → B.
+    assert!(
+        b.test_set_redirected_target(w_xid, bk_xid),
+        "redirect install (W={w_xid:#x}, B={bk_xid:#x})"
+    );
+
+    // Fill green on C at (1, 1, 4, 4) — C-window-local coords.
+    // Expected outcome: paint resolves through C→W (ancestor walk)
+    // with accumulated offset (2, 3), then through W's redirect
+    // to B. Result: green rect at B coords (3, 4, 4, 4).
+    b.fill_rectangle(None, c_xid, 0xFF00FF00, 1, 1, 4, 4)
+        .expect("descendant fill");
+
+    // GetImage on B directly. Stride for depth-32 is `w * 4`.
+    let img = b
+        .get_image(None, bk_xid, 2, 0, 0, 16, 16, !0)
+        .expect("get_image B")
+        .expect("Some bytes");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 16 + x) * 4;
+        [img[off], img[off + 1], img[off + 2], img[off + 3]]
+    };
+    // Inside the redirected rect: (3,4)..(7,8).
+    assert_eq!(
+        pixel(3, 4),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "B at (3,4) must be green — descendant offset (2,3) plus rect (1,1) sums to (3,4)",
+    );
+    assert_eq!(
+        pixel(6, 7),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "B at (6,7) — last pixel of the redirected rect — must also be green",
+    );
+    // Outside the rect: still the seeded black.
+    assert_eq!(
+        pixel(0, 0),
+        [0x00, 0x00, 0x00, 0xFF],
+        "B at (0,0) must stay black — fill lands at (3,4), not the origin",
+    );
+    assert_eq!(
+        pixel(8, 8),
+        [0x00, 0x00, 0x00, 0xFF],
+        "B at (8,8) must stay black — past the redirected rect's bottom-right",
+    );
+}

@@ -357,6 +357,14 @@ pub(crate) struct Drawable {
     /// [`ack_presentation_damage`].
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
+
+    /// Stage 4a — COMPOSITE redirect routing. When `Some(B_id)`,
+    /// paint that resolves through this drawable's xid lands in
+    /// `B_id` instead. Pure storage-side state; side effects on
+    /// damage / refcount / `scene_participating` are the caller's
+    /// responsibility (4c sets those via the dedicated Backend
+    /// methods). Default `None` — no redirect.
+    pub(crate) redirected_target: Option<DrawableId>,
 }
 
 impl Drawable {
@@ -494,6 +502,7 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
+            redirected_target: None,
         };
         self.entries.insert(id, drawable);
         self.by_xid.insert(xid, id);
@@ -685,6 +694,33 @@ impl DrawableStore {
         } else {
             d.presentation_damage.subtract(&snap.region);
         }
+    }
+
+    /// Stage 4a — set or clear a window's COMPOSITE redirect
+    /// routing. `Some(backing_id)` routes future paint resolution
+    /// against `window_id`'s xid (or any descendant whose nearest
+    /// redirected ancestor is this drawable) into `backing_id`;
+    /// `None` un-redirects. No side effects on damage / refcount /
+    /// `scene_participating` — those flips belong to the protocol
+    /// handler in 4c via the dedicated Backend methods.
+    pub(crate) fn set_redirected_target(
+        &mut self,
+        window_id: DrawableId,
+        backing_id: Option<DrawableId>,
+    ) {
+        if let Some(d) = self.entries.get_mut(&window_id) {
+            d.redirected_target = backing_id;
+        }
+    }
+
+    /// Stage 4a — leaf accessor returning the per-drawable
+    /// `redirected_target`. Returns `None` if the drawable
+    /// doesn't exist or isn't redirected. The full ancestor walk
+    /// lives on `KmsBackendV2::resolve_paint_target` because it
+    /// needs window-geometry metadata (`windows_v2`) that isn't
+    /// in the store.
+    pub(crate) fn redirected_target(&self, id: DrawableId) -> Option<DrawableId> {
+        self.entries.get(&id)?.redirected_target
     }
 
     /// Record an in-flight ticket. Coalesces: replaces any
@@ -1012,6 +1048,70 @@ mod tests {
             .expect("re-alloc must succeed after detach_xid");
         assert_ne!(new_id, id);
         assert_eq!(s.lookup(0x42), Some(new_id));
+    }
+
+    /// Stage 4a — `set_redirected_target(Some(B))` makes
+    /// `redirected_target(W)` return `Some(B)`. Pure storage-side
+    /// state; the full ancestor walk + paint dispatch lives on
+    /// `KmsBackendV2::resolve_paint_target`.
+    #[test]
+    fn set_redirected_target_stores_backing_id() {
+        let mut s = DrawableStore::new();
+        let w_id = s
+            .allocate(0x100, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let b_id = s
+            .allocate(0x200, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+        assert_eq!(s.redirected_target(w_id), None);
+        s.set_redirected_target(w_id, Some(b_id));
+        assert_eq!(s.redirected_target(w_id), Some(b_id));
+    }
+
+    /// Stage 4a — `set_redirected_target(None)` clears the route.
+    #[test]
+    fn set_redirected_target_none_clears_route() {
+        let mut s = DrawableStore::new();
+        let w_id = s
+            .allocate(0x100, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let b_id = s
+            .allocate(0x200, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+        s.set_redirected_target(w_id, Some(b_id));
+        s.set_redirected_target(w_id, None);
+        assert_eq!(s.redirected_target(w_id), None);
+    }
+
+    /// Stage 4a — flipping `set_redirected_target` does NOT touch
+    /// damage / refcount / `scene_participating`. Those flips are
+    /// 4c's responsibility via the dedicated Backend methods.
+    #[test]
+    fn set_redirected_target_has_no_side_effects() {
+        let mut s = DrawableStore::new();
+        let w_id = s
+            .allocate(0x100, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let b_id = s
+            .allocate(0x200, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+        s.damage(w_id, rect(0, 0, 4, 4));
+        let epoch_before = s.get(w_id).unwrap().presentation_damage_epoch;
+        let refcount_before = s.get(w_id).unwrap().refcount;
+        let participating_before = s.get(w_id).unwrap().scene_participating;
+        s.set_redirected_target(w_id, Some(b_id));
+        let d = s.get(w_id).unwrap();
+        assert_eq!(d.presentation_damage.rects().len(), 1);
+        assert_eq!(d.presentation_damage_epoch, epoch_before);
+        assert_eq!(d.refcount, refcount_before);
+        assert_eq!(d.scene_participating, participating_before);
+    }
+
+    #[test]
+    fn redirected_target_unknown_id_returns_none() {
+        let s = DrawableStore::new();
+        // Construct a fresh DrawableId that doesn't exist in the store.
+        assert_eq!(s.redirected_target(DrawableId(999)), None);
     }
 
     #[test]

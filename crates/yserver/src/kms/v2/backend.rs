@@ -83,6 +83,25 @@ pub(crate) struct WindowGeometryV2 {
 
 pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 
+/// Stage 4a — resolution result for a paint operation against a
+/// host xid. `id` is the DrawableId that actually receives the
+/// paint; `offset` is the (x, y) translation that callers add to
+/// every paint rect's origin (in 16.16-free pixel units) before
+/// dispatching to the engine.
+///
+/// The offset is non-zero only when the target is a descendant of
+/// a redirected ancestor: paint against descendant `C` of
+/// redirected `W`, with `C` positioned at `(cx, cy)` relative to
+/// `W`, lands at `(cx + x, cy + y, w, h)` in `W`'s backing.
+///
+/// For unredirected windows and Pixmap targets, `offset = (0, 0)`
+/// and `id` is just the leaf drawable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaintTarget {
+    pub(crate) id: crate::kms::v2::store::DrawableId,
+    pub(crate) offset: (i32, i32),
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -274,6 +293,32 @@ impl KmsBackendV2 {
         Ok(base)
     }
 
+    /// Stage 4a — test-only knob to install a COMPOSITE redirect
+    /// route directly via the store, bypassing 4b's protocol
+    /// surface (`allocate_redirected_backing` / `name_window_pixmap`
+    /// still stubs returning Err until 4b lands). The
+    /// `v2_acceptance` integration tests use this to set up
+    /// routing for `resolve_paint_target` coverage without
+    /// touching alias-registry / host_window_to_backing
+    /// bookkeeping.
+    ///
+    /// `window_xid` must resolve in the store; `backing_xid` must
+    /// also exist and is what window-keyed paint routes into.
+    /// Returns `true` if both were resolved and the route was
+    /// recorded; `false` otherwise. No side effects on damage,
+    /// refcount, or `scene_participating`.
+    #[doc(hidden)]
+    pub fn test_set_redirected_target(&mut self, window_xid: u32, backing_xid: u32) -> bool {
+        let Some(w_id) = self.store.lookup(window_xid) else {
+            return false;
+        };
+        let Some(b_id) = self.store.lookup(backing_xid) else {
+            return false;
+        };
+        self.store.set_redirected_target(w_id, Some(b_id));
+        true
+    }
+
     /// Headless test seed. Single 800×600 stub output; no
     /// Vulkan; no real DRM device. Mirrors `KmsBackend::for_tests`
     /// in shape so unit tests that drive v2 through
@@ -352,6 +397,112 @@ impl KmsBackendV2 {
         ) && self.platform.vk.is_some()
         {
             log::warn!("v2 init_root_storage: initial root fill failed: {e:?}");
+        }
+    }
+
+    /// Stage 4a — resolve a host xid into the actual paint target
+    /// under COMPOSITE redirect routing. Walks up the
+    /// `windows_v2.parent` chain accumulating `(x, y)` offsets;
+    /// the first ancestor (including `host_xid` itself) whose
+    /// `Drawable.redirected_target` is `Some(B_id)` wins.
+    ///
+    /// Returns:
+    /// - `None` if `host_xid` doesn't map to any drawable.
+    /// - `Some(PaintTarget { id: leaf, offset: (0, 0) })` for
+    ///   Pixmap targets (not in `windows_v2`) and for
+    ///   unredirected windows whose ancestor chain reaches root
+    ///   without finding a redirected ancestor.
+    /// - `Some(PaintTarget { id: B_id, offset: accumulated })`
+    ///   for redirected windows + their descendants.
+    ///
+    /// Per Stage 4 plan §"Per-hierarchy redirect": this is the
+    /// per-op walk; tree depth bounds cost (typically ≤ 4 for
+    /// real apps). Cached-ancestry alternative deferred to
+    /// Stage 5 if profiling shows it.
+    pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
+        let leaf_id = self.store.lookup(host_xid)?;
+        // Pixmaps aren't in `windows_v2` and can't themselves be
+        // redirect targets per Composite spec. Root is a window
+        // but also isn't tracked in `windows_v2` (parent = None,
+        // geometry implicit) — it CAN legitimately carry a
+        // redirected_target if a compositor redirects root itself.
+        // Check the leaf's own redirect on the short-circuit so
+        // root-redirect resolves correctly; for true pixmaps the
+        // store's accessor returns None anyway.
+        if !self.windows_v2.contains_key(&host_xid) {
+            if let Some(b_id) = self.store.redirected_target(leaf_id) {
+                return Some(PaintTarget {
+                    id: b_id,
+                    offset: (0, 0),
+                });
+            }
+            return Some(PaintTarget {
+                id: leaf_id,
+                offset: (0, 0),
+            });
+        }
+        let mut cur_xid = host_xid;
+        let mut cur_id = leaf_id;
+        let mut offset = (0_i32, 0_i32);
+        loop {
+            if let Some(b_id) = self.store.redirected_target(cur_id) {
+                return Some(PaintTarget { id: b_id, offset });
+            }
+            // No `windows_v2` entry means we've stepped onto root
+            // (parent = `core.window_id`, not tracked) or onto an
+            // unparented orphan. In both cases there's no parent
+            // chain left to walk; return identity at the leaf.
+            // (Root's own redirect was already checked on the
+            // prior loop iteration when `cur_id` became root_id.)
+            let Some(geom) = self.windows_v2.get(&cur_xid) else {
+                return Some(PaintTarget {
+                    id: leaf_id,
+                    offset: (0, 0),
+                });
+            };
+            match geom.parent {
+                None => {
+                    // Top-level: parent is root, not tracked in
+                    // `windows_v2`. `create_subwindow` records
+                    // `parent = None` when the host_parent is
+                    // root_xid (the if-not-in-windows_v2 branch),
+                    // so this is the production representation
+                    // for every top-level. Step up to root
+                    // explicitly so a `RedirectWindow(root, …)`
+                    // compositor sees top-level descendants route
+                    // through the root backing — codex round-7
+                    // finding (`parent == None` previously
+                    // returned identity without consulting root).
+                    offset.0 += i32::from(geom.x);
+                    offset.1 += i32::from(geom.y);
+                    if let Some(root_id) = self.store.lookup(self.core.window_id)
+                        && let Some(b_id) = self.store.redirected_target(root_id)
+                    {
+                        return Some(PaintTarget { id: b_id, offset });
+                    }
+                    // No root redirect: paint stays on the leaf
+                    // at its own origin. Explicit match (not `?`)
+                    // so we don't poison the outer Option.
+                    return Some(PaintTarget {
+                        id: leaf_id,
+                        offset: (0, 0),
+                    });
+                }
+                Some(parent_xid) => {
+                    offset.0 += i32::from(geom.x);
+                    offset.1 += i32::from(geom.y);
+                    cur_xid = parent_xid;
+                    // Parent xid not in the store means a
+                    // dangling reparent: fall back to identity.
+                    let Some(next_id) = self.store.lookup(parent_xid) else {
+                        return Some(PaintTarget {
+                            id: leaf_id,
+                            offset: (0, 0),
+                        });
+                    };
+                    cur_id = next_id;
+                }
+            }
         }
     }
 
@@ -935,6 +1086,48 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Stage 4a — shift each rect by `(dx, dy)` (saturating to
+    /// i16 range). Returns the input unchanged when both deltas
+    /// are zero. Used to translate window-local paint rects into
+    /// backing-local coords under COMPOSITE redirect: a paint
+    /// against descendant C of redirected W at offset
+    /// `(cx, cy)` against W lands at C's rect + `(cx, cy)` in
+    /// W's backing.
+    fn shift_rectangles_for_paint(
+        rects: &[Rectangle16],
+        (dx, dy): (i32, i32),
+    ) -> std::borrow::Cow<'_, [Rectangle16]> {
+        if dx == 0 && dy == 0 {
+            return std::borrow::Cow::Borrowed(rects);
+        }
+        std::borrow::Cow::Owned(
+            rects
+                .iter()
+                .map(|r| Rectangle16 {
+                    x: (i32::from(r.x) + dx).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                    y: (i32::from(r.y) + dy).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                    width: r.width,
+                    height: r.height,
+                })
+                .collect(),
+        )
+    }
+
+    /// Stage 4a — shift a picture's clip rects from
+    /// dst-drawable-local into backing-local coords. The clip
+    /// itself is stored in dst-window-local coords (pre-shifted
+    /// by Stage 3b's `clip_x` / `clip_y`); when paint resolves
+    /// through a redirected ancestor, the per-rect scissor in
+    /// the engine operates against the backing's storage extent,
+    /// so the clip must move with it.
+    fn shift_dst_picture_clip(
+        clip: Option<Vec<Rectangle16>>,
+        offset: (i32, i32),
+    ) -> Option<Vec<Rectangle16>> {
+        let rects = clip?;
+        Some(Self::shift_rectangles_for_paint(&rects, offset).into_owned())
+    }
+
     /// [`fill_rects_honoring_fill_state`] for the Solid arm.
     ///
     /// `GcFunction::Copy` (the common case) goes through the fast
@@ -943,12 +1136,12 @@ impl KmsBackendV2 {
     /// divert to `engine.logic_fill`, which builds a per-function
     /// `VkLogicOp` pipeline through the shared
     /// `LogicFillPipelineCache`. `GcFunction::NoOp` is a no-op.
-    fn fill_solid_rects(
-        &mut self,
-        id: crate::kms::v2::store::DrawableId,
-        fg: u32,
-        rects: &[Rectangle16],
-    ) {
+    ///
+    /// Stage 4a: `target` carries the resolved DrawableId + a
+    /// paint-translation offset for COMPOSITE redirect. Window-
+    /// local `rects` are shifted by `target.offset` before going
+    /// to the engine.
+    fn fill_solid_rects(&mut self, target: PaintTarget, fg: u32, rects: &[Rectangle16]) {
         use yserver_core::backend::GcFunction;
         if rects.is_empty() {
             return;
@@ -957,6 +1150,8 @@ impl KmsBackendV2 {
         if matches!(function, GcFunction::NoOp) {
             return;
         }
+        let (dx, dy) = target.offset;
+        let id = target.id;
         if !matches!(function, GcFunction::Copy) {
             // Compute `opaque_alpha` per the L1 server-α invariant:
             // depth-32 ARGB destinations take the LogicOp on all four
@@ -964,6 +1159,10 @@ impl KmsBackendV2 {
             // pipeline's write mask drops alpha to keep the dst byte
             // intact. Depth lookup via the drawable record.
             let opaque_alpha = self.store.get(id).map(|d| d.depth != 32).unwrap_or(true);
+            // Stage 4a — shift window-local rects into backing-local
+            // coords when this paint resolves through a redirected
+            // ancestor. `Cow::Borrowed` when offset is (0, 0).
+            let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
@@ -971,7 +1170,7 @@ impl KmsBackendV2 {
                 function,
                 opaque_alpha,
                 fg,
-                rects,
+                &shifted,
             ) {
                 Ok(()) => {
                     // One submit per call regardless of rect count
@@ -992,13 +1191,16 @@ impl KmsBackendV2 {
         // / PolyRectangle fan-outs now pay O(1) submits per protocol
         // request instead of O(N). Zero-sized rects are filtered
         // inside the engine.
+        //
+        // Stage 4a — apply paint-target offset (window-local →
+        // backing-local) directly into the i32 vk::Offset2D.
         let vk_rects: Vec<ash::vk::Rect2D> = rects
             .iter()
             .filter(|r| r.width != 0 && r.height != 0)
             .map(|r| ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
-                    x: i32::from(r.x),
-                    y: i32::from(r.y),
+                    x: i32::from(r.x) + dx,
+                    y: i32::from(r.y) + dy,
                 },
                 extent: ash::vk::Extent2D {
                     width: u32::from(r.width),
@@ -1037,7 +1239,7 @@ impl KmsBackendV2 {
     /// to solid for now; proper stipple support is post-Stage-3.
     fn fill_rects_honoring_fill_state(
         &mut self,
-        id: crate::kms::v2::store::DrawableId,
+        target: PaintTarget,
         fg: u32,
         rects: &[Rectangle16],
     ) {
@@ -1057,19 +1259,19 @@ impl KmsBackendV2 {
                     // Non-Copy + Tiled isn't covered by any current
                     // client; degenerate to solid logic-op fill so
                     // the function is honoured (matches v1).
-                    self.fill_solid_rects(id, fg, rects);
+                    self.fill_solid_rects(target, fg, rects);
                     return;
                 }
-                if !self.try_tiled_fill(id, tile_xid, origin.0, origin.1, rects) {
+                if !self.try_tiled_fill(target, tile_xid, origin.0, origin.1, rects) {
                     // Tile not in store / aliases dst / non-BGRA8
                     // tile — degenerate to solid foreground.
-                    self.fill_solid_rects(id, fg, rects);
+                    self.fill_solid_rects(target, fg, rects);
                 }
             }
             FillState::Solid | FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
                 // Stipple support is post-Stage-3 (no real-app smoke
                 // client drives it on KMS). Fall through as solid.
-                self.fill_solid_rects(id, fg, rects);
+                self.fill_solid_rects(target, fg, rects);
             }
         }
     }
@@ -1078,9 +1280,15 @@ impl KmsBackendV2 {
     /// `true` iff the call submitted; `false` if the tile isn't
     /// usable (unknown xid, self-tile aliasing, non-BGRA8 tile
     /// format), in which case the caller falls back to solid.
+    ///
+    /// Stage 4a: `dst` carries the resolved DrawableId + offset.
+    /// Dst-space rect origins are shifted by `dst.offset` to land
+    /// in backing coords; `src_x/src_y` stay window-local because
+    /// they're a `(dst - tile_origin)` difference that doesn't
+    /// depend on the absolute frame.
     fn try_tiled_fill(
         &mut self,
-        dst_id: crate::kms::v2::store::DrawableId,
+        dst: PaintTarget,
         tile_xid: u32,
         ox: i16,
         oy: i16,
@@ -1094,7 +1302,7 @@ impl KmsBackendV2 {
             log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} not in store");
             return false;
         };
-        if tile_id == dst_id {
+        if tile_id == dst.id {
             // Self-tile would alias src + dst inside render_composite.
             return false;
         }
@@ -1103,6 +1311,7 @@ impl KmsBackendV2 {
             log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8");
             return false;
         }
+        let (dx, dy) = dst.offset;
         // Build per-rect CompositeRects in dst space with
         // `src_origin = dst - tile_origin` so the shader's
         // `src_origin + dst_offset` lands on the right tile pixel.
@@ -1117,8 +1326,8 @@ impl KmsBackendV2 {
                     src_y: i32::from(r.y) - i32::from(oy),
                     mask_x: 0,
                     mask_y: 0,
-                    dst_x: i32::from(r.x),
-                    dst_y: i32::from(r.y),
+                    dst_x: i32::from(r.x) + dx,
+                    dst_y: i32::from(r.y) + dy,
                     width: u32::from(r.width),
                     height: u32::from(r.height),
                 })
@@ -1135,7 +1344,7 @@ impl KmsBackendV2 {
             OP_SRC,
             ResolvedSource::Drawable(tile_id),
             ResolvedSource::None,
-            dst_id,
+            dst.id,
             &composite_rects,
             None, // GC clip already applied by caller
             Repeat::Normal,
@@ -1271,9 +1480,13 @@ impl KmsBackendV2 {
         let Some(font_xid) = self.core.current_font else {
             return Ok(());
         };
-        let Some(target_id) = self.store.lookup(host_xid) else {
+        // Stage 4a — resolve through redirect routing. Glyph
+        // `dst_x` / `dst_y` per `PreparedGlyph` get the
+        // window→backing translation applied below.
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
+        let (paint_dx, paint_dy) = target.offset;
         // Rasterise glyphs in a tight FreeType-borrow scope so the
         // subsequent &mut self engine call doesn't conflict.
         let mut rendered: Vec<PreparedGlyph> = Vec::with_capacity(text.len());
@@ -1309,8 +1522,8 @@ impl KmsBackendV2 {
                         pixels[row * w..row * w + w].copy_from_slice(&buf[src..src + w]);
                     }
                     rendered.push(PreparedGlyph {
-                        dst_x: cursor_x + glyph.bitmap_left(),
-                        dst_y: y - glyph.bitmap_top(),
+                        dst_x: cursor_x + glyph.bitmap_left() + paint_dx,
+                        dst_y: y - glyph.bitmap_top() + paint_dy,
                         w,
                         h,
                         pixels,
@@ -1332,7 +1545,7 @@ impl KmsBackendV2 {
         match self.engine.image_text(
             &mut self.store,
             &mut self.platform,
-            target_id,
+            target.id,
             font_xid,
             foreground_rgba,
             &rendered,
@@ -1376,12 +1589,17 @@ impl KmsBackendV2 {
         if w <= 0 || h <= 0 {
             return Ok(());
         }
-        let Some(target_id) = self.store.lookup(host_xid) else {
+        // Stage 4a — resolve through redirect; rect origin is
+        // shifted by the descendant→ancestor-backing offset.
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
         let color = decode_x11_pixel_bgra(background);
         let rect = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D { x, y },
+            offset: ash::vk::Offset2D {
+                x: x + target.offset.0,
+                y: y + target.offset.1,
+            },
             extent: ash::vk::Extent2D {
                 width: u32::try_from(w).unwrap_or(0),
                 height: u32::try_from(h).unwrap_or(0),
@@ -1389,7 +1607,7 @@ impl KmsBackendV2 {
         };
         if let Err(e) =
             self.engine
-                .fill_rect(&mut self.store, &mut self.platform, target_id, rect, color)
+                .fill_rect(&mut self.store, &mut self.platform, target.id, rect, color)
         {
             log::warn!("v2 image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
         } else {
@@ -1864,19 +2082,23 @@ fn resolve_picture_for_render(
 
 /// Stage 3c: dst picture resolution. RENDER paint ops require
 /// the dst to be a `PictureRecord::Drawable` (you can't paint
-/// into a SolidFill or a Gradient). Returns the resolved
-/// `DrawableId` plus the picture's clip rectangles (already
-/// pre-shifted by `clip_x` / `clip_y` per Stage 3b).
+/// into a SolidFill or a Gradient). Returns the underlying
+/// dst drawable's `host_xid` plus the picture's clip rectangles
+/// (already pre-shifted by `clip_x` / `clip_y` per Stage 3b).
+///
+/// Stage 4a: callers feed `host_xid` through
+/// `KmsBackendV2::resolve_paint_target` to apply COMPOSITE
+/// redirect routing. The free function stays pure
+/// (`&KmsCore`-only) so it can also be called from contexts
+/// where the windows_v2 / parent chain isn't relevant.
 fn resolve_dst_picture_for_render(
     core: &KmsCore,
-    store: &crate::kms::v2::store::DrawableStore,
     host_pic: u32,
-) -> Option<(crate::kms::v2::store::DrawableId, Option<Vec<Rectangle16>>)> {
+) -> Option<(u32, Option<Vec<Rectangle16>>)> {
     let PictureRecord::Drawable { host_xid, clip, .. } = core.pictures.get(&host_pic)? else {
         return None;
     };
-    let id = store.lookup(*host_xid)?;
-    Some((id, clip.clone()))
+    Some((*host_xid, clip.clone()))
 }
 
 /// Stage 3f.8: 16×16 BGRA8 default-arrow cursor sprite. Hotspot
@@ -2694,9 +2916,18 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         self.core.bg_pixel = Some(pixel);
         self.core.bg_pixmap = None;
-        if let Some(id) = self.store.lookup(self.core.window_id) {
+        // Stage 4a — root paint resolves through redirect routing.
+        // In the common (unredirected) case this is the leaf root
+        // drawable; if a compositor has redirected root, paint
+        // lands in its backing instead. `resolve_paint_target`
+        // returns `None` only when the root xid isn't in the
+        // store, which is a fixture-init bug.
+        if let Some(target) = self.resolve_paint_target(self.core.window_id) {
             let rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
+                offset: ash::vk::Offset2D {
+                    x: target.offset.0,
+                    y: target.offset.1,
+                },
                 extent: ash::vk::Extent2D {
                     width: u32::from(self.platform.fb_w.max(1)),
                     height: u32::from(self.platform.fb_h.max(1)),
@@ -2705,7 +2936,7 @@ impl Backend for KmsBackendV2 {
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,
-                id,
+                target.id,
                 rect,
                 decode_x11_pixel_bgra(pixel),
             ) {
@@ -2726,10 +2957,12 @@ impl Backend for KmsBackendV2 {
         use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
-        let Some(dst) = self.store.lookup(self.core.window_id) else {
+        // Stage 4a — root paint resolves through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
             self.scene.mark_scene_structure_dirty();
             return Ok(());
         };
+        let dst = dst_target.id;
         let Some(src) = self.store.lookup(host_pixmap_xid) else {
             log::debug!(
                 "v2 set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
@@ -2774,8 +3007,8 @@ impl Backend for KmsBackendV2 {
             src_y: 0,
             mask_x: 0,
             mask_y: 0,
-            dst_x: 0,
-            dst_y: 0,
+            dst_x: dst_target.offset.0,
+            dst_y: dst_target.offset.1,
             width: dst_extent.width,
             height: dst_extent.height,
         }];
@@ -2931,10 +3164,17 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let (Some(src), Some(dst)) = (
-            self.store.lookup(src_host_xid),
-            self.store.lookup(dst_host_xid),
-        ) else {
+        let Some(src) = self.store.lookup(src_host_xid) else {
+            self.log_v2_gap("copy_area_unknown_xid");
+            return Ok(());
+        };
+        // Stage 4a — dst resolves through `resolve_paint_target` so
+        // copy_area into a redirected window lands in the backing
+        // with the descendant offset applied. Source stays at the
+        // raw store lookup per spec § "render_composite separates
+        // src/dst resolution" — the X11 client reads from the
+        // drawable as it sees it.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
@@ -2949,14 +3189,14 @@ impl Backend for KmsBackendV2 {
             },
         };
         let dst_pos = ash::vk::Offset2D {
-            x: i32::from(dst_x),
-            y: i32::from(dst_y),
+            x: i32::from(dst_x) + dst_target.offset.0,
+            y: i32::from(dst_y) + dst_target.offset.1,
         };
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
             &mut self.platform,
             src,
-            dst,
+            dst_target.id,
             src_rect,
             dst_pos,
         ) {
@@ -3134,7 +3374,7 @@ impl Backend for KmsBackendV2 {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("put_image_unknown_xid");
             return Ok(());
         };
@@ -3152,10 +3392,10 @@ impl Backend for KmsBackendV2 {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            id,
+            target.id,
             ash::vk::Offset2D {
-                x: i32::from(dst_x),
-                y: i32::from(dst_y),
+                x: i32::from(dst_x) + target.offset.0,
+                y: i32::from(dst_y) + target.offset.1,
             },
             ash::vk::Extent2D {
                 width: u32::from(width),
@@ -3182,18 +3422,23 @@ impl Backend for KmsBackendV2 {
         height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        // Stage 4a — resolve through redirect routing per spec Risk 1
+        // ("GetImage reads what the X server considers W's content,
+        // which under redirect is B"). Depth comes from the
+        // resolved target's drawable (backing is allocated to match
+        // W's depth, so v1 / v2 see the same wire shape).
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("get_image_unknown_xid");
             return Ok(None);
         };
-        let depth = match self.store.get(id) {
+        let depth = match self.store.get(target.id) {
             Some(d) => d.depth,
             None => return Ok(None),
         };
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: i32::from(x),
-                y: i32::from(y),
+                x: i32::from(x) + target.offset.0,
+                y: i32::from(y) + target.offset.1,
             },
             extent: ash::vk::Extent2D {
                 width: u32::from(width),
@@ -3203,7 +3448,7 @@ impl Backend for KmsBackendV2 {
         let start = std::time::Instant::now();
         match self
             .engine
-            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
         {
             Ok(bytes) => {
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -3226,7 +3471,7 @@ impl Backend for KmsBackendV2 {
         coordinate_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_line_unknown_xid");
             return Ok(());
         };
@@ -3252,7 +3497,7 @@ impl Backend for KmsBackendV2 {
             prev = Some((xi, yi));
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
 
@@ -3263,7 +3508,7 @@ impl Backend for KmsBackendV2 {
         foreground: u32,
         segments: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_segment_unknown_xid");
             return Ok(());
         };
@@ -3287,7 +3532,7 @@ impl Backend for KmsBackendV2 {
             );
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
 
@@ -3298,7 +3543,7 @@ impl Backend for KmsBackendV2 {
         foreground: u32,
         rectangles: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_rectangle_unknown_xid");
             return Ok(());
         };
@@ -3343,7 +3588,7 @@ impl Backend for KmsBackendV2 {
             });
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
 
@@ -3354,7 +3599,7 @@ impl Backend for KmsBackendV2 {
         foreground: u32,
         arcs: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_arc_unknown_xid");
             return Ok(());
         };
@@ -3427,7 +3672,7 @@ impl Backend for KmsBackendV2 {
             }
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
 
@@ -3439,7 +3684,7 @@ impl Backend for KmsBackendV2 {
         coordinate_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_point_unknown_xid");
             return Ok(());
         };
@@ -3464,7 +3709,7 @@ impl Backend for KmsBackendV2 {
             });
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(id, foreground, &rects);
+        self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
 
@@ -3476,7 +3721,7 @@ impl Backend for KmsBackendV2 {
         rectangles: &[u8],
     ) -> io::Result<()> {
         // Each X11 Rectangle is 8 bytes: { i16 x, i16 y, u16 w, u16 h }.
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_fill_rectangle_unknown_xid");
             return Ok(());
         };
@@ -3490,7 +3735,7 @@ impl Backend for KmsBackendV2 {
             rects.push(r);
         }
         let rects = self.intersect_with_current_clip(&rects);
-        self.fill_rects_honoring_fill_state(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(target, foreground, &rects);
         Ok(())
     }
 
@@ -3501,7 +3746,7 @@ impl Backend for KmsBackendV2 {
         foreground: u32,
         arcs: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("poly_fill_arc_unknown_xid");
             return Ok(());
         };
@@ -3548,7 +3793,7 @@ impl Backend for KmsBackendV2 {
         }
         if !rects.is_empty() {
             let rects = self.intersect_with_current_clip(&rects);
-            self.fill_rects_honoring_fill_state(id, foreground, &rects);
+            self.fill_rects_honoring_fill_state(target, foreground, &rects);
         }
         Ok(())
     }
@@ -3561,7 +3806,7 @@ impl Backend for KmsBackendV2 {
         coord_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("fill_poly_unknown_xid");
             return Ok(());
         };
@@ -3587,7 +3832,7 @@ impl Backend for KmsBackendV2 {
             .unwrap_or((0, 0));
         let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
         let rects = self.intersect_with_current_clip(&clipped);
-        self.fill_rects_honoring_fill_state(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(target, foreground, &rects);
         Ok(())
     }
 
@@ -3601,7 +3846,7 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("fill_rectangle_unknown_xid");
             return Ok(());
         };
@@ -3611,7 +3856,7 @@ impl Backend for KmsBackendV2 {
             width,
             height,
         }]);
-        self.fill_rects_honoring_fill_state(id, foreground, &rects);
+        self.fill_rects_honoring_fill_state(target, foreground, &rects);
         Ok(())
     }
 
@@ -4007,20 +4252,30 @@ impl Backend for KmsBackendV2 {
             };
             t
         };
-        let Some((dst_id, dst_clip)) =
-            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture");
             return Ok(());
         };
+        // Stage 4a — resolve through redirect routing. The picture
+        // wraps a window xid; the actual paint may land in that
+        // window's COMPOSITE backing with an accumulated offset.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!(
+                "v2 render_composite gap: dst drawable 0x{dst_host_xid:x} \
+                 not in store (post-resolve)"
+            );
+            return Ok(());
+        };
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
 
         let rect = crate::kms::vk::ops::render::CompositeRect {
             src_x: i32::from(src_x),
             src_y: i32::from(src_y),
             mask_x: i32::from(mask_x),
             mask_y: i32::from(mask_y),
-            dst_x: i32::from(dst_x),
-            dst_y: i32::from(dst_y),
+            dst_x: i32::from(dst_x) + dst_target.offset.0,
+            dst_y: i32::from(dst_y) + dst_target.offset.1,
             width: u32::from(width),
             height: u32::from(height),
         };
@@ -4030,7 +4285,7 @@ impl Backend for KmsBackendV2 {
             op,
             src_resolved,
             mask_resolved,
-            dst_id,
+            dst_target.id,
             std::slice::from_ref(&rect),
             dst_clip.as_deref(),
             src_repeat,
@@ -4124,12 +4379,17 @@ impl Backend for KmsBackendV2 {
                 return Ok(());
             }
         };
-        let Some((dst_id, dst_clip)) =
-            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
             return Ok(());
         };
+        // Stage 4a — resolve through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!("v2 composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store");
+            return Ok(());
+        };
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         if !self.core.glyphsets.contains_key(&host_gs) {
             log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
             return Ok(());
@@ -4312,7 +4572,10 @@ impl Backend for KmsBackendV2 {
         }
 
         // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
-        // with a stable slice reference.
+        // with a stable slice reference. Stage 4a — apply the
+        // dst-target offset to each glyph's dst coordinates so a
+        // redirected window's glyphs land in the backing.
+        let (paint_dx, paint_dy) = dst_target.offset;
         let inputs: Vec<CompositeGlyphInput<'_>> = parsed
             .iter()
             .filter_map(|p| {
@@ -4331,8 +4594,8 @@ impl Backend for KmsBackendV2 {
                     w: p.w,
                     h: p.h,
                     pixels,
-                    dst_x: p.dst_x,
-                    dst_y: p.dst_y,
+                    dst_x: p.dst_x + paint_dx,
+                    dst_y: p.dst_y + paint_dy,
                 })
             })
             .collect();
@@ -4344,7 +4607,7 @@ impl Backend for KmsBackendV2 {
         let stats = self.engine.composite_glyphs(
             &mut self.store,
             &mut self.platform,
-            dst_id,
+            dst_target.id,
             foreground_premul,
             &inputs,
             dst_clip.as_deref(),
@@ -4390,14 +4653,22 @@ impl Backend for KmsBackendV2 {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<()> {
-        let Some((dst_id, dst_clip)) =
-            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!(
                 "v2 render_fill_rectangles gap: host_dst 0x{host_dst:x} not a Drawable picture"
             );
             return Ok(());
         };
+        // Stage 4a — redirect routing for dst.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!(
+                "v2 render_fill_rectangles gap: dst drawable 0x{dst_host_xid:x} not in store"
+            );
+            return Ok(());
+        };
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
+        let (paint_dx, paint_dy) = dst_target.offset;
 
         // X RENDER XRenderColor is wire-premultiplied (rendercheck
         // main.c:337-345); pass through unchanged.
@@ -4423,8 +4694,8 @@ impl Backend for KmsBackendV2 {
                 src_y: 0,
                 mask_x: 0,
                 mask_y: 0,
-                dst_x: i32::from(rx),
-                dst_y: i32::from(ry),
+                dst_x: i32::from(rx) + paint_dx,
+                dst_y: i32::from(ry) + paint_dy,
                 width: u32::from(rw),
                 height: u32::from(rh),
             });
@@ -4438,7 +4709,7 @@ impl Backend for KmsBackendV2 {
             &mut self.platform,
             op,
             color_premul,
-            dst_id,
+            dst_target.id,
             &decoded,
             dst_clip.as_deref(),
         );
@@ -4494,8 +4765,31 @@ impl Backend for KmsBackendV2 {
                 right_p2: (read_i32(32), read_i32(36)),
             });
         }
-        let dx = i32::from(x_off) << 16;
-        let dy = i32::from(y_off) << 16;
+        // Resolve src + dst via the same helpers render_composite
+        // uses. The trap path doesn't read GC clip — picture clip
+        // (from dst) is what scopes the draw (plan §4).
+        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
+        else {
+            log::debug!("v2 render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(());
+        };
+        // Stage 4a — redirect routing for dst. The fold of
+        // `x_off`/`y_off` and the redirect offset (both in pixel
+        // units) into a single fixed-point delta keeps the
+        // 16.16-arithmetic single-pass.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!("v2 render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store");
+            return Ok(());
+        };
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
+        let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
+        let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
         if dx != 0 || dy != 0 {
             for t in &mut decoded {
                 t.top = t.top.wrapping_add(dy);
@@ -4532,27 +4826,12 @@ impl Backend for KmsBackendV2 {
             instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
         }
 
-        // Resolve src + dst via the same helpers render_composite
-        // uses. The trap path doesn't read GC clip — picture clip
-        // (from dst) is what scopes the draw (plan §4).
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
-        else {
-            log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
-            return Ok(());
-        };
-        let Some((dst_id, dst_clip)) =
-            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
-        else {
-            log::debug!("v2 render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(());
-        };
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
             op,
             src_resolved,
-            dst_id,
+            dst_target.id,
             TrapPrimKind::Trapezoid,
             &instance_bytes,
             #[allow(clippy::cast_possible_truncation)]
@@ -4655,8 +4934,26 @@ impl Backend for KmsBackendV2 {
         if tris.is_empty() {
             return Ok(());
         }
-        let dx = i32::from(x_off) << 16;
-        let dy = i32::from(y_off) << 16;
+        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
+        else {
+            log::debug!("v2 render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(());
+        };
+        // Stage 4a — redirect routing for dst; fold the redirect
+        // offset into the same fixed-point delta as `x_off/y_off`.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!("v2 render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store");
+            return Ok(());
+        };
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
+        let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
+        let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
         if dx != 0 || dy != 0 {
             for t in &mut tris {
                 t.p1.0 = t.p1.0.wrapping_add(dx);
@@ -4687,24 +4984,12 @@ impl Backend for KmsBackendV2 {
             instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
         }
 
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
-        else {
-            log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
-            return Ok(());
-        };
-        let Some((dst_id, dst_clip)) =
-            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
-        else {
-            log::debug!("v2 render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(());
-        };
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
             op,
             src_resolved,
-            dst_id,
+            dst_target.id,
             TrapPrimKind::Triangle,
             &instance_bytes,
             #[allow(clippy::cast_possible_truncation)]
@@ -6758,5 +7043,380 @@ mod tests {
         assert_eq!(geom.parent, None);
         assert_eq!(geom.x, 100);
         assert_eq!(geom.y, 200);
+    }
+
+    // ───── Stage 4a — resolve_paint_target ─────────────────────────
+
+    /// Seed a window in `windows_v2` and a matching no-Vk store
+    /// entry, returning the new DrawableId. Used by the 4a
+    /// resolver tests so the ancestor walk has something to chew
+    /// on without touching Vk.
+    fn seed_window(
+        b: &mut KmsBackendV2,
+        xid: u32,
+        parent: Option<u32>,
+        x: i16,
+        y: i16,
+    ) -> crate::kms::v2::store::DrawableId {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        b.windows_v2.insert(
+            xid,
+            super::WindowGeometryV2 {
+                x,
+                y,
+                width: 100,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.store
+            .allocate(
+                xid,
+                DrawableKind::Window,
+                32,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("seed_window allocate")
+    }
+
+    /// Unknown xid → `None`. The resolver's first step is
+    /// `store.lookup`, which fails for an xid that was never
+    /// allocated.
+    #[test]
+    fn resolve_paint_target_unknown_xid_returns_none() {
+        let b = KmsBackendV2::for_tests();
+        assert_eq!(b.resolve_paint_target(0xDEAD_BEEF), None);
+    }
+
+    /// Pixmap xid (not in `windows_v2`) with no redirect →
+    /// identity result. Covers the pre-loop short-circuit so the
+    /// ancestor walk never reads `None` off a pixmap.
+    #[test]
+    fn resolve_paint_target_pixmap_returns_identity() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let pix_id = b
+            .store
+            .allocate(
+                0x2000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("pixmap allocate");
+        let pt = b.resolve_paint_target(0x2000).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: pix_id,
+                offset: (0, 0)
+            }
+        );
+    }
+
+    /// Top-level window with no redirect → identity result.
+    /// `parent == None` reaches the explicit fall-through arm; the
+    /// resolver must NOT short-circuit to `None` via `?` on the
+    /// missing parent.
+    #[test]
+    fn resolve_paint_target_unredirected_top_level_returns_identity() {
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let pt = b.resolve_paint_target(0x100).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: w_id,
+                offset: (0, 0)
+            }
+        );
+    }
+
+    /// `set_redirected_target(W, Some(B))` routes paint against
+    /// `W`'s xid to `B`'s drawable. Offset stays `(0, 0)` —
+    /// `W` is the redirected node itself, not a descendant.
+    #[test]
+    fn resolve_paint_target_redirected_window_routes_to_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let b_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(b_id));
+        let pt = b.resolve_paint_target(0x100).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: b_id,
+                offset: (0, 0)
+            }
+        );
+    }
+
+    /// Descendant paint accumulates `(x, y)` offsets up the
+    /// ancestor chain. W at root with redirect to B; child C at
+    /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
+    /// G's xid resolves to `(B, (13, 24))` — the sum of the
+    /// child offsets traversed.
+    #[test]
+    fn resolve_paint_target_descendant_accumulates_offset() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
+        let b_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 200,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(b_id));
+        let pt = b.resolve_paint_target(0x300).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: b_id,
+                offset: (13, 24)
+            }
+        );
+    }
+
+    /// Top-level whose `parent == Some(root_xid)` (root isn't in
+    /// `windows_v2`) walks one step and finds root's redirect
+    /// state. With root un-redirected, paint stays on the leaf.
+    /// Regression for the resolver-returns-None bug that surfaced
+    /// when `v2_subwindow_resize_clears_old_paint` started routing
+    /// `fill_rectangle` through `resolve_paint_target` and the
+    /// previous `windows_v2.get(parent_xid)?` chain poisoned the
+    /// outer Option for any parent==root case.
+    #[test]
+    fn resolve_paint_target_parent_root_falls_back_to_identity() {
+        let mut b = KmsBackendV2::for_tests();
+        // root_xid is seeded via `KmsCore::for_tests()` and present
+        // in the store (init_root_storage); but NOT in windows_v2.
+        let root_xid = b.core.window_id;
+        assert!(!b.windows_v2.contains_key(&root_xid));
+        let w_id = seed_window(&mut b, 0x100, Some(root_xid), 0, 0);
+        let pt = b.resolve_paint_target(0x100).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: w_id,
+                offset: (0, 0)
+            }
+        );
+    }
+
+    /// Root itself can be the redirect target — a compositor that
+    /// runs `RedirectWindow(root, …)` sets `redirected_target` on
+    /// root's drawable. Paint against root or its descendants
+    /// resolves through the root-backing.
+    ///
+    /// Codex round-7 finding: top-level windows are recorded with
+    /// `parent == None` (NOT `Some(root_xid)`) by
+    /// `create_subwindow` because root isn't tracked in
+    /// `windows_v2`. The pre-fix resolver's `None` arm returned
+    /// identity without consulting root, so real top-level
+    /// descendants bypassed the root backing.
+    #[test]
+    fn resolve_paint_target_redirected_root_routes_descendants() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let root_xid = b.core.window_id;
+        let root_id = b.store.lookup(root_xid).expect("root id");
+        // Use the production representation: `parent = None`
+        // marks a top-level whose host_parent is root_xid (see
+        // `create_subwindow`'s `if !windows_v2.contains_key →
+        // parent = None` branch). Also seed a descendant whose
+        // parent IS the top-level so we exercise the full walk.
+        let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
+        let _c_id = seed_window(&mut b, 0x101, Some(0x100), 3, 4);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 800,
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(root_id, Some(backing_id));
+        // Root paint (direct) resolves through the leaf-level
+        // pre-loop short-circuit.
+        let pt_root = b.resolve_paint_target(root_xid).expect("resolve root");
+        assert_eq!(
+            pt_root,
+            super::PaintTarget {
+                id: backing_id,
+                offset: (0, 0)
+            }
+        );
+        // Top-level (parent=None production rep) must walk into
+        // root's redirect with its own (x, y) accumulated.
+        let pt_w = b.resolve_paint_target(0x100).expect("resolve W");
+        assert_eq!(
+            pt_w,
+            super::PaintTarget {
+                id: backing_id,
+                offset: (50, 60)
+            }
+        );
+        // Descendant of a top-level: accumulates C-in-W (3, 4)
+        // then W-in-root (50, 60) → (53, 64).
+        let pt_c = b.resolve_paint_target(0x101).expect("resolve C");
+        assert_eq!(
+            pt_c,
+            super::PaintTarget {
+                id: backing_id,
+                offset: (53, 64)
+            }
+        );
+    }
+
+    /// Plan §4a (Tests, line 644-646): clearing a redirect via
+    /// `set_redirected_target(W, None)` falls back to leaf-storage
+    /// routing. The store-level `set_redirected_target_none_clears_route`
+    /// verifies the field is cleared; this end-to-end check
+    /// asserts the resolver flow honours that. Catches a regression
+    /// where a missing branch / wrong `?` could special-case the
+    /// cleared state.
+    #[test]
+    fn resolve_paint_target_after_clear_falls_back_to_identity() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        // Install the redirect, then immediately clear it.
+        b.store.set_redirected_target(w_id, Some(backing_id));
+        b.store.set_redirected_target(w_id, None);
+        let pt = b.resolve_paint_target(0x100).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: w_id,
+                offset: (0, 0)
+            },
+            "cleared redirect must fall through to leaf identity",
+        );
+    }
+
+    /// Nearest redirected ancestor wins. W→B_W and C→B_C both
+    /// redirected; grandchild G under C must route to B_C with
+    /// the C-relative offset, NOT to B_W with the
+    /// W-relative offset.
+    #[test]
+    fn resolve_paint_target_stops_at_nearest_redirected_ancestor() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let _g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
+        let bw_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 200,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("B_W");
+        let bc_id = b
+            .store
+            .allocate(
+                0x901,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("B_C");
+        b.store.set_redirected_target(w_id, Some(bw_id));
+        b.store.set_redirected_target(c_id, Some(bc_id));
+        let pt = b.resolve_paint_target(0x300).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: bc_id,
+                offset: (3, 4)
+            }
+        );
     }
 }
