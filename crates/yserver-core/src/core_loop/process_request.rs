@@ -2823,6 +2823,24 @@ fn handle_composite_request(
                         COMPOSITE_MAJOR_OPCODE,
                     );
                 }
+                let mode_flip = matches!(prev, Some(p) if p.mode != mode);
+                let mode_flip_suffix = if mode_flip {
+                    match prev {
+                        Some(p) => format!(" [mode-flip from {:?}]", p.mode),
+                        None => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                debug!(
+                    "client {} #{} COMPOSITE::Redirect{}(0x{:x}, mode={:?}{})",
+                    client_id.0,
+                    sequence.0,
+                    if subwindows { "Subwindows" } else { "Window" },
+                    window,
+                    mode,
+                    mode_flip_suffix,
+                );
                 state.composite_redirects.insert(
                     key,
                     crate::server::RedirectRecord {
@@ -2847,7 +2865,6 @@ fn handle_composite_request(
                     // preserved as-is — re-running the seed-copy
                     // would clobber the compositor's in-flight
                     // paint per the plan's codex-round-6 decision).
-                    let mode_flip = matches!(prev, Some(p) if p.mode != mode);
                     let targets: Vec<ResourceId> = if subwindows {
                         // Snapshot children to a Vec — the helper takes
                         // `&mut state`, so the borrow on `state.resources`
@@ -2886,6 +2903,14 @@ fn handle_composite_request(
                 } else {
                     vec![ResourceId(window)]
                 };
+                debug!(
+                    "client {} #{} COMPOSITE::Unredirect{}(0x{:x}) targets={}",
+                    client_id.0,
+                    sequence.0,
+                    if subwindows { "Subwindows" } else { "Window" },
+                    window,
+                    targets.len(),
+                );
                 for target in &targets {
                     crate::core_loop::process_disconnect::teardown_redirect_for_window(
                         state, backend, *target,
@@ -2933,6 +2958,10 @@ fn handle_composite_request(
             };
             let window = ResourceId(window_raw);
             let pixmap = ResourceId(pixmap_raw);
+            debug!(
+                "client {} #{} COMPOSITE::NameWindowPixmap(window=0x{:x}, pixmap=0x{:x})",
+                client_id.0, sequence.0, window_raw, pixmap_raw,
+            );
             let snapshot = state.resources.window(window).map(|w| {
                 let parent_redirected = state
                     .composite_redirects
@@ -2993,7 +3022,11 @@ fn handle_composite_request(
             }
             let host_pixmap_xid = match backend.name_window_pixmap(origin, host_window_xid) {
                 Ok(handle) => handle,
-                Err(_) => {
+                Err(err) => {
+                    debug!(
+                        "client {} #{} COMPOSITE::NameWindowPixmap(window=0x{:x}) -> Err: {err}",
+                        client_id.0, sequence.0, window_raw,
+                    );
                     return emit_x11_error_with_minor(
                         state,
                         client_id,

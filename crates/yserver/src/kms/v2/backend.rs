@@ -2846,7 +2846,12 @@ impl Backend for KmsBackendV2 {
         _mask: u32,
         _enabled: bool,
     ) -> io::Result<()> {
-        self.log_v2_gap("update_host_event_mask");
+        // No-op on KMS, same shape as v1. The trait method is a
+        // holdover from Phase 6.3 ynest where it forwarded event-mask
+        // changes to a host X server; KMS owns the display directly
+        // and has no upstream server to notify. Event delivery on KMS
+        // is driven entirely from libinput/seat plumbing inside the
+        // backend, so there's nothing to update here.
         Ok(())
     }
 
