@@ -1587,15 +1587,57 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       `_existing_alias_survives_window_unmap`) — need
       `handle_composite_request` test scaffolding which doesn't
       exist in yserver-core today.
-    - **4c.6 (HARDWARE SMOKE — USER OWNED, NOT YET RUN)**: 
-      `just yserver-mate-hw` with mate-session +
-      marco-with-compositing on bee + fuji. v2 is the boot
-      default since `3afa5bd`. Enable marco compositing in
-      MATE control center or `gsettings set
-      org.mate.Marco.general compositing-manager true`. Gate:
-      window decorations + drop shadows render correctly; no
-      `render_composite gap: host_src 0x... not resolvable`
-      lines from marco's compositor log.
+    - **4c.6 (HARDWARE SMOKE)** — ran 2026-05-17 on bee
+      (RDNA2/RADV). Result: **black screen + partial mate-panel
+      gray bar at top + repeating `render_composite gap:
+      host_src 0x40005f not resolvable`**. Diagnosis from
+      `yserver-hw.log` (12K lines) + `mate.log` cross-reference:
+
+      1. Marco issued **zero** `RedirectWindow` /
+         `RedirectSubwindows` calls during the entire ~20s
+         session. Only `COMPOSITE::QueryVersion` and
+         `COMPOSITE::GetOverlayWindow -> 0x103`. The
+         classic Redirect-based path that Stages 4a/4b/4c
+         built is **never exercised** by modern marco.
+      2. Marco's compositor uses pure COW (XComposite
+         Overlay Window). Marco called `GetOverlayWindow`,
+         got the sentinel xid `0x103`, then built a
+         Picture wrapping COW (xid `0x40005f` in the log).
+         The Picture record was correctly stored in
+         `core.pictures`, but the underlying drawable
+         `host_xid = 0x103` has no entry in the v2 store —
+         `get_overlay_window` returns the sentinel without
+         allocating storage. `resolve_picture_for_render`
+         → `store.lookup(0x103)` → `None` → render_composite
+         drops every paint marco issues. Repeats every tick
+         while marco's compositor is alive.
+      3. The plan's §4c gate text *"mate + marco-with-
+         compositing"* was a planning miss. The plan's own
+         §4c hedge for xfwm4 (*"renders if it doesn't use
+         COW (it likely does, so see 4d)"*) applies
+         identically to marco: marco-with-compositing
+         requires COW. The 4c implementation IS correct —
+         it's just unused by modern compositors. The
+         meaningful smoke that exercises 4c without 4d
+         would need a non-COW compositor (e.g. `xcompmgr`
+         classic, or marco-compositing-disabled with
+         non-COW XRender clients).
+
+      **4c implementation status: correct, unblocked by
+      this smoke result.** The black-screen failure mode
+      is the 4d-COW gap, not a 4c bug. mate-panel's gray
+      bar rendered correctly through the non-compositor
+      v2 paint pipeline (top-level windows compose via
+      `build_scene` per Stage 3f.6); caja-desktop hadn't
+      finished its wallpaper render by the time the session
+      was killed at ~20s.
+
+      Plan revision: §4c "Hardware smoke gate" amended to
+      reflect that marco-with-compositing is a 4d gate, not
+      a 4c gate. The 4c-only gate (if needed) is a
+      non-COW-using compositor or marco-without-compositing
+      exercising classic RedirectSubwindows from a synthetic
+      test. Deferred until 4d lands.
 
     Final reviewer assessment: READY_FOR_HARDWARE_SMOKE. 277
     yserver lib + 22 ignored v2 Vk + 28 v2_acceptance tests
@@ -1613,8 +1655,22 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     only — no `DrawableId` per the spec's `KmsCore` scope
     rule); `cow_id: Option<DrawableId>` on `KmsBackendV2`.
     `build_scene` appends COW above top-levels, below the
-    cursor. Hardware-smoke gate: full xfce4 session with
-    xfwm4-with-compositing on bee + fuji.
+    cursor.
+
+    **Promoted from "secondary gate" to "load-bearing":**
+    Per the 2026-05-17 4c.6 smoke result, both
+    marco-with-compositing AND xfwm4-with-compositing use
+    COW. 4d is the **actual** gate for "compositing WMs
+    render correctly" — not 4c. mate + marco-compositing
+    fails at 4c without 4d (`render_composite gap:
+    host_src 0x40005f not resolvable` log shape with
+    `0x40005f` being a Picture wrapping COW 0x103).
+
+    Hardware-smoke gate: **(a)** mate-session +
+    marco-with-compositing on bee + fuji — should now
+    render correctly with COW backing in place; and
+    **(b)** full xfce4 session with xfwm4-with-compositing
+    on bee + fuji. Both should pass after 4d.
 - [ ] **Stage 5 (optional) — advanced perf strategies.**
   Strategy plug-ins on the existing components: damage-strategy
   selection per frame, HW cursor return, direct scanout, HW
