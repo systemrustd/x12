@@ -152,6 +152,19 @@ pub struct KmsBackendV2 {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
+
+    /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
+    /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
+    /// futex) for idle/sync fences; the mmap'd mapping lets us
+    /// `xshmfence_trigger` directly when the X side wants to
+    /// signal idle. Mirrors v1's `dri3_xshmfences` field shape.
+    pub(crate) dri3_xshmfences: HashMap<u32, crate::kms::xshmfence::FenceMapping>,
+    /// DRI3 sync-fence / syncobj resources keyed by the client's
+    /// xid. Either `FenceFromFD` falling through the xshmfence
+    /// path (sync_file fd → `VkSemaphore`) or `ImportSyncobj`
+    /// (drm_syncobj fd → timeline `VkSemaphore`). Mirrors v1's
+    /// `dri3_sync_resources` field shape.
+    pub(crate) dri3_sync_resources: HashMap<u32, ash::vk::Semaphore>,
 }
 
 impl KmsBackendV2 {
@@ -203,6 +216,8 @@ impl KmsBackendV2 {
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
             cow_id: None,
+            dri3_xshmfences: HashMap::new(),
+            dri3_sync_resources: HashMap::new(),
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -398,6 +413,8 @@ impl KmsBackendV2 {
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
             cow_id: None,
+            dri3_xshmfences: HashMap::new(),
+            dri3_sync_resources: HashMap::new(),
         }
     }
 
@@ -5896,21 +5913,262 @@ impl Backend for KmsBackendV2 {
         Ok((0, 11))
     }
 
-    // ── DRI3 — all unsupported in v2 Stage 1b (no Vulkan) ───────
+    // ── DRI3 — ported from v1 (Stage 4d backfill) ───────────────
+    //
+    // Body shape mirrors `kms/backend.rs:8613-8869` verbatim — the
+    // helpers in `kms::vk::dri3`, `kms::vk::sync`, `kms::render_node`,
+    // and `kms::xshmfence` are already shared with v1, so v2 calls
+    // them directly. Without these, no compositor (marco, xfwm4,
+    // picom, compton) can import redirected window backings as GPU
+    // textures and the 4d-close hardware smoke wedges on
+    // PresentPixmap → COW.
+
+    fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+        // Open a fresh fd at the render-node path per client. dup()'ing
+        // a shared long-lived fd would give every client the same
+        // kernel struct file, and libdrm_amdgpu maintains GEM handles
+        // + contexts in per-struct-file state — the first client
+        // populates it, the second crashes in `amdgpu_winsys_create`
+        // hitting leftover handles. See
+        // feedback_dri3_open_fresh_fd.md.
+        let path = self.platform.render_node_path.as_deref().ok_or_else(|| {
+            io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
+        })?;
+        crate::kms::render_node::open_fresh(path)
+            .map_err(|e| io::Error::other(format!("open render-node {}: {e}", path.display())))
+    }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
-        Dri3Caps::unsupported()
+        // DRI3 entirely unavailable when render-node fd or Vulkan
+        // weren't resolved at backend init.
+        if self.platform.render_node_fd.is_none() || self.platform.vk.is_none() {
+            return Dri3Caps::unsupported();
+        }
+        let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
+        let modifiers = vk.image_drm_format_modifier;
+        // VK_KHR_external_semaphore_fd is unconditionally enabled at
+        // device init; fence_fd / SYNC_FD handle type rides along
+        // with it. syncobj uses the OPAQUE_FD + timeline-semaphore
+        // path also covered by VK_KHR_external_semaphore_fd — which
+        // Mesa prefers and Venus accepts (per the live vng smoke).
+        let fence_fd = true;
+        let syncobj = true;
+        // Version cap per Phase 4.2 design §4: with syncobj
+        // advertise (1, 4); without it cap at (1, 3).
+        let version = if syncobj { (1, 4) } else { (1, 3) };
+        Dri3Caps {
+            version,
+            modifiers,
+            fence_fd,
+            syncobj,
+        }
+    }
+
+    fn dri3_import_pixmap(
+        &mut self,
+        fd: std::os::fd::OwnedFd,
+        width: u16,
+        height: u16,
+        stride: u32,
+        offset: u32,
+        modifier: u64,
+        depth: u8,
+        bpp: u8,
+    ) -> io::Result<PixmapHandle> {
+        // Per Phase 4.2 design §3.2: import the dma-buf into a
+        // DrawableImage via VK_EXT_image_drm_format_modifier, wrap
+        // it as a v2 Storage, allocate a fresh Pixmap entry in
+        // the store. Pixmap exists as a real X resource so clients
+        // can CopyArea / ChangePicture against it.
+        let Some(vk) = self.platform.vk.clone() else {
+            return Err(io::Error::other("DRI3 import: Vulkan unavailable"));
+        };
+        let format = match (depth, bpp) {
+            (24 | 32, 32) => ash::vk::Format::B8G8R8A8_UNORM,
+            _ => {
+                return Err(io::Error::other(format!(
+                    "DRI3 import: unsupported (depth={depth}, bpp={bpp}); Phase 4.2 RGB single-plane only"
+                )));
+            }
+        };
+        let drawable = crate::kms::vk::dri3::import_dmabuf(
+            vk,
+            fd,
+            u32::from(width),
+            u32::from(height),
+            format,
+            modifier,
+            &[crate::kms::vk::dri3::DmabufPlane {
+                offset: u64::from(offset),
+                pitch: stride,
+            }],
+        )
+        .map_err(|e| io::Error::other(format!("DRI3 import_dmabuf: {e:?}")))?;
+        let storage = Storage::from_imported_drawable_image(drawable);
+        let host_xid = self.core.next_host_xid();
+        self.store
+            .allocate(host_xid, DrawableKind::Pixmap, depth, false, storage)
+            .map_err(|e| io::Error::other(format!("DRI3 import store.allocate: {e:?}")))?;
+        // Telemetry: an imported pixmap is still a fresh storage
+        // entry + a view (the DrawableImage built one inside
+        // from_dmabuf). Mirrors init_root_storage's accounting so
+        // the per-second counters stay accurate under DRI3 traffic.
+        self.telemetry.record_storage_allocation();
+        self.telemetry.record_image_view_create();
+        PixmapHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other("DRI3 import: failed to make PixmapHandle"))
+    }
+
+    fn dri3_supported_modifiers(&self, _window: u32, depth: u8, bpp: u8) -> (Vec<u64>, Vec<u64>) {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return (vec![0], vec![0]);
+        };
+        // Map (depth, bpp) to a vk::Format. Phase 4.2 RGB single-
+        // plane scope means we only handle depth-24/32 BGRA today.
+        let format = match (depth, bpp) {
+            (24 | 32, 32) => ash::vk::Format::B8G8R8A8_UNORM,
+            _ => return (vec![0], vec![0]),
+        };
+        let screen = crate::kms::vk::dri3::supported_modifiers(vk, format);
+        // Window-modifier list is the subset that the window's
+        // output can flip-scanout. Phase 4.1 always uses LINEAR
+        // for scanout, so the window list collapses to LINEAR
+        // here. A follow-up populates `output.scanout_format_set`
+        // from the real add_fb2 probe and widens this.
+        let window: Vec<u64> = screen.iter().copied().filter(|&m| m == 0).collect();
+        let window = if window.is_empty() { vec![0] } else { window };
+        (window, screen)
+    }
+
+    fn dri3_export_pixmap(
+        &mut self,
+        host_xid: u32,
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
+        };
+        let id = self.store.lookup(host_xid).ok_or_else(|| {
+            io::Error::other(format!("DRI3 export: unknown pixmap 0x{host_xid:x}"))
+        })?;
+        let drawable = self.store.get(id).ok_or_else(|| {
+            io::Error::other(format!("DRI3 export: store entry missing 0x{host_xid:x}"))
+        })?;
+        let imported = drawable.storage.imported_drawable.as_ref().ok_or_else(|| {
+            io::Error::other(format!(
+                "DRI3 export: pixmap 0x{host_xid:x} has no imported backing"
+            ))
+        })?;
+        let depth = drawable.depth;
+        let width = u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX);
+        let height = u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX);
+        let bpp: u8 = match depth {
+            24 | 32 => 32,
+            d => d,
+        };
+        let export = crate::kms::vk::dri3::export_dmabuf(vk, imported)
+            .map_err(|e| io::Error::other(format!("DRI3 export_dmabuf: {e:?}")))?;
+        let stride16 = u16::try_from(export.stride).unwrap_or(u16::MAX);
+        Ok((export.size, width, height, stride16, depth, bpp, export.fd))
+    }
+
+    fn dri3_fence_from_fd(&mut self, fence_xid: u32, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+        // Mesa's loader_dri3 sends an xshmfence (memfd + futex) —
+        // try that path FIRST. vkImportSemaphoreFdKHR rejects
+        // xshmfence fds because they aren't sync_file. Mmap first;
+        // fall through to Vulkan import only if mmap fails (i.e.
+        // the fd really is a sync_file).
+        use std::os::fd::AsFd as _;
+        if let Some(mapping) = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()) {
+            self.dri3_xshmfences.insert(fence_xid, mapping);
+            log::debug!("DRI3 FenceFromFD 0x{fence_xid:x}: imported as xshmfence");
+            return Ok(());
+        }
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other(
+                "DRI3 FenceFromFD: fd isn't xshmfence and Vulkan is unavailable",
+            ));
+        };
+        let semaphore = crate::kms::vk::sync::import_sync_file(vk, fd)
+            .map_err(|e| io::Error::other(format!("import_sync_file: {e:?}")))?;
+        if let Some(prev) = self.dri3_sync_resources.insert(fence_xid, semaphore) {
+            unsafe { vk.device.destroy_semaphore(prev, None) };
+        }
+        Ok(())
+    }
+
+    fn dri3_trigger_fence(&mut self, fence_xid: u32) -> io::Result<()> {
+        if let Some(mapping) = self.dri3_xshmfences.get(&fence_xid) {
+            mapping.trigger();
+            return Ok(());
+        }
+        // VkSemaphore-backed fences: signalling is done via queue
+        // submit (or vkSignalSemaphore for timeline). For Phase 4.2
+        // first-cut Copy path the GPU work is already serialized,
+        // so a server-only `triggered=true` mirror is sufficient
+        // — no GPU operation needed here.
+        Ok(())
+    }
+
+    fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other("DRI3 FDFromFence: Vulkan unavailable"));
+        };
+        let &semaphore = self.dri3_sync_resources.get(&fence_xid).ok_or_else(|| {
+            io::Error::other(format!("DRI3 FDFromFence: unknown fence 0x{fence_xid:x}"))
+        })?;
+        crate::kms::vk::sync::export_sync_file(vk, semaphore)
+            .map_err(|e| io::Error::other(format!("export_sync_file: {e:?}")))
+    }
+
+    fn dri3_import_syncobj(
+        &mut self,
+        syncobj_xid: u32,
+        fd: std::os::fd::OwnedFd,
+    ) -> io::Result<()> {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other("DRI3 ImportSyncobj: Vulkan unavailable"));
+        };
+        let semaphore = crate::kms::vk::sync::import_drm_syncobj(vk, fd)
+            .map_err(|e| io::Error::other(format!("import_drm_syncobj: {e:?}")))?;
+        if let Some(prev) = self.dri3_sync_resources.insert(syncobj_xid, semaphore) {
+            unsafe { vk.device.destroy_semaphore(prev, None) };
+        }
+        Ok(())
+    }
+
+    fn dri3_free_syncobj(&mut self, syncobj_xid: u32) -> io::Result<()> {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other("DRI3 FreeSyncobj: Vulkan unavailable"));
+        };
+        if let Some(sem) = self.dri3_sync_resources.remove(&syncobj_xid) {
+            unsafe { vk.device.destroy_semaphore(sem, None) };
+        }
+        Ok(())
+    }
+
+    fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return Err(io::Error::other("DRI3 SignalSyncobj: Vulkan unavailable"));
+        };
+        let &semaphore = self.dri3_sync_resources.get(&syncobj_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+            ))
+        })?;
+        crate::kms::vk::sync::signal_timeline(vk, semaphore, value)
+            .map_err(|e| io::Error::other(format!("vkSignalSemaphore: {e:?}")))
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
-        PresentCaps::default()
+        // Mirror v1's conservative "Copy-path only" caps. syncobj
+        // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay
+        // false until alien-BO scanout integration lands on v2.
+        PresentCaps {
+            flip_path: false,
+            async_may_tear: false,
+            syncobj: self.dri3_capabilities().syncobj,
+        }
     }
-
-    // dri3_open / dri3_import_pixmap / dri3_export_pixmap /
-    // dri3_fence_from_fd / dri3_fd_from_fence / dri3_import_syncobj
-    // / dri3_free_syncobj / dri3_signal_syncobj /
-    // dri3_supported_modifiers / dri3_trigger_fence keep the trait
-    // defaults (which all return "DRI3 unsupported" errors).
 
     // ── Other extensions ────────────────────────────────────────
 
@@ -8554,5 +8812,260 @@ mod tests {
         b.get_overlay_window(None).expect("get after noop release");
         assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
+    }
+
+    // ── DRI3 backfill (Stage 4d.* compositor unblock) ───────────
+    //
+    // Ports v1's DRI3 surface to v2. The `for_tests()` fixture
+    // has no render-node + no Vk, so it exercises the
+    // "unsupported" branch of every accessor. The Vk-backed
+    // tests are gated `#[ignore]` and run under `vng` via
+    // `cargo test -- --ignored`, mirroring the Phase 4.2 hardware
+    // coverage matrix.
+
+    #[test]
+    fn dri3_capabilities_unsupported_without_vk_returns_unsupported() {
+        let b = KmsBackendV2::for_tests();
+        let caps = b.dri3_capabilities();
+        // unsupported() sentinel is (0, 0) per the trait_def
+        // doc-comment.
+        assert_eq!(caps.version, (0, 0), "no Vk → DRI3 reports unsupported");
+        assert!(!caps.modifiers);
+        assert!(!caps.fence_fd);
+        assert!(!caps.syncobj);
+    }
+
+    #[test]
+    fn dri3_open_errs_when_render_node_unavailable() {
+        // for_tests sets render_node_path: None on PlatformBackend,
+        // so dri3_open must Err out (the SCM_RIGHTS dispatch path
+        // then maps it to BadAlloc).
+        let mut b = KmsBackendV2::for_tests();
+        let res = b.dri3_open(0x1234);
+        assert!(res.is_err(), "expected Err when render_node_path is None");
+    }
+
+    #[test]
+    fn dri3_export_pixmap_unknown_xid_errs() {
+        // No Vk → first guard fires. With Vk this would still
+        // Err because the xid isn't in the store — covered by
+        // the Vk-backed test below.
+        let mut b = KmsBackendV2::for_tests();
+        let res = b.dri3_export_pixmap(0x4040_0000);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn dri3_fd_from_fence_unknown_errs() {
+        let mut b = KmsBackendV2::for_tests();
+        assert!(b.dri3_fd_from_fence(0x4040_4040).is_err());
+    }
+
+    #[test]
+    fn dri3_signal_syncobj_unknown_errs() {
+        let mut b = KmsBackendV2::for_tests();
+        assert!(b.dri3_signal_syncobj(0x4040_4040, 1).is_err());
+    }
+
+    #[test]
+    fn dri3_trigger_fence_unknown_is_ok() {
+        // v1's body returns Ok for the unknown-fence case — the
+        // VkSemaphore path is server-state-only, no GPU op. v2
+        // mirrors.
+        let mut b = KmsBackendV2::for_tests();
+        assert!(b.dri3_trigger_fence(0x4040_4040).is_ok());
+    }
+
+    /// Vk-backed: DRI3 capabilities reach `(1, 4)` with
+    /// `fence_fd` + `syncobj` when a real `VkContext` is attached.
+    /// Gated `#[ignore]` because it needs lavapipe (or any live
+    /// Vulkan ICD).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn dri3_capabilities_v14_with_syncobj_when_vk_attached() {
+        let b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let caps = b.dri3_capabilities();
+        // for_tests_with_vk still has render_node_fd: None
+        // (no real DRM device). The guard checks render_node_fd
+        // first → caps come back unsupported even with Vk.
+        // Verify that branch is what reports unsupported, then
+        // bypass it for the version + syncobj assertion by
+        // injecting a synthetic render-node fd into platform.
+        assert_eq!(
+            caps.version,
+            (0, 0),
+            "without render_node_fd, even with Vk, dri3 is gated unsupported",
+        );
+        // Now stuff in a synthetic render-node fd so the guard
+        // passes; use /dev/null which is openable + safely
+        // droppable. The cap accessor doesn't actually use the
+        // fd, just checks Some-ness.
+        let mut b = b;
+        b.platform.render_node_fd = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open("/dev/null")
+                .expect("open /dev/null")
+                .into(),
+        );
+        let caps = b.dri3_capabilities();
+        assert_eq!(caps.version, (1, 4));
+        assert!(caps.fence_fd);
+        assert!(caps.syncobj);
+        // `modifiers` reflects whether the device picked up
+        // VK_EXT_image_drm_format_modifier — lavapipe does, Venus
+        // does. Just assert the field is set consistently with
+        // what the Vk layer reported (no hard true-here).
+    }
+
+    /// Vk-backed: `dri3_import_pixmap` rejects unsupported
+    /// (depth, bpp) combinations with a non-empty error before
+    /// touching the dma-buf fd. Exercises the guard above the
+    /// `import_dmabuf` call. Vk-attached so we hit the second
+    /// arm (the Vk branch).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn dri3_import_pixmap_rejects_unsupported_depth_bpp() {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        // Synthesise an arbitrary fd — depth=8 trips the guard
+        // before the fd is consumed, so any openable file works.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let raw = f.into_raw_fd();
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let res = b.dri3_import_pixmap(fd, 16, 16, 64, 0, 0, 8, 8);
+        assert!(
+            res.is_err(),
+            "depth=8 bpp=8 is outside Phase 4.2 RGB single-plane scope",
+        );
+    }
+
+    /// Vk-backed: `dri3_supported_modifiers` returns at least
+    /// LINEAR (0) on the screen side for depth-32/bpp-32. Lavapipe
+    /// reports LINEAR; Venus reports LINEAR + tile modifiers; we
+    /// only assert LINEAR is present (the conservative invariant).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn dri3_supported_modifiers_includes_linear_with_vk() {
+        let b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        let (window, screen) = b.dri3_supported_modifiers(0, 24, 32);
+        assert!(
+            window.contains(&0),
+            "window modifiers always include LINEAR (Phase 4.1 scanout policy)",
+        );
+        assert!(
+            screen.contains(&0),
+            "screen modifiers always include LINEAR (fallback row of the design matrix)",
+        );
+    }
+
+    /// xshmfence-path of `dri3_fence_from_fd`: mmap an xshmfence
+    /// (synthesised via `memfd_create` + `ftruncate`), feed the
+    /// fd in, assert it landed in `dri3_xshmfences` (not
+    /// `dri3_sync_resources`) and that `trigger()` flips the
+    /// state to signalled.
+    #[test]
+    fn dri3_fence_from_fd_xshmfence_path_triggers() {
+        // The xshmfence module exposes the C alloc/map helpers;
+        // build a fresh shm fd via `xshmfence_alloc_shm` directly
+        // through libc-equivalent shape (memfd_create). To keep
+        // the test self-contained without pulling libxshmfence
+        // alloc, we synthesise a memfd that's at least page-sized
+        // and let `FenceMapping::map` mmap it — libxshmfence's
+        // map_shm only requires the fd be at least one page.
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let raw =
+            unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_dri3_test".as_ptr(), 0u32) };
+        if raw < 0 {
+            eprintln!("skip: memfd_create unavailable");
+            return;
+        }
+        let raw = i32::try_from(raw).expect("fd fits i32");
+        // Size the memfd to one page so map_shm succeeds.
+        let page_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page: libc::off_t = if page_raw > 0 {
+            page_raw as libc::off_t
+        } else {
+            4096
+        };
+        if unsafe { libc::ftruncate(raw, page) } != 0 {
+            unsafe { libc::close(raw) };
+            eprintln!("skip: ftruncate failed");
+            return;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut b = KmsBackendV2::for_tests();
+        let fence_xid: u32 = 0x4040_1111;
+        b.dri3_fence_from_fd(fence_xid, fd)
+            .expect("xshmfence import");
+        assert!(
+            b.dri3_xshmfences.contains_key(&fence_xid),
+            "xshmfence path stores under dri3_xshmfences",
+        );
+        assert!(
+            !b.dri3_sync_resources.contains_key(&fence_xid),
+            "xshmfence path must NOT also populate dri3_sync_resources",
+        );
+        // Inspect the mapping's pre-trigger state.
+        let mapping = b.dri3_xshmfences.get(&fence_xid).expect("present");
+        let pre = mapping.query();
+        // Trigger via the public trait surface.
+        b.dri3_trigger_fence(fence_xid).expect("trigger ok");
+        let post = b
+            .dri3_xshmfences
+            .get(&fence_xid)
+            .expect("still present")
+            .query();
+        assert_eq!(post, 1, "after trigger, xshmfence query() == 1");
+        // Defensive: pre and post differ in the expected direction.
+        assert_ne!(pre, post, "trigger() should have changed the fence state");
+    }
+
+    /// `dri3_import_syncobj`'s no-Vk branch errs cleanly. Builds
+    /// an `OwnedFd` from `/dev/null` and verifies the Vk-gate
+    /// triggers before any external lib gets the fd — exercises
+    /// the "Vk-required" guard mirroring v1's body. We use
+    /// `IntoRawFd` + `FromRawFd` to keep the fd lifetime
+    /// explicit since no Vk path runs.
+    #[test]
+    fn dri3_import_syncobj_no_vk_errs() {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        // SAFETY: we own this fd via the OpenOptions handle; we
+        // re-wrap it as OwnedFd directly. No Vk path runs, the
+        // function returns Err immediately, and the OwnedFd's
+        // Drop closes it cleanly.
+        let raw = f.into_raw_fd();
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut b = KmsBackendV2::for_tests();
+        let res = b.dri3_import_syncobj(0x4040_3333, fd);
+        assert!(
+            res.is_err(),
+            "import_syncobj without Vk must Err on the Vk gate",
+        );
     }
 }

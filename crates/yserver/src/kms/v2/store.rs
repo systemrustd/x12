@@ -83,6 +83,14 @@ pub(crate) struct Storage {
     /// Set when the storage was made via `for_tests_null`. The
     /// `Drop` path skips destroying null handles.
     pub(crate) is_test_stub: bool,
+    /// When `Some`, the Vk handles in `image`/`memory`/`image_view`
+    /// above are **borrowed from** this `DrawableImage` (the DRI3
+    /// import path — Stage 4d / Phase 4.2 §3.2). `Storage::destroy`
+    /// skips its own destroy path in this case; the inner
+    /// `DrawableImage`'s own `Drop` releases the handles + the
+    /// imported dma-buf fd. Pool-return is also skipped because
+    /// imported memory isn't pool-eligible.
+    pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
 }
 
 impl Storage {
@@ -105,6 +113,34 @@ impl Storage {
             format,
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
+            imported_drawable: None,
+        }
+    }
+
+    /// Wrap a DRI3-imported [`DrawableImage`](crate::kms::vk::target::DrawableImage)
+    /// as a v2 `Storage`. The handles in `image`/`memory`/`image_view`
+    /// alias the inner `DrawableImage`; the inner `Drop` owns the
+    /// release of those handles + the imported dma-buf fd.
+    /// `current_layout` starts at `UNDEFINED` (`DrawableImage`'s
+    /// `from_dmabuf` likewise leaves the image undefined until the
+    /// first paint barrier). Used by `dri3_import_pixmap`.
+    pub(crate) fn from_imported_drawable_image(
+        drawable: crate::kms::vk::target::DrawableImage,
+    ) -> Self {
+        let image = drawable.vk_image;
+        let image_view = drawable.vk_image_view;
+        let memory = drawable.backing_memory();
+        let extent = drawable.extent;
+        let format = drawable.format;
+        Self {
+            image,
+            memory,
+            image_view,
+            extent,
+            format,
+            current_layout: vk::ImageLayout::UNDEFINED,
+            is_test_stub: false,
+            imported_drawable: Some(drawable),
         }
     }
 
@@ -125,6 +161,7 @@ impl Storage {
             format,
             current_layout: pooled.current_layout,
             is_test_stub: false,
+            imported_drawable: None,
         }
     }
 
@@ -141,6 +178,7 @@ impl Storage {
             format,
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: true,
+            imported_drawable: None,
         }
     }
 
@@ -155,6 +193,23 @@ impl Storage {
     /// fall through to synchronous destroy.
     fn destroy(&mut self, platform: &PlatformBackend) {
         if self.is_test_stub {
+            return;
+        }
+        // DRI3-imported storage: the DrawableImage owns its own Vk
+        // handles + dma-buf fd; its Drop releases everything. Skip
+        // the normal destroy path so we don't double-free the
+        // borrowed image/view/memory aliased above.
+        if self.imported_drawable.is_some() {
+            // Null out the aliasing handles before the inner Drop
+            // runs to avoid any chance of pool-return or other
+            // observers seeing live handles after the underlying
+            // memory has been freed.
+            self.image = vk::Image::null();
+            self.image_view = vk::ImageView::null();
+            self.memory = vk::DeviceMemory::null();
+            // Dropping `self.imported_drawable` triggers
+            // DrawableImage::drop which destroys the real handles.
+            self.imported_drawable = None;
             return;
         }
         let Some(vk) = platform.vk.as_ref() else {
