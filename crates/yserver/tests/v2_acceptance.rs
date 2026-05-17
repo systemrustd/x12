@@ -2172,3 +2172,79 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 //     A held NameWindowPixmap alias must keep the backing alive past
 //     a subsequent UnmapWindow(W) (no race that drops the storage
 //     when the redirect map clears).
+
+/// Stage 4d — paint into the Composite Overlay Window via its xid
+/// after `GetOverlayWindow`, and assert the paint lands on COW
+/// storage with presentation damage accumulated. This is the load-
+/// bearing v2 path for compositing WMs (marco-compositing,
+/// xfwm4-compositing): pre-4d the COW xid resolved to nothing in
+/// the store, so every render_composite against it gap-logged and
+/// dropped paint.
+///
+/// Oracle shape: scanout dump integration is heavyweight (needs
+/// `dump_scanout` wiring that test fixtures don't have); per the
+/// stage brief, the acceptable surrogate is
+/// `test_peek_presentation_damage_nonempty(0x103)` after a
+/// `put_image` against the COW xid — confirms (a) the xid resolves,
+/// (b) the storage is scene_participating, and (c) the paint
+/// accumulated presentation damage that a scene tick would consume.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_cow_paint_appears_on_scanout() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Step 1: GetOverlayWindow — allocates COW storage at xid 0x103.
+    b.get_overlay_window(None).expect("get_overlay_window");
+    let cow_xid = 0x103u32;
+
+    // Step 2: paint a known red square at (0, 0). put_image with a
+    // 4-byte BGRA pixel goes through the engine.put_image path; on
+    // a Vk-backed fixture this lands on COW storage.
+    let pixels: Vec<u8> = vec![
+        // 2×2 of red (BGRA premul: B=0, G=0, R=0xFF, A=0xFF)
+        0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF,
+        0xFF,
+    ];
+    b.put_image(None, cow_xid, 24, 2, 2, 0, 0, &pixels)
+        .expect("put_image into COW xid");
+
+    // Step 3: GetImage on the COW xid round-trips back the red
+    // pixels — confirms the put_image actually landed on COW
+    // storage (vs being dropped into the gap-logged no-op path).
+    let img = b
+        .get_image(None, cow_xid, 2, 0, 0, 2, 2, !0)
+        .expect("get_image COW")
+        .expect("Some COW bytes");
+    assert_eq!(
+        &img[..4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "COW (0,0) must round-trip the painted red",
+    );
+
+    // Step 4: presentation damage accumulated on COW. The scene
+    // tick would consume this on next composite; here we assert
+    // the storage is in the right state (scene_participating=true
+    // + non-empty damage region) to be picked up by build_scene.
+    assert!(
+        b.test_peek_presentation_damage_nonempty(cow_xid),
+        "COW must have non-empty presentation damage after put_image — \
+         false ⇒ either xid resolved to nothing (pre-4d shape) or \
+         scene_participating=false (4d wiring missing)",
+    );
+
+    // Step 5: release drops the storage; the xid must no longer
+    // resolve.
+    b.release_overlay_window(None).expect("release");
+    let img_after = b.get_image(None, cow_xid, 2, 0, 0, 2, 2, !0);
+    assert!(
+        img_after.is_err() || img_after.as_ref().unwrap().is_none(),
+        "GetImage on COW xid after final release must fail or return None \
+         (storage destroyed) — got {img_after:?}",
+    );
+}

@@ -471,6 +471,58 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Stage 4d — Composite Overlay Window (COW) allocation hook.
+    ///
+    /// Called on each `XComposite::GetOverlayWindow` request.
+    /// First call must allocate screen-extent depth-24 storage
+    /// for the COW xid (`COMPOSITE_OVERLAY_WINDOW` = 0x103),
+    /// install it in the backend's drawable store with
+    /// `scene_participating=true`, and register the COW as a
+    /// scene entry layered ABOVE all top-levels but BELOW the
+    /// cursor (per Stage 4 plan §"scene layering item 3"+
+    /// item 4). Subsequent calls bump a refcount; the storage
+    /// is freed on the final `release_overlay_window`.
+    ///
+    /// Compositors (marco, xfwm4 with compositing on, etc.)
+    /// `XSelectInput` on this XID and paint directly into it;
+    /// pre-Stage-4d the xid resolved to nothing in v2's
+    /// `DrawableStore` so every `render_composite` against it
+    /// gap-logged and dropped paint — the load-bearing gate for
+    /// compositing WMs (Stage 4 plan §4d).
+    ///
+    /// Default no-op covers v1 (uses its own per-window mirror
+    /// model and never reaches this trait) plus the test
+    /// `RecordingBackend` / ynest. v2 (`KmsBackendV2`) overrides.
+    ///
+    /// # Errors
+    ///
+    /// Backend-internal failures on storage allocation or store
+    /// insertion. Per protocol the `GetOverlayWindow` reply must
+    /// still go out on the wire when this errors — callers
+    /// (`process_request.rs`) log + continue.
+    fn get_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<()> {
+        let _ = origin;
+        Ok(())
+    }
+
+    /// Stage 4d — Composite Overlay Window release hook.
+    ///
+    /// Called on each `XComposite::ReleaseOverlayWindow`
+    /// request. Decrements the COW refcount; on the final
+    /// release the backend unregisters the scene entry and
+    /// frees the storage. Defensive against unmatched releases
+    /// (refcount=0 → no-op).
+    ///
+    /// Default no-op as for `get_overlay_window`.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as `get_overlay_window`.
+    fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<()> {
+        let _ = origin;
+        Ok(())
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Resources (pixmap, font, cursor)
     // ──────────────────────────────────────────────────────────────

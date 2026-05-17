@@ -144,6 +144,14 @@ pub struct KmsBackendV2 {
     /// `map_subwindow` / `unmap_subwindow` /
     /// `destroy_subwindow`.
     pub(crate) windows_v2: WindowsV2Map,
+    /// Stage 4d: `DrawableId` of the Composite Overlay Window
+    /// storage, allocated lazily on the first `GetOverlayWindow`
+    /// and dropped on the final `ReleaseOverlayWindow`. `None`
+    /// when no compositor is holding a COW. Storage handle lives
+    /// here (backend / Vk-side state) — the matching protocol
+    /// refcount lives on `core.cow_refcount` per the v2 plan
+    /// §"`KmsCore` scope — narrowly drawn" split.
+    pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 }
 
 impl KmsBackendV2 {
@@ -194,6 +202,7 @@ impl KmsBackendV2 {
             scene,
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
+            cow_id: None,
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -388,6 +397,7 @@ impl KmsBackendV2 {
             scene: SceneCompositor::stub(),
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
+            cow_id: None,
         }
     }
 
@@ -3151,6 +3161,115 @@ impl Backend for KmsBackendV2 {
         }
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
+        }
+        Ok(())
+    }
+
+    /// Stage 4d — Composite Overlay Window allocation.
+    ///
+    /// First `GetOverlayWindow` allocates screen-extent depth-24
+    /// storage at xid `COMPOSITE_OVERLAY_WINDOW` (0x103), stores
+    /// the resulting `DrawableId` on `self.cow_id`, sets the
+    /// matching protocol refcount on `core.cow_refcount = 1`, and
+    /// registers the entry with `SceneCompositor::register_cow`
+    /// so `build_scene` lays it above top-levels + below the
+    /// cursor.
+    ///
+    /// Subsequent calls (compositor restart, multi-client
+    /// scenarios) just bump `core.cow_refcount` and return Ok
+    /// — the protocol reply is the same fixed xid.
+    ///
+    /// Initial fill: storage from `allocate_drawable_storage`
+    /// is uninitialised Vk-DEVICE_LOCAL memory (same problem
+    /// Stage 3f.14 fixed for `create_pixmap`). We do an explicit
+    /// transparent-black fill via `engine.fill_rect` so the
+    /// compositor's first paint composites over a known zero
+    /// rather than recycled GPU garbage. The fill is best-effort
+    /// — on the stub fixture (no Vk) `engine.fill_rect` errors;
+    /// log + continue (storage already exists at xid level).
+    fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+        if self.cow_id.is_some() {
+            self.core.cow_refcount = self.core.cow_refcount.saturating_add(1);
+            return Ok(());
+        }
+        let fb_w = self.platform.fb_w.max(1);
+        let fb_h = self.platform.fb_h.max(1);
+        let storage = match self.platform.allocate_drawable_storage(fb_w, fb_h, 24) {
+            Ok(storage) => {
+                self.telemetry.record_storage_allocation();
+                self.telemetry.record_image_view_create();
+                storage
+            }
+            Err(e) => {
+                // Test-fixture / no-Vk path: same shape as
+                // `init_root_storage` — fall back to a null-view
+                // stub so unit tests can exercise refcount /
+                // scene-registration without a live Vk ICD.
+                log::debug!("v2 get_overlay_window: no Vk, using stub COW storage: {e:?}");
+                crate::kms::v2::store::Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(fb_w),
+                        height: u32::from(fb_h),
+                    },
+                    crate::kms::v2::platform::PlatformBackend::format_for_depth(24),
+                )
+            }
+        };
+        let xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        // Defensive: if a stale mapping somehow survives a prior
+        // teardown (decref's PendingFence path detaches xid for us,
+        // but a synchronous-destroy path could race), detach first
+        // so the allocate doesn't trip XidInUse.
+        self.store.detach_xid(xid);
+        let id = self
+            .store
+            .allocate(xid, DrawableKind::Window, 24, true, storage)
+            .map_err(|e| io::Error::other(format!("v2 get_overlay_window: store alloc: {e:?}")))?;
+        // Stage 3f.14 follow-on — zero-fill the fresh storage so
+        // the compositor doesn't composite over recycled GPU
+        // garbage on its first paint. Best-effort on stub paths.
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: ash::vk::Extent2D {
+                width: u32::from(fb_w),
+                height: u32::from(fb_h),
+            },
+        };
+        if let Err(e) =
+            self.engine
+                .fill_rect(&mut self.store, &mut self.platform, id, rect, [0.0; 4])
+            && self.platform.vk.is_some()
+        {
+            log::warn!("v2 get_overlay_window: initial zero-fill failed: {e:?}");
+        }
+        self.cow_id = Some(id);
+        self.core.cow_refcount = 1;
+        self.scene.register_cow(id);
+        Ok(())
+    }
+
+    /// Stage 4d — Composite Overlay Window release.
+    ///
+    /// Decrements `core.cow_refcount`; on the final release
+    /// unregisters the scene entry, decrefs the store storage,
+    /// and clears `self.cow_id`. `DrawableStore::decref` removes
+    /// the xid mapping (immediately on synchronous-destroy,
+    /// deferred on `PendingFence`) so the next `GetOverlayWindow`
+    /// reallocates fresh storage at the same xid.
+    ///
+    /// Defensive against unmatched releases (refcount=0 → Ok
+    /// no-op). The trait docstring is the canonical statement of
+    /// this shape.
+    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+        if self.core.cow_refcount == 0 {
+            return Ok(());
+        }
+        self.core.cow_refcount -= 1;
+        if self.core.cow_refcount == 0 {
+            self.scene.unregister_cow();
+            if let Some(id) = self.cow_id.take() {
+                self.store.decref(&mut self.platform, id);
+            }
         }
         Ok(())
     }
@@ -8232,5 +8351,143 @@ mod tests {
             b.test_host_window_to_backing(0x100).is_none(),
             "host_window_to_backing must be cleared after release",
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Stage 4d — Composite Overlay Window (COW) lifecycle.
+    //
+    // These exercise the no-Vk pathway: `allocate_drawable_storage`
+    // returns `ERROR_INITIALIZATION_FAILED` on `for_tests()`; the
+    // get_overlay_window override falls back to a `Storage::for_tests_null`
+    // stub so the store-side wiring (xid mapping, refcount, scene
+    // registration) is still exercised. The Vk-backed test in
+    // `tests/v2_acceptance.rs` covers the actual paint+scanout path.
+    // ────────────────────────────────────────────────────────────────
+
+    /// First call: COW xid resolves in store; refcount = 1;
+    /// backend `cow_id` set; scene registration is a no-op on
+    /// the stub fixture but the field flip is observable as a
+    /// `scene_structure_dirty` toggle on the live-Vk path.
+    #[test]
+    fn cow_get_overlay_first_call_allocates_storage() {
+        let mut b = KmsBackendV2::for_tests();
+        assert_eq!(b.core.cow_refcount, 0);
+        assert!(b.cow_id.is_none());
+        // Pre-flight: COW xid is NOT in the store yet.
+        assert!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .is_none(),
+            "COW xid must not resolve before GetOverlayWindow",
+        );
+
+        b.get_overlay_window(None).expect("get_overlay_window");
+
+        assert_eq!(b.core.cow_refcount, 1, "refcount must be 1 after first GET");
+        assert!(b.cow_id.is_some(), "backend.cow_id must be set after GET");
+        assert!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .is_some(),
+            "COW xid must resolve in the store after GetOverlayWindow",
+        );
+        // Storage shape: depth-24 screen-extent, scene-participating,
+        // DrawableKind::Window so build_scene's window-kind gating
+        // doesn't filter it.
+        let cow_id = b.cow_id.expect("cow_id set");
+        let cow = b.store.get(cow_id).expect("cow drawable");
+        assert_eq!(cow.depth, 24, "COW must be depth-24");
+        assert!(
+            cow.scene_participating,
+            "COW must be scene_participating=true so build_scene includes it",
+        );
+        assert!(
+            matches!(cow.kind, super::super::store::DrawableKind::Window),
+            "COW must be DrawableKind::Window",
+        );
+        assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
+        assert_eq!(cow.storage.extent.height, u32::from(b.platform.fb_h));
+    }
+
+    /// Second call without an intervening release just bumps the
+    /// refcount. Storage stays the same `DrawableId` (no
+    /// re-allocation), `cow_id` unchanged.
+    #[test]
+    fn cow_get_overlay_second_call_refcounts() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("first get");
+        let id_after_first = b.cow_id.expect("cow_id set after first GET");
+
+        b.get_overlay_window(None).expect("second get");
+
+        assert_eq!(
+            b.core.cow_refcount, 2,
+            "refcount must increment to 2 on the second GET",
+        );
+        assert_eq!(
+            b.cow_id.expect("cow_id set after second GET"),
+            id_after_first,
+            "second GetOverlayWindow must NOT reallocate — same DrawableId",
+        );
+    }
+
+    /// Release after multiple GETs decrements but keeps the
+    /// storage alive (refcount > 0). The COW xid still resolves.
+    #[test]
+    fn cow_release_decrements_refcount() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("get 1");
+        b.get_overlay_window(None).expect("get 2");
+        b.get_overlay_window(None).expect("get 3");
+        assert_eq!(b.core.cow_refcount, 3);
+
+        b.release_overlay_window(None).expect("release 1");
+
+        assert_eq!(b.core.cow_refcount, 2, "refcount drops from 3 → 2");
+        assert!(
+            b.cow_id.is_some(),
+            "storage still held — refcount > 0 keeps cow_id",
+        );
+        assert!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .is_some(),
+            "COW xid still resolves while refcount > 0",
+        );
+    }
+
+    /// Final release drops the storage. `cow_id` clears; xid no
+    /// longer resolves in the store (so a fresh `GetOverlayWindow`
+    /// would reallocate clean — protocol guarantees the COW xid
+    /// is reusable after every release-to-zero).
+    #[test]
+    fn cow_release_zero_drops_storage() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("get");
+        assert_eq!(b.core.cow_refcount, 1);
+
+        b.release_overlay_window(None).expect("release");
+
+        assert_eq!(b.core.cow_refcount, 0);
+        assert!(
+            b.cow_id.is_none(),
+            "cow_id must clear on refcount→0 release",
+        );
+        assert!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .is_none(),
+            "COW xid must NOT resolve after the final release — \
+             the store has destroyed (or detached) the entry so a \
+             subsequent GetOverlayWindow can reallocate at the \
+             same xid",
+        );
+
+        // A second GetOverlayWindow round-trips cleanly: reallocates
+        // fresh, refcount climbs from 0 → 1.
+        b.get_overlay_window(None)
+            .expect("re-get after final release");
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(b.cow_id.is_some());
     }
 }

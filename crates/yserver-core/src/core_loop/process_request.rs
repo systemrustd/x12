@@ -3032,6 +3032,20 @@ fn handle_composite_request(
             // for why — marco's compositor immediately calls XSelectInput on
             // this XID and would otherwise wipe its own WM event mask on root.
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
+            // Stage 4d: ask the backend to materialise the COW as a
+            // first-class scene entry (allocate screen-extent storage,
+            // register the scene layer). v1 picks up the trait default
+            // no-op; v2's override is the load-bearing path for
+            // compositing WMs. Log + continue on Err — the protocol
+            // reply must still go out (marco treats a failed
+            // GetOverlayWindow as fatal otherwise).
+            if let Err(err) = backend.get_overlay_window(origin) {
+                log::warn!(
+                    "client {} #{} COMPOSITE::GetOverlayWindow backend hook failed: {err}",
+                    client_id.0,
+                    sequence.0,
+                );
+            }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
                 client_id.0, sequence.0, overlay
@@ -3049,6 +3063,16 @@ fn handle_composite_request(
                 "client {} #{} COMPOSITE::ReleaseOverlayWindow",
                 client_id.0, sequence.0
             );
+            // Stage 4d: decrement the COW refcount; the final release
+            // drops the scene entry + storage. Log-only on Err (the
+            // request carries no reply).
+            if let Err(err) = backend.release_overlay_window(origin) {
+                log::warn!(
+                    "client {} #{} COMPOSITE::ReleaseOverlayWindow backend hook failed: {err}",
+                    client_id.0,
+                    sequence.0,
+                );
+            }
         }
         other => {
             debug!(

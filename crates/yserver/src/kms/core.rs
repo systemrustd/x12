@@ -750,6 +750,20 @@ pub(crate) struct KmsCore {
     /// up the matching backing here. Cleared when a redirect is
     /// torn down.
     pub(crate) host_window_to_backing: HashMap<u32, PixmapHandle>,
+    /// Stage 4d — Composite Overlay Window refcount.
+    ///
+    /// Live count of outstanding `XComposite::GetOverlayWindow`
+    /// holds. Bumped on every GET, decremented on every RELEASE;
+    /// when it hits zero the backend drops the underlying COW
+    /// storage. Protocol-side bookkeeping per the v2 plan
+    /// §"`KmsCore` scope — narrowly drawn": this is metadata (a
+    /// counter), not a storage handle. The `DrawableId` of the
+    /// allocated COW storage lives on `KmsBackendV2.cow_id`.
+    ///
+    /// See Stage 4 plan §4d "Composite Overlay Window (COW) as
+    /// first-class scene entry" + spec lines 453, 459, 470 for
+    /// the protocol/storage split.
+    pub(crate) cow_refcount: u32,
 
     // RENDER glyphset source data (atlas storage is backend-specific)
     pub(crate) glyphsets: HashMap<u32, GlyphSetState>,
@@ -837,6 +851,7 @@ impl KmsCore {
             shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
+            cow_refcount: 0,
             glyphsets: HashMap::new(),
             pictures: HashMap::new(),
         })
@@ -906,6 +921,7 @@ impl KmsCore {
             shape_input: HashMap::new(),
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
+            cow_refcount: 0,
             glyphsets: HashMap::new(),
             pictures: HashMap::new(),
         }
