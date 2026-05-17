@@ -76,10 +76,36 @@ const _: () = assert!(std::mem::size_of::<RenderPushConsts>() == 128);
 /// X11 RENDER repeat-mode constants. Numeric values match the
 /// `Repeat` enum in the `pixman` crate so call sites can keep
 /// converting via `as i32`.
+///
+/// ## `RenderPushConsts::repeat_modes[i]` bit layout
+///
+/// `repeat_modes[0]` is the src picture's encoding,
+/// `repeat_modes[1]` the mask's. The push-constants are tight
+/// against the 128-byte `maxPushConstantsSize` minimum, so we
+/// pack the X11 Render `PictFormat` force-opaque flag into the
+/// upper bits of the existing `i32` rather than growing the
+/// struct. Shader-side mask: `& REPEAT_MODE_MASK` for the repeat
+/// mode, `& REPEAT_FORCE_OPAQUE_BIT` for the force-opaque flag.
+///
+/// ```text
+///   bits  0..=7   — repeat mode (REPEAT_NONE..=REPEAT_REFLECT)
+///   bit   8       — force_opaque (1 if the picture's source format
+///                   has alpha_mask = 0 per X11 Render `PictFormat`)
+///   bits  9..=31  — reserved (must be 0)
+/// ```
 pub const REPEAT_NONE: i32 = 0;
 pub const REPEAT_NORMAL: i32 = 1;
 pub const REPEAT_PAD: i32 = 2;
 pub const REPEAT_REFLECT: i32 = 3;
+
+/// Mask for the repeat-mode bits of `RenderPushConsts::repeat_modes[i]`
+/// — `repeat_modes[i] & REPEAT_MODE_MASK` recovers the repeat constant.
+pub const REPEAT_MODE_MASK: i32 = 0xff;
+/// Force-opaque bit of `RenderPushConsts::repeat_modes[i]`. When set,
+/// the fragment shader pins the sampled alpha to 1.0 regardless of the
+/// texel's actual alpha — the spec behaviour for picture formats whose
+/// `alpha_mask` is 0 (e.g. depth-24 RGB visuals).
+pub const REPEAT_FORCE_OPAQUE_BIT: i32 = 1 << 8;
 
 impl RenderPushConsts {
     pub fn as_bytes(&self) -> &[u8] {

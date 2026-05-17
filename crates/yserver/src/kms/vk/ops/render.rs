@@ -24,7 +24,11 @@
 
 use ash::vk;
 
-use crate::kms::vk::{device::VkContext, render_pipeline::RenderPushConsts, target::DrawableImage};
+use crate::kms::vk::{
+    device::VkContext,
+    render_pipeline::{REPEAT_FORCE_OPAQUE_BIT, RenderPushConsts},
+    target::DrawableImage,
+};
 
 /// Minimal paint-target surface that [`record_render_composite`]
 /// reads / mutates. Lets the recorder operate against either v1's
@@ -89,12 +93,42 @@ impl AffineXform {
     };
 }
 
+/// Pack a repeat-mode constant and the force-opaque flag into the
+/// `i32` slot the shader reads from `RenderPushConsts::repeat_modes[i]`.
+/// Bit layout is documented next to [`REPEAT_FORCE_OPAQUE_BIT`].
+///
+/// Exposed (and tested) so the encoding is greppable from both
+/// sides — Rust pushers and the GLSL shader. Inlines to a single
+/// `or` at the call site in `record_render_composite`.
+#[inline]
+#[must_use]
+pub fn pack_repeat_mode(repeat: i32, force_opaque: bool) -> i32 {
+    repeat | (i32::from(force_opaque) * REPEAT_FORCE_OPAQUE_BIT)
+}
+
 /// Per-Composite-call attribute bundle.
 pub struct CompositeAttrs {
     pub src_extent: ash::vk::Extent2D,
     pub mask_extent: ash::vk::Extent2D,
     pub src_repeat: i32,
     pub mask_repeat: i32,
+    /// X11 RENDER PictFormat-driven force-opaque flag for the src
+    /// picture. When the source picture's format has
+    /// `alpha_mask == 0` (e.g. a depth-24 RGB visual), the spec
+    /// requires samples to return `α = 1.0` regardless of the
+    /// byte content of the underlying storage — the alpha byte
+    /// is server-owned padding. The shader-side check honours
+    /// the spec even when the image-view swizzle alone cannot
+    /// (self-alias scratch paths, picture formats that disagree
+    /// with the drawable depth, etc.). Packed into the upper
+    /// bits of `RenderPushConsts::repeat_modes[0]` — see
+    /// `REPEAT_FORCE_OPAQUE_BIT`.
+    pub src_force_opaque: bool,
+    /// Same shape as [`Self::src_force_opaque`] for the mask
+    /// picture. Depth-24 masks are rare in practice (most masks
+    /// are A8 picture formats), but the spec semantics are
+    /// identical so we keep the plumbing symmetric.
+    pub mask_force_opaque: bool,
     pub src_xform: AffineXform,
     pub mask_xform: AffineXform,
 }
@@ -230,7 +264,10 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
                     mask_origin: [r.mask_x as f32, r.mask_y as f32],
                     src_extent: src_extent_px,
                     mask_extent: mask_extent_px,
-                    repeat_modes: [attrs.src_repeat, attrs.mask_repeat],
+                    repeat_modes: [
+                        pack_repeat_mode(attrs.src_repeat, attrs.src_force_opaque),
+                        pack_repeat_mode(attrs.mask_repeat, attrs.mask_force_opaque),
+                    ],
                     src_xform_row0: attrs.src_xform.row0,
                     src_xform_row1: attrs.src_xform.row1,
                     mask_xform_row0: attrs.mask_xform.row0,
@@ -275,4 +312,60 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kms::vk::render_pipeline::{
+        REPEAT_FORCE_OPAQUE_BIT, REPEAT_MODE_MASK, REPEAT_NONE, REPEAT_NORMAL, REPEAT_PAD,
+        REPEAT_REFLECT,
+    };
+
+    /// X11 Render `PictFormat` fix: the force-opaque flag must pack
+    /// into the upper bits of `repeat_modes[i]` (bit 8) without
+    /// aliasing any of the 4 repeat-mode constants
+    /// (`REPEAT_NONE` = 0 .. `REPEAT_REFLECT` = 3). Verifies the
+    /// encoding contract the GLSL shader relies on — both sides
+    /// must agree on the bit layout or the shader will sample
+    /// garbage as the force-opaque hint.
+    #[test]
+    fn composite_attrs_packs_force_opaque_into_repeat_modes_upper_bits() {
+        // REPEAT_PAD encodes as the bare constant when force_opaque
+        // is false — the shader's `repeat & REPEAT_MODE_MASK` must
+        // recover the original repeat.
+        assert_eq!(pack_repeat_mode(REPEAT_PAD, false), REPEAT_PAD);
+        assert_eq!(
+            pack_repeat_mode(REPEAT_PAD, false) & REPEAT_MODE_MASK,
+            REPEAT_PAD
+        );
+        assert_eq!(
+            pack_repeat_mode(REPEAT_PAD, false) & REPEAT_FORCE_OPAQUE_BIT,
+            0
+        );
+
+        // With force_opaque, bit 8 is set; the repeat mode in the
+        // low byte is preserved.
+        let pad_opaque = pack_repeat_mode(REPEAT_PAD, true);
+        assert_eq!(pad_opaque, REPEAT_PAD | (1 << 8));
+        assert_eq!(pad_opaque & REPEAT_MODE_MASK, REPEAT_PAD);
+        assert_eq!(
+            pad_opaque & REPEAT_FORCE_OPAQUE_BIT,
+            REPEAT_FORCE_OPAQUE_BIT
+        );
+
+        // Each of the 4 repeat constants survives the round-trip
+        // unchanged regardless of the force-opaque bit.
+        for r in [REPEAT_NONE, REPEAT_NORMAL, REPEAT_PAD, REPEAT_REFLECT] {
+            for force in [false, true] {
+                let packed = pack_repeat_mode(r, force);
+                assert_eq!(packed & REPEAT_MODE_MASK, r);
+                assert_eq!(
+                    (packed & REPEAT_FORCE_OPAQUE_BIT) != 0,
+                    force,
+                    "force_opaque bit round-trip failed for r={r}, force={force}"
+                );
+            }
+        }
+    }
 }

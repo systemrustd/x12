@@ -74,6 +74,15 @@ const int REPEAT_NORMAL = 1;
 const int REPEAT_PAD = 2;
 const int REPEAT_REFLECT = 3;
 
+// Bit layout of `pc.repeat_modes[i]` — see
+// `render_pipeline::REPEAT_FORCE_OPAQUE_BIT` on the Rust side.
+//   bits 0..=7  — repeat mode constant
+//   bit  8      — force_opaque (X11 Render: PictFormat.alpha_mask == 0
+//                 ⇒ samples return α = 1.0 regardless of stored bytes)
+//   bits 9..=31 — reserved (zero)
+const int REPEAT_MODE_MASK = 0xff;
+const int REPEAT_FORCE_OPAQUE_BIT = (1 << 8);
+
 // Apply the repeat mode to a UV in `[0,1]` (post-extent normalisation).
 // Returns `vec3(uv.xy, 1.0)` if the sample is in-range, or
 // `vec3(_, _, 0.0)` if the repeat mode is `None` and the sample falls
@@ -109,7 +118,7 @@ vec3 sample_at(sampler2D tex, vec2 origin_px, vec2 extent_px,
     float y = row1.x * pre.x + row1.y * pre.y + row1.z;
     // Normalise to UV.
     vec2 uv = vec2(x / extent_px.x, y / extent_px.y);
-    return apply_repeat(uv, repeat_mode);
+    return apply_repeat(uv, repeat_mode & REPEAT_MODE_MASK);
 }
 
 // X RENDER Disjoint/Conjoint Fa, Fb tables. `aa = src.a`, `ab = dst.a`.
@@ -221,6 +230,27 @@ void main() {
 
     vec4 src = texture(src_tex, src_uv.xy) * src_uv.z;
     vec4 mask_sample = texture(mask_tex, mask_uv.xy) * mask_uv.z;
+
+    // X11 Render: PictFormat.alpha_mask == 0 ⇒ samples must return
+    // α = 1.0 regardless of what the storage byte holds. The
+    // Rust-side resolver sets this bit on `repeat_modes[i]` when the
+    // picture wraps a drawable whose depth is < 32 (the only case
+    // where the storage's α byte is server-owned padding). Apply
+    // *before* the operator stages — the rest of the shader (premul
+    // math, fixed-function blend factors, Disjoint/Conjoint manual
+    // blend) assumes the sampled α is the picture-space α, which is
+    // exactly the post-fixup value.
+    bool src_force_opaque  = (pc.repeat_modes.x & REPEAT_FORCE_OPAQUE_BIT) != 0;
+    bool mask_force_opaque = (pc.repeat_modes.y & REPEAT_FORCE_OPAQUE_BIT) != 0;
+    if (src_force_opaque) {
+        // REPEAT_NONE's out-of-range zero (src_uv.z == 0) must still
+        // suppress the texel; only force α to 1.0 *inside* the
+        // sampled region — `src_uv.z` is 1.0 there, 0.0 outside.
+        src.a = src_uv.z;
+    }
+    if (mask_force_opaque) {
+        mask_sample.a = mask_uv.z;
+    }
 
     vec4 s;          // premul source colour, post-mask
     vec4 src_alpha;  // src alpha factor (per-channel for COMPONENT_ALPHA)

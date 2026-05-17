@@ -2248,3 +2248,112 @@ fn v2_cow_paint_appears_on_scanout() {
          (storage destroyed) — got {img_after:?}",
     );
 }
+
+/// Stage 4d X11 Render `PictFormat` fix — marco-compositing widgets-
+/// invisible repro.
+///
+/// Bug: redirected window backings end up with `α = 0x00` in their
+/// storage (depth-24 padding byte) but marco's `Over` operator
+/// samples that α=0 source, blends it with the dst, and produces
+/// no contribution — widget contents stay invisible. The X11
+/// Render spec says samples from a picture wrapping a depth-24
+/// drawable must return `α = 1.0` (`PictFormat.alpha_mask = 0`).
+///
+/// Oracle: fill a depth-24 pixmap to a known RGB with α=0 in the
+/// storage byte, then composite (`OP_SRC`) it onto a depth-32
+/// pixmap pre-filled to transparent black. After the composite,
+/// the dst must have `α = 0xFF` everywhere (force-opaque), not
+/// `α = 0x00` (the pre-fix bug).
+///
+/// `OP_SRC` (op=1) was chosen because it's the simplest predicate:
+/// `dst = src`. Any α-blending op would also work but introduces
+/// more failure modes. The fix is exclusively shader-side, so the
+/// minimal-blend op is the cleanest gate.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_composite_depth24_src_samples_opaque_alpha() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Step 1: depth-24 src pixmap, 4×4. fill_rectangle with
+    // foreground 0x00_AABBCC: alpha-byte = 0x00, R = 0xAA, G = 0xBB,
+    // B = 0xCC. v2's RGB→storage path lays this down as BGRA
+    // `[0xCC, 0xBB, 0xAA, 0x00]` — α byte 0x00, exactly the
+    // depth-24 padding case the marco-compositing bug hits.
+    let src_pix = b.create_pixmap(None, 24, 4, 4).expect("create src d24");
+    let src_xid = src_pix.as_raw();
+    b.fill_rectangle(None, src_xid, 0x00_AA_BB_CC, 0, 0, 4, 4)
+        .expect("fill_rectangle src d24 with α=0 in storage");
+
+    // Step 2: depth-32 dst pixmap, 4×4, pre-cleared to transparent
+    // black (α=0). After Composite the dst's α byte is the gate:
+    // pre-fix it remains 0x00 (sampled from src storage), post-fix
+    // it must be 0xFF (forced by the shader on depth-24 sources).
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create dst d32");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0x00_00_00_00, 0, 0, 4, 4)
+        .expect("fill_rectangle dst d32 to transparent black");
+
+    // Step 3: Pictures. Default formats — the backend picks
+    // depth-matched PictFormats per the standard X11 Render
+    // table (depth-24 → x8r8g8b8; depth-32 → a8r8g8b8).
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(src_pix), 0, 0, &[])
+        .expect("render_create_picture src")
+        .expect("Some(src PictureHandle)");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(dst PictureHandle)");
+
+    // Step 4: Composite OP_SRC, full 4×4 cover. No mask, no
+    // transform, no clip — the simplest path through
+    // `RenderEngine::render_composite`. The src picture wraps a
+    // depth-24 drawable; the force-opaque resolver flags it; the
+    // shader pins sampled α = 1.0 (= src_uv.z, which is 1.0
+    // everywhere inside the 4×4 cover); OP_SRC writes
+    // `(R, G, B, 1.0)` into the dst.
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        4,
+    )
+    .expect("render_composite");
+
+    // Step 5: Read dst back. Every pixel's α byte must be 0xFF —
+    // the post-fix invariant. Pre-fix, α would be 0x00 (the src
+    // padding byte).
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image dst")
+        .expect("Some(dst bytes)");
+    assert_eq!(out.len(), 4 * 4 * 4, "4×4 BGRA8 readback");
+    for y in 0..4 {
+        for x in 0..4 {
+            let off = (y * 4 + x) * 4;
+            let px = &out[off..off + 4];
+            // BGRA storage. The RGB channels come through from
+            // src; the load-bearing assertion is α = 0xFF.
+            assert_eq!(
+                px[3], 0xFF,
+                "dst ({x},{y}) α must be 0xFF (force-opaque); got {px:?}. \
+                 Pre-fix this would be 0x00 — the depth-24 src padding byte.",
+            );
+        }
+    }
+}

@@ -2872,11 +2872,22 @@ impl RenderEngine {
             None => user_mask_xform,
         };
 
+        // X11 Render PictFormat: pictures wrapping a depth < 32
+        // drawable have `alpha_mask = 0`, so samples must return
+        // α = 1.0 regardless of the storage byte (which is
+        // server-owned padding for depth-24 BGRA storage). Resolve
+        // per src/mask drawable; Solid / Gradient / None carry their
+        // own α and don't need the override.
+        let src_force_opaque = resolve_force_opaque(store, &src);
+        let mask_force_opaque = resolve_force_opaque(store, &mask);
+
         let attrs = vk_render::CompositeAttrs {
             src_extent,
             mask_extent,
             src_repeat: effective_src_repeat,
             mask_repeat: effective_mask_repeat,
+            src_force_opaque,
+            mask_force_opaque,
             src_xform: combined_src_xform,
             mask_xform: combined_mask_xform,
         };
@@ -3567,11 +3578,19 @@ impl RenderEngine {
         } else {
             crate::kms::backend::repeat_to_shader_const(src_repeat)
         };
+        // X11 Render PictFormat force-opaque for the src picture.
+        // The mask is the trap-coverage R8 scratch the engine
+        // rasterised in this op — never a user picture — so its α
+        // is server-controlled and force_opaque doesn't apply.
+        let src_force_opaque = resolve_force_opaque(store, &src);
+
         let attrs = vk_render::CompositeAttrs {
             src_extent,
             mask_extent,
             src_repeat: effective_src_repeat,
             mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
+            src_force_opaque,
+            mask_force_opaque: false,
             src_xform: combined_src_xform,
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
@@ -3713,6 +3732,41 @@ struct DrawableViewInfo {
     extent: vk::Extent2D,
     format: vk::Format,
     depth: u8,
+}
+
+/// X11 Render PictFormat force-opaque resolver.
+///
+/// Per the X11 Render spec, a Picture whose format has
+/// `alpha_mask == 0` (e.g. a depth-24 RGB visual: r8g8b8 or
+/// x8r8g8b8) must yield samples with `α = 1.0` regardless of the
+/// byte content of the underlying storage. v2 stores depth-24
+/// pixmaps as `B8G8R8A8_UNORM` with the α byte as server-owned
+/// padding — without this override, marco/compositing samples the
+/// padding byte (often 0) and the operator collapses to no-op,
+/// leaving widget windows invisible under a compositing WM.
+///
+/// ## Gate: `depth == 24` BGRA storage only
+///
+/// Stage 4d landed this as `depth == 24` rather than the broader
+/// `depth < 32` because depth-8 (A8 alpha-only pictures) and
+/// depth-1 (bitmap masks) carry meaningful α in the X11 Render
+/// `PictFormat` — forcing `α = 1.0` on a depth-8 mask would
+/// silently turn coverage masks into solid blocks. Picture-
+/// format-driven resolution (looking up the actual `PictFormat`
+/// attached to the source picture rather than the drawable
+/// depth) is the cleaner long-term shape; `depth == 24` is the
+/// load-bearing case marco-with-compositing depends on, so we
+/// fix that first and broaden later if a non-depth-24 picture
+/// format with `alpha_mask == 0` shows up in a real workload.
+///
+/// `Solid` carries its own α, `Gradient` LUTs are authored with
+/// the right α from `RenderCreateGradient`, and `None` is the
+/// synthetic white-mask path — none of those need the override.
+fn resolve_force_opaque(store: &DrawableStore, src: &ResolvedSource) -> bool {
+    match src {
+        ResolvedSource::Drawable(id) => store.get(*id).is_some_and(|d| d.depth == 24),
+        ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => false,
+    }
 }
 
 fn drawable_for_render_view(store: &DrawableStore, id: DrawableId) -> Option<DrawableViewInfo> {
@@ -6450,5 +6504,132 @@ mod tests {
         }
 
         engine.drain_all(&platform);
+    }
+
+    /// X11 Render PictFormat fix — resolver-level oracle.
+    ///
+    /// Per the X11 Render spec, a Picture wrapping a depth-24
+    /// drawable has `PictFormat.alpha_mask = 0`; samples must
+    /// return α = 1.0 regardless of the storage's padding byte.
+    /// `resolve_force_opaque` is the single point where v2's
+    /// `render_composite` and `render_traps_or_tris` decide
+    /// whether to set the shader-side force-opaque bit on the
+    /// src/mask picture.
+    ///
+    /// This test is the logic-only gate: a depth-24 Drawable
+    /// must resolve to `true`; depth-32 to `false`. Solid and
+    /// Gradient sources carry α intrinsically (LUT-baked or
+    /// caller-supplied), so they're always `false`. `None` is
+    /// the synthetic white-mask path — `α = 1.0` already by
+    /// construction, so no override needed.
+    #[test]
+    fn render_composite_resolve_force_opaque_oracle() {
+        let mut store = DrawableStore::new();
+        let storage32 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id32 = store
+            .allocate(
+                0xA001,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage32,
+            )
+            .unwrap();
+        let storage24 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id24 = store
+            .allocate(
+                0xA002,
+                super::super::store::DrawableKind::Pixmap,
+                24,
+                false,
+                storage24,
+            )
+            .unwrap();
+
+        // depth-32 Drawable: storage's α byte is client-meaningful,
+        // do not force.
+        assert!(!resolve_force_opaque(
+            &store,
+            &ResolvedSource::Drawable(id32)
+        ));
+        // depth-24 Drawable: storage's α byte is server-owned
+        // padding, force α = 1.0.
+        assert!(resolve_force_opaque(
+            &store,
+            &ResolvedSource::Drawable(id24)
+        ));
+
+        // Solid: α is caller-supplied premul. Gradient: α is
+        // LUT-baked. None: white-mask scratch is initialised to
+        // α = 1.0 at engine init. All three pass through.
+        assert!(!resolve_force_opaque(
+            &store,
+            &ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]),
+        ));
+        assert!(!resolve_force_opaque(
+            &store,
+            &ResolvedSource::Gradient(0x1234)
+        ));
+        assert!(!resolve_force_opaque(&store, &ResolvedSource::None));
+
+        // depth-1 (bitmap mask) and depth-8 (a8 alpha picture)
+        // both have meaningful α in their PictFormat — α carries
+        // the bitmap value / coverage. Forcing α = 1.0 on those
+        // would turn coverage masks into solid blocks, so the
+        // resolver explicitly excludes them. Only depth-24 (the
+        // x8r8g8b8 / r8g8b8 case where storage's α byte is
+        // server-owned padding) gets the override.
+        let storage1 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id1 = store
+            .allocate(
+                0xA003,
+                super::super::store::DrawableKind::Pixmap,
+                1,
+                false,
+                storage1,
+            )
+            .unwrap();
+        assert!(!resolve_force_opaque(
+            &store,
+            &ResolvedSource::Drawable(id1)
+        ));
+        let storage8 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let id8 = store
+            .allocate(
+                0xA004,
+                super::super::store::DrawableKind::Pixmap,
+                8,
+                false,
+                storage8,
+            )
+            .unwrap();
+        assert!(!resolve_force_opaque(
+            &store,
+            &ResolvedSource::Drawable(id8)
+        ));
     }
 }

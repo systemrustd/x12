@@ -4925,6 +4925,13 @@ impl KmsBackend {
             // outside-bbox pixels (mask=0 makes the operator yield
             // the right zero / dst-preserved result).
             mask_repeat: 0,
+            // v1 force-opaque is out of scope for the depth-24 RENDER
+            // fix (Stage 4d v2-only). The v1 path predates the
+            // PictFormat-aware sampler plumbing; if marco-with-
+            // compositing on v1 turns out to need the same fix, mirror
+            // the resolver from `kms::v2::engine::resolve_force_opaque`.
+            src_force_opaque: false,
+            mask_force_opaque: false,
             src_xform: src_picture_xform.unwrap_or(vk_render::AffineXform::IDENTITY),
             mask_xform: vk_render::AffineXform::IDENTITY,
         };
@@ -6223,6 +6230,13 @@ impl KmsBackend {
             mask_extent,
             src_repeat: effective_src_repeat,
             mask_repeat: effective_mask_repeat,
+            // v1 RENDER paint path — Stage 4d's PictFormat
+            // force-opaque fix lives on v2 (`kms::v2::engine`).
+            // Wiring v1's `ResolvedSource` analog into this site is
+            // tracked as follow-up; default-false keeps v1 behaviour
+            // unchanged.
+            src_force_opaque: false,
+            mask_force_opaque: false,
             src_xform: combined_src_xform,
             mask_xform: combined_mask_xform,
         };
