@@ -29,7 +29,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `rm`, picom validation harness.
 - Active dev branch: `rendering-model-v2`, off
   `graphics-followups`. v2 spec at base; Stages 1a/1b/2a–2f and
-  3a through 3f.14 landed on top (see "Done" / "In progress"
+  3a through 3f.15 landed on top (see "Done" / "In progress"
   below for commit hashes). `YSERVER_RENDER_MODEL=v2` is the
   **boot default** as of `3afa5bd` (2026-05-17 — previously the
   status doc claimed v2 default but `dispatch.rs` had v1 as the
@@ -40,7 +40,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   convolution Phase 1+2, the rotate fix, and the
   parallel-implementation lessons. Don't ship anything from there.
 
-### What runs on v2 today (after 3f.14 + hardware-smoke fixes)
+### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
 - xeyes pupils render correctly (post-`dae5769` MaskScratch
   IDENTITY attachment view).
@@ -1125,15 +1125,46 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         black. Applied in both `allocate_window_storage` and
         the `configure_subwindow` resize path.
       3 new tests (2 Vk-backed, 1 logic).
-    - [ ] **3f.15 — submit aggregation for stroke ops
-      (post-3f.5 polish, may slip to Stage 5).** fvwm3 drag
-      stutter + caja apparent "hang" both trace back to
-      PolySegment fan-out → many tiny per-segment Vk
-      submits. v1's `PaintBatch` coalesces; v2 has no
-      submit aggregation. Spec § Stage 5 names this as the
-      submit-rate-bound perf class. Stage-3-close-acceptable
-      if Stage 3f.5 hardware smoke shows the choppiness is
-      tolerable; Stage 5 owns the real fix.
+    - [x] **3f.15 — submit aggregation for stroke ops landed
+      2026-05-17.** PolySegment / PolyLine / PolyRectangle /
+      PolyArc / PolyPoint fan-outs no longer pay O(N) submits.
+      New `RenderEngine::fill_rect_batch(target, color, &[Rect2D])`
+      records every rect into a single `cmd_clear_attachments`
+      call (Vulkan natively accepts a `ClearRect` slice) inside
+      one CB + one queue submit + one `SubmittedOp`. Single
+      layout-transition pair per batch instead of per rect.
+      `RenderEngine::fill_rect` keeps its one-rect signature for
+      the create_pixmap / bg_pixel / image_text-bg / root-init
+      / window-init call sites by delegating to `fill_rect_batch`
+      with a 1-slice. `KmsBackendV2::fill_solid_rects` (the
+      shared lowering for every solid stroke op) drops its
+      per-rect for-loop in the `GcFunction::Copy` arm and calls
+      `fill_rect_batch` with the full slice; `record_paint_submit`
+      fires once per call, matching the non-Copy `logic_fill`
+      path's shape. Zero-sized rects are filtered up-front so an
+      all-empty batch never burns a CB / fence ticket. Non-Copy
+      logic-op stroke ops were already coalesced by
+      `logic_fill` (3f.2); no change there.
+
+      Effect on the worst-case workload: an 8-segment
+      `PolySegment` request that pre-3f.15 drove ~50 paint
+      submits now drives 1. fvwm3 drag stutter + caja "hang"
+      should both ease; Stage 3f.5 hardware smoke is the
+      load-bearing gate.
+
+      2 new tests: `fill_rect_batch_one_submit_for_n_rects`
+      (engine-level Vk-backed: 3 disjoint rects on a 16×4 BGRA8
+      pixmap pre-cleared blue, asserts `inner.submitted` grew
+      by exactly 1 across the call + pixel-correct per-rect red
+      + blue background); `v2_poly_segment_coalesces_to_one_submit`
+      (acceptance Vk-backed: drives 8 segments via
+      `Backend::poly_segment`, asserts `telemetry.lifetime
+      .paint_submits` delta is 1 and `queue_submit2` delta is
+      1). 249 lib + 23 ignored v2 Vk + 16 v2_acceptance tests
+      green under lavapipe (3 pre-existing failures unrelated
+      to 3f.15: see "Open follow-up from 2026-05-17 smoke"
+      below); clippy clean. Hardware smoke (fvwm3 drag,
+      caja-on-mate) deferred to 3f.5.
 
   ### Shared-Vk and v2-storage fixes landed 2026-05-16/17
   ### (from xeyes-on-mate-marco hardware smoke)
@@ -1247,6 +1278,27 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       with the xeyes-shrink bug (rapid configure_subwindow on
       panel applet activity) or be its own scene-damage issue.
       Worth capturing a focused trace+log when picked up.
+    - [ ] **Lavapipe-only Vk test flakes** (surfaced during
+      3f.15 close, reproduce on the 3f.14 baseline — *not* a
+      3f.15 regression). Hardware-smoke on RADV / Intel is the
+      gate of record; these are diagnosis owed for the
+      lavapipe-only CI loop:
+      1. `render_composite_linear_gradient_horizontal_two_stop`
+         — reads `BGRA=(0,0,0,255)` instead of the colored
+         ramp at the right edge. 3f.13 commit message
+         explicitly notes "Fuji hw-smoke confirmed gradient
+         rendering by user 2026-05-16," so the live wire path
+         works; failure likely sits in lavapipe's gradient-
+         sampler corner.
+      2. `render_composite_radial_gradient_centred` — rim
+         pixel reads black instead of near-white. Same
+         3f.13 LUT path; same lavapipe-vs-real-HW shape.
+      3. `v2_set_container_background_pixmap_tiles_across_root`
+         — SIGSEGV in the test binary (3f.14 tile path).
+         Hard crash, not a pixel-mismatch; this one needs
+         a real triage pass (binding lifetime? `Repeat::Normal`
+         sampler under lavapipe?) since it affects the rest
+         of the acceptance run by aborting the binary.
 
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix (xterm / xclock / xeyes / gedit / MATE /

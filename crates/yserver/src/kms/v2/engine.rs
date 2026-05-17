@@ -800,12 +800,12 @@ impl RenderEngine {
         });
     }
 
-    // ── Op: fill_rect ───────────────────────────────────────────
+    // ── Op: fill_rect / fill_rect_batch ─────────────────────────
 
     /// Fill `rect` in `target`'s storage with `color` (RGBA float).
-    /// `vkCmdClearAttachments` inside an active render pass — no
-    /// pipeline / shader / descriptor set needed; matches v1's
-    /// `fill::record_fill_rectangles` choice.
+    /// Convenience wrapper around [`Self::fill_rect_batch`] for the
+    /// single-rect call sites (create_pixmap zero-fill, bg_pixel
+    /// init, image_text background, etc.).
     ///
     /// # Errors
     ///
@@ -819,9 +819,32 @@ impl RenderEngine {
         rect: vk::Rect2D,
         color: [f32; 4],
     ) -> Result<(), RenderError> {
-        if rect.extent.width == 0 || rect.extent.height == 0 {
-            return Ok(());
-        }
+        self.fill_rect_batch(store, platform, target, color, &[rect])
+    }
+
+    /// Fill every rect in `rects` on `target` with `color`, recording
+    /// all clears into a **single** CB + a **single** submit + a
+    /// **single** `SubmittedOp` (Stage 3f.15 stroke-op aggregation).
+    /// `vkCmdClearAttachments` natively accepts a slice of `ClearRect`,
+    /// so PolySegment / PolyLine / PolyRectangle stroke fan-outs that
+    /// previously paid N submits collapse to one.
+    ///
+    /// Zero-sized rects are filtered up-front; if the slice contains
+    /// only empties (or is empty), the call short-circuits without
+    /// touching the queue.
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk`, `UnknownDrawable`, `RendererFailed`, or any
+    ///   propagated `vk::Result` from CB allocation / submit.
+    pub(crate) fn fill_rect_batch(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        target: DrawableId,
+        color: [f32; 4],
+        rects: &[vk::Rect2D],
+    ) -> Result<(), RenderError> {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -833,6 +856,18 @@ impl RenderEngine {
         };
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
+
+        // Clamp + drop empties up front. Doing this before begin_op_cb
+        // means an all-empty batch doesn't allocate a CB or burn a
+        // fence ticket.
+        let clamped: Vec<vk::Rect2D> = rects
+            .iter()
+            .map(|r| clamp_rect(*r, extent))
+            .filter(|r| r.extent.width != 0 && r.extent.height != 0)
+            .collect();
+        if clamped.is_empty() {
+            return Ok(());
+        }
 
         let (cb, ticket) = begin_op_cb(inner, platform)?;
         let device = &inner.vk.device;
@@ -867,6 +902,23 @@ impl RenderEngine {
             .render_area(render_area)
             .layer_count(1)
             .color_attachments(&color_attachment);
+
+        let attachments = [vk::ClearAttachment::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .color_attachment(0)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: color },
+            })];
+        let clear_rects: Vec<vk::ClearRect> = clamped
+            .iter()
+            .map(|r| {
+                vk::ClearRect::default()
+                    .rect(*r)
+                    .base_array_layer(0)
+                    .layer_count(1)
+            })
+            .collect();
+
         unsafe {
             device.cmd_begin_rendering(cb, &rendering_info);
             let viewport = [vk::Viewport {
@@ -883,16 +935,6 @@ impl RenderEngine {
             let scissor = [render_area];
             device.cmd_set_scissor(cb, 0, &scissor);
 
-            let attachments = [vk::ClearAttachment::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .color_attachment(0)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue { float32: color },
-                })];
-            let clear_rects = [vk::ClearRect::default()
-                .rect(clamp_rect(rect, extent))
-                .base_array_layer(0)
-                .layer_count(1)];
             device.cmd_clear_attachments(cb, &attachments, &clear_rects);
             device.cmd_end_rendering(cb);
         }
@@ -910,7 +952,9 @@ impl RenderEngine {
 
         end_and_submit_op(inner, platform, cb, &ticket)?;
         store.touch_render_fence(target, ticket.clone());
-        store.damage(target, rect);
+        for r in &clamped {
+            store.damage(target, *r);
+        }
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
@@ -6257,5 +6301,147 @@ mod tests {
             p3: (8 << 16, 0),
         };
         assert!(crate::kms::vk::ops::traps::triangle_bbox(&[colinear]).is_none());
+    }
+
+    /// Stage 3f.15: `fill_rect_batch` records N rects into ONE CB +
+    /// ONE submit + ONE `SubmittedOp`. Drives 3 disjoint rects on a
+    /// 16×4 BGRA8 dst pre-cleared to blue, fills them red, and
+    /// asserts (a) the dst observes red inside each rect and blue
+    /// outside, and (b) `inner.submitted` grew by exactly 1 across
+    /// the batch call.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn fill_rect_batch_one_submit_for_n_rects() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage = platform
+            .allocate_drawable_storage(16, 4, 32)
+            .expect("alloc");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .unwrap();
+
+        // Pre-fill the dst with blue so we can see the batch-painted
+        // rects against a known background.
+        let blue = decode_x11_pixel_bgra(0xFF_00_00_FF);
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 16,
+                        height: 4,
+                    },
+                },
+                blue,
+            )
+            .expect("blue prefill");
+
+        // Snapshot the SubmittedOp count BEFORE the batch call so we
+        // can assert exactly +1 across the call regardless of what
+        // prior ops are still in flight.
+        let before = engine
+            .inner
+            .as_ref()
+            .map(|i| i.submitted.len())
+            .unwrap_or(0);
+
+        let red = decode_x11_pixel_bgra(0xFF_FF_00_00);
+        let rects = [
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: 2,
+                    height: 2,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 6, y: 1 },
+                extent: vk::Extent2D {
+                    width: 3,
+                    height: 2,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 13, y: 2 },
+                extent: vk::Extent2D {
+                    width: 3,
+                    height: 2,
+                },
+            },
+        ];
+        engine
+            .fill_rect_batch(&mut store, &mut platform, id, red, &rects)
+            .expect("fill_rect_batch");
+
+        let after = engine
+            .inner
+            .as_ref()
+            .map(|i| i.submitted.len())
+            .unwrap_or(0);
+        assert_eq!(
+            after,
+            before + 1,
+            "fill_rect_batch must produce exactly one SubmittedOp regardless of rect count \
+             (before={before}, after={after})"
+        );
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 16,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        // Helper: does (x, y) fall inside any of the painted rects?
+        let in_rect = |x: i32, y: i32| -> bool {
+            rects.iter().any(|r| {
+                x >= r.offset.x
+                    && y >= r.offset.y
+                    && x < r.offset.x + r.extent.width as i32
+                    && y < r.offset.y + r.extent.height as i32
+            })
+        };
+        for y in 0..4 {
+            for x in 0..16 {
+                let off = (y * 16 + x) as usize * 4;
+                let px = &out[off..off + 4];
+                if in_rect(x, y) {
+                    assert_eq!(px[2], 0xFF, "rect pixel ({x},{y}) R should be 0xFF (red)");
+                    assert_eq!(px[0], 0x00, "rect pixel ({x},{y}) B should be 0x00");
+                } else {
+                    assert_eq!(
+                        px[0], 0xFF,
+                        "background pixel ({x},{y}) B should be 0xFF (blue)"
+                    );
+                    assert_eq!(px[2], 0x00, "background pixel ({x},{y}) R should be 0x00");
+                }
+            }
+        }
+
+        engine.drain_all(&platform);
     }
 }

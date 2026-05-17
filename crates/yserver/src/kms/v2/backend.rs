@@ -971,11 +971,15 @@ impl KmsBackendV2 {
             return;
         }
         let color = decode_x11_pixel_bgra(fg);
-        for r in rects {
-            if r.width == 0 || r.height == 0 {
-                continue;
-            }
-            let rect = ash::vk::Rect2D {
+        // Stage 3f.15: coalesce N stroke rects into one CB + one
+        // submit via engine.fill_rect_batch. PolySegment / PolyLine
+        // / PolyRectangle fan-outs now pay O(1) submits per protocol
+        // request instead of O(N). Zero-sized rects are filtered
+        // inside the engine.
+        let vk_rects: Vec<ash::vk::Rect2D> = rects
+            .iter()
+            .filter(|r| r.width != 0 && r.height != 0)
+            .map(|r| ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
                     x: i32::from(r.x),
                     y: i32::from(r.y),
@@ -984,15 +988,21 @@ impl KmsBackendV2 {
                     width: u32::from(r.width),
                     height: u32::from(r.height),
                 },
-            };
-            if let Err(e) =
-                self.engine
-                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
-            {
-                log::warn!("v2 fill_solid_rects: engine.fill_rect failed: {e:?}");
-                break;
+            })
+            .collect();
+        if vk_rects.is_empty() {
+            return;
+        }
+        match self
+            .engine
+            .fill_rect_batch(&mut self.store, &mut self.platform, id, color, &vk_rects)
+        {
+            Ok(()) => {
+                self.telemetry.record_paint_submit();
             }
-            self.telemetry.record_paint_submit();
+            Err(e) => {
+                log::warn!("v2 fill_solid_rects: engine.fill_rect_batch failed: {e:?}");
+            }
         }
     }
 

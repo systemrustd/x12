@@ -1300,3 +1300,68 @@ fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
         );
     }
 }
+
+/// Stage 3f.15: PolySegment with N segments produces ONE paint
+/// submit, not N. v2 used to call `engine.fill_rect` once per
+/// Bresenham-output rect inside `fill_solid_rects`; the batch entry
+/// point added in 3f.15 records every rect into a single
+/// `cmd_clear_attachments` call. fvwm3 drag stutter + caja apparent
+/// hangs both traced back to PolySegment fan-out → many tiny
+/// per-segment Vk submits. This test drives 8 segments through the
+/// Backend surface and asserts the lifetime paint_submits delta is
+/// exactly 1.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_poly_segment_coalesces_to_one_submit() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let xid = b.create_pixmap(None, 32, 32, 32).unwrap().as_raw();
+
+    // Snapshot lifetime counters before the stroke op.
+    let before_paint = b.telemetry().lifetime.paint_submits;
+    let before_q = b.telemetry().lifetime.queue_submit2;
+
+    // Build 8 disjoint diagonal-ish segments. Each segment is
+    // (x1, y1, x2, y2) as four i16's LE = 8 bytes. Bresenham
+    // produces ~6-8 1×1 rects per segment, so the call passes
+    // ~50 rects through `fill_solid_rects`. Pre-3f.15 this would
+    // be ~50 paint_submits; post-3f.15 the count must be 1.
+    let mut wire = Vec::with_capacity(8 * 8);
+    let segs: [(i16, i16, i16, i16); 8] = [
+        (0, 0, 6, 6),
+        (8, 0, 14, 6),
+        (16, 0, 22, 6),
+        (24, 0, 30, 6),
+        (0, 8, 6, 14),
+        (8, 8, 14, 14),
+        (16, 8, 22, 14),
+        (24, 8, 30, 14),
+    ];
+    for (x1, y1, x2, y2) in segs {
+        wire.extend_from_slice(&x1.to_le_bytes());
+        wire.extend_from_slice(&y1.to_le_bytes());
+        wire.extend_from_slice(&x2.to_le_bytes());
+        wire.extend_from_slice(&y2.to_le_bytes());
+    }
+    b.poly_segment(None, xid, 0xFFFF_FFFF, &wire)
+        .expect("poly_segment");
+
+    let after_paint = b.telemetry().lifetime.paint_submits;
+    let after_q = b.telemetry().lifetime.queue_submit2;
+    assert_eq!(
+        after_paint - before_paint,
+        1,
+        "PolySegment with 8 segments must coalesce to one paint submit (before={before_paint}, after={after_paint})",
+    );
+    assert_eq!(
+        after_q - before_q,
+        1,
+        "queue_submit2 should also tick by exactly one for the batch",
+    );
+}
