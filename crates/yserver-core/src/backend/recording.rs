@@ -106,6 +106,14 @@ pub struct RecordingBackend {
     /// PageFlipReady dispatches do not get suppressed by the run_core
     /// dispatch loop.
     pub page_flip_count: std::sync::atomic::AtomicU32,
+    /// Stage 4d COW: lets tests pretend this backend tracks COW
+    /// lifecycle. When true, the next `release_overlay_window` call
+    /// returns `Ok(true)` (final release, COW destroyed); otherwise
+    /// the default `Ok(false)` no-op semantics apply. Reset to false
+    /// after consumed. Plain `bool` not `AtomicBool` — `Backend`
+    /// methods take `&mut self`, so the test thread already has
+    /// exclusive access.
+    pub cow_next_release_is_final: bool,
 }
 
 impl Default for RecordingBackend {
@@ -123,6 +131,7 @@ impl RecordingBackend {
             fake_root_visual_xid: 0x0000_0021,
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
+            cow_next_release_is_final: false,
         }
     }
 
@@ -1005,6 +1014,17 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
         Ok((0, Vec::new()))
+    }
+
+    /// Stage 4d COW: override only to honor the
+    /// `cow_next_release_is_final` knob set by tests. Default trait
+    /// impl returns `Ok(false)` ("I didn't destroy anything"); tests
+    /// that exercise the handler-side `host_xid` clear-on-final-
+    /// release path flip the knob first.
+    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
+        let final_release = self.cow_next_release_is_final;
+        self.cow_next_release_is_final = false;
+        Ok(final_release)
     }
 }
 

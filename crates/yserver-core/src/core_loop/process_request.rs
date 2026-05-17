@@ -3046,6 +3046,44 @@ fn handle_composite_request(
                     sequence.0,
                 );
             }
+            // Stage 4d gate: wire the COW resource record's `host_xid`
+            // + dimensions so `host_drawable_target(COW)` resolves.
+            // Without this, marco-with-compositing's PRESENT::Pixmap
+            // onto COW (which it does instead of NameWindowPixmap)
+            // silently falls through the `if let (Some, Some)` guard
+            // in the PresentPixmap handler and drops every paint.
+            //
+            // Idempotent across repeated GETs: the `host_xid.is_none()`
+            // guard skips re-wiring after the first allocation.
+            // RELEASE_OVERLAY_WINDOW clears `host_xid` on the final
+            // release so a subsequent GET re-wires fresh.
+            //
+            // The COW xid IS the host xid here (v2 keys its
+            // `DrawableStore` on the protocol xid directly — see
+            // `KmsBackendV2::get_overlay_window`). v1 and other
+            // backends without a real COW allocation return `Ok(())`
+            // from the default no-op above; this wiring is harmless
+            // there since v1 never reaches the v2 COW scene path.
+            if let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
+                && overlay_win.host_xid.is_none()
+            {
+                overlay_win.host_xid =
+                    Some(crate::backend::WindowHandle::from_raw_panicking(overlay));
+                // Match the backend-side COW storage extent. Backends
+                // allocate screen-extent storage; read from the root
+                // window so this stays protocol-layer (no new Backend
+                // trait method needed to ask for fb_w / fb_h).
+                let root_extent = state
+                    .resources
+                    .window(ROOT_WINDOW)
+                    .map(|root| (root.width, root.height));
+                if let Some((w, h)) = root_extent
+                    && let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
+                {
+                    overlay_win.width = w;
+                    overlay_win.height = h;
+                }
+            }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
                 client_id.0, sequence.0, overlay
@@ -3066,12 +3104,37 @@ fn handle_composite_request(
             // Stage 4d: decrement the COW refcount; the final release
             // drops the scene entry + storage. Log-only on Err (the
             // request carries no reply).
-            if let Err(err) = backend.release_overlay_window(origin) {
-                log::warn!(
-                    "client {} #{} COMPOSITE::ReleaseOverlayWindow backend hook failed: {err}",
-                    client_id.0,
-                    sequence.0,
-                );
+            //
+            // The backend returns `Ok(true)` iff this call was the
+            // final release (refcount → 0, COW storage destroyed) —
+            // in that case clear the COW resource record's `host_xid`
+            // so the next `GetOverlayWindow` re-wires fresh. Backends
+            // that don't track COW lifecycle (v1, ynest,
+            // `RecordingBackend`) keep the default `Ok(false)` and we
+            // leave `host_xid` alone.
+            //
+            // The backend returns `Ok(true)` iff this call was the
+            // final release (refcount → 0, COW storage destroyed) —
+            // in that case clear the COW resource record's `host_xid`
+            // so the next `GetOverlayWindow` re-wires fresh. Backends
+            // that don't track COW lifecycle (v1, ynest,
+            // `RecordingBackend`'s default) keep the `Ok(false)` and
+            // we leave `host_xid` alone.
+            let final_release = match backend.release_overlay_window(origin) {
+                Ok(final_release) => final_release,
+                Err(err) => {
+                    log::warn!(
+                        "client {} #{} COMPOSITE::ReleaseOverlayWindow backend hook failed: {err}",
+                        client_id.0,
+                        sequence.0,
+                    );
+                    false
+                }
+            };
+            if final_release
+                && let Some(overlay_win) = state.resources.window_mut(COMPOSITE_OVERLAY_WINDOW)
+            {
+                overlay_win.host_xid = None;
             }
         }
         other => {
@@ -11912,5 +11975,262 @@ mod tests {
         // BAD_VALUE = 2
         assert_eq!(buf[1], 2, "expected BadValue (2), got {}", buf[1]);
         assert!(state.composite_redirects.is_empty());
+    }
+
+    // ---------------- Stage 4d gate: COW host_xid wiring ----------------
+    //
+    // Marco-with-compositing uses **pure PRESENT-pixmap onto COW** with zero
+    // `RedirectSubwindows` / `NameWindowPixmap` calls — it repeatedly emits
+    // `PRESENT::Pixmap(window=0x103 /* COW */, pixmap=client_offscreen)`.
+    //
+    // `process_present_pixmap` resolves both endpoints via
+    // `state.resources.host_drawable_target(...)`, which returns `None` when
+    // `window.host_xid` is `None`. Stage 4d allocated COW storage on the
+    // backend (`KmsBackendV2.cow_id`) and registered with the scene, but
+    // left `host_xid` `None` on the yserver-core resource record (seeded
+    // that way at `ResourceTable::new` since the COW xid pre-exists the
+    // backend-side allocation). Every `PresentPixmap → COW` therefore
+    // silently fell through the `if let (Some, Some)` guard at
+    // `process_request.rs:~4124` and dropped paint.
+    //
+    // Fix: on the GET_OVERLAY_WINDOW arm, after the backend hook lands
+    // successfully, wire `host_xid = Some(0x103)` and copy root dimensions
+    // onto the COW resource record. On RELEASE_OVERLAY_WINDOW, when the
+    // backend signals final-release (refcount → 0), clear `host_xid` back
+    // to `None` so the next GET re-wires fresh storage.
+    //
+    // These tests use `RecordingBackend` with its
+    // `cow_next_release_is_final` knob (default `false`, opt-in to
+    // simulate a final-release for the clear-host_xid test). The
+    // default `Ok(false)` shape matches v1's semantics (v1 doesn't
+    // track COW lifecycle).
+
+    fn dispatch_composite_minor(
+        state: &mut ServerState,
+        backend: &mut dyn crate::backend::Backend,
+        client_id: ClientId,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) -> RequestOutcome {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            state,
+            backend,
+            client_id,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 144, // COMPOSITE
+                data: minor,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn get_overlay_window_wires_cow_host_xid() {
+        // Pre-condition: COW resource record exists with host_xid = None.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let cow_pre = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record seeded at ResourceTable::new");
+        assert!(
+            cow_pre.host_xid.is_none(),
+            "COW must start with host_xid=None — the seed in resources.rs:230 \
+             must not be silently fixed without updating this oracle",
+        );
+
+        // GetOverlayWindow body: window xid (we use root, marco ignores
+        // the reply's input and just trusts whatever XID we hand back).
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        // Load-bearing assertion: after GET, host_drawable_target must
+        // resolve. This is what makes PresentPixmap → COW actually paint.
+        let target = state
+            .resources
+            .host_drawable_target(crate::resources::COMPOSITE_OVERLAY_WINDOW);
+        match target {
+            Some(crate::resources::HostDrawableTarget::Window {
+                nested,
+                host_xid,
+                depth,
+            }) => {
+                assert_eq!(nested, crate::resources::COMPOSITE_OVERLAY_WINDOW);
+                assert_eq!(
+                    host_xid.as_raw(),
+                    crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
+                    "COW host_xid must equal its protocol xid (0x103)",
+                );
+                assert_eq!(depth, 24, "COW is depth-24");
+            }
+            other => panic!(
+                "host_drawable_target(COW) must resolve to Window after \
+                 GetOverlayWindow — got {other:?}. Pre-fix shape returned \
+                 None (host_xid still unset on the resource record), which \
+                 dropped every PresentPixmap → COW.",
+            ),
+        }
+
+        // Dimensions: COW should track the root extent (the backend's
+        // COW storage is screen-extent per the Stage 4d plan).
+        let cow = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record");
+        let root = state
+            .resources
+            .window(crate::resources::ROOT_WINDOW)
+            .expect("ROOT record");
+        assert_eq!(cow.width, root.width, "COW must match root extent");
+        assert_eq!(cow.height, root.height, "COW must match root extent");
+    }
+
+    #[test]
+    fn get_overlay_window_is_idempotent_across_repeated_calls() {
+        // A compositor may emit GetOverlayWindow multiple times (e.g.
+        // re-registration on a window-manager hand-off). The handler-
+        // side wiring is idempotent: the `host_xid.is_none()` guard
+        // prevents repeated allocation, repeated GETs still bump the
+        // backend refcount, host_xid stays stable.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        let cow = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record");
+        assert_eq!(
+            cow.host_xid.map(crate::backend::WindowHandle::as_raw),
+            Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            "host_xid stays wired across repeated GETs",
+        );
+    }
+
+    #[test]
+    fn release_overlay_window_clears_host_xid_on_final_release() {
+        // Final release (backend returns Ok(true)) must clear host_xid so
+        // a subsequent GetOverlayWindow re-wires fresh storage. Otherwise
+        // host_xid would alias the prior (freed) backend storage — paint
+        // would land on stale GPU memory or, depending on the store's
+        // detach behaviour, gap-log silently.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Wire COW via GET first.
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert!(
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .and_then(|w| w.host_xid)
+                .is_some(),
+        );
+
+        // Final release — backend signals "I destroyed the COW".
+        backend.cow_next_release_is_final = true;
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        let cow = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record");
+        assert!(
+            cow.host_xid.is_none(),
+            "final release (backend.Ok(true)) must clear host_xid so the \
+             next GetOverlayWindow can re-wire fresh storage",
+        );
+    }
+
+    #[test]
+    fn release_overlay_window_keeps_host_xid_on_non_final_release() {
+        // Non-final release (refcount > 0 after decrement): storage is
+        // still live on the backend, host_xid must stay wired so any
+        // remaining compositor's PresentPixmap → COW keeps landing.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        // Non-final release (RecordingBackend default returns Ok(false)).
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        let cow = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record");
+        assert_eq!(
+            cow.host_xid.map(crate::backend::WindowHandle::as_raw),
+            Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            "non-final release must keep host_xid wired — \
+             storage is still alive on the backend",
+        );
     }
 }

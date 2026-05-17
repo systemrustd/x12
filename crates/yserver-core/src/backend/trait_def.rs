@@ -513,14 +513,25 @@ pub trait Backend: Send {
     /// frees the storage. Defensive against unmatched releases
     /// (refcount=0 → no-op).
     ///
-    /// Default no-op as for `get_overlay_window`.
+    /// Returns `Ok(true)` when **this** release was the final
+    /// one (refcount transitioned to 0 and the backend
+    /// destroyed the COW storage); `Ok(false)` otherwise
+    /// (refcount > 0 after decrement, defensive no-op, or
+    /// backends that don't track COW lifecycle at all — v1,
+    /// ynest, `RecordingBackend`). The handler uses this signal
+    /// to clear `host_xid` on the COW resource record when the
+    /// storage actually went away, so the next
+    /// `GetOverlayWindow` re-wires fresh.
+    ///
+    /// Default no-op as for `get_overlay_window`: returns
+    /// `Ok(false)` because "I didn't destroy anything."
     ///
     /// # Errors
     ///
     /// Same shape as `get_overlay_window`.
-    fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<()> {
+    fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
-        Ok(())
+        Ok(false)
     }
 
     // ──────────────────────────────────────────────────────────────

@@ -3264,12 +3264,17 @@ impl Backend for KmsBackendV2 {
     /// deferred on `PendingFence`) so the next `GetOverlayWindow`
     /// reallocates fresh storage at the same xid.
     ///
-    /// Defensive against unmatched releases (refcount=0 → Ok
+    /// Defensive against unmatched releases (refcount=0 → Ok(false)
     /// no-op). The trait docstring is the canonical statement of
     /// this shape.
-    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
+    ///
+    /// Returns `Ok(true)` iff this call drove the refcount to 0
+    /// and the COW storage was destroyed. The handler uses that
+    /// signal to clear `host_xid` on the COW resource record so
+    /// the next `GetOverlayWindow` re-wires fresh.
+    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.core.cow_refcount == 0 {
-            return Ok(());
+            return Ok(false);
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
@@ -3277,8 +3282,10 @@ impl Backend for KmsBackendV2 {
             if let Some(id) = self.cow_id.take() {
                 self.store.decref(&mut self.platform, id);
             }
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     // ── Resources (pixmap / font / cursor) ──────────────────────
@@ -8448,7 +8455,13 @@ mod tests {
         b.get_overlay_window(None).expect("get 3");
         assert_eq!(b.core.cow_refcount, 3);
 
-        b.release_overlay_window(None).expect("release 1");
+        let was_final = b.release_overlay_window(None).expect("release 1");
+        assert!(
+            !was_final,
+            "release_overlay_window must return Ok(false) when refcount > 0 \
+             after decrement (handler uses this signal to skip the host_xid \
+             clear-on-final-release path)",
+        );
 
         assert_eq!(b.core.cow_refcount, 2, "refcount drops from 3 → 2");
         assert!(
@@ -8473,7 +8486,13 @@ mod tests {
         b.get_overlay_window(None).expect("get");
         assert_eq!(b.core.cow_refcount, 1);
 
-        b.release_overlay_window(None).expect("release");
+        let was_final = b.release_overlay_window(None).expect("release");
+        assert!(
+            was_final,
+            "release_overlay_window must return Ok(true) on the refcount→0 \
+             transition (handler uses this signal to clear the COW resource \
+             record's host_xid so the next GetOverlayWindow re-wires fresh)",
+        );
 
         assert_eq!(b.core.cow_refcount, 0);
         assert!(
@@ -8510,7 +8529,12 @@ mod tests {
         assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
 
-        b.release_overlay_window(None).expect("noop release");
+        let was_final = b.release_overlay_window(None).expect("noop release");
+        assert!(
+            !was_final,
+            "unmatched release (refcount already 0) must return Ok(false): \
+             we didn't transition the refcount and didn't destroy any storage",
+        );
 
         assert_eq!(
             b.core.cow_refcount, 0,
