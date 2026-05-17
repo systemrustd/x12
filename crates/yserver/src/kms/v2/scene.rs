@@ -1342,7 +1342,20 @@ fn emit_window_subtree(
                     dst_size: [win_w as f32, win_h as f32],
                     src_origin: [0.0, 0.0],
                     src_size: [1.0, 1.0],
-                    alpha_passthrough: false,
+                    // Depth-32 ARGB windows initialize their storage to
+                    // (0,0,0,0) per `default_window_init_color(32)`, so any
+                    // unpainted region is transparent and must alpha-blend
+                    // onto the layers below — matching X11 / Composite
+                    // semantics where the root window is the opaque
+                    // bottom layer and ARGB windows stack with blending.
+                    // Forcing alpha to 1.0 here (the old `false` setting)
+                    // turned transparent areas into opaque black, hiding
+                    // mate-panel applets, control-center sidebar text,
+                    // system-tray icons, and tooltips. Depth-24 sources
+                    // stay correct because their BgraNoAlpha image-view
+                    // swizzle pins alpha=ONE at view-bind time, so this
+                    // pipeline sees alpha=1 from them regardless.
+                    alpha_passthrough: true,
                 });
                 sampled_ids.push(source_id);
                 if let Some(snap) = store.peek_presentation_damage(source_id) {
