@@ -532,6 +532,62 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Stage 4c.2 — compute the screen-absolute rect for a window's
+    /// `DrawableId`. Walks the `windows_v2.parent` chain upward
+    /// from `w_id`, accumulating each step's `(x, y)` offset; the
+    /// resulting rect's `offset` is the window's root-relative
+    /// origin and the `extent` is its own `width × height`.
+    ///
+    /// Returns `None` when:
+    /// - `w_id` doesn't resolve in the store, OR
+    /// - the leaf xid has no `windows_v2` entry (Pixmap / Root /
+    ///   detached), OR
+    /// - the parent chain hits a dangling `Some(xid)` that is
+    ///   neither root (`core.window_id`) nor a tracked
+    ///   `windows_v2` entry. Bailing keeps callers from acting on
+    ///   a half-accumulated rect; Stage 5 cache work can revisit
+    ///   if the conservative choice ever bites.
+    ///
+    /// Consumed by Stage 4c.4's `set_window_scene_participation`:
+    /// it captures the previous on-screen rect BEFORE flipping
+    /// `scene_participating` so it can fire
+    /// `mark_scene_structure_damage_rects(&[prev_rect])` for the
+    /// redirect transition. Until 4c.4 wires up the caller, the
+    /// only consumers are this module's tests — hence the
+    /// `dead_code` allow.
+    #[allow(dead_code)]
+    pub(crate) fn window_absolute_rect(
+        &self,
+        w_id: crate::kms::v2::store::DrawableId,
+    ) -> Option<ash::vk::Rect2D> {
+        let leaf_xid = self.store.get(w_id)?.xid;
+        let leaf_geom = self.windows_v2.get(&leaf_xid)?;
+        let mut abs_x = i32::from(leaf_geom.x);
+        let mut abs_y = i32::from(leaf_geom.y);
+        let mut cur_parent = leaf_geom.parent;
+        while let Some(parent_xid) = cur_parent {
+            if parent_xid == self.core.window_id {
+                // Reached root explicitly — root is the (0, 0)
+                // origin of the screen-absolute coordinate space.
+                break;
+            }
+            let Some(parent_geom) = self.windows_v2.get(&parent_xid) else {
+                // Dangling parent: not root, not tracked. Bail.
+                return None;
+            };
+            abs_x += i32::from(parent_geom.x);
+            abs_y += i32::from(parent_geom.y);
+            cur_parent = parent_geom.parent;
+        }
+        Some(ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: abs_x, y: abs_y },
+            extent: ash::vk::Extent2D {
+                width: u32::from(leaf_geom.width),
+                height: u32::from(leaf_geom.height),
+            },
+        })
+    }
+
     /// Stage 4b.5 — seed the backing `b_id` with W's content and
     /// each of W's mapped-or-unmapped descendants' content at the
     /// descendant's accumulated `(x, y)` position relative to W.
@@ -7698,5 +7754,123 @@ mod tests {
                 offset: (3, 4)
             }
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Stage 4c.2 — `window_absolute_rect` helper
+    // ────────────────────────────────────────────────────────────────
+
+    /// Top-level W at (50, 60) size 100×80, parent=None. Absolute
+    /// rect echoes its own (x, y, w, h) — there's no ancestor to
+    /// accumulate through.
+    #[test]
+    fn window_absolute_rect_top_level() {
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 50, 60);
+        // `seed_window` hard-codes 100×100; resize via the geom entry.
+        b.windows_v2.get_mut(&0x100).unwrap().width = 100;
+        b.windows_v2.get_mut(&0x100).unwrap().height = 80;
+        let rect = b.window_absolute_rect(w_id).expect("rect");
+        assert_eq!(
+            rect,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 50, y: 60 },
+                extent: ash::vk::Extent2D {
+                    width: 100,
+                    height: 80
+                },
+            }
+        );
+    }
+
+    /// Three-level chain: W(50, 60) → C(10, 20) → G(3, 4) size 8×8.
+    /// G's absolute rect is at (63, 84) with G's own 8×8 extent.
+    #[test]
+    fn window_absolute_rect_descendant() {
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
+        // `seed_window` defaults C/G to 100×100; shrink to plan sizes.
+        {
+            let c = b.windows_v2.get_mut(&0x200).unwrap();
+            c.width = 30;
+            c.height = 30;
+        }
+        {
+            let g = b.windows_v2.get_mut(&0x300).unwrap();
+            g.width = 8;
+            g.height = 8;
+        }
+        let rect = b.window_absolute_rect(g_id).expect("rect");
+        assert_eq!(
+            rect,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 63, y: 84 },
+                extent: ash::vk::Extent2D {
+                    width: 8,
+                    height: 8
+                },
+            }
+        );
+    }
+
+    /// `DrawableId` that the store no longer knows about → None.
+    /// Allocate a window then `decref` it down to retirement so
+    /// the id no longer resolves; `store.get` returns None and the
+    /// helper short-circuits without poking `windows_v2`.
+    #[test]
+    fn window_absolute_rect_unknown_drawable_returns_none() {
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 50, 60);
+        // Tear it back down so the DrawableId no longer resolves.
+        // `decref` with no Vk treats the ticket as signaled and
+        // calls `destroy_now`, removing the id from `entries`.
+        let _ = b.store.decref(&mut b.platform, w_id);
+        // Also clear the windows_v2 entry — otherwise the helper
+        // would early-return on the xid lookup, not the id lookup
+        // we want to exercise.
+        b.windows_v2.remove(&0x100);
+        assert!(b.store.get(w_id).is_none());
+        assert_eq!(b.window_absolute_rect(w_id), None);
+    }
+
+    /// Pixmaps live in the store but not in `windows_v2`. The
+    /// helper has no geometry to walk → None.
+    #[test]
+    fn window_absolute_rect_pixmap_returns_none() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let pix_id = b
+            .store
+            .allocate(
+                0x2000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("pixmap allocate");
+        assert_eq!(b.window_absolute_rect(pix_id), None);
+    }
+
+    /// Dangling parent xid: W has `parent = Some(0xDEAD)` and
+    /// 0xDEAD is neither root nor in `windows_v2`. Conservative
+    /// choice per plan: bail with None rather than return a
+    /// half-accumulated rect that callers can't act on.
+    #[test]
+    fn window_absolute_rect_dangling_parent_returns_none() {
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, Some(0xDEAD), 50, 60);
+        // 0xDEAD is not in windows_v2 and is not root_xid.
+        assert!(!b.windows_v2.contains_key(&0xDEAD));
+        assert_ne!(b.core.window_id, 0xDEAD);
+        assert_eq!(b.window_absolute_rect(w_id), None);
     }
 }
