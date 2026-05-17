@@ -412,14 +412,13 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        for o in &mut inner.outputs {
-            let ext = o.output_extent;
-            for r in rects {
-                if let Some(clipped) = clip_rect_to_output_extent(*r, ext) {
-                    o.scene_structure_damage.add(clipped);
-                }
-            }
-        }
+        dispatch_clip_rects_to_outputs(
+            inner
+                .outputs
+                .iter_mut()
+                .map(|o| (o.output_extent, &mut o.scene_structure_damage)),
+            rects,
+        );
     }
 
     /// Drain in-flight compose work before tear-down. Best-effort
@@ -1168,6 +1167,26 @@ fn emit_window_subtree(
     }
 }
 
+/// Stage 4c.1 — for each `(extent, damage)` pair in `outputs`, clip
+/// every rect in `rects` to that output's extent and (if non-empty)
+/// add the clipped rect to that output's damage `RegionSet`.
+///
+/// Extracted from [`SceneCompositor::mark_scene_structure_damage_rects`]
+/// so the dispatch + clip + accumulate wiring is unit-testable
+/// without needing a live `VkContext` + `CompositorPipeline`.
+fn dispatch_clip_rects_to_outputs<'a, I>(outputs: I, rects: &[vk::Rect2D])
+where
+    I: IntoIterator<Item = (vk::Extent2D, &'a mut RegionSet)>,
+{
+    for (ext, damage) in outputs {
+        for r in rects {
+            if let Some(clipped) = clip_rect_to_output_extent(*r, ext) {
+                damage.add(clipped);
+            }
+        }
+    }
+}
+
 /// Stage 4c.1 — intersect a rect (in output-local coords) with the
 /// output's extent. Returns `None` if the intersection is empty
 /// (rect lies fully outside, or input has zero width/height).
@@ -1579,6 +1598,105 @@ mod tests {
         scene.scene_structure_dirty = false;
         scene.mark_scene_structure_damage_rects(&[rect(0, 0, 10, 10)]);
         assert!(scene.scene_structure_dirty);
+    }
+
+    /// Stage 4c.1 — code-quality follow-up. The plural setter test
+    /// above only proves the dirty bit gets set on the stub-mode
+    /// compositor (where `inner` is `None` and the dispatch for-loop
+    /// is unreachable). `clip_rect_to_output_extent_handles_all_cases`
+    /// only covers the helper math in isolation. Their union does
+    /// NOT cover the dispatch wiring — a regression that swapped
+    /// `damage.add(clipped)` for a no-op (or dropped the per-output
+    /// loop entirely) would pass both tests. This test exercises
+    /// the extracted `dispatch_clip_rects_to_outputs` helper that
+    /// `mark_scene_structure_damage_rects` delegates to, with two
+    /// synthetic outputs of different extents, and asserts that:
+    ///
+    /// - a rect wholly inside lands unchanged on every output;
+    /// - a rect spilling off the right edge lands clipped (NOT in
+    ///   its original form) on the output where it spills;
+    /// - a rect that's fully outside an output is dropped for that
+    ///   output but still lands on the other output if it fits there;
+    /// - per-output clipping is independent (extent of output A does
+    ///   not influence what lands on output B).
+    #[test]
+    fn dispatch_clip_rects_lands_per_output_clipped() {
+        // Output 0: 800×600, Output 1: 400×400. Same input rect set.
+        let ext_a = extent(800, 600);
+        let ext_b = extent(400, 400);
+        let mut damage_a = RegionSet::new();
+        let mut damage_b = RegionSet::new();
+
+        let inside = rect(10, 20, 100, 50); // fits both outputs
+        let spilling_right = rect(700, 0, 200, 50); // spills A on right; fully outside B
+        let outside_a_inside_b = rect(350, 350, 30, 30); // fits both (B clips to 50×50)
+        let fully_outside = rect(2000, 2000, 50, 50); // outside both
+
+        let rects = [inside, spilling_right, outside_a_inside_b, fully_outside];
+
+        // Build a `Vec` of tuples so the slice carries a stable lifetime
+        // for the iterator; `iter_mut` produces `(extent, &mut damage)`
+        // exactly as the production callsite does.
+        let mut outs: Vec<(vk::Extent2D, &mut RegionSet)> =
+            vec![(ext_a, &mut damage_a), (ext_b, &mut damage_b)];
+        dispatch_clip_rects_to_outputs(outs.drain(..), &rects);
+
+        // Output A (800×600):
+        //   - inside (10,20,100,50): identity
+        //   - spilling_right (700,0,200,50): clipped width 200→100
+        //   - outside_a_inside_b (350,350,30,30): identity (fits A)
+        //   - fully_outside: dropped
+        let a_rects = damage_a.rects();
+        assert!(
+            a_rects.contains(&inside),
+            "inside rect must land unchanged on output A: {a_rects:?}",
+        );
+        let spilling_clipped_a = rect(700, 0, 100, 50);
+        assert!(
+            a_rects.contains(&spilling_clipped_a),
+            "spilling rect must land CLIPPED on output A (expected {spilling_clipped_a:?}), got {a_rects:?}",
+        );
+        assert!(
+            !a_rects.contains(&spilling_right),
+            "spilling rect must NOT land in its original (unclipped) form on output A: {a_rects:?}",
+        );
+        assert!(
+            a_rects.contains(&outside_a_inside_b),
+            "rect that fits output A unchanged must land: {a_rects:?}",
+        );
+        assert!(
+            !a_rects.iter().any(|r| r.offset.x >= 800
+                || r.offset.y >= 600
+                || i64::from(r.offset.x) + i64::from(r.extent.width) > 800
+                || i64::from(r.offset.y) + i64::from(r.extent.height) > 600),
+            "no rect on output A may spill its 800×600 extent: {a_rects:?}",
+        );
+
+        // Output B (400×400):
+        //   - inside (10,20,100,50): identity
+        //   - spilling_right (700,0,...): fully outside → dropped
+        //   - outside_a_inside_b (350,350,30,30): clipped → (350,350,30,30) fits in 400×400
+        //   - fully_outside: dropped
+        let b_rects = damage_b.rects();
+        assert!(
+            b_rects.contains(&inside),
+            "inside rect must land unchanged on output B: {b_rects:?}",
+        );
+        assert!(
+            !b_rects.iter().any(|r| r.offset.x >= 700),
+            "spilling-right (x=700) is fully outside output B and must be dropped: {b_rects:?}",
+        );
+        assert!(
+            b_rects.contains(&outside_a_inside_b),
+            "rect that fits output B unchanged must land: {b_rects:?}",
+        );
+        assert!(
+            !b_rects
+                .iter()
+                .any(|r| i64::from(r.offset.x) + i64::from(r.extent.width) > 400
+                    || i64::from(r.offset.y) + i64::from(r.extent.height) > 400),
+            "no rect on output B may spill its 400×400 extent: {b_rects:?}",
+        );
     }
 
     /// Stage 4c.1 — the helper clips a rect to the output's extent
