@@ -538,7 +538,7 @@ yserver-wmaker-xterm-hw log="debug":
 yserver-picom-hw client="xclock":
     tools/picom-yserver.sh {{client}}
 
-yserver-xfce-hw log="debug":
+yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
@@ -552,7 +552,7 @@ yserver-xfce-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "xfce log:    xfce.log"'
 
-yserver-mate-hw log="debug":
+yserver-mate-hw log="debug,yserver::kms::v2::scene=trace":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\

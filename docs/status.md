@@ -1650,27 +1650,264 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       assuming origin (0, 0); under multi-output layouts the
       clip would be in the wrong frame (not a regression vs the
       4c.1 stub but now flagged).
-  - [ ] **Stage 4d — Composite Overlay Window as first-class
-    scene entry.** `cow_refcount: u32` in `KmsCore` (metadata
-    only — no `DrawableId` per the spec's `KmsCore` scope
-    rule); `cow_id: Option<DrawableId>` on `KmsBackendV2`.
-    `build_scene` appends COW above top-levels, below the
-    cursor.
+  - [~] **Stage 4d — Composite Overlay Window as first-class
+    scene entry, code landed 2026-05-17 (`8a0456f` + `dac676d`
+    polish).** Hardware-smoke gate is user-driven and not yet
+    run.
 
-    **Promoted from "secondary gate" to "load-bearing":**
-    Per the 2026-05-17 4c.6 smoke result, both
-    marco-with-compositing AND xfwm4-with-compositing use
-    COW. 4d is the **actual** gate for "compositing WMs
-    render correctly" — not 4c. mate + marco-compositing
-    fails at 4c without 4d (`render_composite gap:
-    host_src 0x40005f not resolvable` log shape with
-    `0x40005f` being a Picture wrapping COW 0x103).
+    `cow_refcount: u32` added to `KmsCore` (protocol
+    bookkeeping only). `cow_id: Option<DrawableId>` on
+    `KmsBackendV2`. Two new `Backend` trait methods —
+    `get_overlay_window` + `release_overlay_window` (default
+    no-op for v1 / ynest / RecordingBackend; v2 overrides).
+    Backend impl: first `get_overlay_window` allocates a
+    screen-extent depth-24 BGRA8 drawable as
+    `DrawableKind::Window` with `scene_participating=true`,
+    zero-fills via `engine.fill_rect`, registers with the
+    scene, sets `cow_id` + refcount=1. Subsequent calls bump
+    refcount only. `release_overlay_window` decrements; on
+    zero unregisters the scene entry + decrefs storage + clears
+    `cow_id`. Defensive guard against unmatched release (no
+    underflow). `process_request.rs` GET / RELEASE arms now
+    call the backend hooks; log + continue on Err so the
+    protocol reply still goes out.
+
+    `SceneCompositor` grows `cow: Option<DrawableId>` on the
+    inner state with `register_cow` / `unregister_cow` setters
+    (both bump `scene_structure_dirty`). `build_scene` appends
+    a `CompositeDraw` for COW **between** the top-level loop
+    and the cursor block — position projects through
+    `layout_x0/y0` like root storage, extent from COW
+    storage's image, `alpha_passthrough=true` so compositor-
+    written alpha actually blends. Damage peek + project mirror
+    the root path; COW id pushes onto `sampled_ids` so
+    retirement covers it.
+
+    7 tests: `cow_get_overlay_first_call_allocates_storage`,
+    `_second_call_refcounts`, `cow_release_decrements_refcount`,
+    `_zero_drops_storage`, `cow_release_without_prior_get_is_noop`
+    (defensive-branch coverage), `build_scene_appends_cow_above_top_levels`,
+    `build_scene_cow_is_below_cursor` (spec layering item 4),
+    plus 1 Vk-backed acceptance `v2_cow_paint_appears_on_scanout`
+    (paint via `put_image` on the COW xid, assert
+    presentation-damage non-empty + `get_image` roundtrip
+    confirms paint landed on COW storage). 285 yserver lib +
+    23 ignored v2 Vk + 29 v2_acceptance tests green under
+    lavapipe; clippy pedantic clean for touched lines.
+
+    **Promoted from "secondary gate" to "load-bearing":** per
+    the 2026-05-17 4c.6 smoke result, both
+    marco-with-compositing AND xfwm4-with-compositing use COW.
+    4d is the **actual** gate for "compositing WMs render
+    correctly". mate + marco-compositing failed at 4c without
+    4d (`render_composite gap: host_src 0x40005f not
+    resolvable` log shape with `0x40005f` being a Picture
+    wrapping COW 0x103).
 
     Hardware-smoke gate: **(a)** mate-session +
-    marco-with-compositing on bee + fuji — should now
-    render correctly with COW backing in place; and
-    **(b)** full xfce4 session with xfwm4-with-compositing
-    on bee + fuji. Both should pass after 4d.
+    marco-with-compositing on bee + fuji; and **(b)** full
+    xfce4 session with xfwm4-with-compositing on bee + fuji.
+
+    ### Stage 4d post-smoke iteration (2026-05-17)
+
+    Eight rounds of hardware smoke on bee uncovered a cascade
+    of issues. Fixes that landed:
+
+    - [x] **Stage 4d.1 — COW host_xid wiring on resource
+      record (`3ed630c`).** First smoke run after the 4d
+      commits (`8a0456f` + `dac676d`) showed marco's
+      PresentPixmap onto COW silently dropping at
+      `process_request.rs:4124` because
+      `state.resources.host_drawable_target(0x103)` returned
+      None. COW window was registered in resources.rs:230 with
+      `host_xid: None` and 4d never wired it. Fix: handler-side
+      mutation on first `GetOverlayWindow` to set host_xid +
+      root extent; symmetric clear when refcount hits 0 (new
+      `release_overlay_window -> io::Result<bool>` trait
+      return). Marco's PresentPixmap into COW now lands.
+
+    - [x] **Stage 4d.2 — COMPOSITE handler logging (`589aa87`).**
+      Multiple diagnosis rounds wasted because
+      `REDIRECT_WINDOW` / `REDIRECT_SUBWINDOWS` /
+      `UNREDIRECT_*` / `NAME_WINDOW_PIXMAP` arms had no
+      `debug!` lines. Silenced the misleading
+      `update_host_event_mask not yet implemented` warn at the
+      same time (v1's body is a pure no-op on KMS).
+
+    - [x] **Stage 4d.3 — DRI3 backfill (`9414096`).** v2's
+      `dri3_capabilities()` hard-returned `unsupported()` per
+      a "Stage 1b — no Vulkan" comment that never got
+      backfilled when 2a landed Vk. Ported v1's ~260 LoC DRI3
+      impl (`dri3_capabilities`, `dri3_open`,
+      `dri3_import_pixmap`, `dri3_fence_from_fd`,
+      `dri3_trigger_fence`, `dri3_fd_from_fence`,
+      `dri3_import_syncobj`, `dri3_free_syncobj`,
+      `dri3_signal_syncobj`, `dri3_export_pixmap`,
+      `dri3_supported_modifiers`). v2's `Storage` gained a
+      `from_imported_drawable_image` constructor (DrawableImage
+      stays owner of Vk handles + dma-buf fd; v2 Storage
+      aliases image/view/memory; Storage::destroy drops the
+      inner DrawableImage). Added `dri3_xshmfences` +
+      `dri3_sync_resources` state fields on `KmsBackendV2`.
+      Without this, mate-session-check-accelerated fails its
+      GLES probe (`libEGL warning: DRI3 error: Could not get
+      DRI3 device`) and downstream compositors can't import
+      backings as GPU textures.
+
+    - [x] **Stage 4d.4 — disconnect-recovery participation
+      restore (`6b63173`).** `teardown_redirect_for_window`
+      in `process_disconnect.rs` called
+      `release_redirected_backing` but didn't restore
+      `set_window_scene_participation(W, true)`. Manual-mode
+      compositor crash would leave every redirected window
+      invisible until session end. `RecordingBackend`
+      extended with `ReleaseRedirectedBacking` +
+      `SetWindowSceneParticipation` recorded calls.
+
+    - [x] **Stage 4d.5 — rotate_redirected_backing_on_resize
+      release-then-allocate order (`cd22f47`).** First
+      with-comp smoke showed the top panel invisible —
+      marco's `NameWindowPixmap(top_panel)` returned
+      `not redirected` even though `RedirectSubwindows(root,
+      Manual)` was active and the panel was a top-level. Root
+      cause: panel got resized 25→28 after map (marco's
+      animation). `rotate_redirected_backing_on_resize` did
+      `allocate(new_w, new_h) → release(old)` but v2's
+      `allocate_redirected_backing` is idempotent on
+      `host_window_to_backing[W]` (matches v1) and returns the
+      existing backing **ignoring the new dimensions**. The
+      release then destroyed that same backing → `W` lost its
+      route. Fix: swap order to release-then-allocate.
+      Backing survives if `NameWindowPixmap` aliases hold
+      (per Composite spec); allocate creates a fresh one at
+      new size since host_window_to_backing is now empty.
+
+    - [x] **Stage 4d.6 — depth-24 source pictures force
+      alpha=1.0 (`d20f279`).** Per X11 Render PictFormat:
+      Pictures wrapping depth-24 drawables have alpha_mask=0
+      and samples must return alpha=1.0. v2's render_composite
+      was sampling raw alpha bits from depth-24 storage
+      (where the "X" padding byte is undefined / often 0).
+      Plumbed a `force_opaque_src/mask` bit into push-constants
+      `repeat_modes[]` upper bits (bit 8); shader applies
+      `src.a = 1.0` for that case. Implementer noted the
+      existing `BgraNoAlpha` swizzle on depth-24 image views
+      already pinned `a=ONE` so the shader-side force is
+      belt-and-suspenders; left in place for paths that bypass
+      the swizzle (self-alias scratch). Scoped to `depth == 24`
+      (not `depth < 32`) so depth-8 (A8) and depth-1 (bitmap)
+      mask coverages aren't broken.
+
+    - [x] **Stage 4d.7 — emit_window_subtree alpha_passthrough
+      = true (`f3e9276`).** Non-compositing v2 smoke showed
+      mate panel-right area (clock applet / system tray) as
+      opaque black instead of v1's visible widgets. Root
+      cause: v2's scene draws windows with
+      `alpha_passthrough=false` which force-opaques alpha=1.0
+      in the shader. depth-32 panel storage initialized to
+      `(0,0,0,0)` per `default_window_init_color(32)` →
+      panel-right unpainted areas had alpha=0 → force-opaque
+      → opaque black covering wallpaper + masking applet
+      windows that should sit there. v1's per-window-mirror
+      scanout walk alpha-blends → matches X11 Composite
+      semantics. Flipped to `alpha_passthrough=true`. Root
+      storage draw at scene.rs:986 left `false` (it IS the
+      opaque bottom layer). Brought mate-no-comp visual to
+      ~95% v1 parity.
+
+    ### Stage 4d hardware-smoke state (2026-05-17)
+
+    **mate-no-comp**: ~95% parity with v1. Desktop icons,
+    panel-left, panel-right (clock + system tray icons),
+    bottom panel "Control Center" task entry, full Control
+    Center window, tooltips visible. Missing vs v1: yellow
+    group-header labels ("Filter", "Groups", "Common Tasks")
+    in Control Center sidebar — likely a colored-source-with-
+    glyph-mask Render::Composite that doesn't fully work yet.
+
+    **mate-with-compositing**: BROKEN. Marco issues
+    `RedirectSubwindows(root, Manual)`. Top-levels removed
+    from scene per spec §I4. Marco's compositor partially
+    populates COW — mate-panel's own paint shows (panel-left
+    glyphs, bottom-panel task list, top-right 2 small tray
+    icons), nm-applet popup appears with artefacts, but most
+    of the scene (control center, hover menus, clock-applet,
+    bottom panel center) shows only marco's shadow over
+    wallpaper. Indicates marco's COW has alpha=0 in most areas
+    + COW is alpha_passthrough=true (correct for the COW
+    layer) so root wallpaper bleeds through.
+
+    **xfce-with-compositing** (default xfwm4 compositor):
+    WORSE. xfwm4 also does `RedirectSubwindows(root, Manual)`.
+    Almost entire screen dark gray (root storage default,
+    xfdesktop is a redirected top-level + xfdesktop's
+    wallpaper paint goes to B but B is never composited
+    visibly), only 2 tray icons + nm-applet popup visible.
+
+    **mate-no-comp v1 baseline**: full visual parity with
+    real X11.
+
+    **mate-with-comp v1 baseline (2026-05-17 19:12)**: looks
+    **identical to v1 no-comp**. v1's `Manual`-redirect path
+    effectively no-ops — windows stay in v1's per-window-
+    mirror scanout walk, marco's compositor reads return
+    nothing useful from NameWindowPixmap, marco's COW
+    PresentPixmap lands but doesn't visibly affect output. v1
+    silently ignores marco's "you take over compositing"
+    intent. **No tooltips have shadows, no transparency
+    effects, no real compositor visual on v1.** Apps render
+    via the bypass, not the compositor.
+
+    ### Stage 4d close decision (pending implementation)
+
+    v1's compositing "support" is a no-op fallback that
+    happens to render apps. v2 implements the spec correctly
+    (Manual-redirected windows removed from scene; compositor
+    is supposed to populate COW) but no real compositor we've
+    tested populates COW correctly without proper substrate
+    (full PictFormat tracking, alpha-aware sampling, possibly
+    multi-layer alpha-mask). The compositing substrate is
+    bigger than 4d's scope.
+
+    **Pragmatic close**: deviate from spec §I4 — Manual-mode
+    `set_window_scene_participation(false)` becomes a no-op
+    in v2 (or stores intent but doesn't flip the flag).
+    Scene keeps walking the window; sampling reads from B via
+    Stage 4c.3's `redirected_target` indirection (already
+    landed for Automatic). Compositor's COW alpha-blends on
+    top — anything marco/xfwm4 paints (shadows, decoration)
+    layers over the scene-drawn windows. Compositor effects
+    partially work; full ARGB-aware compositing not
+    guaranteed. **Bounded spec deviation** matched by v1's
+    informal "ignore-compositor" floor. Tracked as **Stage
+    4d.8** to implement.
+
+    **Spec-compliant alternative**: complete the compositor
+    chain (PictFormat tracking, picture-source alpha
+    interpretation per ARGB vs xRGB visual, full multi-layer
+    Render::Composite correctness). Probably a separate
+    Stage 4e or its own follow-on after 4d closes pragmatically.
+
+    ### Known follow-ups (post-4d-close-pragmatic)
+
+    - Stage 4d.8 — Manual-mode keeps scene_participating=true
+      (implementation pending).
+    - **Task 4 — KmsCore.pictures disconnect cleanup**.
+      Stale Picture records from disconnected clients
+      (mate-session-check) persist in v2's `KmsCore.pictures`,
+      causing ~100 `render_composite gap` noise lines per
+      smoke. yserver-core's `process_disconnect.rs:261`
+      already loops `removed.freed_pictures` calling
+      `backend.render_free_picture`; verify v2's impl actually
+      evicts from `KmsCore.pictures`. ~50 LoC.
+    - Yellow group-header labels missing in mate Control
+      Center sidebar (also missing in non-comp; likely a
+      colored-source + glyph-mask Render::Composite path
+      issue).
+    - Control Center "bits flicker on hover" under marco-comp
+      — buffer-age / damage-tracking hint.
+    - v2 should still backfill PictFormat tracking + alpha
+      interpretation per picture format (Stage 4e or follow-on).
 - [ ] **Stage 5 (optional) — advanced perf strategies.**
   Strategy plug-ins on the existing components: damage-strategy
   selection per frame, HW cursor return, direct scanout, HW
