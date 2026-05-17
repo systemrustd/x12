@@ -1025,6 +1025,7 @@ fn build_scene(
             &mut snapshots,
             &mut sampled_ids,
             &mut projected,
+            false, /* under_redirected_ancestor */
         );
     }
     log::trace!(
@@ -1219,6 +1220,7 @@ fn emit_window_subtree(
     snapshots: &mut Vec<DamageSnapshot>,
     sampled_ids: &mut Vec<super::store::DrawableId>,
     projected: &mut RegionSet,
+    under_redirected_ancestor: bool,
 ) {
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
     // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`. The
@@ -1405,6 +1407,32 @@ fn emit_window_subtree(
         }
     }
 
+    // Stage 4d.8e — children of a redirected ancestor are
+    // composited THROUGH that ancestor's backing pixmap B per the
+    // X11 Composite spec: "the parent's backing pixmap holds the
+    // redirected subtree". Their own storage stays at the default
+    // initial fill because v2's `resolve_paint_target` routes
+    // every paint against a descendant of a redirected W to W's
+    // backing B; the child's own storage is never written to.
+    // Emitting the child here would cover the ancestor's
+    // cascade-painted content with an empty (background-coloured)
+    // draw — the symptom that hid mate-control-center's main UI
+    // content under compositor-WMs (4d.8 smoke).
+    //
+    // We make the decision AFTER emitting this window (so the
+    // redirected window W still produces its own draw sampling B),
+    // then short-circuit the subtree walk if either:
+    //   * an ancestor is already redirected (cascade), or
+    //   * this window is itself redirected (its B already holds
+    //     the children's painted content).
+    let this_is_redirected = store
+        .lookup(host_xid)
+        .and_then(|id| store.redirected_target(id))
+        .is_some();
+    if under_redirected_ancestor || this_is_redirected {
+        return;
+    }
+
     // Recurse into mapped descendants. Sibling z-order is HashMap
     // iteration order (see fn-level comment) — proper stack tracking
     // is post-3f.6.
@@ -1433,6 +1461,9 @@ fn emit_window_subtree(
             snapshots,
             sampled_ids,
             projected,
+            false, /* under_redirected_ancestor — short-circuit above
+                    * guarantees we only reach here when neither this
+                    * window nor any ancestor is redirected */
         );
     }
 }
@@ -2486,6 +2517,106 @@ mod tests {
             built.sampled_ids[0], b_id,
             "sampled_ids must carry source_id (B_id) for damage / fence keying"
         );
+    }
+
+    /// Stage 4d.8e — when an ancestor W is redirected to a backing
+    /// pixmap B, W's mapped descendants MUST NOT emit independent
+    /// draw entries. Per the X11 Composite spec, the redirected
+    /// subtree is composited through W's backing pixmap: paint
+    /// against any descendant of W routes (via
+    /// `resolve_paint_target`) to B, and B alone holds the
+    /// subtree's pixel content. The child's own storage is never
+    /// written to and stays at the default fill — emitting it
+    /// here would cover B's painted content with an empty draw
+    /// (the bug that hid GTK widget content under marco/xfwm4 in
+    /// compositor-WM hardware smoke).
+    ///
+    /// Setup: top-level W @ (50, 60) 200×100 with `redirected_target`
+    /// = `Some(B)`; child C @ (10, 20)-rel under W. Walk
+    /// `build_scene`. Expect exactly ONE draw — W's, sampling B —
+    /// and NO draw for C.
+    #[test]
+    fn build_scene_skips_descendants_of_redirected_window() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Top-level W.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Mapped child C under W.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x101,
+            10,
+            20,
+            40,
+            30,
+            Some(0x100),
+            true,
+        );
+
+        // Allocate W's backing pixmap B with a distinct sentinel
+        // view and wire the redirect route.
+        let mut b_storage = super::super::store::Storage::for_tests_null(
+            extent(200, 100),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let b_view: vk::ImageView = ash::vk::Handle::from_raw(0xB000_BEEF);
+        b_storage.image_view = b_view;
+        let b_id = store
+            .allocate(0xB001, DrawableKind::Pixmap, 32, true, b_storage)
+            .expect("alloc backing stub");
+        let w_id = store.lookup(0x100).expect("w_id present");
+        store.set_redirected_target(w_id, Some(b_id));
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+        );
+        let scene = &built.scene;
+        assert_eq!(
+            scene.draws.len(),
+            1,
+            "redirected W's mapped child must NOT emit its own draw \
+             (composite spec: subtree composites through W's backing B); \
+             got draws={:?}",
+            scene.draws,
+        );
+        let w_draw = &scene.draws[0];
+        assert_eq!(
+            w_draw.dst_origin,
+            [50.0, 60.0],
+            "the one draw must be W's (top-level geometry)"
+        );
+        assert_eq!(w_draw.dst_size, [200.0, 100.0]);
+        assert_eq!(
+            w_draw.image_view, b_view,
+            "the one draw must sample FROM B (redirect indirection)"
+        );
+
+        // sampled_ids parallels draws — only B.
+        assert_eq!(built.sampled_ids.len(), 1);
+        assert_eq!(built.sampled_ids[0], b_id);
     }
 
     /// Stage 4c.5 — Manual-mode invariant.
