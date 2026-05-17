@@ -1241,14 +1241,11 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
 /// We don't directly exercise the pool here — the test fixture's
 /// platform has no `pixmap_pool` attached, so fresh allocs always
 /// come from a Vk allocator. The test still asserts the
-/// fill-on-alloc invariant via the *initial* read: every depth →
-/// opaque black `(0, 0, 0, 0xFF)` BGRA bytes (Stage 4d.8a flipped
-/// depth-32 from transparent `(0,0,0,0)` to opaque black to match
-/// v1's effective per-window-mirror floor under compositing WMs).
-/// Without the 3f.14 fill, the freshly allocated Vk image would
-/// have UNDEFINED layout content and the readback would be either
-/// driver-defined zero or garbage — driver-dependent. The fill
-/// makes it explicit.
+/// fill-on-alloc invariant via the *initial* read: depth-32 →
+/// `(0, 0, 0, 0)` BGRA bytes. Without the 3f.14 fill, the freshly
+/// allocated Vk image would have UNDEFINED layout content and the
+/// readback would be either driver-defined zero or
+/// garbage — driver-dependent. The fill makes it explicit.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
@@ -1292,13 +1289,13 @@ fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 16 * 16 * 4);
-    // Stage 4d.8a: every depth → opaque black per
-    // `default_window_init_color` (pragmatic compositor floor).
+    // Depth-32 → transparent black `(0, 0, 0, 0)` per
+    // `default_window_init_color`.
     for (i, px) in out.chunks_exact(4).enumerate() {
         assert_eq!(
             &px[0..4],
-            &[0x00, 0x00, 0x00, 0xFF],
-            "fresh depth-32 storage pixel #{i} must be opaque black (got {:?})",
+            &[0x00, 0x00, 0x00, 0x00],
+            "fresh depth-32 storage pixel #{i} must be transparent black (got {:?})",
             &px[0..4],
         );
     }

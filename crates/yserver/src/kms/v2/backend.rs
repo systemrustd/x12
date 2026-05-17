@@ -2208,28 +2208,25 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
 /// drawable backing has gone away. The engine treats this as a
 /// gap and silently no-ops (matches v1's
 /// `resolve_render_pic_with_gradient_xid` shape).
-/// Stage 3f.14 / 4d.8a: safe-default init colour for fresh window
-/// storage when the X11 attribute `background-pixel` is `None`.
-/// The v2 PixmapPool (3f.10) recycles (image, view, memory)
-/// triples between drawables; a pool-take inherits the returner's
-/// pixels, so leaving fresh storage at pool content surfaces
-/// visually as widget-rect islands on black (caja's drag artifact,
-/// 3f.10 + 3f.14 reproducer).
+/// Stage 3f.14: depth-appropriate safe-default init colour for
+/// fresh window storage when the X11 attribute `background-pixel`
+/// is `None`. The v2 PixmapPool (3f.10) recycles
+/// (image, view, memory) triples between drawables; a pool-take
+/// inherits the returner's pixels, so leaving fresh storage at
+/// pool content surfaces visually as widget-rect islands on
+/// black (caja's drag artifact, 3f.10 + 3f.14 reproducer).
 ///
-/// Stage 4d.8a — pragmatic compositor floor: always opaque-black
-/// regardless of depth. Depth-32 storage used to initialize to
-/// transparent `(0, 0, 0, 0)` on the rationale that ARGB windows
-/// premultiply-α onto layers below; in practice depth-32 windows
-/// that get `CopyArea`'d from depth-24 sources (or the
-/// empty-pixmap-CopyArea pattern the clock-applet uses) end up
-/// with alpha=0 stored content and disappear under compositing
-/// WMs that read the storage back. Real X11 servers running on
-/// zeroed-page allocators give the same effective behavior we
-/// pick here; intentional ARGB-transparent popups (real tooltips
-/// with shadow) don't work today regardless. Matches v1's
-/// effective per-window-mirror floor.
-fn default_window_init_color(_depth: u8) -> [f32; 4] {
-    [0.0, 0.0, 0.0, 1.0]
+/// - Depth 32 windows are premultiplied-α; transparent black
+///   `(0, 0, 0, 0)` is the no-op contribution to compositing.
+/// - Depth 24 and other non-alpha visuals get opaque black
+///   `(0, 0, 0, 1)` — matches "uninitialised window shows black"
+///   which is the historical X11 behaviour clients expect.
+fn default_window_init_color(depth: u8) -> [f32; 4] {
+    if depth == 32 {
+        [0.0, 0.0, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
 }
 
 /// Stage 3f.13 glyph fallback: pull the first stop's premultiplied
@@ -2938,41 +2935,30 @@ impl Backend for KmsBackendV2 {
         true
     }
 
-    /// Stage 4c.4 / 4d.8b — handle a window's scene-participation
-    /// transition under COMPOSITE redirect. Fires scene-structure
-    /// damage for the redirect transition itself (the source for
-    /// W's area changes from W's own storage to B via Stage 4c.3's
-    /// `redirected_target` indirection, even when the flag value
-    /// doesn't move).
+    /// Stage 4c.4 — flip a window's scene-participation under
+    /// COMPOSITE redirect. Delegates to `DrawableStore::
+    /// set_scene_participating` (which clears unpresented
+    /// presentation damage + bumps the epoch on a true→false
+    /// transition per spec §I5) and fires scene-structure damage
+    /// for the redirect transition.
     ///
-    /// **Stage 4d.8b — pragmatic compositor floor**: when
-    /// `participating=false` (Manual-activate per spec §I4) the
-    /// flag flip is SKIPPED. Spec §I4 says remove W from the scene
-    /// walk and let the compositor populate the COW, but no real
-    /// compositor we've tested (marco, xfwm4) populates COW
-    /// correctly without an ARGB-aware substrate (PictFormat
-    /// tracking, multi-layer alpha mask, etc.). Keeping W in the
-    /// scene walk means yserver still draws it from its backing B
-    /// via Stage 4c.3's `redirected_target` indirection; the
-    /// compositor's COW alpha-blends on top, so any decorations /
-    /// shadows / effects it does paint layer over the
-    /// scene-drawn window. Matches v1's effective floor.
+    /// **Scene-structure damage** — always fires per the plan's
+    /// Cross-cutting §"Concrete scene-structure damage":
+    ///   - `participating=true` (un-redirect / Automatic-activate):
+    ///     rect = W's current screen rect — the scene newly
+    ///     includes W and must paint W's location.
+    ///   - `participating=false` (Manual-activate): rect = W's
+    ///     pre-flip rect — the scene NO LONGER includes W but
+    ///     whatever is underneath must repaint the area where W
+    ///     used to be.
     ///
-    /// `participating=true` (un-redirect / Automatic-activate)
-    /// still flips through normally — the call is a no-op when the
-    /// flag is already true (which it is for any mapped window).
-    ///
-    /// **Scene-structure damage** — fires in both branches:
-    ///   - `participating=true`: rect = W's current screen rect.
-    ///   - `participating=false`: rect = W's pre-flip rect — even
-    ///     though W stays in the scene, its source changes from
-    ///     own-storage → B (4c.3 indirection), so the region must
-    ///     repaint.
-    ///
-    /// When `window_absolute_rect` returns `None` (root or
-    /// untracked geometry), fall back to the coarse
-    /// `mark_scene_structure_dirty` — correctness-preserving,
-    /// just wider than needed.
+    /// In both branches we capture the rect BEFORE the flip
+    /// (pre-flip and post-flip geometry coincide because the
+    /// participation flip itself doesn't move W); the only
+    /// difference is semantic. When `window_absolute_rect`
+    /// returns `None` (root or untracked geometry), fall back to
+    /// the coarse `mark_scene_structure_dirty` — correctness-
+    /// preserving, just wider than needed.
     fn set_window_scene_participation(
         &mut self,
         _origin: Option<OriginContext>,
@@ -2987,18 +2973,15 @@ impl Backend for KmsBackendV2 {
             );
             return Ok(());
         };
-        // Capture rect BEFORE any flip — pre- and post-flip
-        // geometry coincide because the participation transition
-        // itself doesn't move W; pre-flip keeps the two branches
-        // symmetric.
+        // Capture rect BEFORE the flip — on participating=false
+        // (Manual activation) the pre-flip rect is what the scene
+        // needs to repaint over; on participating=true the pre-
+        // and post-flip rects coincide (no geometry move on this
+        // path) so either reading is fine, and pre-flip keeps the
+        // two branches symmetric.
         let pre_flip_rect = self.window_absolute_rect(w_id);
 
-        // Stage 4d.8b: Manual mode (participating=false) keeps W
-        // in the scene walk; only the Automatic / un-redirect
-        // branch actually touches the store flag.
-        if participating {
-            self.store.set_scene_participating(w_id, true);
-        }
+        self.store.set_scene_participating(w_id, participating);
 
         if let Some(rect) = pre_flip_rect {
             self.scene.mark_scene_structure_damage_rects(&[rect]);
@@ -6868,16 +6851,16 @@ mod tests {
         assert_eq!(b.engine.picture_paint_len(), 0);
     }
 
-    /// Stage 4d.8a: pragmatic compositor floor — every depth
-    /// (including 32) initializes to opaque black. Depth-32 used
-    /// to default to transparent `(0,0,0,0)` so ARGB windows
-    /// premultiplied onto layers below, but real compositors read
-    /// the storage back and the missing alpha hid widgets under
-    /// marco-compositing / xfwm4-compositing. See
-    /// `default_window_init_color` for the full rationale.
+    /// Stage 3f.14: depth-32 windows are premultiplied-α and a
+    /// transparent-black default is the no-op contribution to
+    /// compositing; depth-24 (and other non-α visuals) get opaque
+    /// black. Locks the contract in the test suite so a refactor
+    /// doesn't silently flip 32-bit windows to opaque black (which
+    /// would visually look the same on top of the root but break
+    /// compositors that depend on alpha for blending).
     #[test]
     fn v2_default_window_init_color_per_depth() {
-        assert_eq!(super::default_window_init_color(32), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(super::default_window_init_color(32), [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(super::default_window_init_color(24), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(super::default_window_init_color(1), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(super::default_window_init_color(8), [0.0, 0.0, 0.0, 1.0]);
@@ -8402,31 +8385,18 @@ mod tests {
     // set_backing_scene_participation
     // ────────────────────────────────────────────────────────────────
 
-    /// Stage 4d.8b — pragmatic compositor floor: `participating=false`
-    /// (Manual activation) is a no-op on the scene-participation
-    /// flag. W stays in the scene walk; yserver continues drawing
-    /// it from its backing B via Stage 4c.3's `redirected_target`
-    /// indirection while the compositor's COW layers on top.
-    /// Replaces the pre-4d.8 `set_window_scene_participation_false_clears_window_damage`,
-    /// which asserted the opposite (flag cleared, damage flushed).
-    /// Note: because the flag doesn't transition, presentation
-    /// damage on W is preserved (the `set_scene_participating`
-    /// clear-on-true→false hook isn't reached).
+    /// `participating=false` on a window with pending presentation
+    /// damage must delegate to `DrawableStore::set_scene_participating`
+    /// — that store method clears the damage and bumps the epoch.
+    /// This verifies the v2 backend actually wires the call (rather
+    /// than e.g. silently returning Ok).
     #[test]
-    fn set_window_scene_participation_manual_keeps_participating_true() {
+    fn set_window_scene_participation_false_clears_window_damage() {
         use yserver_core::backend::WindowHandle;
         let mut b = KmsBackendV2::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
-        // Sanity: seeded windows start scene_participating=true
-        // (per `seed_window`'s `mapped=true` allocation path).
-        assert!(
-            b.store.get(w_id).unwrap().scene_participating,
-            "fixture sanity: seeded window starts scene_participating=true",
-        );
-
-        // Seed presentation damage so the assertion below can
-        // observe that Manual mode does NOT clear it (the
-        // pre-4d.8 contract did; we no longer want that).
+        // Seed presentation damage so the store actually has work
+        // to clear when participation flips off.
         b.store.damage(
             w_id,
             ash::vk::Rect2D {
@@ -8437,45 +8407,30 @@ mod tests {
                 },
             },
         );
+        assert_eq!(
+            b.store.get(w_id).unwrap().presentation_damage.rects().len(),
+            1,
+        );
+        let epoch_before = b.store.get(w_id).unwrap().presentation_damage_epoch;
 
         let handle = WindowHandle::from_raw(0x100).expect("WindowHandle");
         b.set_window_scene_participation(None, handle, false)
-            .expect("set_window_scene_participation(false)");
+            .expect("set_window_scene_participation");
 
         let d = b.store.get(w_id).expect("drawable still alive");
         assert!(
-            d.scene_participating,
-            "Stage 4d.8b: Manual activation (participating=false) must NOT \
-             flip the store flag — W stays in scene so yserver continues \
-             drawing it via the 4c.3 redirected_target indirection",
+            d.presentation_damage.is_empty(),
+            "presentation_damage must clear on participating=false transition: {:?}",
+            d.presentation_damage.rects(),
         );
         assert!(
-            !d.presentation_damage.is_empty(),
-            "Manual activation must NOT clear pending presentation damage \
-             (the clear hook only fires on a true→false transition, which \
-             we now skip)",
+            d.presentation_damage_epoch > epoch_before,
+            "epoch must bump on participating=false transition (before={epoch_before}, after={})",
+            d.presentation_damage_epoch,
         );
-    }
-
-    /// Stage 4d.8b — `participating=true` (un-redirect /
-    /// Automatic-activate) is the path that actually touches the
-    /// store flag. It's a no-op when the flag is already true
-    /// (which it is for any mapped window) but must still leave
-    /// the flag at true on completion.
-    #[test]
-    fn set_window_scene_participation_automatic_keeps_participating_true() {
-        use yserver_core::backend::WindowHandle;
-        let mut b = KmsBackendV2::for_tests();
-        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
-        assert!(b.store.get(w_id).unwrap().scene_participating);
-
-        let handle = WindowHandle::from_raw(0x100).expect("WindowHandle");
-        b.set_window_scene_participation(None, handle, true)
-            .expect("set_window_scene_participation(true)");
-
         assert!(
-            b.store.get(w_id).unwrap().scene_participating,
-            "participating=true must leave the flag at true",
+            !d.scene_participating,
+            "scene_participating flag must be cleared",
         );
     }
 
