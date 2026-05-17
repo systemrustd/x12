@@ -122,7 +122,7 @@ enforcement of at least one. Violating any of them is the bug.
 | I1 | A drawable is **storage** plus metadata. Not "a window that gets walked by scanout" or "a pixmap forwarded to the host." | `DrawableStore` |
 | I2 | Client drawing mutates **only drawable storage**. Paint paths do not write to scanout BOs, do not bypass storage, do not have a "live window" fast path. | `RenderEngine` |
 | I3 | Window visibility is produced **only by a compositor pass**. Scanout is the output of a scene-graph composition over drawable storage, never a direct view onto window mirrors. | `SceneCompositor` |
-| I4 | COMPOSITE redirect only changes the **target storage** for a window. It does not change which paint paths run, which RENDER ops are valid, which damage fires. Manual-mode redirect additionally **removes the window from server-managed scene composition** — yserver routes client paint into the backing and exposes it via `NameWindowPixmap`, but the external compositor decides what becomes visible (typically by painting to root or COW). The scene does **not** automatically draw the redirected backing; doing so would duplicate or bypass the compositor's policy. Automatic-mode redirect keeps the window in the scene (the compositor only observes damage, not presents). | `DrawableStore` + `SceneCompositor` |
+| I4 | COMPOSITE redirect only changes the **target storage** for a window. It does not change which paint paths run, which RENDER ops are valid, which damage fires. Manual-mode redirect additionally **removes the window from server-managed scene composition** — yserver routes client paint into the backing and exposes it via `NameWindowPixmap`, but the external compositor decides what becomes visible (typically by painting to root or COW). **Manual backings** are not drawn by the scene at all (no scene entry); the scene would otherwise duplicate or bypass the compositor's policy. **Automatic backings** are sampled only through W's existing scene entry (`build_scene` resolves the entry's storage source through `Drawable.redirected_target` per the I5 amendment 2026-05-17) — never as an independent entry — so the scene continues to draw W with B as the texture source and the compositor observes damage in parallel. Automatic-mode redirect keeps the window in the scene; the compositor only observes damage, not presents. | `DrawableStore` + `SceneCompositor` |
 | I5 | Damage is **two separate concerns** with overlapping inputs. **Presentation damage** drives the scene's next re-blit and has two sources: (a) per-storage paint-mutated region (in storage-local coords, only on scene-participating storage); (b) scene-structure damage from map/unmap/configure/stacking/shape/redirect-state/cursor/output changes (in output coords). Both feed **per-output damage**, which is what the compositor re-blits — restacks and occlusion re-expose regions even when storage didn't change. Acked only on successful present; failed submits don't lose repaint state. **Protocol damage** is the X11 DAMAGE-extension's per-drawable region: accumulates on every paint to any storage, regardless of scene participation, drives DamageNotify events to subscribed clients, acked by `DamageSubtract`. **Owned at the request layer in `yserver-core`** (see I5 amendment under `DrawableStore`), not by the backend's storage type — fanout fires per paint request and is identical for v1/v2. Manual-redirected backings get protocol damage but **no** presentation damage — the external compositor reads via NameWindowPixmap on the DamageNotify, repaints root, root's presentation damage drives the scene. | `DrawableStore` (presentation) + `SceneCompositor` (presentation + scene-structure) + `yserver-core::damage_fanout` (protocol) |
 | I6 | Every image / buffer / fence has an **owner** and a **retirement generation**. v2 tracks **two distinct retirement signals** because they describe different consumers: **I6a — GPU render-completion fence** (signaled when the queue finishes executing a submitted CB; source storage sampled by the compose pass is releasable once this fires). **I6b — KMS page-flip retirement** (signaled when KMS hands back the previously-scanned-out BO; that BO is releasable for reuse only on this signal). Resources are freed only after **the relevant** retirement signal for their last consumer has fired. | Cross-cutting; `PlatformBackend` provides both fence primitives |
 | I7 | **Initial invariant**: direct scanout is disabled; the scanout BO is filled only by `SceneCompositor`'s composed pass. No per-window scanout shortcuts, no HW cursor plane shortcut, no bypass paths. **Future relaxation**: direct scanout, HW cursor plane, and HW plane assignment may be reintroduced later, but only as `SceneCompositor`-owned **strategy choices** over scene entries — never as side paths that bypass scene ownership. The contract stays "output equals the resolved scene"; the strategy chooses how scene entries reach the screen (composition, plane, direct present). | `PlatformBackend` (initial); `SceneCompositor` decides strategy when relaxed |
@@ -183,11 +183,29 @@ Tracks:
   - **Presentation damage** — region the scene needs to re-blit.
     Only meaningful for storage that participates in the scene
     (root, mapped non-redirected windows + descendants, COW,
-    cursor). Peeked by `SceneCompositor` at composite time, acked
-    after successful present. Pixmaps not in the scene, unmapped
-    windows, and Manual-redirected backings do **not** accumulate
-    presentation damage — the scene doesn't draw from them, so
-    there's nothing for `SceneCompositor` to ack.
+    cursor, **Automatic-redirected backings** — see amendment
+    2026-05-17 below). Peeked by `SceneCompositor` at composite
+    time, acked after successful present. Pixmaps not in the
+    scene, unmapped windows, and **Manual**-redirected backings
+    do **not** accumulate presentation damage — the scene
+    doesn't draw from them, so there's nothing for
+    `SceneCompositor` to ack.
+
+    **Amendment 2026-05-17** (Stage 4 planning): Automatic-mode
+    redirect keeps W in the scene, but paint routes to W's
+    backing B (via `set_redirected_target`). The scene must
+    therefore read from B (not from W's now-unpainted own
+    storage). The model: `SceneCompositor::build_scene`
+    resolves each scene entry's `storage_id` through
+    `Drawable.redirected_target` (`source_id =
+    redirected_target.unwrap_or(W_id)`), so Automatic-W's
+    entry samples B and tracks damage/ack on B's epoch. For
+    this to work, **Automatic backings have
+    `scene_participating=true`** while a redirect is active
+    (Manual backings stay `false` because the scene doesn't
+    sample them — the external compositor reads via
+    NameWindowPixmap → root). Cleared back to `false` when
+    the redirect releases.
   - **Protocol damage** — region the X11 DAMAGE extension reports
     to clients that have called `DamageCreate` on this drawable.
     **Amendment 2026-05-16**: protocol damage is **request-layer
@@ -212,9 +230,12 @@ Exposes:
   -> DrawableId` — `scene_participating` decides whether
   presentation damage accumulates. Root, windows (set/unset at
   map/unmap), COW, cursor: true. Pixmaps, Manual-redirected
-  backings: false.
+  backings: false. **Automatic-redirected backings: flipped to
+  true at redirect activation** (per amendment 2026-05-17
+  above), back to false at release.
 - `set_scene_participating(id, bool)` — flip the flag when a
-  window maps/unmaps or its redirect state changes.
+  window maps/unmaps, when its redirect state changes (W-side),
+  or when an Automatic backing activates/releases (B-side).
 - `borrow(id) -> &Storage` (read-only access for paint, composition)
 - `borrow_mut(id) -> &mut Storage` (write access for paint)
 - `damage(id, rect)` — accumulate **presentation** damage for the
@@ -777,10 +798,24 @@ exact failure mode v2 is designed to eliminate.
 - Composite Overlay Window: a real window with storage; if a
   compositor has called `GetOverlayWindow`, the scene puts it above
   all top-levels.
-- xfwm4 + xfce drop-shadow renders correctly. picom xrender backend
-  composites and updates per Damage event.
-- Stage done when: xfce menu shadows are alpha-correct, picom blur
-  renders, no regression on non-composited WMs.
+- xfwm4-with-compositing + xfce drop-shadow renders correctly.
+  marco-with-compositing under mate-session renders correctly.
+- Stage done when: xfce / xfwm4 menu shadows are alpha-correct,
+  no regression on non-composited WMs, no `name_window_pixmap`
+  Err / `host_src ... not resolvable` lines in steady state
+  under either compositor.
+
+**Amendment 2026-05-17** (after Stage 3 close): the original
+draft of this section named picom (xrender backend + blur) as
+the closing gate. picom never worked on v1 because picom-glx
+needs `GLX_EXT_texture_from_pixmap` (a separate substrate per
+`project_compiz_is_required`) and picom-xrender has its own
+deep RENDER + alpha-mask dependencies. Neither is a
+v1→v2 regression to skip; both are follow-on substrate work
+(Compiz / texture-from-pixmap path). Stage 4 close now gates
+on the marco + xfwm4 compositor cases that real users hit and
+that v1 cannot do. picom support moves to a post-v1-deletion
+follow-on.
 
 ### Stage 5 (optional, follow-up) — advanced perf strategies
 
