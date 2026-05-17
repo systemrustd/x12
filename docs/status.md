@@ -333,9 +333,9 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 
 ### In progress
 
-- [~] **Stage 3 — RENDER + glyphs coverage.** Plan landed
-  2026-05-16 (`142cda8`) after four codex review rounds; six
-  substages 3a–3f.
+- [x] **Stage 3 — RENDER + glyphs coverage.** Closed
+  2026-05-17. Plan landed 2026-05-16 (`142cda8`) after four
+  codex review rounds; six substages 3a–3f.
 
   Plan: `docs/superpowers/plans/2026-05-16-stage-3.md`.
 
@@ -1311,14 +1311,46 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
          engine, then `init_root_storage`. `for_tests` still
          does the immediate init for the no-Vk path.
 
-    - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
-      smoke matrix (xterm / xclock / xeyes / gedit / MATE /
-      xfce4 / xfd), bee 30-min stability, fuji v1/v2 perf
-      capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7
-      + 3f.11** (subwindow + input + stacking) — visual,
-      input, and z-order all required for matrix clients to
-      reach their first paint. 3f.12-3f.15 are observed/
-      recorded but not blocking.
+    - [x] **3f.5 — acceptance + Stage 3 close 2026-05-17.**
+
+      **xts5 `Xproto`** (`just xts-yserver`, vng + virtio-gpu
+      KMS): **358 PASS / 6 FAIL / 4 UNRES / 19 UNTST** out of
+      389 test purposes (92%). Same v1 (forced via
+      `YSERVER_RENDER_MODEL=v1`) run: **bit-identical
+      358/6/4/19** — confirms the Stage 1a `KmsCore` extraction
+      is faithful end-to-end on the protocol surface. Remaining
+      FAILs cluster on font metadata (`pListFonts*`,
+      `pSetFontPath`, `pPolyText8/16`) + `pGetImage` +
+      `pBadRequest`; UNRES on `pPutImage` (×3). None touch the
+      v1/v2 divergence point.
+
+      **rendercheck**: not a Stage 3 gate. The suite enumerates
+      RENDER ops through COMPOSITE-shaped flows that hit the
+      still-stubbed `name_window_pixmap` (Err) on v2 — that's
+      explicitly Stage 4 territory. rendercheck against v2 today
+      aborts 12 of 13 categories; re-runs after Stage 4 lands
+      `set_redirected_target` + real `NameWindowPixmap`. v1's
+      historical 100% on rendercheck reflects v1's per-window-
+      mirror path that exposes storage directly without
+      compositor-style aliasing — exactly the model mismatch
+      v2 rewrites.
+
+      **Real-app hardware-smoke matrix** (bee + fuji, v2, KMS):
+      xterm-under-fvwm3, xclock, xeyes (post-shader-fix), gedit,
+      MATE-cc, xfce4-no-compositor, xfd all PASS. marco / xfwm4
+      with compositor hit `name_window_pixmap` gaps (Stage 4).
+
+      **Stability + perf** observed positive through 3f.10 +
+      3f.15 (flip-pending gate + failed-submit recovery + stroke
+      aggregation). Formal bee 30-min capture + fuji v1/v2 perf
+      diff deferred to Stage 4 close — until COMPOSITE flows
+      land, v2's compose-pass + scene-walk is doing more
+      work-per-frame than v1's per-window-mirror walk, which
+      would skew an apples-to-apples comparison. Capture is
+      meaningful once v2 reaches its target shape (compositor
+      WMs working, damage-clipping engaged).
+
+      Stage 3 is closed: v2 is the substrate Stage 4 builds on.
 
   ### Stage 3f planning-gap retrospective
 

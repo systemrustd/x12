@@ -99,15 +99,17 @@ screen-saver state, error-code edge cases, etc.
   Xt-suite tests will mostly UNRES because the toolkit's font /
   resource expectations diverge sharply from ynest's stubs.
 
-## Not yet measured
+## Run history (yserver KMS, `Xproto` scenario)
 
-- **`yserver` (KMS) baseline.** The KMS backend runs only inside
-  `vng`, so running xts against it requires either building xts
-  inside the guest's rootfs or tunnelling a guest DISPLAY to the
-  host. Deferred — once the structural quick-wins land we expect
-  KMS numbers to be lower than ynest (no `RENDER`-via-host fallback,
-  fewer extension stubs), and the comparison is only interesting
-  after those are fixed.
+The KMS backend runs only inside `vng`. `just xts-yserver` boots
+yserver as the only X server in a virtme-ng guest (virtio-gpu KMS)
+and runs the same xts harness ynest uses. Results land in
+`/home/jos/Projects/xts/results/<ts>/` on the host (vng mounts
+host rootfs `--rw`).
+
+| Date       | PASS | FAIL | UNRES | UNTST | Notes |
+|------------|-----:|-----:|------:|------:|-------|
+| 2026-05-17 |  358 |    6 |     4 |    19 | First captured xts-yserver run. v2 backend (`YSERVER_RENDER_MODEL=v2`, the dispatch default since `3afa5bd`). 92% pass on 389 test purposes; **+21 PASS over the ynest `Xproto` row that landed `xproto` branch** (337). Failing test cases (~10): `pBadRequest`, `pGetImage`, `pListFonts`, `pListFontsWithInfo`, `pPolyText8/16`, `pPutImage` (×3 subtests UNRES), `pSetFontPath`. Mix of font-path metadata, GetImage edge cases, and one PolyText format. Triage TBD. |
 
 ## rendercheck (RENDER smoke suite)
 
