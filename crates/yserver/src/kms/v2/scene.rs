@@ -1001,6 +1001,15 @@ fn build_scene(
             }
         }
     }
+    // Stage 4 diagnostic: trace-level scene-walk marker. Brackets
+    // the per-top-level traces emitted inside `emit_window_subtree`
+    // so grep+awk can carve out one frame's worth of decisions.
+    // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`.
+    log::trace!(
+        "v2 scene_walk begin output={output_idx} top_levels={n} \
+         layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+        n = core.top_level_order.len(),
+    );
     for &top_xid in &core.top_level_order {
         emit_window_subtree(
             top_xid,
@@ -1018,6 +1027,12 @@ fn build_scene(
             &mut projected,
         );
     }
+    log::trace!(
+        "v2 scene_walk end output={output_idx} draws={n_draws} \
+         sampled={n_sampled}",
+        n_draws = draws.len(),
+        n_sampled = sampled_ids.len(),
+    );
 
     // Stage 4d: append the Composite Overlay Window draw entry
     // ABOVE all top-levels but BELOW the cursor (Stage 4 plan
@@ -1165,6 +1180,7 @@ fn build_scene(
 /// `unmapped` short-circuits the entire subtree (matches X11
 /// MapWindow semantics — an unmapped parent hides all descendants).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn emit_window_subtree(
     host_xid: u32,
     parent_abs_x: i32,
@@ -1180,11 +1196,28 @@ fn emit_window_subtree(
     sampled_ids: &mut Vec<super::store::DrawableId>,
     projected: &mut RegionSet,
 ) {
+    // Stage 4 diagnostic: trace-level scene-walk decision per window.
+    // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`. The
+    // top-level and descendant paths share this function so the
+    // single trace site covers both. Format is greppable —
+    // `v2 scene_walk xid=...: ...` — for `grep v2 scene_walk` over
+    // yserver-hw.log to extract just these lines.
     let Some(geom) = windows_v2.get(&host_xid) else {
+        log::trace!("v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows_v2");
         return;
     };
     if !geom.mapped {
         // X11: an unmapped window (and entire subtree) is invisible.
+        log::trace!(
+            "v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+             geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
+            x = geom.x,
+            y = geom.y,
+            w = geom.width,
+            h = geom.height,
+            depth = geom.depth,
+            parent = geom.parent,
+        );
         return;
     }
     let abs_x = parent_abs_x + i32::from(geom.x);
@@ -1192,35 +1225,115 @@ fn emit_window_subtree(
 
     // Emit a draw entry for this window if it has live storage that
     // participates in the scene.
-    if let Some(id) = store.lookup(host_xid)
-        && let Some(drawable) = store.get(id)
-        && drawable.scene_participating
-        && matches!(drawable.kind, DrawableKind::Window)
-    {
-        // Stage 4c.3 — route source-storage through `redirected_target`.
-        // Automatic-mode redirected W blits FROM B; W's geometry
-        // (dst_origin, dst_size, intersect test) stays driven by W's
-        // own state in `windows_v2`. Only the sampled storage handle
-        // reroutes. Manual-mode W's are filtered out before this
-        // path (scene_participating=false), so the indirection only
-        // fires for Automatic.
-        let source_id = store.redirected_target(id).unwrap_or(id);
-        if let Some(source) = store.get(source_id)
-            && source.storage.image_view != vk::ImageView::null()
+    let lookup_id = store.lookup(host_xid);
+    if lookup_id.is_none() {
+        log::trace!(
+            "v2 scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+             geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+            x = geom.x,
+            y = geom.y,
+            w = geom.width,
+            h = geom.height,
+            depth = geom.depth,
+        );
+    }
+    if let Some(id) = lookup_id {
+        // Pull diagnostic fields up front (cheap copies) so we can
+        // emit a single SKIP/WILL_EMIT trace line per gate failure
+        // without re-borrowing the store across log call sites.
+        let drawable_snap = store.get(id).map(|d| {
+            (
+                d.id,
+                d.kind,
+                d.depth,
+                d.refcount,
+                d.scene_participating,
+                d.storage.extent,
+                d.storage.image_view == vk::ImageView::null(),
+            )
+        });
+        if let Some((d_id, d_kind, d_depth, d_refcount, d_part, d_extent, d_view_null)) =
+            drawable_snap
         {
-            let image_view = source.storage.image_view;
-            // Project onto output-local coords.
+            // Stage 4c.3 — route source-storage through `redirected_target`.
+            // Automatic-mode redirected W blits FROM B; W's geometry
+            // (dst_origin, dst_size, intersect test) stays driven by W's
+            // own state in `windows_v2`. Only the sampled storage handle
+            // reroutes. Manual-mode W's are filtered out before this
+            // path (scene_participating=false), so the indirection only
+            // fires for Automatic.
+            let source_id = store.redirected_target(id).unwrap_or(id);
+            let source_view_null = store
+                .get(source_id)
+                .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+
+            // Project onto output-local coords (computed once here so
+            // both the SKIP=no_intersect and WILL_EMIT trace lines can
+            // include the dst rect).
             let dx = abs_x - layout_x0;
             let dy = abs_y - layout_y0;
             let win_w = i32::from(geom.width);
             let win_h = i32::from(geom.height);
-            // Trivial reject only if the window doesn't intersect the
-            // output at all.
             let intersects = !(dx + win_w <= 0
                 || dy + win_h <= 0
                 || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
                 || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
-            if intersects {
+
+            // Pick the first failing gate and emit a single SKIP line;
+            // otherwise emit WILL_EMIT. Order matches the production
+            // gate ordering below so the trace mirrors the live path.
+            let skip_reason: Option<&'static str> = if !d_part {
+                Some("scene_participating=false")
+            } else if !matches!(d_kind, DrawableKind::Window) {
+                Some("kind!=Window")
+            } else if source_view_null {
+                Some("source_image_view_null")
+            } else if !intersects {
+                Some("no_intersect_with_output")
+            } else {
+                None
+            };
+
+            if let Some(reason) = skip_reason {
+                log::trace!(
+                    "v2 scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                     geom=({gx},{gy} {gw}x{gh}) mapped=true \
+                     store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                     refcount={d_refcount} scene_participating={d_part} \
+                     storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                     source_id={source_id:?} source_view_null={source_view_null}",
+                    gx = geom.x,
+                    gy = geom.y,
+                    gw = geom.width,
+                    gh = geom.height,
+                    dew = d_extent.width,
+                    deh = d_extent.height,
+                );
+            } else {
+                log::trace!(
+                    "v2 scene_walk xid={host_xid:#x}: WILL_EMIT \
+                     geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
+                     output=({dx},{dy} {win_w}x{win_h}) \
+                     store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                     refcount={d_refcount} scene_participating={d_part} \
+                     storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                     source_id={source_id:?}",
+                    gx = geom.x,
+                    gy = geom.y,
+                    gw = geom.width,
+                    gh = geom.height,
+                    dew = d_extent.width,
+                    deh = d_extent.height,
+                );
+            }
+
+            if d_part
+                && matches!(d_kind, DrawableKind::Window)
+                && let Some(source) = store.get(source_id)
+                && source.storage.image_view != vk::ImageView::null()
+                && intersects
+            {
+                let image_view = source.storage.image_view;
                 draws.push(CompositeDraw {
                     image_view,
                     #[allow(clippy::cast_precision_loss)]
@@ -1239,6 +1352,16 @@ fn emit_window_subtree(
                     snapshots.push(snap);
                 }
             }
+        } else {
+            log::trace!(
+                "v2 scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                 store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                x = geom.x,
+                y = geom.y,
+                w = geom.width,
+                h = geom.height,
+                depth = geom.depth,
+            );
         }
     }
 
