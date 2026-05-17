@@ -61,7 +61,7 @@ fn v2_put_image_fill_get_image_oracle() {
         .expect("put_image");
 
     let out = b
-        .get_image(None, xid, 2 /* ZPixmap */, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(xid, 2 /* ZPixmap */, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some(bytes)");
     assert_eq!(out, src, "PutImage→GetImage byte-identical (depth-32)");
@@ -80,7 +80,7 @@ fn v2_put_image_fill_get_image_oracle() {
         .expect("poly_fill_rectangle");
 
     let after = b
-        .get_image(None, xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some");
     // (3, 3) — inside the fill — must be red: BGRA = [0,0,0xFF,0xFF].
@@ -125,7 +125,7 @@ fn v2_copy_area_disjoint_oracle() {
         .expect("copy_area");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 8, 4, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 4, !0)
         .expect("get_image")
         .expect("Some");
     // Left half blue, right half red.
@@ -176,7 +176,9 @@ fn v2_telemetry_lifetime_after_sequence() {
     let buf = vec![0xFFu8; 4 * 4 * 4];
     b.put_image(None, xid, 32, 4, 4, 0, 0, &buf).unwrap();
     // 1 get_image.
-    let _ = b.get_image(None, xid, 2, 0, 0, 4, 4, !0).unwrap();
+    let _ = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 4, 4, !0)
+        .unwrap();
 
     let t = b.telemetry();
     assert_eq!(t.lifetime.paint_submits, 4, "3 fills + 1 put_image");
@@ -273,7 +275,7 @@ fn v2_render_composite_no_gc_clip_leak() {
     .expect("render_composite");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 4, 4, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
         .expect("get_image")
         .expect("Some(bytes)");
     // Every pixel must be red BGRA = [0, 0, 0xFF, 0xFF].
@@ -397,7 +399,7 @@ fn v2_composite_glyphs_clip_intersects_picture() {
     .expect("render_composite_glyphs");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 8, 4, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 4, !0)
         .expect("get_image")
         .expect("Some(bytes)");
 
@@ -488,7 +490,7 @@ fn v2_copy_plane_depth1_extracts_mask_bits() {
     .expect("copy_plane");
 
     let out = b
-        .get_image(None, dst_pix.as_raw(), 2, 0, 0, 8, 1, !0)
+        .get_image_pixels_for_tests(dst_pix.as_raw(), 2, 0, 0, 8, 1, !0)
         .expect("get_image dst")
         .expect("Some(bytes)");
     // Expected per-pixel: bit set → red BGRA = [0,0,0xFF,0xFF];
@@ -574,7 +576,7 @@ fn v2_render_trapezoids_renders_filled_rect() {
     .expect("render_trapezoids");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some");
     // Trap interior pixel (3, 3) — solidly inside — must be red.
@@ -706,7 +708,7 @@ fn v2_back_to_back_trapezoids_different_solidfill_colors() {
     .expect("render_trapezoids black");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some");
 
@@ -834,7 +836,7 @@ fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
     .expect("render_trapezoids");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 10, 10, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 10, 10, !0)
         .expect("get_image")
         .expect("Some");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -947,7 +949,7 @@ fn v2_subwindow_resize_clears_old_paint() {
     // drawable). Pre-fix: destroy_now blindly removed the xid
     // mapping → new storage orphaned → get_image returns None.
     let out = b
-        .get_image(None, xid, 2, 0, 0, 64, 64, !0)
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 64, 64, !0)
         .expect("get_image returned Err (storage orphaned by destroy_now?)")
         .expect("Some — by_xid[xid] resolved");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -999,11 +1001,11 @@ fn v2_fresh_pixmap_reads_back_zero() {
     let pix24 = b.create_pixmap(None, 24, 16, 16).expect("depth-24 pixmap");
 
     let out32 = b
-        .get_image(None, pix32.as_raw(), 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(pix32.as_raw(), 2, 0, 0, 16, 16, !0)
         .expect("get_image depth-32")
         .expect("Some");
     let out24 = b
-        .get_image(None, pix24.as_raw(), 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(pix24.as_raw(), 2, 0, 0, 16, 16, !0)
         .expect("get_image depth-24")
         .expect("Some");
 
@@ -1092,7 +1094,7 @@ fn v2_render_trapezoids_large_bbox_repro() {
     .expect("render_trapezoids");
 
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 200, 200, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 200, 200, !0)
         .expect("get_image")
         .expect("Some");
     // Center pixel (100, 100) — well inside trap (50..150, 50..150).
@@ -1156,7 +1158,7 @@ fn v2_tiled_fill_replicates_tile_pixmap() {
         .expect("poly_fill_rectangle tiled");
 
     let out = b
-        .get_image(None, dst.as_raw(), 2, 0, 0, 4, 4, !0)
+        .get_image_pixels_for_tests(dst.as_raw(), 2, 0, 0, 4, 4, !0)
         .expect("get_image")
         .expect("Some");
     // Every pixel should now be red (tile colour), not the blue
@@ -1211,7 +1213,7 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
     // test fixture (`KmsCore.window_id`).
     let root_xid = 1u32;
     let out = b
-        .get_image(None, root_xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(root_xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 8 * 8 * 4, "8×8 BGRA8");
@@ -1274,7 +1276,7 @@ fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
         .expect("clear_area bg_pixmap");
 
     let out = b
-        .get_image(None, xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -1369,7 +1371,7 @@ fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
     .expect("resize");
 
     let out = b
-        .get_image(None, xid, 2, 20, 20, 1, 1, !0)
+        .get_image_pixels_for_tests(xid, 2, 20, 20, 1, 1, !0)
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 4, "single BGRA8 pixel");
@@ -1438,7 +1440,7 @@ fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
     let child_xid = child.as_raw();
 
     let out = b
-        .get_image(None, child_xid, 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(child_xid, 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 16 * 16 * 4);
@@ -1562,7 +1564,7 @@ fn v2_set_redirected_target_routes_fill_to_backing() {
     // GetImage on B's xid (raw, no redirect on a Pixmap) returns
     // the green — the redirected fill landed here.
     let img_b = b
-        .get_image(None, bk_xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(bk_xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image B")
         .expect("Some B bytes");
     assert_eq!(
@@ -1575,7 +1577,7 @@ fn v2_set_redirected_target_routes_fill_to_backing() {
     // Risk 1, so it reads the same green from B — NOT the seeded
     // red on W's own storage.
     let img_w = b
-        .get_image(None, w_xid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 8, 8, !0)
         .expect("get_image W")
         .expect("Some W bytes");
     assert_eq!(
@@ -1668,7 +1670,7 @@ fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
 
     // GetImage on B directly. Stride for depth-32 is `w * 4`.
     let img = b
-        .get_image(None, bk_xid, 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(bk_xid, 2, 0, 0, 16, 16, !0)
         .expect("get_image B")
         .expect("Some bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -1913,7 +1915,7 @@ fn v2_redirect_seed_copies_window_content() {
     let bxid = backing.as_raw();
 
     let img = b
-        .get_image(None, bxid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(bxid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some bytes");
     assert_eq!(
@@ -2003,7 +2005,7 @@ fn v2_redirect_seed_copies_descendants() {
     let bxid = backing.as_raw();
 
     let img = b
-        .get_image(None, bxid, 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(bxid, 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -2151,7 +2153,7 @@ fn v2_redirect_seed_respects_overlapping_sibling_stack_order() {
         .allocate_redirected_backing(None, w_handle, 16, 16, 32)
         .expect("allocate must succeed");
     let img = b
-        .get_image(None, backing.as_raw(), 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(backing.as_raw(), 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -2288,7 +2290,7 @@ fn v2_automatic_redirect_backing_is_scene_participating() {
     // GetImage on B confirms the paint landed there (sanity — the
     // damage assertion below relies on the paint actually hitting).
     let img = b
-        .get_image(None, bxid, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(bxid, 2, 0, 0, 8, 8, !0)
         .expect("get_image B")
         .expect("Some B bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
@@ -2377,7 +2379,7 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
     b.fill_rectangle(None, bxid_pre_flip, 0xFFFF00FF, 0, 0, 8, 8)
         .expect("sentinel paint into B");
     let img_pre = b
-        .get_image(None, bxid_pre_flip, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(bxid_pre_flip, 2, 0, 0, 8, 8, !0)
         .expect("get_image pre-flip")
         .expect("Some bytes pre-flip");
     let pre_pixel: [u8; 4] = [img_pre[0], img_pre[1], img_pre[2], img_pre[3]];
@@ -2419,7 +2421,7 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 
     // Content preserved — B's (0,0) still magenta.
     let img_post = b
-        .get_image(None, bxid_pre_flip, 2, 0, 0, 8, 8, !0)
+        .get_image_pixels_for_tests(bxid_pre_flip, 2, 0, 0, 8, 8, !0)
         .expect("get_image post-flip")
         .expect("Some bytes post-flip");
     let post_pixel: [u8; 4] = [img_post[0], img_post[1], img_post[2], img_post[3]];
@@ -2509,7 +2511,7 @@ fn v2_cow_paint_appears_on_scanout() {
     // pixels — confirms the put_image actually landed on COW
     // storage (vs being dropped into the gap-logged no-op path).
     let img = b
-        .get_image(None, cow_xid, 2, 0, 0, 2, 2, !0)
+        .get_image_pixels_for_tests(cow_xid, 2, 0, 0, 2, 2, !0)
         .expect("get_image COW")
         .expect("Some COW bytes");
     assert_eq!(
@@ -2532,7 +2534,7 @@ fn v2_cow_paint_appears_on_scanout() {
     // Step 5: release drops the storage; the xid must no longer
     // resolve.
     b.release_overlay_window(None).expect("release");
-    let img_after = b.get_image(None, cow_xid, 2, 0, 0, 2, 2, !0);
+    let img_after = b.get_image_pixels_for_tests(cow_xid, 2, 0, 0, 2, 2, !0);
     assert!(
         img_after.is_err() || img_after.as_ref().unwrap().is_none(),
         "GetImage on COW xid after final release must fail or return None \
@@ -2630,7 +2632,7 @@ fn v2_render_composite_depth24_src_samples_opaque_alpha() {
     // the post-fix invariant. Pre-fix, α would be 0x00 (the src
     // padding byte).
     let out = b
-        .get_image(None, dst_xid, 2, 0, 0, 4, 4, !0)
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
         .expect("get_image dst")
         .expect("Some(dst bytes)");
     assert_eq!(out.len(), 4 * 4 * 4, "4×4 BGRA8 readback");

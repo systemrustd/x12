@@ -174,6 +174,31 @@ pub struct KmsBackendV2 {
 }
 
 impl KmsBackendV2 {
+    /// Test-only entry point: drives the production `get_image` path
+    /// but returns just the pixel bytes (header stripped). Acceptance
+    /// tests use this so they can index into the result starting at
+    /// pixel 0 without each one having to remember the 32-byte X11
+    /// reply prefix.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_image_pixels_for_tests(
+        &mut self,
+        host_xid: u32,
+        format: u8,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        plane_mask: u32,
+    ) -> io::Result<Option<Vec<u8>>> {
+        use yserver_core::backend::Backend;
+        let reply = self.get_image(None, host_xid, format, x, y, width, height, plane_mask)?;
+        Ok(reply.map(|r| {
+            assert!(r.len() >= 32, "v2 GetImage reply missing 32-byte header");
+            r[32..].to_vec()
+        }))
+    }
+
     fn alloc_window_stack_rank(&mut self) -> u64 {
         let rank = self.next_window_stack_rank;
         self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
@@ -2512,6 +2537,30 @@ fn default_cursor_sprite_bgra() -> Vec<u8> {
 /// Resolve the drawable depth for a new subwindow. `CopyFromParent`
 /// inherits the parent window's depth; only the root / untracked
 /// fallback defaults to 24.
+/// Wrap raw GetImage pixel bytes into a full X11 GetImage reply
+/// (32-byte header + pixels). `sequence` and `visual` are patched in
+/// by the handler (`process_request.rs:handle_get_image`); this
+/// helper fills the rest. Mirrors v1's
+/// `KmsBackend::get_image` (kms/backend.rs:10400-10420) byte-for-byte
+/// so the handler's expectations carry across both backends.
+fn wrap_get_image_reply(depth: u8, pixel_bytes: Vec<u8>) -> Vec<u8> {
+    let pixel_len = pixel_bytes.len();
+    let mut out = Vec::with_capacity(32 + pixel_len);
+    out.push(1); // [0]: Reply indicator
+    out.push(depth); // [1]: depth
+    out.extend_from_slice(&[0u8; 2]); // [2..4]: sequence (patched by handler)
+    // [4..8]: reply length in u32 units. Rows are already
+    // 4-byte aligned for the depths we support (1/8/24/32 — see
+    // `pack_from_storage`), so this is `pixel_len / 4`.
+    let reply_length_units = u32::try_from(pixel_len / 4).unwrap_or(u32::MAX);
+    out.extend_from_slice(&reply_length_units.to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]); // [8..12]: visual (patched by handler)
+    out.extend_from_slice(&[0u8; 20]); // [12..32]: padding
+    debug_assert_eq!(out.len(), 32);
+    out.extend_from_slice(&pixel_bytes);
+    out
+}
+
 fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8 {
     match visual {
         HostSubwindowVisual::CopyFromParent => parent_depth.unwrap_or(24),
@@ -4238,11 +4287,21 @@ impl Backend for KmsBackendV2 {
             .engine
             .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
         {
-            Ok(bytes) => {
+            Ok(pixel_bytes) => {
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 self.telemetry.record_one_shot_submit();
                 self.telemetry.record_fence_wait(ns);
-                Ok(Some(bytes))
+                // X11 GetImage reply: 32-byte header + pixel rows.
+                // The handler in `process_request.rs:handle_get_image`
+                // patches `sequence` at [2..4] and `visual` at [8..12];
+                // the rest of the header (depth, reply length in u32
+                // units, padding) is the backend's job. Mirrors v1's
+                // `KmsBackend::get_image` (kms/backend.rs:10400) — when
+                // this returns just the pixel slice (no header), the
+                // handler corrupts the first 32 bytes by writing into
+                // them, and clients reading depth/length/sequence from
+                // the wire see garbage.
+                Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
             }
             Err(e) => {
                 log::warn!("v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",);
