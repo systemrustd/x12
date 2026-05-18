@@ -587,6 +587,7 @@ pub fn run_core(
                                 backend.on_page_flip_ready(state);
                             }
                             Message::DumpScanout => backend.dump_scanout(),
+                            Message::DumpDrawables => backend.dump_drawables(),
                         }
                     }
                 }

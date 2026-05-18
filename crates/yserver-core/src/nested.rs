@@ -524,7 +524,7 @@ fn subtract_rect(a: x11xfixes::RegionRect, b: x11xfixes::RegionRect) -> Vec<x11x
 /// for the body, then Subtract 6 small rects from the corners; the prior
 /// implementation collapsed the result to either the unchanged input or
 /// the empty set, which made the host see no shape at all.
-fn subtract_regions(
+pub(crate) fn subtract_regions(
     current: &[x11xfixes::RegionRect],
     source: &[x11xfixes::RegionRect],
 ) -> Vec<x11xfixes::RegionRect> {

@@ -60,6 +60,14 @@ pub enum Message {
     /// buffer to a file in cwd for offline inspection. Diagnostic-only;
     /// no-op for backends that don't drive their own composite.
     DumpScanout,
+    /// SIGUSR2 received — the backend should dump the storage content
+    /// of every "interesting" drawable (root, COW, every redirected
+    /// backing) to files in cwd. Splits the Stage 4d "shadow only"
+    /// hover-flicker bug into "is B empty / is B correct but COW
+    /// wrong / is B+COW correct but scanout stale" — without storage
+    /// dumps the three are indistinguishable from the scanout alone.
+    /// Diagnostic-only; no-op for backends that don't redirect.
+    DumpDrawables,
 }
 
 #[derive(Debug)]

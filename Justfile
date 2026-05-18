@@ -552,7 +552,7 @@ yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace":
         echo "yserver log: yserver-hw.log";\
         echo "xfce log:    xfce.log"'
 
-yserver-mate-hw log="debug,yserver::kms::v2::scene=trace":
+yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\
@@ -626,11 +626,11 @@ thunar-xorg-trace real="$DISPLAY":
 # but launches mate-session and dumps to `mate.xtrace`. Use to
 # diff Caja's wheel-handling code path before and after the
 # stateful view-switch "fix".
-yserver-mate-hw-trace log="debug":
+yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o mate.xtrace &\
@@ -641,7 +641,7 @@ yserver-mate-hw-trace log="debug":
             dbus-run-session mate-session --display :8 > mate.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
+        echo "yserver log: yserver-hw-mate.log";\
         echo "x11trace:    mate.xtrace";\
         echo "mate log:    mate.log"'
 

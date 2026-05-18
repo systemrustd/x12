@@ -255,6 +255,14 @@ pub fn run() -> io::Result<()> {
                             // Stay alive — SIGUSR1 isn't fatal.
                             continue;
                         }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, dumping drawables");
+                            if signal_sender.send(Message::DumpDrawables).is_err() {
+                                return;
+                            }
+                            // Stay alive — SIGUSR2 isn't fatal.
+                            continue;
+                        }
                         log::info!("yserver: received signal {signo}, requesting shutdown");
                         let _ = signal_sender.send(Message::Shutdown);
                         return;
@@ -320,6 +328,9 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     // SIGUSR1 → diagnostic scanout dump. Blocked so signalfd consumes
     // it instead of the default-action (which would terminate us).
     mask.add(Signal::SIGUSR1);
+    // SIGUSR2 → diagnostic drawable-storage dump (root + COW + every
+    // redirected backing). Same blocking rationale as SIGUSR1.
+    mask.add(Signal::SIGUSR2);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))

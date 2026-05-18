@@ -159,6 +159,25 @@ pub struct KmsBackendV2 {
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 
+    /// Test-only counter: bumps every time
+    /// `clear_window_area_with_background` is entered. Used by the
+    /// `cwa_on_redirected_window_does_not_clear_backing` regression
+    /// test to verify the Stage 4d CWA-clear-skip behavior without
+    /// needing a Vk-backed fixture or scanout-readback. Always
+    /// present (not `cfg(test)`) so the increment is a single
+    /// branchless line; production paths don't observe it.
+    pub(crate) clear_window_area_calls: u32,
+
+    /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
+    /// targeted at COW. Captured via `note_present_pixmap` and
+    /// consumed by `do_dump_drawables_v2` so the per-drawable
+    /// dump includes "marco's most-recent offscreen" — the
+    /// pixmap whose content marco PresentPixmap'd to COW most
+    /// recently. Ring capacity 16 to keep memory trivial while
+    /// covering marco's typical double-buffered front/back pair
+    /// plus head-room for short flips of additional sources.
+    pub(crate) present_to_cow_sources: std::collections::VecDeque<u32>,
+
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
     /// futex) for idle/sync fences; the mmap'd mapping lets us
@@ -217,6 +236,7 @@ impl KmsBackendV2 {
     ) -> io::Result<()> {
         use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
 
+        self.clear_window_area_calls = self.clear_window_area_calls.wrapping_add(1);
         self.clear_clip_rectangles(None)?;
         let Some(dst_target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
@@ -356,6 +376,8 @@ impl KmsBackendV2 {
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             cow_id: None,
+            clear_window_area_calls: 0,
+            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
         };
@@ -568,6 +590,8 @@ impl KmsBackendV2 {
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             cow_id: None,
+            clear_window_area_calls: 0,
+            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
         }
@@ -647,14 +671,34 @@ impl KmsBackendV2 {
     /// Stage 5 if profiling shows it.
     pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
         let leaf_id = self.store.lookup(host_xid)?;
-        // Pixmaps aren't in `windows_v2` and can't themselves be
-        // redirect targets per Composite spec. Root is a window
-        // but also isn't tracked in `windows_v2` (parent = None,
-        // geometry implicit) — it CAN legitimately carry a
-        // redirected_target if a compositor redirects root itself.
-        // Check the leaf's own redirect on the short-circuit so
-        // root-redirect resolves correctly; for true pixmaps the
-        // store's accessor returns None anyway.
+        let result = self.resolve_paint_target_inner(host_xid, leaf_id);
+        // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
+        // investigation). Only fires when the resolve returned the
+        // LEAF id (no redirect found in the ancestor chain) for a
+        // *window* xid. That's the "paint to a window that didn't
+        // route via a redirected ancestor" case — exactly what we
+        // need to see if marco's CC client paints stop routing to B
+        // after a drag. Pixmaps and root paints don't trip this gate
+        // (root has no `windows_v2` entry), so volume stays bounded
+        // to window paints that ought to have hit a redirect.
+        if log::log_enabled!(target: "yserver::kms::v2::paint", log::Level::Trace)
+            && let Some(t) = result.as_ref()
+            && t.id == leaf_id
+            && self.windows_v2.contains_key(&host_xid)
+        {
+            log::trace!(
+                target: "yserver::kms::v2::paint",
+                "resolve_paint_target NO_REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?}",
+            );
+        }
+        result
+    }
+
+    fn resolve_paint_target_inner(
+        &self,
+        host_xid: u32,
+        leaf_id: super::store::DrawableId,
+    ) -> Option<PaintTarget> {
         if !self.windows_v2.contains_key(&host_xid) {
             if let Some(b_id) = self.store.redirected_target(leaf_id) {
                 return Some(PaintTarget {
@@ -807,6 +851,12 @@ impl KmsBackendV2 {
         w_id: crate::kms::v2::store::DrawableId,
         b_id: crate::kms::v2::store::DrawableId,
     ) {
+        // Diagnostic trace (TEMP) — seed entry. Cross-correlate
+        // with `allocate_redirected_backing fresh ...` and the
+        // "B is all-black" dump: a seed that copies an empty W
+        // (= W's storage is its default init color) leaves B
+        // in its default state, which is exactly the symptom.
+        log::debug!("v2 seed_backing_from_window W=0x{w_xid:x} w_id={w_id:?} b_id={b_id:?}");
         // 1. W itself at (0, 0).
         let w_extent = self
             .store
@@ -2374,6 +2424,346 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
     }
 }
 
+/// Look up the X11 RENDER `PICTFORMAT` ID a picture was created
+/// with. Returns `0` for the synthetic / missing cases (picture
+/// xid is 0 = "no picture," non-Drawable variant, or the xid
+/// isn't recorded). Used by the diagnostic `render_composite`
+/// trace to show marco's declared sampling intent alongside the
+/// drawable-depth-derived sampling shape v2 currently uses.
+fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u32) -> u32 {
+    if host_pic == 0 {
+        return 0;
+    }
+    match core.pictures.get(&host_pic) {
+        Some(crate::kms::core::PictureRecord::Drawable { pict_format, .. }) => *pict_format,
+        _ => 0,
+    }
+}
+
+/// Describe a `ResolvedSource` for the diagnostic
+/// `render_composite` trace. Returns `(kind_name, depth)` —
+/// depth is `0` for non-Drawable sources where the concept
+/// doesn't apply. Used only from the trace path; not on hot
+/// paint paths.
+fn describe_resolved_source(
+    store: &super::store::DrawableStore,
+    src: &crate::kms::v2::engine::ResolvedSource,
+) -> (&'static str, u8) {
+    use crate::kms::v2::engine::ResolvedSource;
+    match src {
+        ResolvedSource::Drawable(id) => {
+            let depth = store.get(*id).map_or(0, |d| d.depth);
+            ("drawable", depth)
+        }
+        ResolvedSource::Solid(_) => ("solid", 0),
+        ResolvedSource::Gradient(_) => ("gradient", 0),
+        ResolvedSource::None => ("none", 0),
+    }
+}
+
+/// Per-drawable storage dump triggered by SIGUSR2 (or
+/// `Ctrl-Alt-F12` via the input thread, mirroring
+/// `Ctrl-Alt-Enter` for scanout). Walks a fixed-known set of
+/// "interesting" drawables — root, COW, every redirected backing —
+/// and writes each storage's content to a `yserver-v2-drawable-…`
+/// file in cwd. Each dump cycle increments a global counter so
+/// repeated invocations don't clobber.
+///
+/// Filename layout:
+///
+/// ```text
+/// yserver-v2-drawable-{run}-root-{w}x{h}.ppm
+/// yserver-v2-drawable-{run}-cow-{w}x{h}.ppm
+/// yserver-v2-drawable-{run}-backing-W0x{w_xid}-B0x{b_xid}-{w}x{h}.ppm
+/// ```
+///
+/// PPM (P6, RGB) is chosen for universal viewer support; the α
+/// channel is *intentionally dropped* — the depth-24 padding-byte
+/// question is settled separately (4d.6 + the sample-view fix) and
+/// what we want to see here is whether `B` contains the window's
+/// painted content at all. If a deeper α audit becomes useful later,
+/// switching to PAM (P7 with TUPLTYPE=RGB_ALPHA) is a one-liner.
+///
+/// Reuses `RenderEngine::get_image` for the per-drawable readback so
+/// staging-buffer allocation, layout transitions, fence sync, and
+/// the BGRA8 → wire-byte pack all flow through the existing,
+/// production-tested path. Each dump is one queue submit + one
+/// fence wait, so the total stop-the-world time is `O(n)` Vk waits
+/// — at ~5 ms per drawable on bee this is fine for diagnostic use.
+fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+    let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Snapshot targets BEFORE touching the engine — `engine.get_image`
+    // takes `&mut store + &mut platform`, so we can't hold any
+    // shared borrow on `store` while iterating. Each tuple carries
+    // everything the per-drawable loop needs: a human-readable label
+    // for the filename, the DrawableId for the read, the depth (drives
+    // wire-byte unpack), and the extent (drives the read rect + the
+    // PPM header).
+    #[derive(Debug)]
+    struct DumpTarget {
+        label: String,
+        id: super::store::DrawableId,
+        depth: u8,
+        width: u32,
+        height: u32,
+    }
+    let mut targets: Vec<DumpTarget> = Vec::new();
+    {
+        // Scoped read-borrow on the store + core. The borrow ends
+        // at the `}` so the mutable borrows below are free to fire.
+        if let Some(root_id) = backend.store.lookup(backend.core.window_id)
+            && let Some(d) = backend.store.get(root_id)
+        {
+            targets.push(DumpTarget {
+                label: format!("root-0x{:x}", backend.core.window_id),
+                id: root_id,
+                depth: d.depth,
+                width: d.storage.extent.width,
+                height: d.storage.extent.height,
+            });
+        }
+        if let Some(cow_id) = backend.cow_id
+            && let Some(d) = backend.store.get(cow_id)
+        {
+            targets.push(DumpTarget {
+                label: format!(
+                    "cow-0x{:x}",
+                    yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0
+                ),
+                id: cow_id,
+                depth: d.depth,
+                width: d.storage.extent.width,
+                height: d.storage.extent.height,
+            });
+        }
+        // Sorted iteration so re-running the dump gives the same
+        // filename ordering — keeps diff-tooling stable across runs.
+        let mut pairs: Vec<(u32, u32)> = backend
+            .core
+            .host_window_to_backing
+            .iter()
+            .map(|(&w, b)| (w, b.as_raw()))
+            .collect();
+        pairs.sort_by_key(|(w, _)| *w);
+        for (w_xid, b_xid) in pairs {
+            let Some(b_id) = backend.store.lookup(b_xid) else {
+                continue;
+            };
+            let Some(d) = backend.store.get(b_id) else {
+                continue;
+            };
+            targets.push(DumpTarget {
+                label: format!("backing-W0x{w_xid:x}-B0x{b_xid:x}"),
+                id: b_id,
+                depth: d.depth,
+                width: d.storage.extent.width,
+                height: d.storage.extent.height,
+            });
+        }
+        // Recent COW-targeted PresentPixmap sources — the bisect
+        // dump for "is marco's offscreen broken, or only the
+        // copy-to-COW step?" Walk in submission order (oldest
+        // first); dedup against drawables already in the target
+        // list so we don't double-dump if marco's offscreen
+        // happens to coincide with a registered backing.
+        let already: std::collections::HashSet<super::store::DrawableId> =
+            targets.iter().map(|t| t.id).collect();
+        for (idx, &src_xid) in backend.present_to_cow_sources.iter().enumerate() {
+            let Some(src_id) = backend.store.lookup(src_xid) else {
+                continue;
+            };
+            if already.contains(&src_id) {
+                continue;
+            }
+            let Some(d) = backend.store.get(src_id) else {
+                continue;
+            };
+            targets.push(DumpTarget {
+                label: format!("present-src-{idx}-0x{src_xid:x}"),
+                id: src_id,
+                depth: d.depth,
+                width: d.storage.extent.width,
+                height: d.storage.extent.height,
+            });
+        }
+    }
+
+    if targets.is_empty() {
+        return Err(io::Error::other("no drawable dump targets available"));
+    }
+    log::info!(
+        "v2 do_dump_drawables: run={run} target_count={}",
+        targets.len(),
+    );
+
+    let mut wrote = 0_u32;
+    let mut last_err: Option<io::Error> = None;
+    for t in targets {
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent: ash::vk::Extent2D {
+                width: t.width,
+                height: t.height,
+            },
+        };
+        let bytes = match backend.engine.get_image(
+            &mut backend.store,
+            &mut backend.platform,
+            t.id,
+            rect,
+            t.depth,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                let err = io::Error::other(format!("get_image {} ({:?}): {e:?}", t.label, t.id));
+                log::warn!("v2 do_dump_drawables: {err}");
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let path = format!(
+            "./yserver-v2-drawable-{run}-{label}-{w}x{h}.ppm",
+            label = t.label,
+            w = t.width,
+            h = t.height
+        );
+        if let Err(e) = write_drawable_ppm(&path, &bytes, t.width, t.height, t.depth) {
+            log::warn!("v2 do_dump_drawables: write {path}: {e}");
+            last_err = Some(e);
+            continue;
+        }
+        log::info!(
+            "v2 do_dump_drawables: wrote {path} (depth={} bytes={})",
+            t.depth,
+            bytes.len(),
+        );
+        wrote += 1;
+    }
+    if wrote > 0 {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| io::Error::other("no drawables dumped")))
+    }
+}
+
+/// Write a single drawable's storage content as PAM (P7,
+/// `RGB_ALPHA`) for depth-24 / depth-32 BGRA8 drawables (preserves
+/// the α byte so a later analysis can see whether stored α is zero
+/// / one / noise — the Stage 4d "shadow only" diagnosis needs to
+/// distinguish "RGB looks right but α is zero" from "RGB itself is
+/// broken"), or PGM (P5, gray) for depth-1 / depth-8 R8 drawables.
+/// PAM is Netpbm's anymap format; ImageMagick / GIMP / most viewers
+/// handle it transparently and dispatch on the magic number, not
+/// the file extension.
+///
+/// `bytes` is the wire-packed buffer returned by
+/// `RenderEngine::get_image`:
+/// - depth 24/32: 4 bytes/pixel, X11 wire order (B, G, R, X|A) per
+///   `pack_from_storage`'s BGRA8 → wire mapping.
+/// - depth 8:     1 byte/pixel, R-channel.
+/// - depth 1:     bit-packed MSB-first (rendered as PGM after
+///   bit-expand, mostly for completeness — no real consumer of the
+///   v2 dump runs depth-1 backings).
+fn write_drawable_ppm(
+    path: &str,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    depth: u8,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    let w = usize::try_from(width).map_err(|e| io::Error::other(format!("width: {e}")))?;
+    let h = usize::try_from(height).map_err(|e| io::Error::other(format!("height: {e}")))?;
+    let mut file = std::fs::File::create(path)?;
+    match depth {
+        24 | 32 => {
+            // BGRA8 wire → PAM RGBA. Reorder per pixel: src is
+            // (B, G, R, X|A) in storage byte order; PAM tuples
+            // emit (R, G, B, A).
+            let expected = w
+                .checked_mul(h)
+                .and_then(|p| p.checked_mul(4))
+                .ok_or_else(|| io::Error::other("size overflow"))?;
+            if bytes.len() < expected {
+                return Err(io::Error::other(format!(
+                    "byte buffer too small: have {} need {}",
+                    bytes.len(),
+                    expected,
+                )));
+            }
+            file.write_all(
+                format!(
+                    "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
+                )
+                .as_bytes(),
+            )?;
+            let mut row = vec![0u8; w * 4];
+            for y in 0..h {
+                for x in 0..w {
+                    let src = (y * w + x) * 4;
+                    let dst = x * 4;
+                    row[dst] = bytes[src + 2]; // R
+                    row[dst + 1] = bytes[src + 1]; // G
+                    row[dst + 2] = bytes[src]; // B
+                    row[dst + 3] = bytes[src + 3]; // A
+                }
+                file.write_all(&row)?;
+            }
+        }
+        8 => {
+            let expected = w
+                .checked_mul(h)
+                .ok_or_else(|| io::Error::other("size overflow"))?;
+            if bytes.len() < expected {
+                return Err(io::Error::other(format!(
+                    "byte buffer too small: have {} need {}",
+                    bytes.len(),
+                    expected,
+                )));
+            }
+            file.write_all(format!("P5\n{width} {height}\n255\n").as_bytes())?;
+            file.write_all(&bytes[..expected])?;
+        }
+        1 => {
+            // Bit-packed MSB-first, padded to byte boundaries per
+            // X11 wire spec for ZPixmap depth-1. Expand to PGM
+            // bytes so a viewer can render the mask.
+            let row_bytes = w.div_ceil(8);
+            let expected = row_bytes
+                .checked_mul(h)
+                .ok_or_else(|| io::Error::other("size overflow"))?;
+            if bytes.len() < expected {
+                return Err(io::Error::other(format!(
+                    "byte buffer too small: have {} need {}",
+                    bytes.len(),
+                    expected,
+                )));
+            }
+            file.write_all(format!("P5\n{width} {height}\n255\n").as_bytes())?;
+            let mut out = vec![0u8; w];
+            for y in 0..h {
+                for x in 0..w {
+                    let byte = bytes[y * row_bytes + (x / 8)];
+                    let bit = byte >> (7 - (x % 8)) & 1;
+                    out[x] = if bit == 1 { 255 } else { 0 };
+                }
+                file.write_all(&out)?;
+            }
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported depth {other} for drawable dump",
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Map a host-visual descriptor to a depth for the storage
 /// allocator. Stage 2d picks BGRA32 for `CopyFromParent` (the
 /// default visual is depth-24 ARGB-equivalent in our advertised
@@ -2762,6 +3152,35 @@ impl Backend for KmsBackendV2 {
         }
     }
 
+    fn dump_drawables(&mut self) {
+        if let Err(e) = do_dump_drawables_v2(self) {
+            log::warn!("v2 dump_drawables: {e}");
+        }
+    }
+
+    fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
+        // Capture COW-targeted presents only — that's the bisect
+        // point of interest for the Stage 4d "shadow only" bug.
+        // Other present targets (toplevel windows in DRI3 / GL
+        // composite flows) aren't useful for the dump set.
+        if dst_window_xid != yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0 {
+            return;
+        }
+        const CAP: usize = 16;
+        // Deduplicate consecutive same-xid presents (marco
+        // double-buffers two offscreens so the ring otherwise
+        // alternates between two values; keeping only fresh xids
+        // means a dump of size N captures up to N *distinct*
+        // recent sources).
+        if self.present_to_cow_sources.back() == Some(&src_pixmap_xid) {
+            return;
+        }
+        if self.present_to_cow_sources.len() == CAP {
+            self.present_to_cow_sources.pop_front();
+        }
+        self.present_to_cow_sources.push_back(src_pixmap_xid);
+    }
+
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // DRM fd for page-flip events; libinput fd if the input
         // context is still owned by us. Delegates to
@@ -3087,16 +3506,34 @@ impl Backend for KmsBackendV2 {
             let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
                 return Ok(());
             };
-            let bg_pixel = geom.bg_pixel.unwrap_or(0);
-            self.clear_window_area_with_background(
-                host_xid,
-                bg_pixel,
-                geom.bg_pixmap,
-                0,
-                0,
-                geom.width.max(1),
-                geom.height.max(1),
-            )?;
+            // Stage 4d fix — skip the eager CWA-time clear when W is
+            // under COMPOSITE redirect. The backing's content belongs
+            // to the redirected client / external compositor, not the
+            // server; routing a fill through `resolve_paint_target`
+            // here would land on B and wipe the compositor's pixels
+            // (the marco-with-compositing "CC turns opaque black on
+            // drag" bug — marco re-asserts bg_pixmap=None on every
+            // drag-induced configure). Real X11 doesn't redraw on
+            // CWA either — the bg attribute only affects future
+            // ClearArea / Expose handling. v2's eager clear was a
+            // Stage 3f.6 over-reach.
+            let is_redirected = self
+                .store
+                .lookup(host_xid)
+                .and_then(|id| self.store.redirected_target(id))
+                .is_some();
+            if !is_redirected {
+                let bg_pixel = geom.bg_pixel.unwrap_or(0);
+                self.clear_window_area_with_background(
+                    host_xid,
+                    bg_pixel,
+                    geom.bg_pixmap,
+                    0,
+                    0,
+                    geom.width.max(1),
+                    geom.height.max(1),
+                )?;
+            }
         }
         Ok(())
     }
@@ -3323,6 +3760,16 @@ impl Backend for KmsBackendV2 {
             .get(&host_window.as_raw())
             .copied()
         {
+            // Diagnostic trace (TEMP) — idempotent re-allocate.
+            // Important to know because callers may *expect* a
+            // fresh backing (and a re-seed) but get the existing
+            // one. Stage 4d.5 `rotate_redirected_backing_on_resize`
+            // works around this by release-then-allocate.
+            log::debug!(
+                "v2 allocate_redirected_backing W=0x{w:x}: idempotent return existing B=0x{b:x} ({width}x{height}, depth={depth})",
+                w = host_window.as_raw(),
+                b = existing.as_raw(),
+            );
             return Ok(existing);
         }
         let w_xid = host_window.as_raw();
@@ -3331,6 +3778,14 @@ impl Backend for KmsBackendV2 {
         // `create_pixmap` path (3f.10 pool + 3f.14 zero-fill).
         let backing = self.create_pixmap(origin, depth, width, height)?;
         let backing_xid = backing.as_raw();
+        // Diagnostic trace (TEMP) — fresh allocation. Cross-correlate
+        // against `set_redirected_target` and the "B is all-black"
+        // dump to see whether a fresh-allocated B explains a black
+        // backing (no client paint since the alloc) vs an
+        // unexpectedly-reset existing backing.
+        log::debug!(
+            "v2 allocate_redirected_backing W=0x{w_xid:x}: fresh B=0x{backing_xid:x} ({width}x{height}, depth={depth})",
+        );
 
         // Seed-copy: W → B (and every descendant of W into B at
         // its position relative to W), BEFORE the route flip.
@@ -4969,7 +5424,7 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
         host_drawable: AnyHandle,
-        _ynest_format: u32,
+        ynest_format: u32,
         value_mask: u32,
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
@@ -4981,9 +5436,23 @@ impl Backend for KmsBackendV2 {
         // the value-mask body.
         let drawable_xid = host_drawable.as_raw();
         let picture_xid = self.core.next_host_xid();
-        self.core
-            .pictures
-            .insert(picture_xid, PictureRecord::drawable_default(drawable_xid));
+        // Diagnostic trace (TEMP — Stage 4d "shadow only"
+        // investigation). v2's PictureRecord doesn't store the
+        // requested PictFormat; capturing it here so a downstream
+        // analysis can see which format marco asked for when
+        // wrapping a redirected backing's alias. Enable with
+        // `RUST_LOG=yserver::kms::v2::render=trace`.
+        log::trace!(
+            target: "yserver::kms::v2::render",
+            "render_create_picture pic=0x{picture_xid:x} drawable=0x{drawable_xid:x} \
+             ynest_format=0x{ynest_format:x} value_mask=0x{value_mask:x} \
+             value_bytes={n}",
+            n = values.len(),
+        );
+        self.core.pictures.insert(
+            picture_xid,
+            PictureRecord::drawable_default(drawable_xid, ynest_format),
+        );
         if let Some(id) = self.store.lookup(drawable_xid) {
             self.store.incref(id);
         }
@@ -5005,7 +5474,41 @@ impl Backend for KmsBackendV2 {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
+        // Diagnostic trace (TEMP — Stage 4d "shadow only"
+        // investigation). Body shape: picture(4) + value_mask(4) +
+        // values. We log the mask bits + post-call clip state so a
+        // grep across the log can see whether CPClipMask=None
+        // cleared the dst picture's clip between marco's last
+        // SetPictureClipRectangles and the next render_composite.
+        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace)
+            && body.len() >= 8
+        {
+            let mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            log::trace!(
+                target: "yserver::kms::v2::render",
+                "render_change_picture pic=0x{host_pic:x} mask=0x{mask:x} body_len={}",
+                body.len(),
+            );
+        }
         change_picture_apply_mask(&mut self.core, host_pic, body);
+        // After applying — log clip state if pic is a Drawable.
+        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace)
+            && let Some(PictureRecord::Drawable {
+                clip,
+                clip_x,
+                clip_y,
+                ..
+            }) = self.core.pictures.get(&host_pic)
+        {
+            log::trace!(
+                target: "yserver::kms::v2::render",
+                "render_change_picture post pic=0x{host_pic:x} clip={} clip_origin=({clip_x},{clip_y})",
+                match clip {
+                    None => "None".to_string(),
+                    Some(rects) => format!("Some(n={})", rects.len()),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -5162,6 +5665,70 @@ impl Backend for KmsBackendV2 {
             width: u32::from(width),
             height: u32::from(height),
         };
+        // Diagnostic trace (TEMP — Stage 4d "shadow only"
+        // investigation). Enable with
+        // `RUST_LOG=yserver::kms::v2::render=trace`.
+        // Logs every render_composite at the backend boundary
+        // with resolved source/mask/dst kinds + depths, the dst
+        // drawable id (to bisect "marco's compose onto its own
+        // offscreen" vs "compose onto a redirected backing"), the
+        // composite op, coords, repeat / transform / component-
+        // alpha state, and (after the engine call) the engine
+        // stats (recorded_draws, used_src_alias_scratch,
+        // used_dst_readback). Removed once we land or rule out
+        // the next RENDER-side fix.
+        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace) {
+            let (src_kind, src_depth) = describe_resolved_source(&self.store, &src_resolved);
+            let (mask_kind, mask_depth) = describe_resolved_source(&self.store, &mask_resolved);
+            let dst_depth = self.store.get(dst_target.id).map_or(0, |d| d.depth);
+            // Picture-format IDs as declared at CreatePicture —
+            // captures marco's sampling intent which can differ
+            // from the drawable's depth-derived format.
+            let src_pict_format = picture_pict_format(&self.core, host_src);
+            let mask_pict_format = picture_pict_format(&self.core, host_mask);
+            let dst_pict_format = picture_pict_format(&self.core, host_dst);
+            // Format the clip rect list compactly. The clip rect
+            // *detail* is the load-bearing diagnostic for the
+            // Stage 4d "wallpaper overwrites window content" bug —
+            // marco relies on the wallpaper-fill composite's clip
+            // excluding the window regions, and we need to see
+            // what's actually in those rects, not just the count.
+            // None = "no clip set, paint everywhere" (the X11 default).
+            // Some(empty vec) = "empty clip region, paint nothing"
+            // (per X11 RENDER spec, post the empty-clip fix). Emit
+            // distinct markers so a grep can distinguish the two
+            // — they have opposite effects but used to look the
+            // same in this trace.
+            let clip_dump = match dst_clip.as_deref() {
+                None => "<None>".to_string(),
+                Some([]) => "<empty>".to_string(),
+                Some(rects) => {
+                    use std::fmt::Write as _;
+                    let mut s = String::from("[");
+                    for (i, r) in rects.iter().enumerate() {
+                        if i > 0 {
+                            s.push(' ');
+                        }
+                        let _ = write!(s, "({},{} {}x{})", r.x, r.y, r.width, r.height);
+                    }
+                    s.push(']');
+                    s
+                }
+            };
+            log::trace!(
+                target: "yserver::kms::v2::render",
+                "render_composite op={op} src=0x{host_src:x}({src_kind},d={src_depth},fmt=0x{src_pict_format:x},repeat={src_repeat:?},xform={src_xform}) \
+                 mask=0x{host_mask:x}({mask_kind},d={mask_depth},fmt=0x{mask_pict_format:x},repeat={mask_repeat:?},xform={mask_xform},ca={mask_component_alpha}) \
+                 dst=0x{host_dst:x}->id={dst_id:?},d={dst_depth},fmt=0x{dst_pict_format:x} \
+                 src_xy=({src_x},{src_y}) mask_xy=({mask_x},{mask_y}) dst_xy=({dst_x},{dst_y})+off=({off_x},{off_y}) {width}x{height} \
+                 clip{clip_dump}",
+                src_xform = src_transform.is_some(),
+                mask_xform = mask_transform.is_some(),
+                dst_id = dst_target.id,
+                off_x = dst_target.offset.0,
+                off_y = dst_target.offset.1,
+            );
+        }
         let stats = self.engine.render_composite(
             &mut self.store,
             &mut self.platform,
@@ -5177,15 +5744,26 @@ impl Backend for KmsBackendV2 {
             mask_transform,
             mask_component_alpha,
         );
-        if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
+        match &stats {
+            Ok(s) => {
+                if s.recorded_draws > 0 {
+                    self.telemetry.record_paint_submit();
+                }
+                if s.used_dst_readback {
+                    self.telemetry.record_disjoint_readback();
+                }
+                log::trace!(
+                    target: "yserver::kms::v2::render",
+                    "render_composite stats dst=0x{host_dst:x} \
+                     recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
+                    s.recorded_draws,
+                    s.used_src_alias_scratch,
+                    s.used_dst_readback,
+                );
             }
-            if s.used_dst_readback {
-                self.telemetry.record_disjoint_readback();
+            Err(e) => {
+                log::warn!("v2 render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
             }
-        } else if let Err(e) = stats {
-            log::warn!("v2 render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
         }
         Ok(())
     }
@@ -6109,7 +6687,41 @@ impl Backend for KmsBackendV2 {
             ..
         }) = self.core.pictures.get_mut(&host_pic)
         {
-            *clip = if rects.is_empty() { None } else { Some(rects) };
+            // Diagnostic trace (TEMP — Stage 4d "shadow only"
+            // investigation). Logs marco's incoming clip rect
+            // list at SetPictureClipRectangles time, post-origin
+            // shift. Compare against the per-call clip dump in
+            // the render_composite trace to verify v2 carries
+            // marco's clip through unchanged.
+            if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace) {
+                use std::fmt::Write as _;
+                let mut s = String::new();
+                for (i, r) in rects.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    let _ = write!(s, "({},{} {}x{})", r.x, r.y, r.width, r.height);
+                }
+                log::trace!(
+                    target: "yserver::kms::v2::render",
+                    "set_picture_clip_rectangles pic=0x{host_pic:x} origin=({x_origin},{y_origin}) n={n} rects[{s}]",
+                    n = rects.len(),
+                );
+            }
+            // X11 RENDER spec semantics:
+            //   - `SetPictureClipRectangles` with EMPTY rect list =
+            //     empty clip region = composites paint **nothing**.
+            //   - `ChangePicture(CPClipMask = None)` clears the clip
+            //     back to "no clip" = paint **everywhere** (`clip = None`).
+            // The previous implementation collapsed both to None;
+            // that broke marco-with-compositing because marco uses
+            // the empty-list form between frames as a "stop
+            // painting until I set a real clip again" gate. With
+            // the buggy collapse, the wallpaper-fill composite
+            // that should have been clipped to nothing painted
+            // everywhere and overwrote the just-drawn window
+            // contents — the Stage 4d "shadow only" symptom.
+            *clip = Some(rects);
             // The X RENDER protocol carries clip-origin once per
             // SetPictureClipRectangles; we fold it into the stored
             // rects (above) but also keep clip_x/clip_y so a
@@ -6986,6 +7598,7 @@ mod tests {
         match rec {
             PictureRecord::Drawable {
                 host_xid,
+                pict_format: _,
                 clip,
                 clip_x,
                 clip_y,
@@ -7331,6 +7944,84 @@ mod tests {
         b.render_free_picture(None, pic_xid).expect("free");
         assert!(!b.core.pictures.contains_key(&pic_xid));
         assert_eq!(b.engine.picture_paint_len(), 0);
+    }
+
+    /// X11 RENDER `SetPictureClipRectangles` with an EMPTY rect
+    /// list = empty clip region = composite paints **nothing**.
+    /// Distinct from `ChangePicture(CPClipMask = None)` which
+    /// clears the clip back to "paint everywhere" (`clip = None`).
+    ///
+    /// Regression: pre-fix v2 collapsed empty-list to `clip = None`,
+    /// which made subsequent composites paint everywhere — exactly
+    /// the mate-with-compositing "shadow only / wallpaper
+    /// overwrites window content" bug observed in the Stage 4d
+    /// smoke. The trace at 09:49:44 showed marco's wallpaper-fill
+    /// composite running with `clip[]` (= `None` in v2 storage)
+    /// even though marco's intent (per X11 spec) was "empty clip,
+    /// paint nothing."
+    ///
+    /// Post-fix: empty rect list stores `Some(Vec::new())` so the
+    /// engine's `clip_rects=Some(&[])` path returns early without
+    /// painting.
+    #[test]
+    fn v2_set_picture_clip_rectangles_empty_list_is_empty_clip_not_no_clip() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xCC00_DD00).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // First: set a real clip to prove the field can become
+        // populated (Some(non-empty)).
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes()); // x_origin
+        body.extend_from_slice(&0_i16.to_le_bytes()); // y_origin
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&100_u16.to_le_bytes());
+        body.extend_from_slice(&100_u16.to_le_bytes());
+        b.render_set_picture_clip_rectangles(None, pic_xid, &body)
+            .expect("set_clip non-empty");
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable { clip, .. } => {
+                assert!(
+                    matches!(clip, Some(v) if v.len() == 1),
+                    "expected Some(1 rect) after non-empty set, got {clip:?}",
+                );
+            }
+            _ => panic!("not Drawable"),
+        }
+
+        // Now: empty list. Per X11 RENDER spec this means "empty
+        // clip region — paint nothing." The stored representation
+        // must distinguish this from "no clip set" (paint
+        // everywhere).
+        let mut empty_body: Vec<u8> = Vec::new();
+        empty_body.extend_from_slice(&pic_xid.to_le_bytes());
+        empty_body.extend_from_slice(&0_i16.to_le_bytes()); // x_origin
+        empty_body.extend_from_slice(&0_i16.to_le_bytes()); // y_origin
+        // No rect data — empty list.
+        b.render_set_picture_clip_rectangles(None, pic_xid, &empty_body)
+            .expect("set_clip empty");
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable { clip, .. } => {
+                // Pre-fix: clip was None (= paint everywhere).
+                // Post-fix: Some(empty Vec) (= paint nothing).
+                assert!(
+                    matches!(clip, Some(v) if v.is_empty()),
+                    "empty rect list must store Some(empty Vec) — \
+                     pre-fix stored None which made composites paint \
+                     everywhere instead of nothing. Got: {clip:?}",
+                );
+            }
+            _ => panic!("not Drawable"),
+        }
     }
 
     // ─── Stage 3d: render_composite_glyphs tests ───────────────
@@ -7860,6 +8551,115 @@ mod tests {
                 "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
             );
         }
+    }
+
+    /// Stage 4d regression: `ChangeWindowAttributes` on a window
+    /// under COMPOSITE redirect must NOT trigger a backing wipe.
+    /// Pre-fix `change_subwindow_attributes` eagerly called
+    /// `clear_window_area_with_background`, which routes through
+    /// `resolve_paint_target` into the redirected backing B and
+    /// fills it with depth-24 default black — exactly the
+    /// "mate-control-center turns opaque black on drag" symptom
+    /// observed in hardware smoke (marco re-asserts CWA on every
+    /// drag-induced configure; v2 interprets that as a paint
+    /// command and wipes B).
+    ///
+    /// X11 spec: CWA's background attribute change does not
+    /// repaint. The bg setting only affects future
+    /// `ClearArea` / Expose handling. v2's eager clear was a
+    /// Stage 3f.6 over-reach.
+    #[test]
+    fn cwa_on_redirected_window_does_not_clear_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        // Set up W as a top-level window in windows_v2 + the store.
+        let w_xid: u32 = 0x100_0001;
+        let stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            w_xid,
+            super::WindowGeometryV2 {
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank,
+            },
+        );
+        let w_storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: 200,
+                height: 200,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        let _w_id = b
+            .store
+            .allocate(w_xid, DrawableKind::Window, 24, true, w_storage)
+            .expect("alloc W");
+
+        // Set up B as a pixmap, then install the redirect route
+        // W → B. This is the load-bearing precondition for the
+        // bug: the fill path would route through W's redirect.
+        let b_xid: u32 = 0x100_0002;
+        let b_storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: 200,
+                height: 200,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        let b_id = b
+            .store
+            .allocate(b_xid, DrawableKind::Pixmap, 24, false, b_storage)
+            .expect("alloc B");
+        assert!(b.test_set_redirected_target(w_xid, b_xid));
+        // Sanity: resolve_paint_target on W now lands at B, not W.
+        let resolved = b
+            .resolve_paint_target(w_xid)
+            .expect("resolve_paint_target W");
+        assert_eq!(
+            resolved.id, b_id,
+            "fixture sanity: W's paint must route to B before issuing CWA",
+        );
+
+        // Snapshot the clear counter.
+        let calls_before = b.clear_window_area_calls;
+
+        // Issue CWA with CWBackPixmap = None (value=0). That's
+        // marco's "no background pixmap" attribute change, sent
+        // on every drag-induced configure. v2 must NOT interpret
+        // this as a paint command on the redirected backing.
+        b.change_subwindow_attributes(None, w_xid, 0x01, &[0])
+            .expect("change_subwindow_attributes");
+
+        assert_eq!(
+            b.clear_window_area_calls, calls_before,
+            "CWA on a redirected window must not call clear_window_area_with_background \
+             (pre-fix this fired and wiped B with depth-24 default black, destroying \
+             the compositor's painted pixels — the 'opaque black on drag' bug)",
+        );
+
+        // Same test with CWBackPixel — also a clear-trigger pre-fix.
+        b.change_subwindow_attributes(None, w_xid, 0x02, &[0x00FF_FFFF])
+            .expect("change_subwindow_attributes CWBackPixel");
+        assert_eq!(
+            b.clear_window_area_calls, calls_before,
+            "CWBackPixel on a redirected window must also skip the eager clear",
+        );
+
+        // Sanity: bg state IS stored (CWA still records the
+        // values; only the eager paint is skipped).
+        let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
+        assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
+        assert_eq!(geom.bg_pixmap, None);
     }
 
     /// Stage 3f.6 close: `change_subwindow_attributes` stores

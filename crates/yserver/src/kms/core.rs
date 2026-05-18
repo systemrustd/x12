@@ -481,6 +481,18 @@ pub(crate) enum PictureRecord {
     Drawable {
         /// XID of the backing window or pixmap.
         host_xid: u32,
+        /// X11 `RENDER_PICTFORMAT` ID requested at `CreatePicture`.
+        /// Captures the client's *declared* sampling intent — e.g.
+        /// marco creates a Picture wrapping a depth-24 backing with
+        /// a 24-bit xRGB format, but a depth-32 backing with ARGB32.
+        /// The drawable's depth alone is not enough to distinguish
+        /// "no alpha" from "real alpha" cases (rare but real for
+        /// X RENDER source-format flexibility). Currently
+        /// instrumentation-only — the engine still chooses
+        /// force-opaque via drawable depth; PictFormat-aware
+        /// sampling lands as a follow-on once we have data showing
+        /// where the depth-based heuristic diverges.
+        pict_format: u32,
         /// Optional clip rectangles (set by
         /// `RenderSetPictureClipRectangles`). Stored in dst-coord
         /// space — the clip-origin has already been folded in.
@@ -556,9 +568,10 @@ impl PictureRecord {
     /// `host_xid`. All optional / typed fields take their X RENDER
     /// protocol defaults; subsequent `RenderChangePicture` /
     /// `RenderSetPicture*` calls mutate them.
-    pub(crate) fn drawable_default(host_xid: u32) -> Self {
+    pub(crate) fn drawable_default(host_xid: u32, pict_format: u32) -> Self {
         PictureRecord::Drawable {
             host_xid,
+            pict_format,
             clip: None,
             clip_x: 0,
             clip_y: 0,

@@ -227,6 +227,26 @@ pub trait Backend: Send {
     /// drive their own composite.
     fn dump_scanout(&mut self) {}
 
+    /// Dump the storage content of every "interesting" drawable
+    /// (root, COW, every redirected backing) to files in cwd.
+    /// Diagnostic-only — fired from `Message::DumpDrawables`
+    /// (SIGUSR2 on KMS). Default no-op for backends that don't
+    /// own per-drawable storage (v1 KmsBackend, ynest's
+    /// HostX11Backend, RecordingBackend).
+    fn dump_drawables(&mut self) {}
+
+    /// Observer hook fired on every PRESENT::Pixmap request, with
+    /// the source pixmap xid and destination window xid the
+    /// compositor named in the request. Backends use it to track
+    /// which client offscreens drive presents to which targets —
+    /// notably, the diagnostic drawable-dump (v2) uses the COW-
+    /// targeted sources to extend its dump set to "marco's
+    /// offscreen of the most recent compose," so a bisect of the
+    /// "shadow only" bug can see the pixmap marco actually
+    /// PresentPixmap'd. Default no-op; not part of paint
+    /// correctness.
+    fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
+
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived
     /// from `BackendFdKind`.

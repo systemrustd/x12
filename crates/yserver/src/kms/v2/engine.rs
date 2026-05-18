@@ -856,6 +856,21 @@ impl RenderEngine {
         };
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
+        // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
+        // investigation). Logs every fill_rect_batch with target id
+        // + color + caller-side rects, so we can spot any path that
+        // overwrites a redirected backing with the depth-24 default
+        // (0,0,0,1) color or any other clear. Remove once the
+        // backing-reset cause is identified.
+        if log::log_enabled!(target: "yserver::kms::v2::fill", log::Level::Trace) {
+            let depth = drawable.depth;
+            log::trace!(
+                target: "yserver::kms::v2::fill",
+                "fill_rect_batch target={target:?} depth={depth} color={color:?} n_rects={} first_rect={:?}",
+                rects.len(),
+                rects.first(),
+            );
+        }
 
         // Clamp + drop empties up front. Doing this before begin_op_cb
         // means an all-empty batch doesn't allocate a CB or burn a

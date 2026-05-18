@@ -824,6 +824,23 @@ impl DrawableStore {
         window_id: DrawableId,
         backing_id: Option<DrawableId>,
     ) {
+        // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
+        // investigation). Every redirect-route mutation matters
+        // because clearing the route makes future paints land on
+        // W's own storage instead of B. Volume is bounded by the
+        // small number of redirected windows per session, so the
+        // trace is left at log::trace! and gated by the
+        // `yserver::kms::v2::store` target.
+        if log::log_enabled!(target: "yserver::kms::v2::store", log::Level::Trace) {
+            let old = self
+                .entries
+                .get(&window_id)
+                .and_then(|d| d.redirected_target);
+            log::trace!(
+                target: "yserver::kms::v2::store",
+                "set_redirected_target window={window_id:?} old={old:?} new={backing_id:?}",
+            );
+        }
         if let Some(d) = self.entries.get_mut(&window_id) {
             d.redirected_target = backing_id;
         }

@@ -40,6 +40,13 @@ const LINUX_KEY_LEFTCTRL: u32 = 29;
 const LINUX_KEY_LEFTALT: u32 = 56;
 const LINUX_KEY_RIGHTCTRL: u32 = 97;
 const LINUX_KEY_RIGHTALT: u32 = 100;
+/// F12. Used by the Ctrl-Alt-F12 hotkey that triggers the per-
+/// drawable storage dump (same code path as SIGUSR2). PrintScreen
+/// is the spiritual choice but doesn't reach libinput as KEY_SYSRQ
+/// on every keyboard (some BIOSes / Fn-layers eat it); F12 is the
+/// pragmatic alternative — unambiguous evdev code, universally
+/// present on PC keyboards.
+const LINUX_KEY_F12: u32 = 88;
 
 /// Server-internal hotkeys recognised on the libinput thread before
 /// events are forwarded to X dispatch. The keypress that triggers the
@@ -53,6 +60,10 @@ enum Hotkey {
     /// Ctrl+Alt+Enter — diagnostic scanout dump (same code path as
     /// SIGUSR1).
     DumpScanout,
+    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump (same
+    /// code path as SIGUSR2). Mirrors `DumpScanout` for the per-
+    /// window-storage view: root, COW, every redirected backing.
+    DumpDrawables,
 }
 
 /// Cursor accumulator + framebuffer dimensions held on the libinput
@@ -115,6 +126,9 @@ impl LibinputThreadState {
                     None
                 }
                 LINUX_KEY_BACKSPACE if self.ctrl_pressed && self.alt_pressed => Some(Hotkey::Zap),
+                LINUX_KEY_F12 if self.ctrl_pressed && self.alt_pressed => {
+                    Some(Hotkey::DumpDrawables)
+                }
                 LINUX_KEY_ENTER if self.ctrl_pressed && self.alt_pressed => {
                     Some(Hotkey::DumpScanout)
                 }
@@ -293,6 +307,17 @@ pub fn process_batch(
                 }
                 log::info!("yserver: Ctrl-Alt-Enter pressed — dumping scanout");
                 sender.send(Message::DumpScanout)?;
+                continue;
+            }
+            Some(Hotkey::DumpDrawables) => {
+                // Mirror DumpScanout: flush queued motion, drop the
+                // PrintScreen keypress itself, ask the core to dump
+                // per-drawable storage (same code path as SIGUSR2).
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                log::info!("yserver: Ctrl-Alt-PrintScreen pressed — dumping drawables");
+                sender.send(Message::DumpDrawables)?;
                 continue;
             }
             None => {}
@@ -774,6 +799,49 @@ mod tests {
                 Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && ev.keycode == 28 + 8
             )),
             "Enter keypress must not be forwarded after dump-scanout hotkey, got {collected:?}",
+        );
+        drop(poll);
+    }
+
+    /// Mirror of `ctrl_alt_enter_emits_dump_scanout_and_drops_keypress`
+    /// for the per-drawable storage dump (Ctrl-Alt-F12 → SIGUSR2 path).
+    #[test]
+    fn ctrl_alt_f12_emits_dump_drawables_and_drops_keypress() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTCTRL,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_LEFTALT,
+                },
+                InputEvent::KeyPress {
+                    keycode: LINUX_KEY_F12,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+
+        let collected: Vec<Message> = rx.try_recv_all().collect();
+        assert!(
+            collected
+                .iter()
+                .any(|m| matches!(m, Message::DumpDrawables)),
+            "expected DumpDrawables in {collected:?}",
+        );
+        assert!(
+            !collected.iter().any(|m| matches!(
+                m,
+                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && u32::from(ev.keycode) == LINUX_KEY_F12 + 8
+            )),
+            "F12 keypress must not be forwarded after dump-drawables hotkey, got {collected:?}",
         );
         drop(poll);
     }

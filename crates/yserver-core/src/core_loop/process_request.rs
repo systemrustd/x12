@@ -2573,11 +2573,12 @@ fn handle_xfixes_request(
                     }
                     x11xfixes::INTERSECT_REGION => crate::nested::intersect_regions(&a, &b),
                     x11xfixes::SUBTRACT_REGION => {
-                        if crate::nested::intersect_regions(&a, &b).is_empty() {
-                            a
-                        } else {
-                            Vec::new()
-                        }
+                        // Real rect-band subtraction (a - b). The
+                        // previous implementation collapsed any
+                        // overlap to an empty result — wrong for
+                        // any compositor that builds a wallpaper
+                        // clip via SubtractRegion(screen, windows).
+                        crate::nested::subtract_regions(&a, &b)
                     }
                     _ => unreachable!(),
                 };
@@ -3944,31 +3945,44 @@ fn handle_damage_request(
         }
         x11damage::SUBTRACT => {
             if let Some((damage_id, repair, parts)) = x11damage::parse_subtract(body) {
-                let rects = state
+                // Per X11 DAMAGE spec (cf. Xorg damageext.c:419 +
+                // miext/damage/damage.c:1854):
+                //   if repair == None: parts ← old damage; damage ← empty
+                //   else:              parts ← old ∩ repair; damage ← old − repair
+                // The repair region is a read-only input filter — NEVER
+                // overwrite it. Compositors (marco, picom, ...) feed
+                // `parts` into `SetPictureClipRectangles`; an empty
+                // parts collapses every subsequent composite to a no-op
+                // and the screen freezes.
+                let old_damage = state
                     .damage_objects
                     .get(&damage_id)
                     .map(|d| d.rects.clone())
                     .unwrap_or_default();
-                if repair != 0 {
-                    state.xfixes_regions.insert(
-                        repair,
-                        crate::server::XFixesRegion {
-                            owner: client_id,
-                            rects: rects.clone(),
-                        },
-                    );
-                }
+                let (parts_rects, new_damage) = if repair == 0 {
+                    (old_damage.clone(), Vec::new())
+                } else {
+                    let repair_rects = state
+                        .xfixes_regions
+                        .get(&repair)
+                        .map(|r| r.rects.clone())
+                        .unwrap_or_default();
+                    (
+                        crate::nested::intersect_regions(&old_damage, &repair_rects),
+                        crate::nested::subtract_regions(&old_damage, &repair_rects),
+                    )
+                };
                 if parts != 0 {
                     state.xfixes_regions.insert(
                         parts,
                         crate::server::XFixesRegion {
                             owner: client_id,
-                            rects: Vec::new(),
+                            rects: parts_rects,
                         },
                     );
                 }
                 if let Some(damage) = state.damage_objects.get_mut(&damage_id) {
-                    damage.rects.clear();
+                    damage.rects = new_damage;
                     damage.pending_notify_fired = false;
                 }
             }
@@ -4303,6 +4317,14 @@ fn handle_present_request(
                     width,
                     height,
                 )?;
+                // Observer hook for the diagnostic drawable-dump.
+                // Pass the *host* (backend-side) xids — `req.pixmap`
+                // and `req.window` are CLIENT xids, but backends
+                // (notably v2's DrawableStore) key on the host xid
+                // the resources layer assigned. Using the resolved
+                // `host_xid.as_raw()` / `dst.host_xid()` keeps the
+                // lookup symmetric with `copy_area` above.
+                backend.note_present_pixmap(host_xid.as_raw(), dst.host_xid());
             }
             state
                 .present_msc
@@ -7082,6 +7104,24 @@ fn handle_configure_window(
         );
     }
     if let Some((window_id, geometry, override_redirect)) = configure {
+        // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
+        // for this move, so we can verify marco gets dirty-region
+        // triggers for CC frame drags. Remove after compositor-dirty
+        // investigation closes.
+        let struct_recipients = subscribers_by_id(state, window_id, 0x0002_0000);
+        let subst_recipients = parent
+            .map(|p| subscribers_by_id(state, p, 0x0008_0000))
+            .unwrap_or_default();
+        log::debug!(
+            target: "yserver::diag::configure_notify",
+            "ConfigureNotify emit window=0x{:x} parent={:?} geom=({},{} {}x{}) override_redirect={} STRUCTURE_NOTIFY_to={:?} SUBSTRUCTURE_NOTIFY_to={:?}",
+            window_id.0,
+            parent.map(|p| format!("0x{:x}", p.0)),
+            geometry.x, geometry.y, geometry.width, geometry.height,
+            override_redirect,
+            struct_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
+            subst_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
+        );
         let _dropped =
             emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
                 x11::encode_configure_notify_event(
@@ -12420,5 +12460,273 @@ mod tests {
         assert_eq!(backing.width, 100);
         assert_eq!(backing.height, 75);
         assert_eq!(backing.depth, 32);
+    }
+
+    /// XFIXES SUBTRACT_REGION partial-overlap: subtracting a
+    /// region that overlaps part of `a` must return the bands of
+    /// `a` *not* covered by `b`. The pre-fix dispatcher collapsed
+    /// any overlap to an empty result; compositors that build
+    /// "screen MINUS windows" wallpaper clips this way would end
+    /// up with no clip at all.
+    #[test]
+    fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
+        use crate::server::XFixesRegion;
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // Region A: a 100x100 square at the origin.
+        state.xfixes_regions.insert(
+            0x10,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                }],
+            },
+        );
+        // Region B: a 50x100 strip overlapping the right half of A.
+        state.xfixes_regions.insert(
+            0x11,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: vec![RegionRect {
+                    x: 50,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                }],
+            },
+        );
+        // SUBTRACT_REGION body: source1(4) + source2(4) + dest(4).
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&0x10u32.to_le_bytes());
+        body.extend_from_slice(&0x11u32.to_le_bytes());
+        body.extend_from_slice(&0x12u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 140, // XFIXES major
+                data: yserver_protocol::x11::xfixes::SUBTRACT_REGION,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let result = state
+            .xfixes_regions
+            .get(&0x12)
+            .expect("dest region recorded");
+        assert!(
+            !result.rects.is_empty(),
+            "partial-overlap subtraction must NOT collapse to empty — \
+             pre-fix this returns Vec::new() and breaks compositor \
+             wallpaper-clip computation",
+        );
+        // Geometrically: A (0,0 100x100) minus B (50,0 50x100)
+        // leaves the left band (0,0 50x100). Allow any equivalent
+        // rect decomposition that covers exactly that area.
+        let total_area: u64 = result
+            .rects
+            .iter()
+            .map(|r| u64::from(r.width) * u64::from(r.height))
+            .sum();
+        assert_eq!(
+            total_area,
+            50 * 100,
+            "result area must be 5000 (the left half of A); got rects {:?}",
+            result.rects,
+        );
+        // No result rect may extend into B's x-range [50, 100).
+        for r in &result.rects {
+            assert!(
+                r.x + i16::try_from(r.width).unwrap_or(i16::MAX) <= 50,
+                "result rect {r:?} extends into the subtracted region",
+            );
+        }
+    }
+
+    fn dispatch_damage_subtract(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        damage_id: u32,
+        repair: u32,
+        parts: u32,
+    ) {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&damage_id.to_le_bytes());
+        body.extend_from_slice(&repair.to_le_bytes());
+        body.extend_from_slice(&parts.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 143, // DAMAGE major
+                data: yserver_protocol::x11::damage::SUBTRACT,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears() {
+        use crate::server::{DamageObject, XFixesRegion};
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let damaged_rect = RegionRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        state.damage_objects.insert(
+            0x20,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(0x100),
+                level: 0,
+                rects: vec![damaged_rect],
+                pending_notify_fired: true,
+            },
+        );
+        // Pre-create the parts region so the handler writes into it.
+        state.xfixes_regions.insert(
+            0x21,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+
+        dispatch_damage_subtract(&mut state, &mut backend, 0x20, 0, 0x21);
+
+        // Per X11 DAMAGE spec: repair==None → parts gets old damage,
+        // damage is cleared.
+        let parts = state
+            .xfixes_regions
+            .get(&0x21)
+            .expect("parts region must exist");
+        assert_eq!(
+            parts.rects,
+            vec![damaged_rect],
+            "with repair=None, parts must receive the entire old damage region; \
+             pre-fix this returns Vec::new() and starves compositors of a real clip"
+        );
+        let damage = state.damage_objects.get(&0x20).unwrap();
+        assert!(
+            damage.rects.is_empty(),
+            "with repair=None, damage must be fully cleared"
+        );
+        assert!(
+            !damage.pending_notify_fired,
+            "Subtract is the cycle boundary — pending_notify_fired must reset"
+        );
+    }
+
+    #[test]
+    fn damage_subtract_with_repair_returns_intersection_and_subtracts_from_damage() {
+        use crate::server::{DamageObject, XFixesRegion};
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // Damage: 100x100 at origin.
+        state.damage_objects.insert(
+            0x30,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(0x100),
+                level: 0,
+                rects: vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                }],
+                pending_notify_fired: true,
+            },
+        );
+        // Repair: right-half strip 50x100 at (50, 0). MUST remain
+        // unchanged by Subtract — it's an input filter, not an output.
+        let repair_rect = RegionRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 100,
+        };
+        state.xfixes_regions.insert(
+            0x31,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: vec![repair_rect],
+            },
+        );
+        state.xfixes_regions.insert(
+            0x32,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+
+        dispatch_damage_subtract(&mut state, &mut backend, 0x30, 0x31, 0x32);
+
+        // parts = damage ∩ repair  →  right half 50x100 at (50, 0).
+        let parts = &state.xfixes_regions.get(&0x32).unwrap().rects;
+        let parts_area: u64 = parts
+            .iter()
+            .map(|r| u64::from(r.width) * u64::from(r.height))
+            .sum();
+        assert_eq!(
+            parts_area,
+            50 * 100,
+            "parts must cover the intersection (5000 px²); got {parts:?}"
+        );
+        for r in parts {
+            assert!(
+                r.x >= 50,
+                "parts rect {r:?} extends outside the repair filter"
+            );
+        }
+
+        // damage = damage − repair  →  left half 50x100 at (0, 0).
+        let damage = &state.damage_objects.get(&0x30).unwrap().rects;
+        let damage_area: u64 = damage
+            .iter()
+            .map(|r| u64::from(r.width) * u64::from(r.height))
+            .sum();
+        assert_eq!(
+            damage_area,
+            50 * 100,
+            "damage must retain the un-repaired left half (5000 px²); got {damage:?}"
+        );
+        for r in damage {
+            assert!(
+                r.x + i16::try_from(r.width).unwrap_or(i16::MAX) <= 50,
+                "damage rect {r:?} extends into the repaired region"
+            );
+        }
+
+        // repair region MUST NOT have been overwritten — pre-fix this
+        // stomped repair with `damage.rects.clone()`.
+        let repair_now = &state.xfixes_regions.get(&0x31).unwrap().rects;
+        assert_eq!(
+            repair_now,
+            &vec![repair_rect],
+            "Subtract must treat the repair region as read-only input; \
+             pre-fix this overwrote it with the damage rects"
+        );
     }
 }
