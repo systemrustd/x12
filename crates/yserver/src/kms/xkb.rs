@@ -515,6 +515,31 @@ pub(super) fn reply_get_device_info() -> Vec<u8> {
     r
 }
 
+/// XKB PerClientFlags reply (minor=21). Fixed 32 bytes.
+/// Mirrors Xorg's reply shape: advertise the standard per-client flag
+/// mask and report the requested value for changed bits. This keeps
+/// clients that enable detectable auto-repeat from seeing an all-zero
+/// capability/value pair.
+pub(super) fn reply_per_client_flags(body: &[u8]) -> Vec<u8> {
+    const XKB_PCF_ALL_FLAGS_MASK: u32 = 0x1f;
+
+    let mut r = vec![0u8; 32];
+    r[0] = 1; // reply type
+    r[1] = 1; // deviceID
+    // [2..4] sequence: rewritten by caller
+    // [4..8] extra length in 4-byte units = 0
+    r[8..12].copy_from_slice(&XKB_PCF_ALL_FLAGS_MASK.to_le_bytes());
+
+    if body.len() >= 12 {
+        let change = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        let value = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+        let effective = value & change & XKB_PCF_ALL_FLAGS_MASK;
+        r[12..16].copy_from_slice(&effective.to_le_bytes());
+    }
+
+    r
+}
+
 /// Minimal all-zero 32-byte reply for XKB minors that clients tolerate silently.
 /// Only use for minors with no required reply content (e.g. SetControls has none).
 pub(super) fn reply_minimal(minor: u8) -> Vec<u8> {
@@ -807,5 +832,30 @@ mod tests {
             0,
             "nameLen = 0 (no name follows)"
         );
+    }
+
+    #[test]
+    fn per_client_flags_reports_supported_and_requested_flags() {
+        let mut body = vec![0u8; 24];
+        body[4..8].copy_from_slice(&1u32.to_le_bytes()); // change DetectableAutoRepeat
+        body[8..12].copy_from_slice(&1u32.to_le_bytes()); // value DetectableAutoRepeat
+
+        let r = reply_per_client_flags(&body);
+        assert_eq!(r.len(), 32);
+        assert_eq!(r[0], 1, "reply type");
+        assert_eq!(r[1], 1, "deviceID");
+        assert_eq!(u32::from_le_bytes(r[4..8].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(r[8..12].try_into().unwrap()),
+            0x1f,
+            "supported = XkbPCF_AllFlagsMask"
+        );
+        assert_eq!(
+            u32::from_le_bytes(r[12..16].try_into().unwrap()),
+            1,
+            "value reflects changed supported flags"
+        );
+        assert_eq!(u32::from_le_bytes(r[16..20].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(r[20..24].try_into().unwrap()), 0);
     }
 }

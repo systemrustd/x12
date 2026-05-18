@@ -464,13 +464,19 @@ fn resolve_host_subwindow_visual_to_state(
         return HostSubwindowVisual::CopyFromParent;
     };
     let Some(visual_xid) = visual.host_visual_xid else {
-        return HostSubwindowVisual::CopyFromParent;
+        return HostSubwindowVisual::DepthOnly {
+            depth: window.depth,
+        };
     };
     let Some(colormap) = state.resources.colormap_for_visual(window.visual) else {
-        return HostSubwindowVisual::CopyFromParent;
+        return HostSubwindowVisual::DepthOnly {
+            depth: window.depth,
+        };
     };
     let Some(colormap_xid) = colormap.host_colormap_xid else {
-        return HostSubwindowVisual::CopyFromParent;
+        return HostSubwindowVisual::DepthOnly {
+            depth: window.depth,
+        };
     };
     HostSubwindowVisual::Explicit {
         depth: visual.depth,

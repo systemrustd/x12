@@ -33,6 +33,7 @@ use yserver_core::{
         HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
         PointerEventKind, PointerPosition,
     },
+    resources::{ARGB_COLORMAP, ARGB_VISUAL},
     server::ServerState,
 };
 use yserver_protocol::x11::{
@@ -2968,6 +2969,13 @@ fn wrap_get_image_reply(depth: u8, pixel_bytes: Vec<u8>) -> Vec<u8> {
 fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8 {
     match visual {
         HostSubwindowVisual::CopyFromParent => parent_depth.unwrap_or(24),
+        HostSubwindowVisual::DepthOnly { depth } => {
+            if depth == 0 {
+                parent_depth.unwrap_or(24)
+            } else {
+                depth
+            }
+        }
         HostSubwindowVisual::Explicit { depth, .. } => {
             if depth == 0 {
                 parent_depth.unwrap_or(24)
@@ -3003,11 +3011,11 @@ impl Backend for KmsBackendV2 {
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
-        None
+        Some(ARGB_VISUAL.0)
     }
 
     fn argb_colormap_xid(&self) -> Option<u32> {
-        None
+        Some(ARGB_COLORMAP.0)
     }
 
     fn render_opcode(&self) -> Option<u8> {
@@ -7226,8 +7234,9 @@ impl Backend for KmsBackendV2 {
             8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
             17 => Some(xkb_replies::reply_get_names(&self.core.xkb_keymap.0)),
+            21 => Some(xkb_replies::reply_per_client_flags(_body)),
             24 => Some(xkb_replies::reply_get_device_info()),
-            4 | 12 | 13 | 15 | 19 | 21 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
+            4 | 12 | 13 | 15 | 19 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
             1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
             _ => {
                 log::debug!("v2 xkb: unknown minor {minor}, no reply sent");
@@ -7651,9 +7660,10 @@ mod tests {
         // Non-trivial format passes through untouched; 0 returns None.
         assert_eq!(b.render_format_for_ynest_id(0), None);
         assert_eq!(b.render_format_for_ynest_id(0x12345), Some(0x12345));
-        // No ARGB visual / colormap exposed.
-        assert_eq!(b.argb_visual_xid(), None);
-        assert_eq!(b.argb_colormap_xid(), None);
+        // KMS has no upstream host visuals, but it still advertises
+        // server-local ARGB ids so CreateWindow can preserve depth 32.
+        assert_eq!(b.argb_visual_xid(), Some(0x103));
+        assert_eq!(b.argb_colormap_xid(), Some(0x104));
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
@@ -9250,6 +9260,28 @@ mod tests {
                 0,
                 HostSubwindowVisual::CopyFromParent,
                 None,
+                None,
+            )
+            .expect("create_subwindow");
+        assert_eq!(b.windows_v2[&child.as_raw()].depth, 32);
+    }
+
+    #[test]
+    fn depth_only_visual_preserves_argb_top_level_depth() {
+        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+        let mut b = KmsBackendV2::for_tests();
+        let child = b
+            .create_subwindow(
+                None,
+                WindowHandle::from_raw(b.window_id()).unwrap(),
+                0,
+                0,
+                2944,
+                1840,
+                0,
+                HostSubwindowVisual::DepthOnly { depth: 32 },
+                Some(0),
                 None,
             )
             .expect("create_subwindow");

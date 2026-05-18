@@ -276,6 +276,13 @@ pub(super) enum HostFillState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostSubwindowVisual {
     CopyFromParent,
+    /// Preserve the nested window depth for non-host backends that do
+    /// not need an upstream visual/colormap translation. Host X11
+    /// request encoding treats this like CopyFromParent; KMS backends
+    /// use the carried depth directly.
+    DepthOnly {
+        depth: u8,
+    },
     Explicit {
         depth: u8,
         visual_xid: u32,
@@ -286,14 +293,14 @@ pub enum HostSubwindowVisual {
 impl HostSubwindowVisual {
     pub(super) fn depth(self) -> u8 {
         match self {
-            Self::CopyFromParent => 0,
+            Self::CopyFromParent | Self::DepthOnly { .. } => 0,
             Self::Explicit { depth, .. } => depth,
         }
     }
 
     pub(super) fn visual_xid(self) -> u32 {
         match self {
-            Self::CopyFromParent => 0,
+            Self::CopyFromParent | Self::DepthOnly { .. } => 0,
             Self::Explicit { visual_xid, .. } => visual_xid,
         }
     }

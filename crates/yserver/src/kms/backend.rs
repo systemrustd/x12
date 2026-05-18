@@ -10,6 +10,7 @@ use yserver_core::{
         HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
         PointerEventKind, PointerPosition,
     },
+    resources::{ARGB_COLORMAP, ARGB_VISUAL},
 };
 use yserver_protocol::x11::{
     ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, ResourceId,
@@ -8887,11 +8888,11 @@ impl Backend for KmsBackend {
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
-        None
+        Some(ARGB_VISUAL.0)
     }
 
     fn argb_colormap_xid(&self) -> Option<u32> {
-        None
+        Some(ARGB_COLORMAP.0)
     }
 
     fn render_opcode(&self) -> Option<u8> {
@@ -9087,10 +9088,11 @@ impl Backend for KmsBackend {
         let host_xid = self.core.next_host_xid();
         let depth = match visual {
             HostSubwindowVisual::CopyFromParent => 24,
+            HostSubwindowVisual::DepthOnly { depth } => depth,
             HostSubwindowVisual::Explicit { depth, .. } => depth,
         };
         let visual_xid = match visual {
-            HostSubwindowVisual::CopyFromParent => 0,
+            HostSubwindowVisual::CopyFromParent | HostSubwindowVisual::DepthOnly { .. } => 0,
             HostSubwindowVisual::Explicit { visual_xid, .. } => visual_xid,
         };
         // Allocate the mirror (`initialize_clear` leaves it
@@ -11992,10 +11994,11 @@ impl Backend for KmsBackend {
             8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
             17 => Some(xkb_replies::reply_get_names(&self.core.xkb_keymap.0)),
+            21 => Some(xkb_replies::reply_per_client_flags(_body)),
             24 => Some(xkb_replies::reply_get_device_info()),
             // Reply minors we don't model — answer with a minimal
             // 32-byte zero reply so xcb completes the cookie.
-            4 | 12 | 13 | 15 | 19 | 21 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
+            4 | 12 | 13 | 15 | 19 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
             // Void minors — return None so no reply hits the wire.
             1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
             // Unknown minor — be defensive and stay silent.

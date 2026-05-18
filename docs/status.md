@@ -1339,6 +1339,25 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       xterm-under-fvwm3, xclock, xeyes (post-shader-fix), gedit,
       MATE-cc, xfce4-no-compositor, xfd all PASS. marco / xfwm4
       with compositor hit `name_window_pixmap` gaps (Stage 4).
+      Later Stage 4d follow-up smokes reached MATE + XFCE
+      desktop/window rendering. Cinnamon/muffin then failed early
+      with `Could not initialize XSync counter`; the captured trace
+      showed SYNC `Initialize` itself shaped like Xorg, but every
+      affected client received an all-zero minimal XKB
+      `PerClientFlags` reply immediately before SYNC setup.
+      2026-05-19 fix: XKB minor 21 now returns a structured
+      `xkbPerClientFlagsReply` advertising `XkbPCF_AllFlagsMask`
+      and echoing changed supported flags, on both v1 and v2 KMS
+      paths. A follow-up smoke still logged the same muffin XSync
+      complaint, but the session advanced far enough to map
+      nemo-desktop. The new trace showed nemo-desktop creating a
+      full-screen depth-32 ARGB top-level, while v2 registered the
+      host storage as depth 24, so its transparent desktop surface
+      became an opaque black cover over the root background. KMS now
+      carries a depth-only visual selector when there is no upstream
+      host X server visual / colormap to translate, and v1/v2 KMS
+      consume that selector directly so ARGB top-levels allocate
+      depth-32 storage.
 
       **Stability + perf** observed positive through 3f.10 +
       3f.15 (flip-pending gate + failed-submit recovery + stroke
