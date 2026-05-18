@@ -645,6 +645,25 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
         echo "x11trace:    mate.xtrace";\
         echo "mate log:    mate.log"'
 
+yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
+    cargo build --bin yserver
+    rm -f cinnamon.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o cinnamon.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw-cinnamon.log";\
+        echo "x11trace:    cinnamon.xtrace";\
+        echo "cinnamon log:    cinnamon.log"'
+
 # MATE inside Xephyr (nested Xorg-family server), with x11trace
 # recording marco's wire stream to/from Xephyr. The Xorg-side
 # counterpart to `yserver-mate-hw-trace`: same workload, same
