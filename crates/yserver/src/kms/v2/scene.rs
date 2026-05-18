@@ -1296,6 +1296,24 @@ fn emit_window_subtree(
     let abs_x = parent_abs_x + i32::from(geom.x);
     let abs_y = parent_abs_y + i32::from(geom.y);
 
+    // Manual-redirect subtree boundary. When a window is
+    // `scene_participating=false` here, the compositor owns the
+    // entire subtree's presentation (X11 Composite §285+360 —
+    // Manual-mode redirect removes the window AND its descendants
+    // from normal scene-out; the compositor reads the redirected
+    // backing instead). Set after the per-node decision so we
+    // can return *after* the SKIP trace fires (preserves the
+    // existing trace shape for live debugging) and before the
+    // child-recurse below.
+    //
+    // Assumption: post-`geom.mapped` filter, the only writer that
+    // produces `scene_participating=false` is Manual-redirect
+    // activation (`set_window_scene_participation(W, false)`).
+    // If a third reason is added later, audit whether it also
+    // wants subtree-prune semantics; the store currently tracks
+    // only the bool, not the reason.
+    let mut prune_subtree = false;
+
     // Emit a draw entry for this window if it has live storage that
     // participates in the scene.
     let lookup_id = store.lookup(host_xid);
@@ -1366,6 +1384,9 @@ fn emit_window_subtree(
             // Pick the first failing gate and emit a single SKIP line;
             // otherwise emit WILL_EMIT. Order matches the production
             // gate ordering below so the trace mirrors the live path.
+            if !d_part {
+                prune_subtree = true;
+            }
             let skip_reason: Option<&'static str> = if !d_part {
                 Some("scene_participating=false")
             } else if !matches!(d_kind, DrawableKind::Window) {
@@ -1519,6 +1540,10 @@ fn emit_window_subtree(
                 );
             }
         }
+    }
+
+    if prune_subtree {
+        return;
     }
 
     // Recurse into mapped descendants in stable sibling stack order.
@@ -2731,6 +2756,132 @@ mod tests {
             built.sampled_ids[0], w1_id,
             "sampled_ids must reference W1; W2 was filtered before push",
         );
+    }
+
+    /// Stage 4d — `build_scene` must prune the entire subtree of
+    /// a Manual-redirected (`scene_participating=false`) ancestor,
+    /// NOT just skip the ancestor node and emit its children.
+    ///
+    /// Regression context (Stage 4d marco-with-compositing CC
+    /// disappears): emit_window_subtree's per-node skip-gate
+    /// returned after the SKIP trace but unconditionally recursed
+    /// into children. CC's marco-decorated frame (Manual redirect,
+    /// scene_participating=false) skipped emit; CC's child GtkWindow
+    /// (scene_participating=true, parent=frame) was then walked and
+    /// directly emitted by scene_walk — bypassing marco's
+    /// compositor entirely. The directly-emitted child storage
+    /// (stale, since post-redirect child paints route to the
+    /// frame's backing via resolve_paint_target) muddied COW
+    /// over marco's compositor output. X11 Composite semantics:
+    /// a Manual-redirected window is a *subtree ownership boundary*
+    /// — the compositor owns presentation of every descendant.
+    ///
+    /// Assumption: `scene_participating=false` is set ONLY by
+    /// (un)map and `set_window_scene_participation` (Manual-redirect
+    /// activation). Unmapped windows are pruned earlier in
+    /// emit_window_subtree via `geom.mapped` check, so any
+    /// non-participating MAPPED window reaching the per-node gate
+    /// is Manual-redirected. If a third reason for
+    /// `scene_participating=false` is added later, audit whether it
+    /// also wants subtree-prune semantics; if not, the gate must
+    /// learn the *reason* (store currently tracks only the bool).
+    #[test]
+    fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Frame W @ (100, 200), 200×150 — the manually-redirected
+        // ancestor (CC's marco-decorated frame in production).
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x111,
+            100,
+            200,
+            200,
+            150,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x111);
+
+        // Child C inside frame W at relative (11, 41), 100×80.
+        // scene_participating=true (regular window — only the
+        // ancestor is redirected). This is CC's GtkWindow in
+        // production: a regular window whose paints route to the
+        // frame's redirected backing via resolve_paint_target's
+        // ancestor walk.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x112,
+            11,
+            41,
+            100,
+            80,
+            Some(0x111),
+            true,
+        );
+
+        // Bystander top-level W @ (500, 500) so a "did anything
+        // get emitted?" assertion isn't ambiguous.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x222,
+            500,
+            500,
+            60,
+            30,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x222);
+
+        // Flip frame W to scene_participating=false (Manual
+        // redirect activation). Child stays participating.
+        let w_frame_id = store.lookup(0x111).expect("frame lookup");
+        store.set_scene_participating(w_frame_id, false);
+        let child_id = store.lookup(0x112).expect("child lookup");
+        assert!(
+            store.get(child_id).unwrap().scene_participating,
+            "fixture sanity: child stays scene_participating=true",
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+        );
+        let scene = &built.scene;
+
+        // Only the bystander W (0x222 @ (500,500)) must be drawn.
+        // Frame W skipped (Manual redirect) → child C must NOT
+        // leak in as a top-level descendant emission.
+        assert_eq!(
+            scene.draws.len(),
+            1,
+            "expected exactly 1 draw (the bystander); got {} — children of \
+             a Manual-redirected ancestor must be pruned, not walked: {:?}",
+            scene.draws.len(),
+            scene.draws,
+        );
+        assert_eq!(
+            scene.draws[0].dst_origin,
+            [500.0, 500.0],
+            "the surviving draw must be the bystander at (500,500); \
+             frame and its child were ostensibly pruned",
+        );
+        // sampled_ids mirrors draws — must not reference child.
+        let bystander_id = store.lookup(0x222).expect("bystander lookup");
+        assert_eq!(built.sampled_ids, vec![bystander_id]);
     }
 
     /// Stage 4d — `build_scene` appends the Composite Overlay
