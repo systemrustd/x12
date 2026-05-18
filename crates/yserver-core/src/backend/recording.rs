@@ -99,6 +99,10 @@ pub enum RecordedCall {
         host_window: u32,
         participating: bool,
     },
+    SetBackingSceneParticipation {
+        backing: u32,
+        participating: bool,
+    },
     CopyArea {
         src_host_xid: u32,
         dst_host_xid: u32,
@@ -414,6 +418,19 @@ impl Backend for RecordingBackend {
     ) -> io::Result<()> {
         self.record(RecordedCall::SetWindowSceneParticipation {
             host_window: host_window.as_raw(),
+            participating,
+        });
+        Ok(())
+    }
+
+    fn set_backing_scene_participation(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::SetBackingSceneParticipation {
+            backing: backing.as_raw(),
             participating,
         });
         Ok(())

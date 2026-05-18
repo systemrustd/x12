@@ -552,6 +552,21 @@ fn activate_redirect_backing_for(
             // source; the v2 impl of these setters fires that
             // damage internally so the protocol handler just
             // makes the calls.
+            //
+            // W: Automatic → true (scene walks W, samples B via
+            // 4c.3 indirection). Manual → false (the codex
+            // 2026-05-18 scene-walk fix routes W's draw through
+            // B regardless of W's own `scene_participating`).
+            //
+            // B: ALWAYS true. Both modes route paints to B via
+            // `resolve_paint_target`, and `store.damage(B, rect)`
+            // gates damage accumulation on B's `scene_participating`
+            // (store.rs:775). Pre-fix the Manual branch left B at
+            // its pixmap default of `false`, dropping all paint
+            // damage on the floor — visible as the XFCE desktop
+            // staying black except where cursor-trail damage
+            // forced a sub-rect re-compose. See
+            // `manual_redirect_marks_backing_scene_participating`.
             let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
             if let Err(err) =
                 backend.set_window_scene_participation(origin, host_window, participating)
@@ -561,9 +576,7 @@ fn activate_redirect_backing_for(
                     window.0
                 );
             }
-            if matches!(mode, crate::server::CompositeRedirectMode::Automatic)
-                && let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true)
-            {
+            if let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true) {
                 log::warn!(
                     "set_backing_scene_participation(0x{:x}, true) failed: {err}",
                     host_pixmap.as_raw()
@@ -627,7 +640,11 @@ fn flip_redirect_target_mode(
         return;
     };
     let window_participating = matches!(new_mode, crate::server::CompositeRedirectMode::Automatic);
-    let backing_participating = window_participating;
+    // B stays scene_participating=true in BOTH modes (codex
+    // 2026-05-18 scene-walk fix samples B for Manual-redirected
+    // parents too — see `activate_redirect_backing_for` doc for
+    // the full rationale).
+    let backing_participating = true;
     if let Err(err) =
         backend.set_window_scene_participation(origin, host_window, window_participating)
     {
@@ -12718,6 +12735,94 @@ mod tests {
         assert_eq!(backing.width, 100);
         assert_eq!(backing.height, 75);
         assert_eq!(backing.depth, 32);
+    }
+
+    /// Stage 4d follow-up — `activate_redirect_backing_for` on a
+    /// Manual-mode redirect must mark the backing
+    /// `scene_participating=true` so paint→backing accumulates
+    /// presentation damage. Without this, the codex 2026-05-18
+    /// scene-walk fix (Manual-redirected parents emit B from the
+    /// scene) silently fails: the parent is emitted, but
+    /// `peek_presentation_damage(B)` returns empty because
+    /// `store.damage(B, rect)` drops the rect when B is
+    /// `scene_participating=false` (store.rs:775), so the scanout
+    /// BO keeps its pre-fix baseline (black) for the redirected
+    /// region. Symptom: XFCE desktop wallpaper stays black except
+    /// where cursor damage forces a sub-rect re-compose.
+    #[test]
+    fn manual_redirect_marks_backing_scene_participating() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Install a top-level child of root (the soon-to-be-Manual-
+        // redirected window). Use real CreateWindow flow so the
+        // resource record carries width/height/depth that
+        // `activate_redirect_backing_for` snapshots.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let calls = backend.calls();
+        // Window participation: Manual → false (the existing,
+        // correct behavior — Manual-redirected windows leave the
+        // scene path via `scene_participating=false`, and the
+        // codex scene-walk fix routes them through B instead).
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window,
+                    participating: false,
+                } if *host_window == HOST_XID
+            )),
+            "expected SetWindowSceneParticipation(W, false) for Manual mode; got {calls:?}",
+        );
+        // Backing participation: Manual → true (load-bearing for
+        // damage tracking — see fn-doc above).
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetBackingSceneParticipation {
+                    participating: true,
+                    ..
+                }
+            )),
+            "expected SetBackingSceneParticipation(B, true) for Manual mode; got {calls:?}",
+        );
     }
 
     /// XFIXES SUBTRACT_REGION partial-overlap: subtracting a
