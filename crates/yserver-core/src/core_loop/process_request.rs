@@ -3895,14 +3895,32 @@ fn handle_damage_request(
                         pending_notify_fired: false,
                     },
                 );
+                debug!(
+                    "client {} #{} DAMAGE::Create damage=0x{damage:x} drawable=0x{drawable:x} level={level}",
+                    client_id.0, sequence.0,
+                );
+            } else {
+                debug!(
+                    "client {} #{} DAMAGE::Create parse_failed",
+                    client_id.0, sequence.0
+                );
             }
-            debug!("client {} #{} DAMAGE::Create", client_id.0, sequence.0);
         }
         x11damage::DESTROY => {
             if let Some(damage) = x11damage::parse_resource(body) {
-                state.damage_objects.remove(&damage);
+                let drawable = state.damage_objects.remove(&damage).map(|d| d.drawable.0);
+                debug!(
+                    "client {} #{} DAMAGE::Destroy damage=0x{damage:x} drawable=0x{:x}",
+                    client_id.0,
+                    sequence.0,
+                    drawable.unwrap_or(0),
+                );
+            } else {
+                debug!(
+                    "client {} #{} DAMAGE::Destroy parse_failed",
+                    client_id.0, sequence.0
+                );
             }
-            debug!("client {} #{} DAMAGE::Destroy", client_id.0, sequence.0);
         }
         x11damage::ADD => {
             if let Some((drawable, region)) = x11damage::parse_add(body) {
