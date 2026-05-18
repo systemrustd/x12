@@ -99,6 +99,16 @@ pub enum RecordedCall {
         host_window: u32,
         participating: bool,
     },
+    CopyArea {
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -584,16 +594,26 @@ impl Backend for RecordingBackend {
     fn copy_area(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: copy_area")
+        self.record(RecordedCall::CopyArea {
+            src_host_xid,
+            dst_host_xid,
+            src_x,
+            src_y,
+            dst_x,
+            dst_y,
+            width,
+            height,
+        });
+        Ok(())
     }
 
     fn copy_plane(

@@ -4453,6 +4453,12 @@ impl Backend for KmsBackendV2 {
         self.core.current_background = state.background;
         self.core.current_fill = state.fill.clone();
         self.core.current_clip = state.clip.clone();
+        // Stage 4d Manual-redirect fix: drawing through a
+        // `ClipByChildren` GC into a window must exclude every
+        // mapped child window's area. Capture the mode here so
+        // `copy_area` (and any other future op that consults it)
+        // can split the destination rect against the child rects.
+        self.core.current_subwindow_mode = state.subwindow_mode;
         Ok(())
     }
 
@@ -4484,33 +4490,163 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
-        let src_rect = ash::vk::Rect2D {
+        // Diagnostic trace (TEMP — Stage 4d "top-left-only CC" investigation).
+        // Pins where each CopyArea lands: src store id, dst's resolved
+        // PaintTarget (id + offset), and the wire src/dst coords + size.
+        // Gated on `RUST_LOG=yserver::kms::v2::paint=trace`. Codex round
+        // of 2026-05-18: needed because the symptom narrowed to "B has
+        // CC content only in the top-left 177x80" — we need to see
+        // whether marco's many 975x600 CopyArea(src=CC_offscreen,
+        // dst=CC_window) calls resolve to the frame backing's
+        // DrawableId or get lost en route.
+        log::trace!(
+            target: "yserver::kms::v2::paint",
+            "copy_area src=0x{src_host_xid:x}->id={src:?} dst=0x{dst_host_xid:x}->id={dst_id:?}+off=({off_x},{off_y}) \
+             src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+            dst_id = dst_target.id,
+            off_x = dst_target.offset.0,
+            off_y = dst_target.offset.1,
+        );
+        // Stage 4d Manual-redirect fix: split the copy by
+        // `subwindow_mode = ClipByChildren` rules when dst is a
+        // window. Each surviving sub-rect is in dst-window-local
+        // coords; we issue one engine.copy_area per sub-rect,
+        // adjusting src offsets by the sub-rect's delta from the
+        // original dst_xy. IncludeInferiors (mode=1) keeps the
+        // single-rect fast path. Pixmap destinations also keep the
+        // fast path (no children to clip against).
+        let dst_rect_local = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: i32::from(src_x),
-                y: i32::from(src_y),
+                x: i32::from(dst_x),
+                y: i32::from(dst_y),
             },
             extent: ash::vk::Extent2D {
                 width: u32::from(width),
                 height: u32::from(height),
             },
         };
-        let dst_pos = ash::vk::Offset2D {
-            x: i32::from(dst_x) + dst_target.offset.0,
-            y: i32::from(dst_y) + dst_target.offset.1,
-        };
-        if let Err(e) = self.engine.copy_area(
-            &mut self.store,
-            &mut self.platform,
-            src,
-            dst_target.id,
-            src_rect,
-            dst_pos,
-        ) {
-            log::warn!(
-                "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
-                 dst=0x{dst_host_xid:x}): {e:?}",
-            );
+        // Step 1: GC clip intersection (X11 GC `clip-mask` /
+        // `SetClipRectangles`). When the GC has explicit clip
+        // rectangles, every paint is masked against them first;
+        // `ClipState::None` means "no GC clip", and we keep the
+        // single-rect fast path. `ClipState::Pixmap` rasterises a
+        // mask — out of scope for this fix; pass through untouched
+        // (TODO mirrors v1's `intersect_with_current_clip`).
+        let post_gc_clip: Vec<ash::vk::Rect2D> =
+            if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
+                &self.core.current_clip
+            {
+                let clip_rects: Vec<ash::vk::Rect2D> = rects
+                    .rectangles
+                    .chunks_exact(8)
+                    .filter_map(|chunk| {
+                        let cx = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]))
+                            + i32::from(origin.0);
+                        let cy = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]))
+                            + i32::from(origin.1);
+                        let cw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
+                        let ch = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
+                        if cw <= 0 || ch <= 0 {
+                            return None;
+                        }
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D { x: cx, y: cy },
+                            extent: ash::vk::Extent2D {
+                                width: u32::try_from(cw).unwrap_or(0),
+                                height: u32::try_from(ch).unwrap_or(0),
+                            },
+                        })
+                    })
+                    .collect();
+                intersect_rect_with_clip(dst_rect_local, &clip_rects)
+            } else {
+                vec![dst_rect_local]
+            };
+        if post_gc_clip.is_empty() {
+            // GC clip is empty (or `SetClipRectangles` with n=0):
+            // spec-correct no-op.
+            return Ok(());
+        }
+        // Step 2: ClipByChildren — subtract every mapped child window
+        // rect from each post-GC-clip rect. IncludeInferiors (mode=1)
+        // keeps each post-GC-clip rect as-is. Pixmap destinations
+        // (not in `windows_v2`) also bypass child subtraction.
+        let sub_rects: Vec<ash::vk::Rect2D> = if matches!(
+            self.core.current_subwindow_mode,
+            yserver_core::backend::SubwindowMode::ClipByChildren,
+        ) && self.windows_v2.contains_key(&dst_host_xid)
+        {
+            let child_rects: Vec<ash::vk::Rect2D> = self
+                .windows_v2
+                .values()
+                .filter_map(|geom| {
+                    if geom.parent == Some(dst_host_xid) && geom.mapped {
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(geom.x),
+                                y: i32::from(geom.y),
+                            },
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(geom.width.max(1)),
+                                height: u32::from(geom.height.max(1)),
+                            },
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if child_rects.is_empty() {
+                post_gc_clip
+            } else {
+                post_gc_clip
+                    .into_iter()
+                    .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
+                    .collect()
+            }
         } else {
+            post_gc_clip
+        };
+        if sub_rects.is_empty() {
+            // Whole copy fully covered by mapped children — nothing
+            // to paint. Spec-correct under ClipByChildren.
+            return Ok(());
+        }
+        let mut all_ok = true;
+        for sub in &sub_rects {
+            let sub_dst_x = sub.offset.x;
+            let sub_dst_y = sub.offset.y;
+            // src coords shift by the same delta the dst sub-rect
+            // shifted from the original dst_xy.
+            let sub_src_x = i32::from(src_x) + (sub_dst_x - i32::from(dst_x));
+            let sub_src_y = i32::from(src_y) + (sub_dst_y - i32::from(dst_y));
+            let src_sub_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: sub_src_x,
+                    y: sub_src_y,
+                },
+                extent: sub.extent,
+            };
+            let dst_pos = ash::vk::Offset2D {
+                x: sub_dst_x + dst_target.offset.0,
+                y: sub_dst_y + dst_target.offset.1,
+            };
+            if let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                src,
+                dst_target.id,
+                src_sub_rect,
+                dst_pos,
+            ) {
+                log::warn!(
+                    "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
+                     dst=0x{dst_host_xid:x} sub_rect={sub:?}): {e:?}",
+                );
+                all_ok = false;
+            }
+        }
+        if all_ok {
             self.telemetry.record_paint_submit();
         }
         Ok(())
@@ -7363,9 +7499,146 @@ fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
     pi == pat.len()
 }
 
+/// Stage 4d Manual-redirect fix: when a window has mapped child
+/// windows and is drawn into via a `ClipByChildren` GC (the X11
+/// default), the draw must NOT touch the area covered by each
+/// child. In v1 this was natural because every window had its own
+/// mirror — paint to the parent landed in the parent's storage
+/// while child paint landed in the child's. v2's COMPOSITE Manual-
+/// redirect collapses an entire redirected subtree into a single
+/// backing pixmap, so the parent-vs-child overlap is now a real
+/// region-rect subtraction the backend has to perform.
+///
+/// Symptom this fixes: marco's per-frame full-extent CopyArea
+/// (decorations source → frame) clobbers the inferior CC window's
+/// area inside the redirected backing, then CC repaints only its
+/// small dirty rect, leaving the backing's centre as marco's
+/// (mostly-blank) decoration pixmap. Visible as "top-left content
+/// only" after a few frames.
+///
+/// `dst_rect` is in destination-window-local coordinates; `child_rects`
+/// are mapped-child rectangles also in destination-window-local
+/// coordinates (parent's `(child.x, child.y, child.w, child.h)`).
+/// Returns the surviving sub-rectangles, also in dst-window-local
+/// coordinates. Empty input child list returns `[dst_rect]`. Empty
+/// `dst_rect` (zero-size) returns `[]`.
+/// Intersect a destination rectangle against an X11 GC clip
+/// (a list of rectangles already translated into destination-window
+/// coordinates). Returns the surviving pieces. An empty `clip_rects`
+/// represents an empty clip region — Xorg's behaviour is "paint
+/// nothing", so we return an empty Vec. `rect` with zero area also
+/// returns empty.
+///
+/// Used by `copy_area` ahead of child subtraction so a
+/// `SetClipRectangles`-issued explicit clip constrains the copy
+/// (Stage 4d codex round 2026-05-18: pre-fix `copy_area` honoured
+/// neither GC clip nor `ClipByChildren`).
+fn intersect_rect_with_clip(
+    rect: ash::vk::Rect2D,
+    clip_rects: &[ash::vk::Rect2D],
+) -> Vec<ash::vk::Rect2D> {
+    if clip_rects.is_empty() || rect.extent.width == 0 || rect.extent.height == 0 {
+        return Vec::new();
+    }
+    let rx0 = rect.offset.x;
+    let ry0 = rect.offset.y;
+    let rx1 = rx0 + i32::try_from(rect.extent.width).unwrap_or(i32::MAX);
+    let ry1 = ry0 + i32::try_from(rect.extent.height).unwrap_or(i32::MAX);
+    let mut out = Vec::with_capacity(clip_rects.len());
+    for c in clip_rects {
+        let cx0 = c.offset.x;
+        let cy0 = c.offset.y;
+        let cx1 = cx0 + i32::try_from(c.extent.width).unwrap_or(0);
+        let cy1 = cy0 + i32::try_from(c.extent.height).unwrap_or(0);
+        let ix0 = rx0.max(cx0);
+        let iy0 = ry0.max(cy0);
+        let ix1 = rx1.min(cx1);
+        let iy1 = ry1.min(cy1);
+        if ix0 < ix1 && iy0 < iy1 {
+            out.push(ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: ix0, y: iy0 },
+                extent: ash::vk::Extent2D {
+                    width: u32::try_from(ix1 - ix0).unwrap_or(0),
+                    height: u32::try_from(iy1 - iy0).unwrap_or(0),
+                },
+            });
+        }
+    }
+    out
+}
+
+fn compute_copy_area_dst_rects(
+    dst_rect: ash::vk::Rect2D,
+    child_rects: &[ash::vk::Rect2D],
+) -> Vec<ash::vk::Rect2D> {
+    if dst_rect.extent.width == 0 || dst_rect.extent.height == 0 {
+        return Vec::new();
+    }
+    let mut current = vec![dst_rect];
+    for child in child_rects {
+        let mut next = Vec::new();
+        for r in current {
+            next.extend(subtract_one_rect_clip(r, *child));
+        }
+        current = next;
+        if current.is_empty() {
+            return current;
+        }
+    }
+    current
+}
+
+/// Subtract `inner` from `outer`. Both rects are in the same coord
+/// space. Result is up to 4 disjoint sub-rectangles tiling
+/// `outer \ inner` (top strip, bottom strip, middle-band left strip,
+/// middle-band right strip — Xorg/pixman band order). If `inner`
+/// doesn't intersect `outer`, returns `[outer]` unchanged.
+fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec<ash::vk::Rect2D> {
+    let ox0 = outer.offset.x;
+    let oy0 = outer.offset.y;
+    let ox1 = outer.offset.x + i32::try_from(outer.extent.width).unwrap_or(i32::MAX);
+    let oy1 = outer.offset.y + i32::try_from(outer.extent.height).unwrap_or(i32::MAX);
+    // Intersection of inner with outer (clamped to outer's bounds).
+    let ix0 = inner.offset.x.max(ox0);
+    let iy0 = inner.offset.y.max(oy0);
+    let ix1 = (inner.offset.x + i32::try_from(inner.extent.width).unwrap_or(0)).min(ox1);
+    let iy1 = (inner.offset.y + i32::try_from(inner.extent.height).unwrap_or(0)).min(oy1);
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return vec![outer];
+    }
+    let mk = |x: i32, y: i32, w: i32, h: i32| ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x, y },
+        extent: ash::vk::Extent2D {
+            width: u32::try_from(w).unwrap_or(0),
+            height: u32::try_from(h).unwrap_or(0),
+        },
+    };
+    let mut result = Vec::with_capacity(4);
+    // Top strip: full outer width, y in [oy0, iy0).
+    if oy0 < iy0 {
+        result.push(mk(ox0, oy0, ox1 - ox0, iy0 - oy0));
+    }
+    // Bottom strip: full outer width, y in [iy1, oy1).
+    if iy1 < oy1 {
+        result.push(mk(ox0, iy1, ox1 - ox0, oy1 - iy1));
+    }
+    // Left middle: middle band height, x in [ox0, ix0).
+    if ox0 < ix0 {
+        result.push(mk(ox0, iy0, ix0 - ox0, iy1 - iy0));
+    }
+    // Right middle: middle band height, x in [ix1, ox1).
+    if ix1 < ox1 {
+        result.push(mk(ix1, iy0, ox1 - ix1, iy1 - iy0));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KmsBackendV2, PictureRecord, resolve_picture_for_render};
+    use super::{
+        KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, intersect_rect_with_clip,
+        resolve_picture_for_render,
+    };
     use crate::kms::cpu_types::Repeat;
     use std::collections::HashMap;
     use yserver_core::backend::Backend;
@@ -10355,5 +10628,233 @@ mod tests {
             res.is_err(),
             "import_syncobj without Vk must Err on the Vk gate",
         );
+    }
+
+    /// Stage 4d Manual-redirect CopyArea clip-by-children fix.
+    ///
+    /// Scenario from `yserver-hw-mate.log` (CC frame + reparented
+    /// CC client window in one redirected backing):
+    ///   - Frame W=997, H=652 at parent-local (0, 0).
+    ///   - Reparented CC client at (11, 41) inside the frame,
+    ///     size 975×600 (mapped).
+    ///   - Marco copies its decoration pixmap into the frame with
+    ///     a `ClipByChildren` GC, full 997×652.
+    ///
+    /// Pre-fix: v2's `copy_area` blits the full 997×652 into the
+    /// redirected backing, clobbering CC's content. Visible symptom:
+    /// only the small region CC repaints next survives — the famous
+    /// "top-left square only" artefact.
+    ///
+    /// Spec-correct behaviour (Xorg `mi/midispcur.c` + the
+    /// `ClipByChildren` rule): subtract every mapped child window's
+    /// rect from the destination rect before issuing the copy. For
+    /// this one-child case the result is exactly four strips: top,
+    /// bottom, left-of-child, right-of-child.
+    #[test]
+    fn copy_area_clip_by_children_excludes_mapped_child_rect() {
+        use ash::vk;
+        let dst = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 997,
+                height: 652,
+            },
+        };
+        let child = vk::Rect2D {
+            offset: vk::Offset2D { x: 11, y: 41 },
+            extent: vk::Extent2D {
+                width: 975,
+                height: 600,
+            },
+        };
+
+        let got = compute_copy_area_dst_rects(dst, &[child]);
+
+        // Expected order: top strip, bottom strip, left middle,
+        // right middle (Xorg/pixman band order).
+        let want = vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: 997,
+                    height: 41,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 641 },
+                extent: vk::Extent2D {
+                    width: 997,
+                    height: 11,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 41 },
+                extent: vk::Extent2D {
+                    width: 11,
+                    height: 600,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 986, y: 41 },
+                extent: vk::Extent2D {
+                    width: 11,
+                    height: 600,
+                },
+            },
+        ];
+
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "expected 4 surviving strips (top, bottom, left-middle, right-middle); \
+             pre-fix returns the unclipped 1-rect input, which is the bug",
+        );
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                (g.offset.x, g.offset.y, g.extent.width, g.extent.height),
+                (w.offset.x, w.offset.y, w.extent.width, w.extent.height),
+                "strip {i} mismatch",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_area_clip_by_children_no_children_returns_input() {
+        use ash::vk;
+        let dst = vk::Rect2D {
+            offset: vk::Offset2D { x: 5, y: 7 },
+            extent: vk::Extent2D {
+                width: 100,
+                height: 80,
+            },
+        };
+        let got = compute_copy_area_dst_rects(dst, &[]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].offset.x, 5);
+        assert_eq!(got[0].offset.y, 7);
+        assert_eq!(got[0].extent.width, 100);
+        assert_eq!(got[0].extent.height, 80);
+    }
+
+    /// GC clip intersection: rect partially inside a single clip rect
+    /// produces the intersection alone. Pre-fix the stub returns the
+    /// whole rect — losing the GC clip semantics.
+    #[test]
+    fn intersect_rect_with_clip_single_overlapping_clip_returns_intersection() {
+        use ash::vk;
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 200,
+                height: 200,
+            },
+        };
+        let clip = vec![vk::Rect2D {
+            offset: vk::Offset2D { x: 50, y: 50 },
+            extent: vk::Extent2D {
+                width: 100,
+                height: 100,
+            },
+        }];
+        let got = intersect_rect_with_clip(rect, &clip);
+        assert_eq!(got.len(), 1, "single clip ∩ rect = one intersection");
+        assert_eq!(
+            (
+                got[0].offset.x,
+                got[0].offset.y,
+                got[0].extent.width,
+                got[0].extent.height,
+            ),
+            (50, 50, 100, 100),
+        );
+    }
+
+    #[test]
+    fn intersect_rect_with_clip_empty_clip_returns_empty() {
+        use ash::vk;
+        // Empty clip-rect list represents an empty XFixes region — paint nothing.
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 10,
+                height: 10,
+            },
+        };
+        let got = intersect_rect_with_clip(rect, &[]);
+        assert!(got.is_empty());
+    }
+
+    /// Multi-rect clip: dst that straddles two non-contiguous clip rects
+    /// produces two intersections.
+    #[test]
+    fn intersect_rect_with_clip_multi_rect_clip_produces_per_rect_intersections() {
+        use ash::vk;
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 200,
+                height: 100,
+            },
+        };
+        let clip = vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 10, y: 10 },
+                extent: vk::Extent2D {
+                    width: 40,
+                    height: 40,
+                },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 150, y: 10 },
+                extent: vk::Extent2D {
+                    width: 40,
+                    height: 40,
+                },
+            },
+        ];
+        let got = intersect_rect_with_clip(rect, &clip);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (
+                got[0].offset.x,
+                got[0].offset.y,
+                got[0].extent.width,
+                got[0].extent.height,
+            ),
+            (10, 10, 40, 40),
+        );
+        assert_eq!(
+            (
+                got[1].offset.x,
+                got[1].offset.y,
+                got[1].extent.width,
+                got[1].extent.height,
+            ),
+            (150, 10, 40, 40),
+        );
+    }
+
+    #[test]
+    fn copy_area_clip_by_children_disjoint_child_returns_input() {
+        // Child fully outside dst → no clipping.
+        use ash::vk;
+        let dst = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 50,
+                height: 50,
+            },
+        };
+        let child = vk::Rect2D {
+            offset: vk::Offset2D { x: 200, y: 200 },
+            extent: vk::Extent2D {
+                width: 10,
+                height: 10,
+            },
+        };
+        let got = compute_copy_area_dst_rects(dst, &[child]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].offset.x, 0);
+        assert_eq!(got[0].offset.y, 0);
     }
 }

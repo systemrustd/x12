@@ -26,7 +26,7 @@ use std::{
 };
 
 use yserver_core::{
-    backend::{ClipState, FillState, GcFunction, PixmapHandle},
+    backend::{ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode},
     host_x11::{HostPointerEvent, HostXidMap},
 };
 use yserver_protocol::x11::{CharInfo as ProtocolCharInfo, FontMetrics, ResourceId, xfixes};
@@ -749,6 +749,14 @@ pub(crate) struct KmsCore {
     pub(crate) current_background: u32,
     pub(crate) current_fill: FillState,
     pub(crate) current_clip: ClipState,
+    // Default: `ClipByChildren` per X11 spec § GC. When set,
+    // core drawing ops on a window dst must exclude every
+    // mapped child window's area (Stage 4d Manual-redirect
+    // fix — relevant because v2 collapses an entire redirected
+    // subtree into one backing pixmap, so parent paint can no
+    // longer "miss" its own children by virtue of separate
+    // storage).
+    pub(crate) current_subwindow_mode: SubwindowMode,
 
     // SHAPE extension: per-window shape regions keyed by host XID.
     // None entry = no shape (full rectangle). Some(vec![]) = empty region.
@@ -859,6 +867,7 @@ impl KmsCore {
             current_background: 0x00ff_ffff,
             current_fill: FillState::Solid,
             current_clip: ClipState::None,
+            current_subwindow_mode: SubwindowMode::ClipByChildren,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),
@@ -929,6 +938,7 @@ impl KmsCore {
             current_background: 0x00ff_ffff,
             current_fill: FillState::Solid,
             current_clip: ClipState::None,
+            current_subwindow_mode: SubwindowMode::ClipByChildren,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),

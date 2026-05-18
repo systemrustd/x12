@@ -239,13 +239,33 @@ fn accumulate_at_level(
             d.rects.push(rect_i16);
         }
         if !fired && state.clients.contains_key(&owner.0) {
+            // Per X11 DAMAGE spec + Xorg `damageext/damageext.c:117-126`
+            // (`DamageExtNotify` with `pBoxes == NULL`): NonEmpty events
+            // carry the full drawable extent in `area`, not the actual
+            // damaged sub-rect. Compositors (marco, picom, …) treat
+            // `area` as the region to recomposite — passing the small
+            // rect makes them clip the next composite to it, leaving
+            // the rest of the offscreen stale (observed as shrinking /
+            // top-left-only CC content after small client updates on
+            // marco-with-compositing). Raw / Delta / BoundingBox keep
+            // the current rect.
+            let area_for_level = if level == x11damage::report_level::NON_EMPTY {
+                x11damage::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: geom_full.width,
+                    height: geom_full.height,
+                }
+            } else {
+                area
+            };
             pending.push(PendingNotify {
                 owner,
                 damage_id,
                 level,
                 drawable: level_drawable.0,
                 geometry: geom_rect,
-                area,
+                area: area_for_level,
             });
             if let Some(d) = state.damage_objects.get_mut(&damage_id) {
                 d.pending_notify_fired = true;
@@ -584,6 +604,84 @@ mod tests {
         assert_eq!(
             drawable_geometry_full_extent(&state, ResourceId(0xdead_beef)),
             (0, 0),
+        );
+    }
+
+    /// Per X11 DAMAGE spec + Xorg `damageext/damageext.c:117-126`:
+    /// `DamageReportNonEmpty` (level 3) carries the drawable's FULL
+    /// extent in the event `area` field, not the actually-damaged
+    /// sub-rect. Compositors use `area` as the recomposite region —
+    /// passing the small rect makes them clip the next composite to
+    /// it, leaving the rest of the offscreen stale (observed as
+    /// shrinking / top-left-only CC content after small client
+    /// updates against marco-with-compositing).
+    #[test]
+    fn non_empty_damage_notify_area_is_full_drawable_extent() {
+        use std::io::Read;
+        let mut state = ServerState::new();
+
+        // Client with a real UnixStream pair (not the throwaway
+        // `make_test_writer` — we need to read the encoded event
+        // back). The read end stays alive in `read_end` for the
+        // duration of the test so writes don't EPIPE.
+        let (writer_end, mut read_end) = UnixStream::pair().expect("UnixStream::pair");
+        read_end
+            .set_nonblocking(true)
+            .expect("set_nonblocking on read end");
+        state.clients.insert(
+            1,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer_end)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+
+        // Window 800×600 at root origin. Damage object level=3 (NonEmpty).
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 800, 600);
+        add_damage_on(&mut state, 1, 0xe000_0001, w_id);
+
+        // Small paint at (50, 100) 20×30 — the "post-first-frame
+        // tooltip update" shape that exposed the bug on CC.
+        let _ = accumulate_damage_to_state(&mut state, w_id, 50, 100, 20, 30);
+
+        // Read the encoded DamageNotify off the socket. 32 bytes.
+        let mut buf = [0u8; 32];
+        let n = read_end
+            .read(&mut buf)
+            .expect("read encoded DamageNotify event");
+        assert_eq!(n, 32, "DamageNotify event is exactly 32 bytes on the wire");
+
+        assert_eq!(buf[0], DAMAGE_FIRST_EVENT, "response_type = DamageNotify");
+        assert_eq!(
+            buf[1],
+            x11damage::report_level::NON_EMPTY,
+            "level byte must be NonEmpty (3)",
+        );
+
+        // Area lives at bytes 16..24 (x:i16, y:i16, w:u16, h:u16),
+        // little-endian per the client byte order set above.
+        let area_x = i16::from_le_bytes([buf[16], buf[17]]);
+        let area_y = i16::from_le_bytes([buf[18], buf[19]]);
+        let area_w = u16::from_le_bytes([buf[20], buf[21]]);
+        let area_h = u16::from_le_bytes([buf[22], buf[23]]);
+        assert_eq!(
+            (area_x, area_y, area_w, area_h),
+            (0, 0, 800, 600),
+            "NonEmpty area must be the drawable's full extent (Xorg \
+             damageext.c:117-126 fills {{0,0,w,h}} when pBoxes == NULL); \
+             pre-fix this would be (50, 100, 20, 30) — the small paint \
+             rect — which is the bug",
         );
     }
 }

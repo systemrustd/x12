@@ -9503,26 +9503,62 @@ fn handle_copy_area(
         let st = draw_state.unwrap_or_default();
         backend.apply_clip_state(origin, &st.clip)?;
         backend.apply_draw_state(origin, &st)?;
-        backend.copy_area(
-            origin,
-            src.host_xid(),
-            dst.host_xid(),
-            request.src_x,
-            request.src_y,
-            request.dst_x,
-            request.dst_y,
-            request.width,
-            request.height,
-        )?;
+        // Stage 4d Manual-redirect fix (codex 2026-05-18): when the
+        // destination is a window, the X11 spec requires copy_area to
+        // honour (a) the GC's clip-mask if rectangular and (b) the
+        // `subwindow-mode=ClipByChildren` default by subtracting every
+        // mapped child window's geometry from the destination rect.
+        //
+        // We do this at the dispatch layer because
+        // `state.resources.host_drawable_target(req.dst)` eagerly
+        // substitutes a redirected window's backing pixmap for its
+        // host_xid, so the backend can no longer tell the original
+        // destination was a window. Splitting here keeps the existing
+        // backend trait shape and applies to v1 and v2 uniformly.
+        // ClipState::Pixmap (mask-pixmap clip) is out of scope for this
+        // fix and passes through untouched.
+        let copy_sub_rects = copy_area_effective_dst_rects(state, request.dst, &st, &request);
+        if copy_sub_rects.is_empty() {
+            debug!(
+                "client {} #{} CopyArea fully clipped, no backend call",
+                client_id.0, sequence.0,
+            );
+        }
+        for sub in &copy_sub_rects {
+            // src coords shift by the same delta the dst sub-rect
+            // shifted from the original dst_xy.
+            let sub_src_x = request
+                .src_x
+                .saturating_add(sub.x.saturating_sub(request.dst_x));
+            let sub_src_y = request
+                .src_y
+                .saturating_add(sub.y.saturating_sub(request.dst_y));
+            backend.copy_area(
+                origin,
+                src.host_xid(),
+                dst.host_xid(),
+                sub_src_x,
+                sub_src_y,
+                sub.x,
+                sub.y,
+                sub.width,
+                sub.height,
+            )?;
+        }
         let dst_id = request.dst;
-        let _dropped = accumulate_damage_to_state(
-            state,
-            dst_id,
-            request.dst_x,
-            request.dst_y,
-            request.width,
-            request.height,
-        );
+        // Damage per actually-copied sub-rect rather than the original
+        // full rect — avoids over-damaging the children's areas a
+        // ClipByChildren split just excluded. Skipped naturally when
+        // the slice is empty (fully-clipped copy).
+        for sub in &copy_sub_rects {
+            let _dropped =
+                accumulate_damage_to_state(state, dst_id, sub.x, sub.y, sub.width, sub.height);
+        }
+        // Note: GraphicsExpose / NoExposure below still fires even
+        // when the copy was fully clipped (codex 2026-05-18 follow-up).
+        // Clients with `graphics-exposures=True` rely on receiving
+        // exactly one of those events per handled CopyArea regardless
+        // of whether the server actually copied any pixels.
         // X11 spec: when graphics-exposures is True, send GraphicsExpose
         // for the regions of source that weren't visible (or NoExposure
         // when fully visible). We don't track source obscurity, so we
@@ -9557,6 +9593,199 @@ fn handle_copy_area(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Rectangle in destination-window-local coordinates, used by the
+/// X11 CopyArea clipping pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CopyAreaSubRect {
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+}
+
+/// Compute the surviving destination sub-rectangles for an X11
+/// CopyArea request after applying:
+///
+/// 1. GC rectangular clip-mask (`ClipState::Rectangles`). Empty or
+///    completely-disjoint clip → empty Vec (spec-correct no-op).
+///    `ClipState::Pixmap` is currently NOT honoured here (out of
+///    scope for the Stage 4d fix — see the inline TODO below).
+/// 2. `subwindow-mode == ClipByChildren` (X11 default): subtract
+///    every mapped child window's geometry from the destination
+///    rectangle. v2 collapses a redirected subtree into a single
+///    backing pixmap, so this is the layer that prevents marco's
+///    decoration copies into a frame window from clobbering the
+///    reparented client child area.
+///
+/// Pixmap destinations skip clipping entirely (no children to
+/// subtract; rectangular clip already applies via the same path).
+///
+/// Returns rectangles in the **destination window's** coordinate
+/// space (matching the wire `dst_x` / `dst_y` units).
+fn copy_area_effective_dst_rects(
+    state: &crate::server::ServerState,
+    dst_id: ResourceId,
+    draw_state: &crate::backend::DrawState,
+    req: &yserver_protocol::x11::CopyAreaRequest,
+) -> Vec<CopyAreaSubRect> {
+    let mut current: Vec<CopyAreaSubRect> = vec![CopyAreaSubRect {
+        x: req.dst_x,
+        y: req.dst_y,
+        width: req.width,
+        height: req.height,
+    }];
+    // Step 1: GC rectangular clip-mask. `ClipState::None` is
+    // "no clip" (pass through); `ClipState::Pixmap` is the
+    // depth-1 mask form — TODO: rasterise to rect-band; for now
+    // pass through (mirrors v1's `intersect_with_current_clip`
+    // pixmap-clip skip).
+    if let crate::backend::ClipState::Rectangles { origin, rects } = &draw_state.clip {
+        let mut clip_rects: Vec<CopyAreaSubRect> = Vec::with_capacity(rects.rectangles.len() / 8);
+        for chunk in rects.rectangles.chunks_exact(8) {
+            let cx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(origin.0);
+            let cy = i16::from_le_bytes([chunk[2], chunk[3]]).saturating_add(origin.1);
+            let cw = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let ch = u16::from_le_bytes([chunk[6], chunk[7]]);
+            if cw > 0 && ch > 0 {
+                clip_rects.push(CopyAreaSubRect {
+                    x: cx,
+                    y: cy,
+                    width: cw,
+                    height: ch,
+                });
+            }
+        }
+        current = current
+            .into_iter()
+            .flat_map(|r| {
+                clip_rects
+                    .iter()
+                    .filter_map(move |c| intersect_sub_rects(r, *c))
+            })
+            .collect();
+        if current.is_empty() {
+            return current;
+        }
+    }
+    // Step 2: ClipByChildren. Only meaningful when:
+    // - dst is a window (pixmaps have no children),
+    // - subwindow-mode is ClipByChildren (default),
+    // - the window has mapped children.
+    let Some(dst_window) = state.resources.window(dst_id) else {
+        return current;
+    };
+    if !matches!(
+        draw_state.subwindow_mode,
+        crate::backend::SubwindowMode::ClipByChildren
+    ) {
+        return current;
+    }
+    let child_rects: Vec<CopyAreaSubRect> = dst_window
+        .children
+        .iter()
+        .filter_map(|cid| {
+            let c = state.resources.window(*cid)?;
+            (c.map_state == crate::resources::MapState::Viewable && c.width > 0 && c.height > 0)
+                .then_some(CopyAreaSubRect {
+                    x: c.x,
+                    y: c.y,
+                    width: c.width,
+                    height: c.height,
+                })
+        })
+        .collect();
+    if child_rects.is_empty() {
+        return current;
+    }
+    for child in &child_rects {
+        let mut next = Vec::new();
+        for r in current {
+            next.extend(subtract_sub_rect(r, *child));
+        }
+        current = next;
+        if current.is_empty() {
+            return current;
+        }
+    }
+    current
+}
+
+/// Rect ∩ rect. Returns `None` for disjoint or zero-area input.
+fn intersect_sub_rects(a: CopyAreaSubRect, b: CopyAreaSubRect) -> Option<CopyAreaSubRect> {
+    let ax0 = i32::from(a.x);
+    let ay0 = i32::from(a.y);
+    let ax1 = ax0 + i32::from(a.width);
+    let ay1 = ay0 + i32::from(a.height);
+    let bx0 = i32::from(b.x);
+    let by0 = i32::from(b.y);
+    let bx1 = bx0 + i32::from(b.width);
+    let by1 = by0 + i32::from(b.height);
+    let ix0 = ax0.max(bx0);
+    let iy0 = ay0.max(by0);
+    let ix1 = ax1.min(bx1);
+    let iy1 = ay1.min(by1);
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return None;
+    }
+    Some(CopyAreaSubRect {
+        x: i16::try_from(ix0).ok()?,
+        y: i16::try_from(iy0).ok()?,
+        width: u16::try_from(ix1 - ix0).ok()?,
+        height: u16::try_from(iy1 - iy0).ok()?,
+    })
+}
+
+/// `outer \ inner` → up to 4 disjoint sub-rectangles (top strip,
+/// bottom strip, left middle, right middle). If `inner` doesn't
+/// intersect `outer`, returns `[outer]` unchanged.
+fn subtract_sub_rect(outer: CopyAreaSubRect, inner: CopyAreaSubRect) -> Vec<CopyAreaSubRect> {
+    let ox0 = i32::from(outer.x);
+    let oy0 = i32::from(outer.y);
+    let ox1 = ox0 + i32::from(outer.width);
+    let oy1 = oy0 + i32::from(outer.height);
+    let ix0 = i32::from(inner.x).max(ox0);
+    let iy0 = i32::from(inner.y).max(oy0);
+    let ix1 = (i32::from(inner.x) + i32::from(inner.width)).min(ox1);
+    let iy1 = (i32::from(inner.y) + i32::from(inner.height)).min(oy1);
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return vec![outer];
+    }
+    let mk = |x: i32, y: i32, w: i32, h: i32| -> Option<CopyAreaSubRect> {
+        Some(CopyAreaSubRect {
+            x: i16::try_from(x).ok()?,
+            y: i16::try_from(y).ok()?,
+            width: u16::try_from(w).ok()?,
+            height: u16::try_from(h).ok()?,
+        })
+    };
+    let mut out = Vec::with_capacity(4);
+    // Top strip
+    if oy0 < iy0
+        && let Some(r) = mk(ox0, oy0, ox1 - ox0, iy0 - oy0)
+    {
+        out.push(r);
+    }
+    // Bottom strip
+    if iy1 < oy1
+        && let Some(r) = mk(ox0, iy1, ox1 - ox0, oy1 - iy1)
+    {
+        out.push(r);
+    }
+    // Left middle
+    if ox0 < ix0
+        && let Some(r) = mk(ox0, iy0, ix0 - ox0, iy1 - iy0)
+    {
+        out.push(r);
+    }
+    // Right middle
+    if ix1 < ox1
+        && let Some(r) = mk(ix1, iy0, ox1 - ix1, iy1 - iy0)
+    {
+        out.push(r);
+    }
+    out
 }
 
 fn handle_copy_plane(
@@ -12915,5 +13144,423 @@ mod tests {
              root-relative position + extent; pre-fix this hardcodes \
              (0, 0, w, h) and breaks marco's screen-rect mapping",
         );
+    }
+
+    /// Stage 4d follow-up (codex review 2026-05-18): when ClipByChildren
+    /// (or any other clipping) fully covers the destination so no pixels
+    /// are actually copied, the X11 spec still requires the server to
+    /// emit a GraphicsExpose / NoExposure event for clients with
+    /// `graphics-exposures=True`. Pre-fix the early-return-on-empty
+    /// path silently swallowed this event; clients waiting on it
+    /// (xterm, gtk2 backing-store users) would hang.
+    #[test]
+    fn copy_area_fully_clipped_still_emits_graphics_expose_event() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateGcRequest, CreateWindowRequest};
+
+        const FRAME_XID: u32 = 0x0010_0001;
+        const FRAME_HOST: u32 = 0x0040_0001;
+        const FRAME_BACKING_HOST: u32 = 0x0050_0001;
+        const CHILD_XID: u32 = 0x0010_0002;
+        const CHILD_HOST: u32 = 0x0040_0002;
+        const SRC_PIXMAP_XID: u32 = 0x0010_0010;
+        const SRC_PIXMAP_HOST: u32 = 0x0040_0010;
+        const GC_XID: u32 = 0x0010_0020;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // Make the peer-read non-blocking so an absent event doesn't
+        // hang the test.
+        peer.set_nonblocking(true).expect("nonblocking");
+        let mut backend = RecordingBackend::new();
+
+        // Frame 100×100 entirely covered by child window 100×100 at
+        // (0, 0). Any CopyArea(dst=frame, 0,0 100x100) gets fully
+        // clipped by the child.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(FRAME_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(FRAME_XID))
+                .expect("frame");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(FRAME_HOST));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(FRAME_BACKING_HOST),
+                width: 100,
+                height: 100,
+                depth: 24,
+            });
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ResourceId(FRAME_XID),
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(CHILD_XID))
+                .expect("child");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(CHILD_HOST));
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(SRC_PIXMAP_XID),
+                drawable: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                depth: 24,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(SRC_PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw_for_test(SRC_PIXMAP_HOST),
+        );
+        // GC with graphics_exposures = True (the spec default; without
+        // explicit override the GC inherits that default).
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(GC_XID),
+                drawable: ResourceId(FRAME_XID),
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: Some(true),
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&SRC_PIXMAP_XID.to_le_bytes());
+        body.extend_from_slice(&FRAME_XID.to_le_bytes());
+        body.extend_from_slice(&GC_XID.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes());
+        body.extend_from_slice(&100_u16.to_le_bytes());
+        body.extend_from_slice(&100_u16.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 62,
+                data: 0,
+                length_units: 7,
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch CopyArea");
+
+        // No backend.copy_area should have fired (fully clipped).
+        let copy_calls = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, crate::backend::recording::RecordedCall::CopyArea { .. }))
+            .count();
+        assert_eq!(
+            copy_calls, 0,
+            "fully-clipped CopyArea must NOT call backend.copy_area",
+        );
+
+        // But the GraphicsExpose event must still have been sent.
+        let mut buf = [0u8; 64];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert!(
+            n >= 32,
+            "expected a 32-byte GraphicsExpose event even for a \
+             fully-clipped CopyArea (codex review 2026-05-18); got \
+             {n} bytes",
+        );
+        assert_eq!(
+            buf[0], 13,
+            "first byte must be GraphicsExpose (event type 13)",
+        );
+    }
+
+    /// Stage 4d Manual-redirect CopyArea ClipByChildren fix.
+    ///
+    /// Scenario (matches marco's failing #6886 / #7450 CopyArea on
+    /// the MATE Control Center frame):
+    /// - Frame window 997×652 at root, mapped, with a redirected
+    ///   backing pixmap allocated.
+    /// - CC client window 975×600 reparented under the frame at
+    ///   (11, 41), mapped.
+    /// - X11 CopyArea(src=decoration_pixmap, dst=frame_window,
+    ///   gc=default) 997×652.
+    ///
+    /// Pre-fix: dispatch resolves `dst` to the backing pixmap and
+    /// hands the backend a single full-extent copy, which clobbers
+    /// the area where CC's content lives in the backing.
+    ///
+    /// Spec-correct (Xorg `mi/midispcur.c` + the X11 GC
+    /// `subwindow-mode` default): under `ClipByChildren`, subtract
+    /// every mapped child's geometry before copying. Result is the
+    /// four border strips (top/bottom/left/right of CC).
+    #[test]
+    fn copy_area_into_window_with_mapped_child_excludes_child_area() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::{CreateGcRequest, CreateWindowRequest};
+
+        const FRAME_XID: u32 = 0x0010_0001;
+        const FRAME_HOST: u32 = 0x0040_0001;
+        const FRAME_BACKING_HOST: u32 = 0x0050_0001;
+        const CHILD_XID: u32 = 0x0010_0002;
+        const CHILD_HOST: u32 = 0x0040_0002;
+        const SRC_PIXMAP_XID: u32 = 0x0010_0010;
+        const SRC_PIXMAP_HOST: u32 = 0x0040_0010;
+        const GC_XID: u32 = 0x0010_0020;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Frame: top-level under root, viewable, redirected (backing
+        // present). Mirrors the post-Reparent + post-Map + post-
+        // activate_redirect_backing state.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(FRAME_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 997,
+                height: 652,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(FRAME_XID))
+                .expect("frame");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(FRAME_HOST));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(FRAME_BACKING_HOST),
+                width: 997,
+                height: 652,
+                depth: 24,
+            });
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        // CC: child of frame, viewable, at (11, 41) sized 975×600.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ResourceId(FRAME_XID),
+                x: 11,
+                y: 41,
+                width: 975,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(CHILD_XID))
+                .expect("child");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(CHILD_HOST));
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        // Source pixmap (depth-24, same depth as frame).
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(SRC_PIXMAP_XID),
+                drawable: ROOT_WINDOW,
+                width: 997,
+                height: 652,
+                depth: 24,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(SRC_PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw_for_test(SRC_PIXMAP_HOST),
+        );
+        // GC for client 1. Every value-mask field is None → defaults
+        // apply, including subwindow-mode = ClipByChildren.
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(GC_XID),
+                drawable: ResourceId(FRAME_XID),
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        // Build CopyArea body: src(4) dst(4) gc(4) src_x(2) src_y(2)
+        //                      dst_x(2) dst_y(2) width(2) height(2).
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&SRC_PIXMAP_XID.to_le_bytes());
+        body.extend_from_slice(&FRAME_XID.to_le_bytes());
+        body.extend_from_slice(&GC_XID.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes()); // src_x
+        body.extend_from_slice(&0_i16.to_le_bytes()); // src_y
+        body.extend_from_slice(&0_i16.to_le_bytes()); // dst_x
+        body.extend_from_slice(&0_i16.to_le_bytes()); // dst_y
+        body.extend_from_slice(&997_u16.to_le_bytes()); // width
+        body.extend_from_slice(&652_u16.to_le_bytes()); // height
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 62, // CopyArea major opcode
+                data: 0,
+                length_units: 7, // 1 header + 6 body words = 7 (4-byte units)
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch CopyArea");
+
+        let copy_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                } => Some((
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                )),
+                _ => None,
+            })
+            .collect();
+
+        // Pre-fix: a single 997×652 CopyArea covering CC's area.
+        // Post-fix: four border strips that miss the (11, 41, 975, 600)
+        // child rect entirely.
+        assert_eq!(
+            copy_calls.len(),
+            4,
+            "expected 4 border strips for ClipByChildren around the \
+             mapped child; pre-fix this is 1 (the full-extent copy \
+             that clobbers CC's area in the backing); got {copy_calls:?}",
+        );
+
+        // No copy may overlap the child rect (11, 41, 975, 600).
+        let child = (11_i32, 41_i32, 11_i32 + 975, 41_i32 + 600);
+        for (_, dst_host, _, _, dx, dy, w, h) in &copy_calls {
+            let r = (
+                i32::from(*dx),
+                i32::from(*dy),
+                i32::from(*dx) + i32::from(*w),
+                i32::from(*dy) + i32::from(*h),
+            );
+            let overlaps = r.0 < child.2 && r.2 > child.0 && r.1 < child.3 && r.3 > child.1;
+            assert!(
+                !overlaps,
+                "copy strip ({dx},{dy} {w}x{h}) overlaps the child rect (11,41 975x600); \
+                 ClipByChildren must exclude mapped children",
+            );
+            // All strips must target the frame's backing pixmap (the
+            // host xid eagerly substituted by host_drawable_target).
+            assert_eq!(
+                *dst_host, FRAME_BACKING_HOST,
+                "ClipByChildren splitting must NOT change the backend's \
+                 dst host_xid; it stays the redirected backing pixmap",
+            );
+        }
     }
 }
