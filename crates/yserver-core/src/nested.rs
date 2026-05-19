@@ -24,7 +24,7 @@ const RANDR_FIRST_ERROR: u8 = 147;
 
 const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;
-const RENDER_FIRST_ERROR: u8 = 152;
+pub(crate) const RENDER_FIRST_ERROR: u8 = 152;
 
 const GE_MAJOR_OPCODE: u8 = 138;
 

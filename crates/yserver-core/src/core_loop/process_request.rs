@@ -2830,16 +2830,37 @@ fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                // VERIFY_PICTURE (`xfixes/region.c:255`) returns
+                // `RenderErrBase + BadPicture` on an unknown
+                // picture xid — NOT BadDrawable.
+                let bad_picture = crate::nested::RENDER_FIRST_ERROR + 1;
                 let Some(picture_state) = state.resources.picture(ResourceId(picture)) else {
                     return emit_x11_error(
                         state,
                         client_id,
                         sequence,
-                        x11::error::BAD_DRAWABLE,
+                        bad_picture,
                         picture,
                         XFIXES_MAJOR_OPCODE,
                     );
                 };
+                // `if (!pPicture->pDrawable) return RenderErrBase +
+                // BadPicture` at `xfixes/region.c:257-258`. yserver's
+                // `PictureKind::Sourceless` (SolidFill / gradient
+                // pictures) is exactly that case.
+                if matches!(
+                    picture_state.kind,
+                    crate::resources::PictureKind::Sourceless
+                ) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        bad_picture,
+                        picture,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 let Some(client_clip) =
                     backend.picture_client_clip_rects(picture_state.host_picture_xid.as_raw())
                 else {
@@ -15124,6 +15145,120 @@ mod tests {
              got {} bytes: {:02x?}",
             all.len(),
             all,
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): Xorg's
+    /// `ProcXFixesCreateRegionFromPicture` (`xfixes/region.c:257-258`)
+    /// returns `RenderErrBase + BadPicture` when the picture has no
+    /// underlying drawable. yserver models this case as
+    /// `PictureKind::Sourceless` (SolidFill / gradient pictures).
+    /// Pre-fix the handler fell through to `picture_client_clip_rects`
+    /// and surfaced BadMatch — wrong error class for a sourceless
+    /// picture.
+    #[test]
+    fn create_region_from_picture_with_sourceless_picture_returns_bad_picture() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const APP: u32 = 84;
+        const PICTURE_XID: u32 = 0x0084_0001;
+        const REGION_XID: u32 = 0x0084_0002;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_picture(
+            ResourceId(PICTURE_XID),
+            crate::resources::PictureState {
+                client: ClientId(APP),
+                host_picture_xid: crate::backend::PictureHandle::from_raw_for_test(0x42),
+                host_owned_pixmap: None,
+                kind: crate::resources::PictureKind::Sourceless,
+                drawable: None,
+            },
+        );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&PICTURE_XID.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_PICTURE,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(
+            buf[1],
+            crate::nested::RENDER_FIRST_ERROR + 1,
+            "expected BadPicture (Render first_error + 1 = 153) for \
+             sourceless picture; got {}",
+            buf[1],
+        );
+        assert!(
+            !state.xfixes_regions.contains_key(&REGION_XID),
+            "no region must be inserted on BadPicture",
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): Xorg's
+    /// `ProcXFixesCreateRegionFromPicture` uses `VERIFY_PICTURE`
+    /// (`xfixes/region.c:255`) which returns
+    /// `RenderErrBase + BadPicture` for an unknown picture xid,
+    /// not BadDrawable. yserver was emitting BadDrawable.
+    #[test]
+    fn create_region_from_picture_with_unknown_picture_returns_bad_picture() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const APP: u32 = 85;
+        const UNKNOWN_PIC: u32 = 0x0085_dead;
+        const REGION_XID: u32 = 0x0085_0001;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&UNKNOWN_PIC.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_PICTURE,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(
+            buf[1],
+            crate::nested::RENDER_FIRST_ERROR + 1,
+            "expected BadPicture for unknown picture xid (Xorg VERIFY_PICTURE \
+             returns RenderErrBase+BadPicture, NOT BadDrawable); got {}",
+            buf[1],
         );
     }
 
