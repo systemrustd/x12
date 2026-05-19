@@ -3931,11 +3931,7 @@ fn dst_has_alpha_for_pict_format(format: vk::Format, depth: u8, pict_format: u32
 /// `pict_format == 0` falls back to `swizzle_class_for` for
 /// internal engine paths that don't carry a Picture identity
 /// (composite_glyphs synthesized A8 masks, trapezoid traps).
-fn swizzle_class_for_pict_format(
-    format: vk::Format,
-    depth: u8,
-    pict_format: u32,
-) -> SwizzleClass {
+fn swizzle_class_for_pict_format(format: vk::Format, depth: u8, pict_format: u32) -> SwizzleClass {
     use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
     // R8_UNORM is alpha-only by construction — pict_format can't
     // override that. Same for the legacy depth-24 BGRA8 case.
@@ -6990,30 +6986,18 @@ mod tests {
 
         // xRGB32 on depth-32 storage → BgraNoAlpha (force α=ONE).
         assert_eq!(
-            swizzle_class_for_pict_format(
-                vk::Format::B8G8R8A8_UNORM,
-                32,
-                RENDER_FMT_XRGB32,
-            ),
+            swizzle_class_for_pict_format(vk::Format::B8G8R8A8_UNORM, 32, RENDER_FMT_XRGB32,),
             SwizzleClass::BgraNoAlpha,
         );
         // ARGB32 on depth-32 storage → RgbaIdent (use storage α).
         assert_eq!(
-            swizzle_class_for_pict_format(
-                vk::Format::B8G8R8A8_UNORM,
-                32,
-                RENDER_FMT_ARGB32,
-            ),
+            swizzle_class_for_pict_format(vk::Format::B8G8R8A8_UNORM, 32, RENDER_FMT_ARGB32,),
             SwizzleClass::RgbaIdent,
         );
         // RGB24 on depth-24 storage → BgraNoAlpha (already true via
         // depth, preserved when pict_format aligns).
         assert_eq!(
-            swizzle_class_for_pict_format(
-                vk::Format::B8G8R8A8_UNORM,
-                24,
-                RENDER_FMT_RGB24,
-            ),
+            swizzle_class_for_pict_format(vk::Format::B8G8R8A8_UNORM, 24, RENDER_FMT_RGB24,),
             SwizzleClass::BgraNoAlpha,
         );
         // R8 storage (A8 mask) is alpha-only regardless of pict_format.

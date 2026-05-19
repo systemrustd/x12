@@ -8,6 +8,7 @@
 //! (see `kms::dispatch::KmsBackendKind`).
 
 mod backend;
+pub(crate) mod cursor;
 pub(crate) mod engine;
 pub(crate) mod glyph_atlas;
 pub(crate) mod platform;

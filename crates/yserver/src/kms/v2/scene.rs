@@ -2371,6 +2371,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
     }

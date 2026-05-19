@@ -81,6 +81,11 @@ pub(crate) struct WindowGeometryV2 {
     pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
     pub(crate) bg_pixmap: Option<u32>,
+    /// Stage 5 Phase A — per-window X11 cursor attribute. `None`
+    /// means inherit from the parent chain; `Some(xid)` pins a
+    /// specific cursor on hover-in. Mutated by `define_cursor` /
+    /// `change_subwindow_attributes` (CWCursor mask bit).
+    pub(crate) cursor: Option<u32>,
 }
 
 pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
@@ -191,6 +196,31 @@ pub struct KmsBackendV2 {
     /// (drm_syncobj fd → timeline `VkSemaphore`). Mirrors v1's
     /// `dri3_sync_resources` field shape.
     pub(crate) dri3_sync_resources: HashMap<u32, ash::vk::Semaphore>,
+
+    /// Stage 5 Phase A — canonical cursor xid → immutable record map.
+    /// Inserted by `create_cursor` / `create_glyph_cursor` /
+    /// `render_create_cursor`; read by `define_cursor` /
+    /// `update_pointer_window` to swap the effective sprite. `Arc`
+    /// so anything that captured a reference (a future Phase D
+    /// deferred upload, a pointer grab) keeps stable bytes even
+    /// after a later replacement.
+    pub(crate) cursor_records: HashMap<u32, std::sync::Arc<crate::kms::v2::cursor::CursorRecord>>,
+    /// Per-cursor uploaded Pixmap drawable. The SW scene path samples
+    /// through this. Lifetime is the same as the matching entry in
+    /// `cursor_records`; both maps share the same xid keys.
+    pub(crate) cursor_pixmaps: HashMap<u32, crate::kms::v2::store::DrawableId>,
+    /// Monotonically-increasing version counter for new
+    /// `CursorRecord` allocations. Compared by VALUE in the Phase B/C
+    /// upload-dedup paths.
+    pub(crate) next_cursor_version: u64,
+    /// Xid of the default-arrow record allocated at backend init.
+    /// `define_cursor(_, 0)` (X11 `None`) falls back to this; the
+    /// scene's `register_cursor` swaps to the entry recorded here.
+    pub(crate) default_cursor_xid: Option<u32>,
+    /// Xid of the currently-effective cursor — the one whose sprite
+    /// is shown on screen. Driven by `update_effective_cursor`;
+    /// `define_cursor` + `update_pointer_window` re-evaluate it.
+    pub(crate) effective_cursor_xid: Option<u32>,
 }
 
 impl KmsBackendV2 {
@@ -386,6 +416,11 @@ impl KmsBackendV2 {
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
+            cursor_records: HashMap::new(),
+            cursor_pixmaps: HashMap::new(),
+            next_cursor_version: 1,
+            default_cursor_xid: None,
+            effective_cursor_xid: None,
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -404,44 +439,288 @@ impl KmsBackendV2 {
     /// z. One-time setup; subsequent `define_cursor` flows (Stage 4)
     /// can replace the entry.
     fn init_cursor_sprite(&mut self) -> io::Result<()> {
-        const CW: u16 = 16;
-        const CH: u16 = 16;
+        // Stage 5 Phase A: bake the default-arrow record into the
+        // canonical cursor maps so any DefineCursor that resolves to
+        // None / unknown can fall back to it. The sprite Pixmap +
+        // scene registration happen via the shared
+        // `insert_cursor_record` path so subsequent client cursors
+        // and the default sit on the same plumbing.
         let xid = self.core.next_host_xid();
-        let storage = self
+        let bytes = crate::kms::v2::cursor::default_arrow_bgra();
+        self.insert_cursor_record(
+            xid,
+            crate::kms::v2::cursor::DEFAULT_ARROW_W,
+            crate::kms::v2::cursor::DEFAULT_ARROW_H,
+            0,
+            0,
+            bytes,
+        );
+        self.default_cursor_xid = Some(xid);
+        // Force the effective cursor to resolve against the new
+        // default so the scene picks it up at boot (otherwise
+        // refresh_effective_cursor short-circuits on
+        // pre-default `effective_cursor_xid == None == new_xid`).
+        self.effective_cursor_xid = None;
+        self.refresh_effective_cursor();
+        log::info!("v2: default cursor sprite registered (xid 0x{xid:x})");
+        Ok(())
+    }
+
+    // ── Stage 5 Phase A — cursor record helpers ────────────────────
+
+    /// Allocate a fresh CursorRecord + sprite Pixmap and register
+    /// both in the canonical xid maps. Bumps `next_cursor_version`,
+    /// uploads the BGRA bytes to a v2 store Pixmap (so the SW scene
+    /// path can sample it), and — if the new cursor is the
+    /// currently-effective one — refreshes the scene's
+    /// `CursorEntry`.
+    ///
+    /// `bgra` length MUST equal `width * height * 4`.
+    fn insert_cursor_record(
+        &mut self,
+        xid: u32,
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        bgra: Vec<u8>,
+    ) {
+        debug_assert_eq!(bgra.len(), usize::from(width) * usize::from(height) * 4);
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let record =
+            crate::kms::v2::cursor::CursorRecord::new(width, height, hot_x, hot_y, bgra, version);
+        // Upload the sprite to a v2 store Pixmap so the SW scene
+        // path can sample it. Best-effort: a Vk-less test fixture
+        // skips the upload but still keeps the record so unit tests
+        // can observe bytes / version.
+        if let Some(pixmap_id) = self.allocate_cursor_sprite_pixmap(&record) {
+            self.cursor_pixmaps.insert(xid, pixmap_id);
+        }
+        self.cursor_records.insert(xid, record);
+        self.refresh_effective_cursor();
+    }
+
+    /// Allocate a v2 store Pixmap matching `record`'s dims, depth-32,
+    /// and upload the BGRA bytes via `engine.put_image`. Returns the
+    /// fresh DrawableId. Failures (no Vk in tests, allocate failure,
+    /// upload failure) return `None` — the caller keeps the record
+    /// but the SW scene path won't sample the sprite for that cursor.
+    fn allocate_cursor_sprite_pixmap(
+        &mut self,
+        record: &std::sync::Arc<crate::kms::v2::cursor::CursorRecord>,
+    ) -> Option<crate::kms::v2::store::DrawableId> {
+        let storage = match self
             .platform
-            .allocate_drawable_storage(CW, CH, 32)
-            .map_err(|e| io::Error::other(format!("cursor storage: {e:?}")))?;
-        let id = self
-            .store
-            .allocate(xid, DrawableKind::Pixmap, 32, false, storage)
-            .map_err(|e| io::Error::other(format!("cursor store.allocate: {e:?}")))?;
-        let bytes = default_cursor_sprite_bgra();
+            .allocate_drawable_storage(record.width, record.height, 32)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!(
+                    "v2 cursor sprite alloc: storage failed ({}x{}, depth 32): {e:?}",
+                    record.width,
+                    record.height,
+                );
+                return None;
+            }
+        };
+        let sprite_xid = self.core.next_host_xid();
+        let id = match self.store.allocate(
+            sprite_xid,
+            crate::kms::v2::store::DrawableKind::Pixmap,
+            32,
+            false,
+            storage,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("v2 cursor sprite alloc: store.allocate failed: {e:?}");
+                return None;
+            }
+        };
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
             id,
             ash::vk::Offset2D::default(),
             ash::vk::Extent2D {
-                width: u32::from(CW),
-                height: u32::from(CH),
+                width: u32::from(record.width),
+                height: u32::from(record.height),
             },
-            &bytes,
+            &record.bgra_bytes,
             32,
         ) {
-            return Err(io::Error::other(format!("cursor put_image: {e:?}")));
+            log::warn!("v2 cursor sprite alloc: put_image failed: {e:?}");
+            // Drop the freshly-allocated storage cleanly so it
+            // doesn't leak.
+            self.store.decref(&mut self.platform, id);
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Read a depth-1 X11 pixmap's pixels as R8 (1 byte per pixel,
+    /// non-zero = bit set). Returns `(bytes, width, height)`. None
+    /// when the pixmap isn't in the store or the engine readback
+    /// fails (Vk-less fixture, format mismatch).
+    fn read_cursor_depth1_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
+        let id = self.store.lookup(host_xid)?;
+        let drawable = self.store.get(id)?;
+        let extent = drawable.storage.extent;
+        let w = u16::try_from(extent.width).ok()?;
+        let h = u16::try_from(extent.height).ok()?;
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        match self
+            .engine
+            .get_image(&mut self.store, &mut self.platform, id, rect, 1)
+        {
+            Ok(bytes) => Some((bytes, w, h)),
+            Err(e) => {
+                log::debug!(
+                    "v2 read_cursor_depth1_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Read a BGRA-mirrored X11 pixmap's pixels at depth 32.
+    /// Returns `(bytes, width, height)`. None when the pixmap isn't
+    /// in the store or readback fails (Vk-less fixture, format
+    /// mismatch).
+    fn read_cursor_bgra_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
+        let id = self.store.lookup(host_xid)?;
+        let drawable = self.store.get(id)?;
+        let extent = drawable.storage.extent;
+        let w = u16::try_from(extent.width).ok()?;
+        let h = u16::try_from(extent.height).ok()?;
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        match self
+            .engine
+            .get_image(&mut self.store, &mut self.platform, id, rect, 32)
+        {
+            Ok(bytes) => Some((bytes, w, h)),
+            Err(e) => {
+                log::debug!(
+                    "v2 read_cursor_bgra_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Render a single FreeType glyph from `font_xid` for use in
+    /// glyph-cursor rasterisation. Returns `(pixels, w, h, lsb,
+    /// top)`. Empty glyphs (e.g. SPACE) return a `(vec![0u8], 1, 1,
+    /// lsb, top)` placeholder so the union-bbox math has something
+    /// to work with. None when the font isn't known.
+    fn render_glyph_for_cursor(
+        &self,
+        font_xid: u32,
+        ch: u16,
+    ) -> Option<(Vec<u8>, i32, i32, i32, i32)> {
+        let fs = self.core.fonts.get(&font_xid)?;
+        let face = fs.face.borrow();
+        let _ = face
+            .0
+            .load_char(ch as usize, freetype::face::LoadFlag::RENDER);
+        let glyph = face.0.glyph();
+        let bitmap = glyph.bitmap();
+        let w = bitmap.width();
+        let h = bitmap.rows();
+        if w <= 0 || h <= 0 {
+            return Some((vec![0u8], 1, 1, glyph.bitmap_left(), glyph.bitmap_top()));
+        }
+        let stride = bitmap.pitch();
+        let buf = bitmap.buffer();
+        let wu = w as usize;
+        let hu = h as usize;
+        let mut pixels = vec![0u8; wu * hu];
+        for row in 0..hu {
+            let src_off = if stride >= 0 {
+                row * stride as usize
+            } else {
+                (hu - 1 - row) * (stride as isize).unsigned_abs()
+            };
+            pixels[row * wu..row * wu + wu].copy_from_slice(&buf[src_off..src_off + wu]);
+        }
+        Some((pixels, w, h, glyph.bitmap_left(), glyph.bitmap_top()))
+    }
+
+    /// Walk the parent chain from `host_xid` upward, returning the
+    /// first non-None cursor attribute encountered. Falls back to
+    /// `core.active_cursor` (the sticky DefineCursor-on-root) if
+    /// the chain runs out — that is, no window on the chain bound a
+    /// cursor.
+    fn effective_cursor_walking_chain(&self, host_xid: u32) -> Option<u32> {
+        let mut cur = host_xid;
+        // Bound the walk so a corrupted parent loop can't burn the
+        // event loop. windows_v2 fits in u32 xids; 64 is generous.
+        for _ in 0..64 {
+            if let Some(geom) = self.windows_v2.get(&cur) {
+                if let Some(c) = geom.cursor {
+                    return Some(c);
+                }
+                if let Some(p) = geom.parent {
+                    cur = p;
+                    continue;
+                }
+            }
+            break;
+        }
+        self.core.active_cursor.or(self.default_cursor_xid)
+    }
+
+    /// Recompute the effective cursor for the window currently under
+    /// the pointer and swap the scene `CursorEntry` if it changed.
+    /// Cheap when the choice is stable (HashMap lookup + Option
+    /// compare).
+    fn refresh_effective_cursor(&mut self) {
+        let pointer_window = self.core.prev_pointer_window.unwrap_or(self.core.window_id);
+        let new_xid = self.effective_cursor_walking_chain(pointer_window);
+        if new_xid == self.effective_cursor_xid {
+            return;
+        }
+        self.effective_cursor_xid = new_xid;
+        let Some(xid) = new_xid else {
+            return;
+        };
+        let Some(record) = self.cursor_records.get(&xid).cloned() else {
+            return;
+        };
+        let Some(&pixmap_id) = self.cursor_pixmaps.get(&xid) else {
+            return;
+        };
+        // Sample-view readiness check — same gate as Stage 3f.8's
+        // boot path. A Vk-less fixture builds the record but skips
+        // the sprite alloc, so this short-circuits cleanly.
+        if self
+            .store
+            .get(pixmap_id)
+            .map(|d| d.storage.image_view == ash::vk::ImageView::null())
+            .unwrap_or(true)
+        {
+            return;
         }
         self.scene
             .register_cursor(crate::kms::v2::scene::CursorEntry {
-                id,
+                id: pixmap_id,
                 extent: ash::vk::Extent2D {
-                    width: u32::from(CW),
-                    height: u32::from(CH),
+                    width: u32::from(record.width),
+                    height: u32::from(record.height),
                 },
-                hot_x: 0,
-                hot_y: 0,
+                hot_x: i16::try_from(record.hot_x).unwrap_or(i16::MAX),
+                hot_y: i16::try_from(record.hot_y).unwrap_or(i16::MAX),
             });
-        log::info!("v2: software cursor sprite registered ({CW}x{CH})");
-        Ok(())
+        // The scene blit ordering: register_cursor already marks
+        // scene_structure_dirty so the next tick repaints; no extra
+        // wake needed.
     }
 
     /// Test fixture with live Vulkan attached. Falls back to the
@@ -578,6 +857,12 @@ impl KmsBackendV2 {
     pub fn for_tests() -> Self {
         let mut b = Self::for_tests_seed();
         b.init_root_storage();
+        // Stage 5 Phase A: seed the default-cursor record so test
+        // paths that exercise `define_cursor` / effective-cursor
+        // resolution have a fallback to walk to. Production uses
+        // the same `init_cursor_sprite` body; the test fixture has
+        // no Vk, so the sprite Pixmap allocation skips cleanly.
+        let _ = b.init_cursor_sprite();
         b
     }
 
@@ -600,6 +885,11 @@ impl KmsBackendV2 {
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
+            cursor_records: HashMap::new(),
+            cursor_pixmaps: HashMap::new(),
+            next_cursor_version: 1,
+            default_cursor_xid: None,
+            effective_cursor_xid: None,
         }
     }
 
@@ -867,15 +1157,9 @@ impl KmsBackendV2 {
     /// most of that content via the normal paint flow for
     /// non-compositor cases, and the Stage 4d compositor-floor
     /// scene-walk presents siblings directly.
-    fn seed_backing_from_parent(
-        &mut self,
-        w_xid: u32,
-        b_id: crate::kms::v2::store::DrawableId,
-    ) {
+    fn seed_backing_from_parent(&mut self, w_xid: u32, b_id: crate::kms::v2::store::DrawableId) {
         let Some(w_geom) = self.windows_v2.get(&w_xid).copied() else {
-            log::debug!(
-                "v2 seed_backing_from_parent W=0x{w_xid:x}: not in windows_v2; skip seed"
-            );
+            log::debug!("v2 seed_backing_from_parent W=0x{w_xid:x}: not in windows_v2; skip seed");
             return;
         };
         let Some(parent_xid) = w_geom.parent else {
@@ -937,9 +1221,7 @@ impl KmsBackendV2 {
             src_rect,
             dst_pos,
         ) {
-            log::warn!(
-                "v2 seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",
-            );
+            log::warn!("v2 seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",);
         } else {
             self.telemetry.record_paint_submit();
         }
@@ -1289,6 +1571,9 @@ impl KmsBackendV2 {
             self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
         }
         self.core.prev_pointer_window = Some(new_xid);
+        // Stage 5 Phase A: cross-in may change the effective cursor
+        // (per-window DefineCursor walks up the parent chain).
+        self.refresh_effective_cursor();
     }
 
     fn dispatch_motion_event(&mut self, server_state: &ServerState) {
@@ -1884,6 +2169,7 @@ impl KmsBackendV2 {
                 stack_rank,
                 bg_pixel,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         // Stage 3f.6 + 3f.14: clear newly-allocated storage to a
@@ -2924,44 +3210,6 @@ fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>
         | PictureRecord::LinearGradient { .. }
         | PictureRecord::RadialGradient { .. } => None,
     }
-}
-
-/// Stage 3f.8: 16×16 BGRA8 default-arrow cursor sprite. Hotspot
-/// at (0, 0). The shape is a filled right-triangle pointing
-/// down-right — sized so the tip falls on the click point and the
-/// rest extends into the screen. Pixels: opaque black inside,
-/// fully transparent outside. Stage 4 swaps this for whatever
-/// `define_cursor` / `xfixes_change_cursor_by_name` selects.
-fn default_cursor_sprite_bgra() -> Vec<u8> {
-    const W: usize = 16;
-    const H: usize = 16;
-    let mut bytes = vec![0u8; W * H * 4];
-    let set = |bytes: &mut [u8], x: usize, y: usize, b: u8, g: u8, r: u8, a: u8| {
-        let off = (y * W + x) * 4;
-        bytes[off] = b;
-        bytes[off + 1] = g;
-        bytes[off + 2] = r;
-        bytes[off + 3] = a;
-    };
-    // 12-row arrow body. Each row y has y+1 black pixels starting
-    // at x=0, capped at 10 to leave room for the "tail" rows 10/11.
-    for y in 0..12 {
-        let row_w = y.min(10) + 1;
-        for x in 0..row_w {
-            set(&mut bytes, x, y, 0x00, 0x00, 0x00, 0xFF);
-        }
-    }
-    // 1-px white outline on the diagonal edge for visibility
-    // against dark backgrounds (xfwm4 root, terminal black bg).
-    for y in 0..12 {
-        let edge_x = y.min(10);
-        // Pixel to the right of the diagonal — white outline.
-        let ox = edge_x + 1;
-        if ox < W && y < H {
-            set(&mut bytes, ox, y, 0xFF, 0xFF, 0xFF, 0xFF);
-        }
-    }
-    bytes
 }
 
 /// Resolve the drawable depth for a new subwindow. `CopyFromParent`
@@ -4198,50 +4446,150 @@ impl Backend for KmsBackendV2 {
     fn create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _source_pixmap: PixmapHandle,
-        _mask_pixmap: Option<PixmapHandle>,
-        _fore: (u16, u16, u16),
-        _back: (u16, u16, u16),
-        _hot_x: u16,
-        _hot_y: u16,
+        source_pixmap: PixmapHandle,
+        mask_pixmap: Option<PixmapHandle>,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+        hot_x: u16,
+        hot_y: u16,
     ) -> io::Result<CursorHandle> {
-        // Stage 3f.4: mint a valid xid so clients that probe the
-        // handle don't trip on a zero result. The cursor's
-        // **rasterisation + scene blit** lives at Stage 4 (cursor
-        // is layer 4 in the scene per spec, deferred alongside the
-        // SHAPE work); until then the cursor visually defaults to
-        // the bare KMS HW cursor or no cursor at all. No `log_v2_gap`
-        // because the gap is documented + invariant for Stage 3.
+        // Stage 5 Phase A: real rasterisation. Read source + mask
+        // (both depth-1 R8) via `engine.get_image`, lower to BGRA per
+        // X11's mask/fore/back rule, allocate a CursorRecord + sprite
+        // Pixmap. The cursor is invisible (size 1×1 transparent) if
+        // the source pixmap can't be read — matches v1's degenerate
+        // shape when the source mirror is missing.
         let xid = self.core.next_host_xid();
-        CursorHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_cursor: xid was 0"))
+        let handle = CursorHandle::from_raw(xid)
+            .ok_or_else(|| io::Error::other("create_cursor: xid was 0"))?;
+        let (bgra, w, h) = if let Some((src_bytes, w, h)) =
+            self.read_cursor_depth1_pixmap(source_pixmap.as_raw())
+        {
+            let mask_bytes = mask_pixmap.and_then(|mp| {
+                let (mb, mw, mh) = self.read_cursor_depth1_pixmap(mp.as_raw())?;
+                if mw == w && mh == h {
+                    Some(mb)
+                } else {
+                    log::warn!(
+                        "v2 create_cursor: mask 0x{:x} dims {mw}x{mh} \
+                             differ from src dims {w}x{h}; ignoring mask",
+                        mp.as_raw(),
+                    );
+                    None
+                }
+            });
+            let bgra = crate::kms::v2::cursor::rasterise_create_cursor(
+                &src_bytes,
+                w,
+                h,
+                mask_bytes.as_deref(),
+                fore,
+                back,
+            );
+            (bgra, w, h)
+        } else {
+            log::warn!(
+                "v2 create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
+                source_pixmap.as_raw(),
+            );
+            (vec![0u8; 4], 1u16, 1u16)
+        };
+        self.insert_cursor_record(xid, w, h, hot_x, hot_y, bgra);
+        Ok(handle)
     }
 
     fn create_glyph_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _source_font: FontHandle,
-        _mask_font: Option<FontHandle>,
-        _source_char: u16,
-        _mask_char: u16,
-        _fore: (u16, u16, u16),
-        _back: (u16, u16, u16),
+        source_font: FontHandle,
+        mask_font: Option<FontHandle>,
+        source_char: u16,
+        mask_char: u16,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
     ) -> io::Result<CursorHandle> {
-        // Stage 3f.4: same shape as `create_cursor` — handle minted,
-        // rasterisation deferred to Stage 4.
+        // Stage 5 Phase A: real glyph-cursor rasterisation. Render
+        // source + (optional) mask glyph via FreeType, build the
+        // union bbox + derive the hotspot, then lower to BGRA via
+        // the cursor module's shared rasteriser. Same code shape as
+        // v1's `create_glyph_cursor` (`kms/backend.rs:9937-10108`).
         let xid = self.core.next_host_xid();
-        CursorHandle::from_raw(xid)
-            .ok_or_else(|| io::Error::other("create_glyph_cursor: xid was 0"))
+        let handle = CursorHandle::from_raw(xid)
+            .ok_or_else(|| io::Error::other("create_glyph_cursor: xid was 0"))?;
+        // Render both glyphs into owned Vec<u8>s up front so the
+        // FreeType `bitmap()` borrow doesn't span the second
+        // load_char call (FreeType invalidates the previous glyph's
+        // bitmap when a new load_char fires).
+        let src_xid = source_font.as_raw();
+        let Some((src_pix, src_w, src_h, src_lsb, src_top)) =
+            self.render_glyph_for_cursor(src_xid, source_char)
+        else {
+            log::warn!(
+                "v2 create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
+            );
+            self.insert_cursor_record(xid, 1, 1, 0, 0, vec![0u8; 4]);
+            return Ok(handle);
+        };
+        let mask_data =
+            mask_font.and_then(|mf| self.render_glyph_for_cursor(mf.as_raw(), mask_char));
+        let src = crate::kms::v2::cursor::GlyphBitmap {
+            pixels: &src_pix,
+            width: src_w,
+            height: src_h,
+            lsb: src_lsb,
+            top: src_top,
+        };
+        let mask_bitmap =
+            mask_data.as_ref().map(
+                |(pix, w, h, lsb, top)| crate::kms::v2::cursor::GlyphBitmap {
+                    pixels: pix.as_slice(),
+                    width: *w,
+                    height: *h,
+                    lsb: *lsb,
+                    top: *top,
+                },
+            );
+        let img =
+            crate::kms::v2::cursor::rasterise_glyph_cursor(&src, mask_bitmap.as_ref(), fore, back);
+        self.insert_cursor_record(
+            xid,
+            img.width,
+            img.height,
+            img.hot_x,
+            img.hot_y,
+            img.bgra_bytes,
+        );
+        Ok(handle)
     }
 
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_window_xid: u32,
-        _cursor_host_xid: u32,
+        host_window_xid: u32,
+        cursor_host_xid: u32,
     ) -> io::Result<()> {
-        // Stage 3f.4: Stage 4 cursor scene-layer work will wire
-        // per-window cursor binding; until then v2 stays on the
-        // default cursor.
+        // Stage 5 Phase A: store the cursor on the window's
+        // attribute slot. Per X11, the cursor visible on screen is
+        // the one belonging to the deepest window under the pointer
+        // that has a non-None cursor (walking up the parent chain);
+        // `cursor_host_xid == 0` is X11 `None` and means "inherit
+        // from parent".
+        //
+        // The sticky `active_cursor` fallback on `KmsCore` matches
+        // v1: a DefineCursor on the root container becomes the
+        // server-wide default for windows that don't override it.
+        let nested = if cursor_host_xid == 0 {
+            None
+        } else {
+            Some(cursor_host_xid)
+        };
+        if let Some(geom) = self.windows_v2.get_mut(&host_window_xid) {
+            geom.cursor = nested;
+        }
+        if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
+            self.core.active_cursor = Some(cursor_host_xid);
+        }
+        self.refresh_effective_cursor();
         Ok(())
     }
 
@@ -6933,19 +7281,40 @@ impl Backend for KmsBackendV2 {
     fn render_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_src_pic: PictureHandle,
-        _x: u16,
-        _y: u16,
+        host_src_pic: PictureHandle,
+        x: u16,
+        y: u16,
     ) -> io::Result<Option<CursorHandle>> {
-        // Stage 3f.4: mint an xid so RENDER clients that probe the
-        // cursor handle (Cairo cursor themes, GTK/Qt themed cursors)
-        // see a well-formed reply. Pixel rasterisation + scene blit
-        // lives at Stage 4 alongside the cursor scene-layer work;
-        // until then the cursor stays at the boot default. No
-        // `log_v2_gap` because the gap is documented + invariant
-        // for Stage 3.
+        // Stage 5 Phase A: themed/ARGB cursor — Picture wraps a
+        // depth-32 BGRA Pixmap. Read the pixmap bytes via
+        // `engine.get_image`, allocate a CursorRecord + sprite, and
+        // mint a cursor xid. fvwm pattern (CreatePixmap → PutImage
+        // → CreatePicture → FreePixmap → CreateCursor) means the
+        // backing pixmap may already be gone by the time we arrive,
+        // but for Stage 5 we rely on the picture record's
+        // `host_xid` resolving back to a live store entry — alias-
+        // registry-aware rescue is a follow-up.
+        let pic_xid = host_src_pic.as_raw();
+        let src_host_xid = match self.core.pictures.get(&pic_xid) {
+            Some(crate::kms::core::PictureRecord::Drawable { host_xid, .. }) => *host_xid,
+            other => {
+                log::debug!(
+                    "v2 render_create_cursor: pic 0x{pic_xid:x} not Drawable (got {:?})",
+                    other.map(|_| "non-Drawable"),
+                );
+                return Ok(None);
+            }
+        };
+        let Some((bgra, w, h)) = self.read_cursor_bgra_pixmap(src_host_xid) else {
+            log::debug!(
+                "v2 render_create_cursor: src pixmap 0x{src_host_xid:x} unreadable for pic 0x{pic_xid:x}",
+            );
+            return Ok(None);
+        };
         let xid = self.core.next_host_xid();
-        Ok(CursorHandle::from_raw(xid))
+        let handle = CursorHandle::from_raw(xid);
+        self.insert_cursor_record(xid, w, h, x, y, bgra);
+        Ok(handle)
     }
 
     fn render_set_picture_clip_rectangles(
@@ -9304,11 +9673,13 @@ mod tests {
             .expect("create_glyph_cursor");
         assert!(c2.as_raw() != 0);
 
-        let c3 = b
+        // Stage 5 Phase A: render_create_cursor returns None when
+        // the picture xid isn't registered as a Drawable picture
+        // (no rasterisation source); the contract is "don't log a
+        // gap", not "always mint a handle".
+        let _ = b
             .render_create_cursor(None, pic, 0, 0)
-            .expect("render_create_cursor")
-            .expect("Some handle");
-        assert!(c3.as_raw() != 0);
+            .expect("render_create_cursor");
 
         b.define_cursor(None, 0xABCD_EF01, c1.as_raw())
             .expect("define_cursor");
@@ -9328,6 +9699,183 @@ mod tests {
                 "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
             );
         }
+    }
+
+    /// Stage 5 Phase A: define_cursor stores the cursor on the
+    /// window's geometry slot and (when the window is the root
+    /// container) updates `KmsCore.active_cursor` so unbound child
+    /// windows inherit the new sprite via the parent-chain walk.
+    #[test]
+    fn define_cursor_records_per_window_and_root_sticky() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0010).unwrap();
+        let c = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0xFFFF, 0), 0, 0)
+            .expect("create_cursor");
+
+        // DefineCursor on the root container — sticky fallback.
+        let root_host = b.core.window_id;
+        b.define_cursor(None, root_host, c.as_raw())
+            .expect("define_cursor root");
+        assert_eq!(b.core.active_cursor, Some(c.as_raw()));
+
+        // DefineCursor on a non-root window — stored on geom only,
+        // does NOT touch `active_cursor`.
+        let w: u32 = 0xABCD_0001;
+        let rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            w,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0xFFFF, 0, 0), 0, 0)
+            .expect("create_cursor 2");
+        b.define_cursor(None, w, c2.as_raw())
+            .expect("define_cursor non-root");
+        assert_eq!(
+            b.core.active_cursor,
+            Some(c.as_raw()),
+            "non-root must not touch active_cursor"
+        );
+        assert_eq!(
+            b.windows_v2.get(&w).and_then(|g| g.cursor),
+            Some(c2.as_raw())
+        );
+
+        // `define_cursor(_, 0)` (X11 None) clears the per-window slot.
+        b.define_cursor(None, w, 0).expect("define_cursor clear");
+        assert_eq!(b.windows_v2.get(&w).and_then(|g| g.cursor), None);
+    }
+
+    /// Effective-cursor walk: a child without its own cursor inherits
+    /// from its parent; a fresh root cursor (DefineCursor on root)
+    /// becomes the fallback when no chain entry binds one.
+    #[test]
+    fn effective_cursor_walks_parent_chain() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0011).unwrap();
+        let root_cur = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("create_cursor");
+        let parent_cur = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("create_cursor parent");
+        // Wire: root → parent → child. Parent has its own cursor;
+        // child inherits.
+        let root_host = b.core.window_id;
+        let parent: u32 = 0xDEAD_0001;
+        let child: u32 = 0xDEAD_0002;
+        let rank_p = b.alloc_window_stack_rank();
+        let rank_c = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            parent,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                depth: 24,
+                mapped: true,
+                parent: Some(root_host),
+                stack_rank: rank_p,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.windows_v2.insert(
+            child,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                parent: Some(parent),
+                stack_rank: rank_c,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        // DefineCursor on root + parent.
+        b.define_cursor(None, root_host, root_cur.as_raw())
+            .expect("root");
+        b.define_cursor(None, parent, parent_cur.as_raw())
+            .expect("parent");
+        // Child inherits parent's cursor (parent has its own bound).
+        assert_eq!(
+            b.effective_cursor_walking_chain(child),
+            Some(parent_cur.as_raw())
+        );
+        // Parent itself reports its own cursor.
+        assert_eq!(
+            b.effective_cursor_walking_chain(parent),
+            Some(parent_cur.as_raw())
+        );
+        // Window unknown to windows_v2 → falls back to active_cursor
+        // (root's DefineCursor).
+        assert_eq!(
+            b.effective_cursor_walking_chain(0xFFFF_FFFF),
+            Some(root_cur.as_raw())
+        );
+    }
+
+    /// CursorRecord versions are monotonically increasing — each
+    /// `create_cursor` allocates a fresh version, and the boot-time
+    /// default sits at version 1.
+    #[test]
+    fn cursor_record_versions_monotonic() {
+        use std::sync::Arc;
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let default_xid = b.default_cursor_xid.expect("default cursor xid set");
+        let v0 = b
+            .cursor_records
+            .get(&default_xid)
+            .expect("default record")
+            .version;
+
+        let pix = PixmapHandle::from_raw(0x1234_0020).unwrap();
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("create_cursor");
+        let c2 = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("create_cursor 2");
+
+        let v1 = b.cursor_records.get(&c1.as_raw()).unwrap().version;
+        let v2 = b.cursor_records.get(&c2.as_raw()).unwrap().version;
+        assert!(v0 < v1, "v0={v0} v1={v1}");
+        assert!(v1 < v2, "v1={v1} v2={v2}");
+
+        // Captured Arc reference observes its original bytes even
+        // after later allocations.
+        let captured: Arc<crate::kms::v2::cursor::CursorRecord> =
+            Arc::clone(b.cursor_records.get(&c1.as_raw()).unwrap());
+        let snapshot = captured.bgra_bytes.clone();
+        let _ = b
+            .create_cursor(None, pix, None, (0, 0, 0xFFFF), (0, 0, 0), 0, 0)
+            .expect("create_cursor 3");
+        assert_eq!(captured.bgra_bytes, snapshot);
     }
 
     /// Stage 4d regression: `ChangeWindowAttributes` on a window
@@ -9368,6 +9916,7 @@ mod tests {
                 bg_pixel: None,
                 bg_pixmap: None,
                 stack_rank,
+                cursor: None,
             },
         );
         let w_storage = Storage::for_tests_null(
@@ -9464,6 +10013,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
 
@@ -9664,6 +10214,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -9679,6 +10230,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.core.top_level_order.push(0x1000);
@@ -9788,6 +10340,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         let child = b
@@ -9855,6 +10408,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -9870,6 +10424,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.core.top_level_order.push(0xC0FFEE);
@@ -9936,6 +10491,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -9951,6 +10507,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.restack_subwindow(0xD00D, 1, Some(0xCAFE));
@@ -9978,6 +10535,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.windows_v2.insert(
@@ -9993,6 +10551,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         // Start: child not in top_level_order.
@@ -10039,6 +10598,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                cursor: None,
             },
         );
         b.store
