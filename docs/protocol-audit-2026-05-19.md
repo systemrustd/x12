@@ -107,13 +107,27 @@ The dropped paths in this code are dead for what we ship through. Revisit if a
 workload appears that exercises non-Over ops or non-SolidFill sources (e.g.,
 gradient-textured text via Cairo `set_source(gradient) + show_text`).
 
-### 6. ⬜ Seed copy on redirect activation reads from W, not from parent
-**Severity: Likely-bug**
+### 6. ✅ Seed copy on redirect activation reads from W, not from parent
+**Severity: Likely-bug** — **Fixed in `6f86d7f`**
 - yserver: `kms/v2/backend.rs:849-953`
 - Xorg: `composite/compalloc.c:541-606` (`compNewPixmap` copies parent w/ IncludeInferiors)
 
 Manual-redirected freshly-created W seeds B with default-init opaque black even when
 parent shows real pixels. Matches recurring "black band on map".
+
+**Resolution:** new `seed_backing_from_parent` walks `resolve_paint_target` on
+W's parent and `copy_area`s parent-storage-at-W's-position into B's (0, 0). For
+chained-redirect parents this routes through the parent's own backing (its
+visible storage) rather than the parent's empty own-storage. Three obsolete
+Vk-ignored tests that pinned the W-seed model deleted; new
+`v2_redirect_seed_uses_parent_content_at_w_position` pins the new behaviour
+with a red-parent / default-init-W vector. Net -213 lines.
+**Known deferral:** strict IncludeInferiors (parent's *other* children
+contributing to the seed where they overlap W's screen position) NOT
+implemented — yserver's parent storage already includes most sibling content
+via normal paint flow for non-compositor cases, and Stage 4d's scene walk
+presents siblings directly. Revisit if a compositor workload surfaces a
+sibling-bleed-through case.
 
 ### 7. ⬜ CreateRegionFromGC translates by clip_origin; Xorg does not
 **Severity: Bug**
@@ -328,9 +342,16 @@ For maximum compositor-WM impact with minimum churn:
    piece (Stage 4e substrate done in one patch, including dst-side + trap/tri-path
    coverage caught by codex review)
 
-**Remaining tier-1:** #6 (seed copy from parent — "black band on map" recurring
-symptom) and #7 (CreateRegionFromGC double-translation — affects WMs that build
-regions from GCs). Both clean, focused bug fixes.
+**Remaining tier-1:** #7 (CreateRegionFromGC double-translation — affects WMs
+that build regions from GCs). #6 closed in `6f86d7f`.
+
+**Bonus tier-1 found during yoga mate-hw smoke 2026-05-19 PM** (not in the
+original audit list): Manual-redirect backing's `scene_participating=false`
+silently dropped 96% of `store.damage()` calls on it, leaving redirected
+windows invisible except where cursor-projected damage happened to overlap.
+Fixed in `3a8e028` (separate from this audit document since it's a v2
+internal damage-flow issue, not a protocol-surface vs-Xorg deviation; see
+`docs/status.md` Stage 4d follow-ups for the long form).
 
 ---
 
