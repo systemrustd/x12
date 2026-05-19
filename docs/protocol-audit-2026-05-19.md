@@ -163,25 +163,58 @@ flagged.
 ## Tier 2 — will hang or visibly break clients
 
 ### 9. ✅ `SelectSelectionInput` never emits `XFixesSelectionNotify`
-**Severity: Bug** — **Fixed in `5e19e33`**
+**Severity: Bug** — **Fixed in `5e19e33` + 5 code-review follow-ups**
 - yserver: `process_request.rs:2555-2568`; event emit site missing entirely
-- Xorg: `xfixes/select.c:53-94`
+- Xorg: `xfixes/select.c:53-94`, `dix/selection.c:126-211`
 
 Every clipboard manager (klipper, copyq, gpaste, gnome-shell clipboard indicator) wedges.
 
-**Resolution:** all three notify subtypes wired —
-`SetSelectionOwner` from `handle_set_selection_owner` (after
-`state.selections` is updated; timestamp + selection_timestamp =
-request's `time` arg), `SelectionWindowDestroy` from
-`destroy_window_subtree` (before `state.resources.destroy_window`,
-shared helper `drop_selections_owned_by_windows` matches selections
-whose owner window is in the destroyed subtree), `SelectionClientClose`
-from `process_disconnect` (before the owned-window destroy loop so
+**Resolution:** all three notify subtypes wired — `SetSelectionOwner`
+from `handle_set_selection_owner`, `SelectionWindowDestroy` from
+`destroy_window_subtree` (shared helper
+`drop_selections_owned_by_windows` matches selections whose owner
+window is in the destroyed subtree), `SelectionClientClose` from
+`process_disconnect` (before the owned-window destroy loop so
 `state.resources.window_owner` still resolves). New wire encoder
 `encode_selection_notify_event` + `SELECTION_NOTIFY_*` /
-`SELECTION_MASK_*` constants in yserver-protocol. 7 tests (3 encoder,
-4 fanout). Per-selection `lastTimeChanged` tracking deferred — clipboard
-managers don't gate on `selection_timestamp` in practice.
+`SELECTION_MASK_*` / `SELECTION_ALL_EVENTS_MASK` constants in
+yserver-protocol.
+
+Code-review iterations landed on top of the initial patch — each
+verified directly against the named Xorg line range:
+
+- `7d2508a` — order + timestamps on destroy/close: notify BEFORE
+  clearing `state.selections` (matches `dix/selection.c:131-138`'s
+  `DeleteWindowFromAnySelections` order); track per-selection
+  `lastTimeChanged` (extends `state.selections` value to
+  `(ResourceId, u32)`); event payload carries currentTime +
+  prior lastTimeChanged per `xfixes/select.c:88-89`.
+- `9f8ef05` — drop the `max(1)` clamp on currentTime; switch to
+  existing `ServerState::timestamp_now()`. Xorg's
+  `UpdateCurrentTimeIf` (`dix/dispatch.c:226-236`) has no floor.
+- `f176d32` — `SelectSelectionInput` window + mask validation per
+  `xfixes/select.c:189-196` (BadWindow / BadValue).
+- `0760f9c` — `SetSelectionOwner` timestamp rules per
+  `dix/selection.c:164-211`: future-shifted requests silently
+  ignored; `ClientTimeToServerTime` (time=0 → currentTime); stale
+  requests vs prior `lastTimeChanged` silently ignored;
+  notify carries currentTime + the just-stored lastTimeChanged.
+- `abbadbf` — `SetSelectionOwner` BadWindow + BadAtom validation
+  in Xorg's exact order (future → BadWindow → BadAtom → stale →
+  update; `dix/selection.c:164-178`).
+- `e073fc7` — SelectionClear gate matches
+  `dix/selection.c:194`'s prior-owner-client identity check (NOT
+  window identity); event time field carries resolved server time,
+  not raw `time_val`; BadWindow/BadAtom error replies carry major
+  opcode 22 (was 0 → malformed).
+
+Test count climbed to 13 (3 encoder in yserver-protocol; 10 fanout
++ validation + timing in yserver-core).
+
+**Real-session verification (yoga, 2026-05-20):** parcellite under
+mate-session picks up selection changes from xclip / wezterm /
+applications immediately — the symptom the audit named ("every
+clipboard manager wedges") confirmed resolved end-to-end.
 
 ### 10. `GetClientDisconnectMode` (XFIXES minor 34) has a reply but is silently dropped
 **Severity: Bug**
