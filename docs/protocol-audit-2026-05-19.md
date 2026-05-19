@@ -4,12 +4,17 @@ Audit date: 2026-05-19. Four sub-agents each cross-referenced yserver v2 against
 `/home/jos/Projects/xserver` (render/, composite/, xfixes/, damageext/ + miext/damage/).
 Focus: clipping, redirect routing, damage delivery — the compositor-WM battleground.
 
+**Status legend** (updated 2026-05-19 PM):
+- ✅ **Done** — patch landed, commit hash listed
+- 🟦 **Skipped** — empirically dead code or not exercised by current workloads; reason noted
+- ⬜ **Open** — no patch yet
+
 ---
 
 ## Tier 1 — likely causing visible bugs now
 
-### 1. Paint into backing B never fires DamageNotify on window W
-**Severity: Bug**
+### 1. ✅ Paint into backing B never fires DamageNotify on window W
+**Severity: Bug** — **Fixed (verified on silence via xtrace)**
 - yserver: `damage_fanout.rs:167-275`
 - Xorg: `damageext.c` + `composite/compwindow.c`
 
@@ -17,8 +22,15 @@ Damage fanout matches by `drawable_id == B`, not by `redirected_target` indirect
 Compositors that `XDamageCreate(window=W)` see zero events for auto-redirected paints →
 marco/xfwm4 sit silent after the initial composite. Matches "marco emits 0 DamageNotify".
 
-### 2. `render_composite` drops src/mask client clips entirely
-**Severity: Bug**
+**Resolution:** the audit's diagnosis turned out to be inaccurate for the post-Stage-4d
+codepath — `accumulate_damage_full_to_state` is called with the WINDOW xid from the
+protocol layer, not the backing. The codex + c0ae57d chain (Manual-redirect backing
+becomes `scene_participating=true`) made damage on B accumulate AND fan out to
+W-subscribers correctly. User verified end-to-end on the silence machine that
+DamageNotify now fires for the compositor-relevant cases.
+
+### 2. ✅ `render_composite` drops src/mask client clips entirely
+**Severity: Bug** — **Fixed in `6464531`**
 - yserver: `kms/v2/backend.rs:5780-5879`
 - Xorg: `render/mipict.c:316-389` (`miComputeCompositeRegion`)
 
@@ -26,8 +38,15 @@ marco/xfwm4 sit silent after the initial composite. Matches "marco emits 0 Damag
 xfwm4/muffin shadow blits that scope a source picture with `SetPictureClipRectangles`
 paint over the whole dst. Active hypothesis in `status.md:1973-1979`.
 
-### 3. Scene Manual-redirect subtree prune drops Automatic-redirected descendants
-**Severity: Likely-bug**
+**Resolution:** new pure helpers `compute_render_composite_clip` (dst_clip ∩
+src_clip-translated-to-dst-space ∩ mask_clip-translated-to-dst-space) and
+`picture_client_clip` (extracts a Drawable picture's stored clip); wired into
+`render_composite` between the dst-clip-shift and the engine call. 8 unit tests with
+vectors hand-traced from Xorg's `miClipPictureSrc`. Rendercheck `scoords` / `mcoords` /
+`dcoords` / `tscoords` / `tmcoords` all pass post-fix.
+
+### 3. ✅ Scene Manual-redirect subtree prune drops Automatic-redirected descendants
+**Severity: Likely-bug** — **Fixed in `6ffd370`**
 - yserver: `kms/v2/scene.rs:1296-1556`
 
 If any ancestor has `scene_participating=false`, entire subtree pruned regardless of
@@ -37,22 +56,57 @@ Symptom: `RedirectWindow(frame, Manual)` + `RedirectSubwindows(frame, Automatic)
 (GTK/marco CSD pattern) makes Automatic widgets vanish. Matches Control Center
 missing-menu/widget reports.
 
-### 4. `pict_format` stored but ignored — xRGB32 on depth-32 storage treated as ARGB32
-**Severity: Spec-deviation (active bug)**
-- yserver: `kms/core.rs:488` (comment says "Currently instrumentation-only")
+**Resolution:** replaced the unconditional `prune_subtree=true` with a per-window emit
+gate `paint_target_is_self = has_own_redirected_target || (scene_participating &&
+!under_redirected_ancestor)`. Recursion threads `under_redirected_ancestor: bool` —
+set true whenever traversal enters a window with its own `redirected_target` (mirrors
+`resolve_paint_target`'s stop condition). Non-redirected descendants of redirected
+ancestors skip emit (their paint already lives in the ancestor's B); Auto-redirected
+descendants under a Manual ancestor emit their own B. Updated codex's existing prune
+test to use the realistic state with a backing; new test
+`build_scene_emits_automatic_descendant_under_manual_ancestor` pins the audit case.
+No visible regression on MATE/XFCE smoke (the audit case wasn't being hit by current
+workloads — patch is correctness/spec-compliance only).
+
+### 4. ✅ `pict_format` stored but ignored — xRGB32 on depth-32 storage treated as ARGB32
+**Severity: Spec-deviation (active bug)** — **Fixed in `22223f5`**
+- yserver: `kms/core.rs:488` (comment said "Currently instrumentation-only")
 
 Compositor offscreens with alpha=0-padding leak transparent black onto wallpaper.
 Active 4d shadow/CSD ARGB-vs-xRGB mismatch. Real fix is Stage 4e PictFormat tracking.
 
-### 5. `render_composite_glyphs` silently drops everything except `Over` + SolidFill source
-**Severity: Bug**
+**Resolution:** added `RENDER_FMT_XRGB32` (id=5, depth=32, alpha_mask=0) — mirrors
+Xorg's `PICT_x8r8g8b8`; `write_render_query_pict_formats_reply` now advertises 5
+formats and lists the depth-32 visual with both ARGB32 + XRGB32 pairs. New engine
+helpers `resolve_force_opaque_pict_format` / `swizzle_class_for_pict_format` /
+`dst_has_alpha_for_pict_format` consult `pict_format` first, falling back to the
+legacy depth heuristic when `pict_format=0` (engine-internal callers without Picture
+context). `render_composite` and `render_traps_or_tris` both thread
+src/mask/dst pict_format from the backend's `picture_pict_format()` lookup. 4 new
+unit tests pin the helpers across all format quadrants. **Caveat:** the audit's
+specific failure mode wasn't observable on current workloads because the server didn't
+*advertise* XRGB32 before this patch — so no client could request it. Future
+compositors / Cairo paths that opt into XRGB32 now get correct sampling +
+pipeline + readback selection. Codex review caught dst-side + trap/tri-path gaps on
+successive iterations; both fixed in-patch.
+
+### 5. 🟦 `render_composite_glyphs` silently drops everything except `Over` + SolidFill source
+**Severity: Bug** — **Skipped (empirically dead code)**
 - yserver: `kms/v2/backend.rs:5944-5947`
 - Xorg: supports full op table for CompositeGlyphs
 
 No client error, just counter bump. Cairo gradient-source glyph paint (mate Control
 Center yellow headers, GTK header-bar text on a gradient background) renders nothing.
 
-### 6. Seed copy on redirect activation reads from W, not from parent
+**Empirical cross-check:** 100% of CompositeGlyphs in both `mate.xtrace` (416 calls)
+and `xfce.xtrace` (109 calls) use `op=Over(0x03)` with SolidFill source pictures.
+The "yellow headers" symptom from the audit doc was a guess at why headers might
+fail; user confirmed MATE Control Center renders correctly under current workloads.
+The dropped paths in this code are dead for what we ship through. Revisit if a
+workload appears that exercises non-Over ops or non-SolidFill sources (e.g.,
+gradient-textured text via Cairo `set_source(gradient) + show_text`).
+
+### 6. ⬜ Seed copy on redirect activation reads from W, not from parent
 **Severity: Likely-bug**
 - yserver: `kms/v2/backend.rs:849-953`
 - Xorg: `composite/compalloc.c:541-606` (`compNewPixmap` copies parent w/ IncludeInferiors)
@@ -60,7 +114,7 @@ Center yellow headers, GTK header-bar text on a gradient background) renders not
 Manual-redirected freshly-created W seeds B with default-init opaque black even when
 parent shows real pixels. Matches recurring "black band on map".
 
-### 7. CreateRegionFromGC translates by clip_origin; Xorg does not
+### 7. ⬜ CreateRegionFromGC translates by clip_origin; Xorg does not
 **Severity: Bug**
 - yserver: `process_request.rs:2622-2626`
 - Xorg: `xfixes/region.c:204-232` — returns raw clip-coordinate rects, origin only
@@ -69,15 +123,25 @@ parent shows real pixels. Matches recurring "black band on map".
 A WM that builds a region from a GC then re-installs as that GC's clip gets
 double-translation → wrong area shadowed/repainted.
 
-### 8. `drawable_origin` field defined but never written — mid-WIP
-**Severity: Bug (incomplete)**
+### 8. ✅ `drawable_origin` field defined but never written — mid-WIP
+**Severity: Bug (incomplete)** — **Fixed in `8c5c841`**
 - yserver: `kms/core.rs:487`, `process_request.rs:1153`
-- Backend method `set_picture_drawable_origin` missing entirely (E0599 diagnostic)
-- Also: `picture_client_clip_rects` missing (E0599 at `process_request.rs:2670`)
+- Backend method `set_picture_drawable_origin` had a trait default no-op
+- Also: `picture_client_clip_rects` had a trait default `None`
 
 Window-backed pictures whose drawable is at non-(0,0) (CSD frame children) have clips
 in dst-coords, get clamped by `dst_extent.max(0)`, lose negative-shifted rects.
 **This is the in-flight work referenced by the current diagnostics.**
+
+**Resolution:** v2 now overrides both trait methods. `set_picture_drawable_origin`
+writes into `PictureRecord::Drawable.drawable_origin` (no-op tolerated on SolidFill /
+gradient variants). `picture_client_clip_rects` returns the standard Some(rects) /
+Some(None) / None tristate per Xorg semantics so `CreateRegionFromPicture` works
+end-to-end. 6 unit tests (5 mine + 1 codex review addition pinning that
+drawable_origin must NOT be folded into the returned clip rects). The
+`drawable_origin` field is persisted but has no live consumer in the engine yet —
+that wiring stays a known follow-up; this commit closes the WIP-completion the audit
+flagged.
 
 ---
 
@@ -231,14 +295,24 @@ xfwm4/picom pixel-precise shadow shapes break; SetWindowShape with bitmap clears
 
 For maximum compositor-WM impact with minimum churn:
 
-1. **#1** Damage delivery via `redirected_target` — unblocks marco/xfwm4 compositor event loop
-2. **#2** RENDER src/mask clip propagation — active status.md hypothesis
-3. **#8** Finish `set_picture_drawable_origin` / `picture_client_clip_rects` WIP — already in-flight
-4. **#3** Scene subtree prune — explains class of missing-widget reports
-5. **#5** CompositeGlyphs drop non-SolidFill source silently — yellow headers etc.
-6. **#9** XFixesSelectionNotify — clipboard managers wedge in every DE
-7. **#11 + #12** Map damage + Subtract RepeatNotify — compositor loop completeness
-8. **#4** PictFormat tracking (xRGB vs ARGB) — Stage 4e substrate
+1. ✅ **#1** Damage delivery via `redirected_target` — `c0ae57d` + `a4309f5` (codex);
+   user-verified on silence
+2. ✅ **#2** RENDER src/mask clip propagation — `6464531`
+3. ✅ **#8** Finish `set_picture_drawable_origin` / `picture_client_clip_rects`
+   WIP — `8c5c841`
+4. ✅ **#3** Scene subtree prune — `6ffd370`
+5. 🟦 **#5** CompositeGlyphs drop non-SolidFill source silently —
+   skipped, empirically dead code (0% of marco / xfwm4 CompositeGlyphs use
+   non-Over op or non-SolidFill src in captured traces)
+6. ⬜ **#9** XFixesSelectionNotify — clipboard managers wedge in every DE
+7. ⬜ **#11 + #12** Map damage + Subtract RepeatNotify — compositor loop completeness
+8. ✅ **#4** PictFormat tracking (xRGB vs ARGB) — `22223f5`; ended up the larger
+   piece (Stage 4e substrate done in one patch, including dst-side + trap/tri-path
+   coverage caught by codex review)
+
+**Remaining tier-1:** #6 (seed copy from parent — "black band on map" recurring
+symptom) and #7 (CreateRegionFromGC double-translation — affects WMs that build
+regions from GCs). Both clean, focused bug fixes.
 
 ---
 
