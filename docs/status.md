@@ -1393,6 +1393,22 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       leaving that minor opcode unhandled, so it now returns a proper
       `BadName` error for unsupported output properties instead of
       silently eating the request.
+      Next Cinnamon smoke uncovered muffin exiting early with
+      `Window manager error: Mutter requires XFixes 5.0` in
+      `cinnamon.log`. The xtrace showed muffin sending
+      `XFIXES::QueryVersion major=6 minor=0` and yserver replying
+      `major=2 minor=0`, which is below muffin's hardcoded
+      `xfixes_major < 5` bail. XFIXES `MAJOR_VERSION` was bumped from
+      2 to 5; QueryVersion already returns `min(client, server)` so
+      older clients keep negotiating down. The XFIXES 5.0 opcodes
+      muffin will subsequently issue (`CreatePointerBarrier` minor 31,
+      `DestroyPointerBarrier` minor 32, `SetClientDisconnectMode`
+      minor 33) are reply-less and fall through
+      `handle_xfixes_request`'s `other` arm without blocking the
+      client. A `major_version_meets_mutter_floor` const-assertion
+      test was added so the floor cannot silently regress. Follow-up
+      smoke advanced further but the screen now turns fully white;
+      still to diagnose.
 
       **Stability + perf** observed positive through 3f.10 +
       3f.15 (flip-pending gate + failed-submit recovery + stroke

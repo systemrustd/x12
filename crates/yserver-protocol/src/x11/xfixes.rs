@@ -30,7 +30,12 @@ pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
 
-pub const MAJOR_VERSION: u32 = 2;
+// Mutter/muffin refuses to start as a WM unless XFIXES advertises >= 5.0
+// (`Window manager error: Mutter requires XFixes 5.0`). QueryVersion echoes
+// min(client, server) per axis, so older clients still negotiate down.
+// Stage-5+ opcodes (`CreatePointerBarrier` etc.) are reply-less and fall
+// through `handle_xfixes_request`'s `other` arm without breaking clients.
+pub const MAJOR_VERSION: u32 = 5;
 pub const MINOR_VERSION: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +396,13 @@ mod tests {
         assert_eq!(CHANGE_CURSOR_BY_NAME, 27);
         assert_eq!(HIDE_CURSOR, 29);
         assert_eq!(SHOW_CURSOR, 30);
+    }
+
+    #[test]
+    fn major_version_meets_mutter_floor() {
+        // Mutter/muffin bails with `Window manager error: Mutter requires
+        // XFixes 5.0` if the negotiated major version is below 5.
+        const { assert!(MAJOR_VERSION >= 5) }
     }
 
     #[test]
