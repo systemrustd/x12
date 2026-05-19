@@ -43,6 +43,13 @@ pub const SELECTION_MASK_SET_OWNER: u32 = 1 << SELECTION_NOTIFY_SET_OWNER;
 pub const SELECTION_MASK_WINDOW_DESTROY: u32 = 1 << SELECTION_NOTIFY_WINDOW_DESTROY;
 pub const SELECTION_MASK_CLIENT_CLOSE: u32 = 1 << SELECTION_NOTIFY_CLIENT_CLOSE;
 
+/// Union of all known XFixesSelectionNotify mask bits. A
+/// `SelectSelectionInput` request whose `event_mask` has any bit
+/// outside this union must return BadValue (matches Xorg's
+/// `SelectionAllEvents` at `xfixes/select.c:115-117`).
+pub const SELECTION_ALL_EVENTS_MASK: u32 =
+    SELECTION_MASK_SET_OWNER | SELECTION_MASK_WINDOW_DESTROY | SELECTION_MASK_CLIENT_CLOSE;
+
 // Mutter/muffin refuses to start as a WM unless XFIXES advertises >= 5.0
 // (`Window manager error: Mutter requires XFixes 5.0`). QueryVersion echoes
 // min(client, server) per axis, so older clients still negotiate down.

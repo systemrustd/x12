@@ -2605,6 +2605,29 @@ fn handle_xfixes_request(
         }
         x11xfixes::SELECT_SELECTION_INPUT => {
             if let Some(req) = x11xfixes::parse_select_selection_input(body) {
+                // Xorg `ProcXFixesSelectSelectionInput`
+                // (xfixes/select.c:189-196): validate the window
+                // first, then the mask, before mutating state.
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if req.event_mask & !x11xfixes::SELECTION_ALL_EVENTS_MASK != 0 {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.event_mask,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 let key = (
                     client_id.0,
                     ResourceId(req.window),
@@ -14443,6 +14466,135 @@ mod tests {
             u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
             PRIMARY,
             "selection field",
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's
+    /// `ProcXFixesSelectSelectionInput` (`xfixes/select.c:189-192`)
+    /// runs `dixLookupWindow` first and propagates its return code
+    /// (`BadWindow` for an unknown xid). Before the fix yserver
+    /// silently stored the subscription, accepting illegal records.
+    #[test]
+    fn select_selection_input_with_invalid_window_returns_bad_window() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+
+        const CLIENT: u32 = 21;
+        const UNKNOWN_WIN: u32 = 0x00ff_eeee;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&UNKNOWN_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&x11xfixes::SELECTION_MASK_SET_OWNER.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::SELECT_SELECTION_INPUT,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(buf[0], 0, "first byte = error class");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_WINDOW,
+            "expected BadWindow (3) for unknown window xid; got {}",
+            buf[1],
+        );
+        assert!(
+            state.xfixes_selection_masks.is_empty(),
+            "the subscription must NOT be recorded on BadWindow; got {:?}",
+            state.xfixes_selection_masks,
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's
+    /// `ProcXFixesSelectSelectionInput` (`xfixes/select.c:193-196`)
+    /// returns BadValue when `eventMask & ~SelectionAllEvents` is
+    /// non-zero. Before the fix yserver stored arbitrary mask bits.
+    #[test]
+    fn select_selection_input_with_mask_outside_known_bits_returns_bad_value() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+
+        const CLIENT: u32 = 22;
+        const WIN: u32 = 0x0150_0001;
+        const PRIMARY: u32 = 1;
+        const ILLEGAL_MASK: u32 = 1 << 8; // outside SelectionAllEvents
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        // Window must exist for the window-validation step to pass,
+        // so we cleanly isolate the mask-validation path.
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&ILLEGAL_MASK.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::SELECT_SELECTION_INPUT,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(buf[0], 0, "first byte = error class");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_VALUE,
+            "expected BadValue (2) for mask with bits outside \
+             SelectionAllEvents (0b111); got {}",
+            buf[1],
+        );
+        assert!(
+            state.xfixes_selection_masks.is_empty(),
+            "the subscription must NOT be recorded on BadValue; got {:?}",
+            state.xfixes_selection_masks,
         );
     }
 
