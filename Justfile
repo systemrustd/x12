@@ -630,7 +630,9 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            YSERVER_V2_SCENE_WALK_ALL=1 \
+            target/debug/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o mate.xtrace &\
@@ -685,7 +687,7 @@ yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms:
 #
 # Defaults to 5120x1440 to match the yserver hardware-scanout
 # scenario so CC's drag distances and geometry are comparable.
-mate-xephyr-trace screen="5120x1440":
+mate-xephyr-trace screen="1920x1080":
     rm -f mate-xorg.xtrace mate-xephyr.log mate-xorg.log
     bash -c 'set -e;\
         if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
