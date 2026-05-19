@@ -1069,6 +1069,10 @@ fn build_scene(
             &mut snapshots,
             &mut sampled_ids,
             &mut projected,
+            // Top-level windows start with no redirected ancestor;
+            // the flag flips on inside the recursion when entering
+            // a redirected window's subtree.
+            false,
         );
     }
     log::trace!(
@@ -1249,6 +1253,15 @@ fn emit_window_subtree(
     snapshots: &mut Vec<DamageSnapshot>,
     sampled_ids: &mut Vec<super::store::DrawableId>,
     projected: &mut RegionSet,
+    // Audit #3 (2026-05-19): true iff some ancestor on the recursion
+    // path owns a `redirected_target`. When set, this window's paint
+    // landed in that ancestor's backing (via `resolve_paint_target`'s
+    // ancestor walk), so emitting this window's own storage would
+    // show stale/empty pixels — the ancestor's emit already shows
+    // the content. A descendant that owns ITS OWN `redirected_target`
+    // breaks this chain (its paint stops at itself), so it still
+    // emits its own backing regardless of the inherited flag.
+    under_redirected_ancestor: bool,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -1303,13 +1316,12 @@ fn emit_window_subtree(
     // existing trace shape for live debugging) and before the
     // child-recurse below.
     //
-    // Assumption: post-`geom.mapped` filter, the only writer that
-    // produces `scene_participating=false` is Manual-redirect
-    // activation (`set_window_scene_participation(W, false)`).
-    // If a third reason is added later, audit whether it also
-    // wants subtree-prune semantics; the store currently tracks
-    // only the bool, not the reason.
-    let mut prune_subtree = false;
+    // Audit #3 (2026-05-19): the old `prune_subtree=true` for
+    // `scene_participating=false` is gone — Automatic descendants of
+    // Manual ancestors need to recurse so they can emit their own
+    // backing. Per-window emit-vs-skip is decided by
+    // `paint_target_is_self` below; the recurse always runs and the
+    // `under_redirected_ancestor` flag carries the chain context.
 
     // Emit a draw entry for this window if it has live storage that
     // participates in the scene.
@@ -1355,20 +1367,36 @@ fn emit_window_subtree(
             drawable_snap
         {
             // Stage 4c.3 — route source-storage through `redirected_target`.
-            // Automatic-mode redirected W blits FROM B; W's geometry
-            // (dst_origin, dst_size, intersect test) stays driven by W's
-            // own state in `windows_v2`. Manual-mode redirected W still
-            // contributes its backing directly to the scene, but its
-            // descendants are pruned so the compositor owns the subtree
-            // presentation boundary.
+            // Both modes blit FROM B; W's geometry (dst_origin, dst_size,
+            // intersect test) stays driven by W's own state in
+            // `windows_v2`. Only the sampled storage handle reroutes.
             let source_id = store.redirected_target(id).unwrap_or(id);
             let source_view_null = store
                 .get(source_id)
                 .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
-            let manual_backing_visible = !d_part
-                && matches!(d_kind, DrawableKind::Window)
-                && source_id != id
-                && !source_view_null;
+
+            // Audit #3 (2026-05-19) — emit-or-skip is governed by
+            // "is this window's storage where paint actually lands?"
+            //
+            //   has_own_redirected_target   self owns a `redirected_target`
+            //                               → paint lands in its B, emit B.
+            //   under_redirected_ancestor   some ancestor owns one
+            //                               → paint lands in ancestor's B,
+            //                                 ancestor emits it, we skip.
+            //   d_part                      `scene_participating=true` —
+            //                                 ordinary non-redirected window
+            //                                 with its own storage as the
+            //                                 paint target. Emit own storage.
+            //
+            // Pre-fix the rule was `d_part || manual_backing_visible`
+            // plus an unconditional `prune_subtree` on
+            // `scene_participating=false`. That dropped Automatic-
+            // redirected descendants of Manual-redirected ancestors —
+            // GTK/marco CSD frames lose their inner widgets (per audit
+            // #3 / Control Center missing-widget reports).
+            let has_own_redirected_target = source_id != id;
+            let paint_target_is_self = has_own_redirected_target
+                || (d_part && !under_redirected_ancestor);
 
             // Project onto output-local coords (computed once here so
             // both the SKIP=no_intersect and WILL_EMIT trace lines can
@@ -1385,11 +1413,18 @@ fn emit_window_subtree(
             // Pick the first failing gate and emit a single SKIP line;
             // otherwise emit WILL_EMIT. Order matches the production
             // gate ordering below so the trace mirrors the live path.
-            if !d_part {
-                prune_subtree = true;
-            }
-            let skip_reason: Option<&'static str> = if !d_part && !manual_backing_visible {
-                Some("scene_participating=false")
+            let skip_reason: Option<&'static str> = if !paint_target_is_self {
+                if has_own_redirected_target {
+                    // Defensive — `paint_target_is_self` is true when
+                    // `has_own_redirected_target`, so this branch is
+                    // unreachable. Kept so the match stays exhaustive
+                    // if the rule ever evolves.
+                    Some("paint_target_not_self")
+                } else if under_redirected_ancestor {
+                    Some("paint_target_is_redirected_ancestor")
+                } else {
+                    Some("scene_participating=false")
+                }
             } else if !matches!(d_kind, DrawableKind::Window) {
                 Some("kind!=Window")
             } else if source_view_null {
@@ -1403,7 +1438,9 @@ fn emit_window_subtree(
             if debug_focus {
                 log::debug!(
                     "v2 scene_walk focus xid={host_xid:#x} source_id={source_id:?} \
-                     manual_backing_visible={manual_backing_visible} prune_subtree={prune_subtree} \
+                     has_own_redirected_target={has_own_redirected_target} \
+                     under_redirected_ancestor={under_redirected_ancestor} \
+                     paint_target_is_self={paint_target_is_self} \
                      intersects={intersects} skip_reason={skip_reason:?}",
                 );
             }
@@ -1478,7 +1515,7 @@ fn emit_window_subtree(
                 && let Some(source) = store.get(source_id)
                 && source.storage.image_view != vk::ImageView::null()
                 && intersects
-                && (d_part || manual_backing_visible)
+                && paint_target_is_self
             {
                 // Window scene draw — bind the sample-side view
                 // (format/depth-aware swizzle) instead of the
@@ -1551,9 +1588,21 @@ fn emit_window_subtree(
         }
     }
 
-    if prune_subtree {
-        return;
-    }
+    // Audit #3 (2026-05-19) — descendants need to know whether THEY
+    // sit under a redirected ancestor. The chain is "this window
+    // counts as a redirected ancestor iff it owns its own
+    // `redirected_target`" — that's exactly where
+    // `resolve_paint_target` stops climbing the parent chain. A
+    // recursion under a Manual-redirected ancestor without own
+    // backing flips the flag on; an Automatic-redirected descendant
+    // beneath that resets the flag for its own descendants (because
+    // its paint stops at its own B).
+    let self_owns_redirected_target = store
+        .lookup(host_xid)
+        .and_then(|id| store.redirected_target(id))
+        .is_some();
+    let child_under_redirected_ancestor =
+        under_redirected_ancestor || self_owns_redirected_target;
 
     // Recurse into mapped descendants in stable sibling stack order.
     let mut children: Vec<(u32, u64)> = windows_v2
@@ -1582,6 +1631,7 @@ fn emit_window_subtree(
             snapshots,
             sampled_ids,
             projected,
+            child_under_redirected_ancestor,
         );
     }
 }
@@ -2767,33 +2817,22 @@ mod tests {
         );
     }
 
-    /// Stage 4d — `build_scene` must prune the entire subtree of
-    /// a Manual-redirected (`scene_participating=false`) ancestor,
-    /// NOT just skip the ancestor node and emit its children.
+    /// Stage 4d — `build_scene` must skip non-redirected descendants
+    /// of a Manual-redirected ancestor that owns its own backing.
+    /// The descendants' paint routes through `resolve_paint_target`
+    /// to the ancestor's B; emitting their own (stale) storage on
+    /// top of the ancestor's B would muddy the compositor output.
     ///
-    /// Regression context (Stage 4d marco-with-compositing CC
-    /// disappears): emit_window_subtree's per-node skip-gate
-    /// returned after the SKIP trace but unconditionally recursed
-    /// into children. CC's marco-decorated frame (Manual redirect,
-    /// scene_participating=false) skipped emit; CC's child GtkWindow
-    /// (scene_participating=true, parent=frame) was then walked and
-    /// directly emitted by scene_walk — bypassing marco's
-    /// compositor entirely. The directly-emitted child storage
-    /// (stale, since post-redirect child paints route to the
-    /// frame's backing via resolve_paint_target) muddied COW
-    /// over marco's compositor output. X11 Composite semantics:
-    /// a Manual-redirected window is a *subtree ownership boundary*
-    /// — the compositor owns presentation of every descendant.
-    ///
-    /// Assumption: `scene_participating=false` is set ONLY by
-    /// (un)map and `set_window_scene_participation` (Manual-redirect
-    /// activation). Unmapped windows are pruned earlier in
-    /// emit_window_subtree via `geom.mapped` check, so any
-    /// non-participating MAPPED window reaching the per-node gate
-    /// is Manual-redirected. If a third reason for
-    /// `scene_participating=false` is added later, audit whether it
-    /// also wants subtree-prune semantics; if not, the gate must
-    /// learn the *reason* (store currently tracks only the bool).
+    /// Audit #3 follow-up (2026-05-19): the test was originally
+    /// written against the degenerate state where the parent has
+    /// `scene_participating=false` *without* a redirected backing —
+    /// that state doesn't occur in real life (Manual-redirect
+    /// activation always sets `redirected_target` BEFORE flipping
+    /// `scene_participating=false`, see
+    /// `activate_redirect_backing_for`). Updated to mirror the
+    /// realistic state: frame has both a backing AND
+    /// `scene_participating=false`, and the assertion checks that
+    /// frame_B emits while the non-redirected child is skipped.
     #[test]
     fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
         let mut core = KmsCore::for_tests();
@@ -2849,9 +2888,25 @@ mod tests {
         );
         core.top_level_order.push(0x222);
 
-        // Flip frame W to scene_participating=false (Manual
-        // redirect activation). Child stays participating.
+        // Set up realistic Manual-redirect state on frame W: allocate
+        // a backing, point W's `redirected_target` at it, then flip
+        // `scene_participating=false`. Child stays participating —
+        // its paint will resolve to frame_B via
+        // `resolve_paint_target`'s ancestor walk, NOT to its own
+        // storage; so the child's storage stays stale, and emitting
+        // it would muddy the frame_B emit underneath.
         let w_frame_id = store.lookup(0x111).expect("frame lookup");
+        let mut frame_backing = super::super::store::Storage::for_tests_null(
+            extent(200, 150),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let frame_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_F111);
+        frame_backing.image_view = frame_backing_view;
+        frame_backing.sample_view = frame_backing_view;
+        let frame_backing_id = store
+            .allocate(0xB111, DrawableKind::Pixmap, 32, true, frame_backing)
+            .expect("alloc frame backing");
+        store.set_redirected_target(w_frame_id, Some(frame_backing_id));
         store.set_scene_participating(w_frame_id, false);
         let child_id = store.lookup(0x112).expect("child lookup");
         assert!(
@@ -2871,26 +2926,58 @@ mod tests {
         );
         let scene = &built.scene;
 
-        // Only the bystander W (0x222 @ (500,500)) must be drawn.
-        // Frame W skipped (Manual redirect) → child C must NOT
-        // leak in as a top-level descendant emission.
+        // Two draws: frame_B (origin = frame's pos, since the
+        // Manual-redirected window emits its backing at its own
+        // geometry) AND the bystander. The child of frame W must
+        // NOT emit — its paint routes to frame_B.
         assert_eq!(
             scene.draws.len(),
-            1,
-            "expected exactly 1 draw (the bystander); got {} — children of \
-             a Manual-redirected ancestor must be pruned, not walked: {:?}",
+            2,
+            "expected frame_B + bystander; got {} — non-redirected children of \
+             a Manual-redirected ancestor with a backing must skip emit \
+             (their paint resolves to the ancestor's B): {:?}",
             scene.draws.len(),
             scene.draws,
         );
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
+            "frame backing draw missing: {:?}",
+            scene.draws
+        );
+        assert!(
+            scene.draws.iter().any(|d| d.dst_origin == [500.0, 500.0]),
+            "bystander draw missing: {:?}",
+            scene.draws
+        );
+        // The "must not leak" property — child's draw entry must NOT appear.
+        assert!(
+            !scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [111.0, 241.0]),
+            "non-redirected child of Manual-redirected ancestor leaked into scene.draws: {:?}",
+            scene.draws,
+        );
+        // First-draw checks below are scoped to the surviving entries.
+        let bystander_draw = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_origin == [500.0, 500.0])
+            .expect("bystander present");
         assert_eq!(
-            scene.draws[0].dst_origin,
+            bystander_draw.dst_origin,
             [500.0, 500.0],
             "the surviving draw must be the bystander at (500,500); \
              frame and its child were ostensibly pruned",
         );
-        // sampled_ids mirrors draws — must not reference child.
+        // sampled_ids mirrors draws — frame_B + bystander, no child.
         let bystander_id = store.lookup(0x222).expect("bystander lookup");
-        assert_eq!(built.sampled_ids, vec![bystander_id]);
+        assert_eq!(built.sampled_ids.len(), 2);
+        assert!(built.sampled_ids.contains(&frame_backing_id));
+        assert!(built.sampled_ids.contains(&bystander_id));
     }
 
     /// Stage 4d follow-up — a Manual-redirected parent with a
@@ -2999,6 +3086,125 @@ mod tests {
         assert_eq!(built.sampled_ids.len(), 2);
         assert!(built.sampled_ids.contains(&backing_id));
         assert!(built.sampled_ids.contains(&bystander_id));
+    }
+
+    /// Audit #3 (2026-05-19) — a Manual-redirected parent still
+    /// prunes its NON-redirected descendants (their paint resolves
+    /// to the parent's B via `resolve_paint_target` so the parent
+    /// emit covers them), but Automatic-redirected descendants have
+    /// their OWN backing — `resolve_paint_target` stops at them —
+    /// and MUST still emit. Pre-fix `prune_subtree=true` dropped
+    /// them unconditionally, matching the audit's "GTK/marco CSD
+    /// pattern: RedirectWindow(frame, Manual) +
+    /// RedirectSubwindows(frame, Automatic) makes Automatic
+    /// widgets vanish" symptom (Control Center missing menus /
+    /// widgets).
+    #[test]
+    fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Frame F at (100, 200), 200×150 — Manual-redirected
+        // (scene_participating=false) with its own backing F_B.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x111,
+            100,
+            200,
+            200,
+            150,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x111);
+        let frame_id = store.lookup(0x111).expect("frame lookup");
+
+        let mut frame_backing = super::super::store::Storage::for_tests_null(
+            extent(200, 150),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let frame_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_F000);
+        frame_backing.image_view = frame_backing_view;
+        frame_backing.sample_view = frame_backing_view;
+        let frame_backing_id = store
+            .allocate(0xB111, DrawableKind::Pixmap, 32, true, frame_backing)
+            .expect("alloc frame backing");
+        store.set_redirected_target(frame_id, Some(frame_backing_id));
+        store.set_scene_participating(frame_id, false);
+
+        // Automatic-redirected child C at (11, 41) inside F — own
+        // backing C_B; scene_participating=true (Automatic).
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x112,
+            11,
+            41,
+            100,
+            80,
+            Some(0x111),
+            true,
+        );
+        let child_id = store.lookup(0x112).expect("child lookup");
+
+        let mut child_backing = super::super::store::Storage::for_tests_null(
+            extent(100, 80),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let child_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_C000);
+        child_backing.image_view = child_backing_view;
+        child_backing.sample_view = child_backing_view;
+        let child_backing_id = store
+            .allocate(0xB112, DrawableKind::Pixmap, 32, true, child_backing)
+            .expect("alloc child backing");
+        store.set_redirected_target(child_id, Some(child_backing_id));
+        // Automatic mode → child window stays scene_participating=true.
+        assert!(
+            store.get(child_id).unwrap().scene_participating,
+            "fixture sanity: Automatic-redirected child stays scene_participating=true",
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+        );
+        let scene = &built.scene;
+
+        // Two draws: parent F's backing at (100, 200), child C's
+        // backing at (111, 241) (= F.pos + C.pos relative).
+        assert_eq!(
+            scene.draws.len(),
+            2,
+            "expected manual-parent backing + automatic-child backing; got {:?}",
+            scene.draws
+        );
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
+            "manual parent backing draw missing: {:?}",
+            scene.draws
+        );
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [111.0, 241.0] && d.dst_size == [100.0, 80.0]),
+            "automatic child backing draw missing: {:?}",
+            scene.draws
+        );
+        assert!(built.sampled_ids.contains(&frame_backing_id));
+        assert!(built.sampled_ids.contains(&child_backing_id));
     }
 
     /// Stage 4d — `build_scene` appends the Composite Overlay
