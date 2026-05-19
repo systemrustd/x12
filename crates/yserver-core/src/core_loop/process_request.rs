@@ -11027,6 +11027,9 @@ fn handle_set_selection_owner(
     // BadWindow if `window != None` and the xid doesn't resolve
     // (`dix/selection.c:169-173`). `window == 0` (None) means
     // "release ownership" and is the only valid non-existent value.
+    // The major opcode in the error reply is the core
+    // SetSelectionOwner opcode (22), not 0 — clients keying on
+    // `major_opcode` see a malformed error otherwise.
     if window.0 != 0 && state.resources.window(window).is_none() {
         return emit_x11_error(
             state,
@@ -11034,7 +11037,7 @@ fn handle_set_selection_owner(
             sequence,
             x11::error::BAD_WINDOW,
             window.0,
-            0, // core opcode — minor stays 0
+            22,
         );
     }
     // BadAtom if the selection atom isn't allocated
@@ -11047,7 +11050,7 @@ fn handle_set_selection_owner(
             sequence,
             x11::error::BAD_ATOM,
             selection.0,
-            0,
+            22,
         );
     }
     if let Some(&(_, prior_last_time)) = state.selections.get(&selection)
@@ -11057,15 +11060,16 @@ fn handle_set_selection_owner(
         return Ok(RequestOutcome::Handled);
     }
 
+    // Snapshot prior ownership BEFORE we mutate state.selections so
+    // the SelectionClear gate / event payload sees the previous
+    // owner. `selection_owner_target_id` returns the prior
+    // owner's window + the ClientId we should target.
     let old = selection_owner_target_id(state, selection);
-    let old_window = state.selections.get(&selection).map(|(w, _)| *w);
     if window.0 == 0 {
         state.selections.remove(&selection);
     } else {
         state.selections.insert(selection, (window, resolved_time));
     }
-    let send_clear =
-        old_window.is_some() && old_window != (if window.0 == 0 { None } else { Some(window) });
     let name = state.atoms.name(selection).map(str::to_owned);
     debug!(
         "client {} #{} SetSelectionOwner {} -> 0x{:x}",
@@ -11075,9 +11079,27 @@ fn handle_set_selection_owner(
         window.0
     );
 
-    if send_clear && let Some((old_window, old_target)) = old {
+    // SelectionClear gating per Xorg `dix/selection.c:194`:
+    //   if (pSel->client && (!pWin || (pSel->client != client)))
+    // i.e. fire only when there WAS a prior owner AND either the
+    // new owner is None OR the new owner is a different client.
+    // Same-client moves between own windows must NOT spawn a
+    // SelectionClear. The event's time field carries the resolved
+    // server time (`time.milliseconds` post-`ClientTimeToServerTime`
+    // at line 196), not the raw `time_val` — a client sending
+    // `CurrentTime`/0 must NOT see 0 in the event payload.
+    if let Some((old_window, old_target)) = old
+        && (window.0 == 0 || old_target != client_id)
+    {
         let _dropped = fanout_event_to_clients(state, &[old_target], |buf, seq, order| {
-            x11::encode_selection_clear_event(buf, seq, order, time_val, old_window, selection);
+            x11::encode_selection_clear_event(
+                buf,
+                seq,
+                order,
+                resolved_time,
+                old_window,
+                selection,
+            );
         });
     }
 
@@ -14559,6 +14581,172 @@ mod tests {
     }
 
     /// Audit #9 (code-review follow-up): Xorg's `dixSetSelectionOwner`
+    /// (`dix/selection.c:194`) gates SelectionClear on the previous
+    /// OWNER's client identity, not on the window identity:
+    ///   `if (pSel->client && (!pWin || (pSel->client != client)))`
+    /// A single client moving its own selection between two of its
+    /// own windows must NOT receive a spurious SelectionClear. Pre-fix
+    /// yserver gated on `old_window != new_window`, which over-fires.
+    #[test]
+    fn set_selection_owner_no_clear_when_same_client_moves_between_own_windows() {
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+        const APP: u32 = 50;
+        const WIN_A: u32 = 0x0050_0001;
+        const WIN_B: u32 = 0x0050_0002;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        // Both windows owned by the same client.
+        for win in [WIN_A, WIN_B] {
+            state.resources.create_window(
+                ClientId(APP),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        // Seed prior ownership directly so we isolate the second-call
+        // path. Owner = WIN_A (belongs to APP).
+        state
+            .selections
+            .insert(AtomId(PRIMARY), (ResourceId(WIN_A), 0));
+
+        // Same client takes ownership at WIN_B.
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&WIN_B.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time=CurrentTime
+        handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        // SelectionClear has event type 29 (X11 core).
+        assert!(
+            !all.chunks_exact(32).any(|e| e[0] == 29),
+            "no SelectionClear must be sent when the same client \
+             moves selection between its own windows; got {} bytes: \
+             {:02x?}",
+            all.len(),
+            all,
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg encodes the resolved
+    /// server time (post-`ClientTimeToServerTime`, so CurrentTime/0
+    /// becomes the actual `currentTime`) into the SelectionClear
+    /// event's time field at `dix/selection.c:196`. Pre-fix yserver
+    /// encoded the raw `time_val`, so a client sending `time=0` made
+    /// the SelectionClear carry `time=0` (the CurrentTime sentinel).
+    #[test]
+    fn set_selection_owner_clear_event_uses_resolved_time_when_client_sends_zero() {
+        use std::{io::Read, thread, time::Duration};
+        use yserver_protocol::x11::CreateWindowRequest;
+        const PRIOR_OWNER: u32 = 51;
+        const NEW_OWNER: u32 = 52;
+        const PRIOR_WIN: u32 = 0x0051_0001;
+        const NEW_WIN: u32 = 0x0052_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, PRIOR_OWNER);
+        let _ = install_client(&mut state, NEW_OWNER);
+        for (owner, win) in &[(PRIOR_OWNER, PRIOR_WIN), (NEW_OWNER, NEW_WIN)] {
+            state.resources.create_window(
+                ClientId(*owner),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(*win),
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        // Seed prior ownership with lastTimeChanged=0 so the stale
+        // check at the new call never trips.
+        state
+            .selections
+            .insert(AtomId(PRIMARY), (ResourceId(PRIOR_WIN), 0));
+
+        // Sleep so `state.timestamp_now()` is non-zero when the new
+        // request runs — pre-fix the SelectionClear's `time` field
+        // carries the raw `time_val=0` (CurrentTime sentinel), so
+        // pinning `>= ts_before` after a sleep distinguishes the
+        // resolved-time encoding from the raw-passthrough encoding.
+        thread::sleep(Duration::from_millis(2));
+        let ts_before = state.timestamp_now();
+        assert!(ts_before > 0, "sanity: sleep advanced server time");
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&NEW_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time=CurrentTime
+        handle_set_selection_owner(&mut state, ClientId(NEW_OWNER), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let clear: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|e| e[0] == 29)
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected SelectionClear (event type 29) on prior \
+                     owner's stream; got {} bytes: {:02x?}",
+                    all.len(),
+                    all,
+                );
+            });
+        let clear_time = u32::from_le_bytes([clear[4], clear[5], clear[6], clear[7]]);
+        assert!(
+            clear_time >= ts_before,
+            "SelectionClear.time must be the resolved server time \
+             (>= ts_before={ts_before}), not the raw time_val=0 the \
+             client sent; got {clear_time}",
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's `dixSetSelectionOwner`
     /// (`dix/selection.c:169-173`) returns BadWindow when `window` is
     /// non-`None` and `dixLookupWindow` fails. Pre-fix yserver
     /// silently stored an unknown window xid as the new owner and
@@ -14603,6 +14791,14 @@ mod tests {
             yserver_protocol::x11::error::BAD_WINDOW,
             "expected BadWindow (3) for unknown window xid; got {}",
             buf[1],
+        );
+        // SetSelectionOwner is core opcode 22; the error reply's
+        // major_opcode field (byte 10) MUST reflect that, or
+        // clients that key on major_opcode see a malformed error.
+        assert_eq!(
+            buf[10], 22,
+            "BadWindow reply must carry SetSelectionOwner's major opcode (22); got {}",
+            buf[10],
         );
         assert!(
             state.selections.get(&AtomId(PRIMARY)).is_none(),
@@ -14654,6 +14850,11 @@ mod tests {
             yserver_protocol::x11::error::BAD_ATOM,
             "expected BadAtom (5) for an unknown selection atom; got {}",
             buf[1],
+        );
+        assert_eq!(
+            buf[10], 22,
+            "BadAtom reply must carry SetSelectionOwner's major opcode (22); got {}",
+            buf[10],
         );
         assert!(
             state.selections.get(&AtomId(BOGUS_ATOM)).is_none(),
