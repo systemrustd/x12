@@ -162,12 +162,26 @@ flagged.
 
 ## Tier 2 — will hang or visibly break clients
 
-### 9. `SelectSelectionInput` never emits `XFixesSelectionNotify`
-**Severity: Bug**
+### 9. ✅ `SelectSelectionInput` never emits `XFixesSelectionNotify`
+**Severity: Bug** — **Fixed in `5e19e33`**
 - yserver: `process_request.rs:2555-2568`; event emit site missing entirely
 - Xorg: `xfixes/select.c:53-94`
 
 Every clipboard manager (klipper, copyq, gpaste, gnome-shell clipboard indicator) wedges.
+
+**Resolution:** all three notify subtypes wired —
+`SetSelectionOwner` from `handle_set_selection_owner` (after
+`state.selections` is updated; timestamp + selection_timestamp =
+request's `time` arg), `SelectionWindowDestroy` from
+`destroy_window_subtree` (before `state.resources.destroy_window`,
+shared helper `drop_selections_owned_by_windows` matches selections
+whose owner window is in the destroyed subtree), `SelectionClientClose`
+from `process_disconnect` (before the owned-window destroy loop so
+`state.resources.window_owner` still resolves). New wire encoder
+`encode_selection_notify_event` + `SELECTION_NOTIFY_*` /
+`SELECTION_MASK_*` constants in yserver-protocol. 7 tests (3 encoder,
+4 fanout). Per-selection `lastTimeChanged` tracking deferred — clipboard
+managers don't gate on `selection_timestamp` in practice.
 
 ### 10. `GetClientDisconnectMode` (XFIXES minor 34) has a reply but is silently dropped
 **Severity: Bug**
@@ -336,7 +350,7 @@ For maximum compositor-WM impact with minimum churn:
 5. 🟦 **#5** CompositeGlyphs drop non-SolidFill source silently —
    skipped, empirically dead code (0% of marco / xfwm4 CompositeGlyphs use
    non-Over op or non-SolidFill src in captured traces)
-6. ⬜ **#9** XFixesSelectionNotify — clipboard managers wedge in every DE
+6. ✅ **#9** XFixesSelectionNotify — `5e19e33` (set-owner / window-destroy / client-close subtypes)
 7. ⬜ **#11 + #12** Map damage + Subtract RepeatNotify — compositor loop completeness
 8. ✅ **#4** PictFormat tracking (xRGB vs ARGB) — `22223f5`; ended up the larger
    piece (Stage 4e substrate done in one patch, including dst-side + trap/tri-path
