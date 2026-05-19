@@ -1407,8 +1407,29 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       `handle_xfixes_request`'s `other` arm without blocking the
       client. A `major_version_meets_mutter_floor` const-assertion
       test was added so the floor cannot silently regress. Follow-up
-      smoke advanced further but the screen now turns fully white;
-      still to diagnose.
+      smoke advanced further but the screen turned fully white.
+      Subsequent Cinnamon/Muffin fixes in progress: PRESENT
+      `NotifyMSC` now emits an immediate `CompleteNotify` when the
+      current MSC already satisfies the request (fixing the white
+      screen), root/input hit-testing now reaches the compositor's
+      overlay children (menus and desktop icons become clickable),
+      and XI2 `QueryDevice` now advertises paired master/slave
+      pointer+keyboard devices. Remaining Cinnamon rendering issue:
+      Muffin's full-screen compositor stage surfaces are visible, but
+      managed client frames were also being emitted directly through
+      their Manual-redirected backings, which double-presented clients
+      outside Muffin's own compositor output. 2026-05-19 correction:
+      Manual redirect again removes the window subtree from normal
+      scene traversal for descendants, while the redirected parent
+      still emits its own backing directly into the scene. Automatic
+      redirect samples the backing through W's scene entry.
+      Resize-time backing rotation now
+      reapplies the effective redirect mode so Manual frames do not
+      become scene-visible after ConfigureWindow, and resize-time
+      storage reallocation preserves the existing scene bit instead
+      of blindly re-deriving it from `geom.mapped`. XFCE's previous
+      "emit Manual backing directly" workaround is considered wrong
+      and needs a separate compositor-output fix.
 
       **Stability + perf** observed positive through 3f.10 +
       3f.15 (flip-pending gate + failed-submit recovery + stroke
@@ -1751,11 +1772,13 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     draw in `build_scene`, which avoids covering xfwm4's real
     output with the zero-filled overlay surface.
 
-    Manual-redirected parents still prune their descendants, but
-    if they have a redirected backing the scene emits that backing
-    instead of skipping the parent outright. That keeps compositor-
-    owned desktop/window surfaces visible without leaking child
-    windows separately.
+    2026-05-19 correction after Cinnamon/Muffin smoke: Manual-
+    redirected parents still emit their own redirected backing
+    directly, but their descendants are pruned so the subtree is
+    owned by the compositor. Automatic redirects continue to sample
+    through W's `redirected_target`. The earlier "emit all manual
+    backings" path was too broad; the real rule is parent backing
+    yes, child leakage no.
 
     7 tests: `cow_get_overlay_first_call_allocates_storage`,
     `_second_call_refcounts`, `cow_release_decrements_refcount`,
@@ -1932,6 +1955,37 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     effects, no real compositor visual on v1.** Apps render
     via the bypass, not the compositor.
 
+    **2026-05-19 follow-up**: the scene-boundary fix is back
+    in place so MATE is usable again, but drop shadows are
+    still missing. The current yserver-side fix stores the
+    original drawable origin on `CreatePicture` and uses it to
+    translate root/window-space clip regions into picture-local
+    coordinates before Render scissoring. XFIXES region helpers
+    also mirror Xorg for `CreateRegionFromWindow` honoring its
+    `kind` byte, `CreateRegionFromGC` / `CreateRegionFromPicture`
+    by copying the client clip, and `InvertRegion` now computes
+    `bounds - source` instead of discarding the source operand.
+    Direct RENDER `SetPictureClipRectangles` now also canonicalizes
+    overlapping bands before storing them; the live trace showed
+    repeated identical / overlapping bands surviving in the
+    picture-clip lists, which is our bug, not a DE quirk.
+
+    **2026-05-19 follow-up 2**: the Render destination-clip idea
+    turned out to be the wrong layer and has been backed out.
+    The Xorg trace still matters, but the `subwindow-mode`
+    metadata there is pointing us toward source-validation / source-
+    clip handling for window-backed pictures, not toward clipping
+    the Render destination itself. Keep this as a live mismatch,
+    not a solved branch.
+
+    2026-05-19 follow-up after the latest mate smoke: the log now
+    shows `clear_window_area_with_background` hitting depth-32
+    visible windows with `bg_pixmap=None` and `bg_pixel=0x00000000`,
+    and the fallback clear was decoding that as transparent black.
+    That is the current active alpha bug; the fallback clear path
+    now bypasses the generic fill path and issues a direct opaque
+    fill for server-owned background clears.
+
     ### Stage 4d close decision (pending implementation)
 
     v1's compositing "support" is a no-op fallback that
@@ -2107,6 +2161,16 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       — buffer-age / damage-tracking hint.
     - v2 should still backfill PictFormat tracking + alpha
       interpretation per picture format (Stage 4e or follow-on).
+    - Client-created pixmaps now initialize to opaque black,
+      while visible windows keep the alpha-sensitive depth-32
+      default. This was a targeted response to compositor-owned
+      offscreen buffers starting transparent and leaking desktop
+      through unpainted regions.
+    - RENDER drawable sources now carry their requested
+      `PictFormat` through the v2 resolver, so xRGB/RGB24
+      pictures are forced opaque even when they sit on 32-bit
+      storage. The old depth-only heuristic was too coarse for
+      compositor-managed window surfaces.
 - [ ] **Stage 5 (optional) — advanced perf strategies.**
   Strategy plug-ins on the existing components: damage-strategy
   selection per frame, HW cursor return, direct scanout, HW

@@ -23,10 +23,10 @@
 //!   Stage 2d the cursor is skipped from the scene entirely —
 //!   cursor rendering needs a small cursor pixmap which Stage 3
 //!   will allocate alongside `create_cursor` wiring.
-//! - **Manual-redirected backings skipped automatically.** They
-//!   carry `scene_participating = false` per Stage 2b's
-//!   `RedirectedBacking` default, so the scene-assembly loop
-//!   already excludes them.
+//! - **Manual-redirected windows skipped automatically.** Manual
+//!   redirect flips the window to `scene_participating = false`;
+//!   the scene walk prunes that window's subtree. The compositor
+//!   reintroduces those pixels by painting its output/COW surface.
 //! - **bg_pixel only.** Root background is the
 //!   `vkCmdBeginRendering` clear color; `bg_pixmap` (which
 //!   needs a sample-from-pixmap into root) waits for Stage 3.
@@ -1357,17 +1357,18 @@ fn emit_window_subtree(
             // Stage 4c.3 — route source-storage through `redirected_target`.
             // Automatic-mode redirected W blits FROM B; W's geometry
             // (dst_origin, dst_size, intersect test) stays driven by W's
-            // own state in `windows_v2`. Manual-redirected W's still
-            // prune their descendants, but if they have a redirected
-            // backing the scene draws that backing instead of skipping
-            // the parent outright. That keeps the compositor-owned
-            // desktop/window surface visible while preserving the
-            // subtree boundary.
+            // own state in `windows_v2`. Manual-mode redirected W still
+            // contributes its backing directly to the scene, but its
+            // descendants are pruned so the compositor owns the subtree
+            // presentation boundary.
             let source_id = store.redirected_target(id).unwrap_or(id);
             let source_view_null = store
                 .get(source_id)
                 .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
-            let uses_redirected_source = source_id != id;
+            let manual_backing_visible = !d_part
+                && matches!(d_kind, DrawableKind::Window)
+                && source_id != id
+                && !source_view_null;
 
             // Project onto output-local coords (computed once here so
             // both the SKIP=no_intersect and WILL_EMIT trace lines can
@@ -1387,7 +1388,7 @@ fn emit_window_subtree(
             if !d_part {
                 prune_subtree = true;
             }
-            let skip_reason: Option<&'static str> = if !d_part && !uses_redirected_source {
+            let skip_reason: Option<&'static str> = if !d_part && !manual_backing_visible {
                 Some("scene_participating=false")
             } else if !matches!(d_kind, DrawableKind::Window) {
                 Some("kind!=Window")
@@ -1398,6 +1399,14 @@ fn emit_window_subtree(
             } else {
                 None
             };
+
+            if debug_focus {
+                log::debug!(
+                    "v2 scene_walk focus xid={host_xid:#x} source_id={source_id:?} \
+                     manual_backing_visible={manual_backing_visible} prune_subtree={prune_subtree} \
+                     intersects={intersects} skip_reason={skip_reason:?}",
+                );
+            }
 
             if let Some(reason) = skip_reason {
                 log::trace!(
@@ -1469,7 +1478,7 @@ fn emit_window_subtree(
                 && let Some(source) = store.get(source_id)
                 && source.storage.image_view != vk::ImageView::null()
                 && intersects
-                && (d_part || uses_redirected_source)
+                && (d_part || manual_backing_visible)
             {
                 // Window scene draw — bind the sample-side view
                 // (format/depth-aware swizzle) instead of the
@@ -2885,10 +2894,10 @@ mod tests {
     }
 
     /// Stage 4d follow-up — a Manual-redirected parent with a
-    /// redirected backing must still emit that backing, while its
-    /// descendants remain pruned.
+    /// redirected backing must emit that backing directly, while
+    /// still pruning its descendants.
     #[test]
-    fn build_scene_emits_manual_redirected_parent_backing() {
+    fn build_scene_emits_manual_redirected_parent_backing_but_prunes_descendants() {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
@@ -2968,26 +2977,28 @@ mod tests {
         );
         let scene = &built.scene;
 
-        assert_eq!(
-            scene.draws.len(),
-            2,
-            "expected redirected parent backing + bystander; got {:?}",
-            scene.draws,
+        assert_eq!(scene.draws.len(), 2, "expected manual backing + bystander");
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [100.0, 200.0] && d.dst_size == [200.0, 150.0]),
+            "manual parent backing draw missing: {:?}",
+            scene.draws
         );
-        assert_eq!(scene.draws[0].dst_origin, [100.0, 200.0]);
-        assert_eq!(scene.draws[0].dst_size, [200.0, 150.0]);
-        assert_eq!(
-            scene.draws[0].image_view, backing_view,
-            "manual-redirected parent must sample from its redirected backing",
+        assert!(
+            scene
+                .draws
+                .iter()
+                .any(|d| d.dst_origin == [500.0, 500.0] && d.dst_size == [60.0, 30.0]),
+            "bystander draw missing: {:?}",
+            scene.draws
         );
-        assert_eq!(scene.draws[1].dst_origin, [500.0, 500.0]);
 
+        let bystander_id = store.lookup(0x222).expect("bystander lookup");
         assert_eq!(built.sampled_ids.len(), 2);
-        assert_eq!(built.sampled_ids[0], backing_id);
-        assert_eq!(
-            built.sampled_ids[1],
-            store.lookup(0x222).expect("bystander lookup")
-        );
+        assert!(built.sampled_ids.contains(&backing_id));
+        assert!(built.sampled_ids.contains(&bystander_id));
     }
 
     /// Stage 4d — `build_scene` appends the Composite Overlay

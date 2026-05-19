@@ -76,15 +76,22 @@ pub fn pointer_event_fanout_to_state(
     // runs unconditionally — XI2 events flow to XI2 selectees regardless
     // of any active core grab (the two grab spaces are independent per
     // X11 spec).
-    let top_level_id = xid_map.get(&event.host_xid).copied();
-    let (target, target_x, target_y) = top_level_id
-        .map(|tl| {
-            state
-                .resources
-                .pointer_target_at(tl, event.event_x, event.event_y)
-                .unwrap_or((tl, event.event_x, event.event_y))
-        })
-        .unwrap_or((ROOT_WINDOW, event.event_x, event.event_y));
+    let root_hit = state.root_pointer_target_at(event.root_x, event.root_y);
+    let top_level_id_opt = root_hit
+        .map(|(target, _, _)| state.top_level_for_target(target))
+        .or_else(|| xid_map.get(&event.host_xid).copied());
+    let top_level_id = top_level_id_opt.unwrap_or(ROOT_WINDOW);
+    let (target, target_x, target_y) = root_hit.unwrap_or_else(|| {
+        xid_map
+            .get(&event.host_xid)
+            .copied()
+            .and_then(|tl| {
+                state
+                    .pointer_target_at(tl, event.event_x, event.event_y)
+                    .or(Some((tl, event.event_x, event.event_y)))
+            })
+            .unwrap_or((ROOT_WINDOW, event.event_x, event.event_y))
+    });
 
     // ── Core fanout ─────────────────────────────────────────────────
     let mut handled_core_via_grab = false;
@@ -177,7 +184,7 @@ pub fn pointer_event_fanout_to_state(
         event.kind,
         PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
     );
-    if !handled_core_via_grab && (top_level_id.is_some() || is_crossing) {
+    if !handled_core_via_grab && (top_level_id_opt.is_some() || is_crossing) {
         let mask_bit = pointer_mask_bit(event.kind, event.state);
         let (nested_id, event_x, event_y, core_targets, propagation_child) =
             pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
@@ -193,7 +200,7 @@ pub fn pointer_event_fanout_to_state(
                 event.kind,
                 event.detail,
                 event.host_xid,
-                top_level_id.unwrap_or(ROOT_WINDOW).0,
+                top_level_id.0,
                 target.0,
                 nested_id.0,
                 propagation_child.0,
@@ -232,7 +239,7 @@ pub fn pointer_event_fanout_to_state(
     if is_replay {
         return dropped;
     }
-    let Some(top_level_id) = top_level_id else {
+    let Some(top_level_id) = top_level_id_opt else {
         log::debug!(
             "pointer_fanout: kind={:?} host_xid=0x{:x} not in xid_map — XI2 fanout skipped",
             event.kind,
@@ -452,11 +459,14 @@ fn try_match_passive_grab(
     xid_map: &HostXidMap,
     event: HostPointerEvent,
 ) -> Option<(ClientId, yserver_protocol::x11::ResourceId, u8)> {
-    let top_level_id = xid_map.get(&event.host_xid).copied()?;
     let (hit_window, _, _) = state
-        .resources
-        .pointer_target_at(top_level_id, event.event_x, event.event_y)
-        .unwrap_or((top_level_id, event.event_x, event.event_y));
+        .root_pointer_target_at(event.root_x, event.root_y)
+        .or_else(|| {
+            let top_level_id = xid_map.get(&event.host_xid).copied()?;
+            state
+                .pointer_target_at(top_level_id, event.event_x, event.event_y)
+                .or(Some((top_level_id, event.event_x, event.event_y)))
+        })?;
     let grab = state.find_passive_grab(hit_window, event.detail, event.state)?;
     Some((grab.owner, grab.grab_window, grab.pointer_mode))
 }

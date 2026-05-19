@@ -45,6 +45,7 @@ use crate::{
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
 const XI2_MAJOR_OPCODE: u8 = 137;
+const XFIXES_MAJOR_OPCODE: u8 = 140;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -441,12 +442,9 @@ fn drawable_full_rect_xfixes(
 }
 
 fn normalize_region_rects(
-    mut rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
+    rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
 ) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
-    const MAX_RECTS: usize = 4096;
-    rects.retain(|rect| !rect.is_empty());
-    rects.truncate(MAX_RECTS);
-    rects
+    crate::nested::normalize_region_rects(rects)
 }
 
 fn resolve_host_subwindow_visual_to_state(
@@ -560,19 +558,13 @@ fn activate_redirect_backing_for(
             // makes the calls.
             //
             // W: Automatic → true (scene walks W, samples B via
-            // 4c.3 indirection). Manual → false (the codex
-            // 2026-05-18 scene-walk fix routes W's draw through
-            // B regardless of W's own `scene_participating`).
+            // 4c.3 indirection). Manual → false (the external
+            // compositor owns presentation and reintroduces the
+            // window via its own output/COW surface).
             //
-            // B: ALWAYS true. Both modes route paints to B via
-            // `resolve_paint_target`, and `store.damage(B, rect)`
-            // gates damage accumulation on B's `scene_participating`
-            // (store.rs:775). Pre-fix the Manual branch left B at
-            // its pixmap default of `false`, dropping all paint
-            // damage on the floor — visible as the XFCE desktop
-            // staying black except where cursor-trail damage
-            // forced a sub-rect re-compose. See
-            // `manual_redirect_marks_backing_scene_participating`.
+            // B: Automatic → true because scene samples B through
+            // W. Manual → false because B is an off-screen source
+            // for the compositor, not a scene participant.
             let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
             if let Err(err) =
                 backend.set_window_scene_participation(origin, host_window, participating)
@@ -582,9 +574,11 @@ fn activate_redirect_backing_for(
                     window.0
                 );
             }
-            if let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true) {
+            if let Err(err) =
+                backend.set_backing_scene_participation(origin, host_pixmap, participating)
+            {
                 log::warn!(
-                    "set_backing_scene_participation(0x{:x}, true) failed: {err}",
+                    "set_backing_scene_participation(0x{:x}, {participating}) failed: {err}",
                     host_pixmap.as_raw()
                 );
             }
@@ -646,11 +640,7 @@ fn flip_redirect_target_mode(
         return;
     };
     let window_participating = matches!(new_mode, crate::server::CompositeRedirectMode::Automatic);
-    // B stays scene_participating=true in BOTH modes (codex
-    // 2026-05-18 scene-walk fix samples B for Manual-redirected
-    // parents too — see `activate_redirect_backing_for` doc for
-    // the full rationale).
-    let backing_participating = true;
+    let backing_participating = window_participating;
     if let Err(err) =
         backend.set_window_scene_participation(origin, host_window, window_participating)
     {
@@ -718,6 +708,32 @@ fn maybe_activate_child_under_redirected_parent(
         return;
     };
     activate_redirect_backing_for(state, backend, origin, child, record.mode);
+}
+
+/// Re-apply a window's effective COMPOSITE redirect mode after a
+/// map operation. `map_subwindow` flips storage visible by default;
+/// Manual-redirected windows must be forced back to
+/// `scene_participating=false`, while Automatic windows stay on-scene.
+fn reapply_redirect_mode_after_map(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+) {
+    let Some(mode) = effective_redirect_mode_for_window(state, window) else {
+        return;
+    };
+    let Some(host_xid) = state.resources.window(window).and_then(|w| w.host_xid) else {
+        return;
+    };
+    let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
+    if let Err(err) = backend.set_window_scene_participation(origin, host_xid, participating) {
+        log::warn!(
+            "reapply_redirect_mode_after_map(0x{:x}): \
+             set_window_scene_participation({participating}) failed: {err}",
+            window.0
+        );
+    }
 }
 
 /// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
@@ -834,6 +850,41 @@ fn rotate_redirected_backing_on_resize(
             depth,
         });
     }
+
+    if let Some(mode) = effective_redirect_mode_for_window(state, window) {
+        let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
+        if let Err(err) = backend.set_window_scene_participation(origin, host_window, participating)
+        {
+            log::warn!(
+                "rotate_redirected_backing_on_resize(0x{:x}): \
+                 set_window_scene_participation({participating}) failed: {err}",
+                window.0
+            );
+        }
+        if let Err(err) =
+            backend.set_backing_scene_participation(origin, new_backing, participating)
+        {
+            log::warn!(
+                "rotate_redirected_backing_on_resize(0x{:x}): \
+                 set_backing_scene_participation({participating}) failed: {err}",
+                window.0
+            );
+        }
+    }
+}
+
+fn effective_redirect_mode_for_window(
+    state: &ServerState,
+    window: ResourceId,
+) -> Option<crate::server::CompositeRedirectMode> {
+    if let Some(record) = state.composite_redirects.get(&(window, false)) {
+        return Some(record.mode);
+    }
+    let parent = state.resources.window(window)?.parent;
+    state
+        .composite_redirects
+        .get(&(parent, true))
+        .map(|record| record.mode)
 }
 
 /// One window's worth of identity captured *before* destroy_window
@@ -1077,6 +1128,11 @@ fn handle_render_request(
             let Some(req) = x11::render_create_picture_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let drawable_origin = state
+                .resources
+                .window(req.drawable)
+                .map(|w| (w.x, w.y))
+                .unwrap_or((0, 0));
             let host_drawable_handle = state
                 .resources
                 .host_drawable_target(req.drawable)
@@ -1094,6 +1150,7 @@ fn handle_render_request(
                     .flatten()
             });
             if let Some(host_pic) = host_pic {
+                backend.set_picture_drawable_origin(host_pic.as_raw(), drawable_origin);
                 state.resources.create_picture(
                     req.picture,
                     PictureState {
@@ -2539,35 +2596,103 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::CREATE_REGION_FROM_BITMAP | x11xfixes::CREATE_REGION_FROM_GC => {
-            if let Some((region, _source)) = x11xfixes::parse_u32_pair(body) {
-                state.xfixes_regions.insert(
-                    region,
-                    crate::server::XFixesRegion {
-                        owner: client_id,
-                        rects: Vec::new(),
-                    },
-                );
+            if let Some((region, source)) = x11xfixes::parse_u32_pair(body) {
+                if minor == x11xfixes::CREATE_REGION_FROM_GC {
+                    let gc = ResourceId(source);
+                    let Some(g) = state.resources.gc(gc) else {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_GC,
+                            source,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    };
+                    let Some(clip) = g.clip_rectangles.clone() else {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            source,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    };
+                    let rects = crate::nested::offset_rects(
+                        x11xfixes::parse_rectangles(&clip.rectangles),
+                        clip.x_origin,
+                        clip.y_origin,
+                    );
+                    state.xfixes_regions.insert(
+                        region,
+                        crate::server::XFixesRegion {
+                            owner: client_id,
+                            rects,
+                        },
+                    );
+                } else {
+                    state.xfixes_regions.insert(
+                        region,
+                        crate::server::XFixesRegion {
+                            owner: client_id,
+                            rects: Vec::new(),
+                        },
+                    );
+                }
             }
         }
         x11xfixes::CREATE_REGION_FROM_WINDOW => {
-            if let Some((region, window)) = x11xfixes::parse_u32_pair(body) {
-                let rects = state
-                    .resources
-                    .window(ResourceId(window))
-                    .map(|w| {
-                        vec![x11xfixes::RegionRect {
-                            x: 0,
-                            y: 0,
-                            width: w.width,
-                            height: w.height,
-                        }]
-                    })
-                    .unwrap_or_default();
+            if let Some((region, window, kind)) = x11xfixes::parse_create_region_from_window(body) {
+                let rects = crate::nested::shape_rects_for(state, ResourceId(window), kind);
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
                         owner: client_id,
                         rects,
+                    },
+                );
+            }
+        }
+        x11xfixes::CREATE_REGION_FROM_PICTURE => {
+            if let Some((region, picture)) = x11xfixes::parse_create_region_from_picture(body) {
+                let Some(picture_state) = state.resources.picture(ResourceId(picture)) else {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        picture,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                };
+                let Some(client_clip) =
+                    backend.picture_client_clip_rects(picture_state.host_picture_xid.as_raw())
+                else {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        picture,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                };
+                let Some(rects) = client_clip else {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        picture,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                };
+                state.xfixes_regions.insert(
+                    region,
+                    crate::server::XFixesRegion {
+                        owner: client_id,
+                        rects: normalize_region_rects(rects),
                     },
                 );
             }
@@ -2621,9 +2746,7 @@ fn handle_xfixes_request(
                     .map(|r| r.rects.clone())
                     .unwrap_or_default();
                 let rects = match minor {
-                    x11xfixes::UNION_REGION => {
-                        normalize_region_rects(a.into_iter().chain(b).collect())
-                    }
+                    x11xfixes::UNION_REGION => crate::nested::union_regions(&a, &b),
                     x11xfixes::INTERSECT_REGION => crate::nested::intersect_regions(&a, &b),
                     x11xfixes::SUBTRACT_REGION => {
                         // Real rect-band subtraction (a - b). The
@@ -2645,12 +2768,20 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::INVERT_REGION => {
-            if let Some((_source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
+            if let Some((source, bounds, dest)) = x11xfixes::parse_invert_region(body) {
+                let source_rects = state
+                    .xfixes_regions
+                    .get(&source)
+                    .map(|r| r.rects.clone())
+                    .unwrap_or_default();
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
                         owner: client_id,
-                        rects: normalize_region_rects(vec![bounds]),
+                        rects: crate::nested::subtract_regions(
+                            &normalize_region_rects(vec![bounds]),
+                            &source_rects,
+                        ),
                     },
                 );
             }
@@ -4482,6 +4613,21 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
+                let current_msc = state
+                    .present_msc
+                    .get(&ResourceId(req.window))
+                    .copied()
+                    .unwrap_or(0);
+                if notify_msc_satisfied(current_msc, req.target_msc, req.divisor, req.remainder) {
+                    fire_present_notify_msc_complete_events(
+                        state,
+                        byte_order,
+                        PRESENT_MAJOR_OPCODE,
+                        req.window,
+                        req.serial,
+                        current_msc,
+                    );
+                }
                 state
                     .present_msc
                     .entry(ResourceId(req.window))
@@ -4635,6 +4781,16 @@ fn handle_present_request(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+fn notify_msc_satisfied(current_msc: u64, target_msc: u64, divisor: u64, remainder: u64) -> bool {
+    if current_msc < target_msc {
+        return false;
+    }
+    if divisor == 0 {
+        return true;
+    }
+    current_msc % divisor == remainder
 }
 
 /// Fan out `CompleteNotify { mode: Copy }` and `IdleNotify` to every
@@ -4817,6 +4973,58 @@ fn fire_present_completion_events(
             );
             let _ = write_to_client(client, owner, &ev);
         }
+    }
+}
+
+fn fire_present_notify_msc_complete_events(
+    state: &mut ServerState,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    extension_major: u8,
+    window: u32,
+    serial: u32,
+    current_msc: u64,
+) {
+    use yserver_protocol::x11::present as x11present;
+    const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+
+    let window = ResourceId(window);
+    let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
+    for (eid, sel) in &state.present_event_selections {
+        if sel.window == window {
+            targets.push((*eid, sel.owner, sel.event_mask));
+        }
+    }
+
+    for (eid, owner, mask) in targets {
+        if mask & COMPLETE_NOTIFY_MASK == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner.0) else {
+            continue;
+        };
+        let seq = SequenceNumber(
+            client
+                .last_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let ev = x11present::encode_complete_notify(
+            byte_order,
+            seq,
+            extension_major,
+            eid,
+            window.0,
+            serial,
+            x11present::COMPLETE_KIND_NOTIFY_MSC,
+            x11present::COMPLETE_MODE_COPY,
+            0,
+            current_msc,
+        );
+        debug!(
+            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
+            owner.0,
+            ev.len()
+        );
+        let _ = write_to_client(client, owner, &ev);
     }
 }
 
@@ -6224,6 +6432,28 @@ fn handle_xi2_request(
                 }
             }
 
+            fn write_device_info(
+                buf: &mut Vec<u8>,
+                deviceid: u16,
+                use_type: u16,
+                attachment: u16,
+                name: &str,
+                classes: &[u8],
+                num_classes: u16,
+            ) {
+                let le = ClientByteOrder::LittleEndian;
+                x11::write_u16(le, buf, deviceid);
+                x11::write_u16(le, buf, use_type);
+                x11::write_u16(le, buf, attachment);
+                x11::write_u16(le, buf, num_classes);
+                x11::write_u16(le, buf, name.len() as u16);
+                buf.push(1); // enabled
+                buf.push(0); // pad
+                buf.extend_from_slice(name.as_bytes());
+                x11::pad_vec4(buf);
+                buf.extend_from_slice(classes);
+            }
+
             let mut infos = Vec::new();
 
             // Master Pointer (deviceid=2):
@@ -6289,16 +6519,7 @@ fn handle_xi2_request(
                 );
                 write_scroll_class(&mut classes, deviceid, 2, 1); // vertical
                 write_scroll_class(&mut classes, deviceid, 3, 2); // horizontal
-                x11::write_u16(le, &mut infos, deviceid);
-                x11::write_u16(le, &mut infos, 1); // use = MasterPointer
-                x11::write_u16(le, &mut infos, 3); // attachment = paired keyboard
-                x11::write_u16(le, &mut infos, 7); // num_classes
-                x11::write_u16(le, &mut infos, name.len() as u16);
-                infos.push(1); // enabled
-                infos.push(0); // pad
-                infos.extend_from_slice(name.as_bytes());
-                x11::pad_vec4(&mut infos);
-                infos.extend_from_slice(&classes);
+                write_device_info(&mut infos, deviceid, 1, 3, name, &classes, 7);
             }
 
             // Master Keyboard (deviceid=3): Key with keycodes 8..=255.
@@ -6307,16 +6528,61 @@ fn handle_xi2_request(
                 let name = "Virtual core keyboard";
                 let mut classes = Vec::new();
                 write_key_class(&mut classes, deviceid);
-                x11::write_u16(le, &mut infos, deviceid);
-                x11::write_u16(le, &mut infos, 2); // use = MasterKeyboard
-                x11::write_u16(le, &mut infos, 2); // attachment = paired pointer
-                x11::write_u16(le, &mut infos, 1); // num_classes
-                x11::write_u16(le, &mut infos, name.len() as u16);
-                infos.push(1); // enabled
-                infos.push(0); // pad
-                infos.extend_from_slice(name.as_bytes());
-                x11::pad_vec4(&mut infos);
-                infos.extend_from_slice(&classes);
+                write_device_info(&mut infos, deviceid, 2, 2, name, &classes, 1);
+            }
+
+            // Attached slave devices. GTK/GDK builds its default seat
+            // from the XI2 master/slave hierarchy; advertising only
+            // masters leaves some GTK4/libadwaita clients with no
+            // GdkSeat/GdkDevice even though core input events work.
+            {
+                let deviceid: u16 = 4;
+                let name = "Virtual core XTEST pointer";
+                let mut classes = Vec::new();
+                write_button_class(&mut classes, deviceid, 7);
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    0,
+                    i32::from(screen_w).max(1) - 1,
+                    1,
+                    0,
+                );
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    1,
+                    i32::from(screen_h).max(1) - 1,
+                    1,
+                    0,
+                );
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    2,
+                    0,
+                    0,
+                    state.scroll_axis_value[0],
+                );
+                write_valuator_class(
+                    &mut classes,
+                    deviceid,
+                    3,
+                    0,
+                    0,
+                    state.scroll_axis_value[1],
+                );
+                write_scroll_class(&mut classes, deviceid, 2, 1);
+                write_scroll_class(&mut classes, deviceid, 3, 2);
+                write_device_info(&mut infos, deviceid, 3, 2, name, &classes, 7);
+            }
+
+            {
+                let deviceid: u16 = 5;
+                let name = "Virtual core XTEST keyboard";
+                let mut classes = Vec::new();
+                write_key_class(&mut classes, deviceid);
+                write_device_info(&mut infos, deviceid, 4, 3, name, &classes, 1);
             }
 
             let mut reply = x11::fixed_reply(
@@ -6325,7 +6591,7 @@ fn handle_xi2_request(
                 0,
                 x11::checked_units(infos.len())? as u32,
             );
-            x11::write_u16(le, &mut reply, 2); // num_devices
+            x11::write_u16(le, &mut reply, 4); // num_devices
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&infos);
             buf.extend_from_slice(&reply);
@@ -6408,8 +6674,11 @@ fn handle_xi2_request(
                 i16::try_from(i32::from(root_x_int).saturating_sub(origin_x)).unwrap_or(i16::MAX);
             let win_y_int =
                 i16::try_from(i32::from(root_y_int).saturating_sub(origin_y)).unwrap_or(i16::MAX);
+            let child = state
+                .direct_child_at(queried_window, win_x_int, win_y_int)
+                .unwrap_or(ResourceId(0));
             debug!(
-                "client {} #{} XIQueryPointer window=0x{:x} -> root=({},{}) win=({},{}) mask=0x{:x}",
+                "client {} #{} XIQueryPointer window=0x{:x} -> root=({},{}) win=({},{}) child=0x{:x} mask=0x{:x}",
                 client_id.0,
                 sequence.0,
                 queried_window.0,
@@ -6417,6 +6686,7 @@ fn handle_xi2_request(
                 root_y_int,
                 win_x_int,
                 win_y_int,
+                child.0,
                 mask,
             );
             // Reply layout (length = 6 units = 24 bytes after the
@@ -6431,7 +6701,7 @@ fn handle_xi2_request(
             // appear at root+window_origin instead of near the click.
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 6);
             x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
-            x11::write_u32(byte_order, &mut reply, 0); // child
+            x11::write_u32(byte_order, &mut reply, child.0);
             x11::write_u32(byte_order, &mut reply, (i32::from(root_x_int) << 16) as u32);
             x11::write_u32(byte_order, &mut reply, (i32::from(root_y_int) << 16) as u32);
             x11::write_u32(byte_order, &mut reply, (i32::from(win_x_int) << 16) as u32);
@@ -8404,6 +8674,7 @@ fn handle_map_window(
         // participation flip inside `activate_redirect_backing_for`
         // (sets it back to false) must land last.
         maybe_activate_child_under_redirected_parent(state, backend, origin, window);
+        reapply_redirect_mode_after_map(state, backend, origin, window);
     }
 
     let wants_focus = {
@@ -8479,6 +8750,7 @@ fn handle_map_subwindows(
             // Activation MUST run AFTER `map_subwindow` per the
             // plan's round-6 ordering fix.
             maybe_activate_child_under_redirected_parent(state, backend, origin, child);
+            reapply_redirect_mode_after_map(state, backend, origin, child);
         }
         let wants_focus = {
             let mask = state
@@ -9689,20 +9961,21 @@ fn copy_area_effective_dst_rects(
         width: req.width,
         height: req.height,
     }];
+    let mut gc_clip_rects: Vec<CopyAreaSubRect> = Vec::new();
     // Step 1: GC rectangular clip-mask. `ClipState::None` is
     // "no clip" (pass through); `ClipState::Pixmap` is the
     // depth-1 mask form — TODO: rasterise to rect-band; for now
     // pass through (mirrors v1's `intersect_with_current_clip`
     // pixmap-clip skip).
     if let crate::backend::ClipState::Rectangles { origin, rects } = &draw_state.clip {
-        let mut clip_rects: Vec<CopyAreaSubRect> = Vec::with_capacity(rects.rectangles.len() / 8);
+        gc_clip_rects = Vec::with_capacity(rects.rectangles.len() / 8);
         for chunk in rects.rectangles.chunks_exact(8) {
             let cx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(origin.0);
             let cy = i16::from_le_bytes([chunk[2], chunk[3]]).saturating_add(origin.1);
             let cw = u16::from_le_bytes([chunk[4], chunk[5]]);
             let ch = u16::from_le_bytes([chunk[6], chunk[7]]);
             if cw > 0 && ch > 0 {
-                clip_rects.push(CopyAreaSubRect {
+                gc_clip_rects.push(CopyAreaSubRect {
                     x: cx,
                     y: cy,
                     width: cw,
@@ -9713,12 +9986,23 @@ fn copy_area_effective_dst_rects(
         current = current
             .into_iter()
             .flat_map(|r| {
-                clip_rects
+                gc_clip_rects
                     .iter()
                     .filter_map(move |c| intersect_sub_rects(r, *c))
             })
             .collect();
         if current.is_empty() {
+            log::debug!(
+                target: "yserver_core::core_loop",
+                "copy_area clip empty after GC clip dst=0x{:x} req=({},{}) {}x{} subwindow_mode={:?} gc_clip_rects={:?}",
+                dst_id.0,
+                req.dst_x,
+                req.dst_y,
+                req.width,
+                req.height,
+                draw_state.subwindow_mode,
+                gc_clip_rects,
+            );
             return current;
         }
     }
@@ -9740,7 +10024,10 @@ fn copy_area_effective_dst_rects(
         .iter()
         .filter_map(|cid| {
             let c = state.resources.window(*cid)?;
-            (c.map_state == crate::resources::MapState::Viewable && c.width > 0 && c.height > 0)
+            (c.class == crate::resources::WindowClass::InputOutput
+                && c.map_state == crate::resources::MapState::Viewable
+                && c.width > 0
+                && c.height > 0)
                 .then_some(CopyAreaSubRect {
                     x: c.x,
                     y: c.y,
@@ -9759,6 +10046,21 @@ fn copy_area_effective_dst_rects(
         }
         current = next;
         if current.is_empty() {
+            let redirect_mode = effective_redirect_mode_for_window(state, dst_id);
+            log::debug!(
+                target: "yserver_core::core_loop",
+                "copy_area clip empty after ClipByChildren dst=0x{:x} req=({},{}) {}x{} subwindow_mode={:?} \
+                 redirect_mode={:?} gc_clip_rects={:?} child_rects={:?}",
+                dst_id.0,
+                req.dst_x,
+                req.dst_y,
+                req.width,
+                req.height,
+                draw_state.subwindow_mode,
+                redirect_mode,
+                gc_clip_rects,
+                child_rects,
+            );
             return current;
         }
     }
@@ -10920,7 +11222,6 @@ fn handle_query_pointer(
         // per second on QueryPointer, starving its event loop and
         // dropping clicks on every panel applet.
         let child = state
-            .resources
             .direct_child_at(queried_window, win_x, win_y)
             .unwrap_or(ResourceId(0));
         x11::QueryPointerReply {
@@ -12228,6 +12529,83 @@ mod tests {
         assert_eq!(state.composite_redirects.len(), 1);
     }
 
+    #[test]
+    fn present_notify_msc_immediate_sends_complete_notify() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+        const EID: u32 = 0x0100_0001;
+        const SERIAL: u32 = 0x0100_0002;
+        const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+
+        let mut select_body = Vec::new();
+        select_body.extend_from_slice(&EID.to_le_bytes());
+        select_body.extend_from_slice(&WINDOW.to_le_bytes());
+        select_body.extend_from_slice(&COMPLETE_NOTIFY_MASK.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::SELECT_INPUT,
+                length_units: 4,
+            },
+            &select_body,
+            None,
+        )
+        .expect("Present SelectInput");
+
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&SERIAL.to_le_bytes());
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // remainder
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC");
+
+        let mut event = [0u8; 40];
+        peer.read_exact(&mut event).expect("CompleteNotify event");
+        assert_eq!(event[0], 35, "GenericEvent");
+        assert_eq!(event[1], 145, "Present extension major opcode");
+        assert_eq!(
+            u16::from_le_bytes([event[8], event[9]]),
+            u16::from(yserver_protocol::x11::present::EVENT_COMPLETE_NOTIFY)
+        );
+        assert_eq!(
+            event[10],
+            yserver_protocol::x11::present::COMPLETE_KIND_NOTIFY_MSC
+        );
+        assert_eq!(
+            u32::from_le_bytes([event[12], event[13], event[14], event[15]]),
+            EID
+        );
+        assert_eq!(
+            u32::from_le_bytes([event[16], event[17], event[18], event[19]]),
+            WINDOW
+        );
+        assert_eq!(
+            u32::from_le_bytes([event[20], event[21], event[22], event[23]]),
+            SERIAL
+        );
+    }
+
     // ---------------- extract_shm_zpixmap_region ----------------
     //
     // The protocol-level byte-extraction for MIT-SHM PutImage. Until
@@ -12773,20 +13151,12 @@ mod tests {
         assert_eq!(backing.depth, 32);
     }
 
-    /// Stage 4d follow-up — `activate_redirect_backing_for` on a
-    /// Manual-mode redirect must mark the backing
-    /// `scene_participating=true` so paint→backing accumulates
-    /// presentation damage. Without this, the codex 2026-05-18
-    /// scene-walk fix (Manual-redirected parents emit B from the
-    /// scene) silently fails: the parent is emitted, but
-    /// `peek_presentation_damage(B)` returns empty because
-    /// `store.damage(B, rect)` drops the rect when B is
-    /// `scene_participating=false` (store.rs:775), so the scanout
-    /// BO keeps its pre-fix baseline (black) for the redirected
-    /// region. Symptom: XFCE desktop wallpaper stays black except
-    /// where cursor damage forces a sub-rect re-compose.
+    /// Manual-mode redirect removes W from the normal scene and keeps
+    /// B as an off-screen compositor source. B must not become a scene
+    /// participant, or the scene path can double-present redirected
+    /// client content behind/above the compositor's output surface.
     #[test]
-    fn manual_redirect_marks_backing_scene_participating() {
+    fn manual_redirect_keeps_backing_out_of_scene() {
         use crate::backend::recording::RecordedCall;
 
         const WINDOW_XID: u32 = 0x0010_0001;
@@ -12823,6 +13193,13 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        state.composite_redirects.insert(
+            (ResourceId(WINDOW_XID), false),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: yserver_protocol::x11::ClientId(1),
+            },
+        );
 
         activate_redirect_backing_for(
             &mut state,
@@ -12833,10 +13210,7 @@ mod tests {
         );
 
         let calls = backend.calls();
-        // Window participation: Manual → false (the existing,
-        // correct behavior — Manual-redirected windows leave the
-        // scene path via `scene_participating=false`, and the
-        // codex scene-walk fix routes them through B instead).
+        // Window participation: Manual → false.
         assert!(
             calls.iter().any(|c| matches!(
                 c,
@@ -12847,17 +13221,194 @@ mod tests {
             )),
             "expected SetWindowSceneParticipation(W, false) for Manual mode; got {calls:?}",
         );
-        // Backing participation: Manual → true (load-bearing for
-        // damage tracking — see fn-doc above).
+        // Backing participation: Manual → false.
         assert!(
             calls.iter().any(|c| matches!(
                 c,
                 RecordedCall::SetBackingSceneParticipation {
-                    participating: true,
+                    participating: false,
                     ..
                 }
             )),
-            "expected SetBackingSceneParticipation(B, true) for Manual mode; got {calls:?}",
+            "expected SetBackingSceneParticipation(B, false) for Manual mode; got {calls:?}",
+        );
+    }
+
+    /// Mapping a Manual-redirected window must not leave it visible
+    /// in the normal scene. The map path temporarily flips the
+    /// storage on, then the redirect-mode reapply must force it back
+    /// off.
+    #[test]
+    fn map_window_reapplies_manual_redirect_scene_participation() {
+        use crate::backend::recording::RecordedCall;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0002;
+        const HOST_XID: u32 = 0x0040_0002;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        state.composite_redirects.insert(
+            (ResourceId(WINDOW_XID), false),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+            },
+        );
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+        let before = backend.calls().len();
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        let calls = &backend.calls()[before..];
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window,
+                    participating: false,
+                } if *host_window == HOST_XID
+            )),
+            "mapping a Manual-redirected window must reassert scene_participating=false; got {calls:?}",
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window,
+                    participating: true,
+                } if *host_window == HOST_XID
+            )),
+            "mapping a Manual-redirected window must not leave it scene_participating=true; got {calls:?}",
+        );
+    }
+
+    /// Resize rotates the redirected backing by releasing the old
+    /// backing and allocating a new one. The fresh allocation must
+    /// preserve the effective redirect mode's scene-participation
+    /// flags; otherwise a Manual-redirected frame can become visible
+    /// through normal scene traversal after a ConfigureWindow resize.
+    #[test]
+    fn rotate_redirected_backing_preserves_manual_scene_participation() {
+        use crate::backend::recording::RecordedCall;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+        const OLD_BACKING: u32 = 0x0050_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: 100,
+                height: 50,
+                depth: 32,
+            });
+        }
+        state.composite_redirects.insert(
+            (ResourceId(WINDOW_XID), false),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+            },
+        );
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            100,
+            75,
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window: HOST_XID,
+                    participating: false,
+                }
+            )),
+            "rotate must reapply Manual W scene_participating=false; got {calls:?}",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetBackingSceneParticipation {
+                    participating: false,
+                    ..
+                }
+            )),
+            "rotate must keep the fresh Manual backing out of scene; got {calls:?}",
         );
     }
 
@@ -13703,5 +14254,79 @@ mod tests {
                  dst host_xid; it stays the redirected backing pixmap",
             );
         }
+    }
+
+    /// InputOnly children do not contribute visible pixels and must
+    /// not be subtracted by ClipByChildren.
+    #[test]
+    fn copy_area_clip_by_children_ignores_input_only_child() {
+        use crate::resources::{MapState, WindowClass};
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x0020_0001),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x0020_0002),
+                parent: ResourceId(0x0020_0001),
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+                border_width: 0,
+                class: 2,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let child = state
+                .resources
+                .window_mut(ResourceId(0x0020_0002))
+                .expect("child");
+            child.map_state = MapState::Viewable;
+            assert_eq!(child.class, WindowClass::InputOnly);
+        }
+
+        let rect = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: ResourceId(0x0020_0001),
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 100,
+            height: 80,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+
+        let got =
+            copy_area_effective_dst_rects(&state, ResourceId(0x0020_0001), &draw_state, &rect);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].x, 0);
+        assert_eq!(got[0].y, 0);
+        assert_eq!(got[0].width, 100);
+        assert_eq!(got[0].height, 80);
     }
 }

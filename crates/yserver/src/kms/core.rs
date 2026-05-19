@@ -481,6 +481,10 @@ pub(crate) enum PictureRecord {
     Drawable {
         /// XID of the backing window or pixmap.
         host_xid: u32,
+        /// Drawable-space origin of the wrapped surface.
+        /// Window-backed pictures need this to translate external
+        /// region geometry into picture-local coordinates.
+        drawable_origin: (i16, i16),
         /// X11 `RENDER_PICTFORMAT` ID requested at `CreatePicture`.
         /// Captures the client's *declared* sampling intent — e.g.
         /// marco creates a Picture wrapping a depth-24 backing with
@@ -571,6 +575,7 @@ impl PictureRecord {
     pub(crate) fn drawable_default(host_xid: u32, pict_format: u32) -> Self {
         PictureRecord::Drawable {
             host_xid,
+            drawable_origin: (0, 0),
             pict_format,
             clip: None,
             clip_x: 0,

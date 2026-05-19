@@ -397,16 +397,78 @@ where
     Some(out)
 }
 
-fn normalize_region_rects(mut rects: Vec<x11xfixes::RegionRect>) -> Vec<x11xfixes::RegionRect> {
+pub(crate) fn normalize_region_rects(
+    mut rects: Vec<x11xfixes::RegionRect>,
+) -> Vec<x11xfixes::RegionRect> {
     const MAX_RECTS: usize = 4096;
     rects.retain(|rect| !rect.is_empty());
-    rects.truncate(MAX_RECTS);
-    // Sort into (y, x) order so the SHAPE GetRectangles reply can honestly
-    // claim YXBanded ordering for the common non-overlapping-band case.
-    // For arbitrary overlapping inputs this is YXSorted at best, but xts
-    // and real clients drive SHAPE with already-banded rects.
-    rects.sort_by_key(|r| (r.y, r.x));
-    rects
+    if rects.is_empty() {
+        return rects;
+    }
+
+    let mut y_edges: Vec<i32> = Vec::with_capacity(rects.len() * 2);
+    for r in &rects {
+        let y0 = i32::from(r.y);
+        let y1 = y0 + i32::from(r.height);
+        y_edges.push(y0);
+        y_edges.push(y1);
+    }
+    y_edges.sort_unstable();
+    y_edges.dedup();
+
+    let mut out = Vec::new();
+    for band in y_edges.windows(2) {
+        let y0 = band[0];
+        let y1 = band[1];
+        if y1 <= y0 {
+            continue;
+        }
+        let mut spans: Vec<(i32, i32)> = rects
+            .iter()
+            .filter_map(|r| {
+                let rx0 = i32::from(r.x);
+                let ry0 = i32::from(r.y);
+                let rx1 = rx0 + i32::from(r.width);
+                let ry1 = ry0 + i32::from(r.height);
+                if ry0 <= y0 && ry1 >= y1 {
+                    Some((rx0, rx1))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if spans.is_empty() {
+            continue;
+        }
+        spans.sort_unstable_by_key(|span| (span.0, span.1));
+        let mut current = spans[0];
+        for span in spans.into_iter().skip(1) {
+            if span.0 <= current.1 {
+                current.1 = current.1.max(span.1);
+            } else {
+                out.push(x11xfixes::RegionRect {
+                    x: current.0.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                    y: y0.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                    width: (current.1 - current.0).clamp(0, i32::from(u16::MAX)) as u16,
+                    height: (y1 - y0).clamp(0, i32::from(u16::MAX)) as u16,
+                });
+                if out.len() >= MAX_RECTS {
+                    return out;
+                }
+                current = span;
+            }
+        }
+        out.push(x11xfixes::RegionRect {
+            x: current.0.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            y: y0.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            width: (current.1 - current.0).clamp(0, i32::from(u16::MAX)) as u16,
+            height: (y1 - y0).clamp(0, i32::from(u16::MAX)) as u16,
+        });
+        if out.len() >= MAX_RECTS {
+            return out;
+        }
+    }
+    out
 }
 
 pub(crate) fn region_extents(rects: &[x11xfixes::RegionRect]) -> x11xfixes::RegionRect {
@@ -468,6 +530,34 @@ pub(crate) fn intersect_regions(
         }
     }
     normalize_region_rects(out)
+}
+
+/// Union two normalized region rect sets.
+///
+/// This keeps the result YX-banded by subtracting the already-covered
+/// area from each new source rect before appending it. That is enough
+/// for the compositor/shape workloads here, which only ever feed us
+/// normalized region lists.
+pub(crate) fn union_regions(
+    current: &[x11xfixes::RegionRect],
+    source: &[x11xfixes::RegionRect],
+) -> Vec<x11xfixes::RegionRect> {
+    let mut result: Vec<x11xfixes::RegionRect> = current.to_vec();
+    for s in source {
+        let mut pieces = vec![*s];
+        for existing in &result {
+            let mut next = Vec::new();
+            for piece in pieces {
+                next.extend(subtract_rect(piece, *existing));
+            }
+            pieces = next;
+            if pieces.is_empty() {
+                break;
+            }
+        }
+        result.extend(pieces);
+    }
+    normalize_region_rects(result)
 }
 
 /// Subtract one rectangle `b` from another `a`, returning the parts of
@@ -715,7 +805,7 @@ pub(crate) fn apply_shape_op(
 ) -> Vec<x11xfixes::RegionRect> {
     match op {
         x11shape::OP_SET => normalize_region_rects(source),
-        x11shape::OP_UNION => normalize_region_rects(current.into_iter().chain(source).collect()),
+        x11shape::OP_UNION => union_regions(&current, &source),
         x11shape::OP_INTERSECT => intersect_regions(&current, &source),
         x11shape::OP_SUBTRACT => subtract_regions(&current, &source),
         x11shape::OP_INVERT => normalize_region_rects(source),
@@ -957,6 +1047,7 @@ mod tests {
         use super::super::{
             clear_shape_rects, intersect_regions, normalize_region_rects, region_extents,
             shape_kind_is_set, shape_mask_source_rects, shape_rects_for, translate_region,
+            union_regions,
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::{
@@ -980,8 +1071,23 @@ mod tests {
 
         #[test]
         fn normalize_truncates_at_cap() {
-            let rects: Vec<RegionRect> = (0..4097).map(|i| r(i as i16, 0, 1, 1)).collect();
+            let rects: Vec<RegionRect> = (0..4097).map(|i| r(0, i as i16, 1, 1)).collect();
             assert_eq!(normalize_region_rects(rects).len(), 4096);
+        }
+
+        #[test]
+        fn normalize_dedups_exact_duplicates() {
+            let input = vec![r(1, 2, 3, 4), r(1, 2, 3, 4), r(5, 6, 7, 8)];
+            assert_eq!(
+                normalize_region_rects(input),
+                vec![r(1, 2, 3, 4), r(5, 6, 7, 8)]
+            );
+        }
+
+        #[test]
+        fn normalize_merges_overlapping_bands() {
+            let input = vec![r(0, 0, 10, 10), r(5, 0, 10, 10)];
+            assert_eq!(normalize_region_rects(input), vec![r(0, 0, 15, 10)]);
         }
 
         #[test]
@@ -1022,6 +1128,24 @@ mod tests {
             assert!(intersect_regions(&empty, &nonempty).is_empty());
             assert!(intersect_regions(&nonempty, &empty).is_empty());
         }
+
+        #[test]
+        fn union_merges_disjoint_rects() {
+            let a = vec![r(0, 0, 10, 10)];
+            let b = vec![r(20, 0, 10, 10)];
+            assert_eq!(
+                union_regions(&a, &b),
+                vec![r(0, 0, 10, 10), r(20, 0, 10, 10)]
+            );
+        }
+
+        #[test]
+        fn union_preserves_containing_rect() {
+            let a = vec![r(0, 0, 100, 100)];
+            let b = vec![r(10, 10, 5, 5)];
+            assert_eq!(union_regions(&a, &b), vec![r(0, 0, 100, 100)]);
+        }
+
         #[test]
         fn translate_shifts_coords() {
             let mut rects = vec![r(10, 20, 5, 5)];

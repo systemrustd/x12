@@ -12,6 +12,7 @@ pub const CREATE_REGION: u8 = 5;
 pub const CREATE_REGION_FROM_BITMAP: u8 = 6;
 pub const CREATE_REGION_FROM_WINDOW: u8 = 7;
 pub const CREATE_REGION_FROM_GC: u8 = 8;
+pub const CREATE_REGION_FROM_PICTURE: u8 = 9;
 pub const DESTROY_REGION: u8 = 10;
 pub const SET_REGION: u8 = 11;
 pub const COPY_REGION: u8 = 12;
@@ -176,6 +177,22 @@ pub fn parse_create_region(body: &[u8]) -> Option<(u32, Vec<RegionRect>)> {
         return None;
     }
     Some((read_u32_le(body), parse_rectangles(&body[4..])))
+}
+
+#[must_use]
+pub fn parse_create_region_from_window(body: &[u8]) -> Option<(u32, u32, u8)> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some((read_u32_le(body), read_u32_le(&body[4..]), body[8]))
+}
+
+#[must_use]
+pub fn parse_create_region_from_picture(body: &[u8]) -> Option<(u32, u32)> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some((read_u32_le(body), read_u32_le(&body[4..])))
 }
 
 #[must_use]
@@ -387,6 +404,7 @@ mod tests {
         assert_eq!(GET_CURSOR_IMAGE, 4);
         assert_eq!(CREATE_REGION, 5);
         assert_eq!(DESTROY_REGION, 10);
+        assert_eq!(CREATE_REGION_FROM_PICTURE, 9);
         assert_eq!(COPY_REGION, 12);
         assert_eq!(FETCH_REGION, 19);
         assert_eq!(SET_GC_CLIP_REGION, 20);
@@ -460,6 +478,31 @@ mod tests {
         let req = parse_set_picture_clip_region(&body).unwrap();
         assert_eq!(req.picture, 0xcc);
         assert_eq!(req.region, 0); // None — caller clears the picture clip.
+    }
+
+    #[test]
+    fn create_region_from_window_parses_canonical_layout() {
+        // region(4) | window(4) | kind(1) | pad(3)
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1234_u32.to_le_bytes());
+        body.extend_from_slice(&0xabcd_u32.to_le_bytes());
+        body.push(1); // KIND_CLIP
+        body.extend_from_slice(&[0u8; 3]);
+        let req = parse_create_region_from_window(&body).unwrap();
+        assert_eq!(req.0, 0x1234);
+        assert_eq!(req.1, 0xabcd);
+        assert_eq!(req.2, 1);
+    }
+
+    #[test]
+    fn create_region_from_picture_parses_canonical_layout() {
+        // region(4) | picture(4)
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1234_u32.to_le_bytes());
+        body.extend_from_slice(&0xabcd_u32.to_le_bytes());
+        let req = parse_create_region_from_picture(&body).unwrap();
+        assert_eq!(req.0, 0x1234);
+        assert_eq!(req.1, 0xabcd);
     }
 
     #[test]

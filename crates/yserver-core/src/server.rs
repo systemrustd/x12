@@ -738,6 +738,135 @@ impl ServerState {
     }
 
     #[must_use]
+    pub fn pointer_target_at(
+        &self,
+        top_level: ResourceId,
+        x: i16,
+        y: i16,
+    ) -> Option<(ResourceId, i16, i16)> {
+        let top = self.resources.window(top_level)?;
+        if top.map_state == crate::resources::MapState::Unmapped {
+            return None;
+        }
+        let mut best = (top_level, x, y);
+        self.pointer_target_at_inner(top_level, x, y, &mut best);
+        Some(best)
+    }
+
+    #[must_use]
+    pub fn root_pointer_target_at(&self, x: i16, y: i16) -> Option<(ResourceId, i16, i16)> {
+        self.pointer_target_at(ROOT_WINDOW, x, y)
+    }
+
+    #[must_use]
+    pub fn direct_child_at(&self, parent: ResourceId, x: i16, y: i16) -> Option<ResourceId> {
+        self.hit_test_children(parent, x, y)
+            .map(|(child, _, _)| child)
+    }
+
+    #[must_use]
+    pub fn top_level_for_target(&self, target: ResourceId) -> ResourceId {
+        let mut current = target;
+        let mut top = target;
+        for _ in 0..256 {
+            let Some(window) = self.resources.window(current) else {
+                break;
+            };
+            if window.parent == current || window.parent == ROOT_WINDOW {
+                return top;
+            }
+            top = window.parent;
+            current = window.parent;
+        }
+        top
+    }
+
+    fn pointer_target_at_inner(
+        &self,
+        parent: ResourceId,
+        parent_x: i16,
+        parent_y: i16,
+        best: &mut (ResourceId, i16, i16),
+    ) {
+        let Some((child_id, child_x, child_y)) = self.hit_test_children(parent, parent_x, parent_y)
+        else {
+            return;
+        };
+        *best = (child_id, child_x, child_y);
+        self.pointer_target_at_inner(child_id, child_x, child_y, best);
+    }
+
+    fn hit_test_children(
+        &self,
+        parent: ResourceId,
+        x: i16,
+        y: i16,
+    ) -> Option<(ResourceId, i16, i16)> {
+        let parent_window = self.resources.window(parent)?;
+
+        if parent == ROOT_WINDOW
+            && !parent_window.children.contains(&COMPOSITE_OVERLAY_WINDOW)
+            && self
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .and_then(|overlay| overlay.host_xid)
+                .is_some()
+            && let Some(hit) = self.hit_test_child(COMPOSITE_OVERLAY_WINDOW, x, y)
+        {
+            return Some(hit);
+        }
+
+        for child_id in parent_window.children.iter().rev() {
+            if let Some(hit) = self.hit_test_child(*child_id, x, y) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    fn hit_test_child(
+        &self,
+        child_id: ResourceId,
+        parent_x: i16,
+        parent_y: i16,
+    ) -> Option<(ResourceId, i16, i16)> {
+        let child = self.resources.window(child_id)?;
+        if child.map_state == crate::resources::MapState::Unmapped {
+            return None;
+        }
+        let child_x = parent_x.wrapping_sub(child.x);
+        let child_y = parent_y.wrapping_sub(child.y);
+        if child_x < 0
+            || child_y < 0
+            || child_x >= i16::try_from(child.width).unwrap_or(i16::MAX)
+            || child_y >= i16::try_from(child.height).unwrap_or(i16::MAX)
+            || !self.window_input_contains(child_id, child_x, child_y)
+        {
+            return None;
+        }
+        Some((child_id, child_x, child_y))
+    }
+
+    fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
+        let Some(rects) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|state| state.input.as_ref())
+        else {
+            return true;
+        };
+        rects.iter().any(|rect| {
+            let rx = i32::from(rect.x);
+            let ry = i32::from(rect.y);
+            let rr = rx + i32::from(rect.width);
+            let rb = ry + i32::from(rect.height);
+            let px = i32::from(x);
+            let py = i32::from(y);
+            px >= rx && py >= ry && px < rr && py < rb
+        })
+    }
+
+    #[must_use]
     pub fn subscribers(&self, window: ResourceId, mask_bit: u32) -> Vec<EventTarget> {
         self.clients
             .values()
@@ -1152,8 +1281,8 @@ fn pointer_event_fanout_inner(
         let matched = top_level_id_opt.and_then(|top| {
             let s = state.lock().ok()?;
             let (hit_window, _, _) = s
-                .resources
-                .pointer_target_at(top, event.event_x, event.event_y)
+                .root_pointer_target_at(event.root_x, event.root_y)
+                .or_else(|| s.pointer_target_at(top, event.event_x, event.event_y))
                 .unwrap_or((top, event.event_x, event.event_y));
             s.find_passive_grab(hit_window, event.detail, event.state)
         });
@@ -1246,8 +1375,8 @@ fn pointer_event_fanout_inner(
     {
         Ok(g) => {
             let (target, target_x, target_y) = g
-                .resources
-                .pointer_target_at(top_level_id, event.event_x, event.event_y)
+                .root_pointer_target_at(event.root_x, event.root_y)
+                .or_else(|| g.pointer_target_at(top_level_id, event.event_x, event.event_y))
                 .unwrap_or((top_level_id, event.event_x, event.event_y));
 
             // Walk up the parent chain to the first window any client is
@@ -2629,5 +2758,108 @@ mod tests {
         let button_press_mask: u32 = 0x0000_0004;
         let result = state.pointer_propagation_target(child, 10, 10, button_press_mask);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn root_hit_test_reaches_overlay_child_without_querytree_child() {
+        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        let stage = ResourceId(0x0010_0040);
+        state
+            .resources
+            .window_mut(COMPOSITE_OVERLAY_WINDOW)
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_panicking(0x103));
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: stage,
+                parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(stage);
+
+        assert!(
+            !state
+                .resources
+                .children(ROOT_WINDOW)
+                .contains(&COMPOSITE_OVERLAY_WINDOW)
+        );
+        assert_eq!(state.root_pointer_target_at(25, 30), Some((stage, 25, 30)));
+        assert_eq!(
+            state.direct_child_at(ROOT_WINDOW, 25, 30),
+            Some(COMPOSITE_OVERLAY_WINDOW)
+        );
+    }
+
+    #[test]
+    fn root_hit_test_skips_overlay_when_input_shape_is_empty() {
+        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
+
+        let mut state = ServerState::new();
+        let stage = ResourceId(0x0010_0041);
+        let desktop = ResourceId(0x0010_0042);
+        state
+            .resources
+            .window_mut(COMPOSITE_OVERLAY_WINDOW)
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_panicking(0x103));
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: desktop,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(desktop);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: stage,
+                parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(stage);
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
+
+        assert_eq!(
+            state.root_pointer_target_at(25, 30),
+            Some((desktop, 25, 30))
+        );
+        assert_eq!(state.direct_child_at(ROOT_WINDOW, 25, 30), Some(desktop));
     }
 }
