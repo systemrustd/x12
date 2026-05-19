@@ -11024,6 +11024,32 @@ fn handle_set_selection_owner(
         // Future-shifted: silent no-op (Success per Xorg).
         return Ok(RequestOutcome::Handled);
     }
+    // BadWindow if `window != None` and the xid doesn't resolve
+    // (`dix/selection.c:169-173`). `window == 0` (None) means
+    // "release ownership" and is the only valid non-existent value.
+    if window.0 != 0 && state.resources.window(window).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            window.0,
+            0, // core opcode — minor stays 0
+        );
+    }
+    // BadAtom if the selection atom isn't allocated
+    // (`dix/selection.c:175-178`). `state.atoms.exists` is the
+    // equivalent of Xorg's `ValidAtom`.
+    if !state.atoms.exists(selection) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ATOM,
+            selection.0,
+            0,
+        );
+    }
     if let Some(&(_, prior_last_time)) = state.selections.get(&selection)
         && resolved_time < prior_last_time
     {
@@ -14213,6 +14239,25 @@ mod tests {
         // App: issues SetSelectionOwner (no peer needed).
         let _app_peer = install_client(&mut state, APP);
 
+        // OWNER_WIN must exist for the SetSelectionOwner window
+        // validation gate (`dix/selection.c:169-173`).
+        state.resources.create_window(
+            ClientId(APP),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
         // Subscribe clipboard mgr to PRIMARY's set-owner events on
         // SUBSCRIBER_WIN. This is what `SelectSelectionInput` writes.
         state.xfixes_selection_masks.insert(
@@ -14510,6 +14555,109 @@ mod tests {
             u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
             PRIMARY,
             "selection field",
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's `dixSetSelectionOwner`
+    /// (`dix/selection.c:169-173`) returns BadWindow when `window` is
+    /// non-`None` and `dixLookupWindow` fails. Pre-fix yserver
+    /// silently stored an unknown window xid as the new owner and
+    /// fired XFixesSelectionNotify as if it were valid.
+    #[test]
+    fn set_selection_owner_with_unknown_window_returns_bad_window() {
+        use std::io::Read;
+        const APP: u32 = 40;
+        const UNKNOWN_WIN: u32 = 0x0040_dead;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&UNKNOWN_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 22, // core SetSelectionOwner
+                data: 0,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(buf[0], 0, "first byte = error class");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_WINDOW,
+            "expected BadWindow (3) for unknown window xid; got {}",
+            buf[1],
+        );
+        assert!(
+            state.selections.get(&AtomId(PRIMARY)).is_none(),
+            "no ownership must be recorded on BadWindow; got {:?}",
+            state.selections.get(&AtomId(PRIMARY)),
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's `dixSetSelectionOwner`
+    /// (`dix/selection.c:175-178`) returns BadAtom for an unknown
+    /// selection atom. window=None bypasses the BadWindow gate so the
+    /// BadAtom path is isolated.
+    #[test]
+    fn set_selection_owner_with_invalid_atom_returns_bad_atom() {
+        use std::io::Read;
+        const APP: u32 = 41;
+        const BOGUS_ATOM: u32 = 0xdead_beef;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&0u32.to_le_bytes()); // window=None
+        body.extend_from_slice(&BOGUS_ATOM.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time=CurrentTime
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 22, // core SetSelectionOwner
+                data: 0,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(buf[0], 0, "first byte = error class");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_ATOM,
+            "expected BadAtom (5) for an unknown selection atom; got {}",
+            buf[1],
+        );
+        assert!(
+            state.selections.get(&AtomId(BOGUS_ATOM)).is_none(),
+            "no ownership must be recorded on BadAtom",
         );
     }
 
@@ -14944,6 +15092,25 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, SUBSCRIBER);
         let _ = install_client(&mut state, APP);
+
+        // OWNER_WIN must exist for SetSelectionOwner's window
+        // validation gate.
+        state.resources.create_window(
+            ClientId(APP),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
 
         // Same client, two subscription records on the same selection.
         state.xfixes_selection_masks.insert(
