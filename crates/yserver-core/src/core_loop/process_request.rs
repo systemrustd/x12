@@ -2680,6 +2680,18 @@ fn handle_xfixes_request(
         }
         x11xfixes::CREATE_REGION => {
             if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
+                if xfixes_region_xid_already_taken(state, region)
+                    || xid_out_of_client_range(state, client_id, region)
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        region,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -2691,6 +2703,18 @@ fn handle_xfixes_request(
         }
         x11xfixes::CREATE_REGION_FROM_BITMAP | x11xfixes::CREATE_REGION_FROM_GC => {
             if let Some((region, source)) = x11xfixes::parse_u32_pair(body) {
+                if xfixes_region_xid_already_taken(state, region)
+                    || xid_out_of_client_range(state, client_id, region)
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        region,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 if minor == x11xfixes::CREATE_REGION_FROM_GC {
                     let gc = ResourceId(source);
                     let Some(g) = state.resources.gc(gc) else {
@@ -2744,6 +2768,18 @@ fn handle_xfixes_request(
         }
         x11xfixes::CREATE_REGION_FROM_WINDOW => {
             if let Some((region, window, kind)) = x11xfixes::parse_create_region_from_window(body) {
+                if xfixes_region_xid_already_taken(state, region)
+                    || xid_out_of_client_range(state, client_id, region)
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        region,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 let rects = crate::nested::shape_rects_for(state, ResourceId(window), kind);
                 state.xfixes_regions.insert(
                     region,
@@ -2756,6 +2792,18 @@ fn handle_xfixes_request(
         }
         x11xfixes::CREATE_REGION_FROM_PICTURE => {
             if let Some((region, picture)) = x11xfixes::parse_create_region_from_picture(body) {
+                if xfixes_region_xid_already_taken(state, region)
+                    || xid_out_of_client_range(state, client_id, region)
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        region,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 let Some(picture_state) = state.resources.picture(ResourceId(picture)) else {
                     return emit_x11_error(
                         state,
@@ -8070,6 +8118,18 @@ fn handle_alloc_color_planes(
 /// `BadIDChoice` fires when a CreateXxx request's resource ID is
 /// either already allocated OR outside the client's resource-id range
 /// declared in the setup reply.
+/// `LEGAL_NEW_RESOURCE` equivalent for XFIXES `CreateRegion*`: the
+/// candidate region xid must NOT already name a resource (in the
+/// core `resources` table OR in the dedicated `xfixes_regions`
+/// map). Xorg's `xfixes/region.c:78,114,157,213` all guard their
+/// CreateRegion variants with `LEGAL_NEW_RESOURCE(stuff->region,
+/// client)` before doing any work — duplicates surface as
+/// BadIDChoice (X error code 14). Returns true if the xid clashes
+/// (the caller should emit BadIDChoice).
+fn xfixes_region_xid_already_taken(state: &ServerState, rid: u32) -> bool {
+    state.xfixes_regions.contains_key(&rid) || state.resources.xid_in_use(ResourceId(rid))
+}
+
 fn xid_out_of_client_range(state: &ServerState, client_id: ClientId, xid: u32) -> bool {
     let Some(client) = state.clients.get(&client_id.0) else {
         return false;
@@ -12425,8 +12485,15 @@ mod tests {
                 writer: Arc::new(Mutex::new(a)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
+                // Permissive resource-id range so tests driving
+                // `process_request` can use arbitrary non-zero
+                // resource xids without tripping
+                // `xid_out_of_client_range`. Real clients get a
+                // tight base/mask from the connection handshake;
+                // this is the test-fixture analogue of "every xid
+                // is in range".
                 resource_id_base: 0,
-                resource_id_mask: 0,
+                resource_id_mask: u32::MAX,
                 event_masks: HashMap::new(),
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
@@ -15031,6 +15098,204 @@ mod tests {
              got {} bytes: {:02x?}",
             all.len(),
             all,
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): every XFIXES
+    /// `CreateRegion*` opcode begins with
+    /// `LEGAL_NEW_RESOURCE(stuff->region, client)` in Xorg
+    /// (`xfixes/region.c:78,114,157,213,…`). Reusing an existing
+    /// region XID must surface BadIDChoice. Pre-fix yserver silently
+    /// overwrote `state.xfixes_regions[region]` via `.insert(…)`,
+    /// matching the colormap/window/etc. bug class that the
+    /// codebase already gates elsewhere.
+    #[test]
+    fn create_region_with_in_use_xid_returns_bad_id_choice() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const APP: u32 = 80;
+        const REGION_XID: u32 = 0x0080_0001;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        // Pre-populate the region xid so the new request is a
+        // duplicate.
+        state.xfixes_regions.insert(
+            REGION_XID,
+            crate::server::XFixesRegion {
+                owner: ClientId(APP),
+                rects: Vec::new(),
+            },
+        );
+
+        // CreateRegion body: region(4) + N×8 (rects). Zero rects =
+        // empty region; the duplicate-xid check must fire BEFORE
+        // any rect parsing.
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(buf[0], 0, "first byte = error class");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_ID_CHOICE,
+            "expected BadIDChoice (14) when reusing an existing region xid; got {}",
+            buf[1],
+        );
+        // The duplicate must not be overwritten — the pre-existing
+        // entry's marker (empty rects placeholder) survives intact.
+        let r = state
+            .xfixes_regions
+            .get(&REGION_XID)
+            .expect("pre-existing region must remain");
+        assert!(
+            r.rects.is_empty(),
+            "pre-existing region must not be overwritten on BadIDChoice; \
+             got rects={:?}",
+            r.rects,
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): the duplicate-xid gate
+    /// also applies to `CREATE_REGION_FROM_GC` (and all other
+    /// CreateRegion variants). The GC path is the audit-#7 patch
+    /// site — confirm the new gate is wired in front of the raw
+    /// clip-copy too.
+    #[test]
+    fn create_region_from_gc_with_in_use_xid_returns_bad_id_choice() {
+        use std::io::Read;
+        use yserver_protocol::x11::{
+            ClipRectangles, CreateGcRequest, CreateWindowRequest, SetClipRectanglesRequest,
+            xfixes as x11xfixes,
+        };
+        const APP: u32 = 81;
+        const WIN_XID: u32 = 0x0081_0001;
+        const GC_XID: u32 = 0x0081_0002;
+        const REGION_XID: u32 = 0x0081_0003;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_gc(
+            ClientId(APP),
+            CreateGcRequest {
+                gc: ResourceId(GC_XID),
+                drawable: ResourceId(WIN_XID),
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+        // Single-rect clip so the GC's `clientClip` exists.
+        let mut rect_bytes = Vec::with_capacity(8);
+        rect_bytes.extend_from_slice(&0i16.to_le_bytes());
+        rect_bytes.extend_from_slice(&0i16.to_le_bytes());
+        rect_bytes.extend_from_slice(&5u16.to_le_bytes());
+        rect_bytes.extend_from_slice(&5u16.to_le_bytes());
+        state
+            .resources
+            .set_clip_rectangles(SetClipRectanglesRequest {
+                gc: ResourceId(GC_XID),
+                clip: ClipRectangles {
+                    ordering: 0,
+                    x_origin: 0,
+                    y_origin: 0,
+                    rectangles: rect_bytes,
+                },
+            });
+
+        // Pre-occupy REGION_XID.
+        state.xfixes_regions.insert(
+            REGION_XID,
+            crate::server::XFixesRegion {
+                owner: ClientId(APP),
+                rects: Vec::new(),
+            },
+        );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&GC_XID.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_GC,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_ID_CHOICE,
+            "CreateRegionFromGC must gate on LEGAL_NEW_RESOURCE before \
+             copying the GC's clip; got error code {}",
+            buf[1],
         );
     }
 
