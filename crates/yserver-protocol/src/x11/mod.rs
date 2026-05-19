@@ -4754,6 +4754,7 @@ pub mod error {
     pub const BAD_ALLOC: u8 = 11;
     pub const BAD_GC: u8 = 13;
     pub const BAD_ID_CHOICE: u8 = 14;
+    pub const BAD_NAME: u8 = 15;
     pub const BAD_LENGTH: u8 = 16;
     pub const BAD_IMPLEMENTATION: u8 = 17;
 }

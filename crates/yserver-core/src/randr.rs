@@ -64,6 +64,11 @@ impl RandrState {
     /// - `primary_output = outputs[0].output_id` (0 if empty)
     #[must_use]
     pub fn from_outputs(timestamp: u32, outputs: Vec<RandrOutput>) -> Self {
+        // Some compositors compare the first RANDR resource timestamp with
+        // their own "last SetCrtcConfig" timestamp, which starts at zero.
+        // Advertising zero here makes the initial server state look like a
+        // completed client-side reconfiguration.
+        let timestamp = timestamp.max(1);
         let screen_width: u16 = outputs
             .iter()
             .map(|o| {
@@ -284,6 +289,17 @@ mod tests {
         assert_eq!(out.name, "ynest-0");
         assert_eq!(out.x, 0);
         assert_eq!(out.y, 0);
+    }
+
+    #[test]
+    fn nested_clamps_zero_timestamp() {
+        let state = RandrState::nested(0, 800, 600);
+        assert_eq!(state.timestamp, 1);
+        assert_eq!(state.config_timestamp, 1);
+
+        let resources = state.screen_resources_current();
+        assert_eq!(resources.timestamp, 1);
+        assert_eq!(resources.config_timestamp, 1);
     }
 
     #[test]

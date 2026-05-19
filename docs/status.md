@@ -1358,6 +1358,41 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       host X server visual / colormap to translate, and v1/v2 KMS
       consume that selector directly so ARGB top-levels allocate
       depth-32 storage.
+      Next Cinnamon smoke: background stayed visible and
+      cinnamon-settings rendered, but without decorations. Logs show
+      muffin starts as the WM, sends `SYNC::ListSystemCounters`, gets
+      an empty system-counter list, prints `Could not initialize
+      XSync counter`, and exits before managing the settings window.
+      2026-05-19 follow-up: SYNC now advertises a Xorg-compatible
+      `SERVERTIME` system counter (resolution 4 ms) and
+      `QueryCounter(SERVERTIME)` returns the server timestamp. The
+      follow-up trace showed muffin receiving `SERVERTIME` but still
+      exiting immediately because mutter's idle monitor searches for
+      the `IDLETIME` system counter during XSync startup. SYNC now
+      advertises both `SERVERTIME` and `IDLETIME` with 4 ms
+      resolution; `QueryCounter(IDLETIME)` currently returns the
+      server timestamp as a minimal monotonic stand-in until full idle
+      accounting / alarm delivery is needed.
+      Next Cinnamon smoke reached Muffin's RANDR monitor setup, then
+      crashed with `meta_settings_get_ui_scaling_factor:
+      settings->ui_scaling_factor != 0`. The trace showed the first
+      `RANDR::GetScreenResourcesCurrent` reply carrying
+      `timestamp=0` / `config-timestamp=0`; Muffin's XRandR backend
+      compares the resource timestamp with its own initial
+      last-config timestamp (also zero) and takes a fast path that
+      reads UI scaling before settings post-init has populated it.
+      RANDR initialization now clamps zero resource timestamps to 1 so
+      the initial server layout is not mistaken for a completed
+      client-side reconfiguration. Follow-up xserver comparison also
+      showed `GetMonitors` should mark active server monitors as
+      `automatic=TRUE`; yserver was hardcoding that flag false, which
+      could make Muffin treat the layout as manual/fallback instead of
+      the live server geometry. That flag now matches Xorg. Muffin
+      also probes `RANDR::QueryOutputProperty` for connector atoms
+      such as `EDID`, `ConnectorType`, and `Backlight`; yserver was
+      leaving that minor opcode unhandled, so it now returns a proper
+      `BadName` error for unsupported output properties instead of
+      silently eating the request.
 
       **Stability + perf** observed positive through 3f.10 +
       3f.15 (flip-pending gate + failed-submit recovery + stroke

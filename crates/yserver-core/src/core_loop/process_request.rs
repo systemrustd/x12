@@ -1702,6 +1702,26 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
+        x11randr::RR_QUERY_OUTPUT_PROPERTY => {
+            let Some(req) = x11randr::parse_output_property_request(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    x11randr::RR_QUERY_OUTPUT_PROPERTY,
+                );
+            };
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_NAME,
+                req.property,
+                x11randr::RR_QUERY_OUTPUT_PROPERTY,
+            );
+        }
         x11randr::RR_GET_PANNING => {
             let timestamp = state.randr.timestamp;
             let buf = x11randr::encode_get_panning_reply(byte_order, sequence, timestamp);
@@ -1736,6 +1756,7 @@ fn handle_randr_request(
             struct MonitorRow {
                 name_atom: u32,
                 primary: bool,
+                automatic: bool,
                 x: i16,
                 y: i16,
                 width: u16,
@@ -1761,6 +1782,7 @@ fn handle_randr_request(
                     MonitorRow {
                         name_atom,
                         primary: i == 0,
+                        automatic: true,
                         x: o.x,
                         y: o.y,
                         width: o.width,
@@ -1776,6 +1798,7 @@ fn handle_randr_request(
                 .map(|r| x11randr::MonitorInfo {
                     name: r.name_atom,
                     primary: r.primary,
+                    automatic: r.automatic,
                     x: r.x,
                     y: r.y,
                     width: r.width,

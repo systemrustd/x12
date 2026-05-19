@@ -43,6 +43,7 @@ pub const RR_GET_SCREEN_SIZE_RANGE: u8 = 6;
 pub const RR_GET_SCREEN_RESOURCES: u8 = 8;
 pub const RR_GET_OUTPUT_INFO: u8 = 9;
 pub const RR_LIST_OUTPUT_PROPERTIES: u8 = 10;
+pub const RR_QUERY_OUTPUT_PROPERTY: u8 = 11;
 pub const RR_GET_OUTPUT_PROPERTY: u8 = 15;
 pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
@@ -125,6 +126,12 @@ pub struct OutputRequest {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct OutputPropertyRequest {
+    pub output: u32,
+    pub property: u32,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct CrtcRequest {
     pub crtc: u32,
     pub config_timestamp: u32,
@@ -164,6 +171,16 @@ pub fn parse_output_request(body: &[u8]) -> Option<OutputRequest> {
     Some(OutputRequest {
         output: read_u32_le(body),
         config_timestamp: read_u32_le(&body[4..]),
+    })
+}
+
+pub fn parse_output_property_request(body: &[u8]) -> Option<OutputPropertyRequest> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(OutputPropertyRequest {
+        output: read_u32_le(body),
+        property: read_u32_le(&body[4..]),
     })
 }
 
@@ -642,6 +659,8 @@ pub struct MonitorInfo<'a> {
     /// Atom ID for the monitor name (0 = anonymous).
     pub name: u32,
     pub primary: bool,
+    /// Active server-generated monitors are reported as automatic.
+    pub automatic: bool,
     pub x: i16,
     pub y: i16,
     pub width: u16,
@@ -688,7 +707,7 @@ pub fn encode_get_monitors_reply(
         let n_out = m.outputs.len() as u16;
         out.extend_from_slice(&m.name.to_le_bytes()); // 4: name (Atom)
         out.push(u8::from(m.primary)); // 1: primary
-        out.push(0); // 1: automatic = false
+        out.push(u8::from(m.automatic)); // 1: automatic
         put(byte_order, &mut out, n_out); // 2: nOutput
         out.extend_from_slice(&m.x.to_le_bytes()); // 2: x
         out.extend_from_slice(&m.y.to_le_bytes()); // 2: y
@@ -1024,6 +1043,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_query_output_property_request() {
+        let body = [
+            0x01, 0x00, 0x00, 0x00, // output
+            0x02, 0x00, 0x00, 0x00, // property
+        ];
+        let req = parse_output_property_request(&body).unwrap();
+        assert_eq!(req.output, 1);
+        assert_eq!(req.property, 2);
+    }
+
+    #[test]
     fn encode_get_monitors_single_monitor_shape() {
         let outputs = [0x20u32];
         let buf = encode_get_monitors_reply(
@@ -1033,6 +1063,7 @@ mod tests {
             &[MonitorInfo {
                 name: 0,
                 primary: true,
+                automatic: true,
                 x: 0,
                 y: 0,
                 width: 800,
@@ -1051,6 +1082,7 @@ mod tests {
         assert_eq!(&buf[12..16], &1u32.to_le_bytes()); // nMonitors
         assert_eq!(&buf[16..20], &1u32.to_le_bytes()); // nOutputs
         assert_eq!(buf[36], 1); // primary
+        assert_eq!(buf[37], 1); // automatic
         assert_eq!(&buf[40..42], &0i16.to_le_bytes());
         assert_eq!(&buf[44..46], &800u16.to_le_bytes());
         assert_eq!(&buf[56..60], &0x20u32.to_le_bytes());
