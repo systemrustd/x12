@@ -15,7 +15,13 @@ HARNESS=${1:?harness required: 'xts' or 'rendercheck'}
 shift
 
 cd /home/jos/Projects/yserver
-RUST_LOG=warn target/release/yserver > /tmp/yserver-vng.log 2>&1 &
+# vng's guest /tmp is a fresh tmpfs — anything written to /tmp inside
+# the guest is invisible to the host post-exit. Stash yserver's
+# stderr/stdout in the project tree (host-mounted --rw via vng), so
+# post-mortems / crash logs survive. Env-overrideable for ad-hoc runs:
+#   YSERVER_VNG_LOG=/path/to/log  YSERVER_VNG_RUST_LOG=trace just rendercheck-yserver ...
+YSERVER_LOG="${YSERVER_VNG_LOG:-/home/jos/Projects/yserver/yserver-vng.log}"
+RUST_LOG="${YSERVER_VNG_RUST_LOG:-warn}" RUST_BACKTRACE=1 target/release/yserver > "$YSERVER_LOG" 2>&1 &
 pid=$!
 trap "kill $pid 2>/dev/null; wait $pid 2>/dev/null || true" EXIT
 
@@ -27,7 +33,7 @@ for _ in $(seq 1 150); do
 done
 if ! DISPLAY=:7 xdpyinfo >/dev/null 2>&1; then
     echo "error: yserver did not come up on :7" >&2
-    tail -30 /tmp/yserver-vng.log >&2 || true
+    tail -30 "$YSERVER_LOG" >&2 || true
     exit 2
 fi
 
