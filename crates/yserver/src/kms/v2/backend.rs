@@ -276,6 +276,11 @@ impl KmsBackendV2 {
                     None,
                     None,
                     false,
+                    // Audit #4: no Picture context — pass 0 so the
+                    // engine falls back to the depth-based swizzle.
+                    0,
+                    0,
+                    0,
                 ) {
                     Ok(s) if s.recorded_draws > 0 => {
                         self.telemetry.record_paint_submit();
@@ -1808,6 +1813,11 @@ impl KmsBackendV2 {
             None,
             None,
             false,
+            // Audit #4: synthesized tile-fill draw, no Picture
+            // context. Engine falls back to depth heuristic.
+            0,
+            0,
+            0,
         ) {
             Ok(s) => {
                 if s.recorded_draws > 0 {
@@ -4360,6 +4370,11 @@ impl Backend for KmsBackendV2 {
             None,
             None,
             false,
+            // Audit #4: synthesized backing-seed copy, no Picture
+            // context. Engine falls back to depth heuristic.
+            0,
+            0,
+            0,
         ) {
             Ok(s) if s.recorded_draws > 0 => self.telemetry.record_paint_submit(),
             Ok(_) => {}
@@ -5987,6 +6002,17 @@ impl Backend for KmsBackendV2 {
                 off_y = dst_target.offset.1,
             );
         }
+        // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
+        // through to the engine so an xRGB32 picture wrapping a
+        // depth-32 storage picks a no-alpha sample swizzle +
+        // force-opaque for sources, AND the right "no alpha target"
+        // pipeline + readback selection for destinations.
+        // `picture_pict_format` returns 0 for non-Drawable picture
+        // variants and unknown xids — engine falls back to the depth
+        // heuristic in those cases.
+        let src_pict_format = picture_pict_format(&self.core, host_src);
+        let mask_pict_format = picture_pict_format(&self.core, host_mask);
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.render_composite(
             &mut self.store,
             &mut self.platform,
@@ -6001,6 +6027,9 @@ impl Backend for KmsBackendV2 {
             src_transform,
             mask_transform,
             mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
         );
         match &stats {
             Ok(s) => {
@@ -6545,6 +6574,12 @@ impl Backend for KmsBackendV2 {
             instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
         }
 
+        // Audit #4 (2026-05-19) — same pict_format threading as
+        // render_composite. Trap/tri paint into an xRGB32 dst on
+        // depth-32 storage must drive "no alpha target," and
+        // xRGB32 sources must pin α=ONE on the sample view.
+        let src_pict_format = picture_pict_format(&self.core, host_src);
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -6561,6 +6596,8 @@ impl Backend for KmsBackendV2 {
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
+            src_pict_format,
+            dst_pict_format,
         );
         if let Ok(s) = stats {
             if s.recorded_draws > 0 {
@@ -6703,6 +6740,10 @@ impl Backend for KmsBackendV2 {
             instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
         }
 
+        // Audit #4 (2026-05-19) — same pict_format threading as
+        // the trapezoid path; see that call site for rationale.
+        let src_pict_format = picture_pict_format(&self.core, host_src);
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -6719,6 +6760,8 @@ impl Backend for KmsBackendV2 {
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
+            src_pict_format,
+            dst_pict_format,
         );
         if let Ok(s) = stats {
             if s.recorded_draws > 0 {

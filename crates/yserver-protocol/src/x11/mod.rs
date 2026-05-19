@@ -4342,6 +4342,12 @@ pub const RENDER_FMT_A1: u32 = 1;
 pub const RENDER_FMT_A8: u32 = 2;
 pub const RENDER_FMT_RGB24: u32 = 3;
 pub const RENDER_FMT_ARGB32: u32 = 4;
+/// Audit #4 (2026-05-19): depth-32 r8g8b8 picture format with
+/// `alpha_mask=0`. Lets clients sample a depth-32 storage as
+/// fully opaque without depending on the storage's padding-alpha
+/// bytes (which start as 0 and would otherwise leak into the
+/// composite as α=0 → invisible). Mirrors Xorg's `PICT_x8r8g8b8`.
+pub const RENDER_FMT_XRGB32: u32 = 5;
 
 pub struct RenderCreatePictureRequest {
     pub picture: ResourceId,
@@ -4525,8 +4531,13 @@ pub fn render_composite_request(body: &[u8]) -> Option<RenderCompositeRequest> {
     })
 }
 
-/// Write QueryPictFormats reply. Advertises 4 picture formats (A1, A8, X8R8G8B8, A8R8G8B8)
-/// and maps the root visual (depth 24) to X8R8G8B8 and the ARGB visual (depth 32) to A8R8G8B8.
+/// Write QueryPictFormats reply. Advertises 5 picture formats (A1,
+/// A8, X8R8G8B8, A8R8G8B8, **X8R8G8B8 at depth-32**) and maps the
+/// root visual (depth 24) to X8R8G8B8 and the ARGB visual (depth 32)
+/// to BOTH A8R8G8B8 (primary, with alpha) and X8R8G8B8-at-depth-32
+/// (alternate, no alpha — `RENDER_FMT_XRGB32`). The alternate lets
+/// compositors and Cairo wrap a depth-32 storage as opaque without
+/// depending on the storage's padding-alpha bytes — see audit #4.
 pub fn write_render_query_pict_formats_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -4534,14 +4545,17 @@ pub fn write_render_query_pict_formats_reply(
     root_visual: ResourceId,
     argb_visual: ResourceId,
 ) -> io::Result<()> {
-    // 4 formats × 28 bytes = 112 bytes
-    // 1 screen: nDepth(4) + fallback(4) + [depth24: 8+8 + depth32: 8+8] = 40 bytes
-    // Total body = 152 bytes = 38 × 4-byte units
-    let num_formats: u32 = 4;
+    // 5 formats × 28 bytes = 140 bytes
+    // 1 screen: nDepth(4) + fallback(4) + depth24-section(8 + 8 = 16) +
+    //   depth32-section(8 header + 2 × 8 visual-format pairs = 24) = 48 bytes
+    // Total body = 188 bytes = 47 × 4-byte units
+    let num_formats: u32 = 5;
     let num_screens: u32 = 1;
     let num_depths: u32 = 2;
-    let num_visuals: u32 = 2;
-    let body_units: u32 = (112 + 40) / 4; // 38
+    // Total (visual,format) pairs across all depths: depth-24 has 1,
+    // depth-32 has 2 (ARGB32 + XRGB32-depth32). Sum = 3.
+    let num_visuals: u32 = 3;
+    let body_units: u32 = (140 + 48) / 4; // 47
 
     let mut out = Vec::new();
     out.push(1u8); // Reply
@@ -4615,6 +4629,23 @@ pub fn write_render_query_pict_formats_reply(
     write_u16(byte_order, &mut out, 0xFF); // alpha-mask
     write_u32(byte_order, &mut out, 0);
 
+    // Format 5: X8R8G8B8 at depth=32 (no alpha) — audit #4 / Xorg
+    // PICT_x8r8g8b8. Wrap a depth-32 storage as opaque without
+    // sampling the padding bytes as if they were real alpha.
+    write_u32(byte_order, &mut out, RENDER_FMT_XRGB32);
+    out.push(1); // type=Direct
+    out.push(32); // depth=32
+    out.extend_from_slice(&[0, 0]);
+    write_u16(byte_order, &mut out, 16); // red-shift
+    write_u16(byte_order, &mut out, 0xFF); // red-mask
+    write_u16(byte_order, &mut out, 8); // green-shift
+    write_u16(byte_order, &mut out, 0xFF); // green-mask
+    write_u16(byte_order, &mut out, 0); // blue-shift
+    write_u16(byte_order, &mut out, 0xFF); // blue-mask
+    write_u16(byte_order, &mut out, 0); // alpha-shift
+    write_u16(byte_order, &mut out, 0); // alpha-mask=0 (no alpha)
+    write_u32(byte_order, &mut out, 0);
+
     // Screen info: 1 screen with 2 depths
     write_u32(byte_order, &mut out, num_depths); // nDepth per screen
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24); // fallback
@@ -4625,13 +4656,20 @@ pub fn write_render_query_pict_formats_reply(
     write_u32(byte_order, &mut out, 0); // pad
     write_u32(byte_order, &mut out, root_visual.0);
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
-    // Depth 32 entry: 8-byte header + 1 visual (8 bytes)
+    // Depth 32 entry: 8-byte header + 2 (visual, format) pairs.
+    // The same ARGB visual is listed twice — once with ARGB32 (primary,
+    // with-alpha) and once with XRGB32 (alternate, no-alpha). Per
+    // X RENDER spec, multiple format associations for the same visual
+    // are spec-legal and how Xorg advertises depth-32 — see
+    // `render/picture.c` PICT_x8r8g8b8 + PICT_a8r8g8b8 entries.
     out.push(32);
     out.push(0);
-    write_u16(byte_order, &mut out, 1); // 1 visual
+    write_u16(byte_order, &mut out, 2); // 2 (visual, format) pairs
     write_u32(byte_order, &mut out, 0); // pad
     write_u32(byte_order, &mut out, argb_visual.0);
     write_u32(byte_order, &mut out, RENDER_FMT_ARGB32);
+    write_u32(byte_order, &mut out, argb_visual.0);
+    write_u32(byte_order, &mut out, RENDER_FMT_XRGB32);
 
     writer.write_all(&out)
 }

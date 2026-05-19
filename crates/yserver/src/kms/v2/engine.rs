@@ -2550,6 +2550,7 @@ impl RenderEngine {
     /// `recorded_draws = 0` — the op silently no-ops, matching
     /// v1's `try_vk_render_composite` shape.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_composite(
         &mut self,
         store: &mut DrawableStore,
@@ -2565,6 +2566,18 @@ impl RenderEngine {
         src_transform: Option<PictTransform>,
         mask_transform: Option<PictTransform>,
         mask_component_alpha: bool,
+        // Audit #4 (2026-05-19): src / mask / dst picture PictFormat
+        // IDs. The backend looks them up via `picture_pict_format`
+        // (backend.rs:2437) and threads them here so the engine can
+        // pick the right α swizzle on the sample view + force-opaque
+        // decision for xRGB32 sources, AND the right `dst_has_alpha`
+        // (pipeline + readback selection) for xRGB32 destinations.
+        // 0 = no picture context (engine-internal callers); fall back
+        // to depth heuristic via the legacy `swizzle_class_for` /
+        // `resolve_force_opaque` / `dst_has_alpha_for_pict_format(0)`.
+        src_pict_format: u32,
+        mask_pict_format: u32,
+        dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
         use crate::kms::vk::{
             ops::render as vk_render,
@@ -2609,7 +2622,11 @@ impl RenderEngine {
             );
             return Ok(stats);
         }
-        let dst_has_alpha = dst_format == vk::Format::R8_UNORM || dst_depth == 32;
+        // Audit #4 (2026-05-19): pict_format-aware dst alpha
+        // selection. xRGB32 on depth-32 storage must drive
+        // "no alpha target" pipelines + readback views even though
+        // depth says 32.
+        let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
 
         // Map the protocol op byte to the pipeline cache's enum.
         let Some(std_op) = StdPictOp::from_u8(op) else {
@@ -2696,7 +2713,11 @@ impl RenderEngine {
                 ResolvedSource::Drawable(id) => {
                     let info = drawable_for_render_view(store, id)
                         .ok_or(RenderError::UnknownDrawable(id))?;
-                    let class = swizzle_class_for(info.format, info.depth);
+                    // Audit #4: pict_format-aware swizzle so an
+                    // xRGB32 source on a depth-32 storage picks the
+                    // BgraNoAlpha (force α=ONE) sample view.
+                    let class =
+                        swizzle_class_for_pict_format(info.format, info.depth, src_pict_format);
                     let sampler = sampler_config_for_repeat(src_repeat);
                     let view = ensure_drawable_view(
                         &inner.vk,
@@ -2749,7 +2770,9 @@ impl RenderEngine {
                 ResolvedSource::Drawable(id) => {
                     let info = drawable_for_render_view(store, id)
                         .ok_or(RenderError::UnknownDrawable(id))?;
-                    let class = swizzle_class_for(info.format, info.depth);
+                    // Audit #4: same pict_format-aware swizzle as src.
+                    let class =
+                        swizzle_class_for_pict_format(info.format, info.depth, mask_pict_format);
                     let sampler = sampler_config_for_repeat(mask_repeat);
                     let view = ensure_drawable_view(
                         &inner.vk,
@@ -2887,14 +2910,16 @@ impl RenderEngine {
             None => user_mask_xform,
         };
 
-        // X11 Render PictFormat: pictures wrapping a depth < 32
-        // drawable have `alpha_mask = 0`, so samples must return
-        // α = 1.0 regardless of the storage byte (which is
-        // server-owned padding for depth-24 BGRA storage). Resolve
-        // per src/mask drawable; Solid / Gradient / None carry their
-        // own α and don't need the override.
-        let src_force_opaque = resolve_force_opaque(store, &src);
-        let mask_force_opaque = resolve_force_opaque(store, &mask);
+        // X11 Render PictFormat: pictures with `alpha_mask = 0`
+        // (RGB24 / XRGB32) must sample α = 1.0 regardless of storage.
+        // Audit #4 (2026-05-19): use the pict_format-aware variant
+        // so xRGB32-on-depth-32 pictures pin α=ONE — pre-fix the
+        // engine relied on depth alone and treated depth-32 storage
+        // as ARGB even when the picture declared xRGB32. Solid /
+        // Gradient / None carry their own α and don't need the
+        // override.
+        let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
+        let mask_force_opaque = resolve_force_opaque_pict_format(store, &mask, mask_pict_format);
 
         let attrs = vk_render::CompositeAttrs {
             src_extent,
@@ -3095,6 +3120,12 @@ impl RenderEngine {
             None,
             None,
             false,
+            // Audit #4: Solid src has no Picture context — depth
+            // heuristic fallback is fine, force-opaque is false
+            // anyway for non-Drawable sources.
+            0,
+            0,
+            0,
         )
     }
 
@@ -3130,6 +3161,7 @@ impl RenderEngine {
     /// - `Vk(...)` for pipeline / scratch / CB failures.
     /// - `RendererFailed` if `platform.renderer_failed`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_traps_or_tris(
         &mut self,
         store: &mut DrawableStore,
@@ -3144,6 +3176,14 @@ impl RenderEngine {
         clip_rects: Option<&[Rectangle16]>,
         src_repeat: Repeat,
         src_transform: Option<PictTransform>,
+        // Audit #4 (2026-05-19) — src/dst PictFormat IDs. Mirrors the
+        // render_composite wiring: pict_format-aware α swizzle on the
+        // sample view, pict_format-aware dst_has_alpha for pipeline +
+        // readback selection. 0 = no Picture context → legacy depth
+        // heuristic (the codex round 2026-05-19 follow-up to audit
+        // #4 closed the trap/tri path that was originally missed).
+        src_pict_format: u32,
+        dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
         use crate::kms::vk::{
             ops::render as vk_render,
@@ -3190,7 +3230,10 @@ impl RenderEngine {
             log::debug!("v2 render_traps_or_tris gap: dst format {dst_format:?} unsupported");
             return Ok(stats);
         }
-        let dst_has_alpha = dst_format == vk::Format::R8_UNORM || dst_depth == 32;
+        // Audit #4 (2026-05-19): pict_format-aware dst alpha so a
+        // trap/triangle paint into an xRGB32 picture on depth-32
+        // storage drives "no alpha target" pipelines + readback.
+        let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
         let Some(std_op) = StdPictOp::from_u8(op) else {
             log::debug!("v2 render_traps_or_tris gap: unsupported op {op}");
             return Ok(stats);
@@ -3283,7 +3326,9 @@ impl RenderEngine {
             ResolvedSource::Drawable(id) => {
                 let info =
                     drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
-                let class = swizzle_class_for(info.format, info.depth);
+                // Audit #4 (2026-05-19): pict_format-aware swizzle on
+                // the trap/tri src path, matching render_composite.
+                let class = swizzle_class_for_pict_format(info.format, info.depth, src_pict_format);
                 let sampler = sampler_config_for_repeat(src_repeat);
                 let view = ensure_drawable_view(
                     &inner.vk,
@@ -3594,10 +3639,13 @@ impl RenderEngine {
             crate::kms::backend::repeat_to_shader_const(src_repeat)
         };
         // X11 Render PictFormat force-opaque for the src picture.
+        // Audit #4 (2026-05-19): use the pict_format-aware variant
+        // so xRGB32-on-depth-32 sources in the trap/tri path pin
+        // α=ONE — matching the render_composite wiring.
         // The mask is the trap-coverage R8 scratch the engine
         // rasterised in this op — never a user picture — so its α
         // is server-controlled and force_opaque doesn't apply.
-        let src_force_opaque = resolve_force_opaque(store, &src);
+        let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
 
         let attrs = vk_render::CompositeAttrs {
             src_extent,
@@ -3784,6 +3832,34 @@ fn resolve_force_opaque(store: &DrawableStore, src: &ResolvedSource) -> bool {
     }
 }
 
+/// Audit #4 (2026-05-19) — pict_format-aware force-opaque decision.
+/// A picture with PictFormat declaring `alpha_mask = 0` (xRGB24 or
+/// xRGB32) says "the storage's α byte is padding, not client-
+/// meaningful." Engine must force α=1 regardless of storage depth.
+///
+/// `pict_format == 0` falls back to the legacy depth heuristic for
+/// engine-internal callers that synthesize sources without a real
+/// Picture (composite_glyphs/trapezoids backfills). Both helpers
+/// coexist: the pict_format-aware path threads through the
+/// `render_composite` call site; the older `resolve_force_opaque`
+/// stays for the synthesized-source paths.
+fn resolve_force_opaque_pict_format(
+    store: &DrawableStore,
+    src: &ResolvedSource,
+    pict_format: u32,
+) -> bool {
+    use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    match src {
+        ResolvedSource::Drawable(id) => {
+            if pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32 {
+                return true;
+            }
+            store.get(*id).is_some_and(|d| d.depth == 24)
+        }
+        ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => false,
+    }
+}
+
 fn drawable_for_render_view(store: &DrawableStore, id: DrawableId) -> Option<DrawableViewInfo> {
     let d = store.get(id)?;
     Some(DrawableViewInfo {
@@ -3809,6 +3885,72 @@ fn swizzle_class_for(format: vk::Format, depth: u8) -> SwizzleClass {
         (vk::Format::B8G8R8A8_UNORM, 24) => SwizzleClass::BgraNoAlpha,
         _ => SwizzleClass::RgbaIdent,
     }
+}
+
+/// Audit #4 (2026-05-19) — pict_format-aware destination
+/// `has_alpha` decision. A Picture wrapping a depth-32 storage
+/// with `RENDER_FMT_XRGB32` declares `alpha_mask = 0` — the dst
+/// storage's α byte is padding, NOT a client-meaningful alpha
+/// channel. The pipeline + readback selection must treat it as
+/// "no alpha target" (same as depth-24), else post-composite reads
+/// of the padding bytes leak through to subsequent samples as
+/// partial transparency.
+///
+/// Pre-fix `dst_has_alpha = dst_depth == 32` unconditionally. Now
+/// the picture's PictFormat takes precedence over storage depth
+/// when known (xRGB24 / xRGB32 → no alpha; ARGB32 → has alpha);
+/// `pict_format == 0` falls back to the depth+format heuristic
+/// for engine-internal callers without picture context.
+fn dst_has_alpha_for_pict_format(format: vk::Format, depth: u8, pict_format: u32) -> bool {
+    use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    // R8_UNORM dst is an A8 mask — alpha-only by definition,
+    // pict_format can't override that.
+    if format == vk::Format::R8_UNORM {
+        return true;
+    }
+    if pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32 {
+        return false;
+    }
+    if pict_format == RENDER_FMT_ARGB32 {
+        return true;
+    }
+    // Fallback: legacy depth heuristic.
+    depth == 32
+}
+
+/// Audit #4 (2026-05-19) — pict_format-aware swizzle. A picture
+/// with PictFormat declaring `alpha_mask = 0` (xRGB24 or xRGB32)
+/// must bind a sample view whose α swizzle pins to ONE, regardless
+/// of storage depth. Pre-fix the engine cached one view per
+/// (drawable, sampler, swizzle) tuple where swizzle came from
+/// storage-depth alone — so a depth-32 storage wrapped by an
+/// xRGB32 picture got `RgbaIdent` (pass-through), and the storage's
+/// α padding bytes (typically 0) leaked into the composite as
+/// transparent.
+///
+/// `pict_format == 0` falls back to `swizzle_class_for` for
+/// internal engine paths that don't carry a Picture identity
+/// (composite_glyphs synthesized A8 masks, trapezoid traps).
+fn swizzle_class_for_pict_format(
+    format: vk::Format,
+    depth: u8,
+    pict_format: u32,
+) -> SwizzleClass {
+    use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    // R8_UNORM is alpha-only by construction — pict_format can't
+    // override that. Same for the legacy depth-24 BGRA8 case.
+    if format == vk::Format::R8_UNORM {
+        return SwizzleClass::AlphaOnlyR8;
+    }
+    if format == vk::Format::B8G8R8A8_UNORM {
+        if pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32 {
+            return SwizzleClass::BgraNoAlpha;
+        }
+        if depth == 24 {
+            return SwizzleClass::BgraNoAlpha;
+        }
+    }
+    SwizzleClass::RgbaIdent
 }
 
 /// Lookup/build a `vk::ImageView` for `id` with the given
@@ -5627,6 +5769,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite");
         assert_eq!(stats.recorded_draws, 1);
@@ -5724,6 +5869,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite");
         // One src rect × two clip rects = 2 draw calls.
@@ -5799,6 +5947,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite");
         let out = engine
@@ -5902,6 +6053,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite gradient");
         assert_eq!(stats.recorded_draws, 1);
@@ -6019,6 +6173,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite radial");
         assert_eq!(stats.recorded_draws, 1);
@@ -6103,6 +6260,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite Ok even on missing gradient");
         assert_eq!(stats.recorded_draws, 0);
@@ -6145,6 +6305,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite");
         assert!(
@@ -6222,6 +6385,9 @@ mod tests {
                 None,
                 None,
                 false,
+                0,
+                0,
+                0,
             )
             .expect("render_composite");
         assert!(
@@ -6667,5 +6833,193 @@ mod tests {
             &store,
             &ResolvedSource::Drawable(id8)
         ));
+    }
+
+    /// Audit #4 (2026-05-19) — `pict_format` overrides the depth
+    /// heuristic for `Drawable` sources. A picture wrapping a
+    /// depth-32 storage with `RENDER_FMT_XRGB32` declares
+    /// `alpha_mask=0` — the storage's α byte is padding, not
+    /// client-meaningful. Engine must force α=1 even though
+    /// `d.depth == 32`. Pre-fix `resolve_force_opaque` ignored
+    /// pict_format → depth-32 storages with xRGB32 sampled as
+    /// transparent black against the wallpaper.
+    #[test]
+    fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format() {
+        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+
+        let mut store = DrawableStore::new();
+        // Depth-32 storage (would normally sample with real α).
+        let storage32 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id32 = store
+            .allocate(
+                0xA101,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage32,
+            )
+            .unwrap();
+        // Depth-24 storage (α is padding regardless of pict_format).
+        let storage24 = super::super::store::Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id24 = store
+            .allocate(
+                0xA102,
+                super::super::store::DrawableKind::Pixmap,
+                24,
+                false,
+                storage24,
+            )
+            .unwrap();
+        let src32 = ResolvedSource::Drawable(id32);
+        let src24 = ResolvedSource::Drawable(id24);
+
+        // pict_format=0 (no picture context) → fall back to depth
+        // heuristic (the engine-internal callers that synthesize
+        // sources pass 0 here).
+        assert!(!resolve_force_opaque_pict_format(&store, &src32, 0));
+        assert!(resolve_force_opaque_pict_format(&store, &src24, 0));
+
+        // pict_format=RENDER_FMT_XRGB32 on depth-32 storage → force
+        // opaque (the audit-#4 case). Pre-fix would have returned
+        // false because depth==32.
+        assert!(resolve_force_opaque_pict_format(
+            &store,
+            &src32,
+            RENDER_FMT_XRGB32,
+        ));
+        // pict_format=RENDER_FMT_ARGB32 on depth-32 storage → use
+        // storage α (current behavior preserved).
+        assert!(!resolve_force_opaque_pict_format(
+            &store,
+            &src32,
+            RENDER_FMT_ARGB32,
+        ));
+        // pict_format=RENDER_FMT_RGB24 on depth-24 storage → force
+        // opaque (consistent with the legacy depth-24 path).
+        assert!(resolve_force_opaque_pict_format(
+            &store,
+            &src24,
+            RENDER_FMT_RGB24,
+        ));
+    }
+
+    /// Audit #4 (2026-05-19) — destination `pict_format` overrides
+    /// the depth-32 storage heuristic. A Picture wrapping a
+    /// depth-32 storage with `RENDER_FMT_XRGB32` declares
+    /// `alpha_mask = 0` — the dst storage has no client-meaningful
+    /// alpha channel, padding bytes only. The engine must drive
+    /// the pipeline + readback selection as "no alpha target,"
+    /// matching the depth-24 case, otherwise post-composite reads
+    /// of those padding bytes leak through to subsequent samples
+    /// as partial transparency. Pre-fix `dst_has_alpha = depth == 32`
+    /// unconditionally → xRGB32 destination treated as ARGB.
+    #[test]
+    fn render_composite_dst_has_alpha_honors_xrgb32_pict_format() {
+        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+
+        // pict_format=0 (no picture context — engine-internal callers
+        // synthesizing draws) → depth heuristic.
+        assert!(!dst_has_alpha_for_pict_format(
+            vk::Format::B8G8R8A8_UNORM,
+            24,
+            0,
+        ));
+        assert!(dst_has_alpha_for_pict_format(
+            vk::Format::B8G8R8A8_UNORM,
+            32,
+            0,
+        ));
+
+        // XRGB32 on depth-32 storage → no alpha (audit #4 case).
+        assert!(!dst_has_alpha_for_pict_format(
+            vk::Format::B8G8R8A8_UNORM,
+            32,
+            RENDER_FMT_XRGB32,
+        ));
+        // ARGB32 on depth-32 storage → use storage alpha
+        // (current behavior preserved).
+        assert!(dst_has_alpha_for_pict_format(
+            vk::Format::B8G8R8A8_UNORM,
+            32,
+            RENDER_FMT_ARGB32,
+        ));
+        // RGB24 on depth-24 storage → no alpha (consistent with
+        // legacy depth-24 path).
+        assert!(!dst_has_alpha_for_pict_format(
+            vk::Format::B8G8R8A8_UNORM,
+            24,
+            RENDER_FMT_RGB24,
+        ));
+        // R8 storage (A8 mask destination) is alpha-only regardless
+        // of pict_format — A8 destinations DO have alpha bytes.
+        assert!(dst_has_alpha_for_pict_format(vk::Format::R8_UNORM, 8, 0));
+    }
+
+    /// Audit #4 — `swizzle_class_for` must pick `BgraNoAlpha`
+    /// (force α=ONE swizzle on the sample view) whenever the
+    /// picture's PictFormat declares `alpha_mask=0`, not just
+    /// when `depth == 24`. Pre-fix, depth-32 storages always got
+    /// `RgbaIdent` (pass-through), so an xRGB32 picture wrapping
+    /// a depth-32 storage with α=0 padding bytes sampled as
+    /// transparent.
+    #[test]
+    fn render_composite_swizzle_class_for_pict_format_xrgb32_is_no_alpha() {
+        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+
+        // pict_format=0 falls back to depth heuristic.
+        assert_eq!(
+            swizzle_class_for_pict_format(vk::Format::B8G8R8A8_UNORM, 24, 0),
+            SwizzleClass::BgraNoAlpha,
+        );
+        assert_eq!(
+            swizzle_class_for_pict_format(vk::Format::B8G8R8A8_UNORM, 32, 0),
+            SwizzleClass::RgbaIdent,
+        );
+
+        // xRGB32 on depth-32 storage → BgraNoAlpha (force α=ONE).
+        assert_eq!(
+            swizzle_class_for_pict_format(
+                vk::Format::B8G8R8A8_UNORM,
+                32,
+                RENDER_FMT_XRGB32,
+            ),
+            SwizzleClass::BgraNoAlpha,
+        );
+        // ARGB32 on depth-32 storage → RgbaIdent (use storage α).
+        assert_eq!(
+            swizzle_class_for_pict_format(
+                vk::Format::B8G8R8A8_UNORM,
+                32,
+                RENDER_FMT_ARGB32,
+            ),
+            SwizzleClass::RgbaIdent,
+        );
+        // RGB24 on depth-24 storage → BgraNoAlpha (already true via
+        // depth, preserved when pict_format aligns).
+        assert_eq!(
+            swizzle_class_for_pict_format(
+                vk::Format::B8G8R8A8_UNORM,
+                24,
+                RENDER_FMT_RGB24,
+            ),
+            SwizzleClass::BgraNoAlpha,
+        );
+        // R8 storage (A8 mask) is alpha-only regardless of pict_format.
+        assert_eq!(
+            swizzle_class_for_pict_format(vk::Format::R8_UNORM, 8, 0),
+            SwizzleClass::AlphaOnlyR8,
+        );
     }
 }
