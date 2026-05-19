@@ -101,6 +101,18 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         let _ = ctrl.send(crate::server::ReaderControl::Shutdown);
     }
 
+    // Audit #9 (docs/protocol-audit-2026-05-19.md) — before the
+    // disconnecting client's windows are destroyed, fire
+    // `XFixesSelectionNotify(SelectionClientClose)` to any subscriber
+    // whose mask includes the ClientClose bit, then clear those
+    // ownership entries. This must run BEFORE the destroy loop below
+    // because `fanout_xfixes_selection_client_close_for_client`
+    // resolves selection owners via `state.resources.window_owner`,
+    // and the destroy loop is about to evict those windows.
+    crate::core_loop::process_request::fanout_xfixes_selection_client_close_for_client(
+        state, client_id,
+    );
+
     let mut owned_roots: Vec<ResourceId> = Vec::new();
     state
         .resources

@@ -39,7 +39,7 @@ const XI2_FIRST_EVENT: u8 = 66; // matches Xorg: XI1 legacy events 66-82
 const XI2_FIRST_ERROR: u8 = 153;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
-const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
+pub(crate) const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
 const XFIXES_FIRST_ERROR: u8 = 154;
 
 const SHAPE_MAJOR_OPCODE: u8 = 141;

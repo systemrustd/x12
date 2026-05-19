@@ -1050,6 +1050,19 @@ fn destroy_window_subtree(
     state
         .composite_redirects
         .retain(|(window, _), _| !order.contains(window));
+    // Audit #9 — selections owned by any destroyed window in this
+    // subtree must fire `XFixesSelectionNotify(SelectionWindowDestroy)`
+    // and clear ownership (Xorg `xfixes/select.c` registers a
+    // `SelectionWindowDestroy` callback against the resource-delete
+    // path). MUST run before `destroy_window` drops the resource (so
+    // subscribers don't reference a half-destroyed window) and BEFORE
+    // `drop_window_subscriptions` (which clears xfixes_selection_masks
+    // entries owned by the destroyed window).
+    drop_selections_owned_by_windows(
+        state,
+        &order,
+        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_WINDOW_DESTROY,
+    );
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
 
@@ -10987,7 +11000,137 @@ fn handle_set_selection_owner(
             x11::encode_selection_clear_event(buf, seq, order, time_val, old_window, selection);
         });
     }
+
+    // Audit #9 (docs/protocol-audit-2026-05-19.md) — fire
+    // XFixesSelectionNotify(SetSelectionOwner) to every client that
+    // subscribed to this selection via `SelectSelectionInput` with
+    // the matching mask bit. Xorg fires this from
+    // `XFixesSelectionCallback` (`xfixes/select.c:158-210`) which
+    // is registered as a `SelectionCallback` against the core
+    // selection-mgmt code. Without it, clipboard managers wedge
+    // forever waiting for the "selection changed" signal.
+    fanout_xfixes_selection_notify(
+        state,
+        selection,
+        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_SET_OWNER,
+        window.0,
+        time_val,
+        time_val,
+    );
+
     Ok(RequestOutcome::Handled)
+}
+
+/// Audit #9 fanout helper — emits an `XFixesSelectionNotify` to every
+/// `SelectSelectionInput` subscription on this selection whose mask
+/// includes the matching subtype bit. Each subscription gets its own
+/// event (the `window` field carries the *subscriber's* window, not
+/// the owner's, per the X11 protocol).
+///
+/// `owner_window` is the new owner (or 0 = `None`). `timestamp` /
+/// `selection_timestamp` follow Xorg's
+/// `XFixesSelectionCallback` (`xfixes/select.c:158-210`): for the
+/// SetOwner subtype both equal the request's `time` argument; for
+/// WindowDestroy / ClientClose the timestamp is currentTime and
+/// selection_timestamp is the last-set time of the selection (which
+/// yserver doesn't currently track per-selection — we pass the same
+/// `timestamp` for both for now; refine if a clipboard manager turns
+/// out to gate on selection_timestamp).
+/// Audit #9 — for every selection whose owner is in `owned_windows`,
+/// fire `XFixesSelectionNotify(subtype)` to subscribers and clear the
+/// ownership entry. Used by both `destroy_window_subtree` (with
+/// `subtype = WindowDestroy`) and the client-disconnect path
+/// (with `subtype = ClientClose`).
+fn drop_selections_owned_by_windows(
+    state: &mut ServerState,
+    owned_windows: &[ResourceId],
+    subtype: u8,
+) {
+    let to_drop: Vec<AtomId> = state
+        .selections
+        .iter()
+        .filter_map(|(sel, owner)| {
+            if owned_windows.contains(owner) {
+                Some(*sel)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for sel in to_drop {
+        state.selections.remove(&sel);
+        // owner=0 (None) reflects the cleared ownership per the
+        // X11 spec for destroy/close notifies.
+        fanout_xfixes_selection_notify(state, sel, subtype, 0, 0, 0);
+    }
+}
+
+/// Audit #9 — client-disconnect cleanup: find every window the
+/// disconnecting client owns, check if any of them owns a selection,
+/// and fire `XFixesSelectionNotify(ClientClose)` + clear ownership.
+/// Reference: Xorg `xfixes/select.c`'s
+/// `SelectionClientClose` callback registered against
+/// `clientGoneSelectionRequest`.
+pub(crate) fn fanout_xfixes_selection_client_close_for_client(
+    state: &mut ServerState,
+    cid: ClientId,
+) {
+    let client_windows: Vec<ResourceId> = state
+        .selections
+        .values()
+        .copied()
+        .filter(|win| state.resources.window_owner(*win) == Some(cid))
+        .collect();
+    if client_windows.is_empty() {
+        return;
+    }
+    drop_selections_owned_by_windows(
+        state,
+        &client_windows,
+        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
+    );
+}
+
+fn fanout_xfixes_selection_notify(
+    state: &mut ServerState,
+    selection: AtomId,
+    subtype: u8,
+    owner_window: u32,
+    timestamp: u32,
+    selection_timestamp: u32,
+) {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+
+    let mask_bit = 1u32 << subtype;
+    // Snapshot matching subscriptions before mutating `state.clients`
+    // inside the fanout writer (which needs `&mut state`).
+    let matched: Vec<(ClientId, u32)> = state
+        .xfixes_selection_masks
+        .iter()
+        .filter_map(|((cid, win, sel), mask)| {
+            if *sel == selection && mask & mask_bit != 0 {
+                Some((ClientId(*cid), win.0))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (cid, subscriber_window) in matched {
+        let _dropped = fanout_event_to_clients(state, &[cid], |buf, seq, order| {
+            x11xfixes::encode_selection_notify_event(
+                buf,
+                order,
+                crate::nested::XFIXES_FIRST_EVENT,
+                subtype,
+                seq,
+                subscriber_window,
+                owner_window,
+                selection.0,
+                timestamp,
+                selection_timestamp,
+            );
+        });
+    }
 }
 
 fn handle_convert_selection(
@@ -13965,6 +14108,376 @@ mod tests {
             "DamageNotify.geometry must encode the window's CURRENT \
              root-relative position + extent; pre-fix this hardcodes \
              (0, 0, w, h) and breaks marco's screen-rect mapping",
+        );
+    }
+
+    /// Audit #9 (`docs/protocol-audit-2026-05-19.md`): when a client
+    /// takes ownership of a selection via core `SetSelectionOwner`, the
+    /// server must fire `XFixesSelectionNotify(SetSelectionOwner)` to
+    /// every client that has subscribed via `SelectSelectionInput` with
+    /// the matching mask bit. Without this, every clipboard manager
+    /// (klipper, copyq, gpaste, gnome-shell clipboard indicator) wedges
+    /// waiting for the event that says "the clipboard contents
+    /// changed". Xorg's `xfixes/select.c:158-210` `XFixesSelectionCallback`
+    /// is the reference.
+    #[test]
+    fn set_selection_owner_emits_xfixes_set_owner_notify_to_subscribers() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+
+        const CLIPBOARD_MGR: u32 = 7;
+        const APP: u32 = 9;
+        const SUBSCRIBER_WIN: u32 = 0x0070_0001;
+        const OWNER_WIN: u32 = 0x0090_0001;
+        const PRIMARY: u32 = 1; // X11 atom PRIMARY
+        const REQUEST_TIME: u32 = 0x1234_5678;
+
+        let mut state = ServerState::new();
+        // Clipboard manager: subscribes; we'll inspect its peer socket.
+        let mut peer = install_client(&mut state, CLIPBOARD_MGR);
+        // App: issues SetSelectionOwner (no peer needed).
+        let _app_peer = install_client(&mut state, APP);
+
+        // Subscribe clipboard mgr to PRIMARY's set-owner events on
+        // SUBSCRIBER_WIN. This is what `SelectSelectionInput` writes.
+        state.xfixes_selection_masks.insert(
+            (CLIPBOARD_MGR, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_SET_OWNER,
+        );
+
+        // SetSelectionOwner(window=OWNER_WIN, selection=PRIMARY, time=REQUEST_TIME)
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&REQUEST_TIME.to_le_bytes());
+        handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        // Drain clipboard mgr's socket and locate the XFixesSelectionNotify.
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let evt: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|evt| evt[0] == crate::nested::XFIXES_FIRST_EVENT)
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected XFixesSelectionNotify (type={}) in clipboard manager's stream; \
+                     got {} bytes: {:02x?}",
+                    crate::nested::XFIXES_FIRST_EVENT,
+                    all.len(),
+                    all,
+                )
+            });
+        assert_eq!(
+            evt[1],
+            x11xfixes::SELECTION_NOTIFY_SET_OWNER,
+            "subtype must be SetSelectionOwnerNotify (0)",
+        );
+        // Skip the 2-byte sequence and verify the payload (windows /
+        // selection / timestamps).
+        assert_eq!(
+            u32::from_le_bytes([evt[4], evt[5], evt[6], evt[7]]),
+            SUBSCRIBER_WIN,
+            "window field must be the subscriber's window",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]),
+            OWNER_WIN,
+            "owner field must be the new selection-owner window",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
+            PRIMARY,
+            "selection field must be the selection atom",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[16], evt[17], evt[18], evt[19]]),
+            REQUEST_TIME,
+            "timestamp must be the time arg from the SetSelectionOwner request",
+        );
+    }
+
+    /// Audit #9: when the window currently owning a selection is
+    /// destroyed, the server must fire
+    /// `XFixesSelectionNotify(SelectionWindowDestroy)` to every
+    /// subscribing client whose mask includes the WindowDestroy bit,
+    /// and clear the selection ownership in `state.selections`.
+    /// Reference: Xorg `xfixes/select.c:158-210` + the
+    /// `SelectionCallback`'s `SelectionWindowDestroy` branch.
+    #[test]
+    fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_ownership() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        const SUBSCRIBER_ID: u32 = 8;
+        const OWNER_ID: u32 = 10;
+        const SUBSCRIBER_WIN: u32 = 0x0080_0001;
+        const OWNER_WIN: u32 = 0x00a0_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER_ID);
+        let _ = install_client(&mut state, OWNER_ID);
+
+        // Create the owner window so DestroyWindow can find it.
+        state.resources.create_window(
+            ClientId(OWNER_ID),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        // PRIMARY currently owned by OWNER_WIN.
+        state
+            .selections
+            .insert(AtomId(PRIMARY), ResourceId(OWNER_WIN));
+
+        // Subscriber registered with WindowDestroy bit.
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_WINDOW_DESTROY,
+        );
+
+        // Destroy OWNER_WIN — should fire WindowDestroy notify + clear.
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        let mut backend = RecordingBackend::new();
+        handle_destroy_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(OWNER_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_destroy_window");
+
+        // Verify selection ownership cleared.
+        assert!(
+            !state.selections.contains_key(&AtomId(PRIMARY)),
+            "destroying the owning window must clear state.selections[PRIMARY]; \
+             got {:?}",
+            state.selections.get(&AtomId(PRIMARY)),
+        );
+
+        // Verify subscriber received the event.
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let evt: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|evt| {
+                evt[0] == crate::nested::XFIXES_FIRST_EVENT
+                    && evt[1] == x11xfixes::SELECTION_NOTIFY_WINDOW_DESTROY
+            })
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected XFixesSelectionNotify(WindowDestroy) on subscriber; \
+                     got {} bytes: {:02x?}",
+                    all.len(),
+                    all,
+                )
+            });
+        assert_eq!(
+            u32::from_le_bytes([evt[4], evt[5], evt[6], evt[7]]),
+            SUBSCRIBER_WIN,
+            "window field must be the subscriber's window",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]),
+            0,
+            "owner field must be None (0) after window-destroy",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
+            PRIMARY,
+            "selection field must be the cleared selection atom",
+        );
+    }
+
+    /// Audit #9: when a client disconnects while owning a selection,
+    /// the server must fire
+    /// `XFixesSelectionNotify(SelectionClientClose)` to every subscriber
+    /// whose mask includes the ClientClose bit, and drop the selection
+    /// ownership entry. Reference: Xorg
+    /// `xfixes/select.c:158-210`'s `SelectionClientClose` branch.
+    #[test]
+    fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_ownership() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const SUBSCRIBER_ID: u32 = 11;
+        const OWNER_ID: u32 = 12;
+        const SUBSCRIBER_WIN: u32 = 0x00b0_0001;
+        const OWNER_WIN: u32 = 0x00c0_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER_ID);
+        let _ = install_client(&mut state, OWNER_ID);
+
+        // OWNER_WIN belongs to OWNER_ID via window_owner mapping —
+        // `selection_owner_target_id` walks that mapping.
+        state.resources.create_window(
+            ClientId(OWNER_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .selections
+            .insert(AtomId(PRIMARY), ResourceId(OWNER_WIN));
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_CLIENT_CLOSE,
+        );
+
+        // Simulate client disconnect cleanup for OWNER_ID's selections.
+        fanout_xfixes_selection_client_close_for_client(&mut state, ClientId(OWNER_ID));
+
+        assert!(
+            !state.selections.contains_key(&AtomId(PRIMARY)),
+            "client disconnect must clear selections it owns",
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let evt: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|evt| {
+                evt[0] == crate::nested::XFIXES_FIRST_EVENT
+                    && evt[1] == x11xfixes::SELECTION_NOTIFY_CLIENT_CLOSE
+            })
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected XFixesSelectionNotify(ClientClose); \
+                     got {} bytes: {:02x?}",
+                    all.len(),
+                    all,
+                )
+            });
+        assert_eq!(
+            u32::from_le_bytes([evt[4], evt[5], evt[6], evt[7]]),
+            SUBSCRIBER_WIN,
+            "window field = subscriber",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]),
+            0,
+            "owner field = None on client-close",
+        );
+        assert_eq!(
+            u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
+            PRIMARY,
+            "selection field",
+        );
+    }
+
+    /// Audit #9: subscribing with mask=0 then re-subscribing with the
+    /// set-owner bit, the FIRST owner-change must still emit (verifies
+    /// the mask-bit gate, not the presence of the subscription key).
+    #[test]
+    fn set_selection_owner_skips_subscribers_whose_mask_excludes_set_owner() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+
+        const SUBSCRIBER: u32 = 5;
+        const APP: u32 = 6;
+        const SUBSCRIBER_WIN: u32 = 0x0050_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER);
+        let _ = install_client(&mut state, APP);
+
+        // Subscribe with a mask that does NOT include SET_OWNER —
+        // only WINDOW_DESTROY. SetSelectionOwner must NOT fire for
+        // this subscription.
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_WINDOW_DESTROY,
+        );
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&0x0090_0001u32.to_le_bytes()); // owner window
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !all.chunks_exact(32)
+                .any(|evt| evt[0] == crate::nested::XFIXES_FIRST_EVENT),
+            "no XFixesSelectionNotify expected when subscriber's mask excludes \
+             SET_OWNER; got {} bytes: {:02x?}",
+            all.len(),
+            all,
         );
     }
 

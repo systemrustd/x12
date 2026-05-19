@@ -31,6 +31,18 @@ pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
 
+// XFixesSelectionNotify subtypes (Xorg `xfixes/select.c`).
+pub const SELECTION_NOTIFY_SET_OWNER: u8 = 0;
+pub const SELECTION_NOTIFY_WINDOW_DESTROY: u8 = 1;
+pub const SELECTION_NOTIFY_CLIENT_CLOSE: u8 = 2;
+
+// XFixesSelectionNotify event-mask bits — passed by the client to
+// `SelectSelectionInput` and matched against subtypes when fanning
+// the event out. One bit per subtype.
+pub const SELECTION_MASK_SET_OWNER: u32 = 1 << SELECTION_NOTIFY_SET_OWNER;
+pub const SELECTION_MASK_WINDOW_DESTROY: u32 = 1 << SELECTION_NOTIFY_WINDOW_DESTROY;
+pub const SELECTION_MASK_CLIENT_CLOSE: u32 = 1 << SELECTION_NOTIFY_CLIENT_CLOSE;
+
 // Mutter/muffin refuses to start as a WM unless XFIXES advertises >= 5.0
 // (`Window manager error: Mutter requires XFixes 5.0`). QueryVersion echoes
 // min(client, server) per axis, so older clients still negotiate down.
@@ -311,6 +323,37 @@ pub fn parse_rectangles(mut bytes: &[u8]) -> Vec<RegionRect> {
     rects
 }
 
+/// `XFixesSelectionNotify` event (subtype 0 = SetSelectionOwner,
+/// 1 = SelectionWindowDestroy, 2 = SelectionClientClose).
+///
+/// 32-byte fixed event per Xorg `xfixes/xfixesint.h`. `first_event`
+/// is the dynamically-allocated XFIXES base event code (yserver
+/// uses 87 for XFixesSelectionNotify, 88 for XFixesCursorNotify —
+/// matches Xorg's `XFixesNumberEvents` layout).
+pub fn encode_selection_notify_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    first_event: u8,
+    subtype: u8,
+    seq: SequenceNumber,
+    window: u32,
+    owner: u32,
+    selection: u32,
+    timestamp: u32,
+    selection_timestamp: u32,
+) {
+    out.push(first_event); // type = first_event + 0
+    out.push(subtype);
+    write_u16(order, out, seq.0);
+    write_u32(order, out, window);
+    write_u32(order, out, owner);
+    write_u32(order, out, selection);
+    write_u32(order, out, timestamp);
+    write_u32(order, out, selection_timestamp);
+    out.extend_from_slice(&[0u8; 8]); // pad to 32
+    debug_assert_eq!(out.len(), 32);
+}
+
 #[must_use]
 pub fn encode_query_version_reply(
     byte_order: ClientByteOrder,
@@ -551,6 +594,86 @@ mod tests {
         // Mutter/muffin bails with `Window manager error: Mutter requires
         // XFixes 5.0` if the negotiated major version is below 5.
         const { assert!(MAJOR_VERSION >= 5) }
+    }
+
+    /// XFixesSelectionNotify wire format (Xorg `xfixes/xfixesint.h`'s
+    /// `xXFixesSelectionNotifyEvent` and `xfixes/select.c:158-210`):
+    ///   type=first_event+0 (87), subtype, sequence,
+    ///   window, owner, selection, timestamp, selection_timestamp,
+    ///   12 bytes pad → 32 bytes total.
+    ///
+    /// Test fixes `first_event = 87` per yserver's XFIXES_FIRST_EVENT
+    /// (matches Xorg's allocation for SYNC=83-86, XFIXES=87-88).
+    #[test]
+    fn selection_notify_set_owner_encodes_full_event() {
+        let mut out = Vec::new();
+        encode_selection_notify_event(
+            &mut out,
+            ClientByteOrder::LittleEndian,
+            87, // first_event base for XFIXES
+            SELECTION_NOTIFY_SET_OWNER,
+            SequenceNumber(0x1234),
+            0xaabb_ccdd, // window (subscriber)
+            0x1122_3344, // owner (new)
+            0x5566_7788, // selection
+            0xdead_beef, // timestamp
+            0xcafe_babe, // selection_timestamp
+        );
+        assert_eq!(out.len(), 32, "XFixes events are fixed 32 bytes");
+        assert_eq!(out[0], 87, "type = first_event + 0 (SelectionNotify)");
+        assert_eq!(out[1], 0, "subtype = SetSelectionOwnerNotify (0)");
+        assert_eq!(&out[2..4], &0x1234u16.to_le_bytes(), "sequence");
+        assert_eq!(&out[4..8], &0xaabb_ccddu32.to_le_bytes(), "window");
+        assert_eq!(&out[8..12], &0x1122_3344u32.to_le_bytes(), "owner");
+        assert_eq!(&out[12..16], &0x5566_7788u32.to_le_bytes(), "selection");
+        assert_eq!(&out[16..20], &0xdead_beefu32.to_le_bytes(), "timestamp");
+        assert_eq!(
+            &out[20..24],
+            &0xcafe_babeu32.to_le_bytes(),
+            "selection_timestamp",
+        );
+        assert_eq!(&out[24..32], &[0u8; 8], "tail padding to 32 bytes");
+    }
+
+    /// Subtype byte routes between SetOwner / WindowDestroy /
+    /// ClientClose; the rest of the wire is identical.
+    #[test]
+    fn selection_notify_subtype_byte_routes_three_variants() {
+        for subtype in [
+            SELECTION_NOTIFY_SET_OWNER,
+            SELECTION_NOTIFY_WINDOW_DESTROY,
+            SELECTION_NOTIFY_CLIENT_CLOSE,
+        ] {
+            let mut out = Vec::new();
+            encode_selection_notify_event(
+                &mut out,
+                ClientByteOrder::LittleEndian,
+                87,
+                subtype,
+                SequenceNumber(1),
+                1,
+                2,
+                3,
+                4,
+                5,
+            );
+            assert_eq!(out[1], subtype, "subtype byte = {subtype}");
+            assert_eq!(out[0], 87, "type stays first_event+0 across subtypes");
+        }
+    }
+
+    /// Mask bits pair with subtype values (bit N = subtype N).
+    #[test]
+    fn selection_mask_bits_align_with_subtypes() {
+        assert_eq!(SELECTION_MASK_SET_OWNER, 1 << SELECTION_NOTIFY_SET_OWNER);
+        assert_eq!(
+            SELECTION_MASK_WINDOW_DESTROY,
+            1 << SELECTION_NOTIFY_WINDOW_DESTROY,
+        );
+        assert_eq!(
+            SELECTION_MASK_CLIENT_CLOSE,
+            1 << SELECTION_NOTIFY_CLIENT_CLOSE,
+        );
     }
 
     #[test]
