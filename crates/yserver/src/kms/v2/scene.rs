@@ -1395,8 +1395,8 @@ fn emit_window_subtree(
             // GTK/marco CSD frames lose their inner widgets (per audit
             // #3 / Control Center missing-widget reports).
             let has_own_redirected_target = source_id != id;
-            let paint_target_is_self = has_own_redirected_target
-                || (d_part && !under_redirected_ancestor);
+            let paint_target_is_self =
+                has_own_redirected_target || (d_part && !under_redirected_ancestor);
 
             // Project onto output-local coords (computed once here so
             // both the SKIP=no_intersect and WILL_EMIT trace lines can
@@ -1601,8 +1601,7 @@ fn emit_window_subtree(
         .lookup(host_xid)
         .and_then(|id| store.redirected_target(id))
         .is_some();
-    let child_under_redirected_ancestor =
-        under_redirected_ancestor || self_owns_redirected_target;
+    let child_under_redirected_ancestor = under_redirected_ancestor || self_owns_redirected_target;
 
     // Recurse into mapped descendants in stable sibling stack order.
     let mut children: Vec<(u32, u64)> = windows_v2
@@ -2954,10 +2953,7 @@ mod tests {
         );
         // The "must not leak" property — child's draw entry must NOT appear.
         assert!(
-            !scene
-                .draws
-                .iter()
-                .any(|d| d.dst_origin == [111.0, 241.0]),
+            !scene.draws.iter().any(|d| d.dst_origin == [111.0, 241.0]),
             "non-redirected child of Manual-redirected ancestor leaked into scene.draws: {:?}",
             scene.draws,
         );

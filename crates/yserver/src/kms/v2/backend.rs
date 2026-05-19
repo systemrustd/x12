@@ -5675,6 +5675,66 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    /// Audit #8 (2026-05-19) — store the drawable-space origin of
+    /// the wrapped surface on the picture record. The protocol
+    /// layer calls this right after `render_create_picture` with
+    /// the parent-relative `(x, y)` of a window-backed drawable
+    /// (process_request.rs:1153). Pre-fix v2 inherited the trait
+    /// default no-op so `drawable_origin` stayed at the
+    /// `drawable_default` `(0, 0)` — clips on CSD-frame-child
+    /// pictures couldn't translate external region geometry into
+    /// picture-local coords.
+    ///
+    /// Non-Drawable picture variants (SolidFill / Linear /
+    /// Radial gradient) have no drawable to anchor — tolerated
+    /// no-op so the caller doesn't need to discriminate at the
+    /// call site.
+    fn set_picture_drawable_origin(&mut self, host_pic: u32, origin: (i16, i16)) {
+        if let Some(PictureRecord::Drawable {
+            drawable_origin, ..
+        }) = self.core.pictures.get_mut(&host_pic)
+        {
+            *drawable_origin = origin;
+        }
+    }
+
+    /// Audit #8 (2026-05-19) — return the picture's `clientClip` for
+    /// `CreateRegionFromPicture` (XFixes). Outer `Option` distinguishes
+    /// "picture doesn't carry a clientClip at all" (Solidfill /
+    /// gradient → `None`, dispatcher emits BadMatch) from "picture
+    /// exists and we know its clip state" (Drawable → `Some(_)`).
+    /// Inner `Option` distinguishes "no clip set yet" (`Some(None)`,
+    /// also BadMatch per X11 spec — can't extract a region from a
+    /// picture with no clip) from "clip set" (`Some(Some(rects))`,
+    /// returned as the region's rects).
+    ///
+    /// Pre-fix v2 inherited the trait default `None` so EVERY
+    /// `CreateRegionFromPicture` call returned BadMatch — even for
+    /// pictures with legitimate clipped state. Visible in clipboard
+    /// managers / window managers that use this XFixes path.
+    fn picture_client_clip_rects(
+        &mut self,
+        host_pic: u32,
+    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+        let record = self.core.pictures.get(&host_pic)?;
+        match record {
+            PictureRecord::Drawable { clip, .. } => Some(clip.as_ref().map(|rects| {
+                rects
+                    .iter()
+                    .map(|r| yserver_protocol::x11::xfixes::RegionRect {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect()
+            })),
+            PictureRecord::SolidFill { .. }
+            | PictureRecord::LinearGradient { .. }
+            | PictureRecord::RadialGradient { .. } => None,
+        }
+    }
+
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
@@ -7719,20 +7779,19 @@ fn compute_render_composite_clip(
     mask_clip: Option<&[Rectangle16]>,
     mask_translation: (i32, i32),
 ) -> Option<Vec<Rectangle16>> {
-    let src_in_dst = src_clip.map(|c| translate_clip_rects(c, src_translation.0, src_translation.1));
+    let src_in_dst =
+        src_clip.map(|c| translate_clip_rects(c, src_translation.0, src_translation.1));
     let mask_in_dst =
         mask_clip.map(|c| translate_clip_rects(c, mask_translation.0, mask_translation.1));
     // Start with whichever input is Some, then fold the remaining
     // Some-inputs via intersection. Order doesn't matter — list
     // intersection is associative & commutative.
     let mut acc: Option<Vec<Rectangle16>> = None;
-    let mut fold = |next: Option<Vec<Rectangle16>>| {
-        match (acc.take(), next) {
-            (None, None) => {}
-            (None, Some(v)) => acc = Some(v),
-            (Some(a), None) => acc = Some(a),
-            (Some(a), Some(b)) => acc = Some(intersect_clip_lists(&a, &b)),
-        }
+    let mut fold = |next: Option<Vec<Rectangle16>>| match (acc.take(), next) {
+        (None, None) => {}
+        (None, Some(v)) => acc = Some(v),
+        (Some(a), None) => acc = Some(a),
+        (Some(a), Some(b)) => acc = Some(intersect_clip_lists(&a, &b)),
     };
     fold(dst_clip.map(<[Rectangle16]>::to_vec));
     fold(src_in_dst);
@@ -8470,6 +8529,234 @@ mod tests {
             }
             _ => panic!("not Drawable"),
         }
+    }
+
+    // ─── Audit #8 (2026-05-19): set_picture_drawable_origin +
+    // picture_client_clip_rects v2 backend hooks ──────────────
+
+    /// `set_picture_drawable_origin` writes into the
+    /// `PictureRecord::Drawable.drawable_origin` field. Pre-fix v2
+    /// inherited the trait default no-op so the field stayed at
+    /// (0, 0); window-backed pictures whose drawable sits at a
+    /// non-zero parent offset couldn't translate external region
+    /// geometry back into picture-local coords.
+    #[test]
+    fn v2_set_picture_drawable_origin_persists_on_record() {
+        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA01_BB01).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Pre-call sanity: default origin must be (0, 0).
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable {
+                drawable_origin, ..
+            } => assert_eq!(*drawable_origin, (0, 0)),
+            _ => panic!("not Drawable"),
+        }
+
+        b.set_picture_drawable_origin(pic_xid, (15, 27));
+
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable {
+                drawable_origin, ..
+            } => {
+                assert_eq!(
+                    *drawable_origin,
+                    (15, 27),
+                    "drawable_origin must update; pre-fix the trait default \
+                     no-op left it at (0, 0)",
+                );
+            }
+            _ => panic!("not Drawable"),
+        }
+    }
+
+    /// `set_picture_drawable_origin` on a non-Drawable picture
+    /// (SolidFill / gradient) is a tolerated no-op — those variants
+    /// have no drawable to anchor to.
+    #[test]
+    fn v2_set_picture_drawable_origin_no_op_on_solidfill() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        // Color is fixed-size 8 bytes (BGRA u16×4).
+        let mut color = [0u8; 8];
+        color[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes()); // R
+        color[6..8].copy_from_slice(&0xFFFF_u16.to_le_bytes()); // A
+        let pic = b
+            .render_create_solid_fill(None, color)
+            .expect("create solid fill")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Should not panic; record must remain a SolidFill.
+        b.set_picture_drawable_origin(pic_xid, (10, 20));
+        assert!(
+            matches!(
+                b.core.pictures.get(&pic_xid),
+                Some(PictureRecord::SolidFill { .. })
+            ),
+            "SolidFill picture must remain SolidFill after \
+             set_picture_drawable_origin no-op",
+        );
+    }
+
+    /// `picture_client_clip_rects` on a Drawable picture WITH a
+    /// clip returns `Some(Some(rects))` — those rects feed
+    /// `CreateRegionFromPicture` (XFixes). Pre-fix v2 inherited
+    /// the trait default `None`, making CreateRegionFromPicture
+    /// always return BadMatch even for legitimate clipped pictures.
+    #[test]
+    fn v2_picture_client_clip_rects_returns_set_clip() {
+        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA02_BB02).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Install a 2-rect client clip via SetPictureClipRectangles
+        // (clip-origin both zero so stored rects == request rects).
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&0_i16.to_le_bytes()); // x_origin
+        body.extend_from_slice(&0_i16.to_le_bytes()); // y_origin
+        for (x, y, w, h) in [(0_i16, 0_i16, 10_u16, 10_u16), (100, 200, 30, 40)] {
+            body.extend_from_slice(&x.to_le_bytes());
+            body.extend_from_slice(&y.to_le_bytes());
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+        }
+        b.render_set_picture_clip_rectangles(None, pic_xid, &body)
+            .expect("set_clip");
+
+        let got = b
+            .picture_client_clip_rects(pic_xid)
+            .expect("Drawable picture must be Some(_) (not BadMatch)");
+        let rects = got.expect("clip was set, expected Some(rects)");
+        assert_eq!(rects.len(), 2, "got {rects:?}");
+        assert_eq!(
+            (rects[0].x, rects[0].y, rects[0].width, rects[0].height),
+            (0, 0, 10, 10)
+        );
+        assert_eq!(
+            (rects[1].x, rects[1].y, rects[1].width, rects[1].height),
+            (100, 200, 30, 40)
+        );
+    }
+
+    /// Non-zero drawable origins must not corrupt `CreateRegionFromPicture`.
+    /// The request path stores the origin separately, but the returned client
+    /// clip still needs to reflect the picture-local rectangle coordinates
+    /// only.
+    #[test]
+    fn v2_picture_client_clip_rects_window_backed_picture_with_nonzero_origin() {
+        use yserver_core::backend::{AnyHandle, Backend, WindowHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let window_xid = 0xAA04_BB04;
+        let _w_id = seed_window(&mut b, window_xid, None, 15, 27);
+
+        let pic = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(window_xid).expect("WindowHandle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Mirror the request-layer origin bookkeeping that happens on CreatePicture.
+        b.set_picture_drawable_origin(pic_xid, (15, 27));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&5_i16.to_le_bytes()); // clip origin x
+        body.extend_from_slice(&9_i16.to_le_bytes()); // clip origin y
+        body.extend_from_slice(&1_i16.to_le_bytes());
+        body.extend_from_slice(&2_i16.to_le_bytes());
+        body.extend_from_slice(&7_u16.to_le_bytes());
+        body.extend_from_slice(&11_u16.to_le_bytes());
+        b.render_set_picture_clip_rectangles(None, pic_xid, &body)
+            .expect("set_clip");
+
+        let got = b
+            .picture_client_clip_rects(pic_xid)
+            .expect("Drawable picture must be Some(_) (not BadMatch)");
+        let rects = got.expect("clip was set, expected Some(rects)");
+        assert_eq!(rects.len(), 1, "got {rects:?}");
+        assert_eq!(
+            (rects[0].x, rects[0].y, rects[0].width, rects[0].height),
+            (6, 11, 7, 11),
+            "drawable_origin must not be folded into CreateRegionFromPicture",
+        );
+    }
+
+    /// `picture_client_clip_rects` on a Drawable picture with NO
+    /// clip set returns `Some(None)` — the picture exists but has
+    /// no clientClip yet. Per X RENDER /
+    /// `xfixes/region.c:CreateRegionFromPicture`, the dispatcher
+    /// then emits BadMatch on the caller (no region to extract).
+    #[test]
+    fn v2_picture_client_clip_rects_returns_some_none_when_no_clip_set() {
+        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA03_BB03).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        let got = b.picture_client_clip_rects(pic_xid);
+        assert!(
+            matches!(got, Some(None)),
+            "Drawable picture without a clip must return Some(None) — \
+             got {got:?}",
+        );
+    }
+
+    /// `picture_client_clip_rects` on a non-Drawable picture (e.g.,
+    /// SolidFill) returns the outer `None` so the protocol layer
+    /// raises BadMatch — gradients/solidfills carry no
+    /// `clientClip`. Mirrors Xorg's `CreateRegionFromPicture` →
+    /// BadPicture path for sourceless pictures.
+    #[test]
+    fn v2_picture_client_clip_rects_outer_none_on_solidfill() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut color = [0u8; 8];
+        color[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        color[6..8].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        let pic = b
+            .render_create_solid_fill(None, color)
+            .expect("create solid fill")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        let got = b.picture_client_clip_rects(pic_xid);
+        assert!(
+            got.is_none(),
+            "SolidFill picture must return outer None so the protocol \
+             layer emits BadMatch — got {got:?}",
+        );
     }
 
     // ─── Stage 3d: render_composite_glyphs tests ───────────────
