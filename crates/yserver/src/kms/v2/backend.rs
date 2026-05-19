@@ -835,125 +835,113 @@ impl KmsBackendV2 {
         })
     }
 
-    /// Stage 4b.5 — seed the backing `b_id` with W's content and
-    /// each of W's mapped-or-unmapped descendants' content at the
-    /// descendant's accumulated `(x, y)` position relative to W.
-    /// Mirrors Xorg's behaviour at `composite/compalloc.c:556`.
+    /// Audit #6 (2026-05-19) — Xorg parity rewrite. The old
+    /// "copy W's own storage + DFS-walk descendants" model
+    /// (Stage 4b.5) preserved any pre-redirect paint on W, but
+    /// freshly-mapped windows that hit redirect activation
+    /// before their first paint seeded B with W's default-init
+    /// colour (opaque black on depth-24, transparent on
+    /// depth-32) — visible as the recurring "black band on map"
+    /// symptom and called out by the 2026-05-19 protocol audit.
     ///
-    /// Called by `allocate_redirected_backing` BEFORE the route
-    /// flip so the copies read each window's own storage (not
-    /// post-redirect routed storage). Skips windows whose storage
-    /// isn't in the store (the protocol error case is logged in
-    /// the caller) and zero-extent storage (defensive — fresh
-    /// storage with 0×0 isn't useful as a copy source).
+    /// Replaced with Xorg's `compNewPixmap`
+    /// (composite/compalloc.c:541-606) semantics: copy from
+    /// W's PARENT at the source offset
+    /// `(W.x - parent.x, W.y - parent.y)` to B at `(0, 0)`.
+    /// This gives the compositor / direct-emit scene-walk
+    /// continuity with what was on-screen before W appeared.
+    /// The W's own (default-init) content is not preserved;
+    /// W's first client paint fills B via `resolve_paint_target`
+    /// routing afterwards.
     ///
-    /// The walk is depth-first and bounded by tree depth at
-    /// activation time only; this is the one-shot cost the plan's
-    /// Cross-cutting §"Per-hierarchy redirect" decision called
-    /// out as acceptable.
-    fn seed_backing_from_window(
+    /// Skipped when:
+    /// - W has no parent in `windows_v2` (root or untracked).
+    /// - Parent's storage isn't in the store (pixmap-as-W
+    ///   activation path used by tests; falls back to leaving
+    ///   B at its default-init zero-fill).
+    /// - Parent's storage extent is zero.
+    ///
+    /// `IncludeInferiors`-equivalent semantics (parent's siblings
+    /// of W contributing where they overlap W's screen position)
+    /// are deferred: yserver's parent storage already includes
+    /// most of that content via the normal paint flow for
+    /// non-compositor cases, and the Stage 4d compositor-floor
+    /// scene-walk presents siblings directly.
+    fn seed_backing_from_parent(
         &mut self,
         w_xid: u32,
-        w_id: crate::kms::v2::store::DrawableId,
         b_id: crate::kms::v2::store::DrawableId,
     ) {
-        // Diagnostic trace (TEMP) — seed entry. Cross-correlate
-        // with `allocate_redirected_backing fresh ...` and the
-        // "B is all-black" dump: a seed that copies an empty W
-        // (= W's storage is its default init color) leaves B
-        // in its default state, which is exactly the symptom.
-        log::debug!("v2 seed_backing_from_window W=0x{w_xid:x} w_id={w_id:?} b_id={b_id:?}");
-        // 1. W itself at (0, 0).
-        let w_extent = self
+        let Some(w_geom) = self.windows_v2.get(&w_xid).copied() else {
+            log::debug!(
+                "v2 seed_backing_from_parent W=0x{w_xid:x}: not in windows_v2; skip seed"
+            );
+            return;
+        };
+        let Some(parent_xid) = w_geom.parent else {
+            log::debug!(
+                "v2 seed_backing_from_parent W=0x{w_xid:x}: no parent (root or untracked); skip seed"
+            );
+            return;
+        };
+        // Resolve parent's effective storage. If parent is itself
+        // redirected, its `redirected_target` (B') holds the
+        // currently-visible pixels; if not, parent's own storage
+        // does. `resolve_paint_target` does the chain walk.
+        let Some(parent_target) = self.resolve_paint_target(parent_xid) else {
+            log::debug!(
+                "v2 seed_backing_from_parent W=0x{w_xid:x}: parent 0x{parent_xid:x} has no paint target; skip seed"
+            );
+            return;
+        };
+        let parent_extent = self
             .store
-            .get(w_id)
+            .get(parent_target.id)
             .map(|d| d.storage.extent)
             .unwrap_or_default();
-        if w_extent.width != 0 && w_extent.height != 0 {
-            let src_rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: w_extent,
-            };
-            if let Err(e) = self.engine.copy_area(
-                &mut self.store,
-                &mut self.platform,
-                w_id,
-                b_id,
-                src_rect,
-                ash::vk::Offset2D::default(),
-            ) {
-                log::warn!(
-                    "v2 seed_backing_from_window(0x{w_xid:x}): root copy_area failed: {e:?}",
-                );
-            } else {
-                self.telemetry.record_paint_submit();
-            }
+        if parent_extent.width == 0 || parent_extent.height == 0 {
+            log::debug!(
+                "v2 seed_backing_from_parent W=0x{w_xid:x}: parent storage zero-extent; skip seed"
+            );
+            return;
         }
-
-        // 2. Walk descendants in sibling stack order. Collect to a
-        // Vec first to release the borrow on `windows_v2` before we
-        // call into the engine (which takes `&mut self.store`).
-        //
-        // Each Vec entry is (descendant_xid, descendant_x_in_W,
-        // descendant_y_in_W). The walk is a manual stack-driven DFS
-        // over `windows_v2.parent`. Children are visited in ascending
-        // `stack_rank` so the seed-copy reproduces the same bottom→top
-        // overwrite order the scene uses for overlapping siblings.
-        let mut to_seed: Vec<(u32, i32, i32)> = Vec::new();
-        let mut frontier: Vec<(u32, i32, i32)> = vec![(w_xid, 0, 0)];
-        while let Some((parent_xid, parent_dx, parent_dy)) = frontier.pop() {
-            let mut children: Vec<(u32, u64, i32, i32)> = self
-                .windows_v2
-                .iter()
-                .filter_map(|(xid, geom)| {
-                    (geom.parent == Some(parent_xid)).then_some((
-                        *xid,
-                        geom.stack_rank,
-                        parent_dx + i32::from(geom.x),
-                        parent_dy + i32::from(geom.y),
-                    ))
-                })
-                .collect();
-            children.sort_by_key(|(_, rank, _, _)| *rank);
-            for (xid, _, abs_x, abs_y) in &children {
-                to_seed.push((*xid, *abs_x, *abs_y));
-            }
-            for (xid, _, abs_x, abs_y) in children.into_iter().rev() {
-                frontier.push((xid, abs_x, abs_y));
-            }
-        }
-        for (desc_xid, abs_x, abs_y) in to_seed {
-            let Some(desc_id) = self.store.lookup(desc_xid) else {
-                continue;
-            };
-            let desc_extent = self
-                .store
-                .get(desc_id)
-                .map(|d| d.storage.extent)
-                .unwrap_or_default();
-            if desc_extent.width == 0 || desc_extent.height == 0 {
-                continue;
-            }
-            let src_rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: desc_extent,
-            };
-            let dst_pos = ash::vk::Offset2D { x: abs_x, y: abs_y };
-            if let Err(e) = self.engine.copy_area(
-                &mut self.store,
-                &mut self.platform,
-                desc_id,
-                b_id,
-                src_rect,
-                dst_pos,
-            ) {
-                log::warn!(
-                    "v2 seed_backing_from_window(0x{w_xid:x}): descendant 0x{desc_xid:x} \
-                     copy_area at ({abs_x}, {abs_y}) failed: {e:?}",
-                );
-            } else {
-                self.telemetry.record_paint_submit();
-            }
+        // Source rect on parent: W's position in parent's drawable
+        // space, clamped to parent's extent. parent_target.offset is
+        // already W's accumulated offset into parent's storage when
+        // parent is redirected through an ancestor — we add W's own
+        // (x, y) within parent on top.
+        let src_x = parent_target.offset.0 + i32::from(w_geom.x);
+        let src_y = parent_target.offset.1 + i32::from(w_geom.y);
+        let src_rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: src_x.max(0),
+                y: src_y.max(0),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(w_geom.width),
+                height: u32::from(w_geom.height),
+            },
+        };
+        let dst_pos = ash::vk::Offset2D { x: 0, y: 0 };
+        log::debug!(
+            "v2 seed_backing_from_parent W=0x{w_xid:x} parent=0x{parent_xid:x} \
+             src=({src_x},{src_y} {w}x{h}) → B@(0,0)",
+            w = w_geom.width,
+            h = w_geom.height,
+        );
+        if let Err(e) = self.engine.copy_area(
+            &mut self.store,
+            &mut self.platform,
+            parent_target.id,
+            b_id,
+            src_rect,
+            dst_pos,
+        ) {
+            log::warn!(
+                "v2 seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",
+            );
+        } else {
+            self.telemetry.record_paint_submit();
         }
     }
 
@@ -3832,23 +3820,34 @@ impl Backend for KmsBackendV2 {
             "v2 allocate_redirected_backing W=0x{w_xid:x}: fresh B=0x{backing_xid:x} ({width}x{height}, depth={depth})",
         );
 
-        // Seed-copy: W → B (and every descendant of W into B at
-        // its position relative to W), BEFORE the route flip.
-        // Both ids are raw `DrawableId`s so the copies do NOT
-        // consult `resolve_paint_target` (which would B→B no-op
-        // once the route flip lands below). W must already exist
-        // in the store; if not, that's a protocol error upstream
-        // — log and skip the seed but keep going so the redirect
-        // record still installs.
-        if let (Some(w_id), Some(b_id)) = (self.store.lookup(w_xid), self.store.lookup(backing_xid))
-        {
-            self.seed_backing_from_window(w_xid, w_id, b_id);
+        // Seed-copy: parent → B at W's position, BEFORE the route
+        // flip. Audit #6 (2026-05-19) flipped this from "W → B (+
+        // descendants)" to "parent → B" per Xorg's compNewPixmap
+        // (composite/compalloc.c:541-606). Parent's resolve_paint_target
+        // gives the storage holding parent's currently-visible pixels
+        // (parent's own storage if non-redirected, parent's B if
+        // chain-redirected). W's own pre-redirect storage is now
+        // ignored — its content was default-init for the
+        // newly-mapped-W case (the "black band on map" symptom) and
+        // any pre-paint content lands in B post-flip via the normal
+        // resolve_paint_target routing on the next client paint.
+        if let Some(b_id) = self.store.lookup(backing_xid) {
+            self.seed_backing_from_parent(w_xid, b_id);
             // Now flip routing — after this, paint against W
-            // resolves to B via `resolve_paint_target`.
-            self.store.set_redirected_target(w_id, Some(b_id));
+            // resolves to B via `resolve_paint_target`. The w_id
+            // lookup must still succeed; if not, the redirect
+            // record stays uninstalled (protocol error upstream).
+            if let Some(w_id) = self.store.lookup(w_xid) {
+                self.store.set_redirected_target(w_id, Some(b_id));
+            } else {
+                log::warn!(
+                    "v2 allocate_redirected_backing(0x{w_xid:x}): window not in store \
+                     (seed succeeded, route flip skipped)",
+                );
+            }
         } else {
             log::warn!(
-                "v2 allocate_redirected_backing(0x{w_xid:x}): window or backing not in store \
+                "v2 allocate_redirected_backing(0x{w_xid:x}): backing not in store \
                  (seed + route flip skipped)",
             );
         }

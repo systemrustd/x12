@@ -1882,63 +1882,24 @@ fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
     );
 }
 
-/// Plan §4b cross-cutting "Initial backing content": the backing
-/// captures W's pre-redirect contents (BEFORE
-/// `set_redirected_target` flips routing). Otherwise compositors
-/// that don't repaint immediately on first DamageNotify see a
-/// blank backing.
+/// Audit #6 (2026-05-19) — Xorg parity. `compNewPixmap`
+/// (composite/compalloc.c:541-606) seeds the backing pixmap from
+/// the PARENT's storage at W's position (with IncludeInferiors),
+/// NOT from W's own storage. This is the fix for the recurring
+/// "black band on map" symptom: a freshly mapped window that's
+/// redirected on map has a default-init (opaque black or
+/// transparent) storage; copying that into B would show black
+/// where W is until the client's first paint. Seeding from the
+/// parent shows continuity with what was on-screen before W
+/// appeared.
 ///
-/// Test: paint a recognisable colour into W, then activate the
-/// redirect, then GetImage the backing. The backing must read as
-/// W's seeded colour, NOT zero / undefined.
+/// Repro: paint root red at the W-footprint area; create W as a
+/// child of root with NO paint of its own; activate redirect.
+/// The backing must read red — parent's pixels at W's position —
+/// NOT W's default-init colour.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
-fn v2_redirect_seed_copies_window_content() {
-    use yserver_core::backend::WindowHandle;
-
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
-    };
-    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
-    let w = WindowHandle::from_raw(w_xid).unwrap();
-    // Pre-fill W with red so the seed has something to copy.
-    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 8, 8)
-        .expect("seed W red");
-
-    let backing = b
-        .allocate_redirected_backing(None, w, 8, 8, 32)
-        .expect("allocate must succeed");
-    let bxid = backing.as_raw();
-
-    let img = b
-        .get_image_pixels_for_tests(bxid, 2, 0, 0, 8, 8, !0)
-        .expect("get_image")
-        .expect("Some bytes");
-    assert_eq!(
-        &img[..4],
-        &[0x00, 0x00, 0xFF, 0xFF],
-        "backing's (0,0) must be red — seeded from W BEFORE \
-         set_redirected_target flipped routing (got {:?})",
-        &img[..4],
-    );
-}
-
-/// Plan §4b cross-cutting "Initial backing content" + "Per-
-/// hierarchy redirect": descendants of W also have their content
-/// copied into B at their position relative to W. Mirrors Xorg
-/// `composite/compalloc.c:556`.
-///
-/// Repro: parent W (16×16) red; child C (8×8) at (3, 4) inside W
-/// blue. Activate redirect on W. The backing must show red
-/// everywhere except the C-region at (3, 4)..(11, 12), which is
-/// blue. Pre-4b.5 (only W is seeded): the C-region reads red.
-#[test]
-#[ignore = "needs live Vulkan ICD"]
-fn v2_redirect_seed_copies_descendants() {
+fn v2_redirect_seed_uses_parent_content_at_w_position() {
     use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
@@ -1948,35 +1909,21 @@ fn v2_redirect_seed_copies_descendants() {
             return;
         }
     };
-
-    // Top-level W under root, 16×16, depth-32.
     let root = WindowHandle::from_raw(1).expect("root");
+    let root_xid = root.as_raw();
+
+    // Paint a known red into the root at the area that W will cover.
+    // We paint a 16×16 region from (5, 7) so it strictly contains W
+    // (8×8 at (5, 7) inside root).
+    b.fill_rectangle(None, root_xid, 0xFFFF0000, 5, 7, 16, 16)
+        .expect("seed root red at W footprint");
+
     let w_handle = b
         .create_subwindow(
             None,
             root,
-            0,
-            0,
-            16,
-            16,
-            0,
-            HostSubwindowVisual::Explicit {
-                depth: 32,
-                visual_xid: 0,
-                colormap_xid: 0,
-            },
-            None,
-            None,
-        )
-        .expect("create W");
-    let w_xid = w_handle.as_raw();
-    // Child C at (3, 4) under W, 8×8.
-    let c_handle = b
-        .create_subwindow(
-            None,
-            w_handle,
-            3,
-            4,
+            5,
+            7,
             8,
             8,
             0,
@@ -1988,198 +1935,39 @@ fn v2_redirect_seed_copies_descendants() {
             None,
             None,
         )
-        .expect("create C");
-    let c_xid = c_handle.as_raw();
+        .expect("create W as child of root");
+    // Deliberately do NOT paint W — its storage stays at the
+    // default init colour (depth-32 → (0, 0, 0, 0) transparent).
 
-    // Paint red into W, blue into C — each in its own storage.
-    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 16, 16)
-        .expect("seed W red");
-    b.fill_rectangle(None, c_xid, 0xFF0000FF, 0, 0, 8, 8)
-        .expect("seed C blue");
-
-    // Activate redirect on W. The backing must capture both W's
-    // red and C's blue (at C's position relative to W).
     let backing = b
-        .allocate_redirected_backing(None, w_handle, 16, 16, 32)
+        .allocate_redirected_backing(None, w_handle, 8, 8, 32)
         .expect("allocate must succeed");
     let bxid = backing.as_raw();
 
     let img = b
-        .get_image_pixels_for_tests(bxid, 2, 0, 0, 16, 16, !0)
+        .get_image_pixels_for_tests(bxid, 2, 0, 0, 8, 8, !0)
         .expect("get_image")
         .expect("Some bytes");
     let pixel = |x: usize, y: usize| -> [u8; 4] {
-        let off = (y * 16 + x) * 4;
-        [img[off], img[off + 1], img[off + 2], img[off + 3]]
-    };
-    // Outside C's footprint — W's red.
-    assert_eq!(
-        pixel(0, 0),
-        [0x00, 0x00, 0xFF, 0xFF],
-        "(0, 0) outside C — W's red (got {:?})",
-        pixel(0, 0),
-    );
-    assert_eq!(
-        pixel(15, 0),
-        [0x00, 0x00, 0xFF, 0xFF],
-        "(15, 0) outside C — W's red",
-    );
-    // Inside C's footprint — C's blue. C is at (3, 4)..(11, 12).
-    assert_eq!(
-        pixel(3, 4),
-        [0xFF, 0x00, 0x00, 0xFF],
-        "(3, 4) C top-left — C's blue, NOT W's red (got {:?}). \
-         Pre-4b.5 the descendant seed-copy was missing so this read W's red.",
-        pixel(3, 4),
-    );
-    assert_eq!(
-        pixel(10, 11),
-        [0xFF, 0x00, 0x00, 0xFF],
-        "(10, 11) C bottom-right — C's blue",
-    );
-    // Edge-of-C and just outside.
-    assert_eq!(
-        pixel(11, 4),
-        [0x00, 0x00, 0xFF, 0xFF],
-        "(11, 4) just past C's right edge — W's red",
-    );
-}
-
-/// Redirect seed-copy must respect sibling stack order for
-/// overlapping descendants. WM frame pieces are frequently sibling
-/// subwindows under one parent; if the seed walk uses HashMap order,
-/// the overlap area in the backing becomes nondeterministic.
-#[test]
-#[ignore = "needs live Vulkan ICD"]
-fn v2_redirect_seed_respects_overlapping_sibling_stack_order() {
-    use yserver_core::{
-        backend::WindowHandle,
-        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
-    };
-
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
-    };
-
-    let root = WindowHandle::from_raw(1).expect("root");
-    let w_handle = b
-        .create_subwindow(
-            None,
-            root,
-            0,
-            0,
-            16,
-            16,
-            0,
-            HostSubwindowVisual::Explicit {
-                depth: 32,
-                visual_xid: 0,
-                colormap_xid: 0,
-            },
-            None,
-            None,
-        )
-        .expect("create W");
-    let a_handle = b
-        .create_subwindow(
-            None,
-            w_handle,
-            2,
-            2,
-            8,
-            8,
-            0,
-            HostSubwindowVisual::Explicit {
-                depth: 32,
-                visual_xid: 0,
-                colormap_xid: 0,
-            },
-            None,
-            None,
-        )
-        .expect("create A");
-    let b_handle = b
-        .create_subwindow(
-            None,
-            w_handle,
-            4,
-            4,
-            8,
-            8,
-            0,
-            HostSubwindowVisual::Explicit {
-                depth: 32,
-                visual_xid: 0,
-                colormap_xid: 0,
-            },
-            None,
-            None,
-        )
-        .expect("create B");
-
-    let w_xid = w_handle.as_raw();
-    let a_xid = a_handle.as_raw();
-    let b_xid = b_handle.as_raw();
-
-    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 16, 16)
-        .expect("seed W red");
-    b.fill_rectangle(None, a_xid, 0xFF0000FF, 0, 0, 8, 8)
-        .expect("seed A blue");
-    b.fill_rectangle(None, b_xid, 0xFF00FF00, 0, 0, 8, 8)
-        .expect("seed B green");
-
-    // Put B above A before redirect; the overlap at (4..10, 4..10)
-    // must therefore read green in the seeded backing.
-    b.configure_subwindow(
-        None,
-        b_xid,
-        HostSubwindowConfig {
-            x: None,
-            y: None,
-            width: None,
-            height: None,
-            border_width: None,
-            sibling: Some(a_xid),
-            stack_mode: Some(0),
-        },
-    )
-    .expect("restack B above A");
-
-    let backing = b
-        .allocate_redirected_backing(None, w_handle, 16, 16, 32)
-        .expect("allocate must succeed");
-    let img = b
-        .get_image_pixels_for_tests(backing.as_raw(), 2, 0, 0, 16, 16, !0)
-        .expect("get_image")
-        .expect("Some bytes");
-    let pixel = |x: usize, y: usize| -> [u8; 4] {
-        let off = (y * 16 + x) * 4;
+        let off = (y * 8 + x) * 4;
         [img[off], img[off + 1], img[off + 2], img[off + 3]]
     };
 
+    // Pre-fix: backing reads W's default-init (0,0,0,0) — invisible /
+    // black-band depending on the scene blend. Post-fix: parent's red
+    // at the source position (5, 7), copied into B at (0, 0).
     assert_eq!(
-        pixel(1, 1),
+        pixel(0, 0),
         [0x00, 0x00, 0xFF, 0xFF],
-        "outside children → parent red",
+        "backing's (0, 0) must read parent's red at W's screen \
+         position (5, 7); pre-fix the seed copied W's default-init \
+         colour and produced (0, 0, 0, 0).",
     );
     assert_eq!(
-        pixel(3, 3),
-        [0xFF, 0x00, 0x00, 0xFF],
-        "inside A-only region → A blue",
-    );
-    assert_eq!(
-        pixel(11, 11),
-        [0x00, 0xFF, 0x00, 0xFF],
-        "inside B-only region → B green",
-    );
-    assert_eq!(
-        pixel(5, 5),
-        [0x00, 0xFF, 0x00, 0xFF],
-        "overlap must follow sibling stack order: B above A → green",
+        pixel(7, 7),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "backing's (7, 7) must read parent's red (the W-footprint \
+         region of root was filled red strictly larger than W).",
     );
 }
 

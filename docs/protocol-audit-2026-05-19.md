@@ -7,6 +7,7 @@ Focus: clipping, redirect routing, damage delivery — the compositor-WM battleg
 **Status legend** (updated 2026-05-19 PM):
 - ✅ **Done** — patch landed, commit hash listed
 - 🟦 **Skipped** — empirically dead code or not exercised by current workloads; reason noted
+- ⏸ **Parked** — intentionally deferred; reason noted (typically waiting on prerequisite work)
 - ⬜ **Open** — no patch yet
 
 ---
@@ -183,13 +184,19 @@ the focused client is between Subtracts.
 
 picom (uses DeltaRegion) misses incremental damage between two Subtracts → smearing.
 
-### 14. `SelectCursorInput` never emits `XFixesCursorNotify`; `GetCursorImage` returns 0×0
-**Severity: Bug**
+### 14. ⏸ `SelectCursorInput` never emits `XFixesCursorNotify`; `GetCursorImage` returns 0×0
+**Severity: Bug** — **Parked pending hw-cursor work**
 - yserver: `process_request.rs:2569-2578` (storage only); `xfixes.rs:329-345` (empty reply)
 - Xorg: `xfixes/cursor.c:360-413`
 
 Screencast, magnifier, accessibility tools see no cursor. Cursor-follow features broken.
 `xfixes_change_cursor_by_name` also a documented no-op in v2 backend.
+
+**Status (2026-05-19):** intentionally deferred — will be implemented when the
+hardware cursor pipeline is re-introduced. The XFixes cursor surface (image,
+position, name) is shaped to read from the active cursor sprite, so wiring it
+in isolation against the current always-default-arrow stub adds bookkeeping
+without behavioral gain.
 
 ### 15. `ExpandRegion` (XFIXES 3.0, minor 28) stubbed
 **Severity: Stub**
