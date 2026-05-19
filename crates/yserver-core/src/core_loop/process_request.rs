@@ -1938,7 +1938,7 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::LIST_SYSTEM_COUNTERS => {
-            let reply = x11sync::encode_list_system_counters_empty_reply(byte_order, sequence);
+            let reply = x11sync::encode_list_system_counters_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -1972,7 +1972,14 @@ fn handle_sync_request(
         }
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
-            let value = state.sync_counters.get(&counter).map_or(0, |c| c.value);
+            let value = if matches!(
+                counter,
+                x11sync::SERVERTIME_COUNTER | x11sync::IDLETIME_COUNTER
+            ) {
+                i64::from(state.timestamp_now())
+            } else {
+                state.sync_counters.get(&counter).map_or(0, |c| c.value)
+            };
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);

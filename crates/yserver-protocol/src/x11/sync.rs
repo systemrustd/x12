@@ -24,6 +24,9 @@ pub const DESTROY_FENCE: u8 = 17;
 pub const QUERY_FENCE: u8 = 18;
 pub const AWAIT_FENCE: u8 = 19;
 
+pub const SERVERTIME_COUNTER: u32 = 0x106;
+pub const IDLETIME_COUNTER: u32 = 0x107;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateFenceRequest {
     pub drawable: u32,
@@ -165,6 +168,49 @@ pub fn encode_list_system_counters_empty_reply(
 }
 
 #[must_use]
+pub fn encode_list_system_counters_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    const COUNTERS: &[(u32, i64, &[u8])] = &[
+        (SERVERTIME_COUNTER, 4, b"SERVERTIME"),
+        (IDLETIME_COUNTER, 4, b"IDLETIME"),
+    ];
+
+    let payload_len: usize = COUNTERS
+        .iter()
+        .map(|(_, _, name)| (14 + name.len()).next_multiple_of(4))
+        .sum();
+
+    let mut out = fixed_reply(
+        byte_order,
+        sequence,
+        u32::try_from(payload_len / 4).expect("system counter reply length fits u32"),
+    );
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::try_from(COUNTERS.len()).expect("system counter count fits u32"),
+    );
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
+
+    for &(counter, resolution_ms, name) in COUNTERS {
+        let entry_start = out.len();
+        write_u32(byte_order, &mut out, counter);
+        write_i64(byte_order, &mut out, resolution_ms);
+        write_u16(
+            byte_order,
+            &mut out,
+            u16::try_from(name.len()).expect("system counter name length fits u16"),
+        );
+        out.extend_from_slice(name);
+        out.resize(entry_start + (14 + name.len()).next_multiple_of(4), 0);
+    }
+    out
+}
+
+#[must_use]
 pub fn encode_query_counter_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
@@ -235,6 +281,32 @@ mod tests {
         assert_eq!(reply.len(), 32);
         assert_eq!(i32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn list_system_counters_advertises_servertime_and_idletime() {
+        let reply =
+            encode_list_system_counters_reply(ClientByteOrder::LittleEndian, SequenceNumber(0x88));
+        assert_eq!(reply.len(), 80);
+        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(reply[32..36].try_into().unwrap()),
+            SERVERTIME_COUNTER
+        );
+        assert_eq!(i32::from_le_bytes(reply[36..40].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(reply[40..44].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(reply[44..46].try_into().unwrap()), 10);
+        assert_eq!(&reply[46..56], b"SERVERTIME");
+        assert_eq!(
+            u32::from_le_bytes(reply[56..60].try_into().unwrap()),
+            IDLETIME_COUNTER
+        );
+        assert_eq!(i32::from_le_bytes(reply[60..64].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(reply[64..68].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(reply[68..70].try_into().unwrap()), 8);
+        assert_eq!(&reply[70..78], b"IDLETIME");
+        assert_eq!(&reply[78..80], &[0, 0]);
     }
 
     #[test]
