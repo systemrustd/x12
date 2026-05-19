@@ -11066,25 +11066,20 @@ fn drop_selections_owned_by_windows(
     if to_drop.is_empty() {
         return;
     }
-    let now = current_server_time_ms(state);
+    // `timestamp_now()` matches Xorg's `UpdateCurrentTimeIf` shape
+    // (`dix/dispatch.c:226-236`): bare monotonic-ms snapshot, no
+    // floor. X11 timestamp 0 only has dedicated semantics on the
+    // INPUT side (request `time` arg = "use CurrentTime"); event
+    // payloads emitted in the first ms after server start carry the
+    // actual `0` per Xorg, so the clamp this used to apply was a
+    // protocol mismatch.
+    let now = state.timestamp_now();
     for (sel, prior_last_time_changed) in to_drop {
         // owner=0 (None) — see Xorg `xfixes/select.c:85-86`:
         // destroy/close subtypes always carry owner=None.
         fanout_xfixes_selection_notify(state, sel, subtype, 0, now, prior_last_time_changed);
         state.selections.remove(&sel);
     }
-}
-
-/// X11 `currentTime.milliseconds` equivalent: monotonic ms since
-/// server start. Surfaces on the wire as the `timestamp` field of
-/// `XFixesSelectionNotify` events for destroy/close subtypes (Xorg
-/// `xfixes/select.c:88`). Clamped to a minimum of 1 — X11 timestamp
-/// 0 has dedicated semantics (`CurrentTime`, "server picks") so an
-/// event payload must never emit it as a real moment.
-fn current_server_time_ms(state: &ServerState) -> u32 {
-    let ms = state.start_instant.elapsed().as_millis();
-    let trunc = u32::try_from(ms & u128::from(u32::MAX)).unwrap_or(u32::MAX);
-    trunc.max(1)
 }
 
 /// Audit #9 — client-disconnect cleanup: find every window the
@@ -14555,15 +14550,13 @@ mod tests {
              time arg (Xorg `selection->lastTimeChanged`); pre-fix the \
              payload was zeroed",
         );
-        // `timestamp` should be currentTime, not 0. We can't pin the
-        // exact value (it depends on the test's runtime), but any
-        // non-zero monotonic stamp matches Xorg's `currentTime.milliseconds`.
-        // Pinning > 0 is sufficient to catch the regression of "passed 0".
-        let ts = u32::from_le_bytes([evt[16], evt[17], evt[18], evt[19]]);
-        assert!(
-            ts > 0,
-            "timestamp must be a non-zero server uptime (currentTime), got {ts}",
-        );
+        // The `timestamp` field is `state.timestamp_now()` (Xorg's
+        // `currentTime.milliseconds` equivalent); not asserted here
+        // because in a sub-millisecond test it's legitimately 0 — which
+        // matches Xorg behavior (`UpdateCurrentTimeIf` snapshots
+        // `GetTimeInMillis()` with no floor). The
+        // `selection_timestamp` assertion above is the load-bearing
+        // spec-compliance check.
     }
 
     /// Audit #9 (code-review follow-up): Xorg's
