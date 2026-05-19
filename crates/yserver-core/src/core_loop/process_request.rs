@@ -2713,11 +2713,17 @@ fn handle_xfixes_request(
                             XFIXES_MAJOR_OPCODE,
                         );
                     };
-                    let rects = crate::nested::offset_rects(
-                        x11xfixes::parse_rectangles(&clip.rectangles),
-                        clip.x_origin,
-                        clip.y_origin,
-                    );
+                    // Audit #7 (docs/protocol-audit-2026-05-19.md):
+                    // copy the GC's clip rects RAW — Xorg's
+                    // `ProcXFixesCreateRegionFromGC`
+                    // (`xfixes/region.c:219-226`) does
+                    // `XFixesRegionCopy(pGC->clientClip)` with no
+                    // translation. `clip.x_origin` / `clip.y_origin`
+                    // are properties of the GC's USE, not part of
+                    // the region's content; otherwise a subsequent
+                    // `SetGcClipRegion(gc, region, x_origin,
+                    // y_origin)` double-translates.
+                    let rects = x11xfixes::parse_rectangles(&clip.rectangles);
                     state.xfixes_regions.insert(
                         region,
                         crate::server::XFixesRegion {
@@ -15025,6 +15031,148 @@ mod tests {
              got {} bytes: {:02x?}",
             all.len(),
             all,
+        );
+    }
+
+    /// Audit #7 (`docs/protocol-audit-2026-05-19.md`):
+    /// `CreateRegionFromGC` must return the GC's clip rectangles in
+    /// their RAW clip-coordinate space — Xorg's
+    /// `ProcXFixesCreateRegionFromGC` (`xfixes/region.c:219-226`)
+    /// just `XFixesRegionCopy(pGC->clientClip)` with NO origin
+    /// translation applied. yserver was offsetting by
+    /// `(clip.x_origin, clip.y_origin)` at insert time. When a WM
+    /// later re-installs the resulting region as a GC's clip via
+    /// `SetGcClipRegion(gc, region, x_origin, y_origin)`, the
+    /// GC-side origin is applied a SECOND time → double-translation
+    /// → wrong area shadowed/repainted.
+    #[test]
+    fn create_region_from_gc_copies_clip_rects_without_origin_translation() {
+        use yserver_protocol::x11::{
+            ClipRectangles, CreateGcRequest, CreateWindowRequest, SetClipRectanglesRequest,
+            xfixes as x11xfixes,
+        };
+        const APP: u32 = 70;
+        const WIN_XID: u32 = 0x0070_0001;
+        const GC_XID: u32 = 0x0070_0002;
+        const REGION_XID: u32 = 0x0070_0003;
+        const X_ORIGIN: i16 = 100;
+        const Y_ORIGIN: i16 = 200;
+        const RECT_X: i16 = 10;
+        const RECT_Y: i16 = 20;
+        const RECT_W: u16 = 5;
+        const RECT_H: u16 = 5;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        // Drawable to attach the GC to.
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_gc(
+            ClientId(APP),
+            CreateGcRequest {
+                gc: ResourceId(GC_XID),
+                drawable: ResourceId(WIN_XID),
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        // Set the GC's clip: single rect at (10, 20, 5×5) in
+        // clip-coordinate space, with origin (100, 200). The wire
+        // format is (x i16, y i16, w u16, h u16) per rect.
+        let mut rect_bytes = Vec::with_capacity(8);
+        rect_bytes.extend_from_slice(&RECT_X.to_le_bytes());
+        rect_bytes.extend_from_slice(&RECT_Y.to_le_bytes());
+        rect_bytes.extend_from_slice(&RECT_W.to_le_bytes());
+        rect_bytes.extend_from_slice(&RECT_H.to_le_bytes());
+        state
+            .resources
+            .set_clip_rectangles(SetClipRectanglesRequest {
+                gc: ResourceId(GC_XID),
+                clip: ClipRectangles {
+                    ordering: 0,
+                    x_origin: X_ORIGIN,
+                    y_origin: Y_ORIGIN,
+                    rectangles: rect_bytes,
+                },
+            });
+
+        // CREATE_REGION_FROM_GC body: region(4) + gc(4).
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&GC_XID.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_GC,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        let region = state
+            .xfixes_regions
+            .get(&REGION_XID)
+            .expect("CreateRegionFromGC inserted region");
+        assert_eq!(
+            region.rects.len(),
+            1,
+            "expected exactly one rect from the GC's single-rect clip; got {:?}",
+            region.rects,
+        );
+        let r = &region.rects[0];
+        assert_eq!(
+            (r.x, r.y, r.width, r.height),
+            (RECT_X, RECT_Y, RECT_W, RECT_H),
+            "rect must be in raw clip-coord space (NOT translated by \
+             clip_origin=({X_ORIGIN},{Y_ORIGIN})); the symptom of \
+             over-translation is x={}, y={} (= raw + clip_origin).",
+            r.x,
+            r.y,
         );
     }
 
