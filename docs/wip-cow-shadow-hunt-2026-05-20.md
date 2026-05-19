@@ -67,6 +67,28 @@ regression, but landing it in the same commit because reverting
 the COW fix without it would re-open audit #11 once we revisit
 shadows).
 
+## Confirmed compositor-dependent: XFCE is unaffected
+
+User reports the regression does NOT reproduce under XFCE. xfwm4's
+built-in compositor paints via RENDER into a child compositor
+window of root (its own depth-32 stage), not via `Present::Pixmap`
+onto COW. So `maybe_register_cow_on_paint` never fires under XFCE,
+`inner.cow` stays `None`, v2's per-window scene walk wins, all
+working.
+
+The MATE case has a separate compositor (client 015 in the
+`mate.xtrace` from this run: `RedirectSubwindows(root, Manual)` +
+`GetOverlayWindow` + `Present::Pixmap` onto COW) that's the
+trigger. Likely picom or a marco build with Present output —
+verify by `ps` next session.
+
+So the lazy-register design correctly *avoids* the xfwm4 trap. The
+remaining failure is specifically "Present-Pixmap-onto-COW
+compositor + incomplete-COW + force-opaque depth-24". Three things
+to address; if only one is the proximate fix, it's likely the
+"COW must be alpha-aware so non-painted regions are transparent
+through to v2's walk" angle.
+
 ## The regression (hardware smoke, 2026-05-20 ~01:20 yoga / mate)
 
 User observation, paraphrased:
