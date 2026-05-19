@@ -129,14 +129,24 @@ via normal paint flow for non-compositor cases, and Stage 4d's scene walk
 presents siblings directly. Revisit if a compositor workload surfaces a
 sibling-bleed-through case.
 
-### 7. ⬜ CreateRegionFromGC translates by clip_origin; Xorg does not
-**Severity: Bug**
+### 7. ✅ CreateRegionFromGC translates by clip_origin; Xorg does not
+**Severity: Bug** — **Fixed in `1ae3d87`**
 - yserver: `process_request.rs:2622-2626`
 - Xorg: `xfixes/region.c:204-232` — returns raw clip-coordinate rects, origin only
   applied when GC is *used*
 
 A WM that builds a region from a GC then re-installs as that GC's clip gets
 double-translation → wrong area shadowed/repainted.
+
+**Resolution:** dropped the `nested::offset_rects(rects,
+clip.x_origin, clip.y_origin)` wrap at the CREATE_REGION_FROM_GC
+arm; the region now stores the raw rects from
+`xfixes::parse_rectangles`, mirroring Xorg's `XFixesRegionCopy(pGC->clientClip)`.
+`nested::offset_rects` stays in tree — it's still used by SHAPE /
+XFIXES translate-region paths where the offset IS part of the
+operation's intent. New TDD test
+`create_region_from_gc_copies_clip_rects_without_origin_translation`
+pins the raw-copy invariant with a non-zero clip_origin vector.
 
 ### 8. ✅ `drawable_origin` field defined but never written — mid-WIP
 **Severity: Bug (incomplete)** — **Fixed in `8c5c841`**
@@ -389,8 +399,9 @@ For maximum compositor-WM impact with minimum churn:
    piece (Stage 4e substrate done in one patch, including dst-side + trap/tri-path
    coverage caught by codex review)
 
-**Remaining tier-1:** #7 (CreateRegionFromGC double-translation — affects WMs
-that build regions from GCs). #6 closed in `6f86d7f`.
+**Tier 1 closed.** All eight items resolved: #1 `c0ae57d` + `a4309f5`,
+#2 `6464531`, #3 `6ffd370`, #4 `22223f5`, #5 skipped (empirically
+dead code), #6 `6f86d7f`, #7 `1ae3d87`, #8 `8c5c841`.
 
 **Bonus tier-1 found during yoga mate-hw smoke 2026-05-19 PM** (not in the
 original audit list): Manual-redirect backing's `scene_participating=false`
