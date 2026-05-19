@@ -1309,15 +1309,18 @@ impl KmsBackendV2 {
     }
 
     fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
-        // v2 reads framebuffer extents off platform.outputs[0]
-        // (single-output is the only path exercised today; multi-
-        // output input mapping is risk-listed for later).
-        let (fb_w, fb_h) = self
-            .platform
-            .outputs
-            .first()
-            .map(|o| (f32::from(o.width), f32::from(o.height)))
-            .unwrap_or((1.0, 1.0));
+        // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
+        // not the first output's box. `core_platform_init`
+        // (`kms/backend.rs:1063-1072`) computes this as
+        // `max(x + width)` across every output, which is also the
+        // extent the input thread targets when it accumulates
+        // libinput deltas (`input_thread.rs:180-189`). Pre-fix
+        // this consulted `outputs.first().width/height`, so the
+        // pointer could never cross from output 0 onto a side-
+        // adjacent output 1 — pinned by
+        // `process_pointer_absolute_uses_union_fb_extent_for_multi_output`.
+        let fb_w = f32::from(self.platform.fb_w.max(1));
+        let fb_h = f32::from(self.platform.fb_h.max(1));
         let new_x = x.clamp(0.0, (fb_w - 1.0).max(0.0));
         let new_y = y.clamp(0.0, (fb_h - 1.0).max(0.0));
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
@@ -9101,6 +9104,45 @@ mod tests {
         b.process_pointer_absolute(&state, 5000.0, 5000.0);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
+    }
+
+    /// Multi-output regression: the pointer clamp must use the
+    /// union framebuffer extent (`PlatformBackend.fb_w/fb_h`),
+    /// NOT `outputs.first().width/height`. Pre-fix the clamp
+    /// consulted only the first output, so the cursor could never
+    /// cross from monitor 0 onto monitor 1 in a side-by-side
+    /// layout.
+    ///
+    /// Simulate two side-by-side 2560×1440 monitors by leaving the
+    /// fixture's single 800×600 output entry in place but bumping
+    /// `platform.fb_w` to 5120 (this is what `core_platform_init`
+    /// computes as `max(x + width)` across all outputs in
+    /// production — see `kms/backend.rs:1063-1072`). The input
+    /// thread already targets that union extent at thread spawn,
+    /// so v2 receives `PointerMotion { x, y }` already in
+    /// virtual-screen coords; the only divergence was v2's
+    /// re-clamp.
+    #[test]
+    fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
+        use yserver_core::server::ServerState;
+        let mut b = KmsBackendV2::for_tests();
+        b.platform.fb_w = 5120;
+        b.platform.fb_h = 1440;
+        let state = ServerState::new();
+        // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
+        // fixture extent but well within the 5120 union extent).
+        b.process_pointer_absolute(&state, 4000.0, 1000.0);
+        assert_eq!(
+            b.core.cursor_x, 4000.0,
+            "pointer must be able to cross past the first output's \
+             extent; pre-fix this clamps to 799 and the cursor is \
+             stuck on monitor 0",
+        );
+        assert_eq!(b.core.cursor_y, 1000.0);
+        // Past the union extent → clamped to (union - 1).
+        b.process_pointer_absolute(&state, 9999.0, 9999.0);
+        assert_eq!(b.core.cursor_x, 5119.0);
+        assert_eq!(b.core.cursor_y, 1439.0);
     }
 
     /// `window_under_cursor` returns the topmost mapped top-level
