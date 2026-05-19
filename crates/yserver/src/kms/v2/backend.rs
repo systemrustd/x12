@@ -451,8 +451,8 @@ impl KmsBackendV2 {
             xid,
             crate::kms::v2::cursor::DEFAULT_ARROW_W,
             crate::kms::v2::cursor::DEFAULT_ARROW_H,
-            0,
-            0,
+            crate::kms::v2::cursor::DEFAULT_ARROW_HOT_X,
+            crate::kms::v2::cursor::DEFAULT_ARROW_HOT_Y,
             bytes,
         );
         self.default_cursor_xid = Some(xid);

@@ -90,33 +90,33 @@ impl CursorRecord {
     }
 }
 
-/// 16×16 default-arrow cursor (matches Stage 3f.8's bake) — kept as
-/// a fallback when boot-time rasterisation runs before any client
-/// has defined its own cursor.
+/// 16×16 classic X-shaped default cursor (matches v1's
+/// `install_default_cursor` at `kms/backend.rs:2286-2308`). Both
+/// diagonals of the 16×16 box drawn in black with a 1-pixel white
+/// halo for visibility against dark backgrounds. Hotspot at the
+/// centre — the natural choice for a centred X.
 ///
-/// Shape: filled right-triangle pointing down-right (tip at (0, 0)
-/// = hotspot). 1-px white outline along the diagonal edge.
+/// Renamed from `default_arrow` (Stage 3f.8 placeholder) so the
+/// boot cursor matches the v1 baseline that long-running test
+/// sessions expect.
 pub(crate) fn default_arrow_bgra() -> Vec<u8> {
-    const W: usize = 16;
-    const H: usize = 16;
-    let mut bytes = vec![0u8; W * H * 4];
-    let set = |bytes: &mut [u8], x: usize, y: usize, b: u8, g: u8, r: u8, a: u8| {
-        let off = (y * W + x) * 4;
-        bytes[off] = b;
-        bytes[off + 1] = g;
-        bytes[off + 2] = r;
-        bytes[off + 3] = a;
-    };
-    for y in 0..12 {
-        let row_w = y.min(10) + 1;
-        for x in 0..row_w {
-            set(&mut bytes, x, y, 0x00, 0x00, 0x00, 0xFF);
-        }
-    }
-    for y in 0..11 {
-        let edge_x = y.min(10);
-        if edge_x + 1 < W {
-            set(&mut bytes, edge_x + 1, y, 0xFF, 0xFF, 0xFF, 0xFF);
+    const W: i32 = 16;
+    const H: i32 = 16;
+    let mut bytes = vec![0u8; (W * H) as usize * 4];
+    let last = W - 1;
+    for y in 0..H {
+        for x in 0..W {
+            // Distance to either diagonal of the 16×16 box.
+            let d1 = (x - y).abs();
+            let d2 = (x + y - last).abs();
+            let dist = d1.min(d2);
+            let bgra: [u8; 4] = match dist {
+                0 => [0x00, 0x00, 0x00, 0xFF], // black core, opaque
+                1 => [0xFF, 0xFF, 0xFF, 0xFF], // white halo, opaque
+                _ => [0x00, 0x00, 0x00, 0x00], // transparent
+            };
+            let off = ((y * W + x) as usize) * 4;
+            bytes[off..off + 4].copy_from_slice(&bgra);
         }
     }
     bytes
@@ -124,6 +124,10 @@ pub(crate) fn default_arrow_bgra() -> Vec<u8> {
 
 pub(crate) const DEFAULT_ARROW_W: u16 = 16;
 pub(crate) const DEFAULT_ARROW_H: u16 = 16;
+/// Hotspot for the default X cursor — centred per v1's
+/// `install_default_cursor` (`w/2, h/2`).
+pub(crate) const DEFAULT_ARROW_HOT_X: u16 = 8;
+pub(crate) const DEFAULT_ARROW_HOT_Y: u16 = 8;
 
 /// Rasterise an X11 `CreateCursor` (`source`, `mask`, `fore`, `back`)
 /// tuple into BGRA. Both sources are depth-1 R8-mirrored — a non-zero
@@ -372,21 +376,39 @@ mod tests {
         assert_eq!(&bgra[12..16], &[0, 0, 0, 0]);
     }
 
-    /// Default arrow rasterisation produces straight-alpha output and
-    /// matches the documented shape: opaque black inside the arrow,
-    /// fully transparent outside.
+    /// Default X cursor rasterisation: 16×16 with both diagonals
+    /// in opaque black, 1-pixel white halo, fully-transparent
+    /// elsewhere. Matches v1's `install_default_cursor` at
+    /// `kms/backend.rs:2286-2308`.
     #[test]
-    fn default_arrow_is_straight_alpha() {
+    fn default_arrow_is_x_with_halo() {
         let bytes = default_arrow_bgra();
         assert_eq!(bytes.len(), 16 * 16 * 4);
-        // Tip (0,0) — visible, opaque.
-        assert_eq!(&bytes[0..4], &[0x00, 0x00, 0x00, 0xFF]);
-        // Far right of row 0 — outside arrow, fully transparent.
-        let off = (15) * 4;
-        assert_eq!(&bytes[off..off + 4], &[0, 0, 0, 0]);
-        // Bottom-right corner — outside arrow.
-        let off = (15 * 16 + 15) * 4;
-        assert_eq!(&bytes[off..off + 4], &[0, 0, 0, 0]);
+        let px = |x: usize, y: usize| {
+            let off = (y * 16 + x) * 4;
+            [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]
+        };
+        // Diagonal 1 (top-left → bottom-right): every (k, k) is
+        // opaque black.
+        for k in 0..16 {
+            assert_eq!(px(k, k), [0x00, 0x00, 0x00, 0xFF], "diag1 (k,k)={k}");
+        }
+        // Diagonal 2 (top-right → bottom-left): every (k, 15-k).
+        for k in 0..16 {
+            assert_eq!(
+                px(k, 15 - k),
+                [0x00, 0x00, 0x00, 0xFF],
+                "diag2 (k,15-k)={k}"
+            );
+        }
+        // 1-pixel white halo: e.g. (1, 0) is `dist=1` to diag1,
+        // visible-white.
+        assert_eq!(px(1, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+        // Far from both diagonals: (7, 0) sits at d1=7, d2=8 →
+        // min=7 → transparent.
+        assert_eq!(px(7, 0), [0, 0, 0, 0]);
+        // Centre (8, 8) is on diag1 → opaque black (hotspot).
+        assert_eq!(px(8, 8), [0x00, 0x00, 0x00, 0xFF]);
     }
 
     /// Glyph cursor with `mask = None` collapses to "source bit also
