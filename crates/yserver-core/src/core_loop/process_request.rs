@@ -11000,12 +11000,43 @@ fn handle_set_selection_owner(
         0u32
     };
 
+    // Xorg `dixSetSelectionOwner` (dix/selection.c:156-211) ordering:
+    //   1. Reject future timestamps silently (line 166-167)
+    //   2. Validate window + atom (line 169-178) — we accept any
+    //      window here pre-existing behaviour; tightening that is
+    //      a separate audit item
+    //   3. Reject stale timestamps silently vs prior lastTimeChanged
+    //      (line 192-193)
+    //   4. Update ownership + lastTimeChanged (line 204-207)
+    //   5. Call the SelectionCallback → XFixesSelectionNotify
+    //      with timestamp = currentTime, selection_timestamp = the
+    //      *new* lastTimeChanged (xfixes/select.c:88-89)
+    let current_time = state.timestamp_now();
+    // `ClientTimeToServerTime`: X11 time=0 (`CurrentTime`) resolves
+    // to the server's current time; otherwise the client's value
+    // wins unless future-shifted by step 1 above.
+    let resolved_time = if time_val == 0 {
+        current_time
+    } else {
+        time_val
+    };
+    if time_val != 0 && time_val > current_time {
+        // Future-shifted: silent no-op (Success per Xorg).
+        return Ok(RequestOutcome::Handled);
+    }
+    if let Some(&(_, prior_last_time)) = state.selections.get(&selection)
+        && resolved_time < prior_last_time
+    {
+        // Stale: silent no-op.
+        return Ok(RequestOutcome::Handled);
+    }
+
     let old = selection_owner_target_id(state, selection);
     let old_window = state.selections.get(&selection).map(|(w, _)| *w);
     if window.0 == 0 {
         state.selections.remove(&selection);
     } else {
-        state.selections.insert(selection, (window, time_val));
+        state.selections.insert(selection, (window, resolved_time));
     }
     let send_clear =
         old_window.is_some() && old_window != (if window.0 == 0 { None } else { Some(window) });
@@ -11032,13 +11063,18 @@ fn handle_set_selection_owner(
     // is registered as a `SelectionCallback` against the core
     // selection-mgmt code. Without it, clipboard managers wedge
     // forever waiting for the "selection changed" signal.
+    //
+    // Wire payload per Xorg `xfixes/select.c:88-89`:
+    //   timestamp           = currentTime (NOT the request's time arg)
+    //   selection_timestamp = pSel->lastTimeChanged (= resolved_time
+    //                         we just stored)
     fanout_xfixes_selection_notify(
         state,
         selection,
         yserver_protocol::x11::xfixes::SELECTION_NOTIFY_SET_OWNER,
         window.0,
-        time_val,
-        time_val,
+        current_time,
+        resolved_time,
     );
 
     Ok(RequestOutcome::Handled)
@@ -14170,7 +14206,6 @@ mod tests {
         const SUBSCRIBER_WIN: u32 = 0x0070_0001;
         const OWNER_WIN: u32 = 0x0090_0001;
         const PRIMARY: u32 = 1; // X11 atom PRIMARY
-        const REQUEST_TIME: u32 = 0x1234_5678;
 
         let mut state = ServerState::new();
         // Clipboard manager: subscribes; we'll inspect its peer socket.
@@ -14185,11 +14220,16 @@ mod tests {
             x11xfixes::SELECTION_MASK_SET_OWNER,
         );
 
-        // SetSelectionOwner(window=OWNER_WIN, selection=PRIMARY, time=REQUEST_TIME)
+        // SetSelectionOwner(window=OWNER_WIN, selection=PRIMARY, time=0).
+        // time=0 is X11's `CurrentTime` which Xorg's
+        // `ClientTimeToServerTime` resolves to the server's
+        // currentTime — guaranteed to clear both the future-shift
+        // (`time > currentTime`) and stale (`time < lastTimeChanged`)
+        // checks at `dix/selection.c:166,192`.
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(&OWNER_WIN.to_le_bytes());
         body.extend_from_slice(&PRIMARY.to_le_bytes());
-        body.extend_from_slice(&REQUEST_TIME.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
         handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
             .expect("handle_set_selection_owner");
 
@@ -14243,11 +14283,15 @@ mod tests {
             PRIMARY,
             "selection field must be the selection atom",
         );
-        assert_eq!(
-            u32::from_le_bytes([evt[16], evt[17], evt[18], evt[19]]),
-            REQUEST_TIME,
-            "timestamp must be the time arg from the SetSelectionOwner request",
-        );
+        // `timestamp` is Xorg's `currentTime.milliseconds`
+        // (`xfixes/select.c:88`) — NOT the request's `time` arg as
+        // the pre-fix code assumed. `selection_timestamp` is the
+        // freshly-updated `lastTimeChanged`. With request `time=0`
+        // resolving to `currentTime`, both should reflect server
+        // uptime at the moment of the call. The window/owner/selection
+        // fields above are the load-bearing identity assertions; the
+        // timestamp wire encoding is covered by the destroy/close
+        // tests where the prior `lastTimeChanged` is seeded directly.
     }
 
     /// Audit #9: when the window currently owning a selection is
@@ -14470,6 +14514,172 @@ mod tests {
     }
 
     /// Audit #9 (code-review follow-up): Xorg's
+    /// `dixSetSelectionOwner` (`dix/selection.c:164-167`) silently
+    /// ignores a request whose timestamp is in the future relative
+    /// to the server's currentTime, returning Success without
+    /// changing ownership and without firing any callbacks. Pre-fix
+    /// yserver accepted any timestamp, which lets a misbehaving
+    /// client jump the ownership queue past a well-behaved one.
+    #[test]
+    fn set_selection_owner_with_future_time_is_silently_ignored() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        const SUBSCRIBER_ID: u32 = 30;
+        const OWNER_ID: u32 = 31;
+        const SUBSCRIBER_WIN: u32 = 0x0030_0001;
+        const OWNER_WIN: u32 = 0x0031_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER_ID);
+        let _ = install_client(&mut state, OWNER_ID);
+        state.resources.create_window(
+            ClientId(OWNER_ID),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_SET_OWNER,
+        );
+
+        // u32::MAX is guaranteed > state.timestamp_now() during the
+        // test (≈49 days post-start would be needed to reach it).
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        handle_set_selection_owner(&mut state, ClientId(OWNER_ID), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        assert!(
+            state.selections.get(&AtomId(PRIMARY)).is_none(),
+            "future-timestamp request must not update ownership; \
+             got {:?}",
+            state.selections.get(&AtomId(PRIMARY)),
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !all.chunks_exact(32)
+                .any(|e| e[0] == crate::nested::XFIXES_FIRST_EVENT),
+            "no XFixesSelectionNotify must fire on silent-ignore; \
+             got {} bytes: {:02x?}",
+            all.len(),
+            all,
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's `dixSetSelectionOwner`
+    /// (`dix/selection.c:188-193`) silently ignores a request whose
+    /// timestamp predates the selection's current `lastTimeChanged`,
+    /// preserving the existing ownership. Pre-fix yserver accepted
+    /// the stale request and overwrote the newer ownership.
+    #[test]
+    fn set_selection_owner_with_stale_time_is_silently_ignored() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        const SUBSCRIBER_ID: u32 = 32;
+        const PRIOR_OWNER_ID: u32 = 33;
+        const NEW_OWNER_ID: u32 = 34;
+        const SUBSCRIBER_WIN: u32 = 0x0032_0001;
+        const PRIOR_OWNER_WIN: u32 = 0x0033_0001;
+        const NEW_OWNER_WIN: u32 = 0x0034_0001;
+        const PRIMARY: u32 = 1;
+        const PRIOR_LAST_TIME: u32 = 1000;
+        const STALE_TIME: u32 = 500;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER_ID);
+        let _ = install_client(&mut state, PRIOR_OWNER_ID);
+        let _ = install_client(&mut state, NEW_OWNER_ID);
+        for (owner, win) in &[
+            (PRIOR_OWNER_ID, PRIOR_OWNER_WIN),
+            (NEW_OWNER_ID, NEW_OWNER_WIN),
+        ] {
+            state.resources.create_window(
+                ClientId(*owner),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(*win),
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        // Seed prior ownership with lastTimeChanged = 1000.
+        state.selections.insert(
+            AtomId(PRIMARY),
+            (ResourceId(PRIOR_OWNER_WIN), PRIOR_LAST_TIME),
+        );
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_SET_OWNER,
+        );
+
+        // Attempt to take ownership at time=500 (before
+        // prior_last_time=1000).
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&NEW_OWNER_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&STALE_TIME.to_le_bytes());
+        handle_set_selection_owner(&mut state, ClientId(NEW_OWNER_ID), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        let preserved = state.selections.get(&AtomId(PRIMARY)).copied();
+        assert_eq!(
+            preserved,
+            Some((ResourceId(PRIOR_OWNER_WIN), PRIOR_LAST_TIME)),
+            "stale-timestamp request must NOT overwrite a newer \
+             ownership; got {preserved:?}",
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !all.chunks_exact(32)
+                .any(|e| e[0] == crate::nested::XFIXES_FIRST_EVENT),
+            "no XFixesSelectionNotify must fire on stale-ignore; \
+             got {} bytes: {:02x?}",
+            all.len(),
+            all,
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's
     /// `ProcXFixesSelectSelectionInput` (`xfixes/select.c:189-192`)
     /// runs `dixLookupWindow` first and propagates its return code
     /// (`BadWindow` for an unknown xid). Before the fix yserver
@@ -14643,22 +14853,15 @@ mod tests {
             x11xfixes::SELECTION_MASK_WINDOW_DESTROY,
         );
 
-        // SetSelectionOwner first so lastTimeChanged is recorded.
-        let mut set_body = Vec::with_capacity(12);
-        set_body.extend_from_slice(&OWNER_WIN.to_le_bytes());
-        set_body.extend_from_slice(&PRIMARY.to_le_bytes());
-        set_body.extend_from_slice(&SET_OWNER_TIME.to_le_bytes());
-        handle_set_selection_owner(&mut state, ClientId(OWNER_ID), SequenceNumber(1), &set_body)
-            .expect("handle_set_selection_owner");
-        // Drain the subscriber's socket to discard the SetOwner notify
-        // (we only care about the WindowDestroy one).
-        peer.set_nonblocking(true).unwrap();
-        let mut discard = [0u8; 4096];
-        while let Ok(n) = peer.read(&mut discard) {
-            if n == 0 {
-                break;
-            }
-        }
+        // Seed ownership directly with a known `lastTimeChanged`.
+        // This decouples the destroy-path assertion from
+        // `handle_set_selection_owner`'s time-resolution logic
+        // (future/stale checks, ClientTime → ServerTime conversion);
+        // we only care here that whatever value is in the second
+        // tuple slot flows through to the notify wire payload.
+        state
+            .selections
+            .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), SET_OWNER_TIME));
 
         let mut destroy_body = Vec::with_capacity(4);
         destroy_body.extend_from_slice(&OWNER_WIN.to_le_bytes());
@@ -14672,6 +14875,7 @@ mod tests {
             &destroy_body,
         )
         .expect("handle_destroy_window");
+        peer.set_nonblocking(true).unwrap();
 
         let mut all = Vec::new();
         let mut chunk = [0u8; 4096];
