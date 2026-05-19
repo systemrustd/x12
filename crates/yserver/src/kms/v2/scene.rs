@@ -337,14 +337,21 @@ pub(crate) struct SceneCompositor {
 }
 
 /// Stage 5 Phase H — env gate for the HW cursor strategy. Default
-/// OFF (`YSERVER_V2_HW_CURSOR=1` enables). Loud-but-nonfatal SW
-/// fallback if the plane init failed inside `PlatformBackend` —
-/// gate-on but plane-unavailable is fine, just always picks `Sw`.
+/// **ON**: empty/unset env var enables the strategy. Explicit
+/// `YSERVER_V2_HW_CURSOR=0` (or `false` / `no` / `off`) disables
+/// it for SW fallback / debugging. Loud-but-nonfatal SW fallback
+/// if the plane init failed inside `PlatformBackend` — gate-on but
+/// plane-unavailable is fine, just always picks `Sw`.
+///
+/// Inverted from the plan's original opt-in rollout shape once
+/// Phase A/B/C/D landed and the SW trail-elimination regression
+/// (`19d4e4d`) was identified as a SW-path bug independent of
+/// the HW strategy.
 fn hw_cursor_strategy_enabled() -> bool {
-    std::env::var("YSERVER_V2_HW_CURSOR")
-        .ok()
-        .as_deref()
-        .is_some_and(|v| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES"))
+    !matches!(
+        std::env::var("YSERVER_V2_HW_CURSOR").ok().as_deref(),
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+    )
 }
 
 /// Stage 5 Phase D — deferred upload slot held while at least one
