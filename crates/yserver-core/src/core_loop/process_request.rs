@@ -3343,7 +3343,7 @@ fn handle_composite_request(
                 );
                 for target in &targets {
                     crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                        state, backend, *target,
+                        state, backend, None, *target,
                     );
                 }
                 if backend.supports_redirect_activation() {

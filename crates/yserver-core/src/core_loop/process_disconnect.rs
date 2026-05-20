@@ -218,10 +218,10 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         if *subwindows {
             let kids: Vec<ResourceId> = state.resources.children(*window).to_vec();
             for child in kids {
-                teardown_redirect_for_window(state, backend, child);
+                teardown_redirect_for_window(state, backend, None, child);
             }
         } else {
-            teardown_redirect_for_window(state, backend, *window);
+            teardown_redirect_for_window(state, backend, None, *window);
         }
     }
     state
@@ -298,6 +298,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
 pub(crate) fn teardown_redirect_for_window(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    origin: Option<crate::backend::OriginContext>,
     window: ResourceId,
 ) {
     let (host_window, backing) = {
@@ -309,7 +310,7 @@ pub(crate) fn teardown_redirect_for_window(
     let Some(backing) = backing else {
         return;
     };
-    if let Err(err) = backend.release_redirected_backing(None, backing.host_pixmap) {
+    if let Err(err) = backend.release_redirected_backing(origin, backing.host_pixmap) {
         log::warn!(
             "release_redirected_backing(0x{:x}) failed: {err}",
             backing.host_pixmap.as_raw()
@@ -332,7 +333,7 @@ pub(crate) fn teardown_redirect_for_window(
         );
         return;
     };
-    if let Err(err) = backend.set_window_scene_participation(None, host_window, true) {
+    if let Err(err) = backend.set_window_scene_participation(origin, host_window, true) {
         log::warn!(
             "teardown_redirect_for_window: set_window_scene_participation(0x{:x}, true) failed: {err}",
             window.0
