@@ -3546,6 +3546,24 @@ impl Backend for KmsBackendV2 {
         if let Err(e) = do_dump_drawables_v2(self) {
             log::warn!("v2 dump_drawables: {e}");
         }
+        // Stage 4d shadow-hunt: COW vs scanout vs present-src must
+        // come from the same instant or the comparison is useless
+        // (the moment of interest is the first COW-targeted
+        // Present after caja paints, which moves on every frame).
+        // Pair the scanout dump with the drawable dump so a single
+        // Ctrl+Alt+F12 captures all three artifacts atomically.
+        if let Err(e) = do_dump_scanout_v2(self) {
+            log::warn!("v2 dump_drawables: scanout side: {e}");
+        }
+        // Surface the COW + present-src ring state so the user can
+        // tell at-a-glance whether the dump captured the expected
+        // shape (cow_id set, recent sources non-empty) without
+        // having to grep for the per-target log lines.
+        log::info!(
+            "v2 dump_drawables: cow_id={:?} present_to_cow_sources_len={}",
+            self.cow_id,
+            self.present_to_cow_sources.len(),
+        );
     }
 
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
