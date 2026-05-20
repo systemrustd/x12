@@ -139,6 +139,12 @@ pub struct RecordingBackend {
     /// methods take `&mut self`, so the test thread already has
     /// exclusive access.
     pub cow_next_release_is_final: bool,
+    /// Phase 2 (reparent reconciliation): lets tests opt in to
+    /// claiming `supports_redirect_activation = true` so the
+    /// production reconciliation block in `handle_reparent_window`
+    /// (gated on the trait method) actually runs. Default `false`
+    /// matches the trait default — v1 / host-X11 semantics.
+    pub redirect_activation_supported: bool,
 }
 
 impl Default for RecordingBackend {
@@ -157,7 +163,19 @@ impl RecordingBackend {
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
+            redirect_activation_supported: false,
         }
+    }
+
+    /// Phase 2: opt in to claiming
+    /// `supports_redirect_activation = true`. Used by tests that
+    /// exercise the reparent-redirect-reconciliation path
+    /// (`handle_reparent_window` gates its reconciliation block
+    /// on `backend.supports_redirect_activation()`).
+    #[must_use]
+    pub fn with_redirect_activation(mut self) -> Self {
+        self.redirect_activation_supported = true;
+        self
     }
 
     pub fn calls(&self) -> Vec<RecordedCall> {
@@ -210,6 +228,10 @@ impl Backend for RecordingBackend {
 
     fn composite_opcode(&self) -> Option<u8> {
         None
+    }
+
+    fn supports_redirect_activation(&self) -> bool {
+        self.redirect_activation_supported
     }
 
     fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
