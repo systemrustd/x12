@@ -27,6 +27,7 @@ pub struct VkContext {
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    pub image_drm_format_modifier_ext: Option<ash::ext::image_drm_format_modifier::Device>,
     /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
     /// device. Phase 4.2 DRI3 import needs this for non-LINEAR tilings;
     /// when false, `kms::vk::dri3::supported_modifiers` returns
@@ -261,6 +262,13 @@ impl VkContext {
         };
         let image_drm_format_modifier =
             device_extension_names.contains(&ash::ext::image_drm_format_modifier::NAME);
+        let image_drm_format_modifier_ext = if image_drm_format_modifier {
+            Some(ash::ext::image_drm_format_modifier::Device::new(
+                &instance, &device,
+            ))
+        } else {
+            None
+        };
 
         // Driver-id query. Diagnostic-only after the Vulkan-first
         // pivot — no path branches on it. Kept so future quirks can
@@ -280,6 +288,7 @@ impl VkContext {
             device,
             external_semaphore_fd,
             external_memory_fd,
+            image_drm_format_modifier_ext,
             image_drm_format_modifier,
             graphics_queue_family,
             graphics_queue,

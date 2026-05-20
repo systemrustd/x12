@@ -1135,6 +1135,7 @@ impl KmsBackend {
                     },
                     plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                    scanout_modifiers: Vec::new(),
                 },
                 swapchain: crate::drm::Swapchain::empty_for_tests(),
                 x: 0,
@@ -1660,6 +1661,7 @@ impl KmsBackend {
                             u32::from(l.width),
                             u32::from(l.height),
                             3,
+                            &l.output.scanout_modifiers,
                         ) {
                             Ok(pool) => {
                                 if let Some(first) = pool.bos.first() {
@@ -13046,6 +13048,7 @@ mod tests {
                 },
                 plane_fb_id_prop: ::drm::control::from_u32(2).unwrap(),
                 plane_crtc_id_prop: ::drm::control::from_u32(2).unwrap(),
+                scanout_modifiers: Vec::new(),
             },
             swapchain: crate::drm::Swapchain::empty_for_tests(),
             x,

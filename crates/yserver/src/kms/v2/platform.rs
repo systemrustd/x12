@@ -485,7 +485,14 @@ impl PlatformBackend {
         for (i, layout) in layouts.iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
-            match ScanoutBoPool::allocate(Arc::clone(&vk), Arc::clone(&device), w, h, 3) {
+            match ScanoutBoPool::allocate(
+                Arc::clone(&vk),
+                Arc::clone(&device),
+                w,
+                h,
+                3,
+                &layout.output.scanout_modifiers,
+            ) {
                 Ok(pool) => {
                     let n = pool.bos.len();
                     scanout_pools.push(Some(pool));
@@ -578,6 +585,7 @@ impl PlatformBackend {
                     },
                     plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                    scanout_modifiers: Vec::new(),
                 },
                 swapchain: drm::Swapchain::empty_for_tests(),
                 x: 0,

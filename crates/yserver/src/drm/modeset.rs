@@ -3,9 +3,12 @@ use std::{
     io,
 };
 
-use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, PlaneType,
-    atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
+use drm::{
+    buffer::DrmFourcc,
+    control::{
+        AtomicCommitFlags, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, PlaneType,
+        atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
+    },
 };
 
 use crate::drm::Device;
@@ -80,6 +83,11 @@ pub struct Output {
     pub picked: Mode,
     pub plane_fb_id_prop: property::Handle,
     pub plane_crtc_id_prop: property::Handle,
+    /// DRM modifiers accepted by the primary plane for XRGB8888
+    /// scanout, parsed from the optional IN_FORMATS property. Empty
+    /// means the driver did not expose IN_FORMATS or parsing failed;
+    /// callers should fall back to conservative legacy probing.
+    pub scanout_modifiers: Vec<u64>,
 }
 
 /// One connected connector along with its candidate CRTCs and primary planes.
@@ -299,6 +307,7 @@ fn finalize_output(
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
     let plane_fb_id_prop = plane_props_map.id("FB_ID")?;
     let plane_crtc_id_prop = plane_props_map.id("CRTC_ID")?;
+    let scanout_modifiers = plane_scanout_modifiers(device, asg.plane)?;
 
     log::info!(
         "yserver: connector={} crtc={:?} plane={:?} mode={} ({}x{}@{}{})",
@@ -321,7 +330,103 @@ fn finalize_output(
         picked,
         plane_fb_id_prop,
         plane_crtc_id_prop,
+        scanout_modifiers,
     })
+}
+
+fn plane_scanout_modifiers(device: &Device, plane: plane::Handle) -> io::Result<Vec<u64>> {
+    let props = device.get_properties(plane)?;
+    for (prop_handle, raw_value) in &props {
+        let info = device.get_property(*prop_handle)?;
+        if info.name().to_bytes() != b"IN_FORMATS" {
+            continue;
+        }
+        if *raw_value == 0 {
+            return Ok(Vec::new());
+        }
+        let blob = device.get_property_blob(*raw_value)?;
+        return Ok(parse_in_formats_modifiers(
+            &blob,
+            DrmFourcc::Xrgb8888 as u32,
+        ));
+    }
+    Ok(Vec::new())
+}
+
+fn parse_in_formats_modifiers(blob: &[u8], wanted_format: u32) -> Vec<u64> {
+    const HEADER_LEN: usize = 24;
+    const MODIFIER_LEN: usize = 24;
+
+    if blob.len() < HEADER_LEN {
+        return Vec::new();
+    }
+
+    let read_u32 = |offset: usize| -> Option<u32> {
+        let bytes: [u8; 4] = blob.get(offset..offset + 4)?.try_into().ok()?;
+        Some(u32::from_ne_bytes(bytes))
+    };
+    let read_u64 = |offset: usize| -> Option<u64> {
+        let bytes: [u8; 8] = blob.get(offset..offset + 8)?.try_into().ok()?;
+        Some(u64::from_ne_bytes(bytes))
+    };
+
+    let Some(count_formats) = read_u32(8).map(|n| n as usize) else {
+        return Vec::new();
+    };
+    let Some(formats_offset) = read_u32(12).map(|n| n as usize) else {
+        return Vec::new();
+    };
+    let Some(count_modifiers) = read_u32(16).map(|n| n as usize) else {
+        return Vec::new();
+    };
+    let Some(modifiers_offset) = read_u32(20).map(|n| n as usize) else {
+        return Vec::new();
+    };
+
+    let Some(formats_end) = formats_offset.checked_add(count_formats.saturating_mul(4)) else {
+        return Vec::new();
+    };
+    let Some(modifiers_end) =
+        modifiers_offset.checked_add(count_modifiers.saturating_mul(MODIFIER_LEN))
+    else {
+        return Vec::new();
+    };
+    if formats_end > blob.len() || modifiers_end > blob.len() {
+        return Vec::new();
+    }
+
+    let mut formats = Vec::with_capacity(count_formats);
+    for i in 0..count_formats {
+        let Some(format) = read_u32(formats_offset + i * 4) else {
+            return Vec::new();
+        };
+        formats.push(format);
+    }
+
+    let mut modifiers = Vec::new();
+    for i in 0..count_modifiers {
+        let base = modifiers_offset + i * MODIFIER_LEN;
+        let Some(format_bits) = read_u64(base) else {
+            return Vec::new();
+        };
+        let Some(offset) = read_u32(base + 8) else {
+            return Vec::new();
+        };
+        let Some(modifier) = read_u64(base + 16) else {
+            return Vec::new();
+        };
+        let offset = offset as usize;
+        for bit in 0..64 {
+            if (format_bits & (1_u64 << bit)) == 0 {
+                continue;
+            }
+            let idx = offset + bit;
+            if formats.get(idx).copied() == Some(wanted_format) && !modifiers.contains(&modifier) {
+                modifiers.push(modifier);
+            }
+        }
+    }
+    modifiers
 }
 
 pub fn discover_output(device: &Device) -> io::Result<Output> {
@@ -605,5 +710,36 @@ mod tests {
         let cands = vec![cand(1, "HDMI-NoPlane", vec![c0], vec![(p0, &[c_other])])];
         let err = assign_outputs(&cands).expect_err("must error");
         assert_eq!(err, "HDMI-NoPlane");
+    }
+
+    #[test]
+    fn parses_in_formats_modifiers_for_xrgb8888() {
+        let mut blob = Vec::new();
+        let formats = [0x1111_1111, DrmFourcc::Xrgb8888 as u32];
+        let formats_offset = 24_u32;
+        let modifiers_offset = 32_u32;
+        blob.extend_from_slice(&1_u32.to_ne_bytes()); // version
+        blob.extend_from_slice(&0_u32.to_ne_bytes()); // flags
+        blob.extend_from_slice(&(formats.len() as u32).to_ne_bytes());
+        blob.extend_from_slice(&formats_offset.to_ne_bytes());
+        blob.extend_from_slice(&2_u32.to_ne_bytes()); // count_modifiers
+        blob.extend_from_slice(&modifiers_offset.to_ne_bytes());
+        for format in formats {
+            blob.extend_from_slice(&format.to_ne_bytes());
+        }
+
+        // Modifier 0 applies to format index 0 only; modifier 1 applies
+        // to format index 1 (XRGB8888).
+        blob.extend_from_slice(&1_u64.to_ne_bytes()); // formats bitset
+        blob.extend_from_slice(&0_u32.to_ne_bytes()); // offset
+        blob.extend_from_slice(&0_u32.to_ne_bytes()); // pad
+        blob.extend_from_slice(&0xaaaa_u64.to_ne_bytes());
+        blob.extend_from_slice(&(1_u64 << 1).to_ne_bytes());
+        blob.extend_from_slice(&0_u32.to_ne_bytes());
+        blob.extend_from_slice(&0_u32.to_ne_bytes());
+        blob.extend_from_slice(&0xbbbb_u64.to_ne_bytes());
+
+        let modifiers = parse_in_formats_modifiers(&blob, DrmFourcc::Xrgb8888 as u32);
+        assert_eq!(modifiers, vec![0xbbbb]);
     }
 }

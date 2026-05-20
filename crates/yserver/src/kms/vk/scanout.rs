@@ -7,13 +7,14 @@
 //!
 //! ## Allocation direction
 //!
-//! Vulkan-first: each [`ScanoutBo`] owns a `VkImage` allocated with
-//! `VK_IMAGE_TILING_LINEAR` and bound to device memory carrying
-//! `VkExportMemoryAllocateInfo(handleType=DMA_BUF)`. The memory is
-//! exported as a dma-buf via `vkGetMemoryFdKHR`, the dma-buf is
-//! imported into the DRM device via `PRIME_FD_TO_HANDLE`, and the
-//! resulting GEM handle is registered as a DRM framebuffer with
-//! `add_fb2` (no modifier flag — linear, untagged).
+//! Vulkan-first: each [`ScanoutBo`] owns a dma-buf-exportable
+//! `VkImage`. The preferred path allocates it with an explicit DRM
+//! format modifier from the KMS primary plane / Vulkan intersection;
+//! fallback paths keep the historical `VK_IMAGE_TILING_LINEAR` image.
+//! The memory is exported as a dma-buf via `vkGetMemoryFdKHR`, the
+//! dma-buf is imported into the DRM device via `PRIME_FD_TO_HANDLE`,
+//! and the resulting GEM handle is registered as a DRM framebuffer
+//! with `add_fb2`.
 //!
 //! Why Vulkan-first instead of GBM-first:
 //! - Works on RADV gfx8/Polaris (no `VK_EXT_image_drm_format_modifier`
@@ -278,8 +279,8 @@ pub struct ScanoutBoPool {
 }
 
 impl ScanoutBo {
-    /// Allocate one Vulkan-first scanout bo: VkImage TILING_LINEAR +
-    /// dma-buf-exportable memory + DRM framebuffer registration.
+    /// Allocate one Vulkan-first scanout bo: VkImage + dma-buf-
+    /// exportable memory + DRM framebuffer registration.
     /// All steps must succeed; partial allocations are unwound on
     /// error so the returned `Err` leaves no resources leaked.
     pub fn allocate(
@@ -287,25 +288,59 @@ impl ScanoutBo {
         drm: Arc<crate::drm::Device>,
         width: u32,
         height: u32,
+        scanout_modifiers: &[u64],
+    ) -> io::Result<Self> {
+        let modifier_candidates = scanout_modifier_candidates(&vk, scanout_modifiers);
+        let plans = scanout_allocation_plans(&vk, &modifier_candidates);
+        let mut errors = Vec::new();
+
+        for plan in plans {
+            match Self::allocate_with_plan(Arc::clone(&vk), Arc::clone(&drm), width, height, plan) {
+                Ok(bo) => {
+                    log::info!(
+                        "scanout bo: {} succeeded ({}x{}, pitch {})",
+                        plan.describe(),
+                        width,
+                        height,
+                        bo.pitch,
+                    );
+                    return Ok(bo);
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {e}", plan.describe()));
+                }
+            }
+        }
+
+        Err(io::Error::other(format!(
+            "scanout allocation failed for every path: {}",
+            errors.join("; ")
+        )))
+    }
+
+    fn allocate_with_plan(
+        vk: Arc<VkContext>,
+        drm: Arc<crate::drm::Device>,
+        width: u32,
+        height: u32,
+        plan: ScanoutAllocationPlan,
     ) -> io::Result<Self> {
         // 1. VkImage + memory + dma-buf export.
-        let img = allocate_vk_scanout_image(&vk, width, height)
+        let img = allocate_vk_scanout_image(&vk, width, height, plan)
             .map_err(|e| io::Error::other(format!("vk scanout image: {e}")))?;
         let VkScanoutImage {
             image,
             memory,
             dmabuf,
             pitch,
+            modifier,
         } = img;
 
         // 2. PRIME_FD_TO_HANDLE on the DRM device.
         let gem_handle = match drm.prime_fd_to_buffer(dmabuf.as_fd()) {
             Ok(h) => h,
             Err(e) => {
-                unsafe {
-                    vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
-                }
+                destroy_scanout_image(&vk, image, memory);
                 return Err(io::Error::other(format!("drm prime_fd_to_buffer: {e}")));
             }
         };
@@ -313,24 +348,24 @@ impl ScanoutBo {
         // fd we no longer need.
         drop(dmabuf);
 
-        // 3. add_fb2 (no modifiers — linear, untagged).
+        // 3. add_fb2. Modifier-backed paths must pass the MODIFIERS
+        // flag even for DRM_FORMAT_MOD_LINEAR; the legacy fallback
+        // deliberately keeps the old untagged shape.
         let fb_handle = match drm.add_planar_framebuffer(
             &VkScanoutFb {
                 gem_handle,
                 width,
                 height,
                 pitch,
+                modifier,
             },
-            FbCmd2Flags::empty(),
+            addfb_flags_for_modifier(modifier),
         ) {
             Ok(h) => h,
             Err(e) => {
                 let _ = drm.close_buffer(gem_handle);
-                unsafe {
-                    vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
-                }
-                return Err(io::Error::other(format!("drm add_fb (linear): {e}")));
+                destroy_scanout_image(&vk, image, memory);
+                return Err(io::Error::other(format!("drm add_fb: {e}")));
             }
         };
 
@@ -623,6 +658,7 @@ impl ScanoutBoPool {
         width: u32,
         height: u32,
         count: usize,
+        scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
@@ -631,42 +667,230 @@ impl ScanoutBoPool {
                 Arc::clone(&drm),
                 width,
                 height,
+                scanout_modifiers,
             )?);
         }
         Ok(Self { bos, width, height })
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanoutAllocationPlan {
+    /// A single DRM modifier from the KMS/Vulkan intersection.
+    DrmModifier(u64),
+    /// Linear VkImage, but register the DRM framebuffer with an
+    /// explicit DRM_FORMAT_MOD_LINEAR modifier.
+    ExplicitLinear,
+    /// Historical fallback: linear VkImage, untagged addfb2.
+    LegacyLinear,
+}
+
+impl ScanoutAllocationPlan {
+    fn describe(self) -> String {
+        match self {
+            Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
+            Self::ExplicitLinear => "explicit-linear".to_string(),
+            Self::LegacyLinear => "legacy-linear".to_string(),
+        }
+    }
+}
+
+fn scanout_allocation_plans(
+    vk: &VkContext,
+    modifier_candidates: &[u64],
+) -> Vec<ScanoutAllocationPlan> {
+    let mut plans = Vec::new();
+    if vk.image_drm_format_modifier {
+        plans.extend(
+            modifier_candidates
+                .iter()
+                .copied()
+                .map(ScanoutAllocationPlan::DrmModifier),
+        );
+    }
+    plans.push(ScanoutAllocationPlan::ExplicitLinear);
+    plans.push(ScanoutAllocationPlan::LegacyLinear);
+    plans
+}
+
+fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) -> Vec<u64> {
+    if kms_scanout_modifiers.is_empty() {
+        return Vec::new();
+    }
+
+    let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
+    let mut candidates = Vec::new();
+
+    if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && vulkan.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+    {
+        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
+    }
+
+    for modifier in kms_scanout_modifiers {
+        if *modifier == super::dri3::DRM_FORMAT_MOD_LINEAR {
+            continue;
+        }
+        if vulkan.contains(modifier)
+            && scanout_modifier_is_single_plane_exportable(vk, *modifier)
+            && !candidates.contains(modifier)
+        {
+            candidates.push(*modifier);
+        }
+    }
+
+    candidates
+}
+
+fn scanout_modifier_is_single_plane_exportable(vk: &VkContext, modifier: u64) -> bool {
+    use std::ffi::c_void;
+
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    external_info.p_next = std::ptr::from_mut(&mut modifier_info).cast::<c_void>();
+
+    let mut format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(scanout_image_usage());
+    format_info.p_next = std::ptr::from_mut(&mut external_info).cast::<c_void>();
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    if unsafe {
+        vk.instance.get_physical_device_image_format_properties2(
+            vk.physical_device,
+            &format_info,
+            &mut props2,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+
+    external_props
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        && external_props
+            .external_memory_properties
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        && drm_modifier_plane_count(vk, modifier) == Some(1)
+}
+
+fn drm_modifier_plane_count(vk: &VkContext, modifier: u64) -> Option<u32> {
+    let modifier_count = {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            vk.instance.get_physical_device_format_properties2(
+                vk.physical_device,
+                vk::Format::B8G8R8A8_UNORM,
+                &mut format_props,
+            );
+        }
+        list.drm_format_modifier_count
+    };
+    if modifier_count == 0 {
+        return None;
+    }
+
+    let mut props_storage =
+        vec![vk::DrmFormatModifierPropertiesEXT::default(); modifier_count as usize];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut props_storage);
+    let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe {
+        vk.instance.get_physical_device_format_properties2(
+            vk.physical_device,
+            vk::Format::B8G8R8A8_UNORM,
+            &mut format_props,
+        );
+    }
+    let entries = list.drm_format_modifier_count as usize;
+    props_storage
+        .iter()
+        .take(entries)
+        .find(|p| p.drm_format_modifier == modifier)
+        .map(|p| p.drm_format_modifier_plane_count)
+}
+
+fn scanout_image_usage() -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::SAMPLED
+}
+
+fn addfb_flags_for_modifier(modifier: Option<u64>) -> FbCmd2Flags {
+    if modifier.is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    }
+}
+
+fn destroy_scanout_image(vk: &VkContext, image: vk::Image, memory: vk::DeviceMemory) {
+    unsafe {
+        vk.device.destroy_image(image, None);
+        vk.device.free_memory(memory, None);
+    }
+}
+
 /// Outputs of [`allocate_vk_scanout_image`]: a freshly-bound VkImage,
-/// its memory, the dma-buf fd we exported from that memory, and the
-/// row pitch the driver chose.
+/// its memory, the dma-buf fd we exported from that memory, the
+/// row pitch the driver chose, and the optional DRM modifier to use
+/// for framebuffer registration.
 struct VkScanoutImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     dmabuf: OwnedFd,
     pitch: u32,
+    modifier: Option<u64>,
 }
 
-/// Allocate a `VK_IMAGE_TILING_LINEAR` `VkImage` whose memory is
-/// dma-buf-exportable; bind memory; export the dma-buf; query the
-/// row pitch the driver picked.
+/// Allocate a scanout `VkImage` whose memory is dma-buf-exportable;
+/// bind memory; export the dma-buf; query the row pitch the driver
+/// picked.
 fn allocate_vk_scanout_image(
     vk: &VkContext,
     width: u32,
     height: u32,
+    plan: ScanoutAllocationPlan,
 ) -> Result<VkScanoutImage, vk::Result> {
     let ext_memory_fd = vk
         .external_memory_fd
         .as_ref()
         .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
-    // 1. VkImage with TILING_LINEAR + DMA_BUF external-memory hint.
-    //    Linear is what avoids needing
-    //    VK_EXT_image_drm_format_modifier; KMS just sees a regular
-    //    untagged framebuffer.
+    let drm_modifier = match plan {
+        ScanoutAllocationPlan::DrmModifier(modifier) => Some(modifier),
+        ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => None,
+    };
+
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let image_info = vk::ImageCreateInfo::default()
+    let modifier_storage = [drm_modifier.unwrap_or(super::dri3::DRM_FORMAT_MOD_LINEAR)];
+    let mut modifier_list = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+        .drm_format_modifiers(if drm_modifier.is_some() {
+            &modifier_storage
+        } else {
+            &[]
+        });
+
+    let tiling = match plan {
+        ScanoutAllocationPlan::DrmModifier(_) => vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+        ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
+            vk::ImageTiling::LINEAR
+        }
+    };
+
+    let image_info_base = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(vk::Format::B8G8R8A8_UNORM)
         .extent(vk::Extent3D {
@@ -677,30 +901,20 @@ fn allocate_vk_scanout_image(
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::LINEAR)
-        .usage(
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::SAMPLED,
-        )
+        .tiling(tiling)
+        .usage(scanout_image_usage())
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push_next(&mut external_info);
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    let image_info = if drm_modifier.is_some() {
+        image_info_base
+            .push_next(&mut external_info)
+            .push_next(&mut modifier_list)
+    } else {
+        image_info_base.push_next(&mut external_info)
+    };
 
     let image = unsafe { vk.device.create_image(&image_info, None)? };
-
-    // 2. Row pitch from the driver. We need this for KMS add_fb2.
-    let layout = unsafe {
-        vk.device.get_image_subresource_layout(
-            image,
-            vk::ImageSubresource {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                array_layer: 0,
-            },
-        )
-    };
-    let pitch = u32::try_from(layout.row_pitch).unwrap_or(u32::MAX);
 
     // 3. Memory: dma-buf-exportable + dedicated to this image.
     let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
@@ -752,6 +966,44 @@ fn allocate_vk_scanout_image(
         return Err(e);
     }
 
+    let selected_modifier = match plan {
+        ScanoutAllocationPlan::DrmModifier(_) => {
+            let Some(ext) = vk.image_drm_format_modifier_ext.as_ref() else {
+                unsafe {
+                    vk.device.free_memory(memory, None);
+                    vk.device.destroy_image(image, None);
+                }
+                return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+            };
+            let mut props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+            if let Err(e) =
+                unsafe { ext.get_image_drm_format_modifier_properties(image, &mut props) }
+            {
+                unsafe {
+                    vk.device.free_memory(memory, None);
+                    vk.device.destroy_image(image, None);
+                }
+                return Err(e);
+            }
+            Some(props.drm_format_modifier)
+        }
+        ScanoutAllocationPlan::ExplicitLinear => Some(super::dri3::DRM_FORMAT_MOD_LINEAR),
+        ScanoutAllocationPlan::LegacyLinear => None,
+    };
+
+    // Row pitch from the driver. We need this for KMS addfb2.
+    let layout = unsafe {
+        vk.device.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            },
+        )
+    };
+    let pitch = u32::try_from(layout.row_pitch).unwrap_or(u32::MAX);
+
     // 4. Export the bound memory as a dma-buf fd.
     let get_fd_info = vk::MemoryGetFdInfoKHR::default()
         .memory(memory)
@@ -774,17 +1026,20 @@ fn allocate_vk_scanout_image(
         memory,
         dmabuf,
         pitch,
+        modifier: selected_modifier,
     })
 }
 
 /// Adapter that lets a freshly-imported GEM handle be passed to
 /// drm 0.15's `add_planar_framebuffer` as a `PlanarBuffer`. Single
-/// plane, linear (no modifier).
+/// plane; modifier is present for explicit-modifier addfb2 paths and
+/// absent only for the legacy untagged-linear fallback.
 struct VkScanoutFb {
     gem_handle: DrmBufferHandle,
     width: u32,
     height: u32,
     pitch: u32,
+    modifier: Option<u64>,
 }
 
 impl DrmPlanarBuffer for VkScanoutFb {
@@ -795,9 +1050,7 @@ impl DrmPlanarBuffer for VkScanoutFb {
         DrmFourcc::Xrgb8888
     }
     fn modifier(&self) -> Option<DrmModifier> {
-        // Linear, no explicit modifier — empty FbCmd2Flags goes
-        // through the legacy add_fb2 code path.
-        None
+        self.modifier.map(DrmModifier::from)
     }
     fn pitches(&self) -> [u32; 4] {
         [self.pitch, 0, 0, 0]
@@ -1152,5 +1405,14 @@ mod tests {
         let released = bo.transition_to_free_after_modeset_reset();
         assert_eq!(released.in_fence, None);
         assert_eq!(released.release_fence, None);
+    }
+
+    #[test]
+    fn addfb_modifier_flag_tracks_modifier_presence() {
+        assert_eq!(addfb_flags_for_modifier(None), FbCmd2Flags::empty());
+        assert_eq!(
+            addfb_flags_for_modifier(Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)),
+            FbCmd2Flags::MODIFIERS
+        );
     }
 }
