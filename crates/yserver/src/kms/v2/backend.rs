@@ -174,6 +174,17 @@ pub struct KmsBackendV2 {
     /// branchless line; production paths don't observe it.
     pub(crate) clear_window_area_calls: u32,
 
+    /// Counter incremented every time `copy_area` reaches its
+    /// engine.copy_area dispatch loop (i.e. every surviving
+    /// sub-rect after GC clip + ClipByChildren). Used by the
+    /// `copy_area_clip_by_children_skips_manually_redirected_child`
+    /// regression test to verify the manual-redirect exception
+    /// without needing a Vk-backed fixture: pre-fix a manual-
+    /// redirected child fully covering the dst clips the rect to
+    /// empty and the loop never runs (counter = 0); post-fix the
+    /// counter increments at least once.
+    pub(crate) engine_copy_area_calls: u32,
+
     /// Diagnostic ring of recent `PRESENT::Pixmap` source xids
     /// targeted at COW. Captured via `note_present_pixmap` and
     /// consumed by `do_dump_drawables_v2` so the per-drawable
@@ -413,6 +424,7 @@ impl KmsBackendV2 {
             telemetry: Telemetry::new(),
             cow_id: None,
             clear_window_area_calls: 0,
+            engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
@@ -932,6 +944,7 @@ impl KmsBackendV2 {
             telemetry: Telemetry::new(),
             cow_id: None,
             clear_window_area_calls: 0,
+            engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
@@ -5137,22 +5150,46 @@ impl Backend for KmsBackendV2 {
         {
             let child_rects: Vec<ash::vk::Rect2D> = self
                 .windows_v2
-                .values()
-                .filter_map(|geom| {
-                    if geom.parent == Some(dst_host_xid) && geom.mapped {
-                        Some(ash::vk::Rect2D {
-                            offset: ash::vk::Offset2D {
-                                x: i32::from(geom.x),
-                                y: i32::from(geom.y),
-                            },
-                            extent: ash::vk::Extent2D {
-                                width: u32::from(geom.width.max(1)),
-                                height: u32::from(geom.height.max(1)),
-                            },
-                        })
-                    } else {
-                        None
+                .iter()
+                .filter_map(|(child_host_xid, geom)| {
+                    if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
+                        return None;
                     }
+                    // Manually-redirected children don't claim the
+                    // parent's pixmap real estate — the redirecting
+                    // compositor (which may BE the parent's own
+                    // client, e.g. notification-area-applet over
+                    // its tray sockets) places the children's pixels
+                    // explicitly via subsequent ops. Subtracting them
+                    // strips the compositor's own composite-target
+                    // rect to empty. Same shape as the protocol-layer
+                    // fix at process_request.rs:copy_area_effective_dst_rects.
+                    //
+                    // Detect via v2's `scene_participating` flag: it
+                    // is set to `false` when redirect mode is Manual
+                    // (the X server stops auto-painting the window
+                    // into the scene/parent). Automatic redirect
+                    // keeps it `true`, so Automatic children still
+                    // clip — protecting the marco/CC frame test from
+                    // regression.
+                    let is_manually_redirected = self
+                        .store
+                        .lookup(*child_host_xid)
+                        .and_then(|id| self.store.get(id))
+                        .is_some_and(|d| !d.scene_participating);
+                    if is_manually_redirected {
+                        return None;
+                    }
+                    Some(ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(geom.x),
+                            y: i32::from(geom.y),
+                        },
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(geom.width.max(1)),
+                            height: u32::from(geom.height.max(1)),
+                        },
+                    })
                 })
                 .collect();
             if child_rects.is_empty() {
@@ -5190,6 +5227,7 @@ impl Backend for KmsBackendV2 {
                 x: sub_dst_x + dst_target.offset.0,
                 y: sub_dst_y + dst_target.offset.1,
             };
+            self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
             if let Err(e) = self.engine.copy_area(
                 &mut self.store,
                 &mut self.platform,
@@ -10289,6 +10327,289 @@ mod tests {
             backend.clear_window_area_calls, calls_before,
             "CWBackPixel on a window routed to a redirected ancestor must \
              also skip the eager clear"
+        );
+    }
+
+    /// v2 backend's `copy_area` does ITS OWN ClipByChildren split
+    /// (independent of the protocol-layer split in
+    /// `copy_area_effective_dst_rects`). That second pass had no
+    /// manual-redirect exemption, so even when the protocol layer
+    /// delivered a non-empty sub-rect for a tray-style scenario,
+    /// the v2 layer re-clipped it to empty and the engine call
+    /// never fired. Pin the v2 side's exemption directly: parent
+    /// with mapped child fully overlapping, child's scene
+    /// participation is false (Manual-redirect semantics) → the
+    /// engine.copy_area dispatch loop must run at least once.
+    #[test]
+    fn copy_area_clip_by_children_skips_manually_redirected_child() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        let parent_xid: u32 = 0x100_0001;
+        let child_xid: u32 = 0x100_0002;
+        let src_pixmap_xid: u32 = 0x100_0003;
+
+        let parent_stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            parent_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: parent_stack_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                parent_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc parent");
+
+        // Manually-redirected child fully covering the parent.
+        // scene_participating=false is the v2-store reflection of
+        // Manual-redirect semantics (X server stops auto-painting
+        // it into the scene/parent backing).
+        let child_stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            child_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(parent_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: child_stack_rank,
+                cursor: None,
+            },
+        );
+        let child_id = b
+            .store
+            .allocate(
+                child_xid,
+                DrawableKind::Window,
+                24,
+                false, // scene_participating=false → Manual semantics
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc manual-redirected child");
+        // Allocate the child's redirected backing pixmap so the
+        // scene_participating=false + has-backing combination
+        // matches Manual semantics (not just an unmapped or
+        // input-only window).
+        let backing_id = b
+            .store
+            .allocate(
+                0x100_0099,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc child backing");
+        assert!(b.test_set_redirected_target(child_xid, 0x100_0099));
+        let _ = (child_id, backing_id);
+
+        // Source pixmap for the copy.
+        b.store
+            .allocate(
+                src_pixmap_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc src pixmap");
+
+        // Pre-call snapshot — engine isn't a real Vk so each
+        // engine.copy_area returns NoVk, but the counter increments
+        // *before* the call, which is what we're measuring (the
+        // surviving-sub-rect count, not engine success).
+        let calls_before = b.engine_copy_area_calls;
+
+        b.copy_area(None, src_pixmap_xid, parent_xid, 0, 0, 0, 0, 100, 80)
+            .expect("copy_area must not return Err");
+
+        assert!(
+            b.engine_copy_area_calls > calls_before,
+            "engine.copy_area must dispatch at least once when the only \
+             child fully overlapping the dst is manually redirected; \
+             pre-fix the v2 ClipByChildren clipped the rect to empty and \
+             the loop never ran (counter unchanged) — the live symptom \
+             being notification-area-applet's CopyArea silently dropped"
+        );
+    }
+
+    /// Regression guard: an AUTOMATIC-redirected child (i.e. one
+    /// whose own backing exists but `scene_participating=true`)
+    /// must STILL be subtracted by v2's ClipByChildren. The
+    /// manual-only exemption in
+    /// `copy_area_clip_by_children_skips_manually_redirected_child`
+    /// must not loosen this case — under Automatic mode the X
+    /// server auto-composites the child's backing into the parent's
+    /// pixmap, so the parent's own paint must avoid those rects.
+    #[test]
+    fn copy_area_clip_by_children_still_subtracts_automatic_child_in_v2() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        let parent_xid: u32 = 0x200_0001;
+        let child_xid: u32 = 0x200_0002;
+        let src_pixmap_xid: u32 = 0x200_0003;
+
+        let parent_stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            parent_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: parent_stack_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                parent_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc parent");
+
+        // Automatic-redirected child fully covering the parent —
+        // distinguished by `scene_participating=true` even though it
+        // has its own redirected backing.
+        let child_stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            child_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(parent_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: child_stack_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                child_xid,
+                DrawableKind::Window,
+                24,
+                true, // scene_participating=true → Automatic semantics
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc automatic-redirected child");
+        b.store
+            .allocate(
+                0x200_0099,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc child backing");
+        assert!(b.test_set_redirected_target(child_xid, 0x200_0099));
+
+        b.store
+            .allocate(
+                src_pixmap_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc src pixmap");
+
+        let calls_before = b.engine_copy_area_calls;
+
+        b.copy_area(None, src_pixmap_xid, parent_xid, 0, 0, 0, 0, 100, 80)
+            .expect("copy_area must not return Err");
+
+        assert_eq!(
+            b.engine_copy_area_calls, calls_before,
+            "Automatic-redirected child fully covering dst must still be \
+             subtracted (clip to empty → no engine.copy_area dispatch). \
+             The manual-only exemption must not loosen this case."
         );
     }
 
