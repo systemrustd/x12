@@ -1639,9 +1639,7 @@ fn handle_render_request(
             // y_off(2) then variable trapezoid list.
             if body.len() >= 4 {
                 let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-                if let Some(dst_drawable) =
-                    state.resources.picture(pic).and_then(|p| p.drawable)
-                {
+                if let Some(dst_drawable) = state.resources.picture(pic).and_then(|p| p.drawable) {
                     let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
             }
