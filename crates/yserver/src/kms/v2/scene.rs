@@ -1564,35 +1564,60 @@ fn build_scene(
             }
         }
     }
-    // Stage 4 diagnostic: trace-level scene-walk marker. Brackets
-    // the per-top-level traces emitted inside `emit_window_subtree`
-    // so grep+awk can carve out one frame's worth of decisions.
-    // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`.
-    log::trace!(
-        "v2 scene_walk begin output={output_idx} top_levels={n} \
-         layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
-        n = core.top_level_order.len(),
-    );
-    for &top_xid in &core.top_level_order {
-        emit_window_subtree(
-            top_xid,
-            0,
-            0,
-            store,
-            windows_v2,
-            layout_x0,
-            layout_y0,
-            layout_w,
-            layout_h,
-            &mut draws,
-            &mut snapshots,
-            &mut sampled_ids,
-            &mut projected,
-            // Top-level windows start with no redirected ancestor;
-            // the flag flips on inside the recursion when entering
-            // a redirected window's subtree.
-            false,
+    // Stage 4d — COW-authoritative mode (option 2a from the
+    // shadow-hunt). Once a compositor has registered COW (i.e.
+    // `cow.is_some()` — set by `register_cow` on the first paint
+    // that lands in COW), the scene strips per-top-level entries.
+    // Scanout becomes `root + COW + cursor` only, mirroring Xorg's
+    // compositor contract: the X server doesn't itself compose
+    // redirected toplevels; the compositor reads the redirected
+    // backings, composes, and Presents the result into COW.
+    //
+    // Emitting top-levels alongside COW in v2 invented a layered-
+    // damage model that turned every gap (missed projection, off-
+    // by-one ancestor walk, ack timing, scene_participating gate)
+    // into a visible artefact. Skipping the walk removes that
+    // whole class of failure.
+    //
+    // `cow.is_none()` covers two cases that must still emit top-
+    // levels: (1) no compositor active, scene must drive the
+    // display itself; (2) compositor active but hasn't painted
+    // into COW yet, so the initial frame isn't a blank screen.
+    if cow.is_some() {
+        log::trace!(
+            "v2 scene_walk begin output={output_idx} cow_authoritative=true \
+             top_levels_skipped={n} \
+             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+            n = core.top_level_order.len(),
         );
+    } else {
+        log::trace!(
+            "v2 scene_walk begin output={output_idx} cow_authoritative=false \
+             top_levels={n} \
+             layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+            n = core.top_level_order.len(),
+        );
+        for &top_xid in &core.top_level_order {
+            emit_window_subtree(
+                top_xid,
+                0,
+                0,
+                store,
+                windows_v2,
+                layout_x0,
+                layout_y0,
+                layout_w,
+                layout_h,
+                &mut draws,
+                &mut snapshots,
+                &mut sampled_ids,
+                &mut projected,
+                // Top-level windows start with no redirected ancestor;
+                // the flag flips on inside the recursion when entering
+                // a redirected window's subtree.
+                false,
+            );
+        }
     }
     log::trace!(
         "v2 scene_walk end output={output_idx} draws={n_draws} \
