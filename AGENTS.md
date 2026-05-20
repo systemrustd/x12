@@ -14,6 +14,7 @@ focus is on yserver (KMS) now
 - impl plans go in docs/superpowers/plans
 - work on feature branch for phases
 - squash merge when ready (ask confirmation)
+- Spec compliance is the goal, but if Xorg deviates from spec (unlikely), we need to follow Xorg, clients are tested for 40+ years on Xorg.
 
 ## environment
 
