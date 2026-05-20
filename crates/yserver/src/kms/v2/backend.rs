@@ -1029,13 +1029,23 @@ impl KmsBackendV2 {
         // to window paints that ought to have hit a redirect.
         if log::log_enabled!(target: "yserver::kms::v2::paint", log::Level::Trace)
             && let Some(t) = result.as_ref()
-            && t.id == leaf_id
             && self.windows_v2.contains_key(&host_xid)
         {
-            log::trace!(
-                target: "yserver::kms::v2::paint",
-                "resolve_paint_target NO_REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?}",
-            );
+            if t.id == leaf_id {
+                log::trace!(
+                    target: "yserver::kms::v2::paint",
+                    "resolve_paint_target NO_REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?}",
+                );
+            } else {
+                log::trace!(
+                    target: "yserver::kms::v2::paint",
+                    "resolve_paint_target REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?} \
+                     backing_id={:?} offset=({},{})",
+                    t.id,
+                    t.offset.0,
+                    t.offset.1,
+                );
+            }
         }
         result
     }

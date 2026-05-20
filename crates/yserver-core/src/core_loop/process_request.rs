@@ -7227,8 +7227,21 @@ fn handle_reparent_window(
             .window(window)
             .is_some_and(|w| w.redirected_backing.is_some());
 
+        log::debug!(
+            "reparent reconcile: window=0x{:x} old_parent=0x{:x} new_parent=0x{:x} \
+             old_redirects_sub={old_parent_redirects_subwindows} \
+             new_redirects_sub={new_parent_redirects_subwindows} \
+             directly_redirected={directly_redirected} had_backing={had_backing}",
+            window.0,
+            old_parent.0,
+            new_parent.0,
+        );
         if !directly_redirected {
             if old_parent_redirects_subwindows && !new_parent_redirects_subwindows && had_backing {
+                log::debug!(
+                    "reparent reconcile: REVOKE window=0x{:x} (left redirected subtree)",
+                    window.0,
+                );
                 crate::core_loop::process_disconnect::teardown_redirect_for_window(
                     state, backend, origin, window,
                 );
@@ -7241,6 +7254,11 @@ fn handle_reparent_window(
                     .get(&(new_parent, true))
                     .expect("just checked contains_key")
                     .mode;
+                log::debug!(
+                    "reparent reconcile: GRANT window=0x{:x} new_mode={new_mode:?} \
+                     (entered redirected subtree)",
+                    window.0,
+                );
                 activate_redirect_backing_for(state, backend, origin, window, new_mode);
             } else if old_parent_redirects_subwindows && new_parent_redirects_subwindows {
                 let old_mode = state
@@ -7254,9 +7272,30 @@ fn handle_reparent_window(
                 if old_mode != new_mode
                     && let Some(new_mode) = new_mode
                 {
+                    log::debug!(
+                        "reparent reconcile: FLIP window=0x{:x} old_mode={old_mode:?} \
+                         new_mode={new_mode:?}",
+                        window.0,
+                    );
                     flip_redirect_target_mode(state, backend, origin, window, new_mode);
+                } else {
+                    log::debug!(
+                        "reparent reconcile: no-op (both redirected, mode unchanged) \
+                         window=0x{:x} mode={old_mode:?}",
+                        window.0,
+                    );
                 }
+            } else {
+                log::debug!(
+                    "reparent reconcile: no-op (state already consistent) window=0x{:x}",
+                    window.0,
+                );
             }
+        } else {
+            log::debug!(
+                "reparent reconcile: skipped window=0x{:x} has direct RedirectWindow",
+                window.0,
+            );
         }
     }
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
