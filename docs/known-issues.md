@@ -732,6 +732,28 @@ that the host hides for us.
       decode the failing minor immediately.
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.
+- [x] **~~Nested-DE startup hangs ~25s on xdg-desktop-portal
+      when launched from a host with an active GNOME-Wayland
+      session.~~ FIXED 2026-05-21.** Symptom: `just yserver-mate-hw`
+      from TTY3 (or any TTY) while the user also had a logged-in
+      GNOME-Wayland session showed panels in ~3s but caja desktop
+      icons only after ~30s. Diagnosed via
+      `STRACE=1 DBUS_MONITOR=1 just yserver-mate-hw-perf`: caja's
+      `gtk_application_register` calls
+      `dbus-daemon.StartServiceByName("org.freedesktop.portal.Desktop")`
+      which blocked the full 25 s default GDBus call timeout
+      because xdg-desktop-portal couldn't fully come up — its
+      Documents sub-portal failed to claim `/run/user/1000/doc`
+      (the host portal already had it FUSE-mounted). Root cause
+      is shared `XDG_RUNTIME_DIR=/run/user/1000` between the host
+      GNOME session and the nested mate session. Fix: every
+      nested-DE recipe (mate/xfce/cinnamon hw + trace + release +
+      telemetry + the Xephyr variants) and `tools/profile-mate.sh`
+      now sets `XDG_RUNTIME_DIR=$(mktemp -d -t yserver-run.XXXXXX)`
+      with `chmod 700` and cleans up on exit. Side effect: per-user
+      services (pulseaudio, gnome-keyring, etc.) start fresh in the
+      nested session; audio doesn't carry over from the host but
+      DE startup is sub-second to icons.
 
 ## Archived: ynest-era (pre-rendering-rework, KMS-direct supersedes)
 

@@ -463,38 +463,52 @@ yserver-picom-hw client="xclock":
 yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store=trace":
     cargo build --bin yserver
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null'
 
 yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
     cargo build --bin yserver
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
+# Release-mode mate wrapped in system-wide `perf record`. See
+# tools/profile-mate.sh for what it captures and how to read the trace.
+# Set `STRACE=1` in the env to also attach strace to caja the moment it
+# spawns (writes caja.strace; useful for "what is caja sitting in poll()
+# on for 25s").
+yserver-mate-hw-perf log="warn" freq="999":
+    RUST_LOG={{log}} PERF_FREQ={{freq}} tools/profile-mate.sh
 
 yserver-cinnamon-hw log="debug,yserver::kms::v2::scene=trace":
     cargo build --bin yserver
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null'
 
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
@@ -508,6 +522,7 @@ yserver-xfce-hw-trace log="debug":
     cargo build --bin yserver
     rm -f xfce.xtrace
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -515,10 +530,11 @@ yserver-xfce-hw-trace log="debug":
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session xfce4-session --display :8 > xfce.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # Companion recipe: run thunar against the host Xorg through
 # x11trace, dumping the same protocol view to `thunar-xorg.xtrace`.
@@ -545,6 +561,7 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             YSERVER_V2_SCENE_WALK_ALL=1 \
             target/debug/yserver > yserver-hw-mate.log 2>&1 &\
@@ -554,15 +571,17 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :8 > mate.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
     cargo build --bin yserver
     rm -f cinnamon.xtrace
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -570,10 +589,11 @@ yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms:
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # MATE inside Xephyr (nested Xorg-family server), with x11trace
 # recording marco's wire stream to/from Xephyr. The Xorg-side
@@ -602,18 +622,19 @@ mate-xephyr-trace screen="1920x1080":
         if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
         if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
         if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
-        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19";\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19  XDG_RUNTIME_DIR=$xdg_rd";\
         Xephyr -screen {{screen}} -title "mate-xorg-trace" :18 > mate-xephyr.log 2>&1 &\
         xephyr_pid=$!;\
-        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
         for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
         if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see mate-xephyr.log" >&2; tail -20 mate-xephyr.log >&2; exit 2; fi;\
         x11trace -d :18 -D :19 -n -o mate-xorg.xtrace &\
         xtrace_pid=$!;\
-        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :19 > mate-xorg.log 2>&1;\
         echo "Xephyr log: mate-xephyr.log";\
         echo "x11trace:   mate-xorg.xtrace";\
@@ -625,18 +646,19 @@ xfce-xephyr-trace screen="1920x1080":
         if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
         if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
         if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
-        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19";\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19  XDG_RUNTIME_DIR=$xdg_rd";\
         Xephyr -screen {{screen}} -title "xfce-xorg-trace" :18 > xfce-xephyr.log 2>&1 &\
         xephyr_pid=$!;\
-        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
         for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
         if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see xfce-xephyr.log" >&2; tail -20 xfce-xephyr.log >&2; exit 2; fi;\
         x11trace -d :18 -D :19 -n -o xfce-xorg.xtrace &\
         xtrace_pid=$!;\
-        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session xfce4-session --display=:19 > xfce-xorg.log 2>&1;\
         echo "Xephyr log: xfce-xephyr.log";\
         echo "x11trace:   xfce-xorg.xtrace";\
@@ -657,14 +679,16 @@ xfce-xephyr-trace screen="1920x1080":
 yserver-mate-hw-release log="warn":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # Release-mode mate with the core-loop telemetry enabled (see
 # `LoopTelemetry` in `crates/yserver-core/src/core_loop/run.rs`).
@@ -679,15 +703,17 @@ yserver-mate-hw-release log="warn":
 yserver-mate-hw-telemetry log="info":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
 # `tests` is a comma-separated list. Default budget is 600s/test —

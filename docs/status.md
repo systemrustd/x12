@@ -2251,6 +2251,15 @@ here for awareness during stage planning:
   initial-app residual after the XI2 valuator-scroll fix.
   Unrelated to rendering; lives at `process_request.rs` /
   pointer-event pump. Unaffected by v2.
+- [x] **~~Nested-DE 25 s startup stall under host GNOME-Wayland~~**
+  — FIXED 2026-05-21. caja blocked the full GDBus 25 s timeout in
+  `StartServiceByName("org.freedesktop.portal.Desktop")` because
+  the host's xdg-desktop-portal-documents held
+  `/run/user/1000/doc` FUSE-mounted, so the nested portal couldn't
+  fully come up. All `yserver-{mate,xfce,cinnamon}-hw*` Justfile
+  recipes plus `tools/profile-mate.sh` now allocate an isolated
+  `XDG_RUNTIME_DIR=$(mktemp -d)` per run. See `known-issues.md`
+  for the full diagnostic chain and reproduction recipe.
 
 ---
 
