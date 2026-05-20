@@ -3924,23 +3924,41 @@ impl Backend for KmsBackendV2 {
             let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
                 return Ok(());
             };
-            // Stage 4d fix — skip the eager CWA-time clear when W is
-            // under COMPOSITE redirect. The backing's content belongs
-            // to the redirected client / external compositor, not the
-            // server; routing a fill through `resolve_paint_target`
-            // here would land on B and wipe the compositor's pixels
-            // (the marco-with-compositing "CC turns opaque black on
-            // drag" bug — marco re-asserts bg_pixmap=None on every
-            // drag-induced configure). Real X11 doesn't redraw on
-            // CWA either — the bg attribute only affects future
-            // ClearArea / Expose handling. v2's eager clear was a
-            // Stage 3f.6 over-reach.
-            let is_redirected = self
+            // Stage 4d fix — skip the eager CWA-time clear when W
+            // is under COMPOSITE redirect, EITHER directly (W has
+            // its own backing) OR via ancestor inheritance (W has
+            // no own backing but its paints resolve up the chain
+            // to a redirected ancestor's backing). The backing's
+            // content belongs to the redirected client / external
+            // compositor, not the server; routing a fill through
+            // `resolve_paint_target` here would land on that
+            // backing and wipe pixels we don't own. Two live
+            // triggers covered:
+            //
+            // - marco-with-compositing "CC turns opaque black on
+            //   drag": marco re-asserts bg_pixmap=None on every
+            //   drag-induced configure of CC, which has its own
+            //   backing. (The original Stage 4d case.)
+            // - mate-panel tray applets visible-then-disappear:
+            //   applets reparent away from root into mate-panel
+            //   sockets; they have no own backing but resolve to
+            //   mate-panel's backing via the ancestor walk. marco
+            //   churns their CWA per configure, which pre-fix wiped
+            //   the icon area on mate-panel's backing.
+            //
+            // Real X11 doesn't redraw on CWA either — the bg
+            // attribute only affects future ClearArea / Expose
+            // handling. v2's eager clear was a Stage 3f.6 over-
+            // reach; this guard is what survives of it.
+            let routes_via_redirect = self
                 .store
                 .lookup(host_xid)
-                .and_then(|id| self.store.redirected_target(id))
-                .is_some();
-            if !is_redirected {
+                .and_then(|leaf| {
+                    self.resolve_paint_target(host_xid)
+                        .map(|target| target.id != leaf)
+                })
+                .unwrap_or(false);
+            if !routes_via_redirect {
                 let bg_pixel = geom.bg_pixel.unwrap_or(0);
                 self.clear_window_area_with_background(
                     host_xid,
@@ -10171,6 +10189,107 @@ mod tests {
         let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
         assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
         assert_eq!(geom.bg_pixmap, None);
+    }
+
+    /// Follow-up to `cwa_on_redirected_window_does_not_clear_backing`:
+    /// the original Stage 4d fix only checks `redirected_target(W)`
+    /// — i.e. W has its OWN backing. That misses the case where W
+    /// has no own backing but its paints route to an ANCESTOR's
+    /// backing via `resolve_paint_target`'s ancestor walk. Live
+    /// trigger: mate-panel tray applets — reparented away from root
+    /// into mate-panel sockets, they have no own backing but paint
+    /// to mate-panel's backing via the ancestor chain. marco's CWA
+    /// bg_pixmap=None per drag-induced configure lands a transparent
+    /// fill into mate-panel's backing at the applet's screen
+    /// position, wiping the icon. Symptom: applets visible briefly
+    /// then disappear.
+    #[test]
+    fn cwa_on_descendant_routed_to_redirected_ancestor_does_not_clear() {
+        use yserver_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = KmsBackendV2::for_tests();
+
+        let mate_panel_xid = ResourceId(0x110_0001);
+        let applet_xid = ResourceId(0x140_0001);
+
+        // mate-panel: child of root, has its own redirected backing.
+        seed_v2_window(
+            &mut state,
+            &mut backend,
+            mate_panel_xid,
+            ROOT_WINDOW,
+            0,
+            0,
+            2560,
+            28,
+        );
+        seed_v2_redirected_backing(&mut state, &mut backend, mate_panel_xid);
+        // applet: child of mate-panel, no own backing.
+        seed_v2_window(
+            &mut state,
+            &mut backend,
+            applet_xid,
+            mate_panel_xid,
+            0,
+            1,
+            24,
+            24,
+        );
+
+        let applet_host_xid = synth_host_xid(applet_xid);
+
+        // Fixture sanity: applet has its own leaf drawable but no
+        // own redirected target, while `resolve_paint_target` walks
+        // up to mate-panel's backing. That's the load-bearing
+        // precondition: pre-fix the existing `is_redirected` check
+        // returns false (no own backing), but a CWA-time clear
+        // would still route through `resolve_paint_target` and land
+        // on mate-panel's backing.
+        let applet_leaf = backend
+            .store
+            .lookup(applet_host_xid)
+            .expect("applet has its own leaf drawable");
+        assert!(
+            backend.store.redirected_target(applet_leaf).is_none(),
+            "applet must not have its own backing"
+        );
+        let resolved = backend
+            .resolve_paint_target(applet_host_xid)
+            .expect("applet paint must resolve");
+        assert_ne!(
+            resolved.id, applet_leaf,
+            "applet paints must route to an ancestor's backing, not its own leaf"
+        );
+
+        let calls_before = backend.clear_window_area_calls;
+
+        // marco's "bg_pixmap = None" CWA on the applet. Pre-fix
+        // this routes a transparent fill into mate-panel's backing
+        // at the applet's screen position, wiping any content there.
+        backend
+            .change_subwindow_attributes(None, applet_host_xid, 0x01, &[0])
+            .expect("change_subwindow_attributes");
+
+        assert_eq!(
+            backend.clear_window_area_calls, calls_before,
+            "CWA on a window whose paints route to a redirected ancestor must \
+             not call clear_window_area_with_background (pre-fix this fired \
+             and wiped mate-panel's backing where the tray applet icon was \
+             painted — the 'tray applet visible briefly then disappears' \
+             symptom)"
+        );
+
+        // Same check for CWBackPixel (the other clear-trigger).
+        backend
+            .change_subwindow_attributes(None, applet_host_xid, 0x02, &[0x00FF_FFFF])
+            .expect("change_subwindow_attributes CWBackPixel");
+        assert_eq!(
+            backend.clear_window_area_calls, calls_before,
+            "CWBackPixel on a window routed to a redirected ancestor must \
+             also skip the eager clear"
+        );
     }
 
     /// Stage 3f.6 close: `change_subwindow_attributes` stores
