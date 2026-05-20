@@ -817,24 +817,39 @@ on the marco + xfwm4 compositor cases that real users hit and
 that v1 cannot do. picom support moves to a post-v1-deletion
 follow-on.
 
-### Stage 5 (optional, follow-up) — advanced perf strategies
+### Stage 5 — make v2 fast
 
 Basic output-damage clipping is **load-bearing for v2** and lives
 in Stages 2/3 (Stage 2's `SceneCompositor` already operates on
 output-damage regions per I5; Stage 3 keeps that as RENDER paths
-come online). Stage 5 owns the advanced policy:
+come online). Stage 5 is the measured performance-closure stage:
+make v2 fast enough to become the default on non-ancient hardware.
+
+The active implementation plan is
+`docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
+The earlier HW cursor Stage 5 plan is historical; HW cursor is now
+treated as an implemented prerequisite, not the whole stage.
+
+Stage 5 owns:
 
 - **Strategy selection per frame**: full-output redraw vs
   clipped redraw choice based on damage fragmentation / coverage
   thresholds; occlusion-driven scene entry skip; partial clears.
-- HW cursor plane returns under I6's retirement model, as a
-  `SceneCompositor` strategy choice over the cursor entry.
-- Direct scanout for eligible full-output entries (Compiz, games
-  eventually), as a `SceneCompositor` strategy choice.
-- Hardware plane assignment for video / overlay entries.
-- Submit aggregation across PaintBatch + scene compose.
-- Multi-queue (graphics + transfer split) if profiling justifies.
-- DRM in-fence / syncobj submission to replace CPU fence waits.
+- **Submit-rate reduction**: aggregate high-volume paint traffic so
+  small X11 operations do not become one Vulkan queue submit each.
+- **COW-authoritative compositor mode**: when an external compositor
+  owns COW, scanout shows the compositor's result instead of running
+  a competing per-window compositor above it.
+- **Compose-cost reduction**: descriptor / image-view caching, stable
+  storage bindings, occlusion skips, and repaint-mode selection.
+- **Allocation-churn removal**: pixmap-pool tuning plus telemetry for
+  storage, image-view, and descriptor allocation rates.
+- **Async submission only after profiling**: DRM in-fence / syncobj
+  replaces CPU fence waits if waits remain material after submit-rate
+  reduction.
+- **Optional headroom**: direct scanout, hardware plane assignment,
+  multi-queue, and similar strategies once the composed path is already
+  responsive.
 
 The pattern: Stage 5 work is **strategy plug-ins** that the
 existing components select between. No new model, no new

@@ -1,4 +1,9 @@
-# Stage 5 strategy plug-in — HW cursor reintroduction (v2)
+# Historical Stage 5 strategy plug-in — HW cursor reintroduction (v2)
+
+Status 2026-05-20: HW cursor reintroduction is no longer the active
+Stage 5 scope. It has moved to implemented prerequisite work for the
+new Stage 5 performance-closure plan:
+`docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 
 Pre-implementation design. Drafted 2026-05-19, revised seven
 times same day after successive codex review passes
@@ -13,10 +18,11 @@ Bring back the DRM hardware cursor plane on v2 as a
 entry. The cursor stays a scene entry; the strategy chooses the
 render target for that one entry (plane vs SW blit).
 
-Per spec `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`
-§I7 + Stage 5 (§820-841, §887-890): HW cursor returns under I6's
-retirement model as a `SceneCompositor`-owned strategy choice,
-never as a side path that bypasses scene ownership.
+At drafting time, per spec
+`docs/superpowers/specs/2026-05-15-rendering-model-v2.md` §I7,
+HW cursor returned under I6's retirement model as a
+`SceneCompositor`-owned strategy choice, never as a side path that
+bypasses scene ownership.
 
 Original v1 motivation (`crates/yserver/src/kms/cursor_plane.rs:1-15`):
 the cursor quad was tied to compositor cadence — every position

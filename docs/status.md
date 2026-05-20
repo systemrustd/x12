@@ -778,9 +778,9 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         multi-output input mapping is risk-listed for later).
       - HW cursor calls (`hw_cursor_active` / `hw_cursor_move`
         / `hw_cursor_refresh`) → no-op + `scene.mark_scene_structure_dirty`
-        per spec § I7 (HW cursor plane parked in v2 until
-        Stage 5 reintroduces it as a SceneCompositor
-        strategy).
+        per then-current spec § I7. This was later superseded by
+        the v2 HW cursor implementation; Stage 5 now treats HW
+        cursor as prerequisite work and focuses on perf closure.
 
       6 new unit tests: `serialize_modifiers_zero_on_fresh_state`,
       `cook_host_key_fills_coords_and_modifier_state`,
@@ -2208,11 +2208,15 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       pictures are forced opaque even when they sit on 32-bit
       storage. The old depth-only heuristic was too coarse for
       compositor-managed window surfaces.
-- [ ] **Stage 5 (optional) — advanced perf strategies.**
-  Strategy plug-ins on the existing components: damage-strategy
-  selection per frame, HW cursor return, direct scanout, HW
-  plane assignment, submit aggregation, multi-queue,
-  DRM in-fence / syncobj submission.
+- [ ] **Stage 5 — make v2 fast.**
+  Active plan:
+  `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
+  HW cursor is now treated as implemented prerequisite work, not the
+  Stage 5 scope. Stage 5 is the measured perf-closure pass: telemetry
+  first, bounded frame production, COW-authoritative compositor mode,
+  paint-submit aggregation, cheaper compose, allocation-churn removal,
+  then syncobj/direct-scanout/plane strategies only if profiling still
+  justifies them.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
