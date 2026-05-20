@@ -797,9 +797,9 @@ fn rotate_redirected_backing_on_resize(
     let snapshot = state.resources.window(window).and_then(|w| {
         w.redirected_backing
             .as_ref()
-            .map(|b| (b.host_pixmap, w.host_xid, w.depth))
+            .map(|b| (b.host_pixmap, b.width, b.height, w.host_xid, w.depth))
     });
-    let Some((old_backing, host_window, depth)) = snapshot else {
+    let Some((old_backing, old_width, old_height, host_window, depth)) = snapshot else {
         return;
     };
     let Some(host_window) = host_window else {
@@ -857,6 +857,45 @@ fn rotate_redirected_backing_on_resize(
             height: new_height,
             depth,
         });
+    }
+
+    // compCopyWindow analog: carry pre-resize bits from OLD into NEW
+    // for the overlap rect. Xorg does this via `compCopyWindow`
+    // (composite/compwindow.c:376-388) after `compReallocPixmap`
+    // (compalloc.c:680-712). Without it, any compositor that re-Names
+    // the post-resize backing (marco on mate-panel-top during the
+    // 25→28-px grow) reads an empty buffer and the tray icons that
+    // were painted into the pre-resize backing vanish.
+    //
+    // Storage-alive contract: OLD's backend storage must remain
+    // readable across this call. `release_redirected_backing` above
+    // only frees when `alias_registry.decref` returns true (refcount
+    // hits 0). NameWindowPixmap aliases keep it alive through this
+    // path; the v2 backend's lifecycle for the no-alias case is
+    // tightened separately.
+    let copy_w = old_width.min(new_width);
+    let copy_h = old_height.min(new_height);
+    if copy_w > 0
+        && copy_h > 0
+        && let Err(err) = backend.copy_area(
+            origin,
+            old_backing.as_raw(),
+            new_backing.as_raw(),
+            0,
+            0,
+            0,
+            0,
+            copy_w,
+            copy_h,
+        )
+    {
+        log::warn!(
+            "rotate_redirected_backing_on_resize(0x{:x}): \
+             copy_area(OLD=0x{:x} → NEW=0x{:x}, {copy_w}x{copy_h}) failed: {err}",
+            window.0,
+            old_backing.as_raw(),
+            new_backing.as_raw(),
+        );
     }
 
     if let Some(mode) = effective_redirect_mode_for_window(state, window) {
@@ -13750,6 +13789,111 @@ mod tests {
         assert_eq!(backing.width, 100);
         assert_eq!(backing.height, 75);
         assert_eq!(backing.depth, 32);
+    }
+
+    // compCopyWindow analog: when a redirected window resizes, the
+    // pre-existing backing's contents must be carried over into the new
+    // backing for the overlap region — otherwise any compositor that
+    // re-Names the post-resize backing (marco on mate-panel-top during
+    // the 25→28-px grow, etc.) samples an empty buffer and the panel
+    // renders without the icons that were already painted into the old
+    // backing. Xorg lands this via `compReallocPixmap` (save old
+    // pixmap) + `compCopyWindow` (copy_area old→new). See
+    // /home/jos/Projects/xserver/composite/compalloc.c:680-712 and
+    // compwindow.c:376-388.
+    #[test]
+    fn rotate_redirected_backing_on_resize_copies_old_contents_to_new() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+        const OLD_BACKING: u32 = 0x0050_0001;
+        const OLD_W: u16 = 100;
+        const OLD_H: u16 = 50;
+        const NEW_W: u16 = 100;
+        const NEW_H: u16 = 75;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: OLD_W,
+                height: OLD_H,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: OLD_W,
+                height: OLD_H,
+                depth: 32,
+            });
+        }
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            NEW_W,
+            NEW_H,
+        );
+
+        // NEW handle is whatever the RecordingBackend's allocate
+        // handed back; pull it from the resource state.
+        let new_backing = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after rotate");
+        let new_raw = new_backing.host_pixmap.as_raw();
+
+        let calls = backend.calls();
+        // Expected overlap = min(old, new) per dimension.
+        let expected_w = OLD_W.min(NEW_W);
+        let expected_h = OLD_H.min(NEW_H);
+        let copy = calls.iter().find(|c| {
+            matches!(
+                c,
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x: 0,
+                    src_y: 0,
+                    dst_x: 0,
+                    dst_y: 0,
+                    width,
+                    height,
+                } if *src_host_xid == OLD_BACKING
+                    && *dst_host_xid == new_raw
+                    && *width == expected_w
+                    && *height == expected_h
+            )
+        });
+        assert!(
+            copy.is_some(),
+            "expected CopyArea(OLD=0x{OLD_BACKING:x} → NEW=0x{new_raw:x}, \
+             src=(0,0), dst=(0,0), {expected_w}x{expected_h}) — \
+             missing the compCopyWindow analog that carries pre-resize \
+             contents into the freshly-allocated backing. Calls: {calls:?}",
+        );
     }
 
     /// Manual-mode redirect removes W from the normal scene and keeps
