@@ -7190,6 +7190,75 @@ fn handle_reparent_window(
     let rx = result.x;
     let ry = result.y;
     let override_redirect = result.override_redirect;
+    // Phase 2: Xorg-style redirect reconciliation on reparent.
+    // Mirrors compUnredirectOneSubwindow + compRedirectOneSubwindow
+    // at /home/jos/Projects/xserver/composite/compwindow.c:453-454.
+    // The window's redirect state under RedirectSubwindows is
+    // inherited from its parent — when the parent changes, the
+    // inheritance changes too. RedirectWindow(W) is per-window
+    // and not affected.
+    //
+    // Without this, a window created under
+    // RedirectSubwindows(root, Manual) and reparented into a
+    // non-redirected ancestor (e.g. an XEMBED tray client like
+    // nm-applet reparenting into mate-panel's notification
+    // socket) keeps a stale backing. Paints land in that stale
+    // backing; the compositor reads the new ancestor's pixmap
+    // (which never received them) when building COW.
+    //
+    // Gated on `supports_redirect_activation()` for the same
+    // reason as `activate_redirect_backing_for` at
+    // process_request.rs:3289 — backends that don't opt in
+    // (v1, host-X11, and RecordingBackend in its default
+    // configuration) don't manage redirect state, so the
+    // redirect helpers would panic / silently misbehave there.
+    // Phase 2 tests opt in via
+    // `RecordingBackend::with_redirect_activation()` (see
+    // Task 6) and `KmsBackendV2::for_tests()` (which already
+    // returns `true`).
+    if backend.supports_redirect_activation() {
+        let old_parent_redirects_subwindows =
+            state.composite_redirects.contains_key(&(old_parent, true));
+        let new_parent_redirects_subwindows =
+            state.composite_redirects.contains_key(&(new_parent, true));
+        let directly_redirected = state.composite_redirects.contains_key(&(window, false));
+        let had_backing = state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.redirected_backing.is_some());
+
+        if !directly_redirected {
+            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows && had_backing {
+                crate::core_loop::process_disconnect::teardown_redirect_for_window(
+                    state, backend, origin, window,
+                );
+            } else if !old_parent_redirects_subwindows
+                && new_parent_redirects_subwindows
+                && !had_backing
+            {
+                let new_mode = state
+                    .composite_redirects
+                    .get(&(new_parent, true))
+                    .expect("just checked contains_key")
+                    .mode;
+                activate_redirect_backing_for(state, backend, origin, window, new_mode);
+            } else if old_parent_redirects_subwindows && new_parent_redirects_subwindows {
+                let old_mode = state
+                    .composite_redirects
+                    .get(&(old_parent, true))
+                    .map(|r| r.mode);
+                let new_mode = state
+                    .composite_redirects
+                    .get(&(new_parent, true))
+                    .map(|r| r.mode);
+                if old_mode != new_mode
+                    && let Some(new_mode) = new_mode
+                {
+                    flip_redirect_target_mode(state, backend, origin, window, new_mode);
+                }
+            }
+        }
+    }
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
         x11::encode_reparent_notify_event(
             buf,
