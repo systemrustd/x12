@@ -18,6 +18,69 @@
   Phase A changed it to v2: default cursor sprite registered (xid 0x...) and Phase B adds a v2 PlatformBackend: hardware cursor plane
   initialised line that isn't present here. So the hang is unrelated to the Phase A/B/C/D work just pushed.
 
-  Fixing the actual issue is substantial work — drm add_fb (linear) needs to switch to addFb2 with an explicit modifier (likely
-  DRM_FORMAT_MOD_LINEAR first, then a vendor-tiled modifier negotiated via getFb2_modifiers). That's a v2 platform-layer change, not a
-  cursor-plane one. Want me to investigate that as a follow-up, or leave it for another session?
+  Fixing the actual issue is scanout-platform work, not COW or cursor-plane work. Current scanout BO allocation is:
+
+    VkImage TILING_LINEAR
+    → export dma-buf
+    → DRM PRIME_FD_TO_HANDLE
+    → add_planar_framebuffer(..., FbCmd2Flags::empty())
+    → PlanarBuffer::modifier() = None
+
+  The relevant code is `crates/yserver/src/kms/vk/scanout.rs`:
+  `ScanoutBo::allocate`, `allocate_vk_scanout_image`, and `VkScanoutFb`.
+  NVIDIA rejects that unmodified/legacy-linear framebuffer registration with
+  EINVAL, leaving `0 scanout pools live`.
+
+  Work needed to support NVIDIA:
+
+  1. Quick probe: explicit LINEAR addfb2.
+     - Change `VkScanoutFb` to carry `modifier: Option<u64>`.
+     - Return `Some(DrmModifier::from(0))` for `DRM_FORMAT_MOD_LINEAR`.
+     - Call `add_planar_framebuffer` with `FbCmd2Flags::MODIFIERS`.
+     - If NVIDIA only rejects the untagged legacy path, this may be enough.
+
+  2. Real fix: modifier-negotiated scanout BOs.
+     - Query the KMS primary plane `IN_FORMATS` blob for accepted
+       `(DRM_FORMAT_XRGB8888, modifier)` pairs.
+     - Query Vulkan `VK_EXT_image_drm_format_modifier` support for exportable
+       `VK_FORMAT_B8G8R8A8_UNORM` images with COLOR_ATTACHMENT /
+       TRANSFER_DST / SAMPLED usage.
+     - Intersect KMS and Vulkan candidates.
+     - Prefer explicit LINEAR first if accepted, then driver/vendor tiled
+       modifiers. Keep scope single-plane initially unless NVIDIA exposes only
+       multi-plane scanout modifiers.
+
+  3. Vulkan allocation changes.
+     - Add/store the `ash::ext::image_drm_format_modifier::Device` loader on
+       `VkContext`, not just the boolean extension flag.
+     - For modifier scanout images, create with
+       `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and
+       `VkImageDrmFormatModifierListCreateInfoEXT`.
+     - After `vkCreateImage`, call
+       `vkGetImageDrmFormatModifierPropertiesEXT` to learn the actual selected
+       modifier.
+     - Query the subresource layout for pitch and use that pitch in addfb2.
+
+  4. DRM framebuffer registration changes.
+     - Thread the selected modifier through `VkScanoutImage` /
+       `ScanoutBo::allocate` into `VkScanoutFb`.
+     - `VkScanoutFb::modifier()` returns that modifier.
+     - Pass `FbCmd2Flags::MODIFIERS` whenever a modifier is present.
+     - Keep the existing teardown / close_buffer / destroy_framebuffer unwind
+       rules unchanged.
+
+  5. Fallback policy.
+     - Preserve the current untagged LINEAR path for AMD / Intel / Turnip /
+       virtgpu regressions.
+     - New order should be roughly:
+       a. negotiated explicit modifier path,
+       b. explicit `DRM_FORMAT_MOD_LINEAR` addfb2 path,
+       c. current untagged LINEAR fallback.
+     - Log each rejected candidate with modifier, pitch, and failing stage
+       (`vkCreateImage`, bind/export, PRIME import, addfb2).
+
+  6. Validation.
+     - Unit-test the KMS/Vulkan modifier intersection and candidate ordering.
+     - Add a small pure test for `VkScanoutFb::modifier()` / flags selection.
+     - Hardware-smoke NVIDIA first, then AMD, Intel, X1E/Turnip, and virtgpu
+       to prove the fallback order does not regress working platforms.
