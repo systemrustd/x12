@@ -1626,8 +1626,25 @@ fn handle_render_request(
                 );
             }
         }
-        31 | 32 | 36 => {
-            // CreateAnimCursor / AddTraps / CreateConicalGradient — stubs.
+        31 | 36 => {
+            // CreateAnimCursor / CreateConicalGradient — stubs.
+        }
+        32 => {
+            // AddTraps — backend dispatch is a stub, but match the
+            // damage pattern of the other paint vectors so a future
+            // real impl doesn't silently miss compositor wakeups.
+            // Wasted compositor recomposite on a no-op paint is
+            // harmless; the alternative (no damage call) is a
+            // silent gap on a real impl. Body: pic(4) x_off(2)
+            // y_off(2) then variable trapezoid list.
+            if body.len() >= 4 {
+                let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                if let Some(dst_drawable) =
+                    state.resources.picture(pic).and_then(|p| p.drawable)
+                {
+                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                }
+            }
         }
         _ => {
             debug!(
