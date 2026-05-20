@@ -7642,10 +7642,11 @@ impl Backend for KmsBackendV2 {
         // VK_KHR_external_semaphore_fd is unconditionally enabled at
         // device init; fence_fd / SYNC_FD handle type rides along
         // with it. syncobj uses the OPAQUE_FD + timeline-semaphore
-        // path also covered by VK_KHR_external_semaphore_fd — which
-        // Mesa prefers and Venus accepts (per the live vng smoke).
+        // path also covered by VK_KHR_external_semaphore_fd. NVIDIA
+        // proprietary rejects that import path, so cap syncobj per
+        // driver and let affected clients fall back to fence-fd.
         let fence_fd = true;
-        let syncobj = true;
+        let syncobj = vk.supports_dri3_syncobj();
         // Version cap per Phase 4.2 design §4: with syncobj
         // advertise (1, 4); without it cap at (1, 3).
         let version = if syncobj { (1, 4) } else { (1, 3) };
@@ -11718,8 +11719,9 @@ mod tests {
         assert!(b.dri3_trigger_fence(0x4040_4040).is_ok());
     }
 
-    /// Vk-backed: DRI3 capabilities reach `(1, 4)` with
-    /// `fence_fd` + `syncobj` when a real `VkContext` is attached.
+    /// Vk-backed: DRI3 capabilities expose `fence_fd` when a real
+    /// `VkContext` is attached, and only expose syncobj on drivers
+    /// whose external timeline import path is supported.
     /// Gated `#[ignore]` because it needs lavapipe (or any live
     /// Vulkan ICD).
     #[test]
@@ -11757,9 +11759,12 @@ mod tests {
                 .into(),
         );
         let caps = b.dri3_capabilities();
-        assert_eq!(caps.version, (1, 4));
         assert!(caps.fence_fd);
-        assert!(caps.syncobj);
+        assert_eq!(
+            caps.syncobj,
+            b.platform.vk.as_ref().unwrap().supports_dri3_syncobj()
+        );
+        assert_eq!(caps.version, if caps.syncobj { (1, 4) } else { (1, 3) });
         // `modifiers` reflects whether the device picked up
         // VK_EXT_image_drm_format_modifier — lavapipe does, Venus
         // does. Just assert the field is set consistently with

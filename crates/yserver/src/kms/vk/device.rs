@@ -46,6 +46,21 @@ pub struct VkContext {
 }
 
 impl VkContext {
+    /// Whether this driver should advertise DRI3/Present syncobj.
+    ///
+    /// The implementation currently imports DRI3 syncobj fds as
+    /// timeline semaphores with `OPAQUE_FD`. That works on the
+    /// Vulkan stacks we have used for Venus/Mesa testing, but NVIDIA
+    /// proprietary rejects the very first import with
+    /// `ERROR_INITIALIZATION_FAILED` ("Failed to allocate semaphore
+    /// device memory"). Advertising only DRI3 1.3 on that driver lets
+    /// clients fall back to the older fence-fd path instead of dying
+    /// on `ImportSyncobj`.
+    #[must_use]
+    pub fn supports_dri3_syncobj(&self) -> bool {
+        !matches!(self.driver_id, vk::DriverId::NVIDIA_PROPRIETARY)
+    }
+
     pub fn new() -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()

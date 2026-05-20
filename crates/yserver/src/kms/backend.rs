@@ -8866,14 +8866,11 @@ impl Backend for KmsBackend {
         // VK_KHR_external_semaphore_fd is unconditionally enabled at
         // device init; fence_fd / SYNC_FD handle type rides along
         // with it. syncobj uses the OPAQUE_FD + timeline-semaphore
-        // path (also part of VK_KHR_external_semaphore_fd) which is
-        // what Mesa actually prefers — and which the live vng smoke
-        // showed is the only sync path Venus accepts. With syncobj
-        // advertised, Mesa uses ImportSyncobj + PresentPixmapSynced
-        // and we host-signal the release_syncobj at release_value
-        // when the Copy completes, waking Mesa's vkAcquireNextImage.
+        // path (also part of VK_KHR_external_semaphore_fd). Some
+        // drivers reject that import shape, so cap syncobj per driver
+        // and let affected clients use the fence-fd path.
         let fence_fd = true;
-        let syncobj = true;
+        let syncobj = vk.supports_dri3_syncobj();
         // Version cap per design §4: with syncobj advertise (1, 4);
         // without it cap at (1, 3). fence_fd doesn't affect version.
         let version = if syncobj { (1, 4) } else { (1, 3) };
