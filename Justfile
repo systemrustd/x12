@@ -690,6 +690,32 @@ yserver-mate-hw-release log="warn":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# Release-build counterpart to `yserver-mate-hw-trace`: builds with
+# `--release` (so perf characteristics match real-world) but still
+# wires `x11trace` between mate-session and yserver, dumping the
+# protocol stream to `mate.xtrace`. Use when comparing wire-level
+# behaviour to `mate-xephyr-trace`'s `mate-xorg.xtrace` — the trace
+# recipe above produces a debug-built log that is ~3-5× slower per
+# request, which can mask or distort timing-related symptoms.
+#
+# Defaults `RUST_LOG=warn` so yserver-hw-mate.log stays compact; pass
+# `log=...` to crank specific targets for a cross-reference run.
+yserver-mate-hw-release-trace log="warn":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f mate.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o mate.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :8 > mate.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # Release-mode mate with the core-loop telemetry enabled (see
 # `LoopTelemetry` in `crates/yserver-core/src/core_loop/run.rs`).
 # Emits one info!-level line per second to yserver-hw.log with

@@ -9044,17 +9044,6 @@ fn handle_map_window(
         // (sets it back to false) must land last.
         maybe_activate_child_under_redirected_parent(state, backend, origin, window);
         reapply_redirect_mode_after_map(state, backend, origin, window);
-        // Audit #11: Xorg's `miPaintWindow` fires damage on the
-        // window's extent when the window becomes viewable (the
-        // server-background fill is itself a paint, and DAMAGE
-        // hooks every paint). Compositors that subscribe via
-        // `XDamageCreate(window)` rely on that first DamageNotify
-        // to read the freshly-mapped window's pixels into their
-        // own offscreen. Without it, override-redirect popups,
-        // XEMBED tray icons (`nm-applet`), and any other window
-        // that maps and then sits without further paint stay
-        // invisible on COW under a compositor.
-        let _dropped = accumulate_damage_full_to_state(state, window);
     }
 
     let wants_focus = {
@@ -9096,6 +9085,25 @@ fn handle_map_window(
                 });
             let _dropped = emit_expose_subtree_to_state(state, window);
         }
+    }
+    // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
+    // extent when the window becomes viewable (the server-background
+    // fill is itself a paint, and DAMAGE hooks every paint).
+    // Compositors that subscribe via `XDamageCreate(window)` rely on
+    // that first DamageNotify to read the freshly-mapped window's
+    // pixels into their own offscreen.
+    //
+    // Order matters: this MUST come AFTER the MapNotify emissions
+    // above. Marco subscribes to SubstructureNotify on root, registers
+    // the window in its compositor tree on receiving MapNotify, and
+    // only then accepts DAMAGE-Notify on it as a NameWindowPixmap
+    // trigger. Pre-fix (damage emitted before MapNotify) marco saw the
+    // damage on a window it didn't yet track and silently dropped it,
+    // causing mate-panel-top to render blank until a later resize
+    // damage finally landed. See mate.xtrace lines 4938→4940 vs
+    // mate-xorg.xtrace lines 5164→5173.
+    if host_xid.is_some() {
+        let _dropped = accumulate_damage_full_to_state(state, window);
     }
     debug!(
         "client {} #{} MapWindow 0x{:x}",
@@ -14223,6 +14231,144 @@ mod tests {
              subscribed compositor repaints the new region into its \
              offscreen — pre-fix this is empty and the compositor \
              never sees the newly-mapped popup / tray icon / window",
+        );
+    }
+
+    // X11 wire-event ordering on map. Verified divergence vs Xorg:
+    //
+    // - **Xorg** (mate-xorg.xtrace lines 5164→5173 around mate-panel-top
+    //   map): MapNotify(event=root) first, then DAMAGE-Notify.
+    // - **yserver pre-fix** (mate.xtrace lines 4938→4940): DAMAGE-Notify
+    //   first, then MapNotify(event=root).
+    //
+    // Marco's compositor relies on MapNotify(SubstructureNotify on root)
+    // to register a window in its compositor tree, and on the *next*
+    // DAMAGE-Notify on that window to trigger NameWindowPixmap. When
+    // damage arrives first, marco's tree doesn't know about the window
+    // yet and the damage is silently discarded. Marco then never sees
+    // the audit-#11 initial-paint damage and never Names the window;
+    // the panel renders blank until a *later* damage event arrives
+    // (typically the post-resize damage), by which point the icon-paint
+    // CopyAreas have already missed their compositor pickup window.
+    //
+    // The audit-#11 fix (`accumulate_damage_full_to_state` inside
+    // `handle_map_window`) is structurally correct but was placed
+    // before the MapNotify emissions — inverting the spec-correct
+    // order. This test pins MapNotify-before-DAMAGE on the wire.
+    #[test]
+    fn map_window_emits_map_notify_before_damage_notify() {
+        use crate::server::DamageObject;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0011;
+        const HOST_XID: u32 = 0x0040_0011;
+        const DAMAGE_ID: u32 = 0x0080_0011;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        // Compositor-like subscription: SubstructureNotify on root
+        // (0x0008_0000) — gets MapNotify(event=root) when a child of
+        // root maps. Plus an `XDamageCreate(window)` subscription —
+        // gets DAMAGE-Notify on the new window.
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, 0x0008_0000);
+        state.damage_objects.insert(
+            DAMAGE_ID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(WINDOW_XID),
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+            },
+        );
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        // Drain everything emitted to the client. Each X11 event is
+        // 32 bytes — read until WouldBlock and walk event-by-event.
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        // First occurrence of MapNotify(opcode 19, event=ROOT) and
+        // DAMAGE-Notify(opcode 91) by 32-byte event index. MapNotify's
+        // `event` field is at offset 4..8 (after response_type, pad,
+        // sequence_number_lo, sequence_number_hi).
+        let mut map_root_idx: Option<usize> = None;
+        let mut damage_idx: Option<usize> = None;
+        for (i, chunk) in wire.chunks_exact(32).enumerate() {
+            let opcode = chunk[0] & 0x7f; // top bit is SendEvent flag
+            if opcode == 19 && map_root_idx.is_none() {
+                let event_xid = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                if event_xid == ROOT_WINDOW.0 {
+                    map_root_idx = Some(i);
+                }
+            } else if opcode == 91 && damage_idx.is_none() {
+                damage_idx = Some(i);
+            }
+        }
+
+        let m = map_root_idx.expect(
+            "MapNotify(event=root) must be emitted to a SubstructureNotify-on-root listener",
+        );
+        let d = damage_idx.expect("DAMAGE-Notify must be emitted to a subscribed damage object");
+        assert!(
+            m < d,
+            "MapNotify(event=root, idx={m}) must precede DAMAGE-Notify(idx={d}) on the \
+             wire — pre-fix the audit-#11 damage emission inside `handle_map_window` ran \
+             before the MapNotify emissions, so marco's compositor saw the damage on a \
+             window that hadn't yet entered its compositor tree, silently discarded it, \
+             and never NameWindowPixmap'd the freshly-mapped window. \
+             See mate.xtrace lines 4938→4940 vs mate-xorg.xtrace lines 5164→5173.",
         );
     }
 
