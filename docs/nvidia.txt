@@ -1,0 +1,23 @@
+  1. Root cause: scanout BO allocation fails on nvidia.
+  v2: ScanoutBoPool allocate failed for output 0 (2560x1440):
+    drm add_fb (linear): Invalid argument (os error 22) — output will be skipped
+  v2 PlatformBackend: ready — 1 outputs, fb 2560x1440, 0 scanout pools live
+  NVIDIA's proprietary driver rejects the legacy drmModeAddFB path that v2 uses for linear-format framebuffers. The server boots fine, but
+  with zero scanout pools live no KMS_PAGE_FLIP ever fires → screen stays at whatever frame the kernel had at handover (typically black).
+
+  2. Input devices unreachable.
+  Every /dev/input/event* returned Permission denied. libinput has nothing — no keyboard / no mouse. (Tracked in your memory:
+  reference_hw_input_seat.md — needs input group or seat0 ACL on this user.)
+
+  3. Console is K_OFF.
+  console takeover via KDSKBMODE=K_OFF + KD_GRAPHICS — the kernel keyboard handler is disabled. Combined with #1 + #2 the machine looks
+  hard-hung but yserver itself is running fine. SysRq usually still works (alt+sysrq+r re-enables raw keyboard, then alt+sysrq+k kills
+  X-style processes); SSH from another box is the safest exit.
+
+  The binary you ran is pre-Stage-5. The log says v2: software cursor sprite registered (16x16) — that's the Stage 3f.8 wording. Stage 5
+  Phase A changed it to v2: default cursor sprite registered (xid 0x...) and Phase B adds a v2 PlatformBackend: hardware cursor plane
+  initialised line that isn't present here. So the hang is unrelated to the Phase A/B/C/D work just pushed.
+
+  Fixing the actual issue is substantial work — drm add_fb (linear) needs to switch to addFb2 with an explicit modifier (likely
+  DRM_FORMAT_MOD_LINEAR first, then a vendor-tiled modifier negotiated via getFb2_modifiers). That's a v2 platform-layer change, not a
+  cursor-plane one. Want me to investigate that as a follow-up, or leave it for another session?
