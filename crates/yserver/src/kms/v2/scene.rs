@@ -3871,21 +3871,20 @@ mod tests {
         assert!(built.sampled_ids.contains(&child_backing_id));
     }
 
-    /// Stage 4d — `build_scene` appends the Composite Overlay
-    /// Window draw entry ABOVE all top-levels but BELOW the
-    /// cursor (Stage 4 plan §4d scene layering items 3 + 4).
-    /// Synthetic topology: two top-levels + a registered COW;
-    /// the COW entry MUST be the last non-cursor draw in
-    /// `scene.draws`. `alpha_passthrough=true` so the
-    /// compositor's premul-alpha output blends correctly.
+    /// Phase 1 pre-cleanup — when no COW is registered
+    /// (`cow=None`), `build_scene` walks the top-level order and
+    /// emits a draw entry per mapped top-level. This preserves the
+    /// legacy non-redirected path that Phase 1 (COW-authoritative)
+    /// leaves unchanged; the `cow=Some` shape (top-levels stripped)
+    /// gets its own dedicated test.
     #[test]
-    fn build_scene_appends_cow_above_top_levels() {
+    fn build_scene_cow_none_emits_top_levels() {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
         let mut windows_v2 = super::super::backend::WindowsV2Map::new();
 
-        // Two mapped top-levels — both must appear before the COW.
+        // Two mapped top-levels.
         alloc_stub_window(
             &mut store,
             &mut windows_v2,
@@ -3911,21 +3910,6 @@ mod tests {
         );
         core.top_level_order.push(0x101);
 
-        // Allocate a stub COW storage (synthetic xid + non-zero
-        // sentinel image_view so build_scene doesn't filter it on
-        // the null-view gate). Screen-extent (800×600 matches
-        // PlatformBackend::for_tests()'s output size).
-        let mut cow_storage = super::super::store::Storage::for_tests_null(
-            extent(800, 600),
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
-        cow_storage.image_view = cow_sentinel;
-        cow_storage.sample_view = cow_sentinel;
-        let cow_id = store
-            .allocate(0x103, DrawableKind::Window, 24, true, cow_storage)
-            .expect("alloc COW stub");
-
         let built = build_scene(
             &core,
             &mut store,
@@ -3934,70 +3918,63 @@ mod tests {
             &platform,
             None, // no cursor in this fixture
             None,
-            Some(cow_id),
+            None, // cow=None — legacy non-redirected path
             false,
         );
         let scene = &built.scene;
 
-        // Expect: top-level 0x100, top-level 0x101, COW. Three
-        // entries total (no cursor in this fixture).
+        // Expect: top-level 0x100, top-level 0x101. Two entries
+        // total (no cursor, no COW).
         assert_eq!(
             scene.draws.len(),
-            3,
-            "expected 2 top-levels + COW, got {} draws: {:?}",
+            2,
+            "expected 2 top-levels, got {} draws: {:?}",
             scene.draws.len(),
             scene.draws,
         );
 
-        // COW must be the LAST entry (top of z, since cursor is
-        // None). dst_size matches the COW storage extent
-        // (800×600). alpha_passthrough must be true.
-        let cow_draw = scene.draws.last().expect("COW draw present");
+        // Top-level 0x100 at (0, 0) sized 100×80.
         assert_eq!(
-            cow_draw.dst_size,
-            [800.0, 600.0],
-            "COW draw must carry the screen-extent storage size",
-        );
-        assert!(
-            cow_draw.alpha_passthrough,
-            "COW must blend (compositors paint premul-alpha output)",
-        );
-        // Output layout origin is (0, 0) in the test fixture, so
-        // dst_origin is (0, 0).
-        assert_eq!(
-            cow_draw.dst_origin,
+            scene.draws[0].dst_origin,
             [0.0, 0.0],
-            "COW dst_origin must be (0, 0) absolute after output projection",
+            "first top-level origin",
         );
-
-        // Both top-levels must come BEFORE the COW entry. Confirm
-        // by checking the first two draws are window-sized, NOT
-        // screen-sized.
-        assert_ne!(
-            scene.draws[0].dst_size,
-            [800.0, 600.0],
-            "first draw must be a top-level, not the COW",
-        );
-        assert_ne!(
-            scene.draws[1].dst_size,
-            [800.0, 600.0],
-            "second draw must be a top-level, not the COW",
-        );
-
-        // sampled_ids must carry cow_id last.
         assert_eq!(
-            *built.sampled_ids.last().expect("sampled_ids non-empty"),
-            cow_id,
-            "sampled_ids must reference COW id at the top of z",
+            scene.draws[0].dst_size,
+            [100.0, 80.0],
+            "first top-level size",
         );
+        // Top-level 0x101 at (200, 150) sized 120×90.
+        assert_eq!(
+            scene.draws[1].dst_origin,
+            [200.0, 150.0],
+            "second top-level origin",
+        );
+        assert_eq!(
+            scene.draws[1].dst_size,
+            [120.0, 90.0],
+            "second top-level size",
+        );
+
+        // No draw should be screen-extent (no COW present).
+        for d in &scene.draws {
+            assert_ne!(
+                d.dst_size,
+                [800.0, 600.0],
+                "no draw should be screen-extent when cow=None: {:?}",
+                d,
+            );
+        }
     }
 
-    /// Stage 4d — when a cursor IS registered alongside the COW,
-    /// the COW must appear BELOW the cursor (Stage 4 plan §4d
-    /// layering item 4: COW is below cursor). Layering oracle:
-    /// the cursor draw is last; the COW draw is second-to-last.
+    /// Phase 1 pre-cleanup — when no COW is registered
+    /// (`cow=None`), the cursor draw must still be appended at
+    /// the top of z above the top-level draws. This preserves the
+    /// legacy non-redirected cursor-on-top assertion that Phase 1
+    /// leaves unchanged. The COW-present cursor ordering (top-levels
+    /// stripped, COW below cursor) gets its own dedicated test.
     #[test]
-    fn build_scene_cow_is_below_cursor() {
+    fn build_scene_cow_none_cursor_at_top() {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
@@ -4016,18 +3993,6 @@ mod tests {
             true,
         );
         core.top_level_order.push(0x100);
-
-        // COW @ screen extent.
-        let mut cow_storage = super::super::store::Storage::for_tests_null(
-            extent(800, 600),
-            vk::Format::B8G8R8A8_UNORM,
-        );
-        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
-        cow_storage.image_view = cow_sentinel;
-        cow_storage.sample_view = cow_sentinel;
-        let cow_id = store
-            .allocate(0x103, DrawableKind::Window, 24, true, cow_storage)
-            .expect("alloc COW stub");
 
         // Cursor sprite.
         let mut cursor_storage = super::super::store::Storage::for_tests_null(
@@ -4059,16 +4024,16 @@ mod tests {
             &platform,
             Some(cursor),
             None,
-            Some(cow_id),
+            None, // cow=None — legacy non-redirected path
             false,
         );
         let scene = &built.scene;
 
-        // Expect: top-level, COW, cursor — 3 draws, in that order.
+        // Expect: top-level, cursor — 2 draws, in that order.
         assert_eq!(
             scene.draws.len(),
-            3,
-            "expected top-level + COW + cursor = 3 draws, got {}: {:?}",
+            2,
+            "expected top-level + cursor = 2 draws, got {}: {:?}",
             scene.draws.len(),
             scene.draws,
         );
@@ -4078,11 +4043,11 @@ mod tests {
             [16.0, 16.0],
             "cursor must be the top-of-z draw",
         );
-        // Second-to-last = COW (800×600).
+        // First draw = top-level (400×300).
         assert_eq!(
-            scene.draws[scene.draws.len() - 2].dst_size,
-            [800.0, 600.0],
-            "COW must be directly below cursor",
+            scene.draws[0].dst_size,
+            [400.0, 300.0],
+            "top-level must be below cursor",
         );
     }
 }
