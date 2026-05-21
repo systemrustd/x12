@@ -144,6 +144,12 @@ pub struct KmsBackendV2 {
     /// lifetime totals are always tracked for the acceptance
     /// harness.
     pub(crate) telemetry: Telemetry,
+    /// Stage 5 Task 4 layer 1: last-observed ring lifetime values.
+    /// `sync_descriptor_pool_telemetry` computes deltas vs these
+    /// snapshots and bumps `telemetry` counters by the delta. Spec
+    /// `2026-05-21-descriptor-pool-ring-design.md`.
+    pub(crate) last_observed_pool_creates: u64,
+    pub(crate) last_observed_pool_resets: u64,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -303,7 +309,7 @@ impl KmsBackendV2 {
                     height: u32::from(height),
                 }];
                 const OP_SRC: u8 = 1;
-                match self.engine.render_composite(
+                let composite_result = self.engine.render_composite(
                     &mut self.store,
                     &mut self.platform,
                     OP_SRC,
@@ -322,7 +328,9 @@ impl KmsBackendV2 {
                     0,
                     0,
                     0,
-                ) {
+                );
+                self.sync_descriptor_pool_telemetry();
+                match composite_result {
                     Ok(s) if s.recorded_draws > 0 => {
                         self.telemetry.record_paint_submit();
                         return Ok(());
@@ -422,6 +430,8 @@ impl KmsBackendV2 {
             windows_v2: WindowsV2Map::new(),
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
+            last_observed_pool_creates: 0,
+            last_observed_pool_resets: 0,
             cow_id: None,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
@@ -941,6 +951,8 @@ impl KmsBackendV2 {
             windows_v2: WindowsV2Map::new(),
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
+            last_observed_pool_creates: 0,
+            last_observed_pool_resets: 0,
             cow_id: None,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
@@ -1371,6 +1383,29 @@ impl KmsBackendV2 {
         &self.telemetry
     }
 
+    /// Stage 5 Task 4 layer 1: pull ring lifetime counter deltas
+    /// into Telemetry. Called by the backend after every engine
+    /// RENDER call site + retirement sweep. The bumps are
+    /// independent: ring.lifetime_creates increases inside
+    /// acquire_set; ring.lifetime_resets increases inside
+    /// release_up_to (which only runs inside engine.poll_retired
+    /// and engine.drain_all). Spec
+    /// `2026-05-21-descriptor-pool-ring-design.md` § 'Telemetry'.
+    fn sync_descriptor_pool_telemetry(&mut self) {
+        let creates_now = self.engine.descriptor_pool_creates_lifetime();
+        let resets_now = self.engine.descriptor_pool_resets_lifetime();
+        let creates_delta = creates_now.saturating_sub(self.last_observed_pool_creates);
+        let resets_delta = resets_now.saturating_sub(self.last_observed_pool_resets);
+        for _ in 0..creates_delta {
+            self.telemetry.record_descriptor_pool_create();
+        }
+        if resets_delta > 0 {
+            self.telemetry.record_descriptor_pool_reset(resets_delta);
+        }
+        self.last_observed_pool_creates = creates_now;
+        self.last_observed_pool_resets = resets_now;
+    }
+
     /// Hand the libinput context off to the dedicated input thread.
     /// Mirrors `KmsBackend::take_input_ctx`.
     #[must_use]
@@ -1415,6 +1450,7 @@ impl KmsBackendV2 {
         // each subsystem's book-keeping reclaims its handles
         // against the still-live pool.
         self.engine.drain_all(&self.platform);
+        self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
         self.platform.disable_output()
     }
@@ -2248,7 +2284,7 @@ impl KmsBackendV2 {
         }
         // Op `Src` (1) — tile fill replaces the destination.
         const OP_SRC: u8 = 1;
-        match self.engine.render_composite(
+        let composite_result = self.engine.render_composite(
             &mut self.store,
             &mut self.platform,
             OP_SRC,
@@ -2267,7 +2303,9 @@ impl KmsBackendV2 {
             0,
             0,
             0,
-        ) {
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
             Ok(s) => {
                 if s.recorded_draws > 0 {
                     self.telemetry.record_paint_submit();
@@ -3690,6 +3728,7 @@ impl Backend for KmsBackendV2 {
         // that their fences may have signaled.
         self.engine.poll_retired(&self.platform);
         self.store.poll_pending_retire(&mut self.platform);
+        self.sync_descriptor_pool_telemetry();
     }
 
     fn mark_dirty(&mut self) {
@@ -5127,7 +5166,7 @@ impl Backend for KmsBackendV2 {
             height: dst_extent.height,
         }];
         const OP_SRC: u8 = 1;
-        match self.engine.render_composite(
+        let composite_result = self.engine.render_composite(
             &mut self.store,
             &mut self.platform,
             OP_SRC,
@@ -5146,7 +5185,9 @@ impl Backend for KmsBackendV2 {
             0,
             0,
             0,
-        ) {
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
             Ok(s) if s.recorded_draws > 0 => self.telemetry.record_paint_submit(),
             Ok(_) => {}
             Err(e) => {
@@ -6825,6 +6866,7 @@ impl Backend for KmsBackendV2 {
             mask_pict_format,
             dst_pict_format,
         );
+        self.sync_descriptor_pool_telemetry();
         match &stats {
             Ok(s) => {
                 if s.recorded_draws > 0 {
@@ -7257,6 +7299,7 @@ impl Backend for KmsBackendV2 {
             &decoded,
             dst_clip.as_deref(),
         );
+        self.sync_descriptor_pool_telemetry();
         if let Ok(s) = stats {
             if s.recorded_draws > 0 {
                 self.telemetry.record_paint_submit();
@@ -7396,6 +7439,7 @@ impl Backend for KmsBackendV2 {
             src_pict_format,
             dst_pict_format,
         );
+        self.sync_descriptor_pool_telemetry();
         if let Ok(s) = stats {
             if s.recorded_draws > 0 {
                 self.telemetry.record_paint_submit();
@@ -7561,6 +7605,7 @@ impl Backend for KmsBackendV2 {
             src_pict_format,
             dst_pict_format,
         );
+        self.sync_descriptor_pool_telemetry();
         if let Ok(s) = stats {
             if s.recorded_draws > 0 {
                 self.telemetry.record_paint_submit();

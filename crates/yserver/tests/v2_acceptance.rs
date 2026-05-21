@@ -2602,3 +2602,55 @@ fn v2_storage_depth24_has_distinct_sample_view() {
     assert_ne!(views32.0, vk::ImageView::null());
     assert_ne!(views32.1, vk::ImageView::null());
 }
+
+/// Stage 5 Task 4 layer 1 telemetry primer gate: after a single
+/// render_composite call the backend telemetry must reflect ≥ 1
+/// descriptor_pool_creates lifetime. Without backend wiring the
+/// ring's lifetime counter increments but Telemetry stays at zero.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_composite_bumps_pool_create_telemetry() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
+        .expect("pre-fill");
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("pic")
+        .expect("Some");
+
+    b.render_composite(
+        None,
+        3,
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        4,
+    )
+    .expect("composite");
+
+    let t = b.telemetry();
+    assert!(
+        t.lifetime.descriptor_pool_creates >= 1,
+        "expected ≥ 1 pool create, got {}",
+        t.lifetime.descriptor_pool_creates,
+    );
+}
