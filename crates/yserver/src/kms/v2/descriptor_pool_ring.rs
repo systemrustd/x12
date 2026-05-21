@@ -44,6 +44,8 @@ pub(crate) struct DescriptorPoolRing {
     active: Option<usize>,
     lifetime_creates: u64,
     lifetime_resets: u64,
+    #[cfg(test)]
+    inject_next_allocate_error: Option<vk::Result>,
 }
 
 impl DescriptorPoolRing {
@@ -54,7 +56,14 @@ impl DescriptorPoolRing {
             active: None,
             lifetime_creates: 0,
             lifetime_resets: 0,
+            #[cfg(test)]
+            inject_next_allocate_error: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inject_next_allocate_error(&mut self, err: vk::Result) {
+        self.inject_next_allocate_error = Some(err);
     }
 
     pub(crate) fn pool_count(&self) -> usize {
@@ -98,21 +107,49 @@ impl DescriptorPoolRing {
         generation: u64,
     ) -> Result<vk::DescriptorSet, vk::Result> {
         self.ensure_active_with_capacity()?;
-        let idx = self
-            .active
-            .expect("ensure_active_with_capacity sets active");
+        match self.try_allocate_one(layout) {
+            Ok(set) => {
+                self.note_acquired(generation);
+                Ok(set)
+            }
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                if let Some(idx) = self.active {
+                    self.pools[idx].sets_remaining = 0;
+                }
+                self.ensure_active_with_capacity()?;
+                let set = self.try_allocate_one(layout)?;
+                self.note_acquired(generation);
+                Ok(set)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_allocate_one(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        #[cfg(test)]
+        if let Some(e) = self.inject_next_allocate_error.take() {
+            return Err(e);
+        }
+        let idx = self.active.expect("ensure_active_with_capacity set active");
         let pool = self.pools[idx].pool;
         let layouts = [layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
         let sets = unsafe { self.vk.device.allocate_descriptor_sets(&alloc_info)? };
+        Ok(sets[0])
+    }
+
+    fn note_acquired(&mut self, generation: u64) {
+        let idx = self.active.expect("acquire path established active");
         let slot = &mut self.pools[idx];
         slot.sets_remaining = slot.sets_remaining.saturating_sub(1);
         if slot.high_water_generation < generation {
             slot.high_water_generation = generation;
         }
-        Ok(sets[0])
     }
 
     /// Caller signals "all submissions up to and including generation
@@ -384,6 +421,35 @@ mod tests {
         assert_eq!(ring.state_counts(), (1, 1, 0, 0));
         assert_eq!(ring.lifetime_resets(), 2);
 
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn out_of_pool_memory_retry() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        ring.test_inject_next_allocate_error(vk::Result::ERROR_OUT_OF_POOL_MEMORY);
+        let set = ring.acquire_set(layout, 1).expect("retry should succeed");
+        assert_ne!(set, vk::DescriptorSet::null());
+        // The first alloc consumed an Active pool then errored; the
+        // retry rotates and creates pool 2.
+        assert_eq!(ring.pool_count(), 2);
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn fragmented_pool_retry() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        ring.test_inject_next_allocate_error(vk::Result::ERROR_FRAGMENTED_POOL);
+        let set = ring.acquire_set(layout, 1).expect("retry should succeed");
+        assert_ne!(set, vk::DescriptorSet::null());
+        assert_eq!(ring.pool_count(), 2);
         unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
 }
