@@ -153,6 +153,17 @@ pub struct ActivePointerGrab {
     /// 0 = inherit
     pub cursor: ResourceId,
     pub time: u32,
+    /// X11 `GrabPointer` / XI2 `XIGrabDevice` `owner_events` flag.
+    /// When true, pointer events on windows owned by the grab client
+    /// are delivered normally (to the deepest natural window) rather
+    /// than redirected to `grab_window`. This is how GTK3 menus
+    /// expect motion + click events to flow during a popup grab —
+    /// the panel button stays "hover-tracked" until the pointer
+    /// crosses into the popup itself, at which point natural
+    /// `EnterNotify`/`LeaveNotify` fire and GTK3 transitions menu
+    /// state. With `owner_events=false`, every event is reported
+    /// against `grab_window` with no propagation.
+    pub owner_events: bool,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —

@@ -227,13 +227,13 @@ pub fn process_request(
         23 => handle_get_selection_owner(state, client_id, sequence, body),
         40 => handle_translate_coordinates(state, client_id, sequence, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
-        26 => handle_grab_pointer(state, client_id, sequence, body),
-        27 => handle_ungrab_pointer(state, client_id, sequence),
+        26 => handle_grab_pointer(state, backend, origin, client_id, sequence, header, body),
+        27 => handle_ungrab_pointer(state, backend, origin, client_id, sequence),
         28 => handle_grab_button(state, client_id, sequence, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
-        31 => handle_grab_keyboard(state, client_id, sequence, body),
-        32 => handle_ungrab_keyboard(state, client_id, sequence),
+        31 => handle_grab_keyboard(state, backend, origin, client_id, sequence, body),
+        32 => handle_ungrab_keyboard(state, backend, origin, client_id, sequence),
         33 => handle_grab_key(state, client_id, sequence, header, body),
         34 => handle_ungrab_key(state, client_id, sequence, header, body),
         // ── font / size queries (pure state-read replies) ──
@@ -7373,15 +7373,42 @@ fn handle_xi2_request(
             // 8 + 23 pad). Wire body: window(4) + time(4) + cursor(4)
             // + deviceid(2) + mode(1) + paired_device_mode(1) +
             // owner_events(1) + pad(1) + mask_len(2) + ...
-            let (grab_window, time, cursor, deviceid) = if body.len() >= 14 {
+            // XIGrabDevice body: window(4) time(4) cursor(4)
+            // deviceid(2) mode(1) paired(1) owner_events(1) pad(1)
+            // mask_len(2) mask...
+            let (grab_window, time, cursor, deviceid, owner_events) = if body.len() >= 17 {
                 (
                     u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
                     u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
                     u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
                     u16::from_le_bytes([body[12], body[13]]),
+                    body[16] != 0,
                 )
             } else {
-                (0, 0, 0, 0)
+                (0, 0, 0, 0, false)
+            };
+            // Capture the previous grab window (if any, this client's)
+            // BEFORE we overwrite. Synthesised crossings need to send
+            // Leave on the previous grab window when transitioning to
+            // a different one. GTK3 popups grab the input-shadow
+            // window first, then re-grab the visible popup — without
+            // the Leave on the shadow window GTK3's menu-tracking
+            // never engages on the visible popup.
+            let prev_pointer_grab_window: Option<ResourceId> = if deviceid == 3 {
+                None
+            } else {
+                state
+                    .active_pointer_grab
+                    .filter(|g| g.owner == client_id)
+                    .map(|g| g.grab_window)
+            };
+            let prev_keyboard_grab_window: Option<ResourceId> = if deviceid == 3 {
+                state
+                    .active_keyboard_grab
+                    .filter(|g| g.owner == client_id)
+                    .map(|g| g.grab_window)
+            } else {
+                None
             };
             if deviceid == 3 {
                 state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
@@ -7398,12 +7425,78 @@ fn handle_xi2_request(
                     event_mask: 0xFFFF, // permissive — XI2 mask not parsed
                     cursor: ResourceId(cursor),
                     time,
+                    owner_events,
                 });
             }
             debug!(
                 "client {} #{} XIGrabDevice window=0x{:x} deviceid={} cursor=0x{:x} -> Success",
                 client_id.0, sequence.0, grab_window, deviceid, cursor
             );
+            // Synthesised XI2 crossings on grab activation. Matches
+            // Xorg `Xi/exevents.c::ActivateKeyboardGrab` /
+            // `ActivatePointerGrab` (which call `DoEnterLeaveEvents`
+            // with `NotifyGrab`). Without these GTK3 popup state
+            // machines never engage their hover/click tracking — the
+            // menu is visible but items don't highlight or activate
+            // on click. Captured in `mate-xorg.xtrace` as the pair
+            // `XI_Leave(mode=Grab, detail=Nonlinear)` on the previous
+            // grab window followed by `XI_Enter(mode=Grab,
+            // detail=Nonlinear)` on the new grab window; keyboard
+            // grabs additionally get `XI_FocusIn(mode=Grab,
+            // detail=Nonlinear)`. NotifyGrab = 1, NotifyNonlinear = 3.
+            let pointer_xy = backend
+                .query_pointer(origin)
+                .ok()
+                .map(|p| (p.win_x, p.win_y))
+                .unwrap_or((0, 0));
+            let (root_x, root_y) = pointer_xy;
+            let server_time = state.timestamp_now();
+            let emit_xi_crossing = |state: &mut ServerState,
+                                    evtype: u16,
+                                    target_window: ResourceId| {
+                let (origin_x, origin_y) = state.resources.window_absolute_position(target_window);
+                let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x))
+                    .unwrap_or(i16::MAX);
+                let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
+                    .unwrap_or(i16::MAX);
+                let _dropped =
+                    fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+                        x11::encode_xi2_crossing_event(
+                            out,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            evtype,
+                            deviceid,
+                            server_time,
+                            ROOT_WINDOW,
+                            target_window,
+                            root_x,
+                            root_y,
+                            event_x,
+                            event_y,
+                            0,
+                            1, // mode = NotifyGrab
+                            3, // detail = NotifyNonlinear
+                            deviceid,
+                        );
+                    });
+            };
+            // Emit Leave/FocusOut on the previous grab window if the
+            // grab is moving between different windows.
+            if let Some(prev) = prev_pointer_grab_window
+                && prev != ResourceId(grab_window)
+            {
+                emit_xi_crossing(state, 8, prev); // XI_Leave
+            }
+            if let Some(prev) = prev_keyboard_grab_window
+                && prev != ResourceId(grab_window)
+            {
+                emit_xi_crossing(state, 10, prev); // XI_FocusOut
+            }
+            // Emit Enter/FocusIn on the new grab window.
+            let xi_evtype: u16 = if deviceid == 3 { 9 } else { 7 }; // FocusIn / Enter
+            emit_xi_crossing(state, xi_evtype, ResourceId(grab_window));
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
@@ -7414,6 +7507,23 @@ fn handle_xi2_request(
                 u16::from_le_bytes([body[4], body[5]])
             } else {
                 0
+            };
+            // Capture grab_window BEFORE clearing — we synthesize the
+            // matching XI2 crossing with `NotifyUngrab` on the way out
+            // so the client's grab state machine pairs cleanly with
+            // its earlier NotifyGrab. Matches Xorg
+            // `Xi/exevents.c::DeactivateKeyboardGrab` /
+            // `DeactivatePointerGrab`.
+            let grab_window_for_event: Option<ResourceId> = if deviceid == 3 {
+                state
+                    .active_keyboard_grab
+                    .filter(|g| g.owner == client_id)
+                    .map(|g| g.grab_window)
+            } else {
+                state
+                    .pointer_grab
+                    .filter(|(owner, _)| *owner == client_id)
+                    .map(|(_, w)| w)
             };
             if deviceid == 3 {
                 if state
@@ -7430,6 +7540,44 @@ fn handle_xi2_request(
                 state.pointer_grab_is_passive = false;
                 state.active_pointer_grab = None;
                 state.frozen_pointer_event = None;
+            }
+            if let Some(grab_window) = grab_window_for_event {
+                let pointer_xy = backend
+                    .query_pointer(origin)
+                    .ok()
+                    .map(|p| (p.win_x, p.win_y))
+                    .unwrap_or((0, 0));
+                let (root_x, root_y) = pointer_xy;
+                let (grab_origin_x, grab_origin_y) =
+                    state.resources.window_absolute_position(grab_window);
+                let event_x = i16::try_from(i32::from(root_x).saturating_sub(grab_origin_x))
+                    .unwrap_or(i16::MAX);
+                let event_y = i16::try_from(i32::from(root_y).saturating_sub(grab_origin_y))
+                    .unwrap_or(i16::MAX);
+                let xi_evtype: u16 = if deviceid == 3 { 10 } else { 8 }; // FocusOut / Leave
+                let server_time = state.timestamp_now();
+                let _dropped =
+                    fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+                        x11::encode_xi2_crossing_event(
+                            out,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            xi_evtype,
+                            deviceid,
+                            server_time,
+                            ROOT_WINDOW,
+                            grab_window,
+                            root_x,
+                            root_y,
+                            event_x,
+                            event_y,
+                            0,
+                            2, // mode = NotifyUngrab
+                            3, // detail = NotifyNonlinear
+                            deviceid,
+                        );
+                    });
             }
             debug!(
                 "client {} #{} XIUngrabDevice deviceid={}",
@@ -13050,15 +13198,28 @@ fn handle_query_best_size(
 
 fn handle_grab_pointer(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
+        // GrabPointer wire shape: header opcode/data/length, then
+        // window(4) event-mask(2) pointer-mode(1) keyboard-mode(1)
+        // confine-to(4) cursor(4) time(4). The `owner_events` BOOL
+        // lives in the request header's `data` byte (header.data),
+        // not in the body.
+        let owner_events = header.data != 0;
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let event_mask = u16::from_le_bytes([body[4], body[5]]);
         let cursor = ResourceId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
         let time = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+        let prev_grab_window = state
+            .active_pointer_grab
+            .filter(|g| g.owner == client_id)
+            .map(|g| g.grab_window);
         state.pointer_grab = Some((client_id, grab_window));
         state.pointer_grab_is_passive = false;
         state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
@@ -13067,7 +13228,22 @@ fn handle_grab_pointer(
             event_mask,
             cursor,
             time,
+            owner_events,
         });
+        // Synthesised crossings on grab activation — marco's title-bar
+        // popup menu uses core GrabPointer/GrabKeyboard (not XI2). GTK3
+        // popup machinery needs Leave(mode=NotifyGrab) on the previous
+        // grab window followed by Enter(mode=NotifyGrab) on the new
+        // grab window. Same shape as the XI2 path; see comments there.
+        emit_core_grab_activation_crossings(
+            state,
+            backend,
+            origin,
+            client_id,
+            prev_grab_window,
+            grab_window,
+            CrossingKind::Pointer,
+        );
     }
     debug!("client {} #{} GrabPointer", client_id.0, sequence.0);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -13079,17 +13255,160 @@ fn handle_grab_pointer(
     Ok(write_to_client(client, client_id, &buf))
 }
 
+/// Which mode of crossing the synthesised activation emits — pointer
+/// uses EnterNotify/LeaveNotify (opcodes 7/8); keyboard uses
+/// FocusIn/FocusOut (opcodes 9/10). Matches Xorg
+/// `Xi/exevents.c::ActivatePointerGrab` / `ActivateKeyboardGrab`.
+#[derive(Clone, Copy)]
+enum CrossingKind {
+    Pointer,
+    Keyboard,
+}
+
+fn emit_core_grab_activation_crossings(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    prev_grab_window: Option<ResourceId>,
+    new_grab_window: ResourceId,
+    kind: CrossingKind,
+) {
+    let pointer_xy = backend
+        .query_pointer(origin)
+        .ok()
+        .map(|p| (p.win_x, p.win_y))
+        .unwrap_or((0, 0));
+    let (root_x, root_y) = pointer_xy;
+    let server_time = state.timestamp_now();
+    let (leave_evtype, enter_evtype) = match kind {
+        CrossingKind::Pointer => (8u8, 7u8), // LeaveNotify / EnterNotify
+        CrossingKind::Keyboard => (10u8, 9u8), // FocusOut / FocusIn
+    };
+    let emit_to_client = |state: &mut ServerState, evtype: u8, target: ResourceId| {
+        let (origin_x, origin_y) = state.resources.window_absolute_position(target);
+        let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
+        let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+            if evtype == 7 || evtype == 8 {
+                let crossing = yserver_protocol::x11::CrossingEvent {
+                    sequence: seq,
+                    time: server_time,
+                    root: ROOT_WINDOW,
+                    event: target,
+                    child: ResourceId(0),
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    state: 0,
+                    detail: 3, // NotifyNonlinear
+                    mode: 1,   // NotifyGrab
+                };
+                if evtype == 7 {
+                    x11::encode_enter_notify_event(out, order, crossing);
+                } else {
+                    x11::encode_leave_notify_event(out, order, crossing);
+                }
+            } else {
+                // FocusIn(9) / FocusOut(10) wire shape (32 bytes):
+                //   1:opcode, 1:detail, 2:sequence, 4:window, 1:mode,
+                //   23:pad.
+                out.push(evtype);
+                out.push(3); // detail = NotifyNonlinear
+                yserver_protocol::x11::write_u16(order, out, seq.0);
+                yserver_protocol::x11::write_u32(order, out, target.0);
+                out.push(1); // mode = NotifyGrab
+                out.extend_from_slice(&[0u8; 23]);
+            }
+        });
+    };
+    if let Some(prev) = prev_grab_window
+        && prev != new_grab_window
+    {
+        emit_to_client(state, leave_evtype, prev);
+    }
+    emit_to_client(state, enter_evtype, new_grab_window);
+}
+
 fn handle_ungrab_pointer(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
+    let prev_grab_window = state
+        .active_pointer_grab
+        .filter(|g| g.owner == client_id)
+        .map(|g| g.grab_window);
     state.pointer_grab = None;
     state.pointer_grab_is_passive = false;
     state.active_pointer_grab = None;
     state.frozen_pointer_event = None;
+    if let Some(prev) = prev_grab_window {
+        emit_core_grab_deactivation_crossing(
+            state,
+            backend,
+            origin,
+            client_id,
+            prev,
+            CrossingKind::Pointer,
+        );
+    }
     debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+fn emit_core_grab_deactivation_crossing(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    prev_grab_window: ResourceId,
+    kind: CrossingKind,
+) {
+    let pointer_xy = backend
+        .query_pointer(origin)
+        .ok()
+        .map(|p| (p.win_x, p.win_y))
+        .unwrap_or((0, 0));
+    let (root_x, root_y) = pointer_xy;
+    let server_time = state.timestamp_now();
+    let evtype: u8 = match kind {
+        CrossingKind::Pointer => 8,   // LeaveNotify
+        CrossingKind::Keyboard => 10, // FocusOut
+    };
+    let (origin_x, origin_y) = state.resources.window_absolute_position(prev_grab_window);
+    let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
+    let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
+    let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+        if evtype == 8 {
+            let crossing = yserver_protocol::x11::CrossingEvent {
+                sequence: seq,
+                time: server_time,
+                root: ROOT_WINDOW,
+                event: prev_grab_window,
+                child: ResourceId(0),
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                state: 0,
+                detail: 3, // NotifyNonlinear
+                mode: 2,   // NotifyUngrab
+            };
+            x11::encode_leave_notify_event(out, order, crossing);
+        } else {
+            // FocusOut wire (32 bytes).
+            out.push(evtype);
+            out.push(3); // detail = NotifyNonlinear
+            yserver_protocol::x11::write_u16(order, out, seq.0);
+            yserver_protocol::x11::write_u32(order, out, prev_grab_window.0);
+            out.push(2); // mode = NotifyUngrab
+            out.extend_from_slice(&[0u8; 23]);
+        }
+    });
 }
 
 fn handle_grab_button(
@@ -13180,17 +13499,32 @@ fn handle_change_active_pointer_grab(
 
 fn handle_grab_keyboard(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 12 {
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        let prev_grab_window = state
+            .active_keyboard_grab
+            .filter(|g| g.owner == client_id)
+            .map(|g| g.grab_window);
         state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
             owner: client_id,
             grab_window,
             source: crate::server::ActiveKeyboardGrabSource::Explicit,
         });
+        emit_core_grab_activation_crossings(
+            state,
+            backend,
+            origin,
+            client_id,
+            prev_grab_window,
+            grab_window,
+            CrossingKind::Keyboard,
+        );
     }
     debug!("client {} #{} GrabKeyboard", client_id.0, sequence.0);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -13204,13 +13538,30 @@ fn handle_grab_keyboard(
 
 fn handle_ungrab_keyboard(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
-    if let Some(g) = state.active_keyboard_grab
-        && g.owner == client_id
+    let prev_grab_window = state
+        .active_keyboard_grab
+        .filter(|g| g.owner == client_id)
+        .map(|g| g.grab_window);
+    if state
+        .active_keyboard_grab
+        .is_some_and(|g| g.owner == client_id)
     {
         state.active_keyboard_grab = None;
+    }
+    if let Some(prev) = prev_grab_window {
+        emit_core_grab_deactivation_crossing(
+            state,
+            backend,
+            origin,
+            client_id,
+            prev,
+            CrossingKind::Keyboard,
+        );
     }
     debug!("client {} #{} UngrabKeyboard", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -15892,6 +16243,123 @@ mod tests {
             state.active_keyboard_grab.is_none(),
             "keyboard grab cleared"
         );
+    }
+
+    /// On `XIGrabDevice` activation, Xorg synthesises an XI2 crossing
+    /// event (`XI_Enter`(7) for pointer / `XI_FocusIn`(9) for keyboard)
+    /// with `mode=NotifyGrab`(1) and `detail=NotifyNonlinear`(3) and
+    /// delivers it to the grab requester. Without these events, GTK3
+    /// popup state machines never engage their hover/click tracking —
+    /// the menu is visible but items don't highlight or activate.
+    /// Captured in `mate-xorg.xtrace` (Xi/exevents.c::ActivatePointer
+    /// Grab / ActivateKeyboardGrab). On `XIUngrabDevice` the symmetric
+    /// `mode=NotifyUngrab`(2) crossings fire.
+    #[test]
+    fn xi_grab_device_emits_grab_activation_crossings() {
+        use std::io::Read;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0060;
+        const HOST_XID: u32 = 0x0040_0060;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 200,
+                width: 300,
+                height: 200,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+
+        // XIGrabDevice pointer.
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.extend_from_slice(&[1, 1, 1, 0]);
+        body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[0u8; 2]);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 51,
+            length_units: 7,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XIGrabDevice");
+
+        // Drain wire and look for the synthesised XI2 Enter event:
+        //   byte 0: 35 (GenericEvent)
+        //   byte 1: 137 (XInputExtension major)
+        //   bytes 8-9: evtype = 7 (XI_Enter)
+        //   byte 12: mode = 1 (NotifyGrab)
+        //   byte 13: detail = 3 (NotifyNonlinear)
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // Wire contains both the 32-byte XIGrabDevice reply and the
+        // synthesised XI2 GenericEvent (76 bytes). Order may vary —
+        // scan for the GenericEvent signature: type=35, major=137,
+        // evtype=7 (XI_Enter).
+        let crossing_offset = (0..wire.len().saturating_sub(76))
+            .find(|&i| {
+                wire[i] == 35
+                    && wire[i + 1] == 137
+                    && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 7
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no XI_Enter GenericEvent found in {} wire bytes: {:?}",
+                    wire.len(),
+                    &wire[..wire.len().min(140)],
+                )
+            });
+        let crossing = &wire[crossing_offset..crossing_offset + 76];
+        // Crossing event byte layout (from encode_xi2_crossing_event):
+        //   0:type=35, 1:major, 2..4:seq, 4..8:length, 8..10:evtype,
+        //   10..12:deviceid, 12..16:time, 16..18:sourceid, 18:mode,
+        //   19:detail, 20..24:root, 24..28:event, ...
+        assert_eq!(crossing[18], 1, "mode = NotifyGrab");
+        assert_eq!(crossing[19], 3, "detail = NotifyNonlinear");
+        let event_window =
+            u32::from_le_bytes([crossing[24], crossing[25], crossing[26], crossing[27]]);
+        assert_eq!(event_window, WINDOW_XID);
     }
 
     /// `XIPassiveGrabDevice` with grab_type=Button(0) installs entries

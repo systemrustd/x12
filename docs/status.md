@@ -342,6 +342,54 @@ Cross-cutting bugs and followups that don't fit a stage live in
   yserver has no matching machinery yet. Regressions:
   `xi_grab_device_sets_active_grab_state` and
   `xi_passive_grab_device_pushes_button_and_key_grabs`.
+  Wiring grabs surfaced three more layers that GTK3 popup menus
+  rely on, each cross-checked against `xfce-xorg.xtrace` (lines
+  140188+ for marco title-bar core grabs, lines 218731+ for
+  xfce4-panel main-menu core grabs, lines 41986+ for pluma XI2
+  popups). All three are now in tree.
+  (1) Synthesised grab-activation crossings. Xorg emits
+  `EnterNotify`/`LeaveNotify` (`FocusIn`/`FocusOut` for keyboard
+  grabs) with `mode=NotifyGrab, detail=NotifyNonlinear` when a
+  grab activates or transitions between grab windows. Without
+  these, GTK3's popup state machine never engages — the menu is
+  visible and the grab is held, but hover/click tracking stays
+  dormant and items don't highlight or activate. yserver now
+  emits the matching pair on both `XIGrabDevice` (XI2 minor 51,
+  see `xi_grab_device_emits_grab_activation_crossings`) and core
+  `GrabPointer`/`GrabKeyboard`, including the cross-window
+  Leave-on-previous + Enter-on-new pair when GTK3 re-grabs from
+  its initial input-shadow window onto the visible popup. The
+  matching `NotifyUngrab` pair fires on `XIUngrabDevice` /
+  `UngrabPointer` / `UngrabKeyboard`.
+  (2) Natural Enter/Leave under an active grab. Pre-fix the
+  pointer fanout's active-grab redirect unconditionally set
+  `handled_core_via_grab = true` for ALL pointer events,
+  including `EnterNotify`/`LeaveNotify`, then short-circuited the
+  normal core-propagation path. Natural crossings as the pointer
+  moved between windows were dropped entirely while a grab was
+  active — so GTK3 never received the "pointer entered me" cue
+  needed to transition menu state from "menu open, no item
+  active" to "tracking hover". Crossings now skip the redirect
+  and fall through to normal propagation, matching Xorg
+  `dix/events.c::DeliverGrabbedEvent` which only re-routes events
+  explicitly listed in the grab's event mask.
+  (3) `owner_events=true` semantics. The active-grab redirect
+  was forcibly delivering motion + button events to `grab_window`
+  regardless of the grab's `owner_events` flag — pure
+  `owner_events=false` behaviour. Per spec (and Xorg `xfce-
+  xorg.xtrace:219000+`), when `owner_events=true` AND the natural
+  hit-test window is owned by the grab client, events should be
+  reported on the natural deepest window (so GTK3 menus see motion
+  events on the panel button until the pointer actually crosses
+  into the popup). Captured in `ActivePointerGrab.owner_events`
+  (read from `XIGrabDevice` body byte 16 / core `GrabPointer`
+  header data byte) and now consulted by the redirect: only
+  redirect to `grab_window` if `owner_events=false` OR the
+  natural target is owned by a different client. Verified end-to-
+  end: pluma right-click popup, gnome-text-editor right-click
+  popup, marco title-bar right-click menu, and xfce4-panel
+  whisker-menu all now highlight items on hover and activate on
+  click under MATE+marco / XFCE+xfwm4.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

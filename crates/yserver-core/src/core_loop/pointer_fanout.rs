@@ -97,39 +97,69 @@ pub fn pointer_event_fanout_to_state(
     let mut handled_core_via_grab = false;
 
     // Step 2 — active-grab redirection (core events only).
-    if handle_grabs && let Some((grab_window, grab_client, gx, gy)) = active_grab_target(state) {
+    if handle_grabs
+        && let Some((grab_window, grab_client, gx, gy, owner_events)) = active_grab_target(state)
+    {
+        // With `owner_events=true`, pointer events on windows owned
+        // by the grab client are reported normally (to the deepest
+        // natural window) rather than redirected to `grab_window`.
+        // The grab itself is just an exclusivity mechanism — other
+        // clients can't see the events. GTK3 menus rely on this:
+        // motion fires on the panel button until the user actually
+        // crosses into the popup, at which point natural
+        // Enter/Leave fire and GTK3 transitions menu state. With
+        // `owner_events=false`, all events report against grab_window.
+        let target_owner = state.resources.window_owner(target);
+        let target_is_owned_by_grab_client = target_owner == Some(grab_client);
+        let redirect_to_grab = !owner_events || !target_is_owned_by_grab_client;
         if !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
         ) {
-            let event_x = clamp_grab_coord(event.root_x, gx);
-            let event_y = clamp_grab_coord(event.root_y, gy);
-            log::trace!(
-                "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?}",
-                event.kind,
-                event.detail,
-                grab_window.0,
-                grab_client,
-            );
-            let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
-                encode_pointer_event(
-                    buf,
-                    order,
+            if redirect_to_grab {
+                let event_x = clamp_grab_coord(event.root_x, gx);
+                let event_y = clamp_grab_coord(event.root_y, gy);
+                log::trace!(
+                    "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?} owner_events={}",
                     event.kind,
-                    seq,
                     event.detail,
-                    event.time,
-                    grab_window,
-                    ResourceId(0), // active-grab redirect: no propagation child
-                    event,
-                    event_x,
-                    event_y,
+                    grab_window.0,
+                    grab_client,
+                    owner_events,
                 );
-            });
-            merge_dropped(&mut dropped, extras);
-            release_passive_grab_on_button_release(state, event.kind);
+                let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
+                    encode_pointer_event(
+                        buf,
+                        order,
+                        event.kind,
+                        seq,
+                        event.detail,
+                        event.time,
+                        grab_window,
+                        ResourceId(0), // active-grab redirect: no propagation child
+                        event,
+                        event_x,
+                        event_y,
+                    );
+                });
+                merge_dropped(&mut dropped, extras);
+                release_passive_grab_on_button_release(state, event.kind);
+                handled_core_via_grab = true;
+            }
+            // Else (owner_events=true and target owned by grab client):
+            // fall through to normal propagation so the event fires on
+            // the natural window via the usual subscriber-walk path.
         }
-        handled_core_via_grab = true;
+        // For Enter/Leave (natural pointer crossings between windows),
+        // never mark handled_core_via_grab — let them fall through to
+        // the normal core propagation in step 4. Pre-fix the existing
+        // code set the flag unconditionally and dropped natural
+        // crossings entirely while a grab was active, so GTK3 menus
+        // (xfce4-panel's main menu, marco's title-bar popup) never
+        // received the "pointer entered me" notification needed to
+        // engage hover/click tracking. Matches Xorg
+        // `dix/events.c::DeliverGrabbedEvent` which only re-routes
+        // pointer events explicitly listed in the grab's event mask.
     }
 
     // Step 3 — passive button-grab matching for ButtonPress.
@@ -433,11 +463,19 @@ fn translate_host_event(
 
 fn active_grab_target(
     state: &ServerState,
-) -> Option<(yserver_protocol::x11::ResourceId, ClientId, i32, i32)> {
+) -> Option<(yserver_protocol::x11::ResourceId, ClientId, i32, i32, bool)> {
     let (client_id, grab_window) = state.pointer_grab?;
     let target = client_target_id(state, client_id)?;
     let (gx, gy) = state.resources.window_absolute_position(grab_window);
-    Some((grab_window, target, gx, gy))
+    // `owner_events` from the active grab record. Passive button-grabs
+    // (activated via try_match_passive_grab) leave
+    // `state.active_pointer_grab` unset, so default to false (X11
+    // implicit grab semantics — events report against the grab window).
+    let owner_events = state
+        .active_pointer_grab
+        .filter(|g| g.owner == client_id)
+        .is_some_and(|g| g.owner_events);
+    Some((grab_window, target, gx, gy, owner_events))
 }
 
 fn release_passive_grab_on_button_release(state: &mut ServerState, kind: PointerEventKind) {
