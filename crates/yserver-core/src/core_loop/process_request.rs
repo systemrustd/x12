@@ -6721,7 +6721,52 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         42 => {
-            debug!("client {} #{} XIChangeCursor", client_id.0, sequence.0);
+            // XIChangeCursor (XI2 opcode 42). Wire body after the
+            // request header: window(4), cursor(4), deviceid(2), pad(2).
+            // GTK4 (gnome-text-editor, modern GTK apps) sets per-widget
+            // cursors via this rather than core `XDefineCursor`, so
+            // pre-fix the I-beam never reached the backend and text
+            // areas kept showing the default arrow. Treat it as
+            // `XDefineCursor` for now — yserver doesn't yet route
+            // per-device cursors, but a single effective cursor on the
+            // window matches what XInput2 produces for AllMasterDevices
+            // and is what GTK relies on in practice. `cursor = None`
+            // (xid 0) means "clear" — same semantics as the CWA cursor
+            // path, see Xorg `dix/window.c:1487-1491`.
+            if body.len() < 8 {
+                debug!(
+                    "client {} #{} XIChangeCursor (body too short: {})",
+                    client_id.0,
+                    sequence.0,
+                    body.len()
+                );
+                return Ok(RequestOutcome::Handled);
+            }
+            let window =
+                ResourceId(u32::from_le_bytes(body[0..4].try_into().expect("4 bytes")));
+            let cursor =
+                ResourceId(u32::from_le_bytes(body[4..8].try_into().expect("4 bytes")));
+            let host_window_raw = if window == ROOT_WINDOW {
+                Some(backend.window_id())
+            } else {
+                state
+                    .resources
+                    .window(window)
+                    .and_then(|w| w.host_xid)
+                    .map(|h| h.as_raw())
+            };
+            let cursor_host_xid = if cursor.0 == 0 {
+                Some(0u32)
+            } else {
+                state.resources.cursor_host_xid(cursor)
+            };
+            debug!(
+                "client {} #{} XIChangeCursor window=0x{:x} cursor=0x{:x}",
+                client_id.0, sequence.0, window.0, cursor.0
+            );
+            if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
+                let _ = backend.define_cursor(origin, hw, ch);
+            }
             return Ok(RequestOutcome::Handled);
         }
         44 => {
@@ -15285,6 +15330,141 @@ mod tests {
              cursor. Pre-fix this dropped silently, leaving stale \
              cursor state (marco's resize-frame XDefineCursor(frame, \
              None) reset on edge→interior transitions had no effect).",
+        );
+    }
+
+    /// GTK4 (gnome-text-editor, modern GTK apps) sets per-widget
+    /// cursors through XInput2's `XIChangeCursor` (opcode 42), not
+    /// core X11's `XDefineCursor`. Pre-fix the handler was a logging
+    /// no-op, so the I-beam cursor over a text widget never reached
+    /// the backend and the area kept showing the default arrow.
+    /// Treat it as `XDefineCursor` (per-device cursors aren't routed
+    /// yet; a single effective cursor on the window matches what
+    /// `AllMasterDevices`-style calls produce in practice).
+    #[test]
+    fn xi_change_cursor_propagates_define_cursor_to_backend() {
+        use crate::backend::recording::RecordedCall;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0030;
+        const HOST_XID: u32 = 0x0040_0030;
+        const CURSOR_XID: u32 = 0x0090_0001;
+        const CURSOR_HOST_XID: u32 = 0x00a0_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        state
+            .resources
+            .create_cursor(ClientId(CLIENT_ID), ResourceId(CURSOR_XID));
+        state.resources.set_cursor_host_xid(
+            ResourceId(CURSOR_XID),
+            crate::backend::CursorHandle::from_raw_panicking(CURSOR_HOST_XID),
+        );
+
+        // XIChangeCursor body: window(4), cursor(4), deviceid(2), pad(2).
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body.extend_from_slice(&CURSOR_XID.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131, // doesn't matter — dispatcher is bypassed
+            data: 42,    // XIChangeCursor minor
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("handle_xi2_request");
+
+        let define_cursor_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::DefineCursor { .. }))
+            .collect();
+        assert_eq!(
+            define_cursor_calls,
+            vec![RecordedCall::DefineCursor {
+                host_window_xid: HOST_XID,
+                cursor_host_xid: CURSOR_HOST_XID,
+            }],
+            "XIChangeCursor must propagate to `backend.define_cursor` \
+             so GTK4's per-widget cursor (I-beam on text areas, etc.) \
+             becomes effective. Pre-fix the handler was a logging \
+             no-op — gnome-text-editor and other GTK4 apps kept the \
+             default arrow over text widgets.",
+        );
+
+        // cursor = None (xid 0) clears the per-window cursor.
+        let mut body_none = Vec::with_capacity(12);
+        body_none.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body_none.extend_from_slice(&0u32.to_le_bytes());
+        body_none.extend_from_slice(&0u16.to_le_bytes());
+        body_none.extend_from_slice(&[0u8; 2]);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &body_none,
+        )
+        .expect("handle_xi2_request none");
+
+        let define_cursor_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::DefineCursor { .. }))
+            .collect();
+        assert_eq!(
+            define_cursor_calls,
+            vec![
+                RecordedCall::DefineCursor {
+                    host_window_xid: HOST_XID,
+                    cursor_host_xid: CURSOR_HOST_XID,
+                },
+                RecordedCall::DefineCursor {
+                    host_window_xid: HOST_XID,
+                    cursor_host_xid: 0,
+                },
+            ],
+            "XIChangeCursor with cursor=None (xid 0) must invoke \
+             `backend.define_cursor(window, 0)` — same X11 None \
+             semantics as the CWA cursor path.",
         );
     }
 

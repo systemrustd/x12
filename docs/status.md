@@ -268,6 +268,22 @@ Cross-cutting bugs and followups that don't fit a stage live in
   resize-edge sub-windows receive their `ButtonPress` events
   when the user starts a resize (was previously delivered to the
   frame top-level, which has no resize behaviour bound to it).
+  Latest narrowing — text widgets in GTK4 apps
+  (`gnome-text-editor`, modern GTK apps) kept showing the default
+  arrow over text areas under both XFCE and MATE. Capture: the
+  client issued 567 `XIChangeCursor` (XI2 opcode 42) requests on
+  hover, zero core `XDefineCursor` calls. yserver's XI2 dispatch
+  treated minor 42 as a logging no-op (`debug!` + `Ok(Handled)`),
+  so the I-beam never reached the backend. Modern GTK4 sets
+  per-widget cursors through XInput2 rather than core X11 (GTK3
+  still uses both, depending on widget age). Handler now parses
+  `window(4) + cursor(4) + deviceid(2) + pad(2)` and routes to
+  `backend.define_cursor` — same shape as the CWA-cursor path,
+  including the `cursor = None` (xid 0) clear case. Per-device
+  cursor routing isn't implemented yet; this treats every
+  `XIChangeCursor` as if `deviceid` were `AllMasterDevices`,
+  which is what GTK relies on in practice. Regression:
+  `xi_change_cursor_propagates_define_cursor_to_backend`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
