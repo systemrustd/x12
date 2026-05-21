@@ -460,38 +460,94 @@ impl RenderPipelineCache {
         dst_view: vk::ImageView,
     ) -> Result<vk::DescriptorSet, vk::Result> {
         let set = arena.allocate_set(self.descriptor_set_layout)?;
-        let src_info = [vk::DescriptorImageInfo::default()
-            .image_view(src_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let mask_info = [vk::DescriptorImageInfo::default()
-            .image_view(mask_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let dst_info = [vk::DescriptorImageInfo::default()
-            .image_view(dst_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&src_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&mask_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&dst_info),
-        ];
-        unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
+        write_views_into_descriptor_set(
+            self.vk.as_ref(),
+            set,
+            self.sampler,
+            src_view,
+            mask_view,
+            dst_view,
+        );
         Ok(set)
     }
+
+    /// Stage 5 Task 4 layer 1: ring-backed sibling of
+    /// `allocate_descriptor_for_views_into`. Allocates the descriptor
+    /// set from the engine's long-lived `DescriptorPoolRing` (whose
+    /// pools recycle on retirement) and writes the three view
+    /// bindings via the shared `write_views_into_descriptor_set`
+    /// helper. v2's engine call sites call this method; v1 keeps
+    /// using the per-batch arena variant. Spec
+    /// `2026-05-21-descriptor-pool-ring-design.md`.
+    #[allow(dead_code)] // Call sites wired in Tasks 11+12.
+    pub(crate) fn allocate_descriptor_for_views_into_ring(
+        &self,
+        ring: &mut crate::kms::v2::descriptor_pool_ring::DescriptorPoolRing,
+        generation: u64,
+        src_view: vk::ImageView,
+        mask_view: vk::ImageView,
+        dst_view: vk::ImageView,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let set = ring.acquire_set(self.descriptor_set_layout, generation)?;
+        write_views_into_descriptor_set(
+            self.vk.as_ref(),
+            set,
+            self.sampler,
+            src_view,
+            mask_view,
+            dst_view,
+        );
+        Ok(set)
+    }
+}
+
+/// Shared between `allocate_descriptor_for_views_into` and the ring
+/// sibling. Takes a pre-allocated `vk::DescriptorSet` and writes the
+/// three `COMBINED_IMAGE_SAMPLER` bindings (src=0, mask=1, dst=2)
+/// with the shared linear sampler.
+///
+/// Note: parameter is named `vk_ctx`, NOT `vk`, because `vk` is the
+/// `ash::vk` module alias in this file — using `vk` as a parameter
+/// name shadows the module and breaks every `vk::DescriptorImageInfo`
+/// reference inside the function body.
+fn write_views_into_descriptor_set(
+    vk_ctx: &VkContext,
+    set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    src_view: vk::ImageView,
+    mask_view: vk::ImageView,
+    dst_view: vk::ImageView,
+) {
+    let src_info = [vk::DescriptorImageInfo::default()
+        .image_view(src_view)
+        .sampler(sampler)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let mask_info = [vk::DescriptorImageInfo::default()
+        .image_view(mask_view)
+        .sampler(sampler)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let dst_info = [vk::DescriptorImageInfo::default()
+        .image_view(dst_view)
+        .sampler(sampler)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&src_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&mask_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&dst_info),
+    ];
+    unsafe { vk_ctx.device.update_descriptor_sets(&writes, &[]) };
 }
 
 impl Drop for RenderPipelineCache {
