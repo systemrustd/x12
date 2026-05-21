@@ -65,6 +65,14 @@ pub struct Bucket {
     //    Stage 3a only adds the storage). ────────────────────
     pub composite_glyphs_dropped_unsupported: u64,
     pub disjoint_readback_count: u64,
+    /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
+    /// second. Should reach a near-zero floor after warm-up under
+    /// the descriptor-pool-ring design (spec 2026-05-21).
+    pub descriptor_pool_creates: u64,
+    /// Stage 5 Task 4 layer 1: vkResetDescriptorPool calls in this
+    /// second. Tracks paint_submits/s / SETS_PER_POOL on a healthy
+    /// recycle path.
+    pub descriptor_pool_resets: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -137,6 +145,7 @@ impl Telemetry {
              glyphs_dropped_atlas_full(lifetime)={} \
              composite_glyphs_dropped_unsupported(lifetime)={} \
              disjoint_readback_count/s={} \
+             descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns}",
             b.paint_submits,
@@ -159,6 +168,8 @@ impl Telemetry {
             self.lifetime.glyphs_dropped_atlas_full,
             self.lifetime.composite_glyphs_dropped_unsupported,
             b.disjoint_readback_count,
+            b.descriptor_pool_creates,
+            b.descriptor_pool_resets,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -299,6 +310,24 @@ impl Telemetry {
         self.bucket.disjoint_readback_count += 1;
         self.lifetime.disjoint_readback_count += 1;
     }
+
+    /// Stage 5 Task 4 layer 1: one `vkCreateDescriptorPool` site
+    /// inside `DescriptorPoolRing::acquire_set` (no-Free-slot growth
+    /// branch).
+    pub(crate) fn record_descriptor_pool_create(&mut self) {
+        self.bucket.descriptor_pool_creates += 1;
+        self.lifetime.descriptor_pool_creates += 1;
+    }
+
+    /// Stage 5 Task 4 layer 1: bumped once per `vkResetDescriptorPool`
+    /// `Ok` arm inside `DescriptorPoolRing::release_up_to`. `n` is
+    /// the number of pools the call reset in a single sweep (the
+    /// return value of `release_up_to`).
+    pub(crate) fn record_descriptor_pool_reset(&mut self, n: u64) {
+        self.bucket.descriptor_pool_resets = self.bucket.descriptor_pool_resets.saturating_add(n);
+        self.lifetime.descriptor_pool_resets =
+            self.lifetime.descriptor_pool_resets.saturating_add(n);
+    }
 }
 
 impl Default for Telemetry {
@@ -389,5 +418,15 @@ mod tests {
         t.record_disjoint_readback();
         assert_eq!(t.lifetime.composite_glyphs_dropped_unsupported, 1);
         assert_eq!(t.lifetime.disjoint_readback_count, 2);
+    }
+
+    #[test]
+    fn descriptor_pool_counters_accumulate() {
+        let mut t = Telemetry::new();
+        t.record_descriptor_pool_create();
+        t.record_descriptor_pool_create();
+        t.record_descriptor_pool_reset(3);
+        assert_eq!(t.lifetime.descriptor_pool_creates, 2);
+        assert_eq!(t.lifetime.descriptor_pool_resets, 3);
     }
 }
