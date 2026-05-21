@@ -9,6 +9,7 @@
 
 mod backend;
 pub(crate) mod cursor;
+pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
 pub(crate) mod glyph_atlas;
 pub(crate) mod platform;
