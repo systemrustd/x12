@@ -97,10 +97,10 @@ impl DescriptorPoolRing {
         layout: vk::DescriptorSetLayout,
         generation: u64,
     ) -> Result<vk::DescriptorSet, vk::Result> {
-        if self.active.is_none() {
-            self.create_pool_active()?;
-        }
-        let idx = self.active.expect("active set above");
+        self.ensure_active_with_capacity()?;
+        let idx = self
+            .active
+            .expect("ensure_active_with_capacity sets active");
         let pool = self.pools[idx].pool;
         let layouts = [layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -113,6 +113,32 @@ impl DescriptorPoolRing {
             slot.high_water_generation = generation;
         }
         Ok(sets[0])
+    }
+
+    /// Make sure there is an Active pool with at least one set
+    /// remaining. Picks order:
+    ///   1. current Active still has capacity → no-op.
+    ///   2. Active is exhausted → rotate it to InFlight.
+    ///   3. Pick the first Free pool → promote to Active.
+    ///   4. Else create a new Active pool.
+    fn ensure_active_with_capacity(&mut self) -> Result<(), vk::Result> {
+        if let Some(idx) = self.active {
+            if self.pools[idx].sets_remaining > 0 {
+                return Ok(());
+            }
+            self.pools[idx].state = PoolState::InFlight;
+            self.active = None;
+        }
+        for i in 0..self.pools.len() {
+            if self.pools[i].state == PoolState::Free {
+                self.pools[i].state = PoolState::Active;
+                self.pools[i].sets_remaining = SETS_PER_POOL;
+                self.pools[i].high_water_generation = 0;
+                self.active = Some(i);
+                return Ok(());
+            }
+        }
+        self.create_pool_active()
     }
 
     fn create_pool_active(&mut self) -> Result<(), vk::Result> {
@@ -220,6 +246,25 @@ mod tests {
             // Drop the ring here. If destroy_descriptor_pool leaks,
             // the validation layer flags it on VkDevice destroy.
         }
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn acquire_fills_active_then_rotates() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        // SETS_PER_POOL = 256. Acquire 257 sets at the same gen.
+        for i in 0..257u64 {
+            ring.acquire_set(layout, 1).unwrap_or_else(|e| {
+                panic!("acquire #{i} failed: {e:?}");
+            });
+        }
+        assert_eq!(ring.pool_count(), 2);
+        // First pool rotated to InFlight, second is Active.
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        assert_eq!(ring.lifetime_creates(), 2);
         unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
 }
