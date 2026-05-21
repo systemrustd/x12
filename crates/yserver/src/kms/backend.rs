@@ -1995,7 +1995,9 @@ impl KmsBackend {
         // here is non-fatal — the compositor falls back to the
         // Vulkan-composited cursor quad. Logged so we know which
         // path is active.
-        match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&me.device)) {
+        let crtc_handles: Vec<::drm::control::crtc::Handle> =
+            me.outputs.iter().map(|l| l.output.crtc).collect();
+        match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&me.device), &crtc_handles) {
             Ok(plane) => {
                 log::info!("kms: hardware cursor plane initialised (64x64 ARGB8888)");
                 me.cursor_plane = Some(plane);
@@ -2037,14 +2039,13 @@ impl KmsBackend {
     /// - The cursor extent exceeds `HW_CURSOR_W × HW_CURSOR_H`,
     /// - The GPU readback or load_image fails.
     pub(crate) fn hw_cursor_refresh(&mut self) {
-        use crate::kms::{
-            cursor_plane::{HW_CURSOR_H, HW_CURSOR_W},
-            vk::ops::{image as vk_image, run_one_shot_op},
-        };
+        use crate::kms::vk::ops::{image as vk_image, run_one_shot_op};
 
-        if self.cursor_plane.is_none() {
+        let Some(plane_ref) = self.cursor_plane.as_ref() else {
             return;
-        }
+        };
+        let plane_w = plane_ref.width();
+        let plane_h = plane_ref.height();
         let Some(cursor_xid) = self.effective_cursor() else {
             // No cursor at all — hide the plane.
             self.hw_cursor_hide_all();
@@ -2065,7 +2066,7 @@ impl KmsBackend {
             self.hw_cursor_hide_all();
             return;
         }
-        if cw == 0 || ch == 0 || cw > HW_CURSOR_W || ch > HW_CURSOR_H {
+        if cw == 0 || ch == 0 || cw > plane_w || ch > plane_h {
             // Cursor too large for the hardware plane — hide it and
             // let the composite path render the quad instead.
             self.hw_cursor_hide_all();
@@ -2160,10 +2161,17 @@ impl KmsBackend {
         // showing, set_cursor2 has to be called again to swap in the
         // new image (the kernel doesn't peek at the dumb buffer
         // contents — only at the buffer handle).
-        let layouts_snapshot: Vec<::drm::control::crtc::Handle> =
-            self.outputs.iter().map(|l| l.output.crtc).collect();
-        for crtc_handle in layouts_snapshot {
-            if let Err(e) = plane.show(crtc_handle, (i32::from(hot_x), i32::from(hot_y))) {
+        let cursor_x = self.core.cursor_x as i32;
+        let cursor_y = self.core.cursor_y as i32;
+        let layouts_snapshot: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.output.crtc, l.x, l.y))
+            .collect();
+        for (crtc_handle, layout_x, layout_y) in layouts_snapshot {
+            let cx = cursor_x - layout_x - i32::from(hot_x);
+            let cy = cursor_y - layout_y - i32::from(hot_y);
+            if let Err(e) = plane.show(crtc_handle, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
                 log::warn!("hw_cursor_refresh: set_cursor2 failed on crtc: {e}");
             }
         }
@@ -8184,6 +8192,14 @@ impl KmsBackend {
         }
         if !wrote_any {
             return Err(last_err.unwrap_or_else(|| io::Error::other("scanout dump failed")));
+        }
+
+        // Diagnostic: also dump the HW cursor plane's dumb buffer.
+        if let Some(plane) = self.cursor_plane.as_ref() {
+            let path = format!("./yserver-cursor-{n}.ppm");
+            if let Err(e) = plane.dump_to_ppm(&path) {
+                log::warn!("do_dump_scanout: cursor dump failed: {e}");
+            }
         }
         Ok(())
     }

@@ -2683,6 +2683,44 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
     }
 }
 
+/// Diagnostic helper: write the `CursorRecord`'s source BGRA bytes
+/// (as received from the X11 client, before any `load_image` /
+/// dumb-buffer copy) to a PPM. Used in `do_dump_scanout_v2` to bisect
+/// whether cursor corruption enters at upload time (load_image) or
+/// upstream (engine.get_image / wire format).
+fn dump_cursor_record_to_ppm(
+    path: &str,
+    rec: &crate::kms::v2::cursor::CursorRecord,
+) -> io::Result<()> {
+    use std::io::Write;
+    let w = usize::from(rec.width);
+    let h = usize::from(rec.height);
+    if w == 0 || h == 0 || rec.bgra_bytes.len() < w * h * 4 {
+        return Err(io::Error::other(format!(
+            "bad cursor record: {}x{} bytes={}",
+            rec.width,
+            rec.height,
+            rec.bgra_bytes.len()
+        )));
+    }
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(format!("P6\n{w} {h}\n255\n").as_bytes())?;
+    let mut row_buf = vec![0u8; w * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let pi = (y * w + x) * 4;
+            let b = rec.bgra_bytes[pi];
+            let g = rec.bgra_bytes[pi + 1];
+            let r = rec.bgra_bytes[pi + 2];
+            row_buf[x * 3] = r;
+            row_buf[x * 3 + 1] = g;
+            row_buf[x * 3 + 2] = b;
+        }
+        file.write_all(&row_buf)?;
+    }
+    Ok(())
+}
+
 fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2835,6 +2873,39 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         }
         log::info!("v2 do_dump_scanout: wrote {path} ({width}x{height})");
         wrote_any = true;
+    }
+
+    // Diagnostic: also dump the HW cursor plane's dumb buffer (kernel-side
+    // view, before the display engine samples it). Compared against the
+    // on-screen cursor it isolates load_image stride bugs from display-
+    // engine stride misinterpretation.
+    if let Some(plane) = backend.platform.cursor_plane.as_ref() {
+        let path = format!("./yserver-v2-cursor-{run}.ppm");
+        if let Err(e) = plane.dump_to_ppm(&path) {
+            log::warn!("v2 do_dump_scanout: cursor dump failed: {e}");
+        }
+    }
+    // Also dump the source CursorRecord bytes (BEFORE load_image), so a
+    // diff between this and the dumb-buffer dump localises the bug to
+    // either upstream (engine.get_image / X11 wire) or load_image itself.
+    if let Some(xid) = backend.effective_cursor_xid
+        && let Some(rec) = backend.cursor_records.get(&xid)
+    {
+        let path = format!("./yserver-v2-cursor-src-{run}.ppm");
+        if let Err(e) = dump_cursor_record_to_ppm(&path, rec) {
+            log::warn!("v2 do_dump_scanout: cursor record dump failed: {e}");
+        } else {
+            log::info!(
+                "v2 do_dump_scanout: wrote {path} (xid=0x{xid:x} \
+                 {}x{} hot=({},{}) bytes_len={} version={})",
+                rec.width,
+                rec.height,
+                rec.hot_x,
+                rec.hot_y,
+                rec.bgra_bytes.len(),
+                rec.version,
+            );
+        }
     }
 
     if wrote_any {

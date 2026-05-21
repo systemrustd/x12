@@ -514,20 +514,23 @@ impl PlatformBackend {
 
         // Stage 5 Phase B — bring up the DRM cursor plane. Failure
         // is non-fatal; v2 falls back to the SW scene cursor path.
-        let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&device)) {
-            Ok(plane) => {
-                log::info!(
-                    "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
-                );
-                Some(plane)
-            }
-            Err(e) => {
-                log::warn!(
-                    "v2 PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
-                );
-                None
-            }
-        };
+        let crtc_handles: Vec<::drm::control::crtc::Handle> =
+            layouts.iter().map(|l| l.output.crtc).collect();
+        let cursor_plane =
+            match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&device), &crtc_handles) {
+                Ok(plane) => {
+                    log::info!(
+                        "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
+                    );
+                    Some(plane)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
+                    );
+                    None
+                }
+            };
 
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
@@ -707,13 +710,9 @@ impl PlatformBackend {
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
         };
-        plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)))?;
-        // set_cursor2 may reset the kernel-side cursor position to
-        // (0, 0) on rebind. Reposition immediately so the freshly
-        // shown plane doesn't briefly snap to the origin.
         let cx = x - layout_x - i32::from(hot_x);
         let cy = y - layout_y - i32::from(hot_y);
-        plane.move_to(crtc, cx, cy)
+        plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
     }
 
     /// Steady-state sprite-swap path. Re-issues `set_cursor2(Some,
@@ -746,14 +745,10 @@ impl PlatformBackend {
             if !plane.is_visible_on(crtc) {
                 continue;
             }
-            if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y))) {
-                log::warn!("v2 cursor rebind: set_cursor2 on {crtc:?} failed: {e}");
-                continue;
-            }
             let cx = x - layout_x - i32::from(hot_x);
             let cy = y - layout_y - i32::from(hot_y);
-            if let Err(e) = plane.move_to(crtc, cx, cy) {
-                log::warn!("v2 cursor rebind: move_cursor on {crtc:?} failed: {e}");
+            if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
+                log::warn!("v2 cursor rebind: show on {crtc:?} failed: {e}");
             }
         }
         Ok(())
