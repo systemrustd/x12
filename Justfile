@@ -552,12 +552,10 @@ thunar-xorg-trace real="$DISPLAY":
         kill -TERM $xtrace_pid 2>/dev/null;\
         echo "x11trace: thunar-xorg.xtrace"'
 
-# MATE on yserver with x11trace recording the full X11 wire
-# protocol between clients and yserver. Mirrors the xfce recipe
-# but launches mate-session and dumps to `mate.xtrace`. Use to
-# diff Caja's wheel-handling code path before and after the
-# stateful view-switch "fix".
-yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug,yserver_core::core_loop::damage_fanout=trace":
+# MATE on yserver/KMS with x11trace recording the full X11 wire
+# protocol between clients and yserver. Follows the server default
+# cursor strategy, currently SW cursor.
+yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=debug,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
@@ -565,6 +563,28 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             YSERVER_V2_SCENE_WALK_ALL=1 \
             target/debug/yserver > yserver-hw-mate.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o mate.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session mate-session --display :8 > mate.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
+# Reproduce/debug the known HW cursor-plane jam on yserver/KMS.
+yserver-mate-hwcursor-trace log="debug,yserver::kms::v2::scene=debug,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug,yserver::kms::cursor_plane=debug":
+    cargo build --bin yserver
+    rm -f mate.xtrace
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            YSERVER_V2_HW_CURSOR=1 \
+            YSERVER_V2_SCENE_WALK_ALL=1 \
+            target/debug/yserver > yserver-hwcursor-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o mate.xtrace &\

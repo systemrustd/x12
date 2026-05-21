@@ -39,6 +39,17 @@ Cross-cutting bugs and followups that don't fit a stage live in
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
   parallel-implementation lessons. Don't ship anything from there.
+- Current live work (2026-05-21): `cow-authoritative-mode` is the
+  active Stage 5/COW-authoritative validation branch. Hardware MATE
+  runs currently show two related symptoms: COW/Present churn can make
+  windows appear/disappear, and the same storm produces primary-plane
+  atomic `EBUSY` plus standalone cursor-plane `EBUSY`. The pointer
+  state still moves (hover highlights follow it), but the hardware
+  cursor can visually jam if a cursor plane move/show is dropped while
+  a page flip is pending. `YSERVER_V2_HW_CURSOR` is therefore back to
+  opt-in (`=1` / `true` / `yes` / `on`); the default uses the confirmed
+  good software cursor path. The HW cursor path still uses nonblocking
+  cursor ioctls and is kept only for focused cursor-plane debugging.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
