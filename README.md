@@ -155,10 +155,16 @@ not a valid device model name`).
 
 ### Dependencies
 
+#### Arch
+
+```sh
+sudo pacman -S just gcc libxshmfence libxkbcommon libinput glslc systemd-libs fontconfig
+```
+
 #### Ubuntu
 
 ```sh
-sudo apt install libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
 ```
 
 Before committing:
