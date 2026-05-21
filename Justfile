@@ -741,3 +741,7 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
     vng -r {{KERNEL}} --disable-microvm --rw \
         --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
+
+# Run rendercheck on host
+rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
+    tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
