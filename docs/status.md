@@ -316,6 +316,32 @@ Cross-cutting bugs and followups that don't fit a stage live in
   branch. Cross-checked against `xfixes/cursor.c` in the Xorg
   checkout at `/home/jos/realhome/Projects/xserver`. Regression:
   `xfixes_cursor_name_round_trip`.
+  Closed the last stub-handler bucket from the audit: the XI2
+  grab opcodes (51-55) had been no-op `Success`-replying stubs.
+  GTK / Qt thought they owned the device but pointer events kept
+  going to the normal hit-tested window, so popups dismissed on
+  the first stray motion event and `gtk_window_present` re-
+  mapped the popup at ~50 Hz (the same root cause as brisk-
+  menu's MapWindow remap storm). yserver already had working
+  core X11 grab state (`state.pointer_grab` /
+  `active_pointer_grab` / `button_grabs` /
+  `active_keyboard_grab` / `key_grabs`) and a matching
+  `active_grab_target` redirect in the pointer/key fanout. The
+  XI2 handlers now wire into that same shared state, matching
+  Xorg `Xi/xigrabdev.c::ProcXIGrabDevice` which unpacks the XI2
+  fields and calls the shared `GrabDevice()` helper. Mapping:
+  `deviceid == 3` (master keyboard) populates
+  `active_keyboard_grab`; any other deviceid populates the
+  pointer-grab tuple. `XIPassiveGrabDevice` with
+  `grab_type=Button(0)` / `Keycode(1)` pushes into
+  `button_grabs` / `key_grabs` (one entry per modifier;
+  `num_modifiers=0` becomes a single entry with mask 0; XI2
+  `Any` (bit 31) maps to core X11 `AnyModifier` 0x8000).
+  `XIPassiveUngrabDevice` removes matching entries.
+  Enter/FocusIn/TouchBegin passive grabs are logged + skipped —
+  yserver has no matching machinery yet. Regressions:
+  `xi_grab_device_sets_active_grab_state` and
+  `xi_passive_grab_device_pushes_button_and_key_grabs`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

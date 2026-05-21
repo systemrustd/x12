@@ -7342,35 +7342,99 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 4]); // group info
             buf.extend_from_slice(&reply);
         }
-        // XI2 grab opcodes. We don't yet honour grabs in event routing,
-        // but the calling client (commonly GTK opening a popup) blocks
-        // in _XReply waiting for XIGrabDevice / XIPassiveGrabDevice
-        // replies. Without these stubs, mate-panel's calendar applet
-        // never even maps its popup window. Returning Success +
-        // empty-modifier-list lets the popup state machine advance;
-        // outside-click dismissal works via normal pointer fanout.
+        // XI2 grab opcodes (51-55). yserver wires these into the
+        // existing core X11 grab state (`state.pointer_grab`,
+        // `state.active_pointer_grab`, `state.button_grabs`,
+        // `state.active_keyboard_grab`, `state.key_grabs`) which the
+        // pointer/key fanout already honours. The XI2 mask + per-
+        // device routing isn't fully implemented — every grab is
+        // mapped to a core X11 grab on either the master pointer
+        // (deviceid != 3) or master keyboard (deviceid == 3). That
+        // matches what GTK relies on in practice (its uses of
+        // XIGrabDevice are equivalent to XGrabPointer/XGrabKeyboard).
+        //
+        // Pre-fix all five handlers were no-ops that just sent
+        // Success replies — GTK then thought it owned the device but
+        // events still went to the normal pointer-window, so popups
+        // dismissed on the first stray motion event and `gtk_window_
+        // present` looped re-mapping the popup at ~50 Hz (visible as
+        // brisk-menu's MapWindow remap storm pre-`MapWindow`
+        // no-op fix, and as subtle popup misbehavior elsewhere).
+        //
+        // Match Xorg `Xi/exevents.c::DeviceGrabDevice` /
+        // `ProcXIPassiveGrabDevice` for state-update intent. The
+        // status byte at reply offset 8 is always Success(0); a
+        // strict implementation would return AlreadyGrabbed(1) /
+        // NotViewable(3) / etc., but Xorg's permissive behaviour
+        // (set the grab and let later events sort it out) keeps GTK
+        // happy across pause/resume sleeps.
         51 => {
-            // XIGrabDevice: reply is 32 bytes (header + status byte at
-            // offset 8 + 23 pad). Status=0 (Success). The status sits
-            // inside the trailing 24, not the reply's `data` byte.
-            let (grab_window, deviceid) = if body.len() >= 16 {
+            // XIGrabDevice reply: 32 bytes (header + status at offset
+            // 8 + 23 pad). Wire body: window(4) + time(4) + cursor(4)
+            // + deviceid(2) + mode(1) + paired_device_mode(1) +
+            // owner_events(1) + pad(1) + mask_len(2) + ...
+            let (grab_window, time, cursor, deviceid) = if body.len() >= 14 {
                 (
                     u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+                    u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                    u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
                     u16::from_le_bytes([body[12], body[13]]),
                 )
             } else {
-                (0, 0)
+                (0, 0, 0, 0)
             };
+            if deviceid == 3 {
+                state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+                    owner: client_id,
+                    grab_window: ResourceId(grab_window),
+                    source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                });
+            } else {
+                state.pointer_grab = Some((client_id, ResourceId(grab_window)));
+                state.pointer_grab_is_passive = false;
+                state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+                    owner: client_id,
+                    grab_window: ResourceId(grab_window),
+                    event_mask: 0xFFFF, // permissive — XI2 mask not parsed
+                    cursor: ResourceId(cursor),
+                    time,
+                });
+            }
             debug!(
-                "client {} #{} XIGrabDevice window=0x{:x} deviceid={} -> Success (stub)",
-                client_id.0, sequence.0, grab_window, deviceid
+                "client {} #{} XIGrabDevice window=0x{:x} deviceid={} cursor=0x{:x} -> Success",
+                client_id.0, sequence.0, grab_window, deviceid, cursor
             );
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
         }
         52 => {
-            debug!("client {} #{} XIUngrabDevice (stub)", client_id.0, sequence.0);
+            // XIUngrabDevice body: time(4) + deviceid(2) + pad(2).
+            let deviceid = if body.len() >= 6 {
+                u16::from_le_bytes([body[4], body[5]])
+            } else {
+                0
+            };
+            if deviceid == 3 {
+                if state
+                    .active_keyboard_grab
+                    .is_some_and(|g| g.owner == client_id)
+                {
+                    state.active_keyboard_grab = None;
+                }
+            } else if state
+                .pointer_grab
+                .is_some_and(|(owner, _)| owner == client_id)
+            {
+                state.pointer_grab = None;
+                state.pointer_grab_is_passive = false;
+                state.active_pointer_grab = None;
+                state.frozen_pointer_event = None;
+            }
+            debug!(
+                "client {} #{} XIUngrabDevice deviceid={}",
+                client_id.0, sequence.0, deviceid
+            );
             return Ok(RequestOutcome::Handled);
         }
         53 => {
@@ -7378,31 +7442,186 @@ fn handle_xi2_request(
             return Ok(RequestOutcome::Handled);
         }
         54 => {
-            // XIPassiveGrabDevice: reply is 32 bytes (header +
-            // num_modifiers CARD16 at offset 8 + 22 pad). With
-            // num_modifiers=0 the client treats every requested
-            // modifier combination as successfully grabbed.
-            let (grab_window, detail, deviceid) = if body.len() >= 18 {
+            // XIPassiveGrabDevice body: time(4) + grab_window(4) +
+            // cursor(4) + detail(4) + deviceid(2) + num_modifiers(2)
+            // + grab_type(1) + grab_mode(1) + paired_device_mode(1)
+            // + owner_events(1) + mask_len(2) + pad(2) + mask + mods.
+            //
+            // GrabType: Button=0, Keycode=1, Enter=2, FocusIn=3,
+            // TouchBegin=4. Button and Keycode map onto core X11
+            // PassiveButtonGrab / KeyGrab; the other three are no-ops
+            // for now (yserver doesn't synthesise core X11 Enter/
+            // FocusIn passive grabs).
+            let (grab_window, detail, deviceid, num_modifiers, grab_type) = if body.len() >= 22 {
                 (
                     u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
                     u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
                     u16::from_le_bytes([body[16], body[17]]),
+                    u16::from_le_bytes([body[18], body[19]]),
+                    body[20],
                 )
             } else {
-                (0, 0, 0)
+                (0, 0, 0, 0, 0xff)
             };
+            let mask_len = if body.len() >= 24 {
+                u16::from_le_bytes([body[22], body[23]]) as usize
+            } else {
+                0
+            };
+            // Modifiers tail starts after the mask (mask_len * 4 bytes).
+            let mods_start = 24 + mask_len * 4;
+            let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
+            if num_modifiers == 0 {
+                // "no modifiers" — single grab with modifier-mask 0.
+                modifier_masks.push(0);
+            } else {
+                for i in 0..usize::from(num_modifiers) {
+                    let off = mods_start + i * 4;
+                    if let Some(slice) = body.get(off..off + 4) {
+                        let raw = u32::from_le_bytes(slice.try_into().unwrap());
+                        // XI2 `Any` = bit 31; map to core X11 AnyModifier (0x8000).
+                        #[allow(clippy::cast_possible_truncation)]
+                        let m = if raw & 0x8000_0000 != 0 {
+                            0x8000u16
+                        } else {
+                            (raw & 0xFFFF) as u16
+                        };
+                        modifier_masks.push(m);
+                    }
+                }
+            }
+            match grab_type {
+                0 => {
+                    // Button. detail = button number (0 == AnyButton).
+                    let button = u8::try_from(detail).unwrap_or(0);
+                    for modifiers in &modifier_masks {
+                        state.button_grabs.retain(|g| {
+                            !(g.owner == client_id
+                                && g.grab_window.0 == grab_window
+                                && g.button == button
+                                && g.modifiers == *modifiers)
+                        });
+                        state.button_grabs.push(crate::server::PassiveButtonGrab {
+                            owner: client_id,
+                            grab_window: ResourceId(grab_window),
+                            button,
+                            modifiers: *modifiers,
+                            event_mask: 0xFFFF_FFFF,
+                            pointer_mode: 1, // async — XI2 mode byte parsed only if needed
+                        });
+                    }
+                }
+                1 => {
+                    // Keycode. detail = keycode (0 == AnyKey).
+                    let keycode = u8::try_from(detail).unwrap_or(0);
+                    for modifiers in &modifier_masks {
+                        state.key_grabs.retain(|g| {
+                            !(g.owner == client_id
+                                && g.grab_window.0 == grab_window
+                                && g.keycode == keycode
+                                && g.modifiers == *modifiers)
+                        });
+                        state.key_grabs.push(crate::server::KeyGrab {
+                            owner: client_id,
+                            grab_window: ResourceId(grab_window),
+                            keycode,
+                            modifiers: *modifiers,
+                            owner_events: false,
+                            pointer_mode: 1,
+                            keyboard_mode: 1,
+                        });
+                    }
+                }
+                _ => {
+                    // Enter/FocusIn/TouchBegin — yserver has no
+                    // matching machinery yet; record the request in
+                    // the debug log so a real repro shows up.
+                    debug!(
+                        "client {} #{} XIPassiveGrabDevice unsupported grab_type={} \
+                         (Enter/FocusIn/TouchBegin)",
+                        client_id.0, sequence.0, grab_type
+                    );
+                }
+            }
             debug!(
-                "client {} #{} XIPassiveGrabDevice window=0x{:x} detail=0x{:x} deviceid={} -> empty-modifier-list (stub)",
-                client_id.0, sequence.0, grab_window, detail, deviceid
+                "client {} #{} XIPassiveGrabDevice window=0x{:x} detail=0x{:x} deviceid={} \
+                 grab_type={} num_modifiers={} -> Success",
+                client_id.0,
+                sequence.0,
+                grab_window,
+                detail,
+                deviceid,
+                grab_type,
+                num_modifiers,
             );
+            // Reply: num_modifiers(2) + pad(22). With 0 failed
+            // modifiers the client treats every requested combination
+            // as grabbed.
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
         }
         55 => {
+            // XIPassiveUngrabDevice body: grab_window(4) + detail(4)
+            // + deviceid(2) + num_modifiers(2) + grab_type(1) +
+            // pad(3) + modifiers.
+            let (grab_window, detail, num_modifiers, grab_type) = if body.len() >= 13 {
+                (
+                    u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+                    u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                    u16::from_le_bytes([body[10], body[11]]),
+                    body[12],
+                )
+            } else {
+                (0, 0, 0, 0xff)
+            };
+            let mods_start = 16;
+            let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
+            if num_modifiers == 0 {
+                modifier_masks.push(0);
+            } else {
+                for i in 0..usize::from(num_modifiers) {
+                    let off = mods_start + i * 4;
+                    if let Some(slice) = body.get(off..off + 4) {
+                        let raw = u32::from_le_bytes(slice.try_into().unwrap());
+                        #[allow(clippy::cast_possible_truncation)]
+                        let m = if raw & 0x8000_0000 != 0 {
+                            0x8000u16
+                        } else {
+                            (raw & 0xFFFF) as u16
+                        };
+                        modifier_masks.push(m);
+                    }
+                }
+            }
+            match grab_type {
+                0 => {
+                    let button = u8::try_from(detail).unwrap_or(0);
+                    state.button_grabs.retain(|g| {
+                        !(g.owner == client_id
+                            && g.grab_window.0 == grab_window
+                            && (g.button == button || button == 0)
+                            && modifier_masks
+                                .iter()
+                                .any(|m| g.modifiers == *m || *m == 0x8000))
+                    });
+                }
+                1 => {
+                    let keycode = u8::try_from(detail).unwrap_or(0);
+                    state.key_grabs.retain(|g| {
+                        !(g.owner == client_id
+                            && g.grab_window.0 == grab_window
+                            && (g.keycode == keycode || keycode == 0)
+                            && modifier_masks
+                                .iter()
+                                .any(|m| g.modifiers == *m || *m == 0x8000))
+                    });
+                }
+                _ => {}
+            }
             debug!(
-                "client {} #{} XIPassiveUngrabDevice (stub)",
-                client_id.0, sequence.0
+                "client {} #{} XIPassiveUngrabDevice window=0x{:x} detail=0x{:x} grab_type={}",
+                client_id.0, sequence.0, grab_window, detail, grab_type
             );
             return Ok(RequestOutcome::Handled);
         }
@@ -15545,6 +15764,292 @@ mod tests {
             "XIChangeCursor with cursor=None (xid 0) must invoke \
              `backend.define_cursor(window, 0)` — same X11 None \
              semantics as the CWA cursor path.",
+        );
+    }
+
+    /// `XIGrabDevice` must wire into the existing core X11 grab
+    /// state (`state.pointer_grab` + `state.active_pointer_grab` for
+    /// the master pointer, `state.active_keyboard_grab` for the
+    /// master keyboard) so the pointer/key fanout's
+    /// `active_grab_target` routing kicks in. Pre-fix the handler
+    /// was a no-op that just sent Success — GTK thought it owned
+    /// the device but events still went to whatever window the
+    /// pointer was over, so popups dismissed on the first stray
+    /// motion and `gtk_window_present` looped re-mapping at ~50 Hz.
+    #[test]
+    fn xi_grab_device_sets_active_grab_state() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0050;
+        const CURSOR_XID: u32 = 0x0090_0050;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Pointer grab (deviceid=2) — XIGrabDevice body: window(4)
+        // time(4) cursor(4) deviceid(2) mode(1) paired(1)
+        // owner_events(1) pad(1) mask_len(2) ...
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes()); // window
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&CURSOR_XID.to_le_bytes()); // cursor
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid (pointer)
+        body.extend_from_slice(&[1, 1, 1, 0]); // mode async, paired async, owner_events=1, pad
+        body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[0u8; 2]); // pad
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 51, // XIGrabDevice
+            length_units: 7,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XIGrabDevice pointer");
+
+        assert_eq!(
+            state.pointer_grab,
+            Some((ClientId(CLIENT_ID), ResourceId(WINDOW_XID))),
+            "XIGrabDevice(pointer) must set state.pointer_grab so \
+             pointer_fanout's active_grab_target redirect kicks in",
+        );
+        assert!(!state.pointer_grab_is_passive);
+        let active = state.active_pointer_grab.expect("active_pointer_grab set");
+        assert_eq!(active.owner, ClientId(CLIENT_ID));
+        assert_eq!(active.grab_window, ResourceId(WINDOW_XID));
+        assert_eq!(active.cursor, ResourceId(CURSOR_XID));
+
+        // Keyboard grab (deviceid=3) — same wire format.
+        let mut body_kbd = Vec::with_capacity(24);
+        body_kbd.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body_kbd.extend_from_slice(&0u32.to_le_bytes());
+        body_kbd.extend_from_slice(&0u32.to_le_bytes());
+        body_kbd.extend_from_slice(&3u16.to_le_bytes()); // keyboard
+        body_kbd.extend_from_slice(&[1, 1, 1, 0]);
+        body_kbd.extend_from_slice(&0u16.to_le_bytes());
+        body_kbd.extend_from_slice(&[0u8; 2]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &body_kbd,
+        )
+        .expect("XIGrabDevice keyboard");
+        let kgrab = state
+            .active_keyboard_grab
+            .expect("active_keyboard_grab set");
+        assert_eq!(kgrab.owner, ClientId(CLIENT_ID));
+        assert_eq!(kgrab.grab_window, ResourceId(WINDOW_XID));
+
+        // Ungrab both — XIUngrabDevice body: time(4) deviceid(2) pad(2).
+        let ungrab_header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 52,
+            length_units: 2,
+        };
+        let mut ungrab_p = Vec::with_capacity(8);
+        ungrab_p.extend_from_slice(&0u32.to_le_bytes()); // time
+        ungrab_p.extend_from_slice(&2u16.to_le_bytes()); // pointer
+        ungrab_p.extend_from_slice(&[0u8; 2]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            ungrab_header,
+            &ungrab_p,
+        )
+        .expect("XIUngrabDevice pointer");
+        assert!(state.pointer_grab.is_none(), "pointer grab cleared");
+        assert!(state.active_pointer_grab.is_none());
+
+        let mut ungrab_k = Vec::with_capacity(8);
+        ungrab_k.extend_from_slice(&0u32.to_le_bytes());
+        ungrab_k.extend_from_slice(&3u16.to_le_bytes());
+        ungrab_k.extend_from_slice(&[0u8; 2]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            ungrab_header,
+            &ungrab_k,
+        )
+        .expect("XIUngrabDevice keyboard");
+        assert!(
+            state.active_keyboard_grab.is_none(),
+            "keyboard grab cleared"
+        );
+    }
+
+    /// `XIPassiveGrabDevice` with grab_type=Button(0) installs entries
+    /// in `state.button_grabs`; grab_type=Keycode(1) installs entries
+    /// in `state.key_grabs`. One entry per modifier (or one entry with
+    /// modifiers=0 when num_modifiers=0). `XIPassiveUngrabDevice`
+    /// removes matching entries.
+    #[test]
+    fn xi_passive_grab_device_pushes_button_and_key_grabs() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0051;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Helper to build XIPassiveGrabDevice body.
+        fn build_body(window: u32, detail: u32, grab_type: u8, modifiers: &[u32]) -> Vec<u8> {
+            #[allow(clippy::cast_possible_truncation)]
+            let num_modifiers = modifiers.len() as u16;
+            let mut b = Vec::with_capacity(24 + modifiers.len() * 4);
+            b.extend_from_slice(&0u32.to_le_bytes()); // time
+            b.extend_from_slice(&window.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // cursor
+            b.extend_from_slice(&detail.to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes()); // deviceid (pointer; harmless for keycode)
+            b.extend_from_slice(&num_modifiers.to_le_bytes());
+            b.push(grab_type);
+            b.push(1); // grab_mode async
+            b.push(1); // paired async
+            b.push(0); // owner_events
+            b.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+            b.extend_from_slice(&[0u8; 2]); // pad
+            for m in modifiers {
+                b.extend_from_slice(&m.to_le_bytes());
+            }
+            b
+        }
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 54,
+            length_units: 6,
+        };
+
+        // Button grab on button 3 with modifiers [0, ControlMask(4)].
+        let body = build_body(WINDOW_XID, 3, 0, &[0, 4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("button grab");
+        assert_eq!(state.button_grabs.len(), 2, "one grab per modifier");
+        assert!(
+            state
+                .button_grabs
+                .iter()
+                .any(|g| g.button == 3 && g.modifiers == 0)
+        );
+        assert!(
+            state
+                .button_grabs
+                .iter()
+                .any(|g| g.button == 3 && g.modifiers == 4)
+        );
+
+        // Key grab on keycode 67 (F1) with no modifiers → single entry
+        // with modifier-mask 0.
+        let body = build_body(WINDOW_XID, 67, 1, &[]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &body,
+        )
+        .expect("key grab");
+        assert_eq!(state.key_grabs.len(), 1);
+        assert_eq!(state.key_grabs[0].keycode, 67);
+        assert_eq!(state.key_grabs[0].modifiers, 0);
+
+        // XI2 "Any" modifier (bit 31) → core X11 AnyModifier (0x8000).
+        let body = build_body(WINDOW_XID, 1, 0, &[0x8000_0000]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            header,
+            &body,
+        )
+        .expect("any-modifier grab");
+        assert!(
+            state
+                .button_grabs
+                .iter()
+                .any(|g| g.button == 1 && g.modifiers == 0x8000),
+            "XI2 Any (bit 31) maps to core X11 AnyModifier 0x8000",
+        );
+
+        // XIPassiveUngrabDevice — body: window(4) detail(4) deviceid(2)
+        // num_modifiers(2) grab_type(1) pad(3) modifiers.
+        fn build_ungrab_body(
+            window: u32,
+            detail: u32,
+            grab_type: u8,
+            modifiers: &[u32],
+        ) -> Vec<u8> {
+            #[allow(clippy::cast_possible_truncation)]
+            let num_modifiers = modifiers.len() as u16;
+            let mut b = Vec::with_capacity(16 + modifiers.len() * 4);
+            b.extend_from_slice(&window.to_le_bytes());
+            b.extend_from_slice(&detail.to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+            b.extend_from_slice(&num_modifiers.to_le_bytes());
+            b.push(grab_type);
+            b.extend_from_slice(&[0u8; 3]);
+            for m in modifiers {
+                b.extend_from_slice(&m.to_le_bytes());
+            }
+            b
+        }
+        let ungrab_header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 55,
+            length_units: 4,
+        };
+        let body = build_ungrab_body(WINDOW_XID, 3, 0, &[0, 4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            ungrab_header,
+            &body,
+        )
+        .expect("button ungrab");
+        assert!(
+            !state
+                .button_grabs
+                .iter()
+                .any(|g| g.button == 3 && (g.modifiers == 0 || g.modifiers == 4)),
+            "ungrab removes the matching button+modifier entries",
+        );
+        // AnyModifier grab still present (we didn't ungrab it).
+        assert!(
+            state
+                .button_grabs
+                .iter()
+                .any(|g| g.button == 1 && g.modifiers == 0x8000)
         );
     }
 
