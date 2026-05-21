@@ -60,60 +60,6 @@ yserver-multihead:
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
-# Run the nested ynest binary on the host's X server (no virtme).
-ynest display="99":
-    cargo run --bin ynest -- {{display}}
-
-# Release-build ynest with a chosen container geometry.
-ynest-release display="99" geometry="1920x1080":
-    cargo run --release --bin ynest -- {{display}} --geometry {{geometry}}
-
-# Visible smoke: ynest + wmaker + xterm. Ctrl-C tears it all down.
-ynest-wmaker-xterm display="99" geometry="1024x768":
-    cargo build --release --bin ynest
-    RUST_LOG=trace target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
-        ynest_pid=$!; \
-        sleep 1; \
-        DISPLAY=:{{display}} wmaker & \
-        sleep 2; \
-        DISPLAY=:{{display}} xterm & \
-        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
-        wait $ynest_pid
-
-# Visible smoke: ynest + fvwm3 + xterm. Ctrl-C tears it all down.
-ynest-fvwm3-xterm display="99" geometry="1024x768":
-    cargo build --release --bin ynest
-    RUST_LOG=trace target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
-        ynest_pid=$!; \
-        sleep 1; \
-        DISPLAY=:{{display}} fvwm3 & \
-        sleep 2; \
-        DISPLAY=:{{display}} xterm & \
-        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
-        wait $ynest_pid
-
-# Visible smoke: ynest + e16 + xterm. Ctrl-C tears it all down.
-ynest-e16-xterm display="99" geometry="1024x768":
-    cargo build --release --bin ynest
-    RUST_LOG=trace target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
-        ynest_pid=$!; \
-        sleep 1; \
-        DISPLAY=:{{display}} e16 & \
-        sleep 2; \
-        DISPLAY=:{{display}} xterm & \
-        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
-        wait $ynest_pid
-
-# Visible smoke: ynest + wmaker + xterm. Ctrl-C tears it all down.
-ynest-xeyes display="99" geometry="1024x768":
-    cargo build --release --bin ynest
-    RUST_LOG=debug target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
-        ynest_pid=$!; \
-        sleep 1; \
-        DISPLAY=:{{display}} xeyes & \
-        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
-        wait $ynest_pid
-
 # QEMU window + SSH + debug logging. Run `just yserver-ssh-shell` in a second
 # terminal to get a shell, then: DISPLAY=:7 xterm
 #
@@ -541,22 +487,6 @@ yserver-xfce-hw-trace log="debug":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-# Companion recipe: run thunar against the host Xorg through
-# x11trace, dumping the same protocol view to `thunar-xorg.xtrace`.
-# Diff against `xfce.xtrace` to spot which call sequence differs
-# (the path GTK takes for popup placement, rubber-band anchor,
-# whatever). Defaults to the current `$DISPLAY` (host Xorg); pass
-# `real=":1"` etc. to override.
-thunar-xorg-trace real="$DISPLAY":
-    rm -f thunar-xorg.xtrace
-    bash -c '\
-        x11trace -d {{real}} -D :8 -n -o thunar-xorg.xtrace &\
-        xtrace_pid=$!;\
-        sleep 1;\
-        DISPLAY=:8 thunar;\
-        kill -TERM $xtrace_pid 2>/dev/null;\
-        echo "x11trace: thunar-xorg.xtrace"'
-
 # MATE on yserver/KMS with x11trace recording the full X11 wire
 # protocol between clients and yserver. Follows the server default
 # cursor strategy, currently SW cursor.
@@ -809,5 +739,5 @@ xts-yserver scenario="Xproto" timeout="600":
 rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-device virtio-gpu-pci -display none" \
+        --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
