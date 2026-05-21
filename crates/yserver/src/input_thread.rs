@@ -311,12 +311,12 @@ pub fn process_batch(
             }
             Some(Hotkey::DumpDrawables) => {
                 // Mirror DumpScanout: flush queued motion, drop the
-                // PrintScreen keypress itself, ask the core to dump
+                // F12 keypress itself, ask the core to dump
                 // per-drawable storage (same code path as SIGUSR2).
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
-                log::info!("yserver: Ctrl-Alt-PrintScreen pressed — dumping drawables");
+                log::info!("yserver: Ctrl-Alt-F12 pressed — dumping drawables");
                 sender.send(Message::DumpDrawables)?;
                 continue;
             }
