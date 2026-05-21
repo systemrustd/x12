@@ -479,7 +479,6 @@ impl RenderPipelineCache {
     /// helper. v2's engine call sites call this method; v1 keeps
     /// using the per-batch arena variant. Spec
     /// `2026-05-21-descriptor-pool-ring-design.md`.
-    #[allow(dead_code)] // Call sites wired in Tasks 11+12.
     pub(crate) fn allocate_descriptor_for_views_into_ring(
         &self,
         ring: &mut crate::kms::v2::descriptor_pool_ring::DescriptorPoolRing,

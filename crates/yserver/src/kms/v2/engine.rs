@@ -51,7 +51,6 @@ use super::{
 };
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
-    scheduler::batch_descriptor_arena::BatchDescriptorArena,
     vk::{
         device::VkContext,
         dst_readback::DstReadback,
@@ -119,13 +118,13 @@ struct SubmittedOp {
     /// order is the GPU dependency; this Arc keeps CPU-side
     /// destruction gated on retirement of both submissions.
     atlas_ticket: Option<FenceTicket>,
-    /// Stage 3c: per-op descriptor arena holding the descriptor
-    /// pool that backs the RENDER pipeline descriptor set this CB
-    /// references. Released (pools destroyed) on retirement; this
-    /// is the v2 mirror of v1's `PaintBatch::descriptor_arena`
-    /// retire path. Most ops (fill / put_image / copy_area / text
-    /// runs) don't need this and leave it `None`.
-    descriptor_arena: Option<BatchDescriptorArena>,
+    /// Stage 5 Task 4 layer 1: monotonic acquire-generation stamp.
+    /// `release_retired_ops` calls
+    /// `descriptor_pool_ring.release_up_to(op.generation)` once this
+    /// op pops from the FIFO; pools whose `high_water_generation
+    /// <= op.generation` move back to Free. Spec
+    /// `2026-05-21-descriptor-pool-ring-design.md`.
+    generation: u64,
 }
 
 /// One-shot device-local image used by `copy_area`'s same-image
@@ -428,7 +427,7 @@ struct RenderEngineInner {
         HashMap<vk::Format, crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache>,
     /// Stage 5 Task 4 layer 1: long-lived descriptor pool ring used
     /// by `try_vk_render_composite` + `try_vk_render_traps_or_tris`.
-    /// Replaces per-call `BatchDescriptorArena` instantiation. Spec
+    /// Replaces per-call descriptor-pool instantiation. Spec
     /// `2026-05-21-descriptor-pool-ring-design.md`.
     descriptor_pool_ring: super::descriptor_pool_ring::DescriptorPoolRing,
     /// Stage 5 Task 4 layer 1: monotonic generation tag. Bumped on
@@ -515,13 +514,12 @@ impl RenderEngine {
             }
             // staging drops at end of scope → destroys Vk handles.
             drop(op.staging.take());
-            // Stage 3c: release the per-op descriptor pool, if any.
-            // `BatchDescriptorArena` owns its pools through the
-            // `BatchResource::release` path; plain Drop leaks them.
-            if let Some(arena) = op.descriptor_arena.take() {
-                use crate::kms::scheduler::paint_batch::BatchResource;
-                Box::new(arena).release(&inner.vk);
-            }
+            // Stage 5 Task 4 layer 1: signal the descriptor pool
+            // ring that everything up to and including this op's
+            // generation has retired. Pools whose high_water_
+            // generation <= op.generation transition InFlight → Free
+            // via vkResetDescriptorPool.
+            inner.descriptor_pool_ring.release_up_to(op.generation);
         }
     }
 
@@ -544,10 +542,7 @@ impl RenderEngine {
                 device.free_command_buffers(pool, &[op.cb]);
             }
             drop(op.staging.take());
-            if let Some(arena) = op.descriptor_arena.take() {
-                use crate::kms::scheduler::paint_batch::BatchResource;
-                Box::new(arena).release(&inner.vk);
-            }
+            inner.descriptor_pool_ring.release_up_to(op.generation);
         }
     }
 
@@ -1001,13 +996,15 @@ impl RenderEngine {
         for r in &clamped {
             store.damage(target, *r);
         }
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: None,
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: None,
+            generation,
         });
         Ok(())
     }
@@ -1277,13 +1274,15 @@ impl RenderEngine {
         for r in &damage_rects {
             store.damage(target, *r);
         }
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: None,
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: None,
+            generation,
         });
         Ok(())
     }
@@ -1496,13 +1495,15 @@ impl RenderEngine {
             end_and_submit_op(inner, platform, cb, &ticket)?;
             store.touch_render_fence(src, ticket.clone());
             store.damage(src, dst_rect);
+            inner.acquire_generation += 1;
+            let generation = inner.acquire_generation;
             inner.submitted.push_back(SubmittedOp {
                 cb,
                 ticket,
                 staging: None,
                 scratch: Some(scratch),
                 atlas_ticket: None,
-                descriptor_arena: None,
+                generation,
             });
             return Ok(());
         }
@@ -1594,13 +1595,15 @@ impl RenderEngine {
         store.touch_render_fence(src, ticket.clone());
         store.touch_render_fence(dst, ticket.clone());
         store.damage(dst, dst_rect);
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: None,
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: None,
+            generation,
         });
         Ok(())
     }
@@ -1747,13 +1750,15 @@ impl RenderEngine {
         end_and_submit_op(inner, platform, cb, &ticket)?;
         store.touch_render_fence(target, ticket.clone());
         store.damage(target, dst_rect);
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: Some(staging),
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: None,
+            generation,
         });
         Ok(())
     }
@@ -1881,13 +1886,15 @@ impl RenderEngine {
         // next `poll_retired` call (the fence is already signaled,
         // so the retire happens at next poll — keeps the lifecycle
         // book-keeping uniform).
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: Some(staging),
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: None,
+            generation,
         });
 
         Ok(out)
@@ -2088,13 +2095,15 @@ impl RenderEngine {
                     stats.glyph_uploads += 1;
                     // Park the upload's CB + staging on submitted; the
                     // ticket signals when the upload retires.
+                    inner.acquire_generation += 1;
+                    let generation = inner.acquire_generation;
                     inner.submitted.push_back(SubmittedOp {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
                         scratch: None,
                         atlas_ticket: None,
-                        descriptor_arena: None,
+                        generation,
                     });
                     inner.atlas_last_upload_ticket = Some(ticket);
                     let e = AtlasEntry {
@@ -2197,13 +2206,15 @@ impl RenderEngine {
         // until both upload and consume retire. Same-queue
         // submission order is the GPU dependency.
         let atlas_ticket = inner.atlas_last_upload_ticket.clone();
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: None,
             scratch: None,
             atlas_ticket,
-            descriptor_arena: None,
+            generation,
         });
 
         Ok(stats)
@@ -2386,13 +2397,15 @@ impl RenderEngine {
                         .record_upload(cb, staging_buffer, atlas_x, atlas_y, g.w, g.h);
                     end_and_submit_op(inner, platform, cb, &ticket)?;
                     stats.glyph_uploads += 1;
+                    inner.acquire_generation += 1;
+                    let generation = inner.acquire_generation;
                     inner.submitted.push_back(SubmittedOp {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
                         scratch: None,
                         atlas_ticket: None,
-                        descriptor_arena: None,
+                        generation,
                     });
                     inner.atlas_last_upload_ticket = Some(ticket);
                     let e = AtlasEntry {
@@ -2525,13 +2538,15 @@ impl RenderEngine {
             }
         }
         let atlas_ticket = inner.atlas_last_upload_ticket.clone();
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
             cb,
             ticket,
             staging: None,
             scratch: None,
             atlas_ticket,
-            descriptor_arena: None,
+            generation,
         });
 
         Ok(stats)
@@ -2893,15 +2908,19 @@ impl RenderEngine {
             white_mask_view
         };
 
-        // Per-op descriptor arena: pool lives until SubmittedOp
-        // retires (CB holds descriptor set references).
-        let mut arena = BatchDescriptorArena::new(Arc::clone(&inner.vk));
+        // Stage 5 Task 4 layer 1: bump the generation tag once per
+        // RENDER op so the ring can recycle pools by retirement
+        // watermark. `release_retired_ops` ➜ `release_up_to(
+        // op.generation)` consumes the tag once the CB retires.
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         let descriptor_set = inner
             .render_pipelines
             .as_ref()
             .expect("ensured")
-            .allocate_descriptor_for_views_into(
-                &mut arena,
+            .allocate_descriptor_for_views_into_ring(
+                &mut inner.descriptor_pool_ring,
+                generation,
                 src_view,
                 mask_view,
                 dst_readback_view,
@@ -3114,7 +3133,7 @@ impl RenderEngine {
             staging: None,
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: Some(arena),
+            generation,
         });
         Ok(stats)
     }
@@ -3441,13 +3460,19 @@ impl RenderEngine {
             .as_ref()
             .expect("ensured")
             .pipeline_layout();
-        let mut arena = BatchDescriptorArena::new(Arc::clone(&inner.vk));
+        // Stage 5 Task 4 layer 1: bump the generation tag once per
+        // RENDER op so the ring can recycle pools by retirement
+        // watermark. `release_retired_ops` ➜ `release_up_to(
+        // op.generation)` consumes the tag once the CB retires.
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
         let descriptor_set = inner
             .render_pipelines
             .as_ref()
             .expect("ensured")
-            .allocate_descriptor_for_views_into(
-                &mut arena,
+            .allocate_descriptor_for_views_into_ring(
+                &mut inner.descriptor_pool_ring,
+                generation,
                 src_view,
                 mask_view,
                 dst_readback_view,
@@ -3762,7 +3787,7 @@ impl RenderEngine {
             staging: Some(instance_buf),
             scratch: None,
             atlas_ticket: None,
-            descriptor_arena: Some(arena),
+            generation,
         });
         Ok(stats)
     }
