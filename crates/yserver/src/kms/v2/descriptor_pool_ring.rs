@@ -46,6 +46,8 @@ pub(crate) struct DescriptorPoolRing {
     lifetime_resets: u64,
     #[cfg(test)]
     inject_next_allocate_error: Option<vk::Result>,
+    #[cfg(test)]
+    force_next_reset_failure: bool,
 }
 
 impl DescriptorPoolRing {
@@ -58,12 +60,19 @@ impl DescriptorPoolRing {
             lifetime_resets: 0,
             #[cfg(test)]
             inject_next_allocate_error: None,
+            #[cfg(test)]
+            force_next_reset_failure: false,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn test_inject_next_allocate_error(&mut self, err: vk::Result) {
         self.inject_next_allocate_error = Some(err);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_next_reset_failure(&mut self) {
+        self.force_next_reset_failure = true;
     }
 
     pub(crate) fn pool_count(&self) -> usize {
@@ -106,6 +115,9 @@ impl DescriptorPoolRing {
         layout: vk::DescriptorSetLayout,
         generation: u64,
     ) -> Result<vk::DescriptorSet, vk::Result> {
+        if self.pools.iter().any(|s| s.state == PoolState::Poisoned) {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
         self.ensure_active_with_capacity()?;
         match self.try_allocate_one(layout) {
             Ok(set) => {
@@ -171,12 +183,7 @@ impl DescriptorPoolRing {
                 continue;
             }
             let pool_handle = self.pools[i].pool;
-            let reset_result = unsafe {
-                self.vk
-                    .device
-                    .reset_descriptor_pool(pool_handle, vk::DescriptorPoolResetFlags::empty())
-            };
-            match reset_result {
+            match self.perform_reset(pool_handle) {
                 Ok(()) => {
                     let slot = &mut self.pools[i];
                     slot.state = PoolState::Free;
@@ -195,6 +202,19 @@ impl DescriptorPoolRing {
         }
         self.lifetime_resets = self.lifetime_resets.saturating_add(reclaimed as u64);
         reclaimed
+    }
+
+    fn perform_reset(&mut self, pool: vk::DescriptorPool) -> Result<(), vk::Result> {
+        #[cfg(test)]
+        if self.force_next_reset_failure {
+            self.force_next_reset_failure = false;
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        unsafe {
+            self.vk
+                .device
+                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+        }
     }
 
     /// Make sure there is an Active pool with at least one set
@@ -450,6 +470,32 @@ mod tests {
         let set = ring.acquire_set(layout, 1).expect("retry should succeed");
         assert_ne!(set, vk::DescriptorSet::null());
         assert_eq!(ring.pool_count(), 2);
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn reset_failure_poisons_slot_and_drops_acquire() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        // Fill + rotate so pool A is InFlight at gen=1.
+        for _ in 0..256 {
+            ring.acquire_set(layout, 1).unwrap();
+        }
+        ring.acquire_set(layout, 2).unwrap();
+        ring.test_force_next_reset_failure();
+        let reclaimed = ring.release_up_to(1);
+        // Slot poisoned, not reclaimed.
+        assert_eq!(reclaimed, 0);
+        let (free, active, in_flight, poisoned) = ring.state_counts();
+        assert_eq!(poisoned, 1, "pool A must be poisoned");
+        assert_eq!(free, 0);
+        assert_eq!(active, 1, "pool B remains active");
+        assert_eq!(in_flight, 0);
+        // Next acquire short-circuits with ERROR_UNKNOWN.
+        let err = ring.acquire_set(layout, 3).expect_err("poisoned ring");
+        assert_eq!(err, vk::Result::ERROR_UNKNOWN);
         unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
 }
