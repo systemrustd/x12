@@ -1,8 +1,8 @@
-# Deferred PRESENT completion — replacement for the bee UAF fix
+# Deferred PRESENT completion — replacement for the bee use-after-free fix
 
 **Date:** 2026-05-23
 **Stage:** 5 (perf), Task 6.1
-**Scope:** Replace commit `8ca552a` (bee render-batch UAF + PRESENT wait deadlock fix) with a design that closes the UAF, restores Task 3 aggregation depth, removes the per-PRESENT synchronous GPU wait, and eliminates the shutdown-hang side effect.
+**Scope:** Replace commit `8ca552a` (bee render-batch use-after-free + PRESENT wait deadlock fix) with a design that closes the use-after-free, restores Task 3 aggregation depth, removes the per-PRESENT synchronous GPU wait, and eliminates the shutdown-hang side effect.
 
 ## Motivation
 
@@ -10,7 +10,7 @@ Stage 5 Task 3 (paint-submit aggregation) introduced batched cow_copy_area + ren
 
 Commit `8ca552a` patched this with two layers:
 
-1. **Eager-touch at append time** — every `cow_copy_area` / `render_composite_open` / `render_composite` append calls `store.touch_render_fence(...)` on every drawable whose VkImageView is bound into the batch CB. Closes the UAF window: a subsequent `FreePixmap` on a touched src/mask/dst sees the (pending-batch) ticket and defers destruction.
+1. **Eager-touch at append time** — every `cow_copy_area` / `render_composite_open` / `render_composite` append calls `store.touch_render_fence(...)` on every drawable whose VkImageView is bound into the batch CB. Closes the use-after-free window: a subsequent `FreePixmap` on a touched src/mask/dst sees the (pending-batch) ticket and defers destruction.
 2. **Flush-before-wait in `wait_for_drawable_idle`** — the PRESENT request handler calls `wait_for_drawable_idle(dst)` to block until the GPU has finished reading the source pixmap. Post-eager-touch, the ticket on the COW corresponded to an un-submitted CB, so `ticket.wait(...)` blocked indefinitely (5 s timeout, screen black). Layer 2 flushed any pending render+cow batch before reading `last_render_ticket`, restoring the invariant "ticket exists ⇒ CB submitted."
 
 Both layers shipped together because the eager-touch alone introduced the wait-deadlock.
@@ -42,7 +42,7 @@ User-subjective: no CPU spikes, low frequency, drag feels native. Both proves Ta
 
 Replace commit `8ca552a` with a design that:
 
-- Keeps the UAF closed across all hardware classes (bee, silence, yoga, fuji).
+- Keeps the use-after-free closed across all hardware classes (bee, silence, yoga, fuji).
 - Restores Task 3 aggregation depth on yoga and matches or beats silence's measured numbers.
 - Removes the per-PRESENT synchronous GPU wait from the request-handler thread.
 - Removes the shutdown-hang side effect on yoga.
@@ -52,8 +52,8 @@ Replace commit `8ca552a` with a design that:
 
 - **Pageflip-side IN_FENCE_FD changes.** The scene-compose path at `kms/vk/compositor.rs:184` already exports `SYNC_FD` and consumes it on atomic commit; KMS waits in-kernel for the scene-compose GPU work before flipping. Because same-queue submission order guarantees cow_batch CB completes before scene-compose CB, the existing fence covers the cow_batch transitively. No new KMS plumbing.
 - **Flip-mode PRESENT.** Path selection still returns Copy mode (the BO bridge for Flip hasn't landed). Flip-mode `CompleteNotify` timing (tied to pageflip-complete) is the same problem space but out of scope here.
-- **Eager-touch redesign.** Layer 1 of the bee fix is correct and stays as-is. The UAF closure mechanism is not under reconsideration.
-- **Removing `wait_for_drawable_idle` from non-PRESENT callers.** There's a second caller at `process_request.rs:5284` (CopyArea path); review separately. PRESENT::Pixmap is the load-bearing case.
+- **Eager-touch redesign.** Layer 1 of the bee fix is correct and stays as-is. The use-after-free closure mechanism is not under reconsideration.
+- **`wait_for_drawable_idle` callers outside PRESENT request paths.** Only the two PRESENT call sites are in scope — `Pixmap` at `process_request.rs:5055` and `PixmapSynced` at `process_request.rs:5284`. Both paths are covered by this design (see §"PRESENT handler change" below). The method itself stays in the trait surface for future non-PRESENT callers if any emerge; today, after this change, it has no live callers in tree.
 
 ## Architecture
 
@@ -73,6 +73,8 @@ Steady-state shape: PRESENT::Pixmap returns to the client in O(µs) — append i
 
 The trait crate (yserver-core) sees only the event-emission data, never the `FenceTicket`. `FenceTicket` is `pub(crate)` within the yserver crate and must not leak into the trait surface.
 
+Two PRESENT request paths feed the same queue: `Pixmap` (async wake via xshmfence) and `PixmapSynced` (explicit-sync wake via DRM syncobj timeline point). They share the same deferred-completion mechanism with different fields carrying the wake target.
+
 ```rust
 // In yserver-core (the trait crate) — visible to the main loop.
 pub struct CompletedPresentEvent {
@@ -84,10 +86,23 @@ pub struct CompletedPresentEvent {
     pub host_xid: u32,
     /// Destination drawable host xid (typically COW).
     pub dst_host_xid: u32,
-    /// Idle fence xid (xshmfence). Zero if the client passed none.
-    pub idle_fence_xid: u32,
     /// Original PRESENT options byte (PresentOption*). Echoed in events.
     pub options: u32,
+    /// Wake target. Carries the per-path wake mechanism the request
+    /// originally specified.
+    pub wake: PresentWake,
+}
+
+pub enum PresentWake {
+    /// `Pixmap` path. `idle_fence` is the xshmfence resource id;
+    /// `0` means no xshmfence was attached. `dri3_trigger_fence` fires
+    /// after GPU completion.
+    Pixmap { idle_fence_xid: u32 },
+    /// `PixmapSynced` path. `release_syncobj` + `release_value` name
+    /// the DRM syncobj timeline point to signal after GPU completion
+    /// via `dri3_signal_syncobj`. `release_syncobj == 0` means no
+    /// release object was attached.
+    PixmapSynced { release_syncobj: u32, release_value: u64 },
 }
 ```
 
@@ -123,48 +138,105 @@ Called once per main loop iteration from `core_loop::run`, after the existing pe
 
 ### Main loop drain hook (`core_loop::run`)
 
-After each loop iteration step where forward progress on GPU work might have happened (page-flip-ready dispatch, response to fd readiness), invoke the drain and fire each completed event via the existing emission helpers already in `process_request.rs`:
+After each loop iteration step where forward progress on GPU work might have happened (page-flip-ready dispatch, response to fd readiness, or wake-source readiness — see §"Wake source"), invoke the drain and fire each completed event via the existing emission helpers already in `process_request.rs`:
 
 ```rust
 let completed = backend.drain_completed_present_events();
 for entry in completed {
-    if entry.idle_fence_xid != 0 {
-        let _ = backend.dri3_trigger_fence(entry.idle_fence_xid);
-        if let Some(f) = state.sync_fences.get_mut(&entry.idle_fence_xid) {
-            f.triggered = true;
+    match entry.wake {
+        PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
+            let _ = backend.dri3_trigger_fence(idle_fence_xid);
+            if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                f.triggered = true;
+            }
         }
+        PresentWake::PixmapSynced { release_syncobj, release_value }
+            if release_syncobj != 0 =>
+        {
+            if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+                log::warn!(
+                    "PRESENT::PixmapSynced deferred signal {release_syncobj:#x}@{release_value} failed: {e}"
+                );
+            }
+        }
+        _ => {} // no wake object attached
     }
-    // Existing fan-out helper (process_request.rs:~5384):
-    fan_out_present_complete_and_idle(state, &entry);
+    // Existing fan-out helper (process_request.rs:~5384), extracted
+    // so both legacy and new paths share emission logic.
+    fire_present_completion_events(state, &entry);
 }
 ```
 
-The `fan_out_present_complete_and_idle` helper is extracted from the existing inline emission (`process_request.rs:5113-5170` approximately) so both the legacy code path (until this design lands) and the new drain-hook path call the same emission logic. The helper consumes a `CompletedPresentEvent` plus `&mut state` and emits to each subscribed client.
+The `fire_present_completion_events` helper is extracted from the existing inline emission (`process_request.rs:5113-5170` and the fan-out at line 5384) so both the legacy code path (until this design lands) and the new drain-hook path call the same emission logic. **Emission order is `IdleNotify` first, then `CompleteNotify { mode: Copy }`** — matches the existing site at `process_request.rs:5513` and Mesa's documented expectation. The helper consumes a `CompletedPresentEvent` plus `&mut ServerState` and emits to each subscribed client.
 
-### PRESENT handler change (`process_request.rs:5040-5170`)
+### PRESENT handler change
+
+Both PRESENT call sites get the same shape — the synchronous wait is replaced with an enqueue. They diverge only on the wake variant.
+
+**`PRESENT::Pixmap` (`process_request.rs:5055`):**
 
 ```diff
 -                backend.wait_for_drawable_idle(dst.host_xid())?;
 +                backend.enqueue_present_completion(CompletedPresentEvent {
-+                    client_id: req.client_id,
++                    client_id,
 +                    serial: req.serial,
 +                    host_xid: host_xid.as_raw(),
 +                    dst_host_xid: dst.host_xid(),
-+                    idle_fence_xid: req.idle_fence,
 +                    options: req.options,
++                    wake: PresentWake::Pixmap { idle_fence_xid: req.idle_fence },
 +                });
                  backend.note_present_pixmap(host_xid.as_raw(), dst.host_xid());
                  // damage accounting unchanged
                  // ...
 -                // immediate dri3_trigger_fence + sync_fences.triggered=true
--                // immediate fan-out of CompleteNotify + IdleNotify
+-                // immediate fan-out of IdleNotify + CompleteNotify
 +                // (emission deferred — main loop drains the queue when
 +                //  the cow_batch fence signals)
 ```
 
 The `present_scheduler.enqueue` call at `process_request.rs:5141` stays — that's a separate flip-path mechanism unrelated to the Copy-mode completion timing.
 
-The second `wait_for_drawable_idle` call at `process_request.rs:5284` (inside the CopyArea pre-PRESENT optimisation path) is out of this design's scope; flag for a follow-up review but don't touch in this change.
+**`PRESENT::PixmapSynced` (`process_request.rs:5284`):**
+
+```diff
+                 src_depth == dst.depth()
+                     && backend.copy_area(/* ... */).is_ok()
+-                    && backend.wait_for_drawable_idle(dst.host_xid()).is_ok()
++                    && {
++                        backend.enqueue_present_completion(CompletedPresentEvent {
++                            client_id,
++                            serial: req.serial,
++                            host_xid: host_xid.as_raw(),
++                            dst_host_xid: dst.host_xid(),
++                            options: masked_options,
++                            wake: PresentWake::PixmapSynced {
++                                release_syncobj: req.release_syncobj,
++                                release_value: req.release_value,
++                            },
++                        });
++                        true
++                    }
+```
+
+The immediate `dri3_signal_syncobj` call at `process_request.rs:5300-5308` is deleted; the signal fires deferred from the main loop drain hook with the same arguments.
+
+`copied_to_dst` semantics preserved: the eager-touched cow_batch + the queued completion together replace the synchronous copy-then-wait that this flag previously asserted. The follow-on event fan-out at `process_request.rs:5310+` continues to fire `CompleteNotify`/`IdleNotify`; that fan-out is replaced by the deferred-drain emission, same as the `Pixmap` path.
+
+## Wake source
+
+A pending entry needs the main loop to iterate so its fence can be polled. The existing loop wakes on input fd readiness, DRM page-flip events, deferred requests, repeat-key deadlines, or `Backend::next_wakeup()`. None of these fire deterministically when only a GPU fence signals during an otherwise-idle period (e.g. a single PRESENT followed by quiet — no page-flip queued, no input, no timers).
+
+**Mechanism:** while `pending_present_events` is non-empty, the backend exposes a poll FD that becomes readable when its associated GPU fence signals.
+
+- At enqueue time, `enqueue_present_completion` exports the `FenceTicket`'s underlying `VkFence` as a `sync_file` FD via `VK_KHR_external_fence_fd` + `vkGetFenceFdKHR(VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT_KHR)`. The exported FD is stored on the `PendingPresentEntry`.
+- `Backend::poll_fds()` is extended to return these FDs alongside the existing DRM + libinput FDs, under a new `BackendFdKind::PresentCompletion` variant. The main loop registers them in its epoll set.
+- When KMS or the GPU driver signals the fence, the sync_file FD becomes readable; epoll wakes the main loop; the loop calls `drain_completed_present_events` which polls each entry's `ticket.poll_signaled()`, retires signaled entries, and closes their exported FDs.
+
+This mirrors how Wayland compositors (mutter, kwin, sway) drive event loops on sync_file FDs from explicit-sync clients — the kernel does the wait, userspace gets woken precisely when ready.
+
+`VK_KHR_external_fence_fd` is already enabled on the v2 `VkContext` for the scanout-side `export_semaphore` path (`kms/vk/scanout.rs:1064`); the fence-variant of the same extension is part of the same Vulkan capability set. The plan verifies extension availability at `VkContext::new()` and surfaces an init-time error if a future driver doesn't support it (acceptable; v2 already requires this class of extension).
+
+**Fallback (degraded mode, not part of the design but worth documenting for the plan):** if `VK_KHR_external_fence_fd` turns out unavailable on some Vk impl yserver supports, `Backend::next_wakeup()` can return `Some(now + 1 ms)` while the queue is non-empty. Polling-based, 1ms latency, no FD machinery. The spec requires the FD path; the fallback is a known-acceptable degraded option if a porting need surfaces.
 
 ## Data flow
 
@@ -174,7 +246,9 @@ Client → PRESENT::Pixmap(serial, pixmap, window, options, ..., idle_fence)
   ▼
 process_request.rs handle_present_pixmap:
   1. backend.copy_area(src_host_xid, cow_host_xid, ...)        # appended to cow_batch
-  2. backend.enqueue_present_completion(client, serial, ...)   # pushed onto queue
+  2. backend.enqueue_present_completion(CompletedPresentEvent  # pushed onto queue
+       { ..., wake: PresentWake::Pixmap { idle_fence } })       # backend exports
+                                                                # fence as sync_file FD
   3. backend.note_present_pixmap(...)                           # existing diagnostic
   4. accumulate damage / present_scheduler.enqueue              # existing
   5. handler returns Ok(())                                     # **no synchronous wait**
@@ -190,15 +264,20 @@ maybe_composite tick:
 
 (later, GPU finishes; typically ≤ one frame)
   ▼
-cow_batch FenceTicket.poll_signaled() → true on next main loop iter
+sync_file FD becomes readable → epoll wakes main loop
 
 main loop drain:
   ▼
   for entry in backend.drain_completed_present_events():
-      backend.dri3_trigger_fence(entry.idle_fence_xid)
-        → wakes Mesa WSI thread (xshmfence futex)
-      fan_out_present_complete_and_idle(state, &entry)
-        → emits CompleteNotify { mode: Copy } + IdleNotify
+      match entry.wake:
+        Pixmap { idle_fence_xid } if != 0:
+          backend.dri3_trigger_fence(idle_fence_xid)
+            → wakes Mesa WSI thread (xshmfence futex)
+        PixmapSynced { release_syncobj, release_value } if != 0:
+          backend.dri3_signal_syncobj(release_syncobj, release_value)
+            → signals client's DRM syncobj timeline point
+      fire_present_completion_events(state, &entry)
+        → emits IdleNotify FIRST, then CompleteNotify { mode: Copy }
         → per-subscribed-client per-window event mask
 ```
 
@@ -208,7 +287,7 @@ main loop drain:
 
 **I2. The pending-events queue retires in submission order.** Each entry holds a clone of a cow_batch FenceTicket. Same-queue submission order (`kms/v2/engine.rs` paint queue) means batch N signals before batch N+1. `drain_completed_present_events` walks the queue front-to-back and stops at the first unsignaled entry — every signaled entry is at a contiguous prefix. No reordering, no priority inversion.
 
-**I3. Drain is called at least once per main loop iteration.** The drain hook is on the iteration epilogue (after `on_page_flip_ready` and per-fd dispatch). Under steady load this fires within sub-ms of a fence signal. Under idle, the next event (input, timer, fd readiness) drives an iteration which drains. There is no path where a signaled entry sits in the queue without being drained on the next loop iter.
+**I3. The main loop wakes when any pending entry's fence signals.** The exported sync_file FDs (§"Wake source") are registered with the main loop's epoll set; the kernel makes the FD readable the moment the fence signals; epoll wakes the loop unconditionally. There is no path where a signaled entry sits in the queue without the loop iterating to drain it — even with zero other activity, the sync_file readiness is sufficient. The drain hook runs on the iteration epilogue, immediately reaping every entry whose FD fired.
 
 **I4. Mesa WSI wake order matches event emission order.** Both the xshmfence trigger and the X11 event emission fire from the same drain loop. For a given entry, the trigger fires immediately before the events. Mesa's WSI thread can wake on the futex before the X11 event reaches its dispatcher; the spec allows this (xshmfence is the load-bearing wake, X11 IdleNotify is the audit signal).
 
@@ -224,17 +303,21 @@ Behaviour: on first `drain_completed_present_events` call after `renderer_failed
 
 ### Shutdown (`KmsBackendV2::disable_output`)
 
-`disable_output` already drains in-flight engine + scene submits. After those drains complete (the existing `engine.drain_all` walks `submitted` and waits on each ticket in order), every cow_batch ticket in the pending-events queue has either signaled or the renderer is failed. Drain the queue in full; fire all entries; if any ticket is still unsignaled, fire anyway (we're shutting down; clients receive their event and can clean up).
+`disable_output` currently drains the SubmittedOp queue via `engine.drain_all`, but the engine's drain only walks `submitted` — it does **not** flush an open `pending_cow_batch` / `pending_render_batch` that has been appended to but not yet submitted. A pending-events entry whose ticket names such an un-flushed batch would never signal during drain. The shutdown sequence must explicitly flush pending batches before walking submitted.
 
 Order inside `disable_output`:
-1. `engine.drain_all(&self.platform)` — waits on each in-flight SubmittedOp ticket.
-2. `self.sync_descriptor_pool_telemetry()` — existing.
-3. `self.scene.drain_all(&mut self.platform)` — existing.
-4. **`self.drain_pending_present_events_for_shutdown()`** — new; drain unconditionally, return list to caller.
-5. `self.telemetry.flush_submit_trace()` — existing.
-6. `self.platform.disable_output()` — existing.
+1. **`self.engine.flush_cow_batch(&mut self.store, &mut self.platform)`** — new; promotes any open cow batch into a SubmittedOp so `drain_all` will wait on it.
+2. **`self.engine.flush_render_batch(&mut self.store, &mut self.platform)`** — new; same for the render batch.
+3. `self.engine.drain_all(&self.platform)` — waits on each SubmittedOp ticket in order. After this returns, every cow_batch ticket in the pending-events queue has either signaled or the renderer is failed.
+4. `self.sync_descriptor_pool_telemetry()` — existing.
+5. `self.scene.drain_all(&mut self.platform)` — existing.
+6. **`self.drain_pending_present_events_for_shutdown()`** — new; drain the queue in full regardless of remaining ticket signal state (post-drain_all they should all be signaled; defensive against a runaway). Returns the list to the caller.
+7. `self.telemetry.flush_submit_trace()` — existing.
+8. `self.platform.disable_output()` — existing.
 
-Step 4 returns the entries to the caller (`lib.rs::run`), which emits them to clients before tearing down the socket. The emission has to happen before `fs::remove_file(&socket_path)` so the events make it onto the wire.
+Step 6 returns the entries to the caller (`lib.rs::run`), which emits them to clients before tearing down the socket. The emission has to happen before `fs::remove_file(&socket_path)` so the events make it onto the wire. Step 6 also closes any sync_file FDs still owned by the queue entries.
+
+**Test gate**: `disable_output_flushes_pending_batches_before_drain_all` — open a cow_batch via `engine.cow_copy_area`, enqueue a pending PRESENT entry, call `disable_output`. Assert: no pending batches remain after step 2; the entry's ticket is signaled after step 3; the queue is empty after step 6.
 
 ### Fence wait failure / per-entry timeout
 
@@ -267,15 +350,18 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 
 `FenceTicket` doesn't currently have a test-only "force signaled" knob; add one as `#[cfg(test)] fn test_mark_signaled(&self)` that sets the cached-signal bool to true. Mirrors the existing `#[cfg(test)]` knobs on `DescriptorPoolRing`.
 
-### Integration (engine retirement)
+### Integration (engine retirement + wake source)
 
 `crates/yserver/tests/v2_acceptance.rs`:
 
-- **`v2_present_pixmap_enqueues_pending_and_defers_emission`** — drive the v2 backend's `Backend::copy_area` + `enqueue_present_completion`, assert (a) no synchronous wait was made (latency on the entry call < 100 µs), (b) the entry sits in the queue, (c) after a forced maybe_composite tick + waiting on retirement, drain returns the entry.
+- **`v2_present_pixmap_enqueues_pending_and_defers_emission`** — drive the v2 backend's `Backend::copy_area` + `enqueue_present_completion` with `PresentWake::Pixmap { idle_fence_xid: 0 }`, assert (a) no synchronous wait was made (latency on the entry call < 100 µs), (b) the entry sits in the queue, (c) after a forced maybe_composite tick + waiting on retirement, drain returns the entry.
+- **`v2_present_pixmap_synced_enqueues_with_release_syncobj_wake`** — same shape but using `PresentWake::PixmapSynced`. Asserts the wake variant survives enqueue → drain unchanged; emission path is exercised in a separate unit test of `fire_present_completion_events`.
 - **`v2_present_pixmap_drain_returns_in_fifo_order_against_live_vk`** — Vk-backed: issue 3 PRESENT-shaped sequences (copy_area + enqueue) targeting the same COW under lavapipe; flush + retire all; drain returns 3 entries in submission order.
 - **`v2_present_aggregation_depth_unchanged_after_design`** — issue 10 PRESENT-shaped sequences without any intervening retirement, assert the cow_batch flushes ONCE (depth 10) — i.e. the deferred-completion design doesn't accidentally re-introduce a flush via the enqueue path.
+- **`v2_present_completion_fence_fd_exports_and_signals`** — Vk-backed: enqueue an entry, assert `Backend::poll_fds()` reports a `BackendFdKind::PresentCompletion` FD; before fence signal the FD must NOT be readable; after a forced flush + retirement the FD must become readable (poll with `POLLIN`, zero-timeout); drain closes the FD.
+- **`v2_disable_output_flushes_pending_batches_before_drain_all`** — open a cow_batch, enqueue a pending PRESENT entry against it; call `disable_output`; assert (a) no pending batches in the engine after the explicit flush step, (b) the entry's ticket is signaled after `drain_all`, (c) the queue is empty after the shutdown drain.
 
-### Regression (the bee UAF stays closed)
+### Regression (the bee use-after-free stays closed)
 
 - **`v2_present_pixmap_then_free_pixmap_keeps_source_alive`** — issue a copy_area + enqueue + immediate FreePixmap on the source; the eager-touched ticket on the source pixmap defers destruction; force a CB flush; the CB still sees a valid VkImageView (no crash, no validation warning). The existing `8ca552a` regression tests stay valid:
   - `render_composite_open_marks_src_last_render_ticket_immediately`
@@ -284,7 +370,7 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 
 ### Hardware acceptance (user-driven smoke)
 
-- **bee** (Ryzen 9 6900HX / RDNA2 / RADV): MATE drag must not wedge. The original UAF symptom (`ERROR_DEVICE_LOST` flood, addr_binding_report fault) must not reproduce. The lag-floor of the current bee fix (synchronous PRESENT wait stacking marco frame work on the request handler) should be substantially better.
+- **bee** (Ryzen 9 6900HX / RDNA2 / RADV): MATE drag must not wedge. The original use-after-free symptom (`ERROR_DEVICE_LOST` flood, addr_binding_report fault) must not reproduce. The lag-floor of the current bee fix (synchronous PRESENT wait stacking marco frame work on the request handler) should be substantially better.
 - **yoga** (Snapdragon X1 / Adreno X1 / Turnip): MATE drag should match the user-perceived "snappy, low CPU, low Hz" state of the post-revert measurement. Telemetry: `cow_batches_flushed/s` average depth in the 5-10 range (silence reference 5.41, yoga reverted 8.5).
 - **silence** (i9 13900k / rx580 / RADV): MATE drag perf characteristic unchanged from the existing post-Task-3 baseline. The deferred completion shouldn't change anything for silence (it was never on the flush-on-PRESENT path's binding side).
 - **fuji** (i5-7200U / Intel HD 620 / ANV): sanity check that the design doesn't introduce a new failure on Intel.
@@ -295,17 +381,19 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 
 ## Risks
 
-**R1. Stale ticket on the COW during the brief window between PRESENT enqueue and cow_batch flush.** Pre-fix code path: `wait_for_drawable_idle(COW)` read `COW.last_render_ticket` and returned immediately on `None` (the broken pre-bee-fix behaviour). Post-design: nobody reads `COW.last_render_ticket` on the PRESENT path. Other callers of `wait_for_drawable_idle` (the CopyArea optimisation path at `process_request.rs:5284`) still depend on it; flag for follow-up review.
+**R1. Both PRESENT paths covered.** `Pixmap` (xshmfence wake) and `PixmapSynced` (DRM syncobj wake) both flow through the same `enqueue_present_completion` + drain mechanism via the `PresentWake` enum. After this design lands, `wait_for_drawable_idle` has no callers in tree. The trait method is retained for forward compatibility but logically dead until a new use case appears.
 
-**R2. Main loop iteration starvation under sustained busy-CPU.** If the loop iterates rarely (e.g. compute-bound libinput backlog), pending events sit unfired. Mitigation: drain is in the per-iteration epilogue; the loop iterates on every fd-ready event including the DRM page-flip fd, so under any visual workload (vblanks at 60 Hz minimum) the drain runs ≥ 60 times per second. Idle CPU isn't the failure surface — there are no PRESENTs queued during idle.
+**R2. `VK_KHR_external_fence_fd` availability.** The design requires the extension to export the cow_batch fence as a sync_file FD. RADV, Turnip, ANV, and Mesa's lavapipe all support it; the v2 `VkContext` already enables semaphore-FD export for the scanout path. The fence-FD variant is part of the same Vulkan capability set and is reasonable to require. Mitigation: `VkContext::new` verifies the extension at init time and errors out cleanly if absent. Fallback: `Backend::next_wakeup()` polling-based wake (1 ms bound) is a documented degraded-mode option for future ports.
 
-**R3. Event ordering vs. xshmfence wake-up race.** Mesa WSI threads wake on the xshmfence trigger; they're racing the X11 event dispatcher (separate thread / fd). Per spec the xshmfence trigger is the load-bearing wake; the X11 event is an audit signal. Fine to race. Both fire from the same drain loop iteration, so they're at least logically simultaneous.
+**R3. Event ordering vs. wake-up race.** Mesa WSI threads wake on the xshmfence trigger or the DRM syncobj signal; they're racing the X11 event dispatcher (separate thread / fd). Per spec the wake object is the load-bearing trigger; the X11 events are audit signals. Fine to race. Both fire from the same drain-loop iteration. **Emission order within the drain loop is `IdleNotify` then `CompleteNotify`** matching the existing `process_request.rs:5513` site and Mesa expectation.
 
-**R4. Test coverage of the bee scenario without bee hardware.** The eager-touch unit tests + the existing `8ca552a` regression suite gate the UAF closure logically. The fault would only reproduce on RDNA2 iGPU under heavy churn (per the platform analysis in the original commit message). The acceptance gate is logical — if the eager-touch path is exercised correctly, the UAF is closed on every platform that runs it.
+**R4. Test coverage of the bee scenario without bee hardware.** The eager-touch unit tests + the existing `8ca552a` regression suite gate the use-after-free closure logically. The fault would only reproduce on RDNA2 iGPU under heavy churn (per the platform analysis in the original commit message). The acceptance gate is logical — if the eager-touch path is exercised correctly, the use-after-free is closed on every platform that runs it.
 
 **R5. Telemetry counters may show transient queue-depth spikes during warm-up.** Marco's startup issues a burst of PRESENTs before the first flush; queue depth could briefly exceed expected steady-state. Not a correctness issue; flag in the per-second emitter logs only as a record of warm-up shape.
 
-**R6. `Backend` trait surface grows.** Two new methods. The v1 backend (still in tree per Stage 5 v1-deletion gates) needs stub implementations — return empty for `drain_completed_present_events`; no-op for `enqueue_present_completion`. v1 still uses the synchronous wait at the same call site; that path is unchanged. (v1 doesn't have the Task 3 batching, so it never has a pending ticket without submit.)
+**R6. `Backend` trait surface grows.** Two new methods + one new `BackendFdKind` variant + one new public type (`CompletedPresentEvent` + `PresentWake`). The v1 backend (still in tree per Stage 5 v1-deletion gates) needs stub implementations — return empty for `drain_completed_present_events`; no-op for `enqueue_present_completion`; no new FDs from `poll_fds()`. v1 still calls the synchronous wait at the same code path because v1 has no Task 3 batching (every paint submits its own CB; tickets always correspond to submitted work; no deadlock). v1 unchanged.
+
+**R7. FD leak on abnormal exit.** Each pending entry owns a sync_file FD. If `disable_output` panics or is bypassed (panic in main), FDs leak into the kernel's per-process table until process exit. Mitigation: `PendingPresentEntry::Drop` closes the FD unconditionally; this covers all unwind paths. Documented as part of the implementation contract.
 
 ## Out-of-scope follow-ups
 
@@ -325,6 +413,6 @@ After landing, re-run the same yoga MATE-drag workload that produced the 2026-05
 | `paint_submits/s` drag avg | ~3500–4000 | **≤ 3000** | aggregation restored |
 | Subjective drag | initial slow then speeds up | native-feeling | warm-up cost remains, native steady-state |
 
-Plus: bee MATE drag must not wedge under the same workload that triggered the original UAF. The synchronous-wait lag floor on bee should drop substantially.
+Plus: bee MATE drag must not wedge under the same workload that triggered the original use-after-free. The synchronous-wait lag floor on bee should drop substantially.
 
 Capture via `just yserver-mate-hw-telemetry`. SSH from another machine + `pkill -TERM yserver` for clean exit (the kernel SysRq rebuild on yoga is in flight; don't zap until that lands).
