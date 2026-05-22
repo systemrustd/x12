@@ -1674,6 +1674,12 @@ impl KmsBackendV2 {
         self.engine.drain_all(&self.platform);
         self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
+        // Flush the submit trace after the drains record their
+        // final events, before platform teardown — a VkDevice
+        // destroy can hang on some drivers (msm/Renoir) and
+        // `BufWriter::Drop` would lose the buffered tail to a
+        // subsequent power-cycle. See `submit_trace::SubmitTrace::flush`.
+        self.telemetry.flush_submit_trace();
         self.platform.disable_output()
     }
 

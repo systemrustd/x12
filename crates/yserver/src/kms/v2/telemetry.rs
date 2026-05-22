@@ -173,13 +173,29 @@ impl Telemetry {
     /// Tick the emitter; if ≥ 1s has elapsed, print the
     /// per-second summary and reset the bucket. Safe to call
     /// every core-loop iteration — no-op when below threshold.
+    ///
+    /// Independent of the `enabled` gate: when a [`SubmitTrace`] is
+    /// active, the same 1Hz cadence also flushes its `BufWriter`.
+    /// That bounds the data loss from hard kill (zap, kernel hang,
+    /// hard reboot) to ≤ 1s and lets `tail -f` work during a live
+    /// capture. The cost is one `write(2)` syscall per second when
+    /// tracing — negligible.
     pub(crate) fn maybe_emit(&mut self) {
-        if !self.enabled {
-            return;
-        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_emit);
         if dt < std::time::Duration::from_secs(1) {
+            return;
+        }
+        // 1Hz periodic flush of the submit trace — runs whether or
+        // not the per-second log line is enabled.
+        if let Some(trace) = self.submit_trace.as_mut() {
+            trace.flush();
+        }
+        if !self.enabled {
+            // Advance the timer so the next flush also runs at 1Hz.
+            // The per-second `bucket` keeps accumulating when
+            // disabled — only the log emission + reset are gated.
+            self.last_emit = now;
             return;
         }
         let b = self.bucket;
@@ -245,6 +261,18 @@ impl Telemetry {
     /// whether to assert lifetime counts.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Explicit flush of the active [`SubmitTrace`]. Called from
+    /// `KmsBackendV2::disable_output` before any potentially-
+    /// blocking teardown (VkDevice destroy on the platform side
+    /// can hang on some drivers) so the trace's `BufWriter`
+    /// commits its buffered tail to disk while we still control
+    /// the timing. No-op when tracing is off.
+    pub(crate) fn flush_submit_trace(&mut self) {
+        if let Some(trace) = self.submit_trace.as_mut() {
+            trace.flush();
+        }
     }
 
     // ── Counter sites ───────────────────────────────────────────

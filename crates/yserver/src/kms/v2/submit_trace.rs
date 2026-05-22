@@ -375,6 +375,22 @@ impl SubmitTrace {
         }
     }
 
+    /// Flush the underlying `BufWriter`. Called periodically (1Hz
+    /// via `Telemetry::maybe_emit`) and explicitly during shutdown
+    /// (`KmsBackendV2::disable_output`) so a hung drop chain or
+    /// hard kill doesn't lose the buffered tail. A failed flush
+    /// disables further writes for the rest of the process,
+    /// mirroring `record`'s self-quiescing behaviour.
+    pub(crate) fn flush(&mut self) {
+        if self.write_failed {
+            return;
+        }
+        if let Err(err) = self.writer.flush() {
+            log::warn!("submit_trace: flush failed: {err}; suppressing further trace output");
+            self.write_failed = true;
+        }
+    }
+
     /// Append one event. After the first write error, becomes a
     /// silent no-op for the remainder of the process — we don't
     /// want to spam the log every submit if the disk fills up.
@@ -590,6 +606,70 @@ mod tests {
         assert_eq!(fields[7], "-");
         assert_eq!(fields[8], "-");
         assert_eq!(fields[9], "-");
+    }
+
+    #[test]
+    fn flush_commits_buffered_writes_to_disk() {
+        // The load-bearing regression test: BufWriter's default
+        // 8KB buffer means small captures (e.g. a 2-second drag
+        // truncated by zap) leave the file at 0 bytes until either
+        // Drop or an explicit flush. The 2026-05-22 yoga zap-hang
+        // scenario lost the entire trace because the drop chain
+        // hung before BufWriter::Drop could run. flush() called at
+        // shutdown (or 1Hz via maybe_emit) is what closes that
+        // window.
+        let path = unique_temp_path();
+        let mut trace = make_trace_at(&path.0);
+        let event = SubmitEvent {
+            frame_id: 1,
+            kind: SubmitKind::FillOne,
+            target_kind: TargetKind::Pixmap,
+            target_id: 9,
+            batch_size: 1,
+            op: Op::None,
+            src_class: SrcClass::None,
+            mask_class: SrcClass::None,
+            pipeline_id: None,
+            flags: Flags::NONE,
+        };
+        trace.record(&event);
+        // Pre-flush: only the test fixture's header is on disk
+        // (the fixture flushes it as part of `make_trace_at`). The
+        // recorded event lives in the BufWriter and is invisible
+        // on disk until flush() runs. Assert the row is absent.
+        let before = read_back(&path.0);
+        assert!(
+            !before.contains("fill_one"),
+            "row leaked to disk before flush: {before:?}",
+        );
+
+        trace.flush();
+        // Post-flush: read_back without dropping `trace`. The row
+        // must now be on disk; this is the property a shutdown-
+        // path flush relies on.
+        let after = read_back(&path.0);
+        let row = after.lines().nth(1).expect("event row after flush");
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields.len(), 14);
+        assert_eq!(fields[2], "fill_one");
+        assert_eq!(fields[4], "9");
+    }
+
+    #[test]
+    fn flush_after_write_failure_is_silent_noop() {
+        // Post-write-failure self-quiescing: once `write_failed`
+        // is latched, flush() must not retry or log. Mirrors the
+        // record() behaviour so a single error in the run doesn't
+        // produce one warn line per second from maybe_emit's
+        // periodic flush.
+        let path = unique_temp_path();
+        let mut trace = make_trace_at(&path.0);
+        trace.write_failed = true;
+        trace.flush();
+        // Sanity: the writer wasn't touched. Header from fixture
+        // is still the only content (file may be 0 bytes since the
+        // fixture buffers the header too, but no panic / no log).
+        let _ = read_back(&path.0);
     }
 
     #[test]
