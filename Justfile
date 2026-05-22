@@ -461,6 +461,49 @@ yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::rende
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# Counterpart to `yserver-mate-hw` with Vulkan validation + RADV
+# hang reporting wired in for tracking down GPU VM faults / device
+# losses. Use when yserver wedges with `ERROR_DEVICE_LOST` on a
+# RADV-driven AMD card/APU:
+#   - YSERVER_VK_VALIDATION=1 + VK_INSTANCE_LAYERS turns on the
+#     Khronos validation layer (needs `vulkan-validation-layers`
+#     installed; the loader will warn-and-continue if absent).
+#   - VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT pinpoints
+#     missing layout/cache barriers (the most likely class of bug
+#     for a TCP texture-read VM fault).
+#   - RADV_DEBUG=hang,syncshaders makes RADV insert wait-idle
+#     around every shader stage and dump GPU state to
+#     ~/radv_dumps/ when a hang/fault fires. syncshaders is slow
+#     by design — that's the point; it makes the offending submit
+#     localizable.
+#   - MESA_VK_ABORT_ON_DEVICE_LOSS=1 aborts the process on the
+#     first device-lost rather than letting hundreds of downstream
+#     RendererFailed warnings drown the actual cause.
+# Writes logs to `yserver-hw-mate-vkdebug.log` so the baseline
+# `yserver-hw-mate.log` is preserved for diffing.
+yserver-mate-hw-vkdebug log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
+    cargo build --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=full \
+            YSERVER_VK_VALIDATION=1 \
+            VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+            VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT \
+            RADV_DEBUG=hang,syncshaders \
+            MESA_VK_ABORT_ON_DEVICE_LOSS=1 \
+            target/debug/yserver > yserver-hw-mate-vkdebug.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session mate-session --display :7 > mate-vkdebug.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;\
+        echo "yserver log: yserver-hw-mate-vkdebug.log";\
+        echo "mate log:    mate-vkdebug.log";\
+        echo "radv dumps:  ~/radv_dumps/ (if any)";'
+
 # Release-mode mate wrapped in system-wide `perf record`. See
 # tools/profile-mate.sh for what it captures and how to read the trace.
 # Set `STRACE=1` in the env to also attach strace to caja the moment it
