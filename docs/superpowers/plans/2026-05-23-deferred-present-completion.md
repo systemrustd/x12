@@ -12,6 +12,8 @@
 
 **Pre-flight check:** Master HEAD must include commit `8ca552a` (the bee fix being replaced) and commit `a034d82` (the local revert that proved the design). Run `cargo build -p yserver && cargo test -p yserver --lib` to confirm baseline tests pass — the existing 379 lib tests should be green. Any pre-existing flake should be flagged before proceeding.
 
+ℹ️ **State note**: the revert at `a034d82` undid BOTH layers of `8ca552a` — Layer 1 (engine-side eager-touch) AND Layer 2 (backend-side flush-before-wait in `wait_for_drawable_idle`). The plan's spec relies on Layer 1 staying in place as the use-after-free closure. Layer 1 absence is invisible during Tasks 1-15 (all editor + unit/acceptance test work against lavapipe; the UAF is logically present but doesn't manifest without RDNA2 iGPU GTT fast-recycle exercising it). **Task 15 restores Layer 1** as a pre-Task-16 hardware-readiness step, with verification that Layer 2 stays gone.
+
 ---
 
 ## File Map
@@ -2278,50 +2280,90 @@ of the bee fix (no synchronous wait + correct drain ordering)."
 
 ---
 
-## Task 15: Verify the bee fix's synchronous-wait machinery is fully gone
+## Task 15: Restore eager-touch + verify the bee fix's wait machinery is gone
 
-Cleanup pass. The bee fix (`8ca552a`) added two layers: eager-touch (kept) + flush-before-wait (deleted). Confirm the deletion is complete and `wait_for_drawable_idle` has no remaining callers.
+Two-part cleanup pre-Task-16:
+
+1. **Restore engine-side eager-touch** (Layer 1 of `8ca552a`). Master HEAD has the entire bee fix reverted via `a034d82`. The deferred-completion design assumes Layer 1 stays in place as the use-after-free closure on bee. Tasks 1-14 don't need Layer 1 (no bee testing in those tasks), but Task 16 (hardware verification) does — mate-panel's icon-upload churn on bee will UAF without it.
+
+2. **Confirm Layer 2 stays gone** (the backend `wait_for_drawable_idle` flush-before-wait). After Tasks 12+13, `wait_for_drawable_idle` should have zero remaining callers. The method itself can be deleted or kept as a no-op surface.
 
 **Files:**
-- Read-only: `crates/yserver/src/kms/v2/backend.rs:4244` (`wait_for_drawable_idle` body)
-- Read-only: `crates/yserver-core/src/core_loop/process_request.rs` (no more callers)
+- Modify: `crates/yserver/src/kms/v2/engine.rs` (restore from `8ca552a`)
+- Read-only: `crates/yserver/src/kms/v2/backend.rs` (`wait_for_drawable_idle` body)
+- Read-only: `crates/yserver-core/src/core_loop/process_request.rs` (verify no more callers)
 
-- [ ] **Step 1: Confirm zero callers**
+- [ ] **Step 1: Restore engine.rs from the bee fix commit**
+
+`engine.rs` should have had no edits since `a034d82` except by Tasks 8 (engine accessor `current_cow_batch_ticket`) and any incidental touches. Verify the only differences from `8ca552a` are the Task 8 additions:
 
 ```
-grep -nE "wait_for_drawable_idle" crates/yserver-core crates/yserver -r
+git diff 8ca552a -- crates/yserver/src/kms/v2/engine.rs | head
 ```
 
-Expected: only the method definition + perhaps test code. Zero callers from `process_request.rs`. If any caller survives, identify which path and either:
-- Migrate it to the deferred-completion mechanism (similar to Task 12/13), or
-- Document why it stays.
+If the diff shows only the Task 8 additions (or a clean diff), the safe restore is:
 
-- [ ] **Step 2: Confirm the flush-before-wait body in `wait_for_drawable_idle` is gone**
+```bash
+# Restore engine.rs to its 8ca552a state, then re-apply Task 8's
+# current_cow_batch_ticket accessor on top.
+git checkout 8ca552a -- crates/yserver/src/kms/v2/engine.rs
+# Manually re-add the Task 8 accessor if it was lost (it's a single
+# pub(crate) fn current_cow_batch_ticket method — copy from the
+# Task 8 step 2 code block).
+```
 
-If the body still contains the flush+wait sequence from `8ca552a`, this is a code smell — the method is now dead. Either delete the method entirely or, if you want to keep the surface for future callers, simplify to just the ticket wait (no flush). Either is acceptable; deleting is cleaner.
+Alternative (cleaner if the only intervening change in engine.rs is Task 8):
 
-- [ ] **Step 3: Confirm eager-touch in `engine.rs` is intact**
+```bash
+# Cherry-pick just the engine.rs hunk of 8ca552a; conflicts (if any)
+# manifest at the Task 8 accessor's neighbours.
+git checkout 8ca552a -- crates/yserver/src/kms/v2/engine.rs
+# Inspect what came back vs current HEAD; reapply Task 8.
+```
+
+The bee fix's engine.rs change adds:
+- `RenderEngine::has_pending_batches_for_tests()` — engine-side accessor used by the regression test.
+- `store.touch_render_fence(...)` calls at the four append sites: `cow_copy_area_open_first` / `cow_copy_area` append / `render_composite` open / `render_composite` append.
+
+- [ ] **Step 2: Verify Layer 1 is intact**
 
 ```
 grep -n "store.touch_render_fence" crates/yserver/src/kms/v2/engine.rs
 ```
+Expected: multiple matches at the cow + render batch append sites — at minimum the four sites named above.
 
-The `8ca552a` eager-touch calls at the `cow_copy_area` + `render_composite_open` + `render_composite` appender sites must remain. These are what close the use-after-free. The deferred-completion design depends on them staying.
+- [ ] **Step 3: Confirm `wait_for_drawable_idle` has zero callers**
 
-- [ ] **Step 4: Optionally delete `wait_for_drawable_idle`**
+```
+grep -nE "wait_for_drawable_idle" crates/yserver-core crates/yserver -r
+```
+Expected: only the method definition + perhaps internal test code. **Zero callers from `process_request.rs`** — Tasks 12 + 13 deleted them.
 
-If you choose deletion:
+If any external caller survives, identify which path and either:
+- Migrate it to the deferred-completion mechanism (similar to Task 12/13), or
+- Document why it stays (out-of-scope or different semantics).
+
+- [ ] **Step 4: Confirm Layer 2 (flush-before-wait) is NOT in `wait_for_drawable_idle`**
+
+```
+grep -A20 "fn wait_for_drawable_idle" crates/yserver/src/kms/v2/backend.rs | head -25
+```
+Expected: the body reads the ticket + waits synchronously WITHOUT a flush call. The Layer-2 flush from `8ca552a` was deleted by `a034d82` and must not have come back via the Step-1 restore. If the flush block is present, the restore grabbed too much — verify Step 1 used the `--` flag to limit scope to `engine.rs`.
+
+- [ ] **Step 5: Optionally delete `wait_for_drawable_idle`**
+
+If it has zero callers (Step 3), deleting it is cleaner than leaving dead code:
 
 ```rust
-// Delete the method body + trait method (or leave a trait default
-// returning Ok(())). Note: tests like v2_wait_for_drawable_idle_
-// flushes_pending_batches that were added with 8ca552a also need
-// deletion or rewrite.
+// Remove the method from the Backend trait + the v2 impl + the v1
+// impl. Any test like
+// v2_wait_for_drawable_idle_flushes_pending_batches (the Layer-2
+// regression test from 8ca552a — should already be gone since the
+// revert undid it) also gets deleted if it somehow came back via
+// the Step-1 restore.
 ```
 
-The bee fix's regression tests at `crates/yserver/tests/v2_acceptance.rs::v2_wait_for_drawable_idle_flushes_pending_batches` (if present) need to be either deleted (the property they assert is no longer load-bearing) or rewritten to assert the new deferred-completion behaviour.
-
-- [ ] **Step 5: Run full test matrix + commit**
+- [ ] **Step 6: Run full test matrix + commit**
 
 ```
 cargo +nightly fmt
@@ -2331,18 +2373,32 @@ cargo test -p yserver-core --lib
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
   cargo test -p yserver --test v2_acceptance -- --ignored
 ```
-Expected: all green; clippy clean.
+Expected: all green; clippy clean. The three engine-side regression tests from `8ca552a` come back green:
+- `render_composite_open_marks_src_last_render_ticket_immediately`
+- `render_composite_open_then_decref_src_returns_pending_fence`
+- `cow_copy_area_open_marks_src_last_render_ticket_immediately`
 
 ```bash
-git add -A
-git commit -m "chore(v2): remove dead wait_for_drawable_idle + obsolete bee-fix tests
+git add crates/yserver/src/kms/v2/engine.rs \
+        crates/yserver/src/kms/v2/backend.rs \
+        crates/yserver-core/src/backend/trait_def.rs
+git commit -m "fix(v2): restore eager-touch + drop dead wait_for_drawable_idle
 
-Stage 5 Task 6.1 cleanup. After deferring PRESENT completion to
-the drain hook (Tasks 12-13), wait_for_drawable_idle has zero
-callers. The method body (flush + sync wait, added in 8ca552a)
-is removed along with the v2_wait_for_drawable_idle_flushes_
-pending_batches regression test that gated it. The eager-touch
-layer of 8ca552a stays — that's the load-bearing UAF closure."
+Stage 5 Task 6.1 pre-hardware-validation cleanup.
+
+Restores the engine-side eager-touch from 8ca552a (Layer 1: the
+store.touch_render_fence calls at cow_copy_area + render_composite
+append sites) without the backend-side flush-before-wait (Layer 2:
+the wait_for_drawable_idle flush that gated marco's aggregation).
+Layer 1 is the load-bearing use-after-free closure for bee's
+Rembrandt RDNA2 iGPU; Layer 2 is what the deferred-completion
+mechanism replaces.
+
+After Tasks 12+13 wait_for_drawable_idle has no callers; the
+method is removed entirely. The three engine-side regression
+tests from 8ca552a come back green; the Layer-2 regression test
+(v2_wait_for_drawable_idle_flushes_pending_batches) stays
+deleted."
 ```
 
 ---
