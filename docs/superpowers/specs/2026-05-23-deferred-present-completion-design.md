@@ -155,11 +155,15 @@ If the underlying primitives don't already exist as `Arc`-able handles, the impl
 
 New field on the backend. Owns the queue because the backend has the fence handles; pushing requires no cross-crate plumbing.
 
-### `KmsBackendV2.present_completion_epfd: OwnedFd`
+### `KmsBackendV2.present_completion_epfd: OwnedFd` + `KmsBackendV2.wakeup_eventfd: OwnedFd`
 
-New field on the backend. An `epoll_create1(EPOLL_CLOEXEC)` FD created at backend init. The backend uses it to aggregate the per-entry `fence_fd` sync_files: `epoll_ctl(EPOLL_CTL_ADD)` at enqueue, `EPOLL_CTL_DEL` + `close()` at drain. The main loop sees this single FD via `poll_fds()` and never sees the per-entry FDs directly. Mirrors the `wl_event_loop`-on-epoll pattern Wayland compositors use.
+Two new FDs on the backend, both created at init:
 
-When any per-entry `fence_fd` becomes readable (any pending fence signals), the inner epoll FD itself becomes readable, which wakes the outer main-loop poller. The drain handler then walks the queue with `ticket.poll_signaled()` and reaps signaled entries.
+- **`present_completion_epfd`** — an `epoll_create1(EPOLL_CLOEXEC)` FD. The backend uses it to aggregate the per-entry `fence_fd` sync_files: `epoll_ctl(EPOLL_CTL_ADD)` at enqueue, `EPOLL_CTL_DEL` + `close()` at drain. The main loop sees this single FD via `poll_fds()` and never sees the per-entry FDs directly. Mirrors the `wl_event_loop`-on-epoll pattern Wayland compositors use.
+
+- **`wakeup_eventfd`** — an `eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)` FD, **registered with `present_completion_epfd` once at init** under `EPOLLIN`. The backend writes 1 to it (with `write(2)`) whenever a drain needs to fire without a per-entry FD signal — specifically: (a) `vkGetFenceFdKHR` returned `-1` for an already-signaled fence at enqueue (no per-entry FD was registered), (b) any future force-wake condition. The drain handler reads from the eventfd to clear it after processing.
+
+When any watched source becomes readable (per-entry sync_file OR wakeup_eventfd), the inner epoll FD itself becomes readable, which wakes the outer main-loop poller via the stable FD exposed in `poll_fds()`. This wake mechanism does not depend on `next_wakeup()` semantics and is robust against any execution context that calls `enqueue_present_completion` — including future async paths.
 
 ### `Backend::enqueue_present_completion(&mut self, event: CompletedPresentEvent)` (new trait method)
 
@@ -269,9 +273,11 @@ The main loop's poll set is registered once at `run_core` startup; `poll_fds()` 
 
 - At backend init, `KmsBackendV2` creates `present_completion_epfd = epoll_create1(EPOLL_CLOEXEC)`. Owned for the backend's lifetime.
 - `poll_fds()` returns one new entry: `(present_completion_epfd.as_raw_fd(), BackendFdKind::PresentCompletion)`. Stable; never changes. No update path needed in the outer loop.
-- `enqueue_present_completion` exports the `FenceTicket`'s underlying `VkFence` as a sync_file FD via `VK_KHR_external_fence_fd` + `vkGetFenceFdKHR(VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT_KHR)`, then registers it with the backend's inner epoll: `epoll_ctl(present_completion_epfd, EPOLL_CTL_ADD, fence_fd, EPOLLIN)`. The FD is stored on the entry.
-- When any per-entry sync_file becomes readable (its fence signaled), the inner epoll FD itself becomes readable (Linux epoll semantics: an epoll FD is readable when any watched FD is ready). The outer mio poller in `run_core` wakes; the loop dispatches to `BackendFdKind::PresentCompletion` and calls `backend.drain_completed_present_events()`.
-- Drain walks `pending_present_events` front-to-back, polling each entry's `ticket.poll_signaled()`. For signaled entries: `epoll_ctl(EPOLL_CTL_DEL)` the entry's FD, `close()` it, pop the entry, return the event payload.
+- `enqueue_present_completion` exports the `FenceTicket`'s underlying `VkFence` as a sync_file FD via `VK_KHR_external_fence_fd` + `vkGetFenceFdKHR(VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT_KHR)`. Two outcomes:
+  - Valid FD returned: register with the inner epoll via `epoll_ctl(present_completion_epfd, EPOLL_CTL_ADD, fence_fd, EPOLLIN)`. The FD is stored on the entry.
+  - `-1` returned (already-signaled fast path): no per-entry FD to register. Instead, write 1 to `wakeup_eventfd` (which is itself registered on the inner epoll). This makes the inner epoll readable immediately; the outer loop will drain on its next `poll()`.
+- When any watched source on the inner epoll becomes readable (per-entry sync_file OR wakeup_eventfd), the inner epoll FD itself becomes readable. The outer mio poller in `run_core` wakes; the loop dispatches to `BackendFdKind::PresentCompletion` and calls `backend.drain_completed_present_events()`.
+- Drain walks `pending_present_events` front-to-back, polling each entry's `ticket.poll_signaled()`. For signaled entries: `epoll_ctl(EPOLL_CTL_DEL)` the entry's FD (if it had one), `close()` it, pop the entry, return the event payload. Drain also reads from `wakeup_eventfd` to clear it if it fired (eventfd in non-blocking mode; `read` returns `EAGAIN` if not signaled — that's the no-op case).
 
 This mirrors how Wayland compositors (mutter, kwin, sway) drive event loops on sync_file FDs — one inner epoll per compositor, registered once with the outer loop, dynamically updated as clients come and go.
 
@@ -332,7 +338,7 @@ main loop drain:
 
 **I2. The pending-events queue retires in submission order.** Each entry holds a clone of a cow_batch FenceTicket. Same-queue submission order (`kms/v2/engine.rs` paint queue) means batch N signals before batch N+1. `drain_completed_present_events` walks the queue front-to-back and stops at the first unsignaled entry — every signaled entry is at a contiguous prefix. No reordering, no priority inversion.
 
-**I3. The main loop wakes when any pending entry's fence signals.** For Linux `SYNC_FD` exports, poll/epoll reports `POLLIN` when the fence transitions to signaled. The backend's inner `present_completion_epfd` (§"Wake source") aggregates every pending entry's sync_file FD; the outer mio poller in `run_core` watches that one epoll FD. The kernel makes the inner epoll FD readable when any watched sync_file becomes readable, which wakes the outer loop unconditionally. There is no path where a signaled entry sits in the queue without the loop iterating to drain it — even with zero other activity, the inner-epoll readiness is sufficient. Special case: `vkGetFenceFdKHR` returns `-1` when the fence is already signaled at export time; enqueue treats this as "drain on the next loop iteration" (force `next_wakeup = now`) and skips the epoll registration.
+**I3. The main loop wakes when any pending entry's fence signals.** For Linux `SYNC_FD` exports, poll/epoll reports `POLLIN` when the fence transitions to signaled. The backend's inner `present_completion_epfd` (§"Wake source") aggregates every pending entry's sync_file FD plus a backend-owned `wakeup_eventfd`; the outer mio poller in `run_core` watches that one epoll FD. The kernel makes the inner epoll FD readable when any watched source becomes readable, which wakes the outer loop unconditionally. There is no path where a signaled entry sits in the queue without the loop iterating to drain it — even with zero other activity, the inner-epoll readiness is sufficient. Special case: `vkGetFenceFdKHR` returns `-1` when the fence is already signaled at export time; enqueue writes 1 to `wakeup_eventfd`, which makes the inner epoll readable immediately, which wakes the outer loop on the next `poll()` regardless of whether `next_wakeup()` has been re-consulted. This is the load-bearing wake mechanism — `next_wakeup` is not relied upon.
 
 **I4. Mesa WSI wake order matches event emission order.** Both the xshmfence trigger and the X11 event emission fire from the same drain loop. For a given entry, the trigger fires immediately before the events. Mesa's WSI thread can wake on the futex before the X11 event reaches its dispatcher; the spec allows this (xshmfence is the load-bearing wake, X11 IdleNotify is the audit signal).
 
@@ -405,7 +411,7 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 - **`v2_present_aggregation_depth_unchanged_after_design`** — issue 10 PRESENT-shaped sequences without any intervening retirement, assert the cow_batch flushes ONCE (depth 10) — i.e. the deferred-completion design doesn't accidentally re-introduce a flush via the enqueue path.
 - **`v2_present_completion_inner_epfd_exposed_via_poll_fds`** — at backend init, before any enqueue, `Backend::poll_fds()` already reports a `BackendFdKind::PresentCompletion` FD. The FD is stable across the backend's lifetime (same raw FD value across all enqueue/drain cycles).
 - **`v2_present_completion_fence_fd_aggregates_and_signals`** — Vk-backed: enqueue two entries, assert the inner epoll FD is NOT readable; force one of the two batches to retire; the inner epoll FD becomes readable (poll with `POLLIN`, zero-timeout); drain returns the signaled entry and closes its per-entry FD; the other entry remains pending and its FD remains registered.
-- **`v2_present_completion_already_signaled_fence_drains_on_next_tick`** — pre-signal the cow_batch ticket before enqueue (test helper); enqueue an entry; `vkGetFenceFdKHR` returns `-1`; assert (a) no FD is registered in the inner epoll, (b) `Backend::next_wakeup()` returns `Some(now)` or equivalent, (c) the next drain returns the entry.
+- **`v2_present_completion_already_signaled_fence_writes_wakeup_eventfd`** — pre-signal the cow_batch ticket before enqueue (test helper); enqueue an entry; `vkGetFenceFdKHR` returns `-1`; assert (a) no per-entry FD is registered in the inner epoll, (b) `wakeup_eventfd` has been written to (read with non-blocking `read`, receive a non-zero value), (c) the inner epoll FD is now readable (poll with `POLLIN`, zero-timeout), (d) the next drain returns the entry and the eventfd is cleared.
 - **`v2_present_synced_pin_survives_free_syncobj`** — enqueue a PresentWake::PixmapSynced entry; immediately call the backend's syncobj-destroy path (simulating client FREE_SYNCOBJ); force the cow_batch to retire; drain dispatches to `dri3_signal_syncobj` via the pinned `Arc<vk::Semaphore>` and succeeds (the pin kept the semaphore alive past the resource destruction).
 - **`v2_present_pixmap_pin_survives_destroy_xshmfence`** — same shape with `PresentWake::Pixmap` and `XshmfenceSegment` destroy.
 - **`v2_disable_output_flushes_pending_batches_before_drain_all`** — open a cow_batch, enqueue a pending PRESENT entry against it; call `disable_output`; assert (a) no pending batches in the engine after the explicit flush step, (b) the entry's ticket is signaled after `drain_all`, (c) the queue is empty after the shutdown drain, (d) no leaked per-entry FDs (count FDs before/after).
@@ -445,6 +451,22 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 **R7. FD leak on abnormal exit.** Each pending entry owns a sync_file FD (`OwnedFd`). `OwnedFd::Drop` closes the FD on every unwind path, including the entry's own panic-driven destructor. The inner `present_completion_epfd` is itself an `OwnedFd` owned by `KmsBackendV2`, dropped on backend Drop. The kernel closes any remaining FDs at process exit regardless. No new leak surface vs the existing scanout-side sync_file usage.
 
 **R8. Underlying primitives may not be `Arc`-able yet.** `PinnedWake::Pixmap(Arc<XshmfenceSegment>)` and `PinnedWake::PixmapSynced(Arc<vk::Semaphore>)` assume the backend's xshmfence + syncobj registries store handles in a way that can produce an `Arc` clone at enqueue time. If today they store raw `ash::vk::Semaphore` handles + manage destruction by xid lookup, the implementation needs to wrap them in `Arc<T>` first (one allocation per syncobj/fence creation; small). Plan-time work, not spec-time. Documented as part of the implementation contract.
+
+## Implementation prerequisites
+
+The design depends on three pieces of foundation work that don't exist in the codebase at spec-write time. The implementation plan executes these first (in order), then layers the deferred-completion machinery on top. None of these are externally visible behaviour changes by themselves.
+
+1. **`BackendFdKind::PresentCompletion` variant** on the `BackendFdKind` enum at `crates/yserver-core/src/backend/trait_def.rs:31-41`. Outer-loop dispatch at `crates/yserver-core/src/core_loop/run.rs:328-335` (the existing `Libinput / Drm / HostX11` arm match) gets a fourth arm that routes readiness to a new `drain_completed_present_events` call. Both `KmsBackend` (v1) and `KmsBackendV2` stub `enqueue_present_completion` as a no-op + `drain_completed_present_events` as `Vec::new()`; v1 has no batching so the deferred-completion path is logically irrelevant for it.
+
+2. **`Arc`-wrap the xshmfence + syncobj registries.** Today both backends store these as raw handles indexed by `u32` xid:
+   - v1: `KmsBackend.dri3_xshmfences` and `KmsBackend.dri3_sync_resources` at `crates/yserver/src/kms/backend.rs:707-720`.
+   - v2: equivalent fields on `KmsBackendV2` around `crates/yserver/src/kms/v2/backend.rs:219-225`; `dri3_trigger_fence` / `dri3_signal_syncobj` impls at `:8748-8833`.
+
+   Wrap the value types in `Arc<XshmfenceSegment>` / `Arc<vk::Semaphore>` (or whatever the underlying primitive struct is). `dri3_trigger_fence` / `dri3_signal_syncobj` keep their existing xid-lookup signatures for the legacy synchronous call sites. New API: `Backend::dri3_xshmfence_handle(xid) -> Option<Arc<XshmfenceSegment>>` and `Backend::dri3_syncobj_handle(xid) -> Option<Arc<vk::Semaphore>>` for the enqueue path to grab a pinned clone. `FreeSyncobj` / `XFixesDestroyFence` drop the registry entry; outstanding `Arc` clones keep the primitive alive until the deferred drain releases them.
+
+3. **`Backend::enqueue_present_completion` + `Backend::drain_completed_present_events`** trait methods. Default impls in the trait can be no-op + empty so the v1 path doesn't need to think about them; v2 overrides with the real implementation.
+
+Once these three are in place, the deferred-completion design above lights up incrementally: backend internal state, then PRESENT handler replacements, then test gates. The plan sequences this so each commit leaves the tree green.
 
 ## Out-of-scope follow-ups
 
