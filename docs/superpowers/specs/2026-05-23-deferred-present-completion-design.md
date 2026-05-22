@@ -161,7 +161,7 @@ Two new FDs on the backend, both created at init:
 
 - **`present_completion_epfd`** — an `epoll_create1(EPOLL_CLOEXEC)` FD. The backend uses it to aggregate the per-entry `fence_fd` sync_files: `epoll_ctl(EPOLL_CTL_ADD)` at enqueue, `EPOLL_CTL_DEL` + `close()` at drain. The main loop sees this single FD via `poll_fds()` and never sees the per-entry FDs directly. Mirrors the `wl_event_loop`-on-epoll pattern Wayland compositors use.
 
-- **`wakeup_eventfd`** — an `eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)` FD, **registered with `present_completion_epfd` once at init** under `EPOLLIN`. The backend writes 1 to it (with `write(2)`) whenever a drain needs to fire without a per-entry FD signal — specifically: (a) `vkGetFenceFdKHR` returned `-1` for an already-signaled fence at enqueue (no per-entry FD was registered), (b) any future force-wake condition. The drain handler reads from the eventfd to clear it after processing.
+- **`wakeup_eventfd`** — an `eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)` FD, **registered with `present_completion_epfd` once at init** under `EPOLLIN`. The backend `write(2)`s a `u64` (any non-zero value; convention is `1`) whenever a drain needs to fire without a per-entry FD signal — specifically: (a) `vkGetFenceFdKHR` returned `-1` for an already-signaled fence at enqueue (no per-entry FD was registered), (b) any future force-wake condition. The drain handler `read(2)`s the eventfd to clear it; eventfd semantics: `read` returns the accumulated counter as a `u64` and resets it to zero in one syscall — drain doesn't need to loop. Saturation: `write` returns `EAGAIN` if the counter would overflow `u64::MAX - 1`; treat as benign (the existing pending signal already implies drain will run). `read` returns `EAGAIN` if the counter is zero (nothing to clear); treat as no-op.
 
 When any watched source becomes readable (per-entry sync_file OR wakeup_eventfd), the inner epoll FD itself becomes readable, which wakes the outer main-loop poller via the stable FD exposed in `poll_fds()`. This wake mechanism does not depend on `next_wakeup()` semantics and is robust against any execution context that calls `enqueue_present_completion` — including future async paths.
 
@@ -184,29 +184,36 @@ After each loop iteration step where forward progress on GPU work might have hap
 ```rust
 let completed = backend.drain_completed_present_events();
 for entry in completed {
-    match entry.wake {
-        PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
-            let _ = backend.dri3_trigger_fence(idle_fence_xid);
-            if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+    // Signal via the held Arc handle, NOT via xid lookup. The Arc
+    // was captured at enqueue time (PinnedWake on the internal
+    // PendingPresentEntry; not visible in the public
+    // CompletedPresentEvent — the Arc lives in the backend's
+    // internal state and the drain takes the relevant action
+    // before returning the public event payload to the loop).
+    // Public xids on the event are for log lines + sync_fences map
+    // bookkeeping only.
+    match &entry.wake {
+        PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
+            // Update the X11-protocol-visible triggered flag if the
+            // resource is still in state.sync_fences. If
+            // FreeSyncobj / DestroyFence already removed it,
+            // skip silently — the actual underlying primitive was
+            // already signaled by the backend via the held Arc
+            // during the drain (see backend implementation of
+            // drain_completed_present_events).
+            if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
                 f.triggered = true;
             }
         }
-        PresentWake::PixmapSynced { release_syncobj, release_value }
-            if release_syncobj != 0 =>
-        {
-            if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
-                log::warn!(
-                    "PRESENT::PixmapSynced deferred signal {release_syncobj:#x}@{release_value} failed: {e}"
-                );
-            }
-        }
-        _ => {} // no wake object attached
+        _ => {} // PixmapSynced has no equivalent X11-protocol bookkeeping
     }
     // Existing fan-out helper (process_request.rs:~5384), extracted
     // so both legacy and new paths share emission logic.
     fire_present_completion_events(state, &entry);
 }
 ```
+
+The actual `dri3_trigger_fence_via_handle(&Arc<XshmfenceSegment>)` / `dri3_signal_syncobj_via_handle(&Arc<vk::Semaphore>, u64)` calls fire **inside** the backend's `drain_completed_present_events` impl, before it constructs and returns the `Vec<CompletedPresentEvent>`. The held `Arc` is what makes the signal call safe regardless of whether the X11 resource id is still in the registry. This is the load-bearing property of the lifetime pin: signaling is by-handle, not by-xid.
 
 The `fire_present_completion_events` helper is extracted from the existing inline emission (`process_request.rs:5113-5170` and the fan-out at line 5384) so both the legacy code path (until this design lands) and the new drain-hook path call the same emission logic. **Emission order is `IdleNotify` first, then `CompleteNotify { mode: Copy }`** — matches the existing site at `process_request.rs:5513` and Mesa's documented expectation. The helper consumes a `CompletedPresentEvent` plus `&mut ServerState` and emits to each subscribed client.
 
@@ -454,19 +461,28 @@ The first two confirm the deferred-completion path is firing at the cadence Task
 
 ## Implementation prerequisites
 
-The design depends on three pieces of foundation work that don't exist in the codebase at spec-write time. The implementation plan executes these first (in order), then layers the deferred-completion machinery on top. None of these are externally visible behaviour changes by themselves.
+The design depends on four pieces of foundation work that don't exist in the codebase at spec-write time. The implementation plan executes these first (in order), then layers the deferred-completion machinery on top. None of these are externally visible behaviour changes by themselves.
 
 1. **`BackendFdKind::PresentCompletion` variant** on the `BackendFdKind` enum at `crates/yserver-core/src/backend/trait_def.rs:31-41`. Outer-loop dispatch at `crates/yserver-core/src/core_loop/run.rs:328-335` (the existing `Libinput / Drm / HostX11` arm match) gets a fourth arm that routes readiness to a new `drain_completed_present_events` call. Both `KmsBackend` (v1) and `KmsBackendV2` stub `enqueue_present_completion` as a no-op + `drain_completed_present_events` as `Vec::new()`; v1 has no batching so the deferred-completion path is logically irrelevant for it.
 
-2. **`Arc`-wrap the xshmfence + syncobj registries.** Today both backends store these as raw handles indexed by `u32` xid:
+2. **`Arc`-wrap the xshmfence + syncobj registries; add by-handle signal APIs.** Today both backends store these as raw handles indexed by `u32` xid:
    - v1: `KmsBackend.dri3_xshmfences` and `KmsBackend.dri3_sync_resources` at `crates/yserver/src/kms/backend.rs:707-720`.
    - v2: equivalent fields on `KmsBackendV2` around `crates/yserver/src/kms/v2/backend.rs:219-225`; `dri3_trigger_fence` / `dri3_signal_syncobj` impls at `:8748-8833`.
 
-   Wrap the value types in `Arc<XshmfenceSegment>` / `Arc<vk::Semaphore>` (or whatever the underlying primitive struct is). `dri3_trigger_fence` / `dri3_signal_syncobj` keep their existing xid-lookup signatures for the legacy synchronous call sites. New API: `Backend::dri3_xshmfence_handle(xid) -> Option<Arc<XshmfenceSegment>>` and `Backend::dri3_syncobj_handle(xid) -> Option<Arc<vk::Semaphore>>` for the enqueue path to grab a pinned clone. `FreeSyncobj` / `XFixesDestroyFence` drop the registry entry; outstanding `Arc` clones keep the primitive alive until the deferred drain releases them.
+   Wrap the value types in `Arc<XshmfenceSegment>` / `Arc<vk::Semaphore>` (or whatever the underlying primitive struct is). The existing xid-keyed `dri3_trigger_fence(xid)` / `dri3_signal_syncobj(xid, val)` methods stay, used by the per-request handlers that still resolve by xid. **New APIs for the deferred-drain path** to bypass the registry lookup:
 
-3. **`Backend::enqueue_present_completion` + `Backend::drain_completed_present_events`** trait methods. Default impls in the trait can be no-op + empty so the v1 path doesn't need to think about them; v2 overrides with the real implementation.
+   - `Backend::dri3_xshmfence_handle(xid) -> Option<Arc<XshmfenceSegment>>` — enqueue grabs an Arc clone before returning to the loop.
+   - `Backend::dri3_syncobj_handle(xid) -> Option<Arc<vk::Semaphore>>` — same for syncobj.
+   - `Backend::dri3_trigger_fence_via_handle(handle: &Arc<XshmfenceSegment>) -> io::Result<()>` — drain signals the underlying primitive without an xid lookup.
+   - `Backend::dri3_signal_syncobj_via_handle(handle: &Arc<vk::Semaphore>, value: u64) -> io::Result<()>` — same shape for syncobj.
 
-Once these three are in place, the deferred-completion design above lights up incrementally: backend internal state, then PRESENT handler replacements, then test gates. The plan sequences this so each commit leaves the tree green.
+   `FreeSyncobj` / `XFixesDestroyFence` drop the **registry entry**; outstanding `Arc` clones held by `PinnedWake` on pending entries keep the **underlying primitive** alive until the deferred drain releases them. The handle accessors + by-handle signal methods are the surface that makes the lifetime pin load-bearing — without them, drain would still attempt xid lookup against a registry that may have evicted the entry.
+
+3. **`FenceTicket` sync_file export accessor.** New method `FenceTicket::export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result>` on the ticket type at `crates/yserver/src/kms/v2/platform.rs:88`. Calls `vkGetFenceFdKHR` with `VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT_KHR`. Returns `Ok(Some(fd))` for an unsignaled fence (drainable on poll readiness), `Ok(None)` for an already-signaled fence (the `-1` case — drain immediately via `wakeup_eventfd`), `Err(_)` on Vk failure. Mirrors the existing `ScanoutBo::export_signaled_fd` shape at `crates/yserver/src/kms/vk/scanout.rs:212+`. Requires verifying `VK_KHR_external_fence_fd` is part of the v2 `VkContext` device extensions at `crates/yserver/src/kms/vk/device.rs`; if not, add it.
+
+4. **`Backend::enqueue_present_completion` + `Backend::drain_completed_present_events`** trait methods on `crates/yserver-core/src/backend/trait_def.rs`. Default impls in the trait can be no-op + empty so the v1 path doesn't need to think about them; v2 overrides with the real implementation.
+
+Once these four are in place, the deferred-completion design above lights up incrementally: backend internal state (epfd + eventfd + queue), then PRESENT handler replacements at both call sites, then test gates. The plan sequences this so each commit leaves the tree green.
 
 ## Out-of-scope follow-ups
 
