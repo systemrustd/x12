@@ -353,53 +353,74 @@ from.
       not guaranteed. Marked candidate "Stage 4e" in earlier
       planning; not on the Stage 5 perf path.
 
-      **2026-05-22 investigation note** (gtk3-demo + tooltip CSD
-      shadow): the visible "dense black bar" around GTK3 CSD
-      windows looked at first like a yserver compose bug. Three
-      diagnostic passes ruled out yserver as the cause:
-      1. Pixel-level: backing storage holds GTK's actual CSD
-         shadow profile `α = 151, 128×6, 127, 127, 126, 126, 125,
-         123, …, 67` (dense plateau by GTK design). Marco's
-         `XRenderComposite(Over, src=ARGB32_window_picture,
-         mask=None, dst=offscreen_depth24)` produces the
-         mathematically correct premul result on screen — scanout
-         pixels match `result.rgb = src.rgb + (1-src.a)*dst.rgb`
-         exactly.
-      2. Source-side: `picture_pict_format` correctly returns
-         `RENDER_FMT_ARGB32` (0x4) for the GTK CSD picture →
-         `resolve_force_opaque_pict_format` returns false → src
-         α not stomped to 1.0. Not an ARGB-vs-xRGB intent bug.
-      3. Compositor-side: marco's `window_has_shadow()`
-         (`compositor-xrender.c:1013-1088`) explicitly returns
-         FALSE for `cw->mode == WINDOW_ARGB` windows with no
-         marco frame — gtk3-demo + tooltips never trigger
-         marco's Gaussian soft halo on either Xorg or yserver.
-         The "marco draws a soft shadow around MATE apps but
-         not gtk3-demo" asymmetry is marco's intentional policy,
-         not a yserver path.
+      **2026-05-22 investigation status — UNRESOLVED yserver bug:**
+      gtk3-demo + tooltip CSD shadows render visibly different on
+      yserver than on Xorg-native (denser dark band at the window
+      edge). Pixel-diff against an Xorg reference: inner-shadow
+      RGB `(31,59,48)` on yserver vs `(42,81,68)` on Xorg over
+      wallpaper RGB `(75,144,117)` vs `(75,144,121)` — implied
+      stored α ≈ 151 on yserver vs ≈ 112 on Xorg. **Visible
+      divergence from Xorg = yserver bug**, root cause not yet
+      identified.
 
-      The apparent Xorg-vs-yserver shadow density divergence
-      (Xorg α ≈ 112 vs yserver α = 151 at the inner edge) traces
-      to different GTK theme / wallpaper / session settings
-      between the two reference screenshots — the Xorg
-      session's wallpaper RGB `(75,144,121)` and yserver's
-      `(75,144,117)` differ, indicating different themes were
-      active. GTK draws the same CSD shadow alpha into the
-      pixmap regardless of X server. **PictFormat tracking
-      remains a real correctness gap** for cases where it
-      actually matters (e.g. ARGB sources with xRGB-intent
-      Picture wrappers), but the user-visible gtk3-demo +
-      tooltip "black borders" symptom is GTK's design rendered
-      correctly, not this gap.
+      Ruled out so far:
+      1. Pixel-level compose math: marco's `XRenderComposite(Over,
+         src=ARGB32_window_picture, mask=None, dst=offscreen_d24)`
+         produces `result.rgb = src.rgb + (1-src.a)*dst.rgb`
+         exactly — scanout = marco offscreen bit-for-bit. So the
+         divergence is upstream of marco's compose.
+      2. Force-opaque intent: `picture_pict_format` returns
+         `RENDER_FMT_ARGB32` for the GTK CSD picture →
+         `resolve_force_opaque_pict_format` returns false → α
+         is not stomped to 1.0. Not an ARGB-vs-xRGB picture
+         intent bug.
+      3. Marco shadow plugin: `window_has_shadow()`
+         (`compositor-xrender.c:1013-1088`) returns FALSE for
+         `cw->mode == WINDOW_ARGB` with no marco frame on either
+         Xorg or yserver — neither adds a Gaussian soft halo
+         around CSD windows. Asymmetry vs SSD MATE apps is
+         marco's intentional policy, identical on both servers.
+      4. RANDR / SETUP physical-mm dimensions: confirmed
+         bit-identical GTK CSD backing alpha before and after
+         fixing SETUP mm (38-DPI → 96-DPI synth) and per-output
+         mm (96-DPI synth → real EDID via `drmModeConnector.size()`).
+         GTK does not read RANDR or SETUP mm to compute CSD
+         shadow density on this path. Both fixes shipped
+         2026-05-22 as a separate correctness win, see
+         [feedback_dpi_hardcoded_matters.md].
 
-      Related fixes shipped 2026-05-22: real EDID physical-mm
-      reporting via RANDR (`drmModeConnector` → `Output`
-      → `RandrOutput.mm_width/mm_height`); see
-      [the `dpi-hardcoded-affects-clients` memory entry].
-      Confirmed via pixel-diff that the CSD shadow alpha in the
-      backing is unchanged by any of these reporting fixes —
-      GTK does not read RANDR or SETUP mm to compute CSD shadow
-      density.
+      Candidates not yet ruled out — where the divergence likely
+      lives:
+      - Visual selection / advertised PictFormat list shape
+        (does GTK pick a different visual on yserver because of
+        what we advertise?)
+      - `Xft.dpi` / XSETTINGS propagation (different daemon
+        state? does yserver pre-seed any XSETTINGS?)
+      - Color management / gamma / ICC profile path — the
+        wallpaper RGB itself differs slightly between sessions
+        (`75,144,117` vs `75,144,121`), suggesting some upstream
+        color-rendering path differs too. Could be `PutImage` /
+        DRI3 byte ordering, or a missing `XF86VIDMODE` /
+        `RANDR::QueryOutputProperty BACKLIGHT` reply.
+      - `gdk-window-scaling-factor` setting source — could
+        yserver be ending up at a different GdkWindow scale?
+      - Cairo Xlib surface selection — GTK's
+        `cairo_xlib_surface_create_with_xrender_format` picks
+        a format based on something the server advertises.
+
+      Next concrete diagnostic step: capture a side-by-side
+      gtk3-demo run on Xwayland (96-DPI synth, no real EDID,
+      same as yserver's fallback path) versus yserver, same
+      session, same theme, same wallpaper file. If Xwayland's
+      gtk3-demo matches Xorg-native, the divergence is yserver-
+      specific (and not "Xwayland-style 96-DPI" causing it). If
+      Xwayland matches yserver, the divergence is in something
+      yserver-and-Xwayland both lack vs Xorg-native (likely
+      something EDID-derived beyond mm dimensions, or color/
+      gamma path).
+
+      Marked candidate "Stage 4e" in earlier planning; not on
+      the Stage 5 perf path.
 - [ ] **KmsCore.pictures disconnect cleanup.** Stale Picture
       records from disconnected clients (e.g.
       mate-session-check) can persist in v2's `KmsCore.pictures`,
