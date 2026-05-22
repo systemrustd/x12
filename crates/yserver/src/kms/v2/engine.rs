@@ -138,6 +138,81 @@ struct PendingCowBatch {
     coalesced_count: u32,
 }
 
+/// Stage 5 Task 3 (render-composite generalization): conservative
+/// aggregation key. Two consecutive `render_composite` calls
+/// coalesce into one CB iff every field of their keys is equal.
+/// The predicate deliberately excludes Solid / Gradient sources
+/// and ops needing dst readback, so the existing
+/// `record_solid_color_clear` + `dst_readback` paths inside a
+/// render pass don't have to change.
+/// Fields chosen for what affects pipeline binding + render-pass
+/// attachments (must match across the batch). Per-append data
+/// — `clip_rects`, `src_transform`, `mask_transform`, src/mask
+/// id, src/mask repeat, src/mask pict_format — is NOT in the
+/// key because each append builds its own descriptor set and
+/// `record_render_composite_draws` re-encodes scissor + push
+/// constants per-call. Crucially this means N different srcs
+/// painting onto one dst all coalesce into one CB (marco's
+/// dominant compositor-pump pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderBatchKey {
+    dst: DrawableId,
+    /// Drives pipeline selection (with `dst_pict_format` +
+    /// `mask_component_alpha`). Distinct ops can't share a
+    /// `cmd_bind_pipeline`-once batch.
+    op: u8,
+    /// Drives pipeline `dst_has_alpha`.
+    dst_pict_format: u32,
+    /// Drives pipeline `mask_component_alpha`.
+    mask_component_alpha: bool,
+}
+
+/// Pending RENDER composite batch. Mirrors `PendingCowBatch`
+/// shape: long-lived CB across N appends, exit transitions +
+/// submit at flush. Differs in that `cmd_begin_rendering` is
+/// active across the whole batch (one pair per flush) and the
+/// pipeline + descriptor set bound once at batch start serve
+/// every append.
+struct PendingRenderBatch {
+    cb: vk::CommandBuffer,
+    ticket: FenceTicket,
+    key: RenderBatchKey,
+    /// All accumulated dst-relative damage rects for the batch
+    /// (one per CompositeRect per append); applied on flush.
+    dst_damage: Vec<vk::Rect2D>,
+    /// Every drawable id this batch sampled (src + mask across
+    /// all appends). Used at flush to clone the fence ticket onto
+    /// every touched drawable. Dst is tracked separately via
+    /// `key.dst`.
+    touched_drawables: HashSet<DrawableId>,
+    /// True if at least one append in this batch carried a mask.
+    /// Reported on the flush record for trace-event mask_class.
+    any_mask: bool,
+    /// Number of `vkCmdDraw` calls recorded so far (rects ×
+    /// clip-scissors across all appends). Returned in
+    /// `CompositeStats.recorded_draws` for the LAST appending
+    /// call so the backend still has a non-zero signal where
+    /// appropriate (zero would suppress the wake-for-damage in
+    /// some callers).
+    accumulated_draws: u32,
+    /// Number of protocol-level `render_composite` calls folded
+    /// into the batch. Reported via the flush record for
+    /// telemetry + submit-trace.
+    coalesced_count: u32,
+}
+
+/// One flush record per `render_batch` flush. Carries enough
+/// info for the backend drain to emit a parametrised submit
+/// trace event (op + src class + mask class + batch_size).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RenderFlushRecord {
+    pub(crate) dst: DrawableId,
+    pub(crate) op: u8,
+    /// `true` if the mask was a Drawable (vs `None`).
+    pub(crate) has_mask: bool,
+    pub(crate) coalesced_count: u32,
+}
+
 struct SubmittedOp {
     cb: vk::CommandBuffer,
     ticket: FenceTicket,
@@ -487,6 +562,14 @@ struct RenderEngineInner {
     /// both backend-initiated flushes and engine-internal flushes
     /// (triggered when a non-cow op interleaves a cow batch).
     cow_flush_records: Vec<u32>,
+    /// Stage 5 Task 3 (render-composite generalization): pending
+    /// render batch. See [`PendingRenderBatch`] above.
+    pending_render_batch: Option<PendingRenderBatch>,
+    /// Stage 5 Task 3: flush-records queue parallel to
+    /// `cow_flush_records`. Each render-batch flush pushes one
+    /// record carrying op + has_mask + coalesced_count so the
+    /// backend drain can emit a parametrised submit trace event.
+    render_flush_records: Vec<RenderFlushRecord>,
 }
 
 impl RenderEngine {
@@ -524,6 +607,8 @@ impl RenderEngine {
                 acquire_generation: 0,
                 pending_cow_batch: None,
                 cow_flush_records: Vec::new(),
+                pending_render_batch: None,
+                render_flush_records: Vec::new(),
             }),
         })
     }
@@ -936,6 +1021,7 @@ impl RenderEngine {
         // queue order before this fill (same-queue ordering = our
         // correctness guarantee).
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -1149,6 +1235,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch before any non-cow paint.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         if matches!(function, GcFunction::NoOp) {
             return Ok(());
         }
@@ -1383,6 +1470,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch before any non-cow copy_area.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -1714,6 +1802,9 @@ impl RenderEngine {
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
+        // Flush pending render batch before opening / appending to a
+        // cow batch (different CB family, can't intermix).
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -2103,6 +2194,473 @@ impl RenderEngine {
         std::mem::take(&mut inner.cow_flush_records)
     }
 
+    // ── Op: render-composite batched path (Stage 5 Task 3) ──────
+
+    /// Try to append the call to an in-flight [`PendingRenderBatch`]
+    /// or open a new one. Returns `Ok(Some(stats))` when the call
+    /// is batch-eligible AND was successfully appended; the
+    /// returned `CompositeStats.deferred_to_batch == true` so the
+    /// backend caller suppresses its per-call telemetry / submit-
+    /// trace event. Returns `Ok(None)` if the call is NOT
+    /// eligible — caller must flush any pending render batch and
+    /// fall through to the regular per-call render_composite body.
+    ///
+    /// Eligibility predicate (conservative, mirrors design):
+    /// - `src` and `mask` are `ResolvedSource::Drawable(id)` OR
+    ///   `mask == None`. No Solid (would write scratch), no
+    ///   Gradient (would carry per-call `axis_projection`).
+    /// - `op < 13` (no `dst_readback` path; ops Disjoint/Conjoint
+    ///   need a dst snapshot per call which can't share a batch).
+    /// - Not self-aliasing: `src.id != dst_id` AND `mask.id != dst_id`.
+    /// - Pipeline + descriptor must be identical to the pending
+    ///   batch's (encoded into [`RenderBatchKey`] equality).
+    ///
+    /// # Errors
+    ///
+    /// `NoVk` on the stub engine; `RendererFailed` on a poisoned
+    /// renderer; `Vk` for CB allocation / descriptor / pipeline
+    /// failures on the first append.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Mirrors render_composite signature"
+    )]
+    pub(crate) fn try_append_render_batch(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        src: ResolvedSource,
+        mask: ResolvedSource,
+        dst_id: DrawableId,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        clip_rects: Option<&[Rectangle16]>,
+        src_repeat: Repeat,
+        mask_repeat: Repeat,
+        src_transform: Option<PictTransform>,
+        mask_transform: Option<PictTransform>,
+        mask_component_alpha: bool,
+        src_pict_format: u32,
+        mask_pict_format: u32,
+        dst_pict_format: u32,
+    ) -> Result<Option<CompositeStats>, RenderError> {
+        // Predicate gate 1 — sources.
+        let src_id = match src {
+            ResolvedSource::Drawable(id) if id != dst_id => id,
+            _ => return Ok(None),
+        };
+        let mask_id_opt: Option<DrawableId> = match mask {
+            ResolvedSource::Drawable(id) if id != dst_id => Some(id),
+            ResolvedSource::None => None,
+            _ => return Ok(None),
+        };
+        // Predicate gate 2 — op needs no dst readback.
+        use crate::kms::vk::render_pipeline::StdPictOp;
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            return Ok(None);
+        };
+        if std_op.needs_dst_readback() {
+            return Ok(None);
+        }
+        // Predicate gate 3 — rects non-empty (else nothing to batch).
+        if rects.is_empty() {
+            return Ok(None);
+        }
+
+        // Key constraint is now minimal — only fields that affect
+        // pipeline binding + render-pass attachments. Everything
+        // else (src/mask views, transforms, scissors, repeats,
+        // pict_formats) is re-encoded per-append.
+        let new_key = RenderBatchKey {
+            dst: dst_id,
+            op,
+            dst_pict_format,
+            mask_component_alpha,
+        };
+
+        // Key-mismatch branch: flush, then re-call to open fresh.
+        let need_flush_for_key_change = self
+            .inner
+            .as_ref()
+            .and_then(|i| i.pending_render_batch.as_ref())
+            .is_some_and(|b| b.key != new_key);
+        if need_flush_for_key_change {
+            self.flush_render_batch(store, platform)?;
+        }
+
+        // Lazy-init RENDER assets (mirrors the unbatched path).
+        self.ensure_render_assets(platform)?;
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+
+        // Resolve dst metadata.
+        let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+                d.depth,
+            )
+        };
+        if dst_extent.width == 0 || dst_extent.height == 0 {
+            return Ok(None);
+        }
+        if !matches!(
+            dst_format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
+        ) {
+            return Ok(None);
+        }
+        let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
+
+        // Resolve src view + extent (drawable_view_cache lookup).
+        let src_info =
+            drawable_for_render_view(store, src_id).ok_or(RenderError::UnknownDrawable(src_id))?;
+        let src_class =
+            swizzle_class_for_pict_format(src_info.format, src_info.depth, src_pict_format);
+        let src_sampler = sampler_config_for_repeat(src_repeat);
+        let src_view = ensure_drawable_view(
+            &inner.vk,
+            &mut inner.drawable_view_cache,
+            src_id,
+            src_info.image,
+            src_info.format,
+            src_sampler,
+            src_class,
+        )?;
+        let src_extent = src_info.extent;
+
+        // Resolve mask view + extent.
+        let white_mask_view = inner
+            .white_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let (mask_view, mask_extent) = if let Some(mid) = mask_id_opt {
+            let info =
+                drawable_for_render_view(store, mid).ok_or(RenderError::UnknownDrawable(mid))?;
+            let class = swizzle_class_for_pict_format(info.format, info.depth, mask_pict_format);
+            let sampler = sampler_config_for_repeat(mask_repeat);
+            let view = ensure_drawable_view(
+                &inner.vk,
+                &mut inner.drawable_view_cache,
+                mid,
+                info.image,
+                info.format,
+                sampler,
+                class,
+            )?;
+            (view, info.extent)
+        } else {
+            (
+                white_mask_view,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            )
+        };
+
+        // Pipeline lookup.
+        let pipeline = inner
+            .render_pipelines
+            .as_mut()
+            .expect("ensured")
+            .get(std_op, dst_format, dst_has_alpha, mask_component_alpha)
+            .map_err(|e| {
+                log::warn!("v2 try_append_render_batch: pipeline build failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        let pipeline_layout = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .pipeline_layout();
+
+        // Build CompositeAttrs (force_opaque + repeat + transforms).
+        let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
+        let mask_force_opaque = resolve_force_opaque_pict_format(store, &mask, mask_pict_format);
+        let user_src_xform =
+            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
+        let user_mask_xform =
+            crate::kms::backend::pixman_transform_to_affine(mask_transform.as_ref(), mask_extent);
+        let effective_src_repeat = crate::kms::backend::repeat_to_shader_const(src_repeat);
+        let effective_mask_repeat = if mask_id_opt.is_some() {
+            crate::kms::backend::repeat_to_shader_const(mask_repeat)
+        } else {
+            crate::kms::vk::render_pipeline::REPEAT_PAD
+        };
+        let attrs = crate::kms::vk::ops::render::CompositeAttrs {
+            src_extent,
+            mask_extent,
+            src_repeat: effective_src_repeat,
+            mask_repeat: effective_mask_repeat,
+            src_force_opaque,
+            mask_force_opaque,
+            src_xform: user_src_xform,
+            mask_xform: user_mask_xform,
+        };
+
+        // Build clip scissor list (same clamping as unbatched path).
+        let clip_scissors = build_render_clip_scissors(clip_rects, dst_extent);
+        if clip_scissors.is_empty() {
+            return Ok(Some(CompositeStats {
+                deferred_to_batch: true,
+                ..CompositeStats::default()
+            }));
+        }
+
+        // Allocate THIS call's descriptor set (binds this
+        // append's src + mask views). With the relaxed predicate,
+        // every append gets its own descriptor — pipeline + dst
+        // are shared across the batch but the per-draw inputs
+        // are not.
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
+        let descriptor_set = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .allocate_descriptor_for_views_into_ring(
+                &mut inner.descriptor_pool_ring,
+                generation,
+                src_view,
+                mask_view,
+                white_mask_view, // dummy dst_readback (no readback in batched path)
+            )?;
+
+        // Branch A: open a fresh batch (no pending).
+        let is_open = inner.pending_render_batch.is_some();
+        if !is_open {
+            let (cb, ticket) = begin_op_cb(inner, platform)?;
+            // Use an adapter so `record_render_composite_open` can
+            // update the dst's tracked layout.
+            let mut adapter = {
+                let d = store.get_mut(dst_id).expect("checked");
+                StorageCompositeTarget {
+                    extent: dst_extent,
+                    image: dst_image,
+                    image_view: dst_view,
+                    current_layout: d.storage.current_layout,
+                }
+            };
+            crate::kms::vk::ops::render::record_render_composite_open(
+                &inner.vk,
+                cb,
+                &mut adapter,
+                pipeline,
+            )?;
+            // record_render_composite_open does NOT mutate the
+            // tracked layout (that happens at _close). Update the
+            // adapter's snapshot back into Drawable.storage now so
+            // intermediate observers (none expected in this path)
+            // see COLOR_ATTACHMENT_OPTIMAL between open and close.
+            {
+                let d = store.get_mut(dst_id).expect("checked");
+                d.storage.current_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            }
+            // First-append draws (binds this call's descriptor set).
+            crate::kms::vk::ops::render::record_render_composite_draws(
+                &inner.vk,
+                cb,
+                pipeline_layout,
+                descriptor_set,
+                dst_extent,
+                &attrs,
+                rects,
+                &clip_scissors,
+            );
+            // Accumulate damage.
+            let mut dst_damage = Vec::with_capacity(rects.len());
+            for cr in rects {
+                let rect = vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: cr.dst_x,
+                        y: cr.dst_y,
+                    },
+                    extent: vk::Extent2D {
+                        width: cr.width,
+                        height: cr.height,
+                    },
+                };
+                dst_damage.push(clamp_rect(rect, dst_extent));
+            }
+            let accumulated_draws =
+                u32::try_from(rects.len() * clip_scissors.len()).unwrap_or(u32::MAX);
+            let mut touched = HashSet::new();
+            touched.insert(src_id);
+            if let Some(mid) = mask_id_opt {
+                touched.insert(mid);
+            }
+            inner.pending_render_batch = Some(PendingRenderBatch {
+                cb,
+                ticket,
+                key: new_key,
+                dst_damage,
+                touched_drawables: touched,
+                any_mask: mask_id_opt.is_some(),
+                accumulated_draws,
+                coalesced_count: 1,
+            });
+            return Ok(Some(CompositeStats {
+                recorded_draws: accumulated_draws,
+                deferred_to_batch: true,
+                ..CompositeStats::default()
+            }));
+        }
+
+        // Branch B: append to the existing batch (key matched by
+        // the early check; pipeline still bound from open).
+        // record_render_composite_draws will bind THIS call's
+        // descriptor set inside the open render pass.
+        let batch_cb = inner
+            .pending_render_batch
+            .as_ref()
+            .expect("pending batch present in append branch")
+            .cb;
+        crate::kms::vk::ops::render::record_render_composite_draws(
+            &inner.vk,
+            batch_cb,
+            pipeline_layout,
+            descriptor_set,
+            dst_extent,
+            &attrs,
+            rects,
+            &clip_scissors,
+        );
+        // Update batch state.
+        let added_draws = u32::try_from(rects.len() * clip_scissors.len()).unwrap_or(u32::MAX);
+        let batch = inner
+            .pending_render_batch
+            .as_mut()
+            .expect("pending batch present");
+        batch.accumulated_draws = batch.accumulated_draws.saturating_add(added_draws);
+        batch.coalesced_count = batch.coalesced_count.saturating_add(1);
+        batch.touched_drawables.insert(src_id);
+        if let Some(mid) = mask_id_opt {
+            batch.touched_drawables.insert(mid);
+            batch.any_mask = true;
+        }
+        for cr in rects {
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: cr.dst_x,
+                    y: cr.dst_y,
+                },
+                extent: vk::Extent2D {
+                    width: cr.width,
+                    height: cr.height,
+                },
+            };
+            batch.dst_damage.push(clamp_rect(rect, dst_extent));
+        }
+        Ok(Some(CompositeStats {
+            recorded_draws: batch.accumulated_draws,
+            deferred_to_batch: true,
+            ..CompositeStats::default()
+        }))
+    }
+
+    /// Flush the pending render batch (if any). Records
+    /// `cmd_end_rendering` + exit layout transition, ends + submits
+    /// the CB, clones the fence ticket onto every drawable touched
+    /// by the batch (dst + src + optional mask), applies
+    /// accumulated damage, pushes a `SubmittedOp` + one
+    /// `RenderFlushRecord` for backend drain.
+    ///
+    /// Returns `Some(coalesced_count)` if a batch was flushed,
+    /// `None` if there was nothing pending. Caller uses the
+    /// count for telemetry (`record_render_batch_flushed`).
+    pub(crate) fn flush_render_batch(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) -> Result<Option<u32>, RenderError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let Some(batch) = inner.pending_render_batch.take() else {
+            return Ok(None);
+        };
+        if platform.renderer_failed {
+            log::debug!(
+                "v2 flush_render_batch: renderer_failed; dropping batch \
+                 (coalesced {} composites)",
+                batch.coalesced_count,
+            );
+            return Ok(None);
+        }
+
+        // Resolve dst metadata (image + extent + tracked layout).
+        let (dst_image, dst_view, dst_extent) = {
+            let d = store
+                .get(batch.key.dst)
+                .ok_or(RenderError::UnknownDrawable(batch.key.dst))?;
+            (d.storage.image, d.storage.image_view, d.storage.extent)
+        };
+
+        // Close the render pass + transition dst back to
+        // SHADER_READ_ONLY.
+        let mut adapter = StorageCompositeTarget {
+            extent: dst_extent,
+            image: dst_image,
+            image_view: dst_view,
+            current_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        };
+        crate::kms::vk::ops::render::record_render_composite_close(
+            &inner.vk,
+            batch.cb,
+            &mut adapter,
+        );
+        {
+            let d = store.get_mut(batch.key.dst).expect("checked");
+            d.storage.current_layout = adapter.current_layout;
+        }
+
+        // End + submit.
+        end_and_submit_op(inner, platform, batch.cb, &batch.ticket)?;
+
+        // CPU bookkeeping.
+        store.touch_render_fence(batch.key.dst, batch.ticket.clone());
+        for tid in &batch.touched_drawables {
+            store.touch_render_fence(*tid, batch.ticket.clone());
+        }
+        for rect in &batch.dst_damage {
+            store.damage(batch.key.dst, *rect);
+        }
+        inner.acquire_generation += 1;
+        let generation = inner.acquire_generation;
+        inner.submitted.push_back(SubmittedOp {
+            cb: batch.cb,
+            ticket: batch.ticket,
+            staging: None,
+            scratch: None,
+            atlas_ticket: None,
+            generation,
+        });
+        inner.render_flush_records.push(RenderFlushRecord {
+            dst: batch.key.dst,
+            op: batch.key.op,
+            has_mask: batch.any_mask,
+            coalesced_count: batch.coalesced_count,
+        });
+        Ok(Some(batch.coalesced_count))
+    }
+
+    /// Drain the queue of render-batch flush records. Backend
+    /// calls this once per `maybe_composite` tick.
+    pub(crate) fn drain_render_flush_records(&mut self) -> Vec<RenderFlushRecord> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut inner.render_flush_records)
+    }
+
     // ── Op: put_image ───────────────────────────────────────────
 
     /// Upload `src_bytes` (interpreted per `src_depth`) into
@@ -2132,6 +2690,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch first.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -2289,6 +2848,7 @@ impl RenderEngine {
         // get_image is a synchronous CPU readback — must see all
         // prior submits including any pending COW batch.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -2453,6 +3013,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch first.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -2772,6 +3333,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch first.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -3141,6 +3703,37 @@ impl RenderEngine {
 
         // Flush pending COW batch first.
         self.flush_cow_batch(store, platform)?;
+
+        // Stage 5 Task 3: try the batched path. If eligible
+        // AND a same-key batch is pending (or none is pending),
+        // appends in-line and returns deferred-to-batch stats.
+        // If not eligible, returns None and we fall through to
+        // the unbatched per-call body below, but first flush any
+        // pending render batch (key mismatch with this call's
+        // attributes).
+        if let Some(s) = self.try_append_render_batch(
+            store,
+            platform,
+            op,
+            src,
+            mask,
+            dst_id,
+            rects,
+            clip_rects,
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
+        )? {
+            return Ok(s);
+        }
+        // Not batch-eligible — flush any pending render batch
+        // before this call's own CB submits.
+        self.flush_render_batch(store, platform)?;
 
         // Lazy-init RENDER assets.
         self.ensure_render_assets(platform)?;
@@ -3760,6 +4353,7 @@ impl RenderEngine {
         }
         // Flush pending COW batch first.
         self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
 
         self.ensure_render_assets(platform)?;
         self.ensure_trap_assets(platform)?;
@@ -4364,6 +4958,13 @@ pub(crate) struct CompositeStats {
     /// intersections). Used by the acceptance harness to assert
     /// per-rect-scissor splits.
     pub recorded_draws: u32,
+    /// Stage 5 Task 3 (render-composite generalization): the call
+    /// was appended to a pending [`PendingRenderBatch`] rather
+    /// than submitted as its own CB. Backend callers should
+    /// suppress per-call `paint_submits` + `trace_simple` when
+    /// this is `true`; the flush-time drain emits the events
+    /// instead.
+    pub deferred_to_batch: bool,
 }
 
 /// Snapshot of a drawable's view-relevant metadata. Lives only
@@ -4910,6 +5511,50 @@ fn allocate_scratch_image(
         image,
         memory,
     })
+}
+
+/// Stage 5 Task 3: build clip-scissor list for render_composite
+/// (mirrors the inline arithmetic in `render_composite`). `None`
+/// → single full-extent scissor; `Some(cr)` → clamped per-rect
+/// list (empty rects skipped). Returns empty Vec if no rect is
+/// visible.
+fn build_render_clip_scissors(
+    clip_rects: Option<&[Rectangle16]>,
+    dst_extent: vk::Extent2D,
+) -> Vec<vk::Rect2D> {
+    match clip_rects {
+        None => vec![vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: dst_extent,
+        }],
+        Some(cr) => {
+            let mut out = Vec::with_capacity(cr.len());
+            for r in cr {
+                if r.width == 0 || r.height == 0 {
+                    continue;
+                }
+                let x0 = i32::from(r.x).max(0);
+                let y0 = i32::from(r.y).max(0);
+                let x1 = (i32::from(r.x) + i32::from(r.width))
+                    .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
+                let y1 = (i32::from(r.y) + i32::from(r.height))
+                    .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                out.push(vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        #[allow(clippy::cast_sign_loss)]
+                        width: (x1 - x0) as u32,
+                        #[allow(clippy::cast_sign_loss)]
+                        height: (y1 - y0) as u32,
+                    },
+                });
+            }
+            out
+        }
+    }
 }
 
 fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
@@ -6173,6 +6818,586 @@ mod tests {
                 &mut store,
                 &mut platform,
                 cow_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let off = (y * 4 + x) * 4;
+                assert_eq!(
+                    &out[off..off + 4],
+                    &[0x00, 0xFF, 0x00, 0xFF],
+                    "expected green at ({x},{y})"
+                );
+            }
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_batch_coalesces_two_same_key_calls() {
+        // Stage 5 Task 3 (render-composite generalization): two
+        // consecutive render_composite calls with same
+        // (dst, op, src, mask) coalesce into one CB + one submit.
+        // Both calls' rects end up drawn; pending batch lifts
+        // accumulated_draws across appends.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .unwrap();
+
+        let dst_storage = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                dst_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
+
+        // First composite — OP_OVER, drawable src, no mask, draws
+        // at (0, 0).
+        let rect_left = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_OVER: u8 = 3;
+        let s1 = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect_left,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(s1.deferred_to_batch, "first call should defer to batch");
+        assert_eq!(
+            engine.inner.as_ref().unwrap().submitted.len(),
+            submitted_before,
+            "no SubmittedOp should appear before flush"
+        );
+
+        // Second composite — same key, draws at (4, 0).
+        let rect_right = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 4,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        let s2 = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect_right,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(s2.deferred_to_batch, "second call should also defer");
+        // Pending batch coalesced_count = 2.
+        assert_eq!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .as_ref()
+                .map(|b| b.coalesced_count),
+            Some(2),
+            "two same-key composites should coalesce into one batch"
+        );
+
+        // Flush.
+        let flushed = engine
+            .flush_render_batch(&mut store, &mut platform)
+            .expect("flush ok");
+        assert_eq!(flushed, Some(2));
+        assert_eq!(
+            engine.inner.as_ref().unwrap().submitted.len(),
+            submitted_before + 1,
+            "one SubmittedOp per batch (not two)"
+        );
+        assert_eq!(engine.drain_render_flush_records().len(), 1);
+
+        // Both halves of dst should now show red (Over with no
+        // mask = source replaces with full alpha = 1).
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .unwrap();
+        for y in 0..4 {
+            for x in 0..8 {
+                let off = (y * 8 + x) * 4;
+                assert_eq!(
+                    &out[off..off + 4],
+                    &[0x00, 0x00, 0xFF, 0xFF],
+                    "expected red at ({x},{y})"
+                );
+            }
+        }
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_batch_key_mismatch_flushes() {
+        // Stage 5 Task 3: same dst but different op (mismatched key)
+        // → flush + open new batch.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .unwrap();
+        let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+        let rect = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_SRC: u8 = 1;
+        const OP_OVER: u8 = 3;
+
+        let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
+
+        // Call with OP_OVER → opens batch.
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .is_some(),
+            "OP_OVER call opens batch"
+        );
+        // Call with OP_SRC → flush + open new.
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_SRC,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        // After: pending batch is the OP_SRC one (count 1);
+        // first batch already flushed (one SubmittedOp).
+        assert_eq!(
+            engine.inner.as_ref().unwrap().submitted.len(),
+            submitted_before + 1,
+            "key-mismatch should have flushed the first batch"
+        );
+        let pending_count = engine
+            .inner
+            .as_ref()
+            .unwrap()
+            .pending_render_batch
+            .as_ref()
+            .map(|b| b.coalesced_count);
+        assert_eq!(pending_count, Some(1), "second call started a fresh batch");
+
+        engine
+            .flush_render_batch(&mut store, &mut platform)
+            .unwrap();
+        let records = engine.drain_render_flush_records();
+        assert_eq!(records.len(), 2, "two flushes total");
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_batch_solid_src_skips_batched_path() {
+        // Stage 5 Task 3: Solid source is excluded from the batch
+        // predicate (would need scratch rewrite inside the render
+        // pass, not allowed). Verify the call goes through the
+        // unbatched per-call path: `deferred_to_batch=false`,
+        // SubmittedOp grew immediately, no pending batch.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+
+        let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
+
+        let rect = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_SRC: u8 = 1;
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_SRC,
+                ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(
+            !stats.deferred_to_batch,
+            "Solid src must not take the batched path"
+        );
+        assert!(stats.recorded_draws > 0);
+        assert!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .is_none(),
+            "no batch pending after Solid src"
+        );
+        assert_eq!(
+            engine.inner.as_ref().unwrap().submitted.len(),
+            submitted_before + 1,
+            "Solid src should submit per call"
+        );
+
+        engine.drain_all(&platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_batch_flush_via_non_render_op() {
+        // Stage 5 Task 3: append a render_composite (batched),
+        // then call a non-render engine op (fill_rect on an
+        // unrelated drawable). The per-method flush hook must
+        // submit the pending batch first; same-queue order
+        // means the fill executes after the render batch.
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_00_FF_00),
+            )
+            .unwrap();
+        let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+        let other_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let other_id = store
+            .allocate(
+                0x3,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                other_storage,
+            )
+            .unwrap();
+
+        let rect = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_OVER: u8 = 3;
+
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .is_some()
+        );
+
+        // Non-render fill on a third drawable — must auto-flush
+        // the render batch first.
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                other_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_00_00_FF),
+            )
+            .unwrap();
+        assert!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .is_none(),
+            "non-render op must have flushed the render batch"
+        );
+        let records = engine.drain_render_flush_records();
+        assert_eq!(records.len(), 1, "one flush from the render batch");
+        assert_eq!(records[0].coalesced_count, 1);
+        assert!(!records[0].has_mask);
+
+        // Dst should now show src colour (green).
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst_id,
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {

@@ -87,6 +87,14 @@ pub struct Bucket {
     /// equivalent submit count. The ratio of the two is the
     /// average batch size.
     pub cow_copies_coalesced: u64,
+    /// Stage 5 Task 3 (render-composite generalization): count of
+    /// RENDER batches flushed (each maps to one `vkQueueSubmit2`).
+    /// Per-second + lifetime. Parallel to `cow_batches_flushed`.
+    pub render_batches_flushed: u64,
+    /// Stage 5 Task 3 (render-composite generalization): count of
+    /// individual `render_composite` calls folded into batches.
+    /// Pre-fix each call would have produced its own `paint_submit`.
+    pub render_composites_coalesced: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -199,6 +207,7 @@ impl Telemetry {
              disjoint_readback_count/s={} \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              cow_batches_flushed/s={} cow_copies_coalesced/s={} \
+             render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns}",
             b.paint_submits,
@@ -225,6 +234,8 @@ impl Telemetry {
             b.descriptor_pool_resets,
             b.cow_batches_flushed,
             b.cow_copies_coalesced,
+            b.render_batches_flushed,
+            b.render_composites_coalesced,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -401,6 +412,27 @@ impl Telemetry {
         self.lifetime.cow_copies_coalesced = self
             .lifetime
             .cow_copies_coalesced
+            .saturating_add(u64::from(coalesced));
+        self.lifetime.paint_submits += 1;
+        self.lifetime.queue_submit2 += 1;
+    }
+
+    /// Stage 5 Task 3 (render-composite generalization): one
+    /// render batch flushed. Mirrors `record_cow_batch_flushed`
+    /// — bumps `paint_submits` + `queue_submit2` since each
+    /// flush is one real `vkQueueSubmit2`.
+    pub(crate) fn record_render_batch_flushed(&mut self, coalesced: u32) {
+        self.bucket.render_batches_flushed += 1;
+        self.bucket.render_composites_coalesced = self
+            .bucket
+            .render_composites_coalesced
+            .saturating_add(u64::from(coalesced));
+        self.bucket.paint_submits += 1;
+        self.bucket.queue_submit2 += 1;
+        self.lifetime.render_batches_flushed += 1;
+        self.lifetime.render_composites_coalesced = self
+            .lifetime
+            .render_composites_coalesced
             .saturating_add(u64::from(coalesced));
         self.lifetime.paint_submits += 1;
         self.lifetime.queue_submit2 += 1;

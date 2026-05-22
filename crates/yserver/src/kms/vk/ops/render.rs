@@ -156,7 +156,41 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
     if rects.is_empty() || clip_scissors.is_empty() || extent.width == 0 || extent.height == 0 {
         return Ok(());
     }
+    record_render_composite_open(vk, cb, dst, pipeline)?;
+    record_render_composite_draws(
+        vk,
+        cb,
+        pipeline_layout,
+        descriptor_set,
+        extent,
+        attrs,
+        rects,
+        clip_scissors,
+    );
+    record_render_composite_close(vk, cb, dst);
+    Ok(())
+}
 
+/// Stage 5 Task 3 (render-composite generalization): "open"
+/// phase of a render-composite CB recording. Records the layout
+/// barrier into `COLOR_ATTACHMENT_OPTIMAL`, opens
+/// `cmd_begin_rendering`, sets viewport, binds the pipeline.
+/// Counterpart to [`record_render_composite_close`]; the draws
+/// between are recorded via [`record_render_composite_draws`]
+/// which binds the descriptor set per-call (so each append in a
+/// batched CB can have its own descriptor — different src /
+/// mask views across same-pipeline appends).
+///
+/// For the batched path: this is called once at batch-open
+/// time; subsequent appends only call `_draws`; `_close` runs
+/// once at flush.
+pub fn record_render_composite_open<T: CompositeTarget + ?Sized>(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    dst: &mut T,
+    pipeline: vk::Pipeline,
+) -> Result<(), vk::Result> {
+    let extent = dst.extent();
     let device = &vk.device;
     let old_layout = dst.current_layout();
     let dst_image = dst.vk_image();
@@ -206,6 +240,33 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
         device.cmd_set_viewport(cb, 0, &viewport);
         crate::vk_count!(cmd_bind_pipeline);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    }
+    Ok(())
+}
+
+/// Stage 5 Task 3 (render-composite generalization): per-append
+/// draw recording. Binds the call's descriptor set (so each
+/// append in a batched CB can carry its own src / mask views),
+/// then for every (clip_scissor × rect) pair records
+/// `cmd_set_scissor` + per-rect `cmd_push_constants` +
+/// `cmd_draw(4, 1)`. Caller must have run
+/// [`record_render_composite_open`] first; pipeline must still
+/// be bound (same op + format + alpha across the batch).
+pub fn record_render_composite_draws(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set: vk::DescriptorSet,
+    extent: vk::Extent2D,
+    attrs: &CompositeAttrs,
+    rects: &[CompositeRect],
+    clip_scissors: &[vk::Rect2D],
+) {
+    if rects.is_empty() || clip_scissors.is_empty() {
+        return;
+    }
+    let device = &vk.device;
+    unsafe {
         crate::vk_count!(cmd_bind_descriptor_sets);
         device.cmd_bind_descriptor_sets(
             cb,
@@ -215,44 +276,45 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
             &[descriptor_set],
             &[],
         );
+    }
+    let dst_vp = [extent.width as f32, extent.height as f32];
+    let src_extent_px = [
+        attrs.src_extent.width as f32,
+        attrs.src_extent.height as f32,
+    ];
+    let mask_extent_px = [
+        attrs.mask_extent.width as f32,
+        attrs.mask_extent.height as f32,
+    ];
 
-        let dst_vp = [extent.width as f32, extent.height as f32];
-        let src_extent_px = [
-            attrs.src_extent.width as f32,
-            attrs.src_extent.height as f32,
-        ];
-        let mask_extent_px = [
-            attrs.mask_extent.width as f32,
-            attrs.mask_extent.height as f32,
-        ];
-
-        // Plan §4: one draw call per clip-rect intersection. Set
-        // scissor, issue every rect's draw, set next scissor, ...
-        // Multi-rect picture clips (regions with holes) are
-        // honoured exactly rather than via v1's union-bbox shortcut.
-        //
-        // Each clip_scissor is clamped to the render area so the
-        // unclipped path can pass `Extent2D { width: u32::MAX,
-        // height: u32::MAX }` without tripping Vulkan validation
-        // (`offset.x + extent.width` overflow), which some drivers
-        // (lavapipe) handle by silently dropping the draw.
-        for cs in clip_scissors {
-            let clamped = [vk::Rect2D {
-                offset: cs.offset,
-                extent: vk::Extent2D {
-                    width: cs
-                        .extent
-                        .width
-                        .min(extent.width.saturating_sub(cs.offset.x.max(0) as u32)),
-                    height: cs
-                        .extent
-                        .height
-                        .min(extent.height.saturating_sub(cs.offset.y.max(0) as u32)),
-                },
-            }];
-            if clamped[0].extent.width == 0 || clamped[0].extent.height == 0 {
-                continue;
-            }
+    // Plan §4: one draw call per clip-rect intersection. Set
+    // scissor, issue every rect's draw, set next scissor, ...
+    // Multi-rect picture clips (regions with holes) are
+    // honoured exactly rather than via v1's union-bbox shortcut.
+    //
+    // Each clip_scissor is clamped to the render area so the
+    // unclipped path can pass `Extent2D { width: u32::MAX,
+    // height: u32::MAX }` without tripping Vulkan validation
+    // (`offset.x + extent.width` overflow), which some drivers
+    // (lavapipe) handle by silently dropping the draw.
+    for cs in clip_scissors {
+        let clamped = [vk::Rect2D {
+            offset: cs.offset,
+            extent: vk::Extent2D {
+                width: cs
+                    .extent
+                    .width
+                    .min(extent.width.saturating_sub(cs.offset.x.max(0) as u32)),
+                height: cs
+                    .extent
+                    .height
+                    .min(extent.height.saturating_sub(cs.offset.y.max(0) as u32)),
+            },
+        }];
+        if clamped[0].extent.width == 0 || clamped[0].extent.height == 0 {
+            continue;
+        }
+        unsafe {
             crate::vk_count!(cmd_set_scissor);
             device.cmd_set_scissor(cb, 0, &clamped);
             for r in rects {
@@ -285,7 +347,22 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
                 device.cmd_draw(cb, 4, 1, 0, 0);
             }
         }
+    }
+}
 
+/// Stage 5 Task 3 (render-composite generalization): "close"
+/// phase of a render-composite CB recording. Closes
+/// `cmd_end_rendering` and records the dst layout barrier back
+/// to `SHADER_READ_ONLY_OPTIMAL`. Counterpart to
+/// [`record_render_composite_open`].
+pub fn record_render_composite_close<T: CompositeTarget + ?Sized>(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    dst: &mut T,
+) {
+    let device = &vk.device;
+    let dst_image = dst.vk_image();
+    unsafe {
         crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
     }
@@ -304,7 +381,6 @@ pub fn record_render_composite<T: CompositeTarget + ?Sized>(
     unsafe { device.cmd_pipeline_barrier2(cb, &to_read_dep) };
 
     dst.set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    Ok(())
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {

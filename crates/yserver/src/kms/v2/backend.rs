@@ -334,7 +334,7 @@ impl KmsBackendV2 {
                 );
                 self.sync_descriptor_pool_telemetry();
                 match composite_result {
-                    Ok(s) if s.recorded_draws > 0 => {
+                    Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
                         self.telemetry.record_paint_submit();
                         self.trace_render(
                             SubmitKind::RenderComposite,
@@ -1527,6 +1527,37 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Stage 5 Task 3 (render-composite generalization): drain
+    /// the engine's render-batch flush records, bump telemetry
+    /// counters, emit one submit-trace event per flush.
+    fn drain_render_telemetry(&mut self) {
+        let records = self.engine.drain_render_flush_records();
+        if records.is_empty() {
+            return;
+        }
+        for rec in records {
+            self.telemetry
+                .record_render_batch_flushed(rec.coalesced_count);
+            let target_kind = self.submit_target_kind(rec.dst);
+            self.telemetry.record_submit_event(SubmitEvent {
+                frame_id: 0,
+                kind: SubmitKind::RenderComposite,
+                target_kind,
+                target_id: rec.dst.as_u64(),
+                batch_size: rec.coalesced_count,
+                op: SubmitOp::from_pict_op_byte(rec.op),
+                src_class: SrcClass::Direct,
+                mask_class: if rec.has_mask {
+                    SrcClass::Direct
+                } else {
+                    SrcClass::NoMask
+                },
+                pipeline_id: None,
+                flags: SubmitFlags::NONE,
+            });
+        }
+    }
+
     /// Stage 5 Task 4 layer 1: test-side accessor to the ring's
     /// pool residency. Used by the acceptance harness to assert
     /// steady-state pool count stays small after warm-up.
@@ -2492,7 +2523,7 @@ impl KmsBackendV2 {
         self.sync_descriptor_pool_telemetry();
         match composite_result {
             Ok(s) => {
-                if s.recorded_draws > 0 {
+                if s.recorded_draws > 0 && !s.deferred_to_batch {
                     self.telemetry.record_paint_submit();
                     self.trace_render(
                         SubmitKind::RenderComposite,
@@ -3992,6 +4023,15 @@ impl Backend for KmsBackendV2 {
         {
             log::warn!("v2 maybe_composite: flush_cow_batch failed: {e:?}");
         }
+        // Stage 5 Task 3 (render-composite generalization): same
+        // load-bearing flush for the render batch — scene.tick
+        // samples dst.
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
+        }
         let result = if !self.scene.scene_structure_dirty {
             Ok(())
         } else {
@@ -4039,6 +4079,7 @@ impl Backend for KmsBackendV2 {
         // any engine-internal flushes triggered by paint paths
         // that ran since the previous tick).
         self.drain_cow_telemetry();
+        self.drain_render_telemetry();
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit();
         result
@@ -5015,7 +5056,14 @@ impl Backend for KmsBackendV2 {
             {
                 log::warn!("v2 release_overlay_window: flush_cow_batch failed: {e:?}");
             }
+            if let Err(e) = self
+                .engine
+                .flush_render_batch(&mut self.store, &mut self.platform)
+            {
+                log::warn!("v2 release_overlay_window: flush_render_batch failed: {e:?}");
+            }
             self.drain_cow_telemetry();
+            self.drain_render_telemetry();
             // Drop the scene entry FIRST so subsequent `build_scene`
             // calls during a still-in-flight retire window can't
             // sample a destroyed drawable. `decref` may defer the
@@ -5470,7 +5518,7 @@ impl Backend for KmsBackendV2 {
         );
         self.sync_descriptor_pool_telemetry();
         match composite_result {
-            Ok(s) if s.recorded_draws > 0 => {
+            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
                 self.telemetry.record_paint_submit();
                 self.trace_render(
                     SubmitKind::RenderComposite,
@@ -7199,7 +7247,7 @@ impl Backend for KmsBackendV2 {
         };
         match &stats {
             Ok(s) => {
-                if s.recorded_draws > 0 {
+                if s.recorded_draws > 0 && !s.deferred_to_batch {
                     self.telemetry.record_paint_submit();
                     self.trace_render(
                         SubmitKind::RenderComposite,
