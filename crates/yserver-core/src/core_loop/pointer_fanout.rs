@@ -115,37 +115,36 @@ pub fn pointer_event_fanout_to_state(
         if !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
-        ) {
-            if redirect_to_grab {
-                let event_x = clamp_grab_coord(event.root_x, gx);
-                let event_y = clamp_grab_coord(event.root_y, gy);
-                log::trace!(
-                    "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?} owner_events={}",
+        ) && redirect_to_grab
+        {
+            let event_x = clamp_grab_coord(event.root_x, gx);
+            let event_y = clamp_grab_coord(event.root_y, gy);
+            log::trace!(
+                "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?} owner_events={}",
+                event.kind,
+                event.detail,
+                grab_window.0,
+                grab_client,
+                owner_events,
+            );
+            let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
+                encode_pointer_event(
+                    buf,
+                    order,
                     event.kind,
+                    seq,
                     event.detail,
-                    grab_window.0,
-                    grab_client,
-                    owner_events,
+                    event.time,
+                    grab_window,
+                    ResourceId(0), // active-grab redirect: no propagation child
+                    event,
+                    event_x,
+                    event_y,
                 );
-                let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
-                    encode_pointer_event(
-                        buf,
-                        order,
-                        event.kind,
-                        seq,
-                        event.detail,
-                        event.time,
-                        grab_window,
-                        ResourceId(0), // active-grab redirect: no propagation child
-                        event,
-                        event_x,
-                        event_y,
-                    );
-                });
-                merge_dropped(&mut dropped, extras);
-                release_passive_grab_on_button_release(state, event.kind);
-                handled_core_via_grab = true;
-            }
+            });
+            merge_dropped(&mut dropped, extras);
+            release_passive_grab_on_button_release(state, event.kind);
+            handled_core_via_grab = true;
             // Else (owner_events=true and target owned by grab client):
             // fall through to normal propagation so the event fires on
             // the natural window via the usual subscriber-walk path.
