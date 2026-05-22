@@ -356,12 +356,17 @@ from.
       **2026-05-22 investigation status — UNRESOLVED yserver bug:**
       gtk3-demo + tooltip CSD shadows render visibly different on
       yserver than on Xorg-native (denser dark band at the window
-      edge). Pixel-diff against an Xorg reference: inner-shadow
-      RGB `(31,59,48)` on yserver vs `(42,81,68)` on Xorg over
-      wallpaper RGB `(75,144,117)` vs `(75,144,121)` — implied
-      stored α ≈ 151 on yserver vs ≈ 112 on Xorg. **Visible
-      divergence from Xorg = yserver bug**, root cause not yet
-      identified.
+      edge). Setup: **same machine, same MATE installation, same
+      theme/wallpaper files, same GTK/Cairo binaries** — only the
+      X server differs. Pixel diff against the Xorg reference:
+      inner-shadow RGB `(31,59,48)` on yserver vs `(42,81,68)`
+      on Xorg over wallpaper RGB `(75,144,117)` vs
+      `(75,144,121)` — implied stored α ≈ 151 on yserver vs
+      ≈ 112 on Xorg. **Even the wallpaper green channel differs
+      by 4 LSB despite identical wallpaper file**, indicating a
+      color-pixel-rendering divergence in addition to the shadow
+      one. Per `AGENTS.md`: yserver must match Xorg, this is a
+      real yserver bug, root cause not yet identified.
 
       Ruled out so far:
       1. Pixel-level compose math: marco's `XRenderComposite(Over,
@@ -390,23 +395,38 @@ from.
          [feedback_dpi_hardcoded_matters.md].
 
       Candidates not yet ruled out — where the divergence likely
-      lives:
-      - Visual selection / advertised PictFormat list shape
-        (does GTK pick a different visual on yserver because of
-        what we advertise?)
-      - `Xft.dpi` / XSETTINGS propagation (different daemon
-        state? does yserver pre-seed any XSETTINGS?)
-      - Color management / gamma / ICC profile path — the
-        wallpaper RGB itself differs slightly between sessions
-        (`75,144,117` vs `75,144,121`), suggesting some upstream
-        color-rendering path differs too. Could be `PutImage` /
-        DRI3 byte ordering, or a missing `XF86VIDMODE` /
-        `RANDR::QueryOutputProperty BACKLIGHT` reply.
-      - `gdk-window-scaling-factor` setting source — could
-        yserver be ending up at a different GdkWindow scale?
-      - Cairo Xlib surface selection — GTK's
-        `cairo_xlib_surface_create_with_xrender_format` picks
-        a format based on something the server advertises.
+      lives in yserver:
+      - **Visual / PictFormat advertisement shape** — yserver
+        advertises ~5 visuals vs Xorg's ~272 (visible in
+        `xdpyinfo`). GTK may pick a different visual for the
+        CSD pixmap or root window based on what's listed, and
+        the chosen visual's bit/mask layout drives Cairo's
+        rendering path.
+      - **`PutImage` byte-order / depth-32 handling** — the
+        wallpaper RGB `B` channel differs by 4 LSB
+        (`75,144,117` vs `75,144,121`) despite the same source
+        file. This is a real color divergence in something
+        upstream of the CSD shadow problem. Could be wire-byte
+        permutation in `put_image` for depth-24/32, a swizzle
+        in DRI3 import, or the root storage's interpretation
+        of client-uploaded bytes.
+      - **Cairo Xlib surface selection** — GTK calls
+        `cairo_xlib_surface_create_with_xrender_format` which
+        picks a format based on the server's `QueryPictFormats`
+        reply shape. yserver's format-list ordering or content
+        could be steering Cairo into a different rendering
+        path.
+      - **`RENDER QueryFilters` reply** — affects which Cairo
+        filtering paths GTK uses (Nearest/Bilinear/Convolution).
+        Need to confirm yserver advertises identical filter set
+        to Xorg.
+      - **XSETTINGS** — `mate-settings-daemon` is the same
+        binary on both servers, but its initial-write may
+        depend on what it reads from the server first. Compare
+        the `_XSETTINGS_SETTINGS` property between sessions.
+      - **`gdk-window-scaling-factor` setting source** — could
+        yserver end up reporting something that makes GdkWindow
+        compute a different scale?
 
       Next concrete diagnostic step: capture a side-by-side
       gtk3-demo run on Xwayland (96-DPI synth, no real EDID,
