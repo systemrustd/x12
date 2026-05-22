@@ -599,9 +599,11 @@ fn v2_render_trapezoids_renders_filled_rect() {
 
 /// Repro for the xeyes "pupils missing" hardware-smoke bug
 /// reported 2026-05-16. xeyes paints:
-///   1. Trapezoids op=Over src=<SolidFill white> at the eye region
-///   2. Trapezoids op=Over src=<SolidFill black> at a smaller
-///      pupil region inside it
+///
+/// 1. Trapezoids op=Over src=<SolidFill white> at the eye region
+/// 2. Trapezoids op=Over src=<SolidFill black> at a smaller
+///    pupil region inside it
+///
 /// On hardware the eye whites render correctly but the black
 /// pupils never appear. v1's PaintBatch coalesces multiple paints
 /// into ONE CB with in-CB barriers; v2's per-op CB shape means each
@@ -615,9 +617,11 @@ fn v2_render_trapezoids_renders_filled_rect() {
 /// Test: 16×16 dst pre-filled green; an 8×8 axis-aligned white
 /// trap, then a 4×4 axis-aligned black trap inside it. The final
 /// dst should read:
-///   - black at the centre (inside both traps)
-///   - white between (inside white but outside black)
-///   - green at corners (outside both traps)
+///
+/// - black at the centre (inside both traps)
+/// - white between (inside white but outside black)
+/// - green at corners (outside both traps)
+///
 /// If the second paint loses its black source (race on
 /// `solid_src_image`), the centre will read white or undefined.
 #[test]

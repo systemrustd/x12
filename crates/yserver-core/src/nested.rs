@@ -856,7 +856,7 @@ pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, ki
     }
 }
 
-/// Subtract resets the per-object `pending_notify_fired` flag.
+// Subtract resets the per-object `pending_notify_fired` flag.
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg(test)]

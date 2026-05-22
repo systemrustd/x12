@@ -18553,7 +18553,7 @@ mod tests {
             buf[10],
         );
         assert!(
-            state.selections.get(&AtomId(PRIMARY)).is_none(),
+            !state.selections.contains_key(&AtomId(PRIMARY)),
             "no ownership must be recorded on BadWindow; got {:?}",
             state.selections.get(&AtomId(PRIMARY)),
         );
@@ -18609,7 +18609,7 @@ mod tests {
             buf[10],
         );
         assert!(
-            state.selections.get(&AtomId(BOGUS_ATOM)).is_none(),
+            !state.selections.contains_key(&AtomId(BOGUS_ATOM)),
             "no ownership must be recorded on BadAtom",
         );
     }
@@ -18665,7 +18665,7 @@ mod tests {
             .expect("handle_set_selection_owner");
 
         assert!(
-            state.selections.get(&AtomId(PRIMARY)).is_none(),
+            !state.selections.contains_key(&AtomId(PRIMARY)),
             "future-timestamp request must not update ownership; \
              got {:?}",
             state.selections.get(&AtomId(PRIMARY)),

@@ -523,6 +523,31 @@ fn encode_damage_notify(
     buf.extend_from_slice(&evt);
 }
 
+fn drawable_full_rect(state: &ServerState, drawable: ResourceId) -> xfixes::RegionRect {
+    if let Some(window) = state.resources.window(drawable) {
+        return xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: window.width,
+            height: window.height,
+        };
+    }
+    state.resources.pixmap(drawable).map_or(
+        xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        |pixmap| xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: pixmap.width,
+            height: pixmap.height,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! Damage fanout — ancestor-walk + clipping coverage.
@@ -941,29 +966,4 @@ mod tests {
              rect — which is the bug",
         );
     }
-}
-
-fn drawable_full_rect(state: &ServerState, drawable: ResourceId) -> xfixes::RegionRect {
-    if let Some(window) = state.resources.window(drawable) {
-        return xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: window.width,
-            height: window.height,
-        };
-    }
-    state.resources.pixmap(drawable).map_or(
-        xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        },
-        |pixmap| xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: pixmap.width,
-            height: pixmap.height,
-        },
-    )
 }
