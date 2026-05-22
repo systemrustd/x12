@@ -278,6 +278,15 @@ impl KmsBackendV2 {
         }))
     }
 
+    /// Test hook for the wait-before-flush regression test
+    /// (`v2_wait_for_drawable_idle_flushes_pending_batches`).
+    /// Delegates to `RenderEngine::has_pending_batches_for_tests`
+    /// — see that method's doc for the rationale.
+    #[doc(hidden)]
+    pub fn has_pending_batches_for_tests(&self) -> bool {
+        self.engine.has_pending_batches_for_tests()
+    }
+
     fn alloc_window_stack_rank(&mut self) -> u64 {
         let rank = self.next_window_stack_rank;
         self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
@@ -4239,6 +4248,32 @@ impl Backend for KmsBackendV2 {
         let Some(id) = self.store.lookup(host_xid) else {
             return Ok(());
         };
+        // Stage 5 Task 3 follow-up (deadlock fix, 2026-05-22):
+        // before sampling `last_render_ticket`, flush any pending
+        // batched paint. Post-Task-3 the engine eagerly stamps a
+        // batch's ticket onto every drawable the batch references
+        // (closing the use-after-free on RDNA2 iGPU under
+        // mate-panel's icon-upload churn). But that ticket's fence
+        // isn't submitted to the GPU until `flush_render_batch` /
+        // `flush_cow_batch` runs — which normally happens in the
+        // next `maybe_composite` tick, AFTER this request handler
+        // returns. Calling `ticket.wait(...)` on an unsubmitted
+        // batch ticket would block for 5 seconds (FenceTicket's
+        // internal wait timeout) and stall the PRESENT path,
+        // dead-locking marco's compositor pump and visibly
+        // freezing the display.
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 wait_for_drawable_idle: flush_cow_batch failed: {e:?}");
+        }
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 wait_for_drawable_idle: flush_render_batch failed: {e:?}");
+        }
         let ticket = self
             .store
             .get(id)

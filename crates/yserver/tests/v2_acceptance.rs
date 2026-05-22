@@ -2948,3 +2948,92 @@ fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
         }
     }
 }
+
+/// Stage 5 Task 3 follow-up regression: `wait_for_drawable_idle`
+/// must flush any pending render-batch / cow-batch before blocking
+/// on `last_render_ticket.wait()`. Without that flush, the eagerly-
+/// stamped batch ticket (introduced to close the bee UAF) names a
+/// fence whose CB hasn't been submitted to the GPU yet, so `wait`
+/// blocks for the full 5-second FenceTicket timeout and dead-locks
+/// the PRESENT path — visibly black screen + frozen mouse on bee
+/// 2026-05-22, with `request handler error (client 14 opcode 145):
+/// wait for drawable 0x103: TIMEOUT` in the log.
+///
+/// The invariant under test is **non-blocking**: we assert that
+/// `wait_for_drawable_idle` returns with `has_pending_batches_for_tests
+/// == false`, regardless of whether the underlying fence actually
+/// signals. If a future change rips out the flush calls in
+/// `wait_for_drawable_idle`, this test goes red instantly via the
+/// post-condition rather than by deadlocking the test runner for
+/// 5 seconds.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_wait_for_drawable_idle_flushes_pending_batches() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Drawable src + dst — both 4×4 depth-32 pixmaps. Filled so
+    // their storage has a valid layout when sampled.
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap src");
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap dst");
+    let src_xid = src_pix.as_raw();
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, src_xid, 0xFF00FF00, 0, 0, 4, 4)
+        .expect("fill src");
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
+        .expect("fill dst");
+
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(src_pix), 0, 0, &[])
+        .expect("create src picture")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("create dst picture")
+        .expect("Some");
+
+    // Drawable src + no mask + op=1 (Src) — matches the batch
+    // eligibility predicate in engine.rs's
+    // `pending_render_batch` open path.
+    b.render_composite(
+        None,
+        1,
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        4,
+    )
+    .expect("render_composite");
+
+    assert!(
+        b.has_pending_batches_for_tests(),
+        "precondition: render_composite of drawable→drawable should open a pending batch"
+    );
+
+    // The call under test. Pre-fix this would have either deadlocked
+    // for 5s (returned Err with TIMEOUT) or — even worse —
+    // succeeded by virtue of the ticket happening to be signaled
+    // (concurrent drain). With the fix the batch is flushed before
+    // ticket.wait, so the post-condition is deterministic.
+    b.wait_for_drawable_idle(dst_xid)
+        .expect("wait_for_drawable_idle must not error after fix");
+
+    assert!(
+        !b.has_pending_batches_for_tests(),
+        "wait_for_drawable_idle must flush pending batches before blocking — \
+         otherwise the wait runs on an unsubmitted CB's fence and \
+         dead-locks the PRESENT path (bee 2026-05-22)",
+    );
+}
