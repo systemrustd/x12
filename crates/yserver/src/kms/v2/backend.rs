@@ -1495,6 +1495,38 @@ impl KmsBackendV2 {
             .map_or(SrcClass::Direct, Self::picture_src_class)
     }
 
+    /// Stage 5 Task 3 POC: drain the engine's cow-batch flush
+    /// records (since the last drain), bump telemetry counters,
+    /// emit one submit-trace event per flush. Called once per
+    /// `maybe_composite` tick after the explicit flush + after
+    /// `scene.tick` (the latter may have triggered an
+    /// engine-internal flush via its compose CB build).
+    fn drain_cow_telemetry(&mut self) {
+        let records = self.engine.drain_cow_flush_records();
+        if records.is_empty() {
+            return;
+        }
+        let target_id = self.cow_id.map_or(0_u64, super::store::DrawableId::as_u64);
+        for coalesced in records {
+            self.telemetry.record_cow_batch_flushed(coalesced);
+            // One trace event per flush; batch_size = coalesced
+            // count so the analysis can answer "how big are
+            // batches?".
+            self.telemetry.record_submit_event(SubmitEvent {
+                frame_id: 0,
+                kind: SubmitKind::CopyArea,
+                target_kind: TargetKind::Cow,
+                target_id,
+                batch_size: coalesced,
+                op: SubmitOp::None,
+                src_class: SrcClass::None,
+                mask_class: SrcClass::None,
+                pipeline_id: None,
+                flags: SubmitFlags::NONE,
+            });
+        }
+    }
+
     /// Stage 5 Task 4 layer 1: test-side accessor to the ring's
     /// pool residency. Used by the acceptance harness to assert
     /// steady-state pool count stays small after warm-up.
@@ -3949,6 +3981,17 @@ impl Backend for KmsBackendV2 {
         // id; the scene_compose event of this tick (if it
         // submits) also carries this id.
         self.telemetry.advance_frame();
+        // Stage 5 Task 3 POC: flush pending COW copy_area batch
+        // before scene.tick reads from drawable storage. Engine
+        // also flushes opportunistically from other engine
+        // entry-points; this is the load-bearing flush since
+        // scene.tick's compose CB samples the dst.
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 maybe_composite: flush_cow_batch failed: {e:?}");
+        }
         let result = if !self.scene.scene_structure_dirty {
             Ok(())
         } else {
@@ -3990,6 +4033,12 @@ impl Backend for KmsBackendV2 {
                 }
             }
         };
+        // Stage 5 Task 3 POC: drain cow-batch flush records and
+        // emit telemetry + trace events for each flush since the
+        // last drain (covers both the explicit flush above and
+        // any engine-internal flushes triggered by paint paths
+        // that ran since the previous tick).
+        self.drain_cow_telemetry();
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit();
         result
@@ -4956,6 +5005,17 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
+            // Stage 5 Task 3 POC: flush any pending COW batch
+            // BEFORE clearing cow_id and releasing storage —
+            // otherwise the flush would record a `touch_render_fence`
+            // against a drawable that's about to disappear.
+            if let Err(e) = self
+                .engine
+                .flush_cow_batch(&mut self.store, &mut self.platform)
+            {
+                log::warn!("v2 release_overlay_window: flush_cow_batch failed: {e:?}");
+            }
+            self.drain_cow_telemetry();
             // Drop the scene entry FIRST so subsequent `build_scene`
             // calls during a still-in-flight retire window can't
             // sample a destroyed drawable. `decref` may defer the
@@ -5737,6 +5797,14 @@ impl Backend for KmsBackendV2 {
             // to paint. Spec-correct under ClipByChildren.
             return Ok(());
         }
+        // Stage 5 Task 3 POC: route copy_area to COW through the
+        // coalescing path. Marco's compositor pump is the hot
+        // workload (silence trace: 47k of 62k copy_areas target
+        // COW). Telemetry + trace for cow-routed copies happens
+        // at flush time via `drain_cow_telemetry`; per-call
+        // bumps are suppressed here.
+        let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
+
         let mut all_ok = true;
         for sub in &sub_rects {
             let sub_dst_x = sub.offset.x;
@@ -5757,24 +5825,38 @@ impl Backend for KmsBackendV2 {
                 y: sub_dst_y + dst_target.offset.1,
             };
             self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
-            if let Err(e) = self.engine.copy_area(
-                &mut self.store,
-                &mut self.platform,
-                src,
-                dst_target.id,
-                src_sub_rect,
-                dst_pos,
-            ) {
+            let res = if routes_to_cow {
+                self.engine.cow_copy_area(
+                    &mut self.store,
+                    &mut self.platform,
+                    dst_target.id,
+                    src,
+                    src_sub_rect,
+                    dst_pos,
+                )
+            } else {
+                self.engine.copy_area(
+                    &mut self.store,
+                    &mut self.platform,
+                    src,
+                    dst_target.id,
+                    src_sub_rect,
+                    dst_pos,
+                )
+            };
+            if let Err(e) = res {
                 log::warn!(
                     "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
-                     dst=0x{dst_host_xid:x} sub_rect={sub:?}): {e:?}",
+                     dst=0x{dst_host_xid:x} sub_rect={sub:?} cow_routed={routes_to_cow}): {e:?}",
                 );
                 all_ok = false;
             }
         }
         if all_ok {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
+            if !routes_to_cow {
+                self.telemetry.record_paint_submit();
+                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
+            }
             // Present Copy into COW/backings must wake the scene
             // compositor immediately; otherwise the damage can sit
             // until an unrelated input event arrives.

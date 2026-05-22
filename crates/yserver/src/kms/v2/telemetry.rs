@@ -75,6 +75,18 @@ pub struct Bucket {
     /// second. Tracks paint_submits/s / SETS_PER_POOL on a healthy
     /// recycle path.
     pub descriptor_pool_resets: u64,
+    /// Stage 5 Task 3 POC: count of COW `copy_area` batches flushed
+    /// (each maps to one `vkQueueSubmit2`). Per-second + lifetime.
+    /// Replaces the per-call `paint_submits` increments that the
+    /// pre-POC `copy_area`-to-COW path generated.
+    pub cow_batches_flushed: u64,
+    /// Stage 5 Task 3 POC: count of individual `copy_area` calls
+    /// folded into batches. Per-second + lifetime. Pre-POC
+    /// baseline would have produced this many separate
+    /// `paint_submits`; `cow_batches_flushed` is the post-POC
+    /// equivalent submit count. The ratio of the two is the
+    /// average batch size.
+    pub cow_copies_coalesced: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -186,6 +198,7 @@ impl Telemetry {
              composite_glyphs_dropped_unsupported(lifetime)={} \
              disjoint_readback_count/s={} \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
+             cow_batches_flushed/s={} cow_copies_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns}",
             b.paint_submits,
@@ -210,6 +223,8 @@ impl Telemetry {
             b.disjoint_readback_count,
             b.descriptor_pool_creates,
             b.descriptor_pool_resets,
+            b.cow_batches_flushed,
+            b.cow_copies_coalesced,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -367,6 +382,28 @@ impl Telemetry {
         self.bucket.descriptor_pool_resets = self.bucket.descriptor_pool_resets.saturating_add(n);
         self.lifetime.descriptor_pool_resets =
             self.lifetime.descriptor_pool_resets.saturating_add(n);
+    }
+
+    /// Stage 5 Task 3 POC: one cow batch flushed. Also bumps
+    /// `paint_submits` + `queue_submit2` so the existing per-second
+    /// rates stay accurate (each flush is one real `vkQueueSubmit2`).
+    /// `coalesced` is the number of `copy_area` calls the batch
+    /// folded.
+    pub(crate) fn record_cow_batch_flushed(&mut self, coalesced: u32) {
+        self.bucket.cow_batches_flushed += 1;
+        self.bucket.cow_copies_coalesced = self
+            .bucket
+            .cow_copies_coalesced
+            .saturating_add(u64::from(coalesced));
+        self.bucket.paint_submits += 1;
+        self.bucket.queue_submit2 += 1;
+        self.lifetime.cow_batches_flushed += 1;
+        self.lifetime.cow_copies_coalesced = self
+            .lifetime
+            .cow_copies_coalesced
+            .saturating_add(u64::from(coalesced));
+        self.lifetime.paint_submits += 1;
+        self.lifetime.queue_submit2 += 1;
     }
 }
 
