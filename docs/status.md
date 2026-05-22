@@ -2023,6 +2023,40 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
   then syncobj/direct-scanout/plane strategies only if profiling still
   justifies them.
 
+  - [x] **Task 4 layer 1 — DescriptorPoolRing.** Landed
+    2026-05-22 (commits `fb058a6` through `e12a559`, 14 commits on
+    `perf` branch). Spec:
+    `docs/superpowers/specs/2026-05-21-descriptor-pool-ring-design.md`;
+    plan: `docs/superpowers/plans/2026-05-21-descriptor-pool-ring.md`.
+    Per-call `BatchDescriptorArena` instantiation in
+    `try_vk_render_composite` + `try_vk_render_traps_or_tris`
+    replaced with a long-lived `DescriptorPoolRing` on `EngineInner`
+    cycling Free/Active/InFlight pools by `acquire_generation`
+    watermark. `vkResetDescriptorPool` failure poisons the ring
+    (hard-error propagation: subsequent `acquire_set` returns
+    `ERROR_UNKNOWN`). v1's `BatchDescriptorArena` stays in tree —
+    `paint_batch.descriptor_arena_mut()` still drives it.
+
+    **In-tree gates** (lavapipe ICD, 2026-05-22):
+    11 ring unit tests pass
+    (`crates/yserver/src/kms/v2/descriptor_pool_ring.rs`);
+    3 acceptance gates pass
+    (`v2_render_composite_bumps_pool_create_telemetry`,
+    `v2_render_composite_pool_creates_bounded_after_warmup`,
+    `v2_render_traps_pool_creates_bounded_after_warmup`).
+    Pool ring stats from the 2000-op acceptance runs: `creates=2`,
+    `resets=7`, `residency=2` on both Composite and Trapezoid paths
+    — pools recycle, residency stays bounded.
+
+    **Hardware capture pending** (user runs on yoga / Snapdragon X1 /
+    Turnip out-of-band):
+      - `just yserver-mate-hw-telemetry` — expected `descriptor_pool_creates/s`
+        ≤ 5 steady state (was ~4700 via per-call `vkCreateDescriptorPool`);
+        `descriptor_pool_resets/s` tens-per-second tracking
+        `paint_submits/s / SETS_PER_POOL`.
+      - `just yserver-mate-hw-perf` — expected `create_descriptor_pool`
+        → `msm_ioctl_vm_bind` drop from ~1.63% to ≤ 0.1% of total CPU.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
