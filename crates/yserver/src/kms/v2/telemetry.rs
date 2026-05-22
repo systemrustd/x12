@@ -21,6 +21,8 @@
 
 use std::time::Instant;
 
+use crate::kms::v2::submit_trace::{SubmitEvent, SubmitTrace};
+
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Bucket {
@@ -86,6 +88,15 @@ pub struct Telemetry {
     /// for the acceptance harness which compares totals after
     /// driving a test sequence.
     pub lifetime: Bucket,
+    /// Stage 5 Task 3 diagnostic: per-submit event log,
+    /// enabled by `YSERVER_SUBMIT_TRACE=<path>`. `None` in the
+    /// default off case (zero hot-path cost).
+    submit_trace: Option<SubmitTrace>,
+    /// Bumped at the top of `maybe_composite` (one tick = one
+    /// frame_id). Every `record_submit_event` writes the
+    /// current value, so paint events recorded between ticks
+    /// share the surrounding tick's id.
+    frame_id: u64,
 }
 
 impl Telemetry {
@@ -107,7 +118,36 @@ impl Telemetry {
             last_emit: Instant::now(),
             bucket: Bucket::default(),
             lifetime: Bucket::default(),
+            submit_trace: SubmitTrace::from_env(),
+            frame_id: 0,
         }
+    }
+
+    /// Stage 5 Task 3 diagnostic: log one submit event to the
+    /// trace file if `YSERVER_SUBMIT_TRACE` is set. No-op
+    /// otherwise (and the wrapping `Option::None` lets the
+    /// optimizer fold the call away on the default-off path).
+    #[inline]
+    pub(crate) fn record_submit_event(&mut self, mut event: SubmitEvent) {
+        if let Some(trace) = self.submit_trace.as_mut() {
+            event.frame_id = self.frame_id;
+            trace.record(&event);
+        }
+    }
+
+    /// Bumped once per main-loop tick (top of `maybe_composite`).
+    /// All submit events recorded between calls share the
+    /// current frame_id; the `scene_compose` event for tick N
+    /// also carries id N.
+    pub(crate) fn advance_frame(&mut self) {
+        self.frame_id = self.frame_id.wrapping_add(1);
+    }
+
+    /// Current frame_id. Mainly exposed for tests + diagnostic
+    /// log lines.
+    #[must_use]
+    pub(crate) fn frame_id(&self) -> u64 {
+        self.frame_id
     }
 
     /// Tick the emitter; if ≥ 1s has elapsed, print the

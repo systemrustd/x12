@@ -40,6 +40,16 @@ use super::platform::{FenceTicket, PlatformBackend};
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct DrawableId(u64);
 
+impl DrawableId {
+    /// Raw value for diagnostic logging (`YSERVER_SUBMIT_TRACE`).
+    /// Do not use to build new ids — that's [`DrawableStore`]'s
+    /// job.
+    #[must_use]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrawableKind {
     /// Single root storage covering the full virtual-screen

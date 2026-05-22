@@ -15,6 +15,7 @@ pub(crate) mod glyph_atlas;
 pub(crate) mod platform;
 pub(crate) mod scene;
 pub(crate) mod store;
+pub(crate) mod submit_trace;
 pub(crate) mod telemetry;
 
 pub use backend::KmsBackendV2;

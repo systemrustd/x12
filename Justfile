@@ -676,6 +676,18 @@ yserver-mate-hw-release-trace log="warn":
 # Emits one info!-level line per second to yserver-hw.log with
 # iter/s, req/s, drain_max, top opcodes, host_input gap, etc.
 #
+# Also writes a per-vkQueueSubmit2 TSV to `yserver-${session}.submit.tsv`
+# (Stage 5 Task 3 paint-aggregation diagnostic, see
+# crates/yserver/src/kms/v2/submit_trace.rs). One row per submit:
+#   frame_id ns_mono kind target_kind target_id batch_size op \
+#   src_class mask_class pipeline_id readback alias zero_draws upload
+# Quick analyses:
+#   awk -F'\t' 'NR>1{c[$3]++} END{for(k in c) print c[k],k}' \
+#       yserver-mate.submit.tsv | sort -rn
+#   awk -F'\t' 'NR>1 && $3==pk && $5==pt {run++; next} \
+#       {if(run>1) print run,pk,pt; run=1; pk=$3; pt=$5}' \
+#       yserver-mate.submit.tsv | sort -rn | head
+#
 # Use to diagnose input-loop starvation on bee/adapta — reproduce
 # the lag, then `grep "loop telemetry" yserver-hw.log` for the
 # rollups. RUST_LOG defaults to `info` so the telemetry lines come
@@ -683,9 +695,11 @@ yserver-mate-hw-release-trace log="warn":
 # lose the rollup lines (they're info!-level).
 yserver-mate-hw-telemetry log="info":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-mate.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-mate.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -698,9 +712,11 @@ yserver-mate-hw-telemetry log="info":
 
 yserver-xfce-hw-telemetry log="info":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-xfce.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-xfce.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
