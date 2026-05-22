@@ -35,18 +35,24 @@ interactive headroom:
   responsive desktop. They are later headroom work after the composed
   path is healthy.
 
-## Prerequisites
+## Prerequisites ✅
 
-- Stage 4 compositor correctness issues are closed enough that perf
-  captures represent the intended output:
-  - COW-authoritative mode active when an external compositor owns COW.
-  - Redirect-on-reparent semantics match Xorg for embedded tray applets.
-  - Manual-redirected backings do not compete with COW in the scanout
-    scene.
-- HW cursor is implemented and validated. Pointer motion latency is no
-  longer allowed to mask compositor or paint submit-rate problems.
-- `YSERVER_LOOP_TELEMETRY=1` is available and stable enough to compare
-  runs.
+All met as of 2026-05-22.
+
+- ✅ Stage 4 compositor correctness issues closed (cow-authoritative-mode
+  branch, 2026-05-21):
+  - COW-authoritative mode active when an external compositor owns COW
+    (`19ed354`).
+  - Redirect-on-reparent semantics match Xorg's
+    `compRedirectOneSubwindow` / `compUnredirectOneSubwindow`
+    (`1065c50`).
+  - Manual-redirected backings do not compete with COW in scanout
+    (Stage 4d.7 `f3e9276` + cow-authoritative gating).
+- ✅ HW cursor implemented (`YSERVER_V2_HW_CURSOR=1` opt-in landed
+  in the Stage 4 close).
+- ✅ `YSERVER_LOOP_TELEMETRY=1` enables per-second summary line; trace
+  via `YSERVER_SUBMIT_TRACE=<path>` per-vkQueueSubmit2 (Stage 5 Task 3
+  prep, `abb0855`).
 
 ## Success gates
 
@@ -84,147 +90,188 @@ Required counters for every capture:
 - pixmap-pool hit/miss totals
 - flip-pending / commit-retry counters
 
-## Task 0 - make telemetry answer the question
+## Task 0 - make telemetry answer the question ✅
 
-Before optimizing, make the performance cliff observable in one log.
+Exit gate met by the bee/yoga/silence captures (2026-05-22): a single
+MATE drag identifies bee as submit-rate-bound, yoga as descriptor-
+pool-pin-bound (fixed by Task 4 layer 1), silence as headroom-rich
+with a damage-saturation correctness gap. Diagnostic instrumentation
+delivered in two passes:
 
-- Add missing v2 telemetry counters for `queue_submit2/sec`,
-  descriptor allocation rate, compose descriptor-set reuse/miss, repaint
-  region count, repaint pixels, and flip-pending skips.
-- Split paint submits by operation family: fill, copy, put-image,
-  RENDER composite, glyph, trap/tri, readback.
-- Split compose submits by output and by repaint mode:
-  `Full`, `Clipped`, `SkippedNoDamage`, `SkippedFlipPending`,
-  `FailedSubmitRecovery`.
-- Emit pixmap-pool stats on the v2 telemetry line, not only through the
-  older global hook.
-- Add a stable capture recipe under `docs/` with exact commands,
-  environment, machine name, theme, compositor state, and duration.
+- ✅ `queue_submit2/s` + `descriptor_allocations/s` + flip-related
+  counters added across Stage 3 + Stage 5 Task 4 layer 1 (DescriptorPoolRing
+  telemetry, `893f3e4`).
+- ✅ Per-`vkQueueSubmit2` TSV diagnostic
+  (`YSERVER_SUBMIT_TRACE=<path>`, `abb0855`, 2026-05-22) splits paint
+  submits by op family + target + render-key — this is the structured-
+  event log substitute for the "split paint_submits/compose by family"
+  bullets.
+- ✅ Stable capture recipe via `just yserver-{mate,xfce}-hw-telemetry`
+  (`YSERVER_LOOP_TELEMETRY=1` + `YSERVER_SUBMIT_TRACE` autowired).
 
-Exit gate: a single 60 s MATE run explains whether v2 is CPU-bound in
-scene build, GPU-bound in compose, submit-bound, allocation-bound, or
-waking/repainting without useful damage.
+Items not landed but no longer load-bearing:
 
-## Task 1 - bound frame production
+- ⏳ Pixmap-pool stats on the v2 per-second line. The `GLOBAL_LATEST_POOL`
+  hook drives v1's emitter; v2 doesn't surface them on its line. Easy
+  add when Task 5 picks up the storage-churn work.
+- ⏳ Compose-submit split by repaint mode (`Full` / `Clipped` /
+  `SkippedNoDamage` / `SkippedFlipPending` / `FailedSubmitRecovery`).
+  Captured implicitly via `full_redraw_fallback/s` (Full vs Clipped)
+  and `missed_pageflips/s`. Discrete per-mode counters not yet added.
 
-The compositor must not manufacture work faster than KMS can consume it.
+Task 0 was the diagnostic-first pass; the actual perf-tuning tasks
+follow.
 
-- Audit every `wake_for_damage` and `maybe_composite` path for repeated
-  wakes while a flip is already pending.
-- Convert "rapid damage while flip pending" into one coalesced pending
-  repaint per output.
-- Make the hardcoded commit retry backoff observable and tunable.
-- Add tests that repeated damage while flip-pending produces one pending
-  frame, not N queued compose attempts.
+## Task 1 - bound frame production ✅
 
-Exit gate: under rapid pointer/window-drag damage, v2's attempted
-compose rate is bounded by page-flip retirement plus one coalesced
-pending repaint.
+Met by Stage 3f.9's per-output flip-pending gate (`bc6718a`,
+2026-05-16). `tick_one_output` skips submission when
+`state.pending_acks` is non-empty; `scene_structure_dirty` stays set
+so deferred damage is picked up after page-flip completion. Silence
+verification (dual 2.5k MATE drag): `composite_submits/s` caps at 121
+= 2 × 60 Hz exactly, never exceeds. The Stage 3f.9 commit message
+words it: *"KMS submit rate is now structurally bounded to one flip
+per vblank per output."*
 
-## Task 2 - stop drawing what COW already drew
+Remaining bullets from this task's original list (commit-retry-backoff
+tunability, dedicated "rapid damage → one pending frame" tests) are
+minor polish on already-correct behaviour; not budgeted.
 
-When a compositor is active, v2 should not run a second compositor on
-top of the compositor's output.
+## Task 2 - stop drawing what COW already drew ✅
 
-- Treat COW as authoritative for redirected top-level content.
-- In compositor-active mode, strip normal redirected top-level scene
-  entries from scanout. The scanout scene is root background, COW,
-  server-owned overlays that must remain outside COW, and cursor.
-- Keep non-composited WMs on the normal per-window scene path.
-- Pin this with a scene-build test: caja desktop, mate-panel,
-  tray applets, and a compositor COW must not produce duplicated
-  per-window layers above COW.
+Met by the Stage 4 cow-authoritative-mode close (`19ed354`,
+2026-05-21). `build_scene` gates on COW registration: when a
+compositor has registered to paint COW, the scanout scene emits
+*root + COW + cursor only*. Non-composited WMs keep the normal
+per-window scene path. Status doc cross-link:
+[`status.md`](../../status.md) §"Stage 4 close (2026-05-21)".
 
-Exit gate: compositor-on scene entry count is small and stable; COW
-pixels are not occluded by caja/mate-panel/manual backings.
+Scene-build tests + the full diagnosis chain (~35 commits) live in
+the cow-authoritative-mode branch; the working set behaviour is the
+exit-gate signal already verified during Stage 4 hardware smokes
+(MATE + marco-with-compositing on bee/fuji; xfce4 +
+xfwm4-with-compositing on bee/fuji).
 
-## Task 3 - aggregate paint submissions
+## Task 3 - aggregate paint submissions 🟡 (in progress on `perf`)
 
-The composed path cannot fly if X11 paint traffic maps to one Vulkan
-submit per small operation.
+Cow `copy_area` POC + render_composite generalization landed on `perf`
+(commits `0bec1b3`, `68af625`). Silence verification: cumulative −39 %
+`paint_submits/s` vs pre-POC baseline. Full numbers + design rationale
+in §"Task 3 POC 2026-05-22 — COW `copy_area` coalescing" and §"Task 3
+generalization 2026-05-22 — `render_composite`" below.
 
-- Introduce a v2 paint aggregation boundary in `RenderEngine`: collect
-  compatible operations for the same target until a protocol barrier,
-  readback, layout hazard, target switch requiring strict ordering, or
-  event-loop flush.
-- Keep the existing per-op path for readback and rare strict barriers.
-- Extend current stroke aggregation beyond solid fills:
-  - consecutive `CopyArea` into the same target,
-  - PutImage tile / span bursts,
-  - RENDER composite batches sharing pipeline, target, source class,
-    mask class, and operator,
-  - glyph uploads / glyph draws where atlas lifetime allows it.
-- Preserve X11 ordering. If an operation can be observed by a later
-  readback or external client, flush before the observation.
+Status of each original sub-bullet:
 
-Exit gate: high-volume paint workloads reduce `queue_submit2/sec` and
-`paint_submit/sec` by an order of magnitude or hit the v1-comparable
-budget in the success table.
+- ✅ **Aggregation boundary in `RenderEngine`** — `PendingCowBatch` +
+  `PendingRenderBatch` on `RenderEngineInner`; auto-flush hooks at the
+  top of every engine entry guard against cross-kind ordering bugs.
+- ✅ **Consecutive `CopyArea` into the same target** — cow POC,
+  78 % submit-rate reduction on cow path (silence).
+- ✅ **RENDER composite batches** — generalization landed,
+  1.43 calls/batch avg, peak 8, 30 % reduction on render path.
+- ⏳ **PutImage tile / span bursts** — not done. Lower priority per
+  bee analysis (put_image was ~8 % of all submits; not the hotspot).
+- ⏳ **Glyph upload / draw aggregation** — not done. Glyph_upload was
+  ~0.1 % of silence submits; not load-bearing.
+- ⏳ **`render_fill` (Solid src)** — deliberately excluded from the
+  conservative predicate (would need scratch clear lifted out of the
+  render pass). 8 k savings on silence, deferred.
 
-## Task 4 - make compose cheap
+Exit-gate progress: paint_submits/s on silence is down ~39 % vs
+pre-POC (5,653 → 4,180 avg). Not "order of magnitude" yet, but the
+underlying constraint isn't N-times bigger gains — silence's residual
+load is the long tail (put_image, composite_glyphs, the un-batched
+Solid render_composites). **Bee + yoga re-capture pending hardware
+access** is the decision point for closing Task 3 vs further work.
+
+## Task 4 - make compose cheap 🟡 (correctness fix open)
 
 Scene composition must scale with changed pixels and visible entries,
 not with all historical state.
 
-- Add damage-strategy selection per frame:
-  - clipped repaint for small/medium compact regions,
-  - full redraw when clipping is more expensive than redraw,
-  - structure-damage full fallback only when the retained BO history is
-    invalid.
-- Add occlusion-driven scene-entry skip for fully covered opaque
-  entries. This is especially important for desktop windows and panel
-  rectangles.
-- Cache descriptor sets / sampled-image bindings for stable
-  `DrawableId`s. Reuse across frames until storage generation changes.
-- Avoid per-frame image-view creation; stable storage should have stable
-  views.
+Status of each sub-bullet:
 
-Exit gate: `compose_cb_record_ns/frame`, descriptor allocations, and
-image view creation stay flat under idle and bounded under window drag.
+- ⏳ **Damage-strategy selection per frame** — open and load-bearing.
+  Silence trace shows `damage_fraction` hits 1.00 while
+  `full_redraw_fallback/s` stays ~0; `pick_repaint_region` keeps
+  picking `Clipped` with `loadOp=LOAD` at saturation, leaving the
+  ~1 % uncovered region as stale buffer-age content. **This is the
+  silence smearing bug** — only known correctness regression
+  attributable to Stage 5 work. Sketch: add a `damage_fraction > F →
+  Full` arm before the Clipped path, F ≈ 0.6–0.8. See §"Smearing
+  artifact — Task 4 correctness corollary" below.
+- ⏳ **Occlusion-driven scene-entry skip** — open. No work done.
+- ✅ **Cache descriptor sets / sampled-image bindings** — already
+  delivered by existing infrastructure: `drawable_view_cache` keyed on
+  `(DrawableId, SamplerConfig, SwizzleClass)` handles per-paint view
+  reuse; `DescriptorPoolRing` (Task 4 layer 1) recycles descriptor-set
+  storage. See §"Image-view caching is NOT the next fix" below.
+- ✅ **Avoid per-frame image-view creation** — same as above. The
+  observed `image_view_creates/s = storage_allocations/s` ratio is by
+  counter design (co-located at storage-allocation sites), not
+  per-paint view creation.
 
-## Task 5 - remove allocation churn
+Exit gate (`compose_cb_record_ns/frame`, descriptor allocs, image
+view creation stay flat) — the latter two already flat post Task 4
+layer 1; `compose_cb_record_ns/frame` will respond once the damage
+strategy fix lands (full redraw at saturation is cheaper to record
+than 95 %-clipped scissor lists).
 
-Allocation spikes produce the "fast until a desktop thing appears"
-failure mode.
+## Task 5 - remove allocation churn ⏳ (open)
 
-- Make the v2 pixmap pool visible in telemetry and tune bucket sizes
-  from real MATE/caja traces.
-- Pool or cache transient compose resources that still allocate per
-  frame.
-- Add lifetime counters for drawable storage create/destroy by kind:
-  root, window, redirected backing, pixmap, COW, cursor.
-- Investigate any workload with sustained storage allocation after the
-  first 10 s warm-up.
+Open. Silence trace shows `storage_allocations/s` peak 6,073 — 13×
+bee's 467. Most fall outside the `PixmapPool`'s ≤128 px bucket (the
+pool was sized for small client pixmaps; compositor backings are
+full-output). Bee analysis identifies this as the second-tier
+bottleneck (after Task 3 submit aggregation).
 
-Exit gate: after warm-up, idle MATE compositor-on/off produces near-zero
-storage allocation, image-view creation, and descriptor allocation.
+- ⏳ Pixmap-pool stats on the v2 per-second telemetry line (overlaps
+  Task 0 follow-up).
+- ⏳ Tune bucket sizes from real MATE/caja traces (xtrace under MATE
+  drag would identify dominant CreatePixmap sizes — diagnostic-first
+  per the perf-branch lesson before designing a pool regime).
+- ⏳ Pool or cache transient compose resources that still allocate
+  per frame. (DescriptorPoolRing addressed descriptor-set storage as
+  Task 4 layer 1; `mask_scratch` + `dst_readback` already grow with
+  high-water mark and don't churn — see Bee §"Image-view caching is
+  NOT the next fix".)
+- ⏳ Lifetime counters by drawable kind (root/window/backing/pixmap/
+  cow/cursor).
+- ⏳ Investigate sustained-allocation workloads after 10 s warm-up.
 
-## Task 6 - async submit only where profiling justifies it
+Exit gate: after warm-up, idle MATE produces near-zero storage
+allocation, image-view creation, and descriptor allocation. Existing
+work has already closed the descriptor-allocation side
+(DescriptorPoolRing, Task 4 layer 1).
 
-CPU fence waits should not be on the hot path, but replacing them with
-syncobj plumbing before the submit rate is fixed just hides the real
-problem.
+## Task 6 - async submit only where profiling justifies it ⏳ (deferred)
 
-- Re-profile after Tasks 1-5.
-- If CPU fence wait remains material, add DRM in-fence / syncobj
-  submission for compose without changing `SceneCompositor` semantics.
-- Keep `VkFence` retirement as fallback for drivers without the needed
-  syncobj path.
+Deferred until Tasks 3 + 5 land and we re-profile. Current standing:
 
-Exit gate: `cpu_fence_wait_ns/sec` is either negligible or removed from
-steady-state compose by syncobj/in-fence submission.
+- Silence post-render-POC: `cpu_fence_wait_ns/s` avg 44 ms (~4 % of
+  one core), down from cow-only 76 ms. Not currently load-bearing.
+- Bee pre-POC: 11.97 ms (~12 % of one core). Post-Task-3 should drop
+  further proportionally.
 
-## Task 7 - optional headroom: direct scanout and planes
+Memory note `feedback_perf_branch_2026_05_10`: a prior
+timeline-semaphore attempt at per-op-wait removal did NOT pan out
+without proper per-op characterization. Re-profile data first.
 
-Only after the composed desktop is responsive:
+Exit gate unchanged: `cpu_fence_wait_ns/sec` either negligible or
+removed from steady-state compose by syncobj/in-fence submission.
+
+## Task 7 - optional headroom: direct scanout and planes ⏳ (deferred)
+
+Out of scope until the composed desktop is responsive across the
+hardware classes. Standing items unchanged:
 
 - Direct scanout for a single full-output eligible entry.
 - Hardware plane assignment for video/overlay entries.
 - Multi-queue graphics/transfer split if transfer uploads still block
   graphics after batching.
 
-Exit gate: these improve specific workloads without changing the
-observable scene result and without becoming required for basic desktop
+Exit gate unchanged: improves specific workloads without changing the
+observable scene result or becoming required for basic desktop
 responsiveness.
 
 ## Bee 2026-05-22 perf-branch findings
@@ -701,13 +748,33 @@ needed.
 
 ### What this gives Task 3 design
 
+**⚠️ Trace-schema lesson learned during implementation
+(2026-05-22):** the `src_class` column collapsed distinct `src_id`s
+into a single class label, so this section's predicate
+recommendation (item 2 below) keyed on `src_class` which mis-led
+the initial design. The actual implementation key needed to
+account for **per-call src/mask view variation** — marco's
+pattern is *N different srcs → 1 dst*, same as cow `copy_area`.
+The iter-1 over-strict predicate that took `src_class` literally
+produced 1.005 calls/batch (no coalescing); the iter-2 relaxed
+predicate produced 1.43 calls/batch. See §"Task 3 generalization
+2026-05-22 — render_composite" for the corrected design.
+
+The recommendations below are kept verbatim for traceability —
+items 1 / 3 / 4 / 5 / 6 held up; item 2's specific predicate
+was wrong.
+
 1. **Aggregation boundary: end of main-loop tick** (immediately
    before `maybe_composite` calls `scene.tick`). Engine entry
    points push onto a `Vec<PendingOp>` on `RenderEngine` instead
    of recording immediately; the flush method records all
    compatible-keyed ops into one CB before submit.
-2. **Aggregation key: `(target_id, engine_method, op,
-   src_class, mask_class)`.** Same key = same CB.
+2. ⚠️ **Aggregation key (mis-stated): `(target_id, engine_method,
+   op, src_class, mask_class)`.** The corrected key for
+   `render_composite` is the much smaller
+   `(target_id, op, dst_pict_format, mask_component_alpha)`
+   with per-append descriptor rebinding inside the open render
+   pass.
 3. **Order preservation per target.** Within a target, push
    order is record order. Across targets, the order is
    independent so long as no `get_image` / readback intervenes
@@ -739,7 +806,7 @@ The instrumentation can re-run anywhere with no rebuild — same
 recipe, set `YSERVER_SUBMIT_TRACE=…` in env or via the updated
 `-telemetry` recipes.
 
-## Task 3 POC 2026-05-22 — COW `copy_area` coalescing
+## Task 3 POC 2026-05-22 — COW `copy_area` coalescing ✅ (landed)
 
 First Task 3 implementation landed on `perf` at `0bec1b3`.
 Smallest valuable slice per the trace data above: coalesce
@@ -872,7 +939,7 @@ remaining 60 % of all coalesce savings sit on:
   justifies the work; the trace analysis below shows it didn't
   on silence.
 
-## Task 3 generalization 2026-05-22 — `render_composite`
+## Task 3 generalization 2026-05-22 — `render_composite` ✅ (landed)
 
 Landed on `perf` at `68af625`. Took two iterations.
 
