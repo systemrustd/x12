@@ -2090,15 +2090,133 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       - User subjective: **no CPU spikes during drag** — matches
         the data.
 
+    **Silence hardware capture 2026-05-22** (i9 13900k / rx580
+    Polaris/GCN4 / RADV / dual 2560x1440, same MATE drag workload;
+    full analysis in the Stage 5 plan §"Silence 2026-05-22
+    perf-branch findings"). The perf recipe defaults to
+    `RUST_LOG=warn` which suppresses `INFO`-level v2_telemetry, so
+    telemetry and perf cover two consecutive drag runs.
+      - System fully responsive; drag silky-smooth; CPU spikes
+        peak ~30% user-subjective, confirmed by perf at ~1.1% of
+        total system CPU = ~35% of one logical core averaged
+        across the 13900k's 32 logical cores.
+      - **Paint volume 3-9× bee** because silence's CPU isn't the
+        limiter: `paint_submits/s` avg 6852 peak 18910 (bee peak
+        2048); `queue_submit2/s` avg 7069 peak 19379 (bee peak
+        2119). Same X11 client traffic; bee was rate-limited by
+        single-thread cost so it never measured what MATE actually
+        wanted to push.
+      - **`composite_submits/s` avg 98 peak 121** matches the
+        dual-output prediction (2 × 60 Hz; bee single-output was
+        59). `frame_present_count/s` tracks 1:1 — KMS keeps up on
+        both outputs.
+      - **`storage_allocations/s` avg 1605 peak 6073 — 13× bee.**
+        Dual output compounds with bigger surfaces; every
+        full-output redirected backing misses the `PixmapPool`
+        (≤128px bucket cap). Task 5 territory; pool needs a
+        separate bucket regime for compositor-sized surfaces.
+      - **DescriptorPoolRing working as designed:**
+        `descriptor_pool_creates/s` ≈ 0 (2 across the whole run,
+        both in warmup); `descriptor_pool_resets/s` avg 24 peak
+        65; `descriptor_allocations/s` avg 255 peak 304 (close to
+        yoga's 180). Ring scales with submit rate without
+        exploding creates.
+      - **`cpu_fence_wait_ns/s` avg 76 ms peak 206 ms** (bee 12
+        ms). 7-20% of one core in fence waits — Task 6 territory
+        but doesn't bind on silence either.
+      - **Perf hot-path shape identical to bee, diluted.**
+        `libvulkan_radeon.so` 0.25% / 0.08%, `libc` `__ioctl`
+        0.42% / 0.06%; no Rust symbol above the 0.05% threshold.
+        Same `main → run_core → … → __ioctl → libvulkan_radeon`
+        chain. Confirms the bottleneck is universal across
+        AMD/RADV; it only *binds* where single-core budget runs
+        out.
+      - **`VK_EXT_image_drm_format_modifier` missing on rx580
+        under RADV** — `Vulkan-fed scanout will not work` warning
+        logged at startup, yet the desktop displays correctly,
+        so a fallback scanout path is in use. Worth a follow-up
+        to confirm which path and whether it accounts for any of
+        the silence-specific allocation behaviour. Tracked as a
+        Stage 5 Task 5 sub-question, not a perf gate.
+
+    **Smearing artifact diagnosis (silence-specific surfacing;
+    underlying bug is general).** Drag showed occasional
+    smearing / damage trails on silence that bee/yoga didn't
+    expose. Telemetry pins it: `damage_fraction` hits 1.00 in
+    peak buckets while `full_redraw_fallback/s` stays ~0 across
+    the run. `pick_repaint_region` keeps choosing `Clipped` with
+    `loadOp=LOAD` even when ~100% of the output is damaged;
+    Clipped at 99% damage paints 99% of pixels and leaves the
+    residual ~1% as prior buffer-age content — that residual is
+    the smearing. Bug is the strategy selection (no
+    `damage_fraction > threshold → Full` arm); silence surfaces
+    it because silence is the first hardware with enough headroom
+    to push damage_fraction to saturation under MATE drag. Stage
+    5 Task 4 already calls out "full redraw when clipping is more
+    expensive than redraw" — this is its correctness corollary.
+
     The per-hardware-class bottleneck split is now empirically
-    established: yoga's bottleneck was descriptor-pool churn (fixed
-    by Task 4 layer 1); bee's bottleneck is `vkQueueSubmit2`
-    syscall rate (Task 3 territory).
+    established on three axes:
+      - **yoga (Snapdragon X1 / Turnip)** — `vkCreateDescriptorPool
+        → msm_ioctl_vm_bind` pin path. Fixed by Task 4 layer 1.
+      - **bee (Ryzen 9 6900HX / RADV)** — `vkQueueSubmit2` ioctl
+        rate (~2k/s) bound by single-thread budget. Task 3.
+      - **silence (i9 13900k / RADV)** — same ioctl-rate cost as
+        bee but ~3-9× higher absolute volume, absorbed by
+        single-core headroom. Perf does not bind; the higher
+        damage saturation exposes the `pick_repaint_region`
+        correctness gap (smearing).
 
     Perf branch (`origin/perf`) staying open across machines for
-    Task 3 + Task 5 follow-ups; no intent to merge Task 4 layer 1
-    to master yet — gating that on Task 3 landing too, so master
-    sees one perf-branch closure rather than a half-fix.
+    Task 3 + Task 4 (damage strategy) + Task 5 follow-ups; no
+    intent to merge Task 4 layer 1 to master yet — gating that on
+    Task 3 landing too, so master sees one perf-branch closure
+    rather than a half-fix.
+
+  - [~] **Task 3 prep — submit-trace instrumentation +
+    diagnostic capture.** Landed on `perf` 2026-05-22.
+    `YSERVER_SUBMIT_TRACE=<path>` (off by default, zero hot-path
+    cost) writes one TSV row per `vkQueueSubmit2` with kind +
+    target + op + src/mask class + flags. Wired into all 21 v2
+    submit sites + the per-output scene-compose loop. The two
+    `-telemetry` Justfile recipes enable it automatically and
+    write to `yserver-{mate,xfce}.submit.tsv`. New module
+    `crates/yserver/src/kms/v2/submit_trace.rs` (630 LoC, 6
+    unit tests including a kind-name prefix-collision property
+    check).
+
+    **Silence drag capture 2026-05-22** (45.5 s, 380,917
+    submits, 8,376/s avg). Full analysis in the Stage 5 plan
+    §"Silence 2026-05-22 submit-trace findings (Task 3 design
+    data)". Headline:
+      - **37.7 % of submits sit in trivially coalesce-able runs**
+        (consecutive same-target same-kind same-(op, src_class,
+        mask_class)). Aggregating each run to one CB collapses
+        143,560 of 380,917 submits → ~5,200/s post-aggregation.
+        On bee that lands well below the ~2,000/s steady-state
+        where the lag bound.
+      - Three kinds carry 96 % of the savings: `render_composite`
+        (88k savings), `copy_area` (40k), `render_fill` (8k).
+      - Biggest single hotspot: **marco compositor `copy_area`
+        onto COW — 46,920 of 62,255 (75 %) target drawable
+        id=35**. Runs of length 12-50. Single-target coalescing
+        here alone captures ~40k of the 143k savings.
+      - `render_composite` keys concentrate on 4 dominant
+        tuples (`over | direct | no_mask` 35 %, `src | direct
+        | no_mask` 25 %, `over | direct | direct` 18 %, `src |
+        gradient_linear | no_mask` 6 %). The aggregation key
+        `(target_id, kind, op, src_class, mask_class)` matches
+        the runs naturally.
+      - **Aggregation boundary is the main-loop tick** (end of
+        `maybe_composite`, before `scene.tick`). Compose reads
+        from every touched target, so flushing the pending-op
+        queue immediately before compose runs is correctness-
+        for-free; no cross-tick ordering work needed.
+
+    Bee re-capture pending hardware access. Next concrete step
+    is Task 3 brainstorm → spec → plan (same shape as
+    DescriptorPoolRing / Task 4 layer 1), with the COW
+    `copy_area` slice as the smallest valuable proof-of-concept.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 

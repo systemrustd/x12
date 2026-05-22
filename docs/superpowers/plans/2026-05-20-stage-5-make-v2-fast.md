@@ -433,6 +433,312 @@ Neither is materially affecting yoga (no spikes observed). Both
 are pre-staged followups for if the post-Task-3 / post-Task-5
 profile re-opens a yoga gap.
 
+## Silence 2026-05-22 perf-branch findings
+
+Captured on `perf` branch HEAD `22cdf54`, same MATE drag workload
+as the bee and yoga captures. Host: `silence` (i9 13900k / rx580
+Polaris/GCN4 / RADV / dual 2560x1440). Artifacts:
+`yserver-mate.perf.data` (perf record, ~176 MB / 1.6M samples),
+`yserver-hw-mate.log` (70 one-second v2_telemetry buckets,
+captured from a separate drag run because the perf recipe
+defaults to `RUST_LOG=warn` and suppresses INFO-level telemetry),
+`mate.log` (session).
+
+This is the third hardware class — the first with both AMD/RADV
+(matching bee's userspace stack) AND substantial CPU headroom
+(13900k vs bee's 6900HX), AND multi-output. The result
+empirically separates "the bottleneck" into per-axis behaviour
+the bee and yoga captures alone could not distinguish.
+
+### Telemetry summary across 70 buckets
+
+| metric                          | avg     | peak    | bee peak (ref) |
+| ------------------------------- | ------: | ------: | -------------: |
+| `paint_submits/s`               | 6,852   | 18,910  | 2,048          |
+| `queue_submit2/s`               | 7,069   | 19,379  | 2,119          |
+| `composite_submits/s`           | 98      | 121     | 59             |
+| `frame_present_count/s`         | 98      | 121     | 60             |
+| `storage_allocations/s`         | 1,605   | 6,073   | 467            |
+| `image_view_creates/s`          | 1,605   | 6,073   | 467            |
+| `descriptor_allocations/s`      | 255     | 304     | 180 (yoga)     |
+| `descriptor_pool_creates/s`     | 0.04    | 2       | 0              |
+| `descriptor_pool_resets/s`      | 24      | 65      | 6              |
+| `damage_fraction`               | 0.62    | **1.00** | n/a           |
+| `full_redraw_fallback/s`        | 0.06    | 4       | n/a            |
+| `cpu_fence_wait_ns/s`           | 76 ms   | 206 ms  | 12 ms          |
+| `scene_entries_drawn`           | 2,634   | 10,514  | n/a            |
+| `missed_pageflips/s`            | 0       | 0       | 0              |
+
+### What the data says
+
+1. **DescriptorPoolRing scales to silence's load without
+   breaking.** Two pool creates across the whole run (both
+   warmup); `descriptor_allocations/s` stays in yoga-comparable
+   range despite ~9× the paint volume. The ring's recycle path
+   absorbs the higher submit rate cleanly.
+
+2. **Composite submits double per the dual-output prediction.**
+   `composite_submits/s` ≈ 2 × bee's 59. `frame_present_count/s`
+   tracks 1:1, so KMS keeps up on both outputs. Per-output
+   flip-pending gate + per-output dirty tracking hold up under
+   dual-2.5k load.
+
+3. **silence drives ~9× bee's paint volume.** `paint_submits/s`
+   peak 18,910 vs bee's 2,048. Same X11 client traffic (MATE +
+   marco + caja + wezterm) — bee was rate-limited by its CPU
+   never quite catching up, so it never measured the real client
+   demand. silence shows what MATE actually wants to push when
+   nothing's holding it back. Task 3's "aggregate paint
+   submissions" thesis is even more justified at this volume.
+
+4. **`storage_allocations/s = 1605 avg, 6073 peak — 13× bee.**
+   Two effects compound: dual output ~doubles compositor backing
+   allocations, and bigger surfaces miss `PixmapPool` entirely
+   (the pool's `max_pooled_dim=128` covers only small client
+   pixmaps, never compositor-sized backings). Task 5 work needs
+   a separate bucket regime for large surfaces.
+
+5. **CPU fence waits non-trivial:** `cpu_fence_wait_ns/s` avg
+   76 ms (7.6% of one core) peak 206 ms (20%). Still well below
+   the perf-bind threshold on a 13900k, but the absolute number
+   is a Task 6 candidate after Tasks 3 + 5.
+
+### Perf-flamegraph evidence
+
+System-wide capture, full drag duration:
+
+- `swapper` (idle): **97.80%** of CPU. System was overwhelmingly
+  idle; even peak MATE drag couldn't approach saturating the
+  13900k.
+- `yserver` process: **0.52%** of total system CPU (cpu-clock
+  event). Across 32 logical cores this is ~17% of one logical
+  core averaged, peaking to user-observed ~30%.
+
+Inside yserver:
+
+- `libvulkan_radeon.so`: 0.25% children / 0.08% self.
+- `libc.so.6` (`__ioctl`): 0.42% children / 0.06% self.
+- `[unknown]` (kernel + ASLR-stripped frames): 0.45% children /
+  0.27% self.
+- **No Rust symbol in yserver above the 0.05% noise floor.**
+
+Hot call chain (sched_switch event, where off-CPU wait paths
+surface): `main → run → run_core → … → __ioctl (inlined) →
+libvulkan_radeon.so → amdgpu ioctl`. Identical shape to bee.
+
+### What silence tells us that bee/yoga could not
+
+**The submit-rate bottleneck is universal across AMD/RADV; it
+only *binds* where single-core budget runs out.** silence at
+19k submits/s peak burns a comparable single-core fraction to
+bee at 2k/s, because (a) the 13900k single-thread is ~2-3×
+faster per syscall and (b) most of the time yserver is off-CPU
+waiting on KMS retirement, so the kernel can schedule it
+elsewhere when ready. Task 3 (paint aggregation) cuts the cost
+*everywhere*, just visibly only where it binds.
+
+The corollary: there's nothing new to discover in silence's
+perf profile that bee's didn't already say. Same hot path, same
+shape, just diluted by headroom. Don't budget further
+diagnostic time on silence-specific perf.
+
+### Smearing artifact — Task 4 correctness corollary
+
+User reported "smearing/damage artifacts sometimes visible"
+during silence's drag. Telemetry pins the diagnosis cleanly:
+
+- `damage_fraction` hits 1.00 in peak buckets.
+- `full_redraw_fallback/s` stays ~0 across the entire run
+  (0.06 avg, 4 in one isolated bucket).
+
+So `pick_repaint_region` keeps choosing `Clipped` with
+`loadOp=LOAD` even when ~100% of the output is damaged. Clipped
+at 99% damage paints 99% of pixels and leaves the residual ~1%
+as prior buffer-age content — that residual is the smearing
+trail.
+
+**Why silence surfaces this and bee/yoga didn't:** silence is
+the first hardware with enough headroom for X11 clients to push
+damage_fraction to saturation under MATE drag without yserver
+falling behind. On bee, the submit-rate cap kept paint volume
+low enough that damage_fraction stayed well below 1.0; on yoga,
+the descriptor-pool pin pre-fix did the same. silence's headroom
+exposes a correctness gap that the other captures couldn't
+reach.
+
+Task 4 already lists "full redraw when clipping is more
+expensive than redraw" as a goal — this is its correctness
+corollary. Sketch of fix: in `pick_repaint_region`, add a
+`damage_fraction > F → Full` arm before the Clipped path; F
+likely in the 0.6–0.8 range. Verify by re-running silence drag
+and confirming `full_redraw_fallback/s` rises while smearing
+disappears.
+
+### The three-axis hardware split
+
+The per-hardware-class bottleneck split is now empirically
+established:
+
+- **yoga (Snapdragon X1 / Turnip)** — `vkCreateDescriptorPool →
+  msm_ioctl_vm_bind` pin path. **Fixed** by Task 4 layer 1.
+- **bee (Ryzen 9 6900HX / RADV)** — `vkQueueSubmit2` ioctl rate
+  bound by single-thread budget at ~2k/s. **Task 3** (paint
+  aggregation).
+- **silence (i9 13900k / RADV)** — same ioctl-rate cost as bee
+  but ~3-9× the absolute volume, absorbed by single-core
+  headroom. Perf does not bind; the higher damage saturation
+  exposes the `pick_repaint_region` correctness gap (smearing).
+  **Task 4 correctness corollary**.
+
+### Recommended next order on this branch
+
+Unchanged from the bee analysis: Task 3 (paint aggregation) is
+the next perf work. Add Task 4 damage-strategy fix on top
+because (a) it's much cheaper than aggregation, (b) it's
+correctness not perf, (c) silence is the hardware that will
+verify it. Order:
+
+1. **Diagnostic-first** for Task 3: instrument
+   `vkQueueSubmit2` call sites to log per-second submit-kind
+   histograms (paint vs compose vs upload, target distribution,
+   batch-size distribution). Capture on bee under the same drag.
+   Don't design the aggregation boundary until this data exists.
+2. Land the Task 4 `pick_repaint_region` damage-saturation fix.
+   Verify on silence drag: `full_redraw_fallback/s` should rise
+   in proportion to time spent at `damage_fraction > F`;
+   smearing should disappear.
+3. Brainstorm → spec → plan → execute Task 3 (aggregation),
+   same shape as DescriptorPoolRing (Task 4 layer 1).
+4. Re-capture telemetry on all three hardware classes. If bee's
+   `queue_submit2/s` drops to the v1-comparable budget but lag
+   persists, then look at Task 5 (storage allocation pool) with
+   an xtrace — silence's 6073/s peak makes this likely the
+   next-tier work even if bee improves.
+
+The perf branch is staying open across machines through Tasks 3
++ 4 + 5; no intent to land Task 4 layer 1 to master alone.
+
+## Silence 2026-05-22 submit-trace findings (Task 3 design data)
+
+Diagnostic-first per step 1 of the recommended order above.
+`YSERVER_SUBMIT_TRACE` instrumentation landed on `perf` (one row
+per `vkQueueSubmit2`, 14 TSV columns: frame_id, ns_mono, kind,
+target_kind, target_id, batch_size, op, src_class, mask_class,
+pipeline_id, readback, alias, zero_draws, upload). Captured a
+45.5 s MATE drag on silence via `just yserver-mate-hw-telemetry`
+(dual-2.5k, RADV / rx580). Artifacts:
+`yserver-mate.submit.tsv` (27 MB / 380,917 rows).
+
+### Headline
+
+**47.9 % of submits sit in consecutive same-target same-kind
+runs of length ≥ 2.** Coalescing those runs into one CB each
+collapses 143,560 of 380,917 submits — a **37.7 % reduction**
+in absolute submit rate. Average submit rate goes from
+**8,376/s → ~5,200/s post-aggregation**; on bee that lands well
+below the ~2,000/s steady-state where the lag bound, so silence
+post-aggregation should run comfortably and bee should clear the
+user-perceived lag floor.
+
+### Kind distribution
+
+| kind                | total   | in runs ≥2 | coalesce savings |
+| ------------------- | ------: | ---------: | ---------------: |
+| `render_composite`  | 168,016 | 107,079    | **88,467**       |
+| `copy_area`         |  62,255 |  48,480    | **40,237**       |
+| `render_fill`       |  80,189 |  15,716    |  8,262           |
+| `composite_glyphs`  |  21,988 |   7,627    |  4,438           |
+| `render_traps`      |   8,313 |   2,092    |  1,360           |
+| `scene_compose`     |   4,692 |     842    |    431           |
+| `get_image`         |   4,579 |       —    |    —             |
+| `put_image`         |  30,351 |      70    |     48           |
+| `glyph_upload`      |     417 |     364    |    299           |
+| `fill_batch`        |     117 |      35    |     18           |
+
+Three kinds (`render_composite`, `copy_area`, `render_fill`)
+carry **96 % of the savings**. Everything else is rounding error
+at this point.
+
+### Biggest single hotspot — marco compositor → COW via `copy_area`
+
+**46,920 of 62,255 `copy_area` events (75 %) target drawable
+id=35 = COW.** Marco's compositor Present pump fires one
+`copy_area` per damaged region per backing → COW per frame; on
+dual-2.5k with full-window drag, runs of length 12-50 against
+that single target are common. Single-target `copy_area`
+coalescing into one CB would on its own collapse ~40k submits.
+This is the smallest valuable Task 3 slice.
+
+### `render_composite` keys concentrate on 4 tuples
+
+| `op | src_class | mask_class`   | count   | % of `render_composite` |
+| ----------------------------------- | ------: | ----------------------: |
+| `over | direct | no_mask`           |  58,651 | 35 %                    |
+| `src | direct | no_mask`            |  42,439 | 25 %                    |
+| `over | direct | direct`            |  30,709 | 18 %                    |
+| `src | gradient_linear | no_mask`   |   9,695 |  6 %                    |
+| `over | direct | solid`             |   9,604 |  6 %                    |
+| `src | solid | solid`               |   4,451 |  3 %                    |
+| `out_reverse | direct | no_mask`    |   4,253 |  3 %                    |
+| `add | direct | direct`             |   4,253 |  3 %                    |
+| (8 more, ≤ 2k each)                 |   3,961 |  2 %                    |
+
+The aggregation predicate `(target_id, kind, op, src_class,
+mask_class)` catches the runs naturally. No need for more
+nuanced keys (pipeline_id, transforms, repeat modes) — those
+secondary dimensions correlate with the primary key in practice.
+
+### Per-tick burstiness validates main-loop tick as flush point
+
+Loop-tick submit counts span 1 to 52 per tick. ~10k ticks carry
+just one submit; the long tail to 30-50/tick is concentrated
+during MATE animations and compositor Present floods. **End of
+`maybe_composite` is a guaranteed-correct flush boundary**
+because compose reads from every target the engine has touched;
+flushing the pending-op queue immediately before `scene.tick`
+runs gives correctness for free. No cross-tick ordering work
+needed.
+
+### What this gives Task 3 design
+
+1. **Aggregation boundary: end of main-loop tick** (immediately
+   before `maybe_composite` calls `scene.tick`). Engine entry
+   points push onto a `Vec<PendingOp>` on `RenderEngine` instead
+   of recording immediately; the flush method records all
+   compatible-keyed ops into one CB before submit.
+2. **Aggregation key: `(target_id, engine_method, op,
+   src_class, mask_class)`.** Same key = same CB.
+3. **Order preservation per target.** Within a target, push
+   order is record order. Across targets, the order is
+   independent so long as no `get_image` / readback intervenes
+   (those force flush).
+4. **Smallest valuable slice: single-target `copy_area`
+   coalescing for COW (drawable id of `cow_id`).** 40k of the
+   143k savings, isolated to one target, one kind, no per-rect
+   picture-clip plumbing. Prove the aggregation shape works
+   here before extending to `render_composite`.
+5. **Forced flush triggers:** `get_image`, `copy_plane_rb`,
+   `scene_compose`, any X11 reply that observes drawable
+   content, descriptor-pool retirement boundary, command-buffer
+   capacity (per-op CB size cap), and `disable_output`.
+6. **Compatible-keyed run depth: typical 2-15, peak 50.** Sizing
+   the per-target pending-op slab at ~64 ops is enough for the
+   common case; over-cap forces flush.
+
+The submit-trace instrumentation stays in tree under
+`YSERVER_SUBMIT_TRACE=<path>` (off by default, zero hot-path
+cost) for re-capturing post-Task-3 to verify the rate drop.
+
+### Cross-machine status
+
+Bee re-capture under the same recipe is pending hardware
+access. Yoga and bee are both expected to show a similar
+distribution shape (RADV/Turnip differences sit in descriptor
+allocator + ioctl cost, not in client paint-traffic shape).
+The instrumentation can re-run anywhere with no rebuild — same
+recipe, set `YSERVER_SUBMIT_TRACE=…` in env or via the updated
+`-telemetry` recipes.
+
 ## Close protocol
 
 For each task:
