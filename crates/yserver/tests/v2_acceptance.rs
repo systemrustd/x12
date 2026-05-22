@@ -2745,3 +2745,100 @@ fn v2_render_composite_pool_creates_bounded_after_warmup() {
         "pool_count={residency} after warm-up; expected <= 4",
     );
 }
+
+/// Stage 5 Task 4 layer 1 acceptance for the traps call site. Same
+/// three-assertion shape as render_composite — landing both makes
+/// the regression surface explicit since the two engine paths share
+/// the ring acquire helper.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_traps_pool_creates_bounded_after_warmup() {
+    const N: u32 = 2000;
+    const SETS_PER_POOL: u32 = 256;
+    const WARMUP_SLACK: u64 = 4;
+    let expected_creates_upper = u64::from(N / SETS_PER_POOL) + WARMUP_SLACK;
+    let expected_resets_lower = u64::from(N / SETS_PER_POOL).saturating_sub(WARMUP_SLACK);
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let dst_pix = b.create_pixmap(None, 32, 8, 8).expect("dst pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("pre-fill blue");
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid red")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst pic")
+        .expect("Some");
+
+    // Same axis-aligned 4×4 trap used by
+    // v2_render_trapezoids_renders_filled_rect.
+    let mut traps: Vec<u8> = Vec::with_capacity(40);
+    let fields: [i32; 10] = [
+        2 << 16,
+        6 << 16,
+        2 << 16,
+        2 << 16,
+        2 << 16,
+        6 << 16,
+        6 << 16,
+        2 << 16,
+        6 << 16,
+        6 << 16,
+    ];
+    for v in fields {
+        traps.extend_from_slice(&v.to_le_bytes());
+    }
+
+    for i in 0..N {
+        b.render_trapezoids(
+            None,
+            3,
+            src_pic.as_raw(),
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            &traps,
+            0,
+            0,
+        )
+        .unwrap_or_else(|e| panic!("trap #{i} failed: {e:?}"));
+        if i % 32 == 31 {
+            let _ = b
+                .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+                .expect("get_image");
+            b.for_tests_poll_retired();
+        }
+    }
+    let _ = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("final get_image");
+    b.for_tests_poll_retired();
+
+    let t = b.telemetry();
+    let creates = t.lifetime.descriptor_pool_creates;
+    let resets = t.lifetime.descriptor_pool_resets;
+    let residency = b.descriptor_pool_ring_pool_count();
+
+    assert!(
+        creates <= expected_creates_upper,
+        "creates={creates}, expected <= {expected_creates_upper}",
+    );
+    assert!(
+        resets >= expected_resets_lower,
+        "resets={resets}, expected >= {expected_resets_lower}",
+    );
+    assert!(
+        residency <= 4,
+        "pool_count={residency} after warm-up; expected <= 4",
+    );
+}
