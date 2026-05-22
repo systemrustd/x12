@@ -227,6 +227,117 @@ Exit gate: these improve specific workloads without changing the
 observable scene result and without becoming required for basic desktop
 responsiveness.
 
+## Bee 2026-05-22 perf-branch findings
+
+Captured on `perf` branch HEAD `85d5ce7` (DescriptorPoolRing landed
+through Stage 5 Task 4 layer 1 commits `fb058a6..e12a559`). Host:
+`bee` (Ryzen 9 6900HX / RDNA2 / RADV). Workload: MATE desktop, drag
+of a wezterm + caja window. Artifacts:
+`yserver-mate.perf.data` (perf record), `yserver-hw-mate.log`
+(v2_telemetry lines).
+
+### What the ring fix delivered
+
+`descriptor_pool_creates/s = 0` and `descriptor_pool_resets/s = 5-6`
+throughout the drag, confirming the ring recycles as designed. The
+old `vkCreateDescriptorPool → msm_ioctl_vm_bind` hot path that
+dominated yserver CPU on yoga/Turnip is fully gone. On bee, the
+equivalent path was never material in the first place — RADV doesn't
+shmem-pin pool memory the way Turnip does.
+
+### Where the bee drag CPU actually goes
+
+Telemetry snapshot at drag peak (2026-05-22 06:05:59):
+
+```
+paint_submits/s       = 2048
+queue_submit2/s       = 2119
+composite_submits/s   = 59       (one per frame at 60 Hz — fine)
+cpu_fence_wait_ns/s   = 11.97 ms (37 waits/s)
+storage_allocations/s = 467
+image_view_creates/s  = 467
+descriptor_pool_creates/s = 0    ← ring fix working
+descriptor_pool_resets/s  = 6    ← ring recycling
+avg_compose_cb_record_ns  = 478,374
+```
+
+`perf report` against the same drag confirms yserver's user-space
+hot path is entirely flat (no Rust symbol above 0.05%); the cost
+sits in `libc.so:ioctl → libvulkan_radeon → amdgpu` — i.e. the
+syscall round-trip of ~2k `vkQueueSubmit2/s`. Aggregate yserver CPU
+is 4.26% of 16 logical cores ≈ ~70% of one core averaged, pegging
+one core during burst.
+
+### Image-view caching is NOT the next fix
+
+Investigated 2026-05-22 (this session). Findings:
+
+- `record_image_view_create` is co-located with
+  `record_storage_allocation` at all 5 backend sites
+  (`backend.rs:979, 2386, 4689, 4805, 8114`). The 1:1 ratio is by
+  counter design, not redundant view creation.
+- The 5 sites are all X11-protocol-driven *storage* allocations
+  (`init_root_storage`, `allocate_window_storage`,
+  `get_overlay_window`, `create_pixmap`, DRI3 import). Each is a
+  first-time create.
+- The existing `drawable_view_cache: HashMap<(DrawableId,
+  SamplerConfig, SwizzleClass), CachedDrawableView>` on
+  `RenderEngineInner` (engine.rs:~4084 + the helper that inserts
+  into it) already handles per-paint sampling reuse. It is not
+  being missed.
+- `mask_scratch` and `dst_readback` grow via
+  `next_power_of_two().max(256)` with a high-water mark — they
+  don't churn per paint either.
+
+So the Task 4 sub-bullet "Avoid per-frame image-view creation"
+isn't a real follow-up on bee; the existing caching already
+delivers it. Leave the bullet in place for completeness but do
+not budget work for it.
+
+### The two real next bottlenecks on bee
+
+1. **`queue_submit2/s = 2119` — Task 3 (aggregate paint
+   submissions).** This is what `perf report` shows as the syscall
+   hot path. 35 submits per frame at 60 Hz means each paint op
+   becomes its own command-buffer + `vkQueueSubmit2` + amdgpu
+   ioctl. Coalescing compatible ops (same target, same pipeline,
+   compatible operator/source class, no readback between them)
+   into single CBs should cut submits an order of magnitude. Note
+   `feedback_perf_branch_2026_05_10` memory: an earlier
+   timeline-semaphore attempt at per-op-wait removal did NOT pan
+   out. Approach: profile what the 2k submits carry (op kinds,
+   target distribution, batch-eligibility) BEFORE designing
+   aggregation. Don't repeat the timeline-semaphore mistake of
+   architectural change without per-op characterization.
+
+2. **`storage_allocations/s = 467` — Task 5 (remove allocation
+   churn).** Each is a fresh X11 pixmap (CreatePixmap /
+   NameWindowPixmap / DRI3 import). Likely marco's compositor
+   backing-pixmap pattern. Xorg pools pixmap memory; yserver
+   currently doesn't. An xtrace under the same drag would identify
+   which X11 request types dominate the 467/s — cheap diagnostic
+   before designing a pool. If a small set of compositor-driven
+   sizes recur, a per-size storage pool buys most of the win.
+
+`cpu_fence_wait_ns/s = 11.97 ms` (~12% of one core) is a third-tier
+concern; Task 6 covers it. Don't touch until Tasks 3 and 5 land.
+
+### Recommended order on this branch
+
+1. **Diagnostic-first** for Task 3: instrument
+   `vkQueueSubmit2` call sites to log per-second submit-kind
+   histograms (paint vs compose vs upload, target distribution,
+   batch-size distribution). Cheap. Don't design the aggregation
+   boundary until this data exists.
+2. **Brainstorm → spec → plan → execute** Task 3 (aggregation),
+   same shape as DescriptorPoolRing (Task 4 layer 1).
+3. Re-capture telemetry + perf on bee. If `queue_submit2/s` drops
+   to the v1-comparable budget but lag persists, then look at
+   Task 5 (storage allocation pool) with an xtrace.
+
+The perf branch is staying open across machines for this work; no
+intent to land Task 4 layer 1 to master yet.
+
 ## Close protocol
 
 For each task:
