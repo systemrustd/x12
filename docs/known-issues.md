@@ -352,6 +352,54 @@ from.
       drop-shadows blending against arbitrary backgrounds) is
       not guaranteed. Marked candidate "Stage 4e" in earlier
       planning; not on the Stage 5 perf path.
+
+      **2026-05-22 investigation note** (gtk3-demo + tooltip CSD
+      shadow): the visible "dense black bar" around GTK3 CSD
+      windows looked at first like a yserver compose bug. Three
+      diagnostic passes ruled out yserver as the cause:
+      1. Pixel-level: backing storage holds GTK's actual CSD
+         shadow profile `α = 151, 128×6, 127, 127, 126, 126, 125,
+         123, …, 67` (dense plateau by GTK design). Marco's
+         `XRenderComposite(Over, src=ARGB32_window_picture,
+         mask=None, dst=offscreen_depth24)` produces the
+         mathematically correct premul result on screen — scanout
+         pixels match `result.rgb = src.rgb + (1-src.a)*dst.rgb`
+         exactly.
+      2. Source-side: `picture_pict_format` correctly returns
+         `RENDER_FMT_ARGB32` (0x4) for the GTK CSD picture →
+         `resolve_force_opaque_pict_format` returns false → src
+         α not stomped to 1.0. Not an ARGB-vs-xRGB intent bug.
+      3. Compositor-side: marco's `window_has_shadow()`
+         (`compositor-xrender.c:1013-1088`) explicitly returns
+         FALSE for `cw->mode == WINDOW_ARGB` windows with no
+         marco frame — gtk3-demo + tooltips never trigger
+         marco's Gaussian soft halo on either Xorg or yserver.
+         The "marco draws a soft shadow around MATE apps but
+         not gtk3-demo" asymmetry is marco's intentional policy,
+         not a yserver path.
+
+      The apparent Xorg-vs-yserver shadow density divergence
+      (Xorg α ≈ 112 vs yserver α = 151 at the inner edge) traces
+      to different GTK theme / wallpaper / session settings
+      between the two reference screenshots — the Xorg
+      session's wallpaper RGB `(75,144,121)` and yserver's
+      `(75,144,117)` differ, indicating different themes were
+      active. GTK draws the same CSD shadow alpha into the
+      pixmap regardless of X server. **PictFormat tracking
+      remains a real correctness gap** for cases where it
+      actually matters (e.g. ARGB sources with xRGB-intent
+      Picture wrappers), but the user-visible gtk3-demo +
+      tooltip "black borders" symptom is GTK's design rendered
+      correctly, not this gap.
+
+      Related fixes shipped 2026-05-22: real EDID physical-mm
+      reporting via RANDR (`drmModeConnector` → `Output`
+      → `RandrOutput.mm_width/mm_height`); see
+      [the `dpi-hardcoded-affects-clients` memory entry].
+      Confirmed via pixel-diff that the CSD shadow alpha in the
+      backing is unchanged by any of these reporting fixes —
+      GTK does not read RANDR or SETUP mm to compute CSD shadow
+      density.
 - [ ] **KmsCore.pictures disconnect cleanup.** Stale Picture
       records from disconnected clients (e.g.
       mate-session-check) can persist in v2's `KmsCore.pictures`,

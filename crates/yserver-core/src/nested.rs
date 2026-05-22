@@ -314,6 +314,10 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         width,
         height,
         vrefresh: 60,
+        // Nested backend has no EDID; `RandrState::output_info` falls
+        // back to 96-DPI synthesis from pixel dims.
+        mm_width: 0,
+        mm_height: 0,
     };
     let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
     // Route root-window drawing/clearing to the host container window

@@ -2894,8 +2894,7 @@ fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
     // by the host_x11/ynest path; KMS dispatch goes
     // `handle_change_gc -> resolve_draw_state ->
     // backend.apply_clip_state(&ClipState::Pixmap)`.
-    use yserver_core::backend::ClipState;
-    use yserver_core::backend::PixmapHandle as ApplyPixmapHandle;
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
     let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
     b.apply_clip_state(
         None,

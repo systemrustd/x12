@@ -16,6 +16,12 @@ pub struct RandrOutput {
     pub width: u16,
     pub height: u16,
     pub vrefresh: u32,
+    /// EDID-derived physical dimensions in millimeters. 0 means
+    /// unknown (e.g. virtio-gpu, displays without EDID, ynest nested
+    /// backend) — `output_info` falls back to a 96-DPI synthesis from
+    /// `width`/`height` in that case.
+    pub mm_width: u32,
+    pub mm_height: u32,
 }
 
 /// One unique mode (deduped by `(width, height, vrefresh)`).
@@ -129,6 +135,10 @@ impl RandrState {
             width,
             height,
             vrefresh: 60,
+            // Nested backend has no EDID; `output_info` falls back to
+            // 96-DPI synthesis from pixel dimensions.
+            mm_width: 0,
+            mm_height: 0,
         };
         Self::from_outputs(timestamp, vec![synthetic])
     }
@@ -208,10 +218,21 @@ impl RandrState {
     ) -> Option<OutputInfoReplyData> {
         let _ = config_timestamp; // accepted but not used
         let out = self.outputs.iter().find(|o| o.output_id == output_id)?;
-        // Per-output mm derived from this output's pixel dimensions at
-        // 96 DPI. Integer math: mm = (px*254 + 480) / 960.
-        let width_mm = ((u32::from(out.width) * 254 + 480) / 960).max(1);
-        let height_mm = ((u32::from(out.height) * 254 + 480) / 960).max(1);
+        // Prefer the EDID-reported physical size (passed through from
+        // the DRM connector); fall back to a 96-DPI synthesis from
+        // pixel dimensions when the connector reports 0 (virtio-gpu,
+        // ynest nested, displays without EDID). Integer 96-DPI math:
+        // mm = (px*254 + 480) / 960.
+        let width_mm = if out.mm_width > 0 {
+            out.mm_width
+        } else {
+            ((u32::from(out.width) * 254 + 480) / 960).max(1)
+        };
+        let height_mm = if out.mm_height > 0 {
+            out.mm_height
+        } else {
+            ((u32::from(out.height) * 254 + 480) / 960).max(1)
+        };
         Some(OutputInfoReplyData {
             timestamp: self.timestamp,
             crtc: out.crtc_id,
@@ -336,6 +357,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
             RandrOutput {
                 name: "HDMI-2".into(),
@@ -347,6 +370,8 @@ mod tests {
                 width: 1280,
                 height: 1024,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -372,6 +397,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -383,6 +410,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -402,6 +431,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -413,10 +444,57 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.modes.len(), 2);
+    }
+
+    #[test]
+    fn output_info_uses_edid_mm_when_present() {
+        let outs = vec![RandrOutput {
+            name: "DP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            // 597 × 336 mm for 2560 × 1440 ≈ 109 DPI (typical EDID
+            // for the user's monitors).
+            mm_width: 597,
+            mm_height: 336,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+        let info = st.output_info(1, 0).expect("output 1 exists");
+        assert_eq!(info.width_mm, 597, "should pass EDID width verbatim");
+        assert_eq!(info.height_mm, 336, "should pass EDID height verbatim");
+    }
+
+    #[test]
+    fn output_info_falls_back_to_96dpi_when_no_edid() {
+        let outs = vec![RandrOutput {
+            name: "ynest-0".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+        let info = st.output_info(1, 0).expect("output 1 exists");
+        // 96-DPI synthesis: 2560 * 25.4 / 96 = 677.3 → 677.
+        assert_eq!(info.width_mm, 677);
+        assert_eq!(info.height_mm, 381);
     }
 
     #[test]
@@ -432,6 +510,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -443,6 +523,8 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);

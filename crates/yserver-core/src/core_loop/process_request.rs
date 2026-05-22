@@ -1980,13 +1980,24 @@ fn handle_randr_request(
                 .enumerate()
                 .map(|(i, o)| {
                     let name_atom = state.atoms.intern(&o.name, false).0;
-                    // mm = px * 25.4 / 96, in integer math: (px*254 + 480)/960
-                    // (numerator is mm*10, denominator 96*10). The previous
-                    // 9600 divisor was off by 10× — gave us ~68 mm for a 2560
-                    // px monitor (≈ 956 DPI), triggering 10× GTK auto-scale
-                    // in mate-panel.
-                    let width_mm = ((u32::from(o.width) * 254 + 480) / 960).max(1);
-                    let height_mm = ((u32::from(o.height) * 254 + 480) / 960).max(1);
+                    // Prefer the EDID-reported physical size from the
+                    // DRM connector; fall back to a 96-DPI synthesis
+                    // (`mm = (px*254 + 480) / 960`) when the connector
+                    // didn't report a size (virtio-gpu, ynest nested,
+                    // displays without EDID). The previous unconditional
+                    // 96-DPI synthesis was off from real EDID by 10-15 %
+                    // on typical 109-DPI panels, causing GTK CSD shadows
+                    // to render denser than on Xorg-native.
+                    let width_mm = if o.mm_width > 0 {
+                        o.mm_width
+                    } else {
+                        ((u32::from(o.width) * 254 + 480) / 960).max(1)
+                    };
+                    let height_mm = if o.mm_height > 0 {
+                        o.mm_height
+                    } else {
+                        ((u32::from(o.height) * 254 + 480) / 960).max(1)
+                    };
                     MonitorRow {
                         name_atom,
                         primary: i == 0,
@@ -16724,6 +16735,8 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

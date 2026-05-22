@@ -591,6 +591,8 @@ impl PlatformBackend {
                     plane_in_fence_fd_prop: None,
                     crtc_out_fence_ptr_prop: None,
                     scanout_modifiers: Vec::new(),
+                    mm_width: 0,
+                    mm_height: 0,
                 },
                 swapchain: drm::Swapchain::empty_for_tests(),
                 x: 0,

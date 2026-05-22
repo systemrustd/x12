@@ -1264,6 +1264,8 @@ impl KmsBackend {
                     plane_in_fence_fd_prop: None,
                     crtc_out_fence_ptr_prop: None,
                     scanout_modifiers: Vec::new(),
+                    mm_width: 0,
+                    mm_height: 0,
                 },
                 swapchain: crate::drm::Swapchain::empty_for_tests(),
                 x: 0,
@@ -8217,6 +8219,8 @@ impl KmsBackend {
                     width: layout.width,
                     height: layout.height,
                     vrefresh,
+                    mm_width: layout.output.mm_width,
+                    mm_height: layout.output.mm_height,
                 }
             })
             .collect()
@@ -13275,6 +13279,8 @@ mod tests {
                 plane_in_fence_fd_prop: None,
                 crtc_out_fence_ptr_prop: None,
                 scanout_modifiers: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
             },
             swapchain: crate::drm::Swapchain::empty_for_tests(),
             x,

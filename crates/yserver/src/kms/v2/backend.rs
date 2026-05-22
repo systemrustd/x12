@@ -1400,6 +1400,8 @@ impl KmsBackendV2 {
                     width: layout.width,
                     height: layout.height,
                     vrefresh,
+                    mm_width: layout.output.mm_width,
+                    mm_height: layout.output.mm_height,
                 }
             })
             .collect()
@@ -13490,7 +13492,8 @@ mod tests {
 
         // Expected order: top strip, bottom strip, left middle,
         // right middle (Xorg/pixman band order).
-        let want = [vk::Rect2D {
+        let want = [
+            vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
                     width: 997,
@@ -13517,7 +13520,8 @@ mod tests {
                     width: 11,
                     height: 600,
                 },
-            }];
+            },
+        ];
 
         assert_eq!(
             got.len(),

@@ -154,19 +154,16 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
         id.0, setup.protocol_major, setup.protocol_minor, resp.resource_id_base
     );
 
-    // Standard X11 servers conventionally report 1024×768 px as
-    // 677 mm × 381 mm (≈ 38 / 51 DPI — the "1600×1200 monitor at
-    // 1024×768 resolution" assumption baked into xts5 and many
-    // legacy app heuristics). Scale linearly from the actual pixel
-    // dimensions to preserve that ratio.
-    const REF_WIDTH_PX: u32 = 1024;
-    const REF_HEIGHT_PX: u32 = 768;
-    const REF_WIDTH_MM: u32 = 677;
-    const REF_HEIGHT_MM: u32 = 381;
-    let screen_width_mm = (u32::from(resp.screen_width_px) * REF_WIDTH_MM / REF_WIDTH_PX)
+    // mm = px * 25.4 / 96 (integer form: (px*254 + 480) / 960).
+    // Matches Xorg's and Xwayland's SETUP-reply convention: 5120 px →
+    // 1354 mm, 1440 px → 381 mm. Matches xts5's tetexec.cfg
+    // XT_WIDTH_MM/XT_HEIGHT_MM expectations. Real per-monitor mm
+    // (from EDID via DRM connector) is reported separately via RANDR
+    // GetOutputInfo.
+    let screen_width_mm = ((u32::from(resp.screen_width_px) * 254 + 480) / 960)
         .max(1)
         .min(u32::from(u16::MAX)) as u16;
-    let screen_height_mm = (u32::from(resp.screen_height_px) * REF_HEIGHT_MM / REF_HEIGHT_PX)
+    let screen_height_mm = ((u32::from(resp.screen_height_px) * 254 + 480) / 960)
         .max(1)
         .min(u32::from(u16::MAX)) as u16;
 

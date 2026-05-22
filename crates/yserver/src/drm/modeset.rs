@@ -95,6 +95,13 @@ pub struct Output {
     /// means the driver did not expose IN_FORMATS or parsing failed;
     /// callers should fall back to conservative legacy probing.
     pub scanout_modifiers: Vec<u64>,
+    /// EDID-derived physical width of the connected display in
+    /// millimeters. 0 if the connector did not report a size (e.g.
+    /// virtio-gpu, displays without EDID); callers should fall back
+    /// to a 96-DPI synthesis from pixel dimensions.
+    pub mm_width: u32,
+    /// EDID-derived physical height; see [`Self::mm_width`].
+    pub mm_height: u32,
 }
 
 /// One connected connector along with its candidate CRTCs and primary planes.
@@ -332,6 +339,8 @@ fn finalize_output(
         if picked.preferred { ", preferred" } else { "" }
     );
 
+    let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
+
     Ok(Output {
         connector: asg.connector,
         connector_name: asg.connector_name,
@@ -344,6 +353,8 @@ fn finalize_output(
         plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop,
         scanout_modifiers,
+        mm_width,
+        mm_height,
     })
 }
 
