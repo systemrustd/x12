@@ -11039,4 +11039,97 @@ mod tests {
             "reset count must be non-decreasing after fence retires"
         );
     }
+
+    /// Phase A T15: empty flush must NOT consume an open-batch ticket.
+    ///
+    /// Regression test for the {ticket=None, entries=non-empty} panic state.
+    /// Sequence:
+    ///   1. `cow_copy_area` opens a batch (ticket=Some, entries=empty).
+    ///   2. An empty flush fires (simulating PageflipRetire while batch is
+    ///      still mid-recording). Pre-fix: ticket dropped here → bug state.
+    ///      Post-fix: ticket survives.
+    ///   3. `flush_cow_batch` appends batch.cb to the group.
+    ///   4. A final flush drains normally (pre-fix: panics; post-fix: Ok).
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn empty_flush_preserves_open_batch_ticket() {
+        let Some(mut p) = try_for_tests_with_vk() else {
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        let src = engine
+            .create_pixmap(&mut store, &mut p, 0x1, 4, 4, 32)
+            .unwrap();
+        let cow = engine
+            .create_pixmap(&mut store, &mut p, 0x2, 4, 4, 32)
+            .unwrap();
+
+        // Drain setup CBs (each create_pixmap's zero-fill).
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .unwrap();
+        engine.drain_all(&mut p);
+        assert!(!p.submit_group_is_open(), "setup drained");
+
+        // Open a cow_batch: begin_op_cb opens the group's ticket.
+        // batch.cb is recorded but NOT yet appended to the group.
+        engine
+            .cow_copy_area(
+                &mut store,
+                &mut p,
+                cow,
+                src,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D::default(),
+            )
+            .unwrap();
+        // Invariant: ticket open, entries still empty (batch.cb not yet
+        // appended to the group — that happens in flush_cow_batch).
+        assert!(p.submit_group_is_open(), "cow_batch opened the ticket");
+        assert_eq!(p.submit_group_size(), 0, "batch.cb not yet appended");
+
+        // Empty flush (simulating PageflipRetire firing while cow_batch is
+        // still mid-recording).  Pre-fix: ticket consumed → bug state.
+        // Post-fix: ticket survives.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::PageflipRetire,
+            )
+            .unwrap();
+        assert!(
+            p.submit_group_is_open(),
+            "empty flush must preserve open batch ticket"
+        );
+        assert_eq!(p.submit_group_size(), 0);
+
+        // flush_cow_batch appends batch.cb to the group.
+        // Pre-fix: the subsequent flush_submit_group panics at
+        // "non-empty group has ticket".  Post-fix: this completes Ok.
+        engine
+            .flush_cow_batch(&mut store, &mut p)
+            .expect("must not panic");
+
+        // Drain — verify clean end-state.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SceneCompose,
+            )
+            .unwrap();
+        engine.drain_all(&mut p);
+        assert!(!p.submit_group_is_open(), "drained");
+        assert_eq!(engine.pending_group_ops_count_for_tests(), 0);
+    }
 }

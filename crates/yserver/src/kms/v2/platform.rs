@@ -1436,9 +1436,12 @@ impl PlatformBackend {
         &mut self,
         reason: FlushReason,
     ) -> Result<FlushOutcome, vk::Result> {
-        let (entries, ticket) = self.submit_group.take();
-        if entries.is_empty() {
-            drop(ticket);
+        // Empty-group fast path: do NOT consume the ticket.  An open
+        // cow/render_batch may still be mid-recording (ticket Some,
+        // entries empty).  Dropping the ticket here would force the
+        // batch's eventual append to land in a ticket-less group,
+        // tripping the "non-empty group has ticket" expect below.
+        if self.submit_group.size() == 0 {
             let outcome = FlushOutcome {
                 flushed_entries: 0,
                 reason,
@@ -1447,7 +1450,9 @@ impl PlatformBackend {
             self.last_flush_outcome = Some(outcome);
             return Ok(outcome);
         }
+        let (entries, ticket) = self.submit_group.take();
         let n = entries.len();
+        // entries is guaranteed non-empty here (early-returned above).
         let Some(vk) = self.vk.as_ref() else {
             // Vk-less test fixture: drop entries + ticket on the floor.
             let outcome = FlushOutcome {
