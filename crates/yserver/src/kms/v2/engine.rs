@@ -10951,4 +10951,92 @@ mod tests {
 
         engine.drain_all(&mut p);
     }
+
+    /// Phase A T13: `DescriptorPoolRing::release_up_to` must NOT recycle
+    /// pools while a SubmitGroup is still open (parked `pending_group_ops`
+    /// not yet submitted). Pool resets happen only AFTER the shared fence
+    /// signals, i.e. after `flush_submit_group` + `drain_all`.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_descriptor_ring_does_not_reset_in_use_group() {
+        let Some(mut p) = try_for_tests_with_vk() else {
+            return;
+        };
+        // cap=16 (production default) — 8 composites will not trigger
+        // an auto-flush, so they all park in pending_group_ops.
+        assert_eq!(p.submit_group_max_size_for_tests(), 16, "cap=16");
+
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        let dst = engine
+            .create_pixmap(&mut store, &mut p, 0x1d13_0001, 16, 16, 32)
+            .expect("dst");
+        let src = engine
+            .create_pixmap(&mut store, &mut p, 0x1d13_0002, 16, 16, 32)
+            .expect("src");
+
+        // Drain setup CBs so we start from an empty group + known baseline.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+        assert!(!p.submit_group_is_open(), "setup drained");
+
+        let before_resets = engine.descriptor_pool_resets_lifetime();
+
+        // 8 composites inside one open group (cap=16 → no auto-flush).
+        for i in 0..8u32 {
+            drive_render_composite_same_key_for_tests(
+                &mut engine,
+                &mut store,
+                &mut p,
+                dst,
+                src,
+                &[(i as i32, 0, 4, 4)],
+            );
+            engine
+                .flush_render_batch(&mut store, &mut p)
+                .expect("flush_render_batch");
+        }
+
+        // Group is still open; shared fence has NOT been submitted yet.
+        // pending_group_ops_count_for_tests() counts the CBs parked in
+        // the engine's own pending_group_ops Vec (engine side), which
+        // must be non-zero if any composite landed.
+        assert!(
+            p.submit_group_is_open(),
+            "group should still be open with 8 parked CBs (cap=16)"
+        );
+        assert!(
+            engine.pending_group_ops_count_for_tests() > 0,
+            "pending_group_ops must hold parked work while group is open"
+        );
+
+        let mid_resets = engine.descriptor_pool_resets_lifetime();
+        assert_eq!(
+            mid_resets, before_resets,
+            "no pool reset while group open: release_up_to must not recycle in-use pools"
+        );
+
+        // Flush + drain so the shared fence retires and pools can recycle.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SceneCompose,
+            )
+            .expect("flush ok");
+        engine.drain_all(&mut p);
+
+        // After the fence retires the ring may (or may not) have rotated
+        // past the pool cap and triggered resets.  What is guaranteed:
+        // the counter is non-decreasing.
+        let after_resets = engine.descriptor_pool_resets_lifetime();
+        assert!(
+            after_resets >= mid_resets,
+            "reset count must be non-decreasing after fence retires"
+        );
+    }
 }
