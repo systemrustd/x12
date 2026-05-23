@@ -2547,6 +2547,93 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     tail). All T3.6 stop-and-investigate conditions clear — proceeding
     to T4 (cap=16 + scene-compose flush).
 
+    **2026-05-23 yoga Phase A full capture** (Snapdragon X1E / Adreno
+    X1 / Turnip, MATE drag, full Phase A in tree at HEAD `189e8dd` —
+    cap=16, all four flush triggers (sync_boundary, scene_compose,
+    pageflip_retire, present_completion_signal) wired, plus the T6/T7
+    close-batches-before-flush fix (189e8dd) and the empty-flush
+    open-batch-ticket fix (b1cbbe9) that bee MATE drag at cap=16
+    surfaced as latent invariant violations):
+      - `queue_submit2/s` steady 1500-2100, peak 5752 (vs pre-Phase-A
+        yoga peak ~8200; ~30 % collapse on peaks, similar on steady).
+      - `submit_group_size_avg` steady 6.0-7.5, peak 12.19;
+        `submit_group_size_max_in_window` mostly cap-bound at 16.
+      - `submit_group_flushes/s` steady 250-350, peak 610.
+      - Flush-reason split: `present_completion_signal/s` 114-180
+        (dominant — every COW PRESENT), `scene_compose/s` ~60,
+        `pageflip_retire/s` ~60, `max_size/s` 60-142, `sync_boundary/s`
+        6-92 (get_image bursts), `shutdown/s` 0.
+      - `submit_group_aborts/s` = 0 (no failed submits, no UAFs).
+      - `active_staging_bytes_high_water` = 21.7 MB (matches spec's
+        "16 × worst-op footprint" envelope).
+      - `active_descriptor_pool_count_high_water` = 2 (no ring
+        pressure on this hardware).
+      - `cpu_fence_wait_ns/s` steady 0; occasional 12-88 ms bursts
+        on `get_image` paths.
+      - **Anomaly:** `submit_group_size_max_in_window` shows values
+        > cap (18, 24, 25, 26) in some peak rows. Reproduces on iMac
+        too — real telemetry-or-cap-check bug, not yoga-specific.
+        Filed but not Phase-A blocking.
+      - User subjective: lag-free, but yoga was already lag-free
+        pre-Phase-A (Task 4 layer 1 fixed yoga's pathology). So no
+        perceptible win, no regression — what we expected.
+
+    **2026-05-23 iMac 19,2 Phase A capture** (NEW analogue platform,
+    Intel i5-8500 + Radeon Pro Polaris Baffin / GCN4 / RADV,
+    `connector=eDP-1` at 3840x2160, Ubuntu, same Phase A branch
+    `189e8dd`). Same GCN4 generation as `silence`'s rx580. See
+    [[reference-imac-19-2-bee-analogue]]:
+      - `queue_submit2/s` steady 2400-3700, peak 3671.
+      - `submit_group_size_avg` steady **9-10.6** (notably higher
+        than yoga's 6-7.5) — same code + cap, AMD just produces
+        more consecutive paint CBs between flush triggers because
+        the 4K display drives `render_batches_flushed/s` 700-950
+        (vs yoga's 350-500).
+      - `max_size` flush-reason fires **140-250/s** = 50-55 % of all
+        flushes (vs yoga's ~20 %). **Spec's "cap=16 is a guess,
+        retune from telemetry" open question now has a concrete
+        answer for AMD: cap is too low.** Filed as Phase A T15
+        tuning input.
+      - `submit_group_aborts/s` = 0, no panics, no errors. Only
+        warning is the same `VK_EXT_image_drm_format_modifier`
+        fallback `silence` (rx580) hit — modifier path missing on
+        Polaris under RADV but the desktop renders correctly via a
+        fallback scanout path. Not Phase-A-induced.
+      - Clean shutdown (`shutting down` → `master released` →
+        `console state restored`). An earlier pre-Phase-A run on
+        this iMac hung on zap; the Phase A run shuts down cleanly.
+        Single observation each, but it's the inverse of "Phase A
+        introduced a shutdown bug."
+      - Same `submit_group_size_max_in_window > cap` anomaly as
+        yoga (sgm=18, 20, 25, 26 in peak rows) — confirmed
+        platform-independent.
+
+    **2026-05-23 bee MATE-load freeze (UNRESOLVED, blocks Phase A
+    T15 close):** with full Phase A in tree at `189e8dd`, yserver
+    loads MATE and then freezes on bee (Ryzen 9 6900HX / RDNA2,
+    Arch Linux). User reported; logs not yet captured (Ctrl-Alt-Bsp
+    + RUST_BACKTRACE not retrievable from frozen state).
+    Cross-platform triangulation tonight makes the hypothesis space
+    much smaller:
+      - **Not generic Phase A bug** — yoga (Adreno/Turnip) and iMac
+        (Polaris/RADV) both run Phase A clean on the same commit.
+      - **Not generic RADV/amdgpu bug** — iMac is RADV/amdgpu and
+        works.
+      - **Not generic kernel-7.0 bug** — both bee and iMac run
+        Linux 7.x kernels.
+      - **Not CPU-budget** — bee has 8c/16t vs iMac's 6c/6t; bee
+        has *more* single-thread headroom.
+      - **Narrowed to:** RDNA2-specific RADV/kernel code paths
+        AND/OR Arch's Mesa-current vs Ubuntu's older Mesa. RADV
+        has separate GFX10.3 (RDNA2) submit paths vs GFX8/9
+        (Polaris/Vega) where Phase A's many-CBs-per-`vkQueueSubmit2`
+        could regress one but not the other.
+      - **Next-session first action on bee:** `vulkaninfo |
+        grep -E 'driverName|driverInfo'` to pin the exact Mesa
+        version. Then either downgrade Mesa to a known-good or
+        bring up `mesa-tkg-git` to bisect. iMac is the green
+        reference; yoga is independent corroboration.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
