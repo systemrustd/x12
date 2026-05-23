@@ -50,7 +50,10 @@ use crate::{
     drm,
     kms::{
         backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
-        v2::store::Storage,
+        v2::{
+            store::Storage,
+            submit_group::{FlushReason, SubmitGroup},
+        },
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
@@ -391,6 +394,20 @@ pub(crate) struct PageFlipRetirement {
 }
 
 // ────────────────────────────────────────────────────────────────
+// FlushOutcome
+// ────────────────────────────────────────────────────────────────
+
+/// Phase A: result of a `flush_submit_group` call. Same shape on
+/// both Ok and Err paths; the `aborted` flag distinguishes them.
+/// Task 3.5 hooks the deferred-queue drain that consumes this.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FlushOutcome {
+    pub(crate) flushed_entries: usize,
+    pub(crate) reason: FlushReason,
+    pub(crate) aborted: bool,
+}
+
+// ────────────────────────────────────────────────────────────────
 // PlatformBackend
 // ────────────────────────────────────────────────────────────────
 
@@ -468,6 +485,14 @@ pub(crate) struct PlatformBackend {
     /// composite tick should bail.
     pub(crate) renderer_failed: bool,
     pub(crate) shutting_down: bool,
+
+    /// Phase A: multi-CB accumulator. Populated by Task 3 callers;
+    /// flushed via `flush_submit_group`.
+    submit_group: SubmitGroup,
+
+    /// Phase A: last `FlushOutcome` produced by `flush_submit_group`.
+    /// Consumed exactly once by `take_last_flush_outcome`.
+    last_flush_outcome: Option<FlushOutcome>,
 
     /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
     /// failed (best-effort; SW fallback kicks in) or on the test
@@ -645,6 +670,8 @@ impl PlatformBackend {
             renderer_failed: false,
             shutting_down: false,
             cursor_plane,
+            submit_group: SubmitGroup::new(),
+            last_flush_outcome: None,
         })
     }
 
@@ -721,6 +748,8 @@ impl PlatformBackend {
             renderer_failed: false,
             shutting_down: false,
             cursor_plane: None,
+            submit_group: SubmitGroup::new(),
+            last_flush_outcome: None,
         }
     }
 
@@ -1358,6 +1387,141 @@ impl PlatformBackend {
         }
     }
 
+    // ── Phase A: SubmitGroup API ─────────────────────────────────
+
+    /// Phase A: count of CBs pending in the open submit group. Tests
+    /// + telemetry consult this; 0 when the group is empty.
+    pub(crate) fn submit_group_size(&self) -> usize {
+        self.submit_group.size()
+    }
+
+    /// Phase A: true if any CB has been appended since the last flush.
+    pub(crate) fn submit_group_is_open(&self) -> bool {
+        self.submit_group.is_open()
+    }
+
+    /// Phase A: explicit flush of any buffered submit group. Issues one
+    /// `vkQueueSubmit2` with all buffered CBs + signal semaphores,
+    /// signaling the group's shared fence. Empty group → `Ok(FlushOutcome {
+    /// flushed_entries: 0 })`. Vk-less fixture → same.
+    ///
+    /// Sets `renderer_failed` on `queue_submit2` failure (Phase A fatal
+    /// policy for drawable state; SubmittedOp rollback is engine-side
+    /// via `pending_group_ops`).
+    pub(crate) fn flush_submit_group(
+        &mut self,
+        reason: FlushReason,
+    ) -> Result<FlushOutcome, vk::Result> {
+        let (entries, ticket) = self.submit_group.take();
+        if entries.is_empty() {
+            drop(ticket);
+            let outcome = FlushOutcome {
+                flushed_entries: 0,
+                reason,
+                aborted: false,
+            };
+            self.last_flush_outcome = Some(outcome);
+            return Ok(outcome);
+        }
+        let n = entries.len();
+        let Some(vk) = self.vk.as_ref() else {
+            // Vk-less test fixture: drop entries + ticket on the floor.
+            let outcome = FlushOutcome {
+                flushed_entries: n,
+                reason,
+                aborted: false,
+            };
+            self.last_flush_outcome = Some(outcome);
+            return Ok(outcome);
+        };
+        let ticket = ticket.expect("non-empty group has ticket");
+        let cb_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = entries
+            .iter()
+            .map(|e| vk::CommandBufferSubmitInfo::default().command_buffer(e.cb))
+            .collect();
+        let sig_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = entries
+            .iter()
+            .filter_map(|e| {
+                e.signal.map(|s| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(s)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                })
+            })
+            .collect();
+        let submit = [{
+            let s = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
+            if sig_infos.is_empty() {
+                s
+            } else {
+                s.signal_semaphore_infos(&sig_infos)
+            }
+        }];
+        crate::vk_count!(queue_submit2);
+        match unsafe {
+            vk.device
+                .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
+        } {
+            Ok(()) => {
+                let outcome = FlushOutcome {
+                    flushed_entries: n,
+                    reason,
+                    aborted: false,
+                };
+                self.last_flush_outcome = Some(outcome);
+                Ok(outcome)
+            }
+            Err(e) => self.abort_flush(entries, n, reason, e),
+        }
+    }
+
+    /// Phase A: shared abort path. Frees the just-taken CBs, stashes
+    /// the `aborted: true` `FlushOutcome`, sets `renderer_failed`, and
+    /// surfaces the underlying `vk::Result`. Both the real
+    /// `queue_submit2 Err` arm and the test-only fault injection
+    /// (Task 3 Step 7) route through this helper so cleanup is uniform.
+    fn abort_flush(
+        &mut self,
+        entries: Vec<super::submit_group::GroupEntry>,
+        n: usize,
+        reason: FlushReason,
+        err: vk::Result,
+    ) -> Result<FlushOutcome, vk::Result> {
+        self.renderer_failed = true;
+        if let (Some(vk), Some(pool)) = (self.vk.as_ref(), self.ops_command_pool_handle()) {
+            let cbs: Vec<vk::CommandBuffer> = entries.iter().map(|e| e.cb).collect();
+            if !cbs.is_empty() {
+                unsafe { vk.device.free_command_buffers(pool, &cbs) };
+            }
+        }
+        let outcome = FlushOutcome {
+            flushed_entries: n,
+            reason,
+            aborted: true,
+        };
+        self.last_flush_outcome = Some(outcome);
+        Err(err)
+    }
+
+    /// Phase A: seed the group's shared ticket if not open, then return
+    /// a clone for the caller to stash on its `SubmittedOp`. Mirrors the
+    /// per-op ticket acquisition from today's `begin_op_cb` but the same
+    /// ticket is handed back to every appender in the group.
+    pub(crate) fn submit_group_ticket_or_open(&mut self) -> Result<FenceTicket, vk::Result> {
+        if let Some(t) = self.submit_group.ticket() {
+            return Ok(t.clone());
+        }
+        let fresh = self.acquire_fence_ticket()?;
+        Ok(self.submit_group.open_with(fresh))
+    }
+
+    /// Phase A: consume the last `FlushOutcome` stored by
+    /// `flush_submit_group`. Returns `None` if no flush has occurred
+    /// since the last call.
+    pub(crate) fn take_last_flush_outcome(&mut self) -> Option<FlushOutcome> {
+        self.last_flush_outcome.take()
+    }
+
     // ── I6a: FenceTicket primitives ─────────────────────────────
 
     /// Acquire a fresh, unsignaled fence. Caller passes
@@ -1670,6 +1834,24 @@ mod tests {
         let g = p.record_present(0, 0);
         p.commit_bo_present(0, 0, g); // bo_generations[0] is empty — no-op
         p.commit_bo_present(99, 99, g); // out-of-range — no-op
+    }
+
+    #[test]
+    fn platform_starts_with_empty_closed_submit_group() {
+        let p = PlatformBackend::for_tests();
+        assert!(!p.submit_group_is_open(), "fresh platform has closed group");
+        assert_eq!(p.submit_group_size(), 0);
+    }
+
+    #[test]
+    fn flush_submit_group_empty_is_noop() {
+        let mut p = PlatformBackend::for_tests();
+        // Fixture has no Vk; should NOT attempt queue_submit2.
+        let outcome = p
+            .flush_submit_group(FlushReason::SceneCompose)
+            .expect("empty-group flush is always Ok");
+        assert_eq!(outcome.flushed_entries, 0);
+        assert!(!p.submit_group_is_open());
     }
 
     #[test]
