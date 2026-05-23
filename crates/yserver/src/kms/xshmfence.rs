@@ -66,6 +66,30 @@ impl FenceMapping {
         unsafe { xshmfence_trigger(self.ptr) }
     }
 
+    /// `trigger()` with the raw return code mapped to `io::Result`.
+    /// Single source of truth for the trait impl + any future
+    /// migration of the existing `i32`-returning call sites.
+    pub fn trigger_io(&self) -> std::io::Result<()> {
+        let r = self.trigger();
+        if r < 0 {
+            Err(std::io::Error::other(format!("xshmfence_trigger: {r}")))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only zero-content constructor. The struct's single field
+    /// is a raw `*mut xshmfence`; a null ptr is safe because `Drop`
+    /// already checks for null (it would otherwise UB on a real
+    /// `xshmfence_unmap_shm(null)` call). Used by Task 2's Arc
+    /// lifetime-pinning unit test.
+    #[cfg(test)]
+    pub fn for_tests_dummy() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+        }
+    }
+
     /// Reset the fence back to untriggered.
     #[allow(dead_code)]
     pub fn reset(&self) {
@@ -86,5 +110,19 @@ impl Drop for FenceMapping {
             // SAFETY: we own the mapping until Drop fires once.
             unsafe { xshmfence_unmap_shm(self.ptr) };
         }
+    }
+}
+
+impl std::fmt::Debug for FenceMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FenceMapping")
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
+impl yserver_core::backend::XshmfenceHandle for FenceMapping {
+    fn trigger(&self) -> std::io::Result<()> {
+        self.trigger_io()
     }
 }

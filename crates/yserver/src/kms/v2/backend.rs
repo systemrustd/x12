@@ -218,7 +218,7 @@ pub struct KmsBackendV2 {
     /// futex) for idle/sync fences; the mmap'd mapping lets us
     /// `xshmfence_trigger` directly when the X side wants to
     /// signal idle. Mirrors v1's `dri3_xshmfences` field shape.
-    pub(crate) dri3_xshmfences: HashMap<u32, crate::kms::xshmfence::FenceMapping>,
+    pub(crate) dri3_xshmfences: HashMap<u32, std::sync::Arc<crate::kms::xshmfence::FenceMapping>>,
     /// DRI3 sync-fence / syncobj resources keyed by the client's
     /// xid. Either `FenceFromFD` falling through the xshmfence
     /// path (sync_file fd → `VkSemaphore`) or `ImportSyncobj`
@@ -8753,7 +8753,8 @@ impl Backend for KmsBackendV2 {
         // the fd really is a sync_file).
         use std::os::fd::AsFd as _;
         if let Some(mapping) = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()) {
-            self.dri3_xshmfences.insert(fence_xid, mapping);
+            self.dri3_xshmfences
+                .insert(fence_xid, std::sync::Arc::new(mapping));
             log::debug!("DRI3 FenceFromFD 0x{fence_xid:x}: imported as xshmfence");
             return Ok(());
         }
@@ -8781,6 +8782,16 @@ impl Backend for KmsBackendV2 {
         // so a server-only `triggered=true` mirror is sufficient
         // — no GPU operation needed here.
         Ok(())
+    }
+
+    fn dri3_xshmfence_handle(
+        &self,
+        fence_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
+        self.dri3_xshmfences
+            .get(&fence_xid)
+            .cloned()
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
     }
 
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
@@ -14220,5 +14231,49 @@ mod tests {
             (2387, 0),
             "offset must place the paint at nm-applet's screen-coord position within mate-panel's backing"
         );
+    }
+
+    /// Stage 5 Task 6.1 (foundation prereq #2): the by-handle xshmfence
+    /// accessor returns an Arc clone that pins the underlying
+    /// `FenceMapping` alive past `XFixesDestroyFence` (registry
+    /// removal). Two clones plus the registry entry should give a
+    /// strong count of 3; after removing the registry entry the
+    /// caller-held clones still keep the primitive alive (Drop sees a
+    /// non-shared Arc).
+    #[test]
+    fn xshmfence_handle_accessor_returns_arc_clone() {
+        // Construct a backend without Vk (skip if test fixture needs it).
+        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Manually inject an entry into the registry — bypass the
+        // protocol path (DRI3 FenceFromFD) since constructing a real
+        // xshmfence FD in a unit test is fragile.
+        let xid = 0x1234_5678_u32;
+        let mapping = crate::kms::xshmfence::FenceMapping::for_tests_dummy();
+        b.dri3_xshmfences.insert(xid, std::sync::Arc::new(mapping));
+        let h1 = b.dri3_xshmfence_handle(xid).expect("handle present");
+        assert_eq!(
+            std::sync::Arc::strong_count(&h1),
+            2,
+            "registry + caller should both hold a reference"
+        );
+        let h2 = b.dri3_xshmfence_handle(xid).expect("second handle");
+        assert_eq!(
+            std::sync::Arc::strong_count(&h1),
+            3,
+            "registry + two callers should all hold references"
+        );
+        let _ = h1;
+        let _ = h2;
+        // Drop the registry entry (mimics XFixesDestroyFence).
+        b.dri3_xshmfences.remove(&xid);
+        // Accessor returns None now; but the caller's Arc clones
+        // still pin the FenceMapping alive (no destructor panic).
+        assert!(b.dri3_xshmfence_handle(xid).is_none());
     }
 }

@@ -192,6 +192,19 @@ impl Dri3Caps {
     }
 }
 
+/// Stage 5 Task 6.1: opaque handle to a DRI3 xshmfence's underlying
+/// shared-memory segment. Concrete impl in `yserver::kms::xshmfence::
+/// FenceMapping`. Held as `Arc<dyn XshmfenceHandle>` by the deferred
+/// PRESENT completion path so the underlying primitive can be
+/// lifetime-pinned past `XFixesDestroyFence` while the resource id's
+/// registry entry is dropped.
+pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
+    /// Set the shared-memory fence's counter so any futex waiter on
+    /// the client side wakes up. Mirrors the body of the existing
+    /// `Backend::dri3_trigger_fence(xid)` after its registry lookup.
+    fn trigger(&self) -> std::io::Result<()>;
+}
+
 /// The dynamic backend surface. `Send` is required so that
 /// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
 /// `T: Send`). `Sync` on the trait itself is not required because all
@@ -1311,6 +1324,27 @@ pub trait Backend: Send {
     /// `idle_fence` when the GPU finishes reading.
     fn dri3_trigger_fence(&mut self, _fence_xid: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Stage 5 Task 6.1: take an Arc clone of the xshmfence's
+    /// underlying primitive, suitable for deferred completion paths
+    /// that need to survive an intervening `XFixesDestroyFence`.
+    /// Returns `None` if the xid isn't in the registry at call time.
+    fn dri3_xshmfence_handle(
+        &self,
+        _fence_xid: u32,
+    ) -> Option<std::sync::Arc<dyn XshmfenceHandle>> {
+        None
+    }
+
+    /// Stage 5 Task 6.1: trigger the xshmfence via a held Arc clone,
+    /// bypassing xid lookup. Used by the deferred PRESENT completion
+    /// drain when the resource id may have been freed mid-flight.
+    fn dri3_trigger_fence_via_handle(
+        &mut self,
+        handle: &std::sync::Arc<dyn XshmfenceHandle>,
+    ) -> std::io::Result<()> {
+        handle.trigger()
     }
 
     /// Per-window Present capability surface. Default impl: all-false

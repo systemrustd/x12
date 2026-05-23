@@ -717,7 +717,7 @@ pub struct KmsBackend {
     /// fall back to mmaping the fd and calling
     /// `xshmfence_trigger` directly when the X side wants to
     /// signal idle.
-    pub(crate) dri3_xshmfences: HashMap<u32, crate::kms::xshmfence::FenceMapping>,
+    pub(crate) dri3_xshmfences: HashMap<u32, std::sync::Arc<crate::kms::xshmfence::FenceMapping>>,
     outputs: Vec<OutputLayout>,
     fb_w: u16,
     fb_h: u16,
@@ -8909,7 +8909,8 @@ impl Backend for KmsBackend {
         // (i.e. the fd really is a sync_file).
         use std::os::fd::AsFd;
         if let Some(mapping) = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()) {
-            self.dri3_xshmfences.insert(fence_xid, mapping);
+            self.dri3_xshmfences
+                .insert(fence_xid, std::sync::Arc::new(mapping));
             log::debug!("DRI3 FenceFromFD 0x{fence_xid:x}: imported as xshmfence");
             return Ok(());
         }
@@ -8937,6 +8938,16 @@ impl Backend for KmsBackend {
         // a server-only `triggered=true` mirror in state.sync_fences
         // is sufficient — no GPU operation needed here.
         Ok(())
+    }
+
+    fn dri3_xshmfence_handle(
+        &self,
+        fence_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
+        self.dri3_xshmfences
+            .get(&fence_xid)
+            .cloned()
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
     }
 
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
