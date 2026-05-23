@@ -690,6 +690,17 @@ impl RenderEngine {
         self.inner.as_ref().map(|i| i.submitted.len()).unwrap_or(0)
     }
 
+    /// True if either the cow-copy or render-composite coalescing
+    /// batch is currently open (CB recorded but not yet submitted).
+    /// Used by the eager-touch regression tests and by
+    /// `KmsBackendV2::has_pending_batches_for_tests` (the wrapper
+    /// the v2_acceptance test asserts on).
+    pub fn has_pending_batches_for_tests(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|i| i.pending_cow_batch.is_some() || i.pending_render_batch.is_some())
+    }
+
     /// Stage 5 Task 4 layer 1: lifetime count of `vkCreateDescriptorPool`
     /// calls inside the ring. Backend polls this and bumps telemetry.
     pub(crate) fn descriptor_pool_creates_lifetime(&self) -> u64 {
@@ -1930,12 +1941,22 @@ impl RenderEngine {
                 vk::PipelineStageFlags2::COPY,
                 vk::AccessFlags2::TRANSFER_READ,
             );
+            // Stage 5 Task 3 fix: touch src's render fence the
+            // moment its layout transition + copy land in the
+            // batch CB — see open-first branch for the rationale.
+            let batch_ticket = inner
+                .pending_cow_batch
+                .as_ref()
+                .expect("pending batch present")
+                .ticket
+                .clone();
             inner
                 .pending_cow_batch
                 .as_mut()
                 .expect("pending batch present")
                 .srcs_in_batch
                 .insert(src);
+            store.touch_render_fence(src, batch_ticket);
         }
 
         // Record the copy.
@@ -2065,6 +2086,16 @@ impl RenderEngine {
         }
         let mut srcs = HashSet::new();
         srcs.insert(src);
+        // Stage 5 Task 3 fix (UAF on Rembrandt iGPU, 2026-05-22):
+        // touch the batch ticket onto src + dst the moment a CB
+        // recording references them. The flush-time touch in
+        // `flush_cow_batch` is no longer load-bearing for src-side
+        // lifetime — between this open and the flush, a stray
+        // FreePixmap(src) would otherwise see no live render
+        // ticket on src and destroy the VkImage while the
+        // batch CB still copies from it.
+        store.touch_render_fence(cow_id, ticket.clone());
+        store.touch_render_fence(src, ticket.clone());
         inner.pending_cow_batch = Some(PendingCowBatch {
             cb,
             ticket,
@@ -2508,6 +2539,18 @@ impl RenderEngine {
             if let Some(mid) = mask_id_opt {
                 touched.insert(mid);
             }
+            // Stage 5 Task 3 fix (UAF on Rembrandt iGPU, 2026-05-22):
+            // touch every drawable the batch's CB now references
+            // (dst + src + mask) with the batch ticket. Pre-fix
+            // this only happened in `flush_render_batch`, leaving
+            // a window where an intervening FreePixmap(src) before
+            // flush would destroy the VkImage while the batch CB
+            // still samples it.
+            store.touch_render_fence(dst_id, ticket.clone());
+            store.touch_render_fence(src_id, ticket.clone());
+            if let Some(mid) = mask_id_opt {
+                store.touch_render_fence(mid, ticket.clone());
+            }
             inner.pending_render_batch = Some(PendingRenderBatch {
                 cb,
                 ticket,
@@ -2556,6 +2599,15 @@ impl RenderEngine {
         if let Some(mid) = mask_id_opt {
             batch.touched_drawables.insert(mid);
             batch.any_mask = true;
+        }
+        // Stage 5 Task 3 fix: touch the new drawables the append
+        // just added to `touched_drawables` with the batch ticket
+        // (see open branch above for rationale). Dst's ticket is
+        // already set from open; appending doesn't change it.
+        let batch_ticket = batch.ticket.clone();
+        store.touch_render_fence(src_id, batch_ticket.clone());
+        if let Some(mid) = mask_id_opt {
+            store.touch_render_fence(mid, batch_ticket);
         }
         for cr in rects {
             let rect = vk::Rect2D {
@@ -7060,6 +7112,385 @@ mod tests {
             }
         }
 
+        engine.drain_all(&platform);
+    }
+
+    /// Regression test for the use-after-free that wedged bee
+    /// (Renoir/Rembrandt RDNA2 iGPU) under mate-panel's MIT-SHM
+    /// PutImage churn (radv hang dump 2026-05-22, addr_binding_report
+    /// "Potential use-after-free detected" between a 256×256 d32
+    /// pixmap's `FreePixmap` and its still-in-flight composite CB).
+    ///
+    /// **Invariant**: the moment a render_composite call has
+    /// recorded a descriptor referencing `src` into a pending batch
+    /// CB, `src.last_render_ticket` must already point at the batch
+    /// ticket. `DrawableStore::decref(src)` consults this field; if
+    /// it's `None`, `destroy_now` runs and the CB submitted at the
+    /// next `flush_render_batch` samples freed memory.
+    ///
+    /// Pre-Task-3 code preserved this invariant trivially because
+    /// every render_composite call submitted synchronously and
+    /// called `touch_render_fence(src, ticket)` immediately after.
+    /// The Task 3 coalescing deferred the touch to flush time,
+    /// opening a window for any intervening `FreePixmap(src)` to
+    /// race the eventual submit. On discrete radv (silence) and
+    /// Adreno (yoga) the allocator's slower page-recycle let the
+    /// flush win the race; on Rembrandt's GTT fast-recycle path
+    /// the GPU read the recycled page and TCP fault-killed the
+    /// context.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_open_marks_src_last_render_ticket_immediately() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .unwrap();
+        // Clear src's fill_rect ticket so `is_some()` after compose
+        // can only mean the batch's ticket landed. Otherwise the
+        // assertion is satisfied by the stale fill_rect ticket and
+        // we'd be green for the wrong reason.
+        engine.drain_all(&platform);
+        store.get_mut(src_id).unwrap().last_render_ticket = None;
+
+        let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                dst_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        let rect = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_OVER: u8 = 3;
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(
+            stats.deferred_to_batch,
+            "call should have opened a pending batch"
+        );
+
+        // The actual invariant. (The companion test
+        // `render_composite_open_then_decref_src_returns_pending_fence`
+        // is the load-bearing check that the ticket is the BATCH's,
+        // not a stale pre-compose one — that test drains the
+        // fill_rect ticket first, so a PendingFence outcome can only
+        // come from a fresh, still-unsignaled batch ticket.)
+        assert!(
+            store.get(src_id).unwrap().last_render_ticket.is_some(),
+            "src.last_render_ticket must be set the moment a \
+             render_composite descriptor references src — \
+             otherwise FreePixmap(src) before flush will destroy \
+             the VkImage while the batch CB still samples it (UAF)",
+        );
+
+        engine
+            .flush_render_batch(&mut store, &mut platform)
+            .expect("flush ok");
+        engine.drain_all(&platform);
+    }
+
+    /// Companion regression test, same root cause: a `FreePixmap`
+    /// arriving between the render_composite append and the flush
+    /// must NOT destroy src's storage. `DrawableStore::decref` must
+    /// return `PendingFence`, not `Destroyed`.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_open_then_decref_src_returns_pending_fence() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .unwrap();
+        // Drain the fill_rect submit so src.last_render_ticket
+        // reflects a signaled fence — without this, decref would
+        // return PendingFence on the fill_rect ticket itself and
+        // give a misleading green even with the bug present.
+        engine.drain_all(&platform);
+        assert_eq!(
+            store
+                .get(src_id)
+                .unwrap()
+                .last_render_ticket
+                .as_ref()
+                .map(|t| t.poll_signaled(platform.vk.as_ref().unwrap())),
+            Some(true),
+            "pre-condition: src's fill_rect ticket should be signaled \
+             before we start measuring the bug"
+        );
+
+        let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let dst_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                dst_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                dst_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        let rect = [crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 4,
+        }];
+        const OP_OVER: u8 = 3;
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                OP_OVER,
+                ResolvedSource::Drawable(src_id),
+                ResolvedSource::None,
+                dst_id,
+                &rect,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        // Batch open, CB recorded, NOT yet flushed.
+
+        // The hostile FreePixmap. Pre-fix this returns Destroyed
+        // because src.last_render_ticket is the (signaled) fill_rect
+        // ticket, never bumped to the batch ticket.
+        let decision = store.decref(&mut platform, src_id);
+        assert_eq!(
+            decision,
+            super::super::store::RetireDecision::PendingFence,
+            "FreePixmap(src) between render_composite open and \
+             flush_render_batch must NOT destroy src — pending \
+             batch CB still samples it. Got {decision:?}",
+        );
+
+        engine
+            .flush_render_batch(&mut store, &mut platform)
+            .expect("flush ok");
+        engine.drain_all(&platform);
+    }
+
+    /// Same invariant, cow `copy_area` batch shape. The bug exists
+    /// in the cow path too (`flush_cow_batch` defers
+    /// `touch_render_fence` for every `srcs_in_batch` member).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn cow_copy_area_open_marks_src_last_render_ticket_immediately() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let src_id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                src_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .unwrap();
+        engine.drain_all(&platform);
+
+        let cow_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
+        let cow_id = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                cow_storage,
+            )
+            .unwrap();
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                cow_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        engine
+            .cow_copy_area(
+                &mut store,
+                &mut platform,
+                cow_id,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D { x: 0, y: 0 },
+            )
+            .unwrap();
+
+        // The hostile FreePixmap. Pre-fix this returns Destroyed.
+        let decision = store.decref(&mut platform, src_id);
+        assert_eq!(
+            decision,
+            super::super::store::RetireDecision::PendingFence,
+            "FreePixmap(src) between cow_copy_area open and \
+             flush_cow_batch must NOT destroy src — pending \
+             batch CB still copies from it. Got {decision:?}",
+        );
+
+        engine
+            .flush_cow_batch(&mut store, &mut platform)
+            .expect("flush ok");
         engine.drain_all(&platform);
     }
 

@@ -4426,29 +4426,6 @@ impl Backend for KmsBackendV2 {
         self.present_to_cow_sources.push_back(src_pixmap_xid);
     }
 
-    fn wait_for_drawable_idle(&mut self, host_xid: u32) -> io::Result<()> {
-        let Some(id) = self.store.lookup(host_xid) else {
-            return Ok(());
-        };
-        let ticket = self
-            .store
-            .get(id)
-            .and_then(|drawable| drawable.last_render_ticket.clone());
-        let Some(ticket) = ticket else {
-            return Ok(());
-        };
-        let Some(vk) = self.platform.vk.as_ref().cloned() else {
-            return Ok(());
-        };
-        let started = std::time::Instant::now();
-        ticket
-            .wait(&vk)
-            .map_err(|e| io::Error::other(format!("wait for drawable 0x{host_xid:x}: {e:?}")))?;
-        let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.telemetry.record_fence_wait(waited_ns);
-        Ok(())
-    }
-
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // DRM fd for page-flip events; libinput fd if the input
         // context is still owned by us. Delegates to

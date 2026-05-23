@@ -341,17 +341,6 @@ pub trait Backend: Send {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
-    /// Wait until all already-submitted GPU work touching
-    /// `host_xid` has completed. Present Copy paths use this before
-    /// signaling the client's idle/release fence: the client may
-    /// immediately reuse the presented pixmap after that fence, so
-    /// the server must really be done reading from it.
-    ///
-    /// Default no-op for synchronous or non-GPU backends.
-    fn wait_for_drawable_idle(&mut self, _host_xid: u32) -> io::Result<()> {
-        Ok(())
-    }
-
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived
     /// from `BackendFdKind`.
