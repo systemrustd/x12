@@ -2948,3 +2948,54 @@ fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
         }
     }
 }
+
+/// Stage 5 Task 6.1 — verify that `drain_completed_present_events`
+/// force-fires every queued entry when the platform's
+/// `renderer_failed` flag is set. This is the "renderer is stuck"
+/// escape valve: rather than livelock on fences that will never
+/// signal, the drain unconditionally pops + signals every entry so
+/// the X11 PRESENT serial bookkeeping doesn't pile up at the loop.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_drain_force_fires_all_pending_on_renderer_failed() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Enqueue 3 entries against unsignaled fences via a real
+    // copy_area path (so each pins a live FenceTicket).
+    let src = b.create_pixmap(None, 32, 4, 4).expect("src");
+    let cow = b.create_pixmap(None, 32, 4, 4).expect("cow");
+    for serial in 1..=3 {
+        b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
+            .expect("copy_area");
+        b.enqueue_present_completion(yserver_core::backend::CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial,
+            host_xid: src.as_raw(),
+            dst_host_xid: cow.as_raw(),
+            options: 0,
+            wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+        });
+    }
+    assert_eq!(
+        b.pending_present_events_len_for_tests(),
+        3,
+        "three entries queued before drain",
+    );
+
+    // Force-fire branch: flip renderer_failed; drain returns all
+    // entries unconditionally.
+    b.set_renderer_failed_for_tests(true);
+    let drained = b.drain_completed_present_events_for_tests();
+    assert_eq!(drained.len(), 3, "force-fire returns all 3 entries",);
+    assert_eq!(
+        b.pending_present_events_len_for_tests(),
+        0,
+        "force-fire empties the queue",
+    );
+}

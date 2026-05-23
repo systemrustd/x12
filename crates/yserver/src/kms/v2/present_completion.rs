@@ -7,10 +7,6 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`.
 
-// Scaffolding for Tasks 7+; the enqueue/drain wiring that
-// constructs these types lands in later commits on this branch.
-#![allow(dead_code)]
-
 use std::{os::fd::OwnedFd, sync::Arc};
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
@@ -22,7 +18,11 @@ use crate::kms::v2::platform::FenceTicket;
 /// payload to the main loop.
 pub(crate) struct PendingPresentEntry {
     /// Cow_batch ticket the just-appended copy_area participates in.
-    pub(crate) ticket: FenceTicket,
+    /// `None` when PRESENT arrived with no cow_batch in flight (the
+    /// no-GPU-work fast path) — drain treats this as immediately
+    /// ready. Avoids needing a synthetic "pre-signaled sentinel"
+    /// FenceTicket constructor.
+    pub(crate) ticket: Option<FenceTicket>,
     /// Lifetime pin on the underlying wake primitive. Survives a
     /// mid-flight `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) wake_pin: PinnedWake,
