@@ -249,6 +249,16 @@ struct ScratchImage {
     vk: Arc<VkContext>,
     image: vk::Image,
     memory: vk::DeviceMemory,
+    /// Bytes allocated for this image (from `mem_reqs.size`). Used
+    /// by `active_resource_bytes` to account for active scratch
+    /// memory without querying the driver.
+    size_bytes: u64,
+}
+
+impl ScratchImage {
+    fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 impl Drop for ScratchImage {
@@ -814,6 +824,50 @@ impl RenderEngine {
         self.inner
             .as_ref()
             .map_or(0, |i| i.descriptor_pool_ring.pool_count())
+    }
+
+    /// Phase A Task 3.5: drain all queued `FlushOutcome` records
+    /// accumulated since the last drain. Backend calls this once
+    /// per `maybe_composite` tick to route outcomes to telemetry.
+    pub(crate) fn drain_flush_outcomes(&mut self) -> Vec<super::platform::FlushOutcome> {
+        self.inner
+            .as_mut()
+            .map(|i| std::mem::take(&mut i.pending_flush_outcomes))
+            .unwrap_or_default()
+    }
+
+    /// Phase A Task 3.5: total active staging + scratch bytes
+    /// across both submitted (in-flight) and parked (pending_group)
+    /// ops. Used for per-tick high-water sampling. Returns
+    /// `(staging_bytes, scratch_bytes)`.
+    pub(crate) fn active_resource_bytes(&self) -> (u64, u64) {
+        let Some(inner) = self.inner.as_ref() else {
+            return (0, 0);
+        };
+        let staging_submitted: u64 = inner
+            .submitted
+            .iter()
+            .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
+            .sum();
+        let staging_parked: u64 = inner
+            .pending_group_ops
+            .iter()
+            .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
+            .sum();
+        let scratch_submitted: u64 = inner
+            .submitted
+            .iter()
+            .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+            .sum();
+        let scratch_parked: u64 = inner
+            .pending_group_ops
+            .iter()
+            .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+            .sum();
+        (
+            staging_submitted + staging_parked,
+            scratch_submitted + scratch_parked,
+        )
     }
 
     /// Task 3 test helper: allocate a pixmap drawable in `store` backed
@@ -2400,7 +2454,7 @@ impl RenderEngine {
                 }
                 Err(e) => {
                     log::warn!(
-                        "flush_cow_batch: PresentCompletionSignal flush failed: {e:?}; \
+                        "v2 flush_cow_batch: PresentCompletionSignal flush failed: {e:?}; \
                          force-firing {} PRESENT completion events",
                         present_completions.len(),
                     );
@@ -5843,6 +5897,7 @@ fn allocate_scratch_image(
         vk: Arc::clone(vk),
         image,
         memory,
+        size_bytes: mem_reqs.size,
     })
 }
 

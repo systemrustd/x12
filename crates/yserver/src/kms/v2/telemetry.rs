@@ -95,6 +95,37 @@ pub struct Bucket {
     /// individual `render_composite` calls folded into batches.
     /// Pre-fix each call would have produced its own `paint_submit`.
     pub render_composites_coalesced: u64,
+    // ── Phase A: SubmitGroup size + flush-reason histogram ───────
+    /// Number of SubmitGroup flushes that actually submitted at
+    /// least one entry (non-abort). Per-second + lifetime.
+    pub(crate) submit_group_flushes: u64,
+    /// Number of SubmitGroup flushes that aborted (Vk error path).
+    pub(crate) submit_group_aborts: u64,
+    /// Maximum flushed-entry count observed in the current bucket
+    /// window. Reset each second.
+    pub(crate) submit_group_size_max_in_window: u64,
+    /// Sum of flushed-entry counts across all flushes in the window.
+    /// Divide by `submit_group_flushes` for average group size.
+    pub(crate) submit_group_size_total: u64,
+    /// Histogram of flushed group sizes. Buckets: [1, 2, 4, 8, 12, 16+].
+    pub(crate) submit_group_hist: [u64; 6],
+    // Per-reason flush counters.
+    pub(crate) submit_group_flush_reason_sync_boundary: u64,
+    pub(crate) submit_group_flush_reason_present_completion_signal: u64,
+    pub(crate) submit_group_flush_reason_scene_compose: u64,
+    pub(crate) submit_group_flush_reason_pageflip_retire: u64,
+    pub(crate) submit_group_flush_reason_max_size: u64,
+    pub(crate) submit_group_flush_reason_shutdown: u64,
+    // ── Phase A: retention high-water gauges ─────────────────────
+    /// High-water mark of descriptor pool ring pool count sampled
+    /// each tick.
+    pub(crate) active_descriptor_pool_count_high_water: u64,
+    /// High-water mark of active staging buffer bytes across
+    /// submitted + parked ops, sampled each tick.
+    pub(crate) active_staging_bytes_high_water: u64,
+    /// High-water mark of active scratch image bytes across
+    /// submitted + parked ops, sampled each tick.
+    pub(crate) active_scratch_bytes_high_water: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -208,6 +239,12 @@ impl Telemetry {
         } else {
             0.0
         };
+        let group_avg = if b.submit_group_flushes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            (b.submit_group_size_total as f64 / b.submit_group_flushes as f64)
+        } else {
+            0.0
+        };
         log::info!(
             "v2_telemetry: paint_submits/s={} composite_submits/s={} \
              one_shot_submits/s={} queue_submit2/s={} \
@@ -225,7 +262,20 @@ impl Telemetry {
              cow_batches_flushed/s={} cow_copies_coalesced/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
-             avg_compose_cb_record_ns={avg_compose_cb_ns}",
+             avg_compose_cb_record_ns={avg_compose_cb_ns} \
+             submit_group_flushes/s={} submit_group_aborts/s={} \
+             submit_group_size_avg={group_avg:.2} \
+             submit_group_size_max_in_window={} \
+             submit_group_hist={:?} \
+             submit_group_flush_reason_sync_boundary/s={} \
+             submit_group_flush_reason_present_completion_signal/s={} \
+             submit_group_flush_reason_scene_compose/s={} \
+             submit_group_flush_reason_pageflip_retire/s={} \
+             submit_group_flush_reason_max_size/s={} \
+             submit_group_flush_reason_shutdown/s={} \
+             active_descriptor_pool_count_high_water={} \
+             active_staging_bytes_high_water={} \
+             active_scratch_bytes_high_water={}",
             b.paint_submits,
             b.composite_submits,
             b.one_shot_submits,
@@ -252,6 +302,19 @@ impl Telemetry {
             b.cow_copies_coalesced,
             b.render_batches_flushed,
             b.render_composites_coalesced,
+            b.submit_group_flushes,
+            b.submit_group_aborts,
+            b.submit_group_size_max_in_window,
+            b.submit_group_hist,
+            b.submit_group_flush_reason_sync_boundary,
+            b.submit_group_flush_reason_present_completion_signal,
+            b.submit_group_flush_reason_scene_compose,
+            b.submit_group_flush_reason_pageflip_retire,
+            b.submit_group_flush_reason_max_size,
+            b.submit_group_flush_reason_shutdown,
+            self.lifetime.active_descriptor_pool_count_high_water,
+            self.lifetime.active_staging_bytes_high_water,
+            self.lifetime.active_scratch_bytes_high_water,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -445,6 +508,110 @@ impl Telemetry {
         self.lifetime.queue_submit2 += 1;
     }
 
+    // ── Phase A: SubmitGroup + retention recording sites ─────────
+
+    /// Record one non-aborted SubmitGroup flush with the given
+    /// group size (number of entries submitted) and flush reason.
+    pub(crate) fn record_submit_group_flush(
+        &mut self,
+        size: usize,
+        reason: super::submit_group::FlushReason,
+    ) {
+        let s = u64::try_from(size).unwrap_or(u64::MAX);
+        self.bucket.submit_group_flushes += 1;
+        self.lifetime.submit_group_flushes += 1;
+        self.bucket.submit_group_size_total += s;
+        self.lifetime.submit_group_size_total += s;
+        if s > self.bucket.submit_group_size_max_in_window {
+            self.bucket.submit_group_size_max_in_window = s;
+        }
+        if s > self.lifetime.submit_group_size_max_in_window {
+            self.lifetime.submit_group_size_max_in_window = s;
+        }
+        let bucket_idx = match size {
+            0 | 1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=12 => 4,
+            _ => 5,
+        };
+        self.bucket.submit_group_hist[bucket_idx] += 1;
+        self.lifetime.submit_group_hist[bucket_idx] += 1;
+        use super::submit_group::FlushReason as R;
+        let (b, l) = match reason {
+            R::SyncBoundary => (
+                &mut self.bucket.submit_group_flush_reason_sync_boundary,
+                &mut self.lifetime.submit_group_flush_reason_sync_boundary,
+            ),
+            R::PresentCompletionSignal => (
+                &mut self
+                    .bucket
+                    .submit_group_flush_reason_present_completion_signal,
+                &mut self
+                    .lifetime
+                    .submit_group_flush_reason_present_completion_signal,
+            ),
+            R::SceneCompose => (
+                &mut self.bucket.submit_group_flush_reason_scene_compose,
+                &mut self.lifetime.submit_group_flush_reason_scene_compose,
+            ),
+            R::PageflipRetire => (
+                &mut self.bucket.submit_group_flush_reason_pageflip_retire,
+                &mut self.lifetime.submit_group_flush_reason_pageflip_retire,
+            ),
+            R::MaxSize => (
+                &mut self.bucket.submit_group_flush_reason_max_size,
+                &mut self.lifetime.submit_group_flush_reason_max_size,
+            ),
+            R::Shutdown => (
+                &mut self.bucket.submit_group_flush_reason_shutdown,
+                &mut self.lifetime.submit_group_flush_reason_shutdown,
+            ),
+        };
+        *b += 1;
+        *l += 1;
+    }
+
+    /// Record one aborted SubmitGroup flush (Vk error path).
+    pub(crate) fn record_submit_group_abort(&mut self) {
+        self.bucket.submit_group_aborts += 1;
+        self.lifetime.submit_group_aborts += 1;
+    }
+
+    /// Sample the current descriptor pool ring count; update the
+    /// high-water mark if `n` exceeds the current maximum.
+    pub(crate) fn record_active_descriptor_pool_high_water(&mut self, n: u64) {
+        if n > self.bucket.active_descriptor_pool_count_high_water {
+            self.bucket.active_descriptor_pool_count_high_water = n;
+        }
+        if n > self.lifetime.active_descriptor_pool_count_high_water {
+            self.lifetime.active_descriptor_pool_count_high_water = n;
+        }
+    }
+
+    /// Sample current active staging bytes; update the high-water
+    /// mark for both the current bucket window and lifetime.
+    pub(crate) fn record_active_staging_high_water(&mut self, bytes: u64) {
+        if bytes > self.bucket.active_staging_bytes_high_water {
+            self.bucket.active_staging_bytes_high_water = bytes;
+        }
+        if bytes > self.lifetime.active_staging_bytes_high_water {
+            self.lifetime.active_staging_bytes_high_water = bytes;
+        }
+    }
+
+    /// Sample current active scratch bytes; update the high-water
+    /// mark for both the current bucket window and lifetime.
+    pub(crate) fn record_active_scratch_high_water(&mut self, bytes: u64) {
+        if bytes > self.bucket.active_scratch_bytes_high_water {
+            self.bucket.active_scratch_bytes_high_water = bytes;
+        }
+        if bytes > self.lifetime.active_scratch_bytes_high_water {
+            self.lifetime.active_scratch_bytes_high_water = bytes;
+        }
+    }
+
     /// Stage 5 Task 3 (render-composite generalization): one
     /// render batch flushed. Mirrors `record_cow_batch_flushed`
     /// — bumps `paint_submits` + `queue_submit2` since each
@@ -565,5 +732,20 @@ mod tests {
         t.record_descriptor_pool_reset(3);
         assert_eq!(t.lifetime.descriptor_pool_creates, 2);
         assert_eq!(t.lifetime.descriptor_pool_resets, 3);
+    }
+
+    #[test]
+    fn telemetry_submit_group_hist_buckets_correctly() {
+        let mut t = Telemetry::new();
+        use crate::kms::v2::submit_group::FlushReason;
+        for size in [1, 2, 4, 8, 12, 16, 32] {
+            t.record_submit_group_flush(size, FlushReason::SceneCompose);
+        }
+        assert_eq!(t.lifetime.submit_group_hist[0], 1); // 1
+        assert_eq!(t.lifetime.submit_group_hist[1], 1); // 2
+        assert_eq!(t.lifetime.submit_group_hist[2], 1); // 4
+        assert_eq!(t.lifetime.submit_group_hist[3], 1); // 8
+        assert_eq!(t.lifetime.submit_group_hist[4], 1); // 12
+        assert_eq!(t.lifetime.submit_group_hist[5], 2); // 16, 32
     }
 }

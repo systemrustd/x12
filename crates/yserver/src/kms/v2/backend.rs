@@ -4480,6 +4480,27 @@ impl Backend for KmsBackendV2 {
         // that ran since the previous tick).
         self.drain_cow_telemetry();
         self.drain_render_telemetry();
+        // Phase A Task 3.5: drain SubmitGroup flush outcomes and
+        // route each to the matching telemetry counter.
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        // Phase A telemetry retention gauges. Sample on every tick —
+        // the high-water aggregator handles bursts.
+        let pool_count =
+            u64::try_from(self.engine.descriptor_pool_ring_pool_count()).unwrap_or(u64::MAX);
+        self.telemetry
+            .record_active_descriptor_pool_high_water(pool_count);
+        let (staging_bytes, scratch_bytes) = self.engine.active_resource_bytes();
+        self.telemetry
+            .record_active_staging_high_water(staging_bytes);
+        self.telemetry
+            .record_active_scratch_high_water(scratch_bytes);
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit();
         result
