@@ -576,6 +576,18 @@ struct RenderEngineInner {
     /// whose sync_file fds still need to be registered with the
     /// backend's inner epoll.
     pending_present_batches: Vec<PendingPresentBatch>,
+    /// Phase A: per-group pending SubmittedOps. Each `end_and_submit_op`
+    /// pushes here instead of directly into `submitted`. On successful
+    /// `flush_submit_group` they drain into `submitted` (where
+    /// poll_retired sees them). On failure (renderer_failed branch)
+    /// they drop, releasing CBs + staging + scratch + their shared-
+    /// ticket clones together.
+    ///
+    /// All entries in this vec share the same `FenceTicket` (Model A1).
+    pending_group_ops: Vec<SubmittedOp>,
+    /// Phase A: FlushOutcome records produced by flush_submit_group.
+    /// Drained by the backend telemetry path (Task 3.5).
+    pending_flush_outcomes: Vec<super::platform::FlushOutcome>,
 }
 
 impl RenderEngine {
@@ -616,6 +628,8 @@ impl RenderEngine {
                 pending_render_batch: None,
                 render_flush_records: Vec::new(),
                 pending_present_batches: Vec::new(),
+                pending_group_ops: Vec::new(),
+                pending_flush_outcomes: Vec::new(),
             }),
         })
     }
@@ -671,7 +685,14 @@ impl RenderEngine {
     /// Drain every in-flight submit, waiting on the deepest
     /// ticket. Called at shutdown to ensure all CB / staging
     /// resources are reclaimed before pool destruction.
-    pub(crate) fn drain_all(&mut self, platform: &PlatformBackend) {
+    pub(crate) fn drain_all(&mut self, platform: &mut PlatformBackend) {
+        // Flush any open SubmitGroup first; this commits parked ops
+        // into `submitted` so the loop below sees the right set.
+        if let Err(e) =
+            self.flush_submit_group(platform, super::submit_group::FlushReason::Shutdown)
+        {
+            log::warn!("v2 drain_all: flush_submit_group failed: {e:?}");
+        }
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -691,10 +712,73 @@ impl RenderEngine {
         }
     }
 
+    /// Phase A: flush the platform's SubmitGroup and commit/drop the
+    /// engine's parked per-op state atomically. THIS is the API every
+    /// flush-trigger site calls (scene compose, get_image, PRESENT
+    /// signal, pageflip retire, shutdown, MaxSize auto-flush) —
+    /// NEVER call `platform.flush_submit_group` directly from outside
+    /// the engine.
+    pub(crate) fn flush_submit_group(
+        &mut self,
+        platform: &mut PlatformBackend,
+        reason: super::submit_group::FlushReason,
+    ) -> Result<super::platform::FlushOutcome, vk::Result> {
+        let result = platform.flush_submit_group(reason);
+        // Drain the platform's last_flush_outcome regardless of Ok/Err
+        // — both branches in platform's flush_submit_group populate it
+        // before returning. The engine queues it for backend telemetry
+        // drain (Task 3.5 wires that side).
+        if let Some(outcome) = platform.take_last_flush_outcome()
+            && let Some(inner) = self.inner.as_mut()
+        {
+            inner.pending_flush_outcomes.push(outcome);
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return result;
+        };
+        match result {
+            Ok(outcome) => {
+                // Commit: parked ops graduate to `submitted`.
+                for op in inner.pending_group_ops.drain(..) {
+                    inner.submitted.push_back(op);
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                // Rollback. CBs were already freed by platform's Err
+                // branch. Engine just clears the parked SubmittedOps so
+                // their staging / scratch / atlas_ticket / shared-fence-
+                // Arc clones drop together.
+                inner.pending_group_ops.clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// Phase A: check whether the platform's SubmitGroup has hit its
+    /// cap; if so, drive a `MaxSize` flush.
+    pub(crate) fn maybe_auto_flush_submit_group(
+        &mut self,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), RenderError> {
+        if platform.submit_group_size() >= platform.submit_group_max_size() {
+            self.flush_submit_group(platform, super::submit_group::FlushReason::MaxSize)
+                .map_err(RenderError::Vk)?;
+        }
+        Ok(())
+    }
+
     /// Count of in-flight submits awaiting retirement. Tests use
     /// this to assert the lifecycle book-keeping.
     pub(crate) fn pending_count(&self) -> usize {
         self.inner.as_ref().map(|i| i.submitted.len()).unwrap_or(0)
+    }
+
+    /// Phase A: count of ops parked in pending_group_ops (not yet
+    /// committed to `submitted`). Test helper.
+    #[cfg(test)]
+    pub(crate) fn pending_group_ops_count_for_tests(&self) -> usize {
+        self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
     }
 
     /// True if either the cow-copy or render-composite coalescing
@@ -730,6 +814,32 @@ impl RenderEngine {
         self.inner
             .as_ref()
             .map_or(0, |i| i.descriptor_pool_ring.pool_count())
+    }
+
+    /// Task 3 test helper: allocate a pixmap drawable in `store` backed
+    /// by a real Vk storage. Returns the `DrawableId`.
+    #[cfg(test)]
+    pub(crate) fn create_pixmap(
+        &self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        xid: u32,
+        w: u16,
+        h: u16,
+        depth: u8,
+    ) -> Result<DrawableId, RenderError> {
+        let storage = platform
+            .allocate_drawable_storage(w, h, depth)
+            .map_err(RenderError::Vk)?;
+        store
+            .allocate(
+                xid,
+                super::store::DrawableKind::Pixmap,
+                depth,
+                false,
+                storage,
+            )
+            .map_err(|_| RenderError::NoVk)
     }
 
     /// Stage 3b: drop any GPU-side state cached for `host_pic`.
@@ -1167,7 +1277,7 @@ impl RenderEngine {
         }
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -1175,6 +1285,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(())
     }
 
@@ -1448,7 +1560,7 @@ impl RenderEngine {
         }
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -1456,6 +1568,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(())
     }
 
@@ -1672,7 +1786,7 @@ impl RenderEngine {
             store.damage(src, dst_rect);
             inner.acquire_generation += 1;
             let generation = inner.acquire_generation;
-            inner.submitted.push_back(SubmittedOp {
+            inner.pending_group_ops.push(SubmittedOp {
                 cb,
                 ticket,
                 staging: None,
@@ -1680,6 +1794,8 @@ impl RenderEngine {
                 atlas_ticket: None,
                 generation,
             });
+            // `inner` borrow released. Auto-flush.
+            self.maybe_auto_flush_submit_group(platform)?;
             return Ok(());
         }
 
@@ -1772,7 +1888,7 @@ impl RenderEngine {
         store.damage(dst, dst_rect);
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -1780,6 +1896,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(())
     }
 
@@ -2201,7 +2319,7 @@ impl RenderEngine {
             .as_ref()
             .map(PresentCompletionSignal::semaphore);
 
-        // End + submit.
+        // End + submit (append to group).
         end_and_submit_op_with_signal(
             inner,
             platform,
@@ -2210,33 +2328,8 @@ impl RenderEngine {
             completion_semaphore,
         )?;
 
-        let present_batch = if batch.present_completions.is_empty() {
-            None
-        } else {
-            let (wait, signal) = match completion_signal {
-                Some(signal) => match signal.export_sync_file_fd() {
-                    Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
-                    Ok(None) => (PresentBatchWait::Ready, Some(signal)),
-                    Err(e) => {
-                        log::warn!(
-                            "v2 flush_cow_batch: vkGetSemaphoreFdKHR(SYNC_FD) failed: {e:?}; \
-                             falling back to FenceTicket polling"
-                        );
-                        (PresentBatchWait::Poll, Some(signal))
-                    }
-                },
-                None => (PresentBatchWait::Ready, None),
-            };
-            Some(PendingPresentBatch {
-                wait,
-                ticket: Some(batch.ticket.clone()),
-                signal,
-                events: batch.present_completions,
-            })
-        };
-
         // CPU-side bookkeeping: clone ticket onto every touched
-        // drawable, apply accumulated damage, push SubmittedOp.
+        // drawable, apply accumulated damage, push pending SubmittedOp.
         store.touch_render_fence(batch.dst, batch.ticket.clone());
         for src in &batch.srcs_in_batch {
             store.touch_render_fence(*src, batch.ticket.clone());
@@ -2246,7 +2339,9 @@ impl RenderEngine {
         }
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        let coalesced_count = batch.coalesced_count;
+        let present_completions = batch.present_completions;
+        inner.pending_group_ops.push(SubmittedOp {
             cb: batch.cb,
             ticket: batch.ticket,
             staging: None,
@@ -2254,11 +2349,67 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
-        if let Some(present_batch) = present_batch {
-            inner.pending_present_batches.push(present_batch);
+        inner.cow_flush_records.push(coalesced_count);
+        // `inner` borrow released after this block. Free to call self.* below.
+
+        let has_completion_signal = !present_completions.is_empty();
+        if has_completion_signal {
+            // Phase A Step 8: semaphore-bearing COW batch must flush
+            // before the caller's vkGetSemaphoreFdKHR(SYNC_FD) so the
+            // signal op is queued.
+            match self.flush_submit_group(
+                platform,
+                super::submit_group::FlushReason::PresentCompletionSignal,
+            ) {
+                Ok(_) => {
+                    let inner = self.inner.as_mut().expect("post-flush");
+                    let (wait, signal) = match completion_signal {
+                        Some(signal) => match signal.export_sync_file_fd() {
+                            Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                            Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                            Err(e) => {
+                                log::warn!(
+                                    "v2 flush_cow_batch: vkGetSemaphoreFdKHR(SYNC_FD) failed: \
+                                     {e:?}; falling back to FenceTicket polling"
+                                );
+                                (PresentBatchWait::Poll, Some(signal))
+                            }
+                        },
+                        None => (PresentBatchWait::Ready, None),
+                    };
+                    // The ticket was committed to `submitted` by
+                    // flush_submit_group; use it from there.
+                    let ticket = inner.submitted.back().map(|op| op.ticket.clone());
+                    inner.pending_present_batches.push(PendingPresentBatch {
+                        wait,
+                        ticket,
+                        signal,
+                        events: present_completions,
+                    });
+                }
+                Err(e) => {
+                    log::warn!(
+                        "flush_cow_batch: PresentCompletionSignal flush failed: {e:?}; \
+                         force-firing {} PRESENT completion events",
+                        present_completions.len(),
+                    );
+                    let inner = self.inner.as_mut().expect("post-failed-flush");
+                    inner.pending_present_batches.push(PendingPresentBatch {
+                        wait: PresentBatchWait::Ready,
+                        ticket: None,
+                        signal: None,
+                        events: present_completions,
+                    });
+                    return Err(RenderError::Vk(e));
+                }
+            }
+        } else {
+            // No PRESENT completion attached → max-size auto-flush.
+            // The cow_batch CB stays in the group to collapse with
+            // subsequent ops.
+            self.maybe_auto_flush_submit_group(platform)?;
         }
-        inner.cow_flush_records.push(batch.coalesced_count);
-        Ok(Some(batch.coalesced_count))
+        Ok(Some(coalesced_count))
     }
 
     pub(crate) fn attach_cow_present_completion(
@@ -2750,7 +2901,7 @@ impl RenderEngine {
             d.storage.current_layout = adapter.current_layout;
         }
 
-        // End + submit.
+        // End + submit (append to group).
         end_and_submit_op(inner, platform, batch.cb, &batch.ticket)?;
 
         // CPU bookkeeping.
@@ -2763,7 +2914,8 @@ impl RenderEngine {
         }
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        let coalesced_count = batch.coalesced_count;
+        inner.pending_group_ops.push(SubmittedOp {
             cb: batch.cb,
             ticket: batch.ticket,
             staging: None,
@@ -2775,9 +2927,11 @@ impl RenderEngine {
             dst: batch.key.dst,
             op: batch.key.op,
             has_mask: batch.any_mask,
-            coalesced_count: batch.coalesced_count,
+            coalesced_count,
         });
-        Ok(Some(batch.coalesced_count))
+        // `inner` borrow released. Auto-flush for render_batch (no semaphore path).
+        self.maybe_auto_flush_submit_group(platform)?;
+        Ok(Some(coalesced_count))
     }
 
     /// Drain the queue of render-batch flush records. Backend
@@ -2936,7 +3090,7 @@ impl RenderEngine {
         store.damage(target, dst_rect);
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: Some(staging),
@@ -2944,6 +3098,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(())
     }
 
@@ -3058,6 +3214,18 @@ impl RenderEngine {
 
         end_and_submit_op(inner, platform, cb, &ticket)?;
         store.touch_render_fence(src, ticket.clone());
+        // `inner` borrow released before flush so self.flush_submit_group
+        // can take &mut self.
+        let _ = inner;
+
+        // Phase A: end_and_submit_op now only appends to the SubmitGroup.
+        // Drive the explicit flush so the fence has a queued signal-op
+        // before we wait on it.
+        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)
+            .map_err(RenderError::Vk)?;
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
 
         // Sync wait — off the hot path by protocol design.
         ticket.wait(&inner.vk)?;
@@ -3284,11 +3452,13 @@ impl RenderEngine {
                         .record_upload(cb, staging_buffer, atlas_x, atlas_y, w_u, h_u);
                     end_and_submit_op(inner, platform, cb, &ticket)?;
                     stats.glyph_uploads += 1;
-                    // Park the upload's CB + staging on submitted; the
-                    // ticket signals when the upload retires.
+                    // Park the upload's CB + staging on pending_group_ops.
+                    // NOTE: no maybe_auto_flush_submit_group here — `inner`
+                    // is still borrowed inside the loop. The final text-run
+                    // draw push at the end of this function calls it.
                     inner.acquire_generation += 1;
                     let generation = inner.acquire_generation;
-                    inner.submitted.push_back(SubmittedOp {
+                    inner.pending_group_ops.push(SubmittedOp {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
@@ -3399,7 +3569,7 @@ impl RenderEngine {
         let atlas_ticket = inner.atlas_last_upload_ticket.clone();
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -3407,6 +3577,8 @@ impl RenderEngine {
             atlas_ticket,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
 
         Ok(stats)
     }
@@ -3591,9 +3763,12 @@ impl RenderEngine {
                         .record_upload(cb, staging_buffer, atlas_x, atlas_y, g.w, g.h);
                     end_and_submit_op(inner, platform, cb, &ticket)?;
                     stats.glyph_uploads += 1;
+                    // NOTE: no maybe_auto_flush_submit_group here — `inner`
+                    // is still borrowed inside the loop. The final draw push
+                    // at the end of composite_glyphs calls it.
                     inner.acquire_generation += 1;
                     let generation = inner.acquire_generation;
-                    inner.submitted.push_back(SubmittedOp {
+                    inner.pending_group_ops.push(SubmittedOp {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
@@ -3734,7 +3909,7 @@ impl RenderEngine {
         let atlas_ticket = inner.atlas_last_upload_ticket.clone();
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -3742,6 +3917,8 @@ impl RenderEngine {
             atlas_ticket,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
 
         Ok(stats)
     }
@@ -4355,7 +4532,7 @@ impl RenderEngine {
         }
 
         stats.recorded_draws = u32::try_from(rects.len() * clip_scissors.len()).unwrap_or(u32::MAX);
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: None,
@@ -4363,6 +4540,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(stats)
     }
 
@@ -5012,7 +5191,7 @@ impl RenderEngine {
         store.damage(dst_id, clamp_rect(dmg, dst_extent));
 
         stats.recorded_draws = u32::try_from(clip_scissors.len()).unwrap_or(u32::MAX);
-        inner.submitted.push_back(SubmittedOp {
+        inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
             staging: Some(instance_buf),
@@ -5020,6 +5199,8 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        // `inner` borrow released. Auto-flush.
+        self.maybe_auto_flush_submit_group(platform)?;
         Ok(stats)
     }
 }
@@ -5513,7 +5694,10 @@ fn begin_op_cb(
     let begin =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { device.begin_command_buffer(cb, &begin)? };
-    let ticket = platform.acquire_fence_ticket()?;
+    // Phase A: shared ticket comes from the open submit group. With
+    // max_size = 1, the group auto-closes after one append; with
+    // max_size > 1 (post-Task 4), N appends share the same ticket.
+    let ticket = platform.submit_group_ticket_or_open()?;
     Ok((cb, ticket))
 }
 
@@ -6179,6 +6363,35 @@ mod tests {
         Some(p)
     }
 
+    /// Alias of `live_platform` used by Task 3 tests.
+    fn try_for_tests_with_vk() -> Option<PlatformBackend> {
+        live_platform()
+    }
+
+    /// Allocate a pixmap drawable in `store` backed by a real Vk
+    /// storage. Returns the `DrawableId`. Used by Task 3 tests.
+    fn create_pixmap(
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        xid: u32,
+        w: u16,
+        h: u16,
+        depth: u8,
+    ) -> Result<DrawableId, RenderError> {
+        let storage = platform
+            .allocate_drawable_storage(w, h, depth)
+            .map_err(RenderError::Vk)?;
+        store
+            .allocate(
+                xid,
+                super::super::store::DrawableKind::Pixmap,
+                depth,
+                false,
+                storage,
+            )
+            .map_err(|_| RenderError::NoVk)
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn depth32_put_image_get_image_round_trip() {
@@ -6245,7 +6458,7 @@ mod tests {
             .expect("get_image");
         assert_eq!(out, src, "depth-32 round-trip must be byte-identical");
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -6310,7 +6523,7 @@ mod tests {
             assert_eq!(px[3], 0xFF, "A");
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     /// Stage 3f.2: `engine.logic_fill` applies the per-`GcFunction`
@@ -6415,7 +6628,7 @@ mod tests {
             assert_eq!(px[3], 0xFF, "A preserved by opaque_alpha mask");
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -6531,7 +6744,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -6711,7 +6924,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -6852,7 +7065,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -6990,7 +7203,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -7187,7 +7400,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     /// Regression test for the use-after-free that wedged bee
@@ -7252,7 +7465,7 @@ mod tests {
         // can only mean the batch's ticket landed. Otherwise the
         // assertion is satisfied by the stale fill_rect ticket and
         // we'd be green for the wrong reason.
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
         store.get_mut(src_id).unwrap().last_render_ticket = None;
 
         let dst_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
@@ -7334,7 +7547,7 @@ mod tests {
         engine
             .flush_render_batch(&mut store, &mut platform)
             .expect("flush ok");
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     /// Companion regression test, same root cause: a `FreePixmap`
@@ -7380,7 +7593,7 @@ mod tests {
         // reflects a signaled fence — without this, decref would
         // return PendingFence on the fill_rect ticket itself and
         // give a misleading green even with the bug present.
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
         assert_eq!(
             store
                 .get(src_id)
@@ -7467,7 +7680,7 @@ mod tests {
         engine
             .flush_render_batch(&mut store, &mut platform)
             .expect("flush ok");
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     /// Same invariant, cow `copy_area` batch shape. The bug exists
@@ -7508,7 +7721,7 @@ mod tests {
                 decode_x11_pixel_bgra(0xFF_FF_00_00),
             )
             .unwrap();
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
 
         let cow_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
         let cow_id = store
@@ -7566,7 +7779,7 @@ mod tests {
         engine
             .flush_cow_batch(&mut store, &mut platform)
             .expect("flush ok");
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -7704,7 +7917,7 @@ mod tests {
         let records = engine.drain_render_flush_records();
         assert_eq!(records.len(), 2, "two flushes total");
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -7786,7 +7999,7 @@ mod tests {
             "Solid src should submit per call"
         );
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -7949,7 +8162,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8050,7 +8263,7 @@ mod tests {
             );
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8132,7 +8345,7 @@ mod tests {
         let off_3_3 = (3 * 4 + 3) * 4;
         assert_eq!(&out[off_3_3..off_3_3 + 4], &[0xFF, 0x00, 0x00, 0xFF]);
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8261,7 +8474,7 @@ mod tests {
         assert!(max_x >= 22);
         assert!(max_y >= 17);
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8292,7 +8505,7 @@ mod tests {
             .expect("ok");
         // One upload + one consume.
         assert!(engine.pending_count() >= 2);
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
         assert_eq!(engine.pending_count(), 0);
     }
 
@@ -8400,7 +8613,7 @@ mod tests {
             "between-quad pixel (7,2) should be background black; got ({b:#x},{g:#x},{r:#x})"
         );
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8446,7 +8659,7 @@ mod tests {
         assert_eq!(stats2.atlas_interns, 0);
         assert_eq!(stats2.glyphs_dropped, 1);
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     // ── Stage 3c.3 acceptance tests ─────────────────────────────
@@ -8601,7 +8814,7 @@ mod tests {
             out[off + 3]
         );
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8696,7 +8909,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8764,7 +8977,7 @@ mod tests {
             assert!(near(px[2], 0x40), "R: {:#x}", px[2]);
             assert!(near(px[3], 0xFF), "A: {:#x}", px[3]);
         }
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -8890,7 +9103,7 @@ mod tests {
 
         // Cleanup so the gradient image is freed in this drain.
         engine.picture_paint_remove(grad_xid);
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -9006,7 +9219,7 @@ mod tests {
         );
 
         engine.picture_paint_remove(grad_xid);
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -9054,7 +9267,7 @@ mod tests {
             )
             .expect("render_composite Ok even on missing gradient");
         assert_eq!(stats.recorded_draws, 0);
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -9103,7 +9316,7 @@ mod tests {
             "Disjoint family must drive the readback path",
         );
         assert_eq!(stats.recorded_draws, 1);
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -9204,7 +9417,7 @@ mod tests {
             "Over(self, NoMask, self) must equal self bit-identical",
         );
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     #[test]
@@ -9259,7 +9472,7 @@ mod tests {
         for px in out.chunks_exact(4) {
             assert_eq!(&px[..4], &[0x00, 0x00, 0xFF, 0xFF]);
         }
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     // ── Stage 3e.2 decoder + degenerate-trap unit tests ─────────
@@ -9493,7 +9706,7 @@ mod tests {
             }
         }
 
-        engine.drain_all(&platform);
+        engine.drain_all(&mut platform);
     }
 
     /// X11 Render PictFormat fix — resolver-level oracle.
@@ -9811,5 +10024,106 @@ mod tests {
         };
         assert_eq!(b.engine.descriptor_pool_creates_lifetime(), 0);
         assert_eq!(b.engine.descriptor_pool_resets_lifetime(), 0);
+    }
+
+    // ── Task 3 Phase A regression tests ─────────────────────────
+
+    /// With max_size=1 (default), every paint op auto-flushes
+    /// immediately. Two ops → two vkQueueSubmit2 calls.
+    /// No shared fence reuse across ops (VUID-vkQueueSubmit2-fence-04894
+    /// safety).
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn begin_op_cb_with_max_size_one_does_not_reuse_fence() {
+        let Some(mut p) = try_for_tests_with_vk() else {
+            return;
+        };
+        assert_eq!(p.submit_group_max_size_for_tests(), 1);
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        let initial = p.queue_submit2_count_for_tests();
+        let id = engine
+            .create_pixmap(&mut store, &mut p, 0xfaff_0001, 16, 16, 32)
+            .expect("create");
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 16,
+                        height: 16,
+                    },
+                },
+                [1.0, 0.0, 0.0, 1.0],
+            )
+            .expect("fill");
+        let after = p.queue_submit2_count_for_tests();
+        assert_eq!(after - initial, 1, "max_size=1: one fill → one submit");
+        assert!(!p.submit_group_is_open(), "group closed after auto-flush");
+        assert_eq!(
+            engine.pending_group_ops_count_for_tests(),
+            0,
+            "pending_group_ops drained after auto-flush"
+        );
+        engine.drain_all(&mut p);
+    }
+
+    /// A failed `flush_submit_group` must clear `pending_group_ops`
+    /// (rollback) and set `renderer_failed`. The `submitted` queue
+    /// must NOT grow (no phantom SubmittedOps with unsignaling fences).
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn flush_submit_group_failure_drops_pending_group_ops() {
+        let Some(mut p) = try_for_tests_with_vk() else {
+            return;
+        };
+        p.submit_group_set_max_size_for_tests(16);
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+        let dst = engine
+            .create_pixmap(&mut store, &mut p, 1, 4, 4, 32)
+            .unwrap();
+        // With max_size=16, fill_rect appends but doesn't auto-flush.
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        let parked_before = engine.pending_group_ops_count_for_tests();
+        assert!(parked_before >= 1, "fill_rect parked at least one op");
+        let in_flight_before = engine.pending_count();
+
+        p.force_next_submit_failure_for_tests();
+        let r = engine.flush_submit_group(
+            &mut p,
+            super::super::submit_group::FlushReason::SceneCompose,
+        );
+        assert!(r.is_err(), "flush must fail");
+        assert!(p.renderer_failed, "renderer_failed must be set");
+        assert_eq!(
+            engine.pending_group_ops_count_for_tests(),
+            0,
+            "pending_group_ops must be cleared on rollback"
+        );
+        assert_eq!(
+            engine.pending_count(),
+            in_flight_before,
+            "submitted queue must not grow"
+        );
     }
 }

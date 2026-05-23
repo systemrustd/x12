@@ -230,6 +230,16 @@ impl VkCallStats {
     }
 }
 
+/// Read the current `queue_submit2` counter without resetting it.
+/// Used by test helpers that want to assert on submit counts during
+/// a test run (not across a snapshot boundary).
+///
+/// The counter is global and not reset between tests; callers should
+/// capture the value at the start of a test and compare the delta.
+pub fn queue_submit2_count() -> u64 {
+    VK_CALLS.queue_submit2.load(Ordering::Relaxed)
+}
+
 /// Convenience macro: increment a single counter by one. Cheaper to
 /// read at call sites than the full path each time.
 ///

@@ -494,6 +494,12 @@ pub(crate) struct PlatformBackend {
     /// Consumed exactly once by `take_last_flush_outcome`.
     last_flush_outcome: Option<FlushOutcome>,
 
+    /// Test-only: when true, the next `flush_submit_group` call will
+    /// route through `abort_flush` instead of the real
+    /// `vkQueueSubmit2`. Reset to false after consumption.
+    #[cfg(test)]
+    force_next_submit_failure: bool,
+
     /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
     /// failed (best-effort; SW fallback kicks in) or on the test
     /// fixture. The shared dumb buffer + per-CRTC visibility map
@@ -672,6 +678,8 @@ impl PlatformBackend {
             cursor_plane,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
+            #[cfg(test)]
+            force_next_submit_failure: false,
         })
     }
 
@@ -750,6 +758,8 @@ impl PlatformBackend {
             cursor_plane: None,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
+            #[cfg(test)]
+            force_next_submit_failure: false,
         }
     }
 
@@ -1294,56 +1304,40 @@ impl PlatformBackend {
         ))
     }
 
-    /// Submit a paint command buffer with `signal_fence`. Stage 2c
-    /// covers paint-only submits (no KMS sync semaphore); Stage 2d's
-    /// compose path adds the semaphore parameter.
+    /// Phase A: append a paint CB to the open submit group. Returns
+    /// `Ok(())` once the append is recorded. NEVER auto-flushes —
+    /// flush is the engine's responsibility.
     ///
-    /// # Errors
-    ///
-    /// Propagates `vkQueueSubmit2` failures. Sets `renderer_failed`
-    /// on Err so the next op surfaces the condition.
+    /// `signal_fence` is IGNORED — the group's shared ticket owns the
+    /// fence. The parameter stays in the signature for source
+    /// compatibility with the engine; remove in Phase B.
     pub(crate) fn submit_paint_cb(
         &mut self,
         cb: vk::CommandBuffer,
-        signal_fence: vk::Fence,
+        _signal_fence: vk::Fence,
     ) -> Result<(), vk::Result> {
-        self.submit_paint_cb_with_semaphore(cb, signal_fence, None)
+        self.submit_paint_cb_with_semaphore(cb, vk::Fence::null(), None)
     }
 
-    /// Submit a paint command buffer, optionally signaling a
-    /// dedicated export-only semaphore for deferred PRESENT
-    /// completion in the same queue submission.
+    /// Phase A: append a paint CB to the open submit group, optionally
+    /// attaching a completion semaphore that will be signaled in the
+    /// eventual group flush. NEVER auto-flushes — flush is the
+    /// engine's responsibility.
+    ///
+    /// `signal_fence` is IGNORED — the group's shared ticket owns the
+    /// fence. The parameter stays in the signature for source
+    /// compatibility with the engine; remove in Phase B.
     pub(crate) fn submit_paint_cb_with_semaphore(
         &mut self,
         cb: vk::CommandBuffer,
-        signal_fence: vk::Fence,
+        _signal_fence: vk::Fence,
         completion_signal: Option<vk::Semaphore>,
     ) -> Result<(), vk::Result> {
-        let Some(vk) = self.vk.as_ref() else {
+        if self.vk.is_none() {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let sig_info;
-        let submit_base = vk::SubmitInfo2::default().command_buffer_infos(&cb_info);
-        let submit = if let Some(semaphore) = completion_signal {
-            sig_info = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(semaphore)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-            [submit_base.signal_semaphore_infos(&sig_info)]
-        } else {
-            [submit_base]
-        };
-        crate::vk_count!(queue_submit2);
-        match unsafe {
-            vk.device
-                .queue_submit2(vk.graphics_queue, &submit, signal_fence)
-        } {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.renderer_failed = true;
-                Err(e)
-            }
         }
+        self.submit_group.append(cb, completion_signal);
+        Ok(())
     }
 
     pub(crate) fn acquire_present_completion_signal(
@@ -1400,6 +1394,11 @@ impl PlatformBackend {
         self.submit_group.is_open()
     }
 
+    /// Phase A: max capacity of the submit group before auto-flush.
+    pub(crate) fn submit_group_max_size(&self) -> usize {
+        self.submit_group.max_size()
+    }
+
     /// Phase A: explicit flush of any buffered submit group. Issues one
     /// `vkQueueSubmit2` with all buffered CBs + signal semaphores,
     /// signaling the group's shared fence. Empty group → `Ok(FlushOutcome {
@@ -1435,6 +1434,12 @@ impl PlatformBackend {
             return Ok(outcome);
         };
         let ticket = ticket.expect("non-empty group has ticket");
+        // Test-only fault injection: simulate a queue_submit2 failure.
+        #[cfg(test)]
+        if self.force_next_submit_failure {
+            self.force_next_submit_failure = false;
+            return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST);
+        }
         let cb_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = entries
             .iter()
             .map(|e| vk::CommandBufferSubmitInfo::default().command_buffer(e.cb))
@@ -1852,6 +1857,27 @@ mod tests {
             .expect("empty-group flush is always Ok");
         assert_eq!(outcome.flushed_entries, 0);
         assert!(!p.submit_group_is_open());
+    }
+
+    // ── Task 3 test helpers ──────────────────────────────────────
+
+    #[cfg(test)]
+    impl PlatformBackend {
+        pub(crate) fn submit_group_set_max_size_for_tests(&mut self, n: usize) {
+            self.submit_group.set_max_size(n);
+        }
+
+        pub(crate) fn submit_group_max_size_for_tests(&self) -> usize {
+            self.submit_group.max_size()
+        }
+
+        pub(crate) fn queue_submit2_count_for_tests(&self) -> u64 {
+            crate::kms::vk::call_stats::queue_submit2_count()
+        }
+
+        pub(crate) fn force_next_submit_failure_for_tests(&mut self) {
+            self.force_next_submit_failure = true;
+        }
     }
 
     #[test]

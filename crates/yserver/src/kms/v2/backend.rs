@@ -1927,7 +1927,7 @@ impl KmsBackendV2 {
         // platform's `device_wait_idle` + pool destruction so
         // each subsystem's book-keeping reclaims its handles
         // against the still-live pool.
-        self.engine.drain_all(&self.platform);
+        self.engine.drain_all(&mut self.platform);
         self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
 
