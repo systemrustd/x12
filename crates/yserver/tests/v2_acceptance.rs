@@ -3142,3 +3142,83 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
         "shutdown should hand at least one event back"
     );
 }
+
+/// Phase A T6 regression gate: the non-COW PRESENT enqueue path must
+/// call `flush_submit_group(PresentCompletionSignal)` before the
+/// signal-only submit, so prior paint CBs are queued before the
+/// semaphore signals.
+///
+/// Setup: create a pixmap, drain setup CBs, issue a fill_rectangle
+/// (paint op parks a CB in the SubmitGroup). Then call
+/// `enqueue_present_completion` for the same pixmap against a
+/// *non-COW* destination (no cow_id set). The flush must happen before
+/// the signal-only submit, draining the parked CB.
+///
+/// Spec § "Phase A — concrete scope" trigger 2.
+#[test]
+#[ignore = "lavapipe vk"]
+fn submit_group_flushes_before_non_cow_present_completion_signal() {
+    use yserver_core::backend::{Backend, CompletedPresentEvent, PresentWake};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Drain any CBs buffered during construction (layout transitions etc.).
+    b.engine_flush_submit_group_for_tests()
+        .expect("baseline drain");
+    assert!(
+        !b.platform_submit_group_is_open_for_tests(),
+        "baseline: submit group closed after drain"
+    );
+
+    // Create a 4×4 depth-32 pixmap that will be the PRESENT destination.
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    let dst_xid = dst_pix.as_raw();
+
+    // Drain any CBs from the create_pixmap itself.
+    b.engine_flush_submit_group_for_tests()
+        .expect("post-create drain");
+
+    // Issue a paint op (fill_rectangle) that parks a CB in the group.
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
+        .expect("fill_rectangle");
+
+    // The CB should now be buffered in the group.
+    assert!(
+        b.platform_submit_group_size_for_tests() >= 1
+            || b.engine_pending_group_ops_count_for_tests() >= 1,
+        "paint CB buffered before enqueue_present_completion"
+    );
+
+    // Invoke the non-COW PRESENT enqueue path.  cow_id is unset on
+    // for_tests_with_vk(), so this exercise the non-COW fallback.
+    b.enqueue_present_completion(
+        CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial: 99,
+            host_xid: dst_xid,
+            dst_host_xid: dst_xid,
+            options: 0,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        },
+        dst_xid,
+    );
+
+    // After the call the PresentCompletionSignal flush must have
+    // graduated all parked ops to `submitted` and closed the group.
+    assert_eq!(
+        b.platform_submit_group_size_for_tests(),
+        0,
+        "submit group drained by PresentCompletionSignal flush"
+    );
+    assert_eq!(
+        b.engine_pending_group_ops_count_for_tests(),
+        0,
+        "parked op graduated to submitted before signal-only submit"
+    );
+}

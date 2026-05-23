@@ -785,8 +785,8 @@ impl RenderEngine {
     }
 
     /// Phase A: count of ops parked in pending_group_ops (not yet
-    /// committed to `submitted`). Test helper.
-    #[cfg(test)]
+    /// committed to `submitted`). Test helper — also used by the
+    /// backend wrapper exposed to v2_acceptance integration tests.
     pub(crate) fn pending_group_ops_count_for_tests(&self) -> usize {
         self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
     }

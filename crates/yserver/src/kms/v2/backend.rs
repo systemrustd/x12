@@ -1648,6 +1648,38 @@ impl KmsBackendV2 {
         self.platform.renderer_failed = v;
     }
 
+    /// Phase A T6: flush the engine's SubmitGroup with a
+    /// `SyncBoundary` reason. Convenience wrapper for v2_acceptance
+    /// tests that need to drain setup CBs between assertions.
+    pub fn engine_flush_submit_group_for_tests(&mut self) -> Result<(), ash::vk::Result> {
+        self.engine
+            .flush_submit_group(
+                &mut self.platform,
+                crate::kms::v2::submit_group::FlushReason::SyncBoundary,
+            )
+            .map(|_| ())
+    }
+
+    /// Phase A T6: number of ops parked in the engine's
+    /// `pending_group_ops` (not yet committed to `submitted`).
+    /// Exposed for v2_acceptance regression tests.
+    pub fn engine_pending_group_ops_count_for_tests(&self) -> usize {
+        self.engine.pending_group_ops_count_for_tests()
+    }
+
+    /// Phase A T6: size of the current SubmitGroup (number of CBs
+    /// buffered and not yet submitted to the Vulkan queue).
+    /// Exposed for v2_acceptance regression tests.
+    pub fn platform_submit_group_size_for_tests(&self) -> usize {
+        self.platform.submit_group_size()
+    }
+
+    /// Phase A T6: true while the SubmitGroup is open (has at least
+    /// one CB buffered). Exposed for v2_acceptance regression tests.
+    pub fn platform_submit_group_is_open_for_tests(&self) -> bool {
+        self.platform.submit_group_is_open()
+    }
+
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
     /// queued past `disable_output` so the caller (lib.rs::run) can
     /// fan them out to clients before tearing down the socket.
@@ -9220,6 +9252,19 @@ impl Backend for KmsBackendV2 {
                 Ok(()) => return,
                 Err(returned) => entry = returned,
             }
+        }
+
+        // Phase A: ensure all prior paint is on the queue BEFORE the
+        // signal-only submit. Engine-driven so any parked pending_group_ops
+        // graduate to `submitted` atomically with the submit.
+        // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.platform,
+            crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,
+        ) {
+            log::warn!("v2 enqueue_present_completion: flush_submit_group failed: {e:?}");
+            // Fall through; the signal-only submit will fail with
+            // renderer_failed and the caller's error handling kicks in.
         }
 
         let fallback_ticket = self
