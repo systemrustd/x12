@@ -152,14 +152,17 @@ Spec § Phase B open question 1. The choice is between
 *prepared* (snapshot resources at append). Phase B uses a
 **hybrid**: a compact `RecordedOp` enum carries only the
 *parameters* of each op (rects, colours, glyph keys, pipeline
-choices) plus typed handles into the frame's pin set
-(`PinnedImageViewIdx`, `PinnedDescriptorSetIdx`,
-`PinnedStagingIdx`). Append-time **pins the resources** into
-the frame's pin set (Arc clones into `FrameBuilder.pinned_*`
-vectors) so a later op or close-time replay cannot observe a
-freed view/descriptor/buffer. Close-time replay reads the op
-params, looks up the pinned handles, and records the Vulkan
-commands.
+choices), the raw `vk::DescriptorSet` handle resolved at op
+append time, and typed indices into the frame's Arc-pinned
+resource vectors (`PinnedStagingIdx`, `PinnedSyncObjectIdx`,
+etc.) for resources that ARE Arc-tracked. Append-time **pins
+each resource via the mechanism appropriate to it** (Arc
+clone for Arc-tracked, generation-watermark snapshot for
+DescriptorPoolRing — see § "Frame-wide resource pinning"). A
+later op or close-time replay cannot observe a freed
+view/descriptor/buffer. Close-time replay reads the op params
+and records the Vulkan commands using the saved descriptor-
+set handle + pinned-Arc lookups directly.
 
 ```rust
 #[derive(Debug)]
@@ -205,11 +208,13 @@ structure is in tree, not before").
   simplification and reintroducing the multi-CB shape that the
   bee fault demands we structurally remove.
 - Hybrid: parameters are tiny (a few hundred bytes/op worst
-  case), pins are Arc clones (one refcount bump per pinned
-  resource per op), close-time replay is a single primary CB
-  recorded straight-through. The pinning surface is bounded
-  per-frame (capped by `max_pinned_resources_per_frame` —
-  fail-the-frame guard, not silent growth).
+  case), Arc-tracked pins are one refcount bump per pinned
+  resource per op, generation-watermark pins are one `u64`
+  high-water update per pool per op, close-time replay is a
+  single primary CB recorded straight-through. The pinning
+  surface is bounded per-frame (capped by
+  `max_pinned_resources_per_frame` — fail-the-frame guard, not
+  silent growth).
 
 ### Drawable lifetime — append-time frame-ticket touch
 
@@ -228,13 +233,39 @@ batch did; the same UAF guard must move with it.
 **Contract.** At each `RecordedOp` append, the frame builder
 calls `store.touch_render_fence(id, frame_ticket.clone())` on
 EVERY drawable the op will read or write — dst + src + mask +
-any clip-source. The frame ticket is the same one cloned into
-every retire-gating consumer Phase A already wires
-(scene compositor pending-ack list, the `SubmittedOp` queue,
-etc.). A `FreePixmap(src)` issued after the op append but
-before frame close therefore observes a non-signaled ticket
-and goes via the existing `RetireDecision::PendingFence` path;
-the storage drops only after the frame ticket signals.
+any clip-source. **The first touch of a given drawable
+in-frame snapshots its prior `last_render_ticket`** into the
+frame's `touched_drawables: HashMap<DrawableId,
+Option<FenceTicket>>` overlay (parallel to the layout
+overlay's `(pre_frame, in_frame)` pattern). The frame ticket
+is the same one cloned into every retire-gating consumer
+Phase A already wires (scene compositor pending-ack list, the
+`SubmittedOp` queue, etc.). A `FreePixmap(src)` issued after
+the op append but before frame close therefore observes a
+non-signaled ticket and goes via the existing
+`RetireDecision::PendingFence` path; the storage drops only
+after the frame ticket signals.
+
+**Commit on success.** Frame-close-success leaves
+`last_render_ticket` pointing at the frame ticket (the same
+ticket whose submit just completed); the overlay drops without
+write-back. `decref` / `poll_pending_retire` poll the frame
+ticket; once it signals, retirement proceeds.
+
+**Rollback on failure.** Frame-close-failure walks
+`touched_drawables` and **restores each drawable's
+`last_render_ticket` to its pre-frame value** before setting
+`renderer_failed`. Without restoration, a drawable's
+`last_render_ticket` would point at the frame's
+never-signaled fence; `decref` / `poll_pending_retire`
+(`store.rs:708` / `store.rs:887`) would observe
+`poll_signaled = false` forever and leak storage. With
+restoration, retirement sees the pre-frame ticket (either
+already-signaled, or signaled when the prior frame retires),
+and storage drops normally. Even with `renderer_failed`
+set (Phase A's discipline), shutdown teardown
+(`KmsBackendV2::shutdown`) still iterates the store and must
+not hang on phantom tickets.
 
 **Why ticket-touch instead of pinning the storage via Arc.**
 `Drawable::storage` is not Arc-owned today; it's a struct
@@ -300,6 +331,44 @@ Phase B:
   record into the same frame CB; one submit. Spec target for
   this case: a MATE drag frame with 10–20 glyph misses runs
   in ≤ 1 submit/frame versus Phase A's 10–20 submits/frame.
+
+### Damage accumulation — append-time, not rolled back
+
+`DrawableStore::damage` (`store.rs:781`) tracks both protocol-
+level damage (X11 DAMAGE extension state — clients see this
+via DamageNotify) and presentation damage (scene compose's
+input — drives repaint region selection at
+`scene.rs:1328`). Today's paint paths mutate damage as part
+of the op; Phase B inherits this exactly:
+
+- **Append-time mutation.** Each `RecordedOp` append calls
+  the existing damage mutator at the same time it would have
+  under Phase A. The frame builder does NOT defer or shadow
+  damage state. Reason: damage reflects what the X11 client
+  asked the server to do, not what the server's GPU
+  successfully executed — the client's `XRender` /
+  `XCopyArea` / `XPutImage` request "happened" the moment the
+  server accepted it; subsequent damage events fire on that
+  acceptance, before any GPU work.
+- **No rollback on frame failure.** A failed frame submit
+  doesn't undo the protocol-level state ("client wrote
+  pixels; repaint that area"). The damage region is correct;
+  the engine just can't render it because `renderer_failed`
+  short-circuits subsequent paint, and the only correct
+  response is teardown. Restoring damage to pre-frame would
+  *lose* a DamageNotify the client has already been told
+  about. Out of scope.
+- **In-frame compose (B.4+).** When compose joins the frame,
+  the compose RecordedOp snapshots damage at frame-close as
+  part of its payload (the existing pattern at
+  `scene.rs:1328` lifted into `RecordedOp::Compose`
+  construction). All paint ops in the same frame have
+  already appended, so the compose op sees every contribution
+  from the open frame.
+- **Cross-frame compose (B.1–B.3).** Legacy compose runs
+  after M3 closes the open frame; compose then snapshots
+  damage via today's `scene.tick` path, observing committed
+  state. Same correctness as today.
 
 ### Transactional layout state
 
@@ -442,6 +511,15 @@ unbounded and paint never reaches the GPU.
    the only safe ordering is "flush + commit the frame, then
    the non-ported op runs against committed `current_layout`
    state". Trigger retires at B.5 when SubmitGroup is deleted.
+3b. **Legacy scene compose** (only relevant during B.1–B.3).
+   `maybe_composite`'s tick closes the open frame BEFORE
+   `scene.tick` records compose, since compose still records
+   outside the frame builder until B.4. Same reasoning as
+   trigger 3 (compose samples drawables; must observe
+   submitted paint), applied to the compose call site
+   specifically. This is Invariant M3 in § "Migration
+   boundaries"; trigger retires at B.4 when compose joins
+   the frame.
 4. **Timeout** (idle / no-pageflip case). A frame that's been
    open for > T ms without a ready output forces a close to
    release pinned resources. Default T = 16 ms (one vblank at
@@ -616,6 +694,21 @@ stale `current_layout` and race against the deferred frame on
 the GPU. M2 retires when the last non-ported entry point
 moves into the frame builder at B.4 close.
 
+**Invariant M3 — legacy scene compose closes the open frame
+first.** Until sub-phase B.4 folds compose into the frame, the
+existing `maybe_composite` path (`backend.rs:4574`) records
+the compose CB outside the frame builder and submits via
+`scene.tick`. `scene.tick` samples drawable storage at record
+time (`scene.rs:1307`), so any open paint frame must close +
+commit BEFORE compose records. During B.1–B.3, the load-
+bearing flush in `maybe_composite` becomes:
+`if frame.is_open() { frame.close_into_cb(LegacyScCompose);
+} self.engine.flush_submit_group(SceneCompose); scene.tick(…)`.
+Without M3, legacy compose would sample stale `current_layout`
+on drawables whose paint sits in the open frame, or worse,
+race the deferred frame on the GPU. M3 retires at B.4 when
+compose itself ports into the frame.
+
 **Sub-phases:**
 
 - **Sub-phase B.1 — FrameBuilder skeleton + `composite_glyphs`.**
@@ -677,6 +770,12 @@ but expands the rollback surface:
   `pre_frame_layout` per drawable. If restoration itself fails,
   set `renderer_failed` and stop — subsequent entries
   short-circuit on the existing Phase A gate.
+- **`touched_drawables` overlay.** Per-drawable
+  `last_render_ticket` restored to its pre-frame value (see
+  § "Drawable lifetime"). This is load-bearing: without it,
+  `decref` / `poll_pending_retire` would observe a never-
+  signaled phantom ticket and leak storage even under
+  `renderer_failed`.
 - **Atlas pending inserts.** Dropped (uncommitted; the cached
   glyph pixel addresses were never read).
 - **`pending_present_completions`.** Inherits Phase A § "COW
@@ -707,8 +806,12 @@ paths side by side. All counters report at the existing
 - `frame_builder_opens/s`, `frame_builder_closes/s` (lifetime
   counts of paint-driven open + close-into-cb cycles).
 - `frame_builder_close_reason` (lifetime counts:
-  `MaybeComposite`, `SyncWait`, `Timeout`, `Shutdown`,
-  `PinCeiling`).
+  `MaybeComposite`, `PresentCompletionSignal`, `SyncWait`,
+  `NonPortedPaintOp`, `LegacyScCompose`, `Timeout`,
+  `Shutdown`, `PinCeiling`). `NonPortedPaintOp` and
+  `LegacyScCompose` retire over the sub-phase rollout (M2 at
+  B.4, M3 at B.4); their lifetime counters going to zero is
+  the rollout signal.
 - `frame_builder_ops_per_frame_avg/max/histogram`. Histogram
   buckets `1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+`.
 - `frame_builder_active_pins` (gauge — current pin set size
@@ -733,9 +836,13 @@ sustains the same workload at ~60–300/s (1–5 submits/frame).
 Unit tests:
 
 - `frame_builder_lazy_open_does_not_allocate_when_no_paint`.
-- `frame_builder_op_append_pins_descriptor_set` — appending an
-  op records its descriptor handle in the pin set; the original
-  Arc can drop without affecting the pinned clone.
+- `frame_builder_op_append_watermark_pins_descriptor_pool` —
+  appending an op that acquires a descriptor set bumps the
+  frame's `FrameWatermarks::descriptor_pool_gen` to the
+  acquired set's generation. Subsequent
+  `DescriptorPoolRing::release_up_to` calls (which Phase A's
+  retirement sweep drives) cannot release pools whose
+  generation is ≤ the watermark until the frame ticket signals.
 - `frame_builder_layout_overlay_first_touch_snapshots_pre_frame`.
 - `frame_builder_layout_overlay_commit_writes_back_on_close`.
 - `frame_builder_layout_overlay_rollback_restores_pre_frame`.
