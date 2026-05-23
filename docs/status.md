@@ -2387,6 +2387,95 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     `RADV_DEBUG=syncshaders` stalls the display controller
     hard enough to need SysRq recovery).
 
+    **Task 6.1 deferred PRESENT completion attempt — branch
+    `feature/deferred-present-completion`, shelved 2026-05-23.**
+    Spec
+    `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`;
+    plan `docs/superpowers/plans/2026-05-23-deferred-present-completion.md`.
+    Implemented the deferred-completion design end-to-end (18
+    commits on the branch, lib tests 384 / 49 ignored green,
+    clippy clean, vng smoke recipe added as
+    `just yserver-defpresent-vng-smoke`). Goals: replace `8ca552a`
+    (sync wait + bee fix) with an async mechanism that closes the
+    bee UAF without the yoga deadlock and without per-PRESENT
+    CPU fence waits.
+
+    Two hardware findings:
+    1. **Yoga / Turnip hard hang**, fixed by `4f566e6`. Initial
+       implementation captured `engine.current_cow_batch_ticket()`
+       at PRESENT::Pixmap time and called
+       `vkGetFenceFdKHR(SYNC_FD)` on it. That fence is recorded
+       but not submitted at PRESENT time (the cow_batch CB is
+       still open; submission lands later at `flush_cow_batch`).
+       Per `VUID-VkFenceGetFdInfoKHR-handleType-01457` ("the
+       fence must have an associated fence signal operation that
+       has been submitted for execution"), calling export on an
+       unsubmitted fence is UB — Turnip on yoga hung the entire
+       process; lavapipe likewise hung in a unit test attempt
+       (Task 4 verbatim test was dropped).
+       Fix: capture `dst.last_render_ticket` (set by
+       `engine.copy_area`'s `store.touch_render_fence` after
+       `end_and_submit_op` — fence has a queued signal op).
+       Safety net for the rare `dst == cow_id` corner: force-
+       flush the cow_batch first.
+    2. **Bee / RADV cursor-only regression, blocking ship.**
+       With the `4f566e6` fix in place: no deadlock, no UAF,
+       sustained 60 FPS render activity (`cpu_fence_wait_ns/s
+       = 0`). Clients (`mate-panel`, `caja`, `marco`, …) connect
+       and paint their backing pixmaps successfully (panel
+       backing 254KB / 256KB non-zero — fully drawn; caja-
+       desktop full-screen backing 100% non-zero). COW has ~25%
+       non-zero pixels (some cow_copy_areas did flush — `cow_
+       batches_flushed/s = 1` peak). **But the scanout BO is
+       essentially empty (541 non-zero bytes out of 11MB).**
+       KMS pageflips a black framebuffer; only the cursor
+       plane (which is independent of the scene-compose CB) is
+       visible. Marco bails out of compositor mode with
+       `Window manager error: Unable to open X display :7`
+       after only 11 X requests — its compositor-helper
+       subprocess is failing to open a secondary connection
+       that 8ca552a accepts cleanly. Cause unknown; v2
+       `scene.rs` is byte-identical to 8ca552a and the engine
+       eager-touch is also identical (Task 15 restored it
+       verbatim from 8ca552a).
+
+    Hypothesis being tested: MATE's `mate-session-check-accelerated`
+    GL probe routes through Mesa WSI which uses PRESENT, so the
+    deferred-PRESENT path IS exercised even though MATE itself
+    doesn't visibly use GL. A wrong IdleNotify timing or stale
+    `state.sync_fences` bookkeeping mid-probe might leave the GL
+    helper in a bad state → marco compositor child fails to
+    initialise → COW pump never runs → black scanout. Removing
+    `VK_KHR_external_fence_fd` from the wanted device-extension
+    list as a long-shot diagnostic crashed yserver immediately
+    (ash's loader-stub panics when the function is called without
+    the extension enabled, even though the call site is only
+    reached during PRESENT — confirms MATE startup DOES generate
+    PRESENT traffic). Reverted that diagnostic.
+
+    Cross-machine hardware coverage on the branch:
+      - **silence (rx580 / RADV)**: not tested (lower priority —
+        bee + yoga drive the design).
+      - **bee (Rembrandt RDNA2 / RADV)**: branch + fix runs,
+        cursor only. Master alone hits the original
+        `ERROR_DEVICE_LOST` UAF (matches `8ca552a` chain).
+        `8ca552a` itself works fully.
+      - **yoga (Snapdragon X1E / Turnip)**: branch without fix
+        deadlocks within 2 s of marco starting (Turnip's
+        VUID-01457 enforcement). Branch + fix: not re-tested
+        after the fix landed.
+      - **vng smoke (Venus → host GPU)**: branch + fix runs
+        glxgears at 210 FPS, `cpu_fence_wait_ns/s = 0`, vs
+        master at 78–93 ms/s in synchronous waits. Useful as a
+        regression gate but doesn't exercise marco's COW
+        pump (glxgears targets its own window, never the COW).
+
+    Branch is preserved on `origin/feature/deferred-present-completion`
+    (commits `faa7fca`…`4f566e6`). vng smoke recipe lives in the
+    Justfile. Not ready to land; the cursor-only regression
+    blocks bee usability, and reverting to master re-opens the
+    bee UAF.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
