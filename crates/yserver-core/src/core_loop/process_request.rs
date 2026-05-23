@@ -5261,29 +5261,40 @@ fn handle_present_request(
                             height,
                         )
                         .is_ok()
-                    && backend.wait_for_drawable_idle(dst.host_xid()).is_ok()
+                    && {
+                        // Stage 5 Task 6.1 site #2 — defer completion.
+                        // The synchronous `wait_for_drawable_idle` +
+                        // immediate `dri3_signal_syncobj` +
+                        // immediate `fire_present_completion_events`
+                        // have been replaced by an enqueue. The
+                        // backend pins the cow_batch fence ticket +
+                        // the release_syncobj handle (via `Arc`),
+                        // then the main-loop drain signals the
+                        // release_syncobj at release_value and fires
+                        // CompleteNotify { mode: Copy } + IdleNotify
+                        // once the GPU side has finished.
+                        backend.enqueue_present_completion(crate::backend::CompletedPresentEvent {
+                            client_id,
+                            serial: req.serial,
+                            host_xid: host_xid.as_raw(),
+                            dst_host_xid: dst.host_xid(),
+                            options: masked_options,
+                            wake: crate::backend::PresentWake::PixmapSynced {
+                                release_syncobj: req.release_syncobj,
+                                release_value: req.release_value,
+                            },
+                        });
+                        true
+                    }
             } else {
                 false
             };
             if !copied_to_dst {
                 log::debug!(
-                    "PRESENT::PixmapSynced copy path did not copy/wait before release signal \
+                    "PRESENT::PixmapSynced copy path did not copy before release signal \
                      (window=0x{:x} pixmap=0x{:x})",
                     req.window,
                     req.pixmap
-                );
-            }
-            // Per design §3.3.2 Copy path: signal the client's
-            // release_syncobj at release_value once the GPU has
-            // finished reading the source. The copy/wait block above
-            // is the GPU read completion point; host-signal now.
-            if req.release_syncobj != 0
-                && let Err(e) = backend.dri3_signal_syncobj(req.release_syncobj, req.release_value)
-            {
-                log::warn!(
-                    "PRESENT::PixmapSynced: signalling release_syncobj 0x{:x} @ {} failed: {e}",
-                    req.release_syncobj,
-                    req.release_value
                 );
             }
             state
@@ -5313,40 +5324,6 @@ fn handle_present_request(
                     valid_region: req.valid,
                     update_region: req.update,
                 });
-            let current_msc = state
-                .present_msc
-                .get(&ResourceId(req.window))
-                .copied()
-                .unwrap_or(0);
-            let (chosen, _skipped) = state
-                .present_scheduler
-                .pick_at_vblank(ResourceId(req.window), current_msc);
-            if let Some(frame) = chosen {
-                let wake = match frame.idle {
-                    crate::present_scheduler::PresentSync::Binary { fence } => {
-                        crate::backend::PresentWake::Pixmap {
-                            idle_fence_xid: fence,
-                        }
-                    }
-                    crate::present_scheduler::PresentSync::Timeline { syncobj, value } => {
-                        crate::backend::PresentWake::PixmapSynced {
-                            release_syncobj: syncobj,
-                            release_value: value,
-                        }
-                    }
-                };
-                fire_present_completion_events(
-                    state,
-                    &crate::backend::CompletedPresentEvent {
-                        client_id,
-                        serial: frame.serial,
-                        host_xid: frame.pixmap.0,
-                        dst_host_xid: frame.window.0,
-                        options: 0,
-                        wake,
-                    },
-                );
-            }
             debug!(
                 "client {} #{} PRESENT::PixmapSynced serial={} acquire=0x{:x}@{} release=0x{:x}@{}",
                 client_id.0,

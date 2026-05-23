@@ -3043,3 +3043,34 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
     // assertion is the fast-enqueue time.
     let _drained = b.drain_completed_present_events_for_tests();
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
+    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("src");
+    let cow_pix = b.create_pixmap(None, 32, 4, 4).expect("cow");
+    b.copy_area(None, src_pix.as_raw(), cow_pix.as_raw(), 0, 0, 0, 0, 4, 4)
+        .expect("copy");
+    b.enqueue_present_completion(CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(0),
+        serial: 2,
+        host_xid: src_pix.as_raw(),
+        dst_host_xid: cow_pix.as_raw(),
+        options: 0,
+        wake: PresentWake::PixmapSynced {
+            release_syncobj: 0, // 0 = no wake object; just exercises enqueue
+            release_value: 42,
+        },
+    });
+    // Drain may return entries quickly under lavapipe; assertion is
+    // that enqueue didn't panic + the queue can be drained.
+    let _drained = b.drain_completed_present_events_for_tests();
+}
