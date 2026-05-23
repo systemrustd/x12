@@ -1680,6 +1680,13 @@ impl KmsBackendV2 {
         self.platform.submit_group_is_open()
     }
 
+    /// Phase A T8: override the SubmitGroup max-size cap so regression
+    /// tests can exercise the auto-flush boundary at a specific count
+    /// without depending on the production default.
+    pub fn platform_submit_group_set_max_size_for_tests(&mut self, n: usize) {
+        self.platform.submit_group_set_max_size_for_tests(n);
+    }
+
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
     /// without going through `on_page_flip_ready` (which calls
     /// `drain_page_flip_events` and would error on the test fixture's

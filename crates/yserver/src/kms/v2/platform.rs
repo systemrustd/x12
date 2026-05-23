@@ -1399,6 +1399,14 @@ impl PlatformBackend {
         self.submit_group.max_size()
     }
 
+    /// Phase A T8: override the SubmitGroup max-size cap.  Exposed as
+    /// a non-test `pub(crate)` method so `KmsBackendV2` integration
+    /// tests (in `tests/`) can set the cap without needing
+    /// `#[cfg(test)]`-gated visibility.
+    pub(crate) fn submit_group_set_max_size_for_tests(&mut self, n: usize) {
+        self.submit_group.set_max_size(n);
+    }
+
     /// Phase A: explicit flush of any buffered submit group. Issues one
     /// `vkQueueSubmit2` with all buffered CBs + signal semaphores,
     /// signaling the group's shared fence. Empty group → `Ok(FlushOutcome {
@@ -1863,10 +1871,6 @@ mod tests {
 
     #[cfg(test)]
     impl PlatformBackend {
-        pub(crate) fn submit_group_set_max_size_for_tests(&mut self, n: usize) {
-            self.submit_group.set_max_size(n);
-        }
-
         pub(crate) fn submit_group_max_size_for_tests(&self) -> usize {
             self.submit_group.max_size()
         }

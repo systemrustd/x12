@@ -3222,3 +3222,80 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
         "parked op graduated to submitted before signal-only submit"
     );
 }
+
+/// Phase A T8 regression gate: the SubmitGroup max-size cap auto-flushes
+/// after the cap is reached, and op N+1 lands in a new empty group.
+///
+/// Invariant pinned: "Whatever the cap is, exceeding it forces an extra submit."
+///
+/// Setup: cap=16. Issue 16 paint ops — the 16th append crosses the threshold
+/// and triggers an auto-flush. The group is empty after op 16. Op 17 opens a
+/// fresh group with size=1.
+#[test]
+#[ignore = "lavapipe vk"]
+fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
+    use yserver_core::backend::Backend;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Force the cap to 16 explicitly so the test doesn't drift if
+    // someone tunes the default.
+    b.platform_submit_group_set_max_size_for_tests(16);
+
+    let dst = b.create_pixmap(None, 32, 16, 16).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+
+    // Drain setup CBs so we start from an empty group.
+    b.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    assert!(
+        !b.platform_submit_group_is_open_for_tests(),
+        "setup drained"
+    );
+
+    // Issue 16 paint ops. The 16th append → size reaches cap → auto-flush.
+    for i in 0..16u32 {
+        b.fill_rectangle(None, dst_xid, i, 0, 0, 4, 4)
+            .expect("fill");
+    }
+    // After 16 ops: cap fired exactly once, group is empty.
+    assert_eq!(
+        b.platform_submit_group_size_for_tests(),
+        0,
+        "after 16 ops, cap flushed the group",
+    );
+    assert!(
+        !b.platform_submit_group_is_open_for_tests(),
+        "group closed after cap flush",
+    );
+    assert_eq!(
+        b.engine_pending_group_ops_count_for_tests(),
+        0,
+        "parked ops graduated",
+    );
+
+    // Op 17 lands in a new (empty) group.
+    b.fill_rectangle(None, dst_xid, 16, 0, 0, 4, 4)
+        .expect("17th fill");
+    assert_eq!(
+        b.platform_submit_group_size_for_tests(),
+        1,
+        "op 17 in new empty group, size=1",
+    );
+    assert!(
+        b.platform_submit_group_is_open_for_tests(),
+        "group open with op 17 CB buffered",
+    );
+
+    // Explicit flush — group drains.
+    b.engine_flush_submit_group_for_tests()
+        .expect("final flush");
+    assert_eq!(b.platform_submit_group_size_for_tests(), 0);
+    assert!(!b.platform_submit_group_is_open_for_tests());
+}
