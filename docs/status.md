@@ -2476,6 +2476,61 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     blocks bee usability, and reverting to master re-opens the
     bee UAF.
 
+    **2026-05-23 Codex follow-up (working tree, hardware smoke
+    pending):** replaced the temporary `FenceTicket` polling
+    workaround with the intended semaphore-batch design. COW
+    `PRESENT::Pixmap` now attaches completion payloads to the open
+    COW copy batch; flush submits the batch with one dedicated
+    export-only `VkSemaphore`, exports a `SYNC_FD`, registers that fd
+    with the backend's PresentCompletion epoll, and drains all events
+    attached to that batch together when the fd signals. The
+    `FenceTicket` stays purely internal for I6a lifetime/retirement.
+    Non-COW PRESENT uses a signal-only same-queue submit as a
+    correctness fallback, and the old `VK_KHR_external_fence_fd` /
+    fence sync-file export path was removed. The degraded 1 ms
+    polling path remains only for semaphore setup/export failure or
+    Vk-less tests.
+
+    **2026-05-23 perf follow-up:** first semaphore smoke rendered
+    correctly but showed higher `cow_batches_flushed/s` under drag.
+    Root cause in code review: `maybe_composite` flushed open COW /
+    render batches before checking whether any output could submit;
+    if a pageflip was still pending, `scene.tick` skipped after the
+    batch had already become a GPU submit. Working tree now gates
+    the load-bearing `maybe_composite` flush on
+    `scene.has_output_ready_for_submit()` and `next_wakeup` no longer
+    busy-wakes for a dirty scene that is blocked solely on pageflip /
+    retry. This should let COW copies coalesce until the vblank-limited
+    scanout path can consume them.
+
+    **2026-05-23 bee hardware close — Task 6.1 functionally fixed,
+    drag lag delegated to next perf phase.** Bee MATE telemetry on
+    the optimised working tree (mate-session, ~30 s session, no
+    instrumentation overhead): `cow_batches_flushed/s` peak 152
+    (down from 218 pre-pacing-fix), `cow_copies/batch` ratio 8.09
+    (up from 5.75 — aggregation now ahead of the 8ca552a baseline
+    of ~5.5), `cpu_fence_wait_count/s` peak 24 (down from 28),
+    `cpu_fence_wait_ns/s` peak 26 ms (down from 31 ms). PRESENT
+    completion is no longer the structural bottleneck. The
+    `paint_submits/s` increase (2255 → 3240, +45 %) and
+    `queue_submit2/s` increase (2306 → 3304, +43 %) are back-
+    pressure removal: clients + compositor are no longer artificially
+    stalled by synchronous PRESENT completion, so MATE produces
+    more frames worth of activity. **Subjectively bee drag still
+    feels laggy under heavy load** — but that matches the previously-
+    measured bee bottleneck: per-`queue_submit2` `ioctl →
+    libvulkan_radeon → amdgpu` kernel round-trip overhead. We were
+    at 2119/s on the perf-branch capture; we're now at 3304/s. Lag
+    is structurally pre-existing and unaddressed by Task 6.1.
+
+    **Followup filed: submit-rate reduction on bee.** Hot path is
+    raw queue_submit2 frequency. Next perf phase targets bigger
+    paint/render batches, fewer per-op submits, and identifying the
+    top non-COW submit sources in `yserver-mate.submit.tsv` (the
+    top three by row count from the 2026-05-23 bee capture were
+    `render_composite=20171`, `render_fill=17973`, `composite_glyphs=8993`).
+    Task 6.1 lands as-is.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
