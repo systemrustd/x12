@@ -3299,3 +3299,81 @@ fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
     assert_eq!(b.platform_submit_group_size_for_tests(), 0);
     assert!(!b.platform_submit_group_is_open_for_tests());
 }
+
+/// Phase A T10 regression gate: renderer-failed path full rollback.
+///
+/// Invariants pinned:
+///
+/// 1. **Pending-op drop on failure.** After a `queue_submit2` failure,
+///    `pending_group_ops` is cleared and the `submitted` ring is
+///    unchanged (no phantom in-flight entries).
+///
+/// 2. **`renderer_failed` short-circuits subsequent paint ops.** After
+///    failure, `engine.fill_rect` returns `RendererFailed` immediately.
+///
+/// 3. **No-panic on poisoned drawable state.** `store.get_by_xid(dst)`
+///    must not panic after the failure.
+#[test]
+#[ignore = "lavapipe vk"]
+fn submit_group_failure_drops_pending_ops_and_short_circuits() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+
+    // Drain setup CBs so pending_group_ops and submitted start clean.
+    b.engine_flush_submit_group_for_tests().expect("drain");
+
+    // Buffer two paint ops (cap=16 means they stay parked).
+    b.fill_rectangle(None, dst_xid, 0xFF_00_00_00, 0, 0, 4, 4)
+        .expect("fill 1");
+    b.fill_rectangle(None, dst_xid, 0xFF_00_00_01, 0, 0, 4, 4)
+        .expect("fill 2");
+
+    let parked_before = b.engine_pending_group_ops_count_for_tests();
+    assert_eq!(parked_before, 2, "two ops parked before failure");
+
+    let in_flight_before = b.engine_pending_count_for_tests();
+
+    // Scenario 1: inject failure → flush → pending_group_ops cleared,
+    // submitted count unchanged.
+    b.platform_force_next_submit_failure_for_tests();
+    let flush_result = b.engine_flush_submit_group_for_tests();
+    assert!(
+        flush_result.is_err(),
+        "flush must return Err on injected failure"
+    );
+
+    assert!(
+        b.platform_renderer_failed_for_tests(),
+        "renderer_failed must be set after flush failure"
+    );
+    assert_eq!(
+        b.engine_pending_group_ops_count_for_tests(),
+        0,
+        "pending_group_ops must be cleared after rollback"
+    );
+    assert_eq!(
+        b.engine_pending_count_for_tests(),
+        in_flight_before,
+        "submitted ring must be unchanged (no phantom entries)"
+    );
+
+    // Scenario 2: subsequent engine.fill_rect must short-circuit with
+    // RendererFailed (not attempt to allocate a CB or record work).
+    assert!(
+        b.engine_fill_rect_is_renderer_failed_for_tests(dst_xid),
+        "fill_rect must short-circuit with RendererFailed when renderer is poisoned"
+    );
+
+    // Scenario 3: store lookup must not panic on poisoned state.
+    // The drawable was created before the failure; the backing
+    // VkImage is still registered even though the renderer is dead.
+    let _ = b.store_drawable_exists_for_tests(dst_xid);
+}

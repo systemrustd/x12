@@ -1687,6 +1687,66 @@ impl KmsBackendV2 {
         self.platform.submit_group_set_max_size_for_tests(n);
     }
 
+    /// Phase A T10: inject a `queue_submit2` failure on the next
+    /// `flush_submit_group` call. Delegates to a non-`#[cfg(test)]`
+    /// method on `PlatformBackend` so this wrapper is visible from
+    /// the external `v2_acceptance` integration-test crate.
+    pub fn platform_force_next_submit_failure_for_tests(&mut self) {
+        self.platform
+            .force_next_submit_failure_for_integration_tests();
+    }
+
+    /// Phase A T10: returns `platform.renderer_failed`. Exposed as
+    /// `pub` so the `v2_acceptance` integration test can assert the
+    /// fatal-failure invariant without direct field access.
+    pub fn platform_renderer_failed_for_tests(&self) -> bool {
+        self.platform.renderer_failed
+    }
+
+    /// Phase A T10: count of in-flight submits awaiting retirement.
+    /// Delegates to `engine.pending_count()` (`pub(crate)`). Exposed
+    /// as `pub` for the `v2_acceptance` integration test.
+    pub fn engine_pending_count_for_tests(&self) -> usize {
+        self.engine.pending_count()
+    }
+
+    /// Phase A T10: call `engine.fill_rect` directly and return
+    /// `true` iff the result is `RenderError::RendererFailed`. Used
+    /// by the failure-rollback regression test to assert that paint
+    /// ops short-circuit after the renderer has been poisoned.
+    pub fn engine_fill_rect_is_renderer_failed_for_tests(&mut self, host_xid: u32) -> bool {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return false;
+        };
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 0, y: 0 },
+            extent: ash::vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+        };
+        matches!(
+            self.engine.fill_rect(
+                &mut self.store,
+                &mut self.platform,
+                target.id,
+                rect,
+                [1.0_f32, 0.0, 0.0, 1.0],
+            ),
+            Err(crate::kms::v2::engine::RenderError::RendererFailed)
+        )
+    }
+
+    /// Phase A T10: check whether `host_xid` still resolves in the
+    /// drawable store after a renderer failure. Returns `Some(true)` if
+    /// the drawable exists (regardless of its internal state) or `None`
+    /// if the xid is unknown. Used by the rollback regression test to
+    /// assert that store state is not corrupted to the point of
+    /// panicking on lookup.
+    pub fn store_drawable_exists_for_tests(&self, host_xid: u32) -> bool {
+        self.store.get_by_xid(host_xid).is_some()
+    }
+
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
     /// without going through `on_page_flip_ready` (which calls
     /// `drain_page_flip_events` and would error on the test fixture's

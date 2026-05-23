@@ -497,7 +497,8 @@ pub(crate) struct PlatformBackend {
     /// Test-only: when true, the next `flush_submit_group` call will
     /// route through `abort_flush` instead of the real
     /// `vkQueueSubmit2`. Reset to false after consumption.
-    #[cfg(test)]
+    /// Always compiled (not cfg(test)) so integration-test pub wrappers
+    /// on `KmsBackendV2` can reach it from the external test crate.
     force_next_submit_failure: bool,
 
     /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
@@ -678,7 +679,6 @@ impl PlatformBackend {
             cursor_plane,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
-            #[cfg(test)]
             force_next_submit_failure: false,
         })
     }
@@ -758,7 +758,6 @@ impl PlatformBackend {
             cursor_plane: None,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
-            #[cfg(test)]
             force_next_submit_failure: false,
         }
     }
@@ -1416,6 +1415,15 @@ impl PlatformBackend {
         self.submit_group.peek_entries()
     }
 
+    /// Phase A T10: arm the fault-injection latch so the next
+    /// `flush_submit_group` routes through `abort_flush` instead of the
+    /// real `vkQueueSubmit2`. Not `#[cfg(test)]`-gated so that the
+    /// `pub` wrapper on `KmsBackendV2` is reachable from the external
+    /// `v2_acceptance` integration-test crate.
+    pub(crate) fn force_next_submit_failure_for_integration_tests(&mut self) {
+        self.force_next_submit_failure = true;
+    }
+
     /// Phase A: explicit flush of any buffered submit group. Issues one
     /// `vkQueueSubmit2` with all buffered CBs + signal semaphores,
     /// signaling the group's shared fence. Empty group → `Ok(FlushOutcome {
@@ -1452,7 +1460,11 @@ impl PlatformBackend {
         };
         let ticket = ticket.expect("non-empty group has ticket");
         // Test-only fault injection: simulate a queue_submit2 failure.
-        #[cfg(test)]
+        // The latch is always compiled (field is not cfg(test)) so the
+        // `pub` wrapper on `KmsBackendV2` is reachable from the external
+        // `v2_acceptance` integration-test crate. In production the
+        // field is initialised `false` and never set, so this branch is
+        // never taken.
         if self.force_next_submit_failure {
             self.force_next_submit_failure = false;
             return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST);
