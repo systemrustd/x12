@@ -2714,8 +2714,10 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     **2026-05-23 bee MATE-load freeze (UNRESOLVED, blocks Phase A
     T15 close):** with full Phase A in tree at `189e8dd`, yserver
     loads MATE and then freezes on bee (Ryzen 9 6900HX / RDNA2,
-    Arch Linux). User reported; logs not yet captured (Ctrl-Alt-Bsp
-    + RUST_BACKTRACE not retrievable from frozen state).
+    Arch Linux). Follow-up logs captured on 2026-05-24 show this is
+    not an event-loop deadlock: RADV reports a GPUVM TCP protection
+    fault, then yserver sees `ERROR_DEVICE_LOST`; Ctrl-Alt-Bsp still
+    reaches the input thread and shutdown path.
     Cross-platform triangulation tonight makes the hypothesis space
     much smaller:
       - **Not generic Phase A bug** — yoga (Adreno/Turnip) and iMac
@@ -2727,15 +2729,31 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       - **Not CPU-budget** — bee has 8c/16t vs iMac's 6c/6t; bee
         has *more* single-thread headroom.
       - **Narrowed to:** RDNA2-specific RADV/kernel code paths
-        AND/OR Arch's Mesa-current vs Ubuntu's older Mesa. RADV
-        has separate GFX10.3 (RDNA2) submit paths vs GFX8/9
-        (Polaris/Vega) where Phase A's many-CBs-per-`vkQueueSubmit2`
-        could regress one but not the other.
-      - **Next-session first action on bee:** `vulkaninfo |
-        grep -E 'driverName|driverInfo'` to pin the exact Mesa
-        version. Then either downgrade Mesa to a known-good or
-        bring up `mesa-tkg-git` to bisect. iMac is the green
-        reference; yoga is independent corroboration.
+        AND/OR Arch's Mesa-current vs Ubuntu's older Mesa. Bee is
+        `AMD Radeon 680M (RADV REMBRANDT)`, `driverName=radv`,
+        `driverInfo=Mesa 26.1.0-arch2.1`, kernel
+        `7.0.9-1-cachyos`. iMac is Ubuntu 26.04 + kernel 7.0.x,
+        so "kernel 7.0" alone is no longer a useful separator.
+      - **SubmitGroup cap sweep:** a diagnostic
+        `YSERVER_SUBMIT_GROUP_MAX_SIZE` knob was added for hardware
+        isolation. `cap=1` boots MATE and survives (`submit_group_size_max`
+        mostly 1, with known glyph-loop exceptions still able to
+        exceed the nominal cap). `cap=2` reproduces the same RADV
+        GPUVM fault within MATE load:
+        `GCVM_L2_PROTECTION_FAULT_STATUS=0x701031`,
+        `ERROR_DEVICE_LOST`, longest request `op133` (RENDER) at
+        ~1.98 s. Stop sweeping higher caps; the failure is the first
+        regular multi-CB submit-group shape, not a high-cap tuning
+        cliff.
+      - **Abandoned submit-shape experiment:** changing
+        `flush_submit_group` from one `VkSubmitInfo2` containing N
+        command buffers to one `vkQueueSubmit2` call containing N
+        one-command-buffer submits moved `cap=16` farther (MATE
+        desktop appeared), but bee still froze with the same RADV
+        GPUVM fault during a `composite_glyphs` burst. This makes the
+        env knob useful as a hardware diagnostic, but the fix path is
+        the later real frame-builder phase, not more SubmitGroup
+        tuning.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 

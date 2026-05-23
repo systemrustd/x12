@@ -62,6 +62,34 @@ use crate::{
     },
 };
 
+const SUBMIT_GROUP_MAX_SIZE_ENV: &str = "YSERVER_SUBMIT_GROUP_MAX_SIZE";
+
+fn parse_submit_group_max_size(raw: &str) -> Option<usize> {
+    let n = raw.trim().parse::<usize>().ok()?;
+    (n > 0).then_some(n)
+}
+
+fn submit_group_max_size_from_env(default: usize) -> usize {
+    match std::env::var(SUBMIT_GROUP_MAX_SIZE_ENV) {
+        Ok(raw) => match parse_submit_group_max_size(&raw) {
+            Some(n) => n,
+            None => {
+                log::warn!(
+                    "{SUBMIT_GROUP_MAX_SIZE_ENV}={raw:?} is invalid; using default {default}"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(e) => {
+            log::warn!(
+                "{SUBMIT_GROUP_MAX_SIZE_ENV} could not be read ({e}); using default {default}"
+            );
+            default
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────
 // FenceTicket — CPU-side I6a lifetime ticket.
 //
@@ -648,6 +676,19 @@ impl PlatformBackend {
             )
             .map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
 
+        let mut submit_group = SubmitGroup::new();
+        let default_submit_group_max_size = submit_group.max_size();
+        let configured_submit_group_max_size =
+            submit_group_max_size_from_env(default_submit_group_max_size);
+        submit_group.set_max_size(configured_submit_group_max_size);
+        if configured_submit_group_max_size != default_submit_group_max_size {
+            log::info!(
+                "v2 PlatformBackend: {SUBMIT_GROUP_MAX_SIZE_ENV}={} (default {})",
+                configured_submit_group_max_size,
+                default_submit_group_max_size,
+            );
+        }
+
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
             layouts.len(),
@@ -677,7 +718,7 @@ impl PlatformBackend {
             renderer_failed: false,
             shutting_down: false,
             cursor_plane,
-            submit_group: SubmitGroup::new(),
+            submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
         })
@@ -1891,6 +1932,16 @@ mod tests {
             .expect("empty-group flush is always Ok");
         assert_eq!(outcome.flushed_entries, 0);
         assert!(!p.submit_group_is_open());
+    }
+
+    #[test]
+    fn submit_group_max_size_env_parser_accepts_positive_integers_only() {
+        assert_eq!(parse_submit_group_max_size("1"), Some(1));
+        assert_eq!(parse_submit_group_max_size("16"), Some(16));
+        assert_eq!(parse_submit_group_max_size(" 4 "), Some(4));
+        assert_eq!(parse_submit_group_max_size("0"), None);
+        assert_eq!(parse_submit_group_max_size("-1"), None);
+        assert_eq!(parse_submit_group_max_size("bee"), None);
     }
 
     // ── Task 3 test helpers ──────────────────────────────────────

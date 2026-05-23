@@ -66,7 +66,7 @@ impl SubmitGroup {
     /// via `set_max_size` from `PlatformBackend::open_with_commit`
     /// once Task 4 lands.
     pub(crate) fn set_max_size(&mut self, n: usize) {
-        self.max_size = n;
+        self.max_size = n.max(1);
     }
 
     /// `#[cfg(test)]` introspection: peek at the buffered entries in
