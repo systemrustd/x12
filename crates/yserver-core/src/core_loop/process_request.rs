@@ -5170,12 +5170,22 @@ fn handle_present_request(
                 .present_scheduler
                 .pick_at_vblank(ResourceId(req.window), current_msc);
             if let Some(frame) = chosen {
+                let idle_fence = match frame.idle {
+                    crate::present_scheduler::PresentSync::Binary { fence } => fence,
+                    crate::present_scheduler::PresentSync::Timeline { syncobj, .. } => syncobj,
+                };
                 fire_present_completion_events(
                     state,
-                    byte_order,
-                    PRESENT_MAJOR_OPCODE,
-                    &frame,
-                    current_msc,
+                    &crate::backend::CompletedPresentEvent {
+                        client_id,
+                        serial: frame.serial,
+                        host_xid: frame.pixmap.0,
+                        dst_host_xid: frame.window.0,
+                        options: 0,
+                        wake: crate::backend::PresentWake::Pixmap {
+                            idle_fence_xid: idle_fence,
+                        },
+                    },
                 );
             }
             debug!(
@@ -5342,12 +5352,29 @@ fn handle_present_request(
                 .present_scheduler
                 .pick_at_vblank(ResourceId(req.window), current_msc);
             if let Some(frame) = chosen {
+                let wake = match frame.idle {
+                    crate::present_scheduler::PresentSync::Binary { fence } => {
+                        crate::backend::PresentWake::Pixmap {
+                            idle_fence_xid: fence,
+                        }
+                    }
+                    crate::present_scheduler::PresentSync::Timeline { syncobj, value } => {
+                        crate::backend::PresentWake::PixmapSynced {
+                            release_syncobj: syncobj,
+                            release_value: value,
+                        }
+                    }
+                };
                 fire_present_completion_events(
                     state,
-                    byte_order,
-                    PRESENT_MAJOR_OPCODE,
-                    &frame,
-                    current_msc,
+                    &crate::backend::CompletedPresentEvent {
+                        client_id,
+                        serial: frame.serial,
+                        host_xid: frame.pixmap.0,
+                        dst_host_xid: frame.window.0,
+                        options: 0,
+                        wake,
+                    },
                 );
             }
             debug!(
@@ -5468,33 +5495,44 @@ fn build_path_selector_inputs<'a>(
     }
 }
 
-fn fire_present_completion_events(
+pub(crate) fn fire_present_completion_events(
     state: &mut ServerState,
-    byte_order: yserver_protocol::x11::ClientByteOrder,
-    extension_major: u8,
-    frame: &crate::present_scheduler::QueuedPresent,
-    current_msc: u64,
+    event: &crate::backend::CompletedPresentEvent,
 ) {
+    use crate::backend::PresentWake;
     use yserver_protocol::x11::present as x11present;
+
+    /// PRESENT major opcode.
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
     /// `PresentEventMaskCompleteNotify` per `presentproto`.
     const COMPLETE_NOTIFY_MASK: u32 = 0x2;
     /// `PresentEventMaskIdleNotify`.
     const IDLE_NOTIFY_MASK: u32 = 0x4;
+
+    let window = ResourceId(event.dst_host_xid);
+    let current_msc = state.present_msc.get(&window).copied().unwrap_or(0);
+    let pixmap_xid = event.host_xid;
+    let idle_fence = match event.wake {
+        PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
+        PresentWake::PixmapSynced {
+            release_syncobj, ..
+        } => release_syncobj,
+    };
 
     // Gather the matching (eid, owning client, mask) tuples up front
     // so we can iterate state.clients without holding a borrow on
     // present_event_selections.
     let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
     for (eid, sel) in &state.present_event_selections {
-        if sel.window == frame.window {
+        if sel.window == window {
             targets.push((*eid, sel.owner, sel.event_mask));
         }
     }
     debug!(
         "PRESENT events: window=0x{:x} serial={} pixmap=0x{:x} targets={:?}",
-        frame.window.0,
-        frame.serial,
-        frame.pixmap.0,
+        window.0,
+        event.serial,
+        pixmap_xid,
         targets
             .iter()
             .map(|(e, c, m)| format!("eid=0x{e:x}/client={}/mask=0x{m:x}", c.0))
@@ -5505,6 +5543,11 @@ fn fire_present_completion_events(
         let Some(client) = state.clients.get_mut(&owner.0) else {
             continue;
         };
+        // byte_order is sourced from the OWNER client (the one
+        // receiving the event), not the caller. Fixes a latent bug
+        // where events to owners of different endianness than the
+        // submitting client were mis-encoded.
+        let byte_order = client.byte_order;
         let seq = SequenceNumber(
             client
                 .last_sequence
@@ -5517,25 +5560,21 @@ fn fire_present_completion_events(
         // loader_dri3 expects this order — flipping it makes
         // vkAcquireNextImage hang on the second frame.
         if mask & IDLE_NOTIFY_MASK != 0 {
-            let idle_fence = match frame.idle {
-                crate::present_scheduler::PresentSync::Binary { fence } => fence,
-                crate::present_scheduler::PresentSync::Timeline { syncobj, .. } => syncobj,
-            };
             let ev = x11present::encode_idle_notify(
                 byte_order,
                 seq,
-                extension_major,
+                PRESENT_MAJOR_OPCODE,
                 eid,
-                frame.window.0,
-                frame.serial,
-                frame.pixmap.0,
+                window.0,
+                event.serial,
+                pixmap_xid,
                 idle_fence,
             );
             let outcome = write_to_client(client, owner, &ev);
             debug!(
                 "PRESENT IdleNotify -> client {} eid=0x{eid:x} pixmap=0x{:x} fence=0x{idle_fence:x} ({} bytes) outcome={:?} outbound_len={}",
                 owner.0,
-                frame.pixmap.0,
+                pixmap_xid,
                 ev.len(),
                 outcome,
                 client.outbound.len(),
@@ -5545,10 +5584,10 @@ fn fire_present_completion_events(
             let ev = x11present::encode_complete_notify(
                 byte_order,
                 seq,
-                extension_major,
+                PRESENT_MAJOR_OPCODE,
                 eid,
-                frame.window.0,
-                frame.serial,
+                window.0,
+                event.serial,
                 x11present::COMPLETE_KIND_PIXMAP,
                 x11present::COMPLETE_MODE_COPY,
                 0, // ust unknown without a real vblank timestamp
