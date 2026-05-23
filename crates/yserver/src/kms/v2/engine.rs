@@ -2179,6 +2179,17 @@ impl RenderEngine {
         Ok(Some(batch.coalesced_count))
     }
 
+    /// Stage 5 Task 6.1: snapshot of the FenceTicket the currently-
+    /// open cow_batch will signal once flushed. Returns `None` if
+    /// no cow_batch is pending. The deferred PRESENT completion path
+    /// reads this immediately after `engine.cow_copy_area` to bind
+    /// the just-appended copy to its eventual GPU-done signal.
+    pub(crate) fn current_cow_batch_ticket(&self) -> Option<FenceTicket> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.pending_cow_batch.as_ref().map(|b| b.ticket.clone()))
+    }
+
     /// Drain the queue of cow-batch flush records (one `u32` per
     /// flush, value = `coalesced_count` of that batch). Backend
     /// calls this once per `maybe_composite` tick to bump
@@ -9294,5 +9305,19 @@ mod tests {
         };
         assert_eq!(b.engine.descriptor_pool_creates_lifetime(), 0);
         assert_eq!(b.engine.descriptor_pool_resets_lifetime(), 0);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn current_cow_batch_ticket_none_before_any_copy_area() {
+        let b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let engine = &b.engine;
+        assert!(engine.current_cow_batch_ticket().is_none());
     }
 }
