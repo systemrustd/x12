@@ -2531,6 +2531,22 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     `render_composite=20171`, `render_fill=17973`, `composite_glyphs=8993`).
     Task 6.1 lands as-is.
 
+    **2026-05-23 bee wrapper-overhead baseline (Phase A T3.5 + T3.6
+    landed):** `queue_submit2/s` peak **2457** (pre-Phase-A peak was
+    3304; ~25 % lower already, likely workload variance + the
+    deferred-PRESENT-completion fix from 41f6fbb in-tree). Wrapper
+    is bit-identical to today's per-op cadence at `max_size=1`:
+    `submit_group_size_avg` 1.00-1.04, histogram dominated by the
+    size-1 bucket, `submit_group_flush_reason_max_size/s` accounts
+    for ≥ 95 % of flushes. `submit_group_aborts/s` = 0 throughout.
+    `active_descriptor_pool_count_high_water` = 2 (no ring pressure).
+    `active_staging_bytes_high_water` 14.7 MB. Histogram occasionally
+    spikes to size=13 from `image_text`/`composite_glyphs` glyph-
+    upload loops (documented borrow-factoring exception where the
+    inner-loop appends defer their flush to the outer paint-op's
+    tail). All T3.6 stop-and-investigate conditions clear — proceeding
+    to T4 (cap=16 + scene-compose flush).
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
