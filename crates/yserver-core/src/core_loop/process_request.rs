@@ -4989,6 +4989,18 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            // Per design §4 AsyncMayTear silent-clear: mask the bit
+            // off here when the cap isn't advertised. Computed up
+            // front so both the deferred-completion enqueue (inside
+            // the `if let` below) and the scheduler enqueue (after
+            // it) can use the same masked options.
+            let caps = backend.present_capabilities(req.window);
+            let masked_options = if caps.async_may_tear {
+                req.options
+            } else {
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
+                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
+            };
             if let (
                 Some(crate::resources::HostDrawableTarget::Pixmap {
                     host_xid,
@@ -5052,7 +5064,6 @@ fn handle_present_request(
                         height,
                     )?;
                 }
-                backend.wait_for_drawable_idle(dst.host_xid())?;
                 // Observer hook for the diagnostic drawable-dump.
                 // Pass the *host* (backend-side) xids — `req.pixmap`
                 // and `req.window` are CLIENT xids, but backends
@@ -5085,49 +5096,38 @@ fn handle_present_request(
                         height,
                     );
                 }
+                // Stage 5 Task 6.1 — defer completion. The synchronous
+                // `wait_for_drawable_idle` + immediate xshmfence trigger
+                // + immediate `fire_present_completion_events` have been
+                // replaced by an enqueue. The backend pins the cow_batch
+                // fence ticket + the idle_fence's xshmfence handle (via
+                // `Arc`), then the main-loop drain fires IdleNotify +
+                // CompleteNotify { mode: Copy } and signals the
+                // xshmfence + state.sync_fences[xid].triggered once the
+                // GPU side has finished.
+                backend.enqueue_present_completion(crate::backend::CompletedPresentEvent {
+                    client_id,
+                    serial: req.serial,
+                    host_xid: host_xid.as_raw(),
+                    dst_host_xid: dst.host_xid(),
+                    options: masked_options,
+                    wake: crate::backend::PresentWake::Pixmap {
+                        idle_fence_xid: req.idle_fence,
+                    },
+                });
             }
             state
                 .present_msc
                 .entry(ResourceId(req.window))
                 .and_modify(|msc| *msc = msc.saturating_add(1))
                 .or_insert(1);
-            // Phase 4.2.3 + xshmfence wake. For Mesa's loader_dri3
-            // (which uses xshmfence-backed fences via FenceFromFD),
-            // triggering idle_fence is what wakes vkAcquireNextImage.
-            // The X-side IdleNotify event alone isn't enough — Mesa's
-            // WSI thread blocks on the xshmfence futex.
-            if req.idle_fence != 0
-                && let Err(e) = backend.dri3_trigger_fence(req.idle_fence)
-            {
-                log::warn!(
-                    "PRESENT::Pixmap idle_fence 0x{:x} trigger failed: {e}",
-                    req.idle_fence
-                );
-            }
-            // Mirror onto state.sync_fences so QueryFence sees triggered.
-            if req.idle_fence != 0
-                && let Some(f) = state.sync_fences.get_mut(&req.idle_fence)
-            {
-                f.triggered = true;
-            }
-            // Phase 4.2.3 enqueue + fire events. We mirror the
-            // request onto the scheduler queue so a follow-up
-            // vblank-driven submission path can pick it up; for now
-            // copy_area plus wait_for_drawable_idle above has produced
-            // the visible result, and we fire CompleteNotify { mode:
-            // Copy } and IdleNotify immediately. Per presentproto
-            // §3.3.2 a Copy makes the pixmap idle as soon as the GPU
-            // has finished reading the source.
-            //
-            // Per design §4 AsyncMayTear silent-clear: mask the bit
-            // off here when the cap isn't advertised.
-            let caps = backend.present_capabilities(req.window);
-            let masked_options = if caps.async_may_tear {
-                req.options
-            } else {
-                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
-                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
-            };
+            // Phase 4.2.3 scheduler enqueue. We mirror the request
+            // onto the scheduler queue so a follow-up vblank-driven
+            // submission path can pick it up; today the enqueued
+            // entries are informational (no caller drains them yet),
+            // but the queue keeps the option open for the future
+            // KMS/PresentScheduler integration without re-plumbing
+            // the handler.
             // Run the path selector with real inputs from the live
             // pixmap / window state. `flip_path` short-circuits to
             // Copy when false (which is what the KmsBackend currently
@@ -5158,36 +5158,6 @@ fn handle_present_request(
                     valid_region: req.valid,
                     update_region: req.update,
                 });
-            // Drain the just-enqueued frame (synchronous Copy path —
-            // vblank-driven scheduling lands when KMS integrates with
-            // PresentScheduler::pick_at_vblank).
-            let current_msc = state
-                .present_msc
-                .get(&ResourceId(req.window))
-                .copied()
-                .unwrap_or(0);
-            let (chosen, _skipped) = state
-                .present_scheduler
-                .pick_at_vblank(ResourceId(req.window), current_msc);
-            if let Some(frame) = chosen {
-                let idle_fence = match frame.idle {
-                    crate::present_scheduler::PresentSync::Binary { fence } => fence,
-                    crate::present_scheduler::PresentSync::Timeline { syncobj, .. } => syncobj,
-                };
-                fire_present_completion_events(
-                    state,
-                    &crate::backend::CompletedPresentEvent {
-                        client_id,
-                        serial: frame.serial,
-                        host_xid: frame.pixmap.0,
-                        dst_host_xid: frame.window.0,
-                        options: 0,
-                        wake: crate::backend::PresentWake::Pixmap {
-                            idle_fence_xid: idle_fence,
-                        },
-                    },
-                );
-            }
             debug!(
                 "client {} #{} PRESENT::Pixmap serial={} notifies={}",
                 client_id.0,

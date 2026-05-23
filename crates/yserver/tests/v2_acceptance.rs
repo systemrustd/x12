@@ -2999,3 +2999,47 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
         "force-fire empties the queue",
     );
 }
+
+/// Stage 5 Task 6.1 site #1 (Task 12 of the deferred-PRESENT plan)
+/// — verifies that the v2 backend's `enqueue_present_completion`
+/// returns quickly (i.e. does *not* synchronously wait on the
+/// underlying fence). This is the load-bearing property the
+/// `PRESENT::Pixmap` handler now relies on: the synchronous
+/// `wait_for_drawable_idle` has been replaced by an enqueue that
+/// must hand control back to the main loop without blocking.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
+    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("src pixmap");
+    let cow_pix = b.create_pixmap(None, 32, 4, 4).expect("cow pixmap");
+    b.copy_area(None, src_pix.as_raw(), cow_pix.as_raw(), 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    let before = std::time::Instant::now();
+    b.enqueue_present_completion(CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(0),
+        serial: 1,
+        host_xid: src_pix.as_raw(),
+        dst_host_xid: cow_pix.as_raw(),
+        options: 0,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+    });
+    let elapsed = before.elapsed();
+    assert!(
+        elapsed.as_millis() < 50,
+        "enqueue must be fast (< 50 ms); was {} ms",
+        elapsed.as_millis()
+    );
+    // Drain returns empty since fence isn't signaled yet — but
+    // lavapipe completes the small copy synchronously so this may
+    // also return Some entries. Either is fine; the load-bearing
+    // assertion is the fast-enqueue time.
+    let _drained = b.drain_completed_present_events_for_tests();
+}
