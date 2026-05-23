@@ -464,21 +464,7 @@ pub fn run_core(
                     }
                 }
                 PRESENT_COMPLETION_TOKEN => {
-                    let completed = backend.drain_completed_present_events();
-                    for entry in completed {
-                        if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake
-                            && idle_fence_xid != 0
-                            && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
-                        {
-                            f.triggered = true;
-                        }
-                        // Wake-signal already fired inside the backend's drain via
-                        // the Arc-pinned handle; we only do X11-side event fan-out
-                        // here.
-                        crate::core_loop::process_request::fire_present_completion_events(
-                            state, &entry,
-                        );
-                    }
+                    drain_present_completions(state, backend);
                 }
                 tok if let Some(client_id) = token_to_client(tok) => {
                     // I3: WRITABLE-readiness on a client writer fd.
@@ -670,6 +656,7 @@ pub fn run_core(
         if let Err(e) = backend.maybe_composite() {
             log::warn!("core_loop::run: maybe_composite failed: {e}");
         }
+        drain_present_completions(state, backend);
 
         // Diagnostic: per-iteration accounting + per-second telemetry
         // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
@@ -679,6 +666,22 @@ pub fn run_core(
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
         }
+    }
+}
+
+fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
+    let completed = backend.drain_completed_present_events();
+    for entry in completed {
+        if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake
+            && idle_fence_xid != 0
+            && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
+        {
+            f.triggered = true;
+        }
+        // Wake-signal already fired inside the backend's drain via
+        // the Arc-pinned handle; we only do X11-side event fan-out
+        // here.
+        crate::core_loop::process_request::fire_present_completion_events(state, &entry);
     }
 }
 

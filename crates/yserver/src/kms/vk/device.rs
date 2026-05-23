@@ -26,7 +26,6 @@ pub struct VkContext {
     pub physical_device: vk::PhysicalDevice,
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
-    pub external_fence_fd: ash::khr::external_fence_fd::Device,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     pub image_drm_format_modifier_ext: Option<ash::ext::image_drm_format_modifier::Device>,
     /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
@@ -167,7 +166,6 @@ impl VkContext {
             ash::khr::external_memory_fd::NAME,
             ash::ext::external_memory_dma_buf::NAME,
             ash::khr::external_semaphore_fd::NAME,
-            ash::khr::external_fence_fd::NAME,
             ash::ext::image_drm_format_modifier::NAME,
         ];
         let supported_device_exts =
@@ -268,7 +266,6 @@ impl VkContext {
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
         let external_semaphore_fd =
             ash::khr::external_semaphore_fd::Device::new(&instance, &device);
-        let external_fence_fd = ash::khr::external_fence_fd::Device::new(&instance, &device);
         let external_memory_fd_supported =
             device_extension_names.contains(&ash::khr::external_memory_fd::NAME);
         let external_memory_fd = if external_memory_fd_supported {
@@ -305,7 +302,6 @@ impl VkContext {
             physical_device,
             device,
             external_semaphore_fd,
-            external_fence_fd,
             external_memory_fd,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,

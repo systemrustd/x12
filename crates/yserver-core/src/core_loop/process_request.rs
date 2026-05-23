@@ -5114,8 +5114,8 @@ fn handle_present_request(
                 // which sources from `frame.window.0`/`frame.pixmap.0`
                 // (also client xids). The trailing `dst.host_xid()`
                 // is the backend's drawable-lookup key (server-
-                // internal host xid) needed by enqueue to read the
-                // dst drawable's `last_render_ticket`.
+                // internal host xid) needed by enqueue to bind the
+                // completion to the backend's GPU work.
                 backend.enqueue_present_completion(
                     crate::backend::CompletedPresentEvent {
                         client_id,
@@ -5281,7 +5281,7 @@ fn handle_present_request(
                         // immediate `dri3_signal_syncobj` +
                         // immediate `fire_present_completion_events`
                         // have been replaced by an enqueue. The
-                        // backend pins the cow_batch fence ticket +
+                        // backend pins the batch completion signal +
                         // the release_syncobj handle (via `Arc`),
                         // then the main-loop drain signals the
                         // release_syncobj at release_value and fires

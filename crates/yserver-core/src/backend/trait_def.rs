@@ -40,8 +40,8 @@ pub enum BackendFdKind {
     /// `Backend::drain_host_socket` on the core thread.
     HostX11,
     /// Stage 5 Task 6.1: backend-internal epoll FD aggregating
-    /// per-entry sync_file FDs for deferred PRESENT completion +
-    /// a wakeup_eventfd. Readiness drives
+    /// per-batch sync_file FDs for deferred PRESENT completion +
+    /// a fallback wakeup_eventfd. Readiness drives
     /// `Backend::drain_completed_present_events`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
     PresentCompletion,
@@ -1409,10 +1409,9 @@ pub trait Backend: Send {
     }
 
     /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The
-    /// backend captures `dst_host_xid`'s `last_render_ticket` (the
-    /// submitted fence of the just-finished `copy_area`), an Arc-pinned
-    /// clone of the wake primitive, and returns immediately. The
-    /// drain hook later fires the wake signal + the event payload.
+    /// backend pins the wake primitive, binds the payload to the GPU
+    /// work that makes `dst_host_xid` idle, and returns immediately.
+    /// The drain hook later fires the wake signal + the event payload.
     ///
     /// `dst_host_xid` is the backend's drawable-lookup key — server-
     /// internal host xid, NOT the client xid carried by `event.dst_

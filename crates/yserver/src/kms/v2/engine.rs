@@ -46,7 +46,8 @@ use ash::vk;
 
 use super::{
     glyph_atlas::V2GlyphAtlas,
-    platform::{FenceTicket, PlatformBackend},
+    platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
+    present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
     store::{DrawableId, DrawableStore},
 };
 use crate::kms::{
@@ -136,6 +137,7 @@ struct PendingCowBatch {
     srcs_in_batch: HashSet<DrawableId>,
     dst_damage: Vec<vk::Rect2D>,
     coalesced_count: u32,
+    present_completions: Vec<PendingPresentEntry>,
 }
 
 /// Stage 5 Task 3 (render-composite generalization): conservative
@@ -570,6 +572,10 @@ struct RenderEngineInner {
     /// record carrying op + has_mask + coalesced_count so the
     /// backend drain can emit a parametrised submit trace event.
     render_flush_records: Vec<RenderFlushRecord>,
+    /// Stage 5 Task 6.1: submitted COW PRESENT-completion batches
+    /// whose sync_file fds still need to be registered with the
+    /// backend's inner epoll.
+    pending_present_batches: Vec<PendingPresentBatch>,
 }
 
 impl RenderEngine {
@@ -609,6 +615,7 @@ impl RenderEngine {
                 cow_flush_records: Vec::new(),
                 pending_render_batch: None,
                 render_flush_records: Vec::new(),
+                pending_present_batches: Vec::new(),
             }),
         })
     }
@@ -2103,6 +2110,7 @@ impl RenderEngine {
             srcs_in_batch: srcs,
             dst_damage: vec![dst_rect],
             coalesced_count: 1,
+            present_completions: Vec::new(),
         });
         Ok(())
     }
@@ -2184,8 +2192,48 @@ impl RenderEngine {
             );
         }
 
+        let completion_signal = if batch.present_completions.is_empty() {
+            None
+        } else {
+            Some(platform.acquire_present_completion_signal()?)
+        };
+        let completion_semaphore = completion_signal
+            .as_ref()
+            .map(PresentCompletionSignal::semaphore);
+
         // End + submit.
-        end_and_submit_op(inner, platform, batch.cb, &batch.ticket)?;
+        end_and_submit_op_with_signal(
+            inner,
+            platform,
+            batch.cb,
+            &batch.ticket,
+            completion_semaphore,
+        )?;
+
+        let present_batch = if batch.present_completions.is_empty() {
+            None
+        } else {
+            let (wait, signal) = match completion_signal {
+                Some(signal) => match signal.export_sync_file_fd() {
+                    Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                    Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                    Err(e) => {
+                        log::warn!(
+                            "v2 flush_cow_batch: vkGetSemaphoreFdKHR(SYNC_FD) failed: {e:?}; \
+                             falling back to FenceTicket polling"
+                        );
+                        (PresentBatchWait::Poll, Some(signal))
+                    }
+                },
+                None => (PresentBatchWait::Ready, None),
+            };
+            Some(PendingPresentBatch {
+                wait,
+                ticket: Some(batch.ticket.clone()),
+                signal,
+                events: batch.present_completions,
+            })
+        };
 
         // CPU-side bookkeeping: clone ticket onto every touched
         // drawable, apply accumulated damage, push SubmittedOp.
@@ -2206,19 +2254,36 @@ impl RenderEngine {
             atlas_ticket: None,
             generation,
         });
+        if let Some(present_batch) = present_batch {
+            inner.pending_present_batches.push(present_batch);
+        }
         inner.cow_flush_records.push(batch.coalesced_count);
         Ok(Some(batch.coalesced_count))
     }
 
-    /// Stage 5 Task 6.1: snapshot of the FenceTicket the currently-
-    /// open cow_batch will signal once flushed. Returns `None` if
-    /// no cow_batch is pending. The deferred PRESENT completion path
-    /// reads this immediately after `engine.cow_copy_area` to bind
-    /// the just-appended copy to its eventual GPU-done signal.
-    pub(crate) fn current_cow_batch_ticket(&self) -> Option<FenceTicket> {
-        self.inner
-            .as_ref()
-            .and_then(|i| i.pending_cow_batch.as_ref().map(|b| b.ticket.clone()))
+    pub(crate) fn attach_cow_present_completion(
+        &mut self,
+        cow_id: DrawableId,
+        entry: PendingPresentEntry,
+    ) -> Result<(), PendingPresentEntry> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(entry);
+        };
+        let Some(batch) = inner.pending_cow_batch.as_mut() else {
+            return Err(entry);
+        };
+        if batch.dst != cow_id {
+            return Err(entry);
+        }
+        batch.present_completions.push(entry);
+        Ok(())
+    }
+
+    pub(crate) fn drain_present_batches(&mut self) -> Vec<PendingPresentBatch> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut inner.pending_present_batches)
     }
 
     /// Drain the queue of cow-batch flush records (one `u32` per
@@ -5463,9 +5528,19 @@ fn end_and_submit_op(
     cb: vk::CommandBuffer,
     ticket: &FenceTicket,
 ) -> Result<(), RenderError> {
+    end_and_submit_op_with_signal(inner, platform, cb, ticket, None)
+}
+
+fn end_and_submit_op_with_signal(
+    inner: &mut RenderEngineInner,
+    platform: &mut PlatformBackend,
+    cb: vk::CommandBuffer,
+    ticket: &FenceTicket,
+    completion_signal: Option<vk::Semaphore>,
+) -> Result<(), RenderError> {
     let device = &inner.vk.device;
     unsafe { device.end_command_buffer(cb)? };
-    platform.submit_paint_cb(cb, ticket.fence())?;
+    platform.submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
     let _ = device;
     Ok(())
 }
@@ -9736,19 +9811,5 @@ mod tests {
         };
         assert_eq!(b.engine.descriptor_pool_creates_lifetime(), 0);
         assert_eq!(b.engine.descriptor_pool_resets_lifetime(), 0);
-    }
-
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn current_cow_batch_ticket_none_before_any_copy_area() {
-        let b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skipping: no Vk: {e}");
-                return;
-            }
-        };
-        let engine = &b.engine;
-        assert!(engine.current_cow_batch_ticket().is_none());
     }
 }

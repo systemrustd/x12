@@ -11,29 +11,43 @@ use std::{os::fd::OwnedFd, sync::Arc};
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
-use crate::kms::v2::platform::FenceTicket;
+use crate::kms::v2::platform::{FenceTicket, PresentCompletionSignal};
 
-/// One queued PRESENT awaiting cow_batch retirement. The drain
-/// fires the wake signal via `wake_pin` + returns the `event`
-/// payload to the main loop.
+/// One deferred PRESENT completion payload. The drain fires the
+/// wake signal via `wake_pin` + returns the `event` payload to the
+/// main loop.
 pub(crate) struct PendingPresentEntry {
-    /// Cow_batch ticket the just-appended copy_area participates in.
-    /// `None` when PRESENT arrived with no cow_batch in flight (the
-    /// no-GPU-work fast path) — drain treats this as immediately
-    /// ready. Avoids needing a synthetic "pre-signaled sentinel"
-    /// FenceTicket constructor.
-    pub(crate) ticket: Option<FenceTicket>,
     /// Lifetime pin on the underlying wake primitive. Survives a
     /// mid-flight `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) wake_pin: PinnedWake,
-    /// sync_file FD exported from `ticket.fence` via
-    /// `vkGetFenceFdKHR(SYNC_FD)`. `None` when the fence was
-    /// already signaled at enqueue time (vkGetFenceFdKHR returned
-    /// -1; the wakeup_eventfd path is used instead).
-    pub(crate) fence_fd: Option<OwnedFd>,
     /// Public-facing event payload, returned by `drain_*` to the
     /// main loop.
     pub(crate) event: CompletedPresentEvent,
+}
+
+/// Readiness primitive for a submitted batch of PRESENT completions.
+pub(crate) enum PresentBatchWait {
+    /// Linux sync_file fd exported from a dedicated completion
+    /// semaphore. This is the hot path.
+    Fd(OwnedFd),
+    /// Export returned `-1`, meaning already signaled.
+    Ready,
+    /// Degraded path if fd export fails. Polls `ticket` through
+    /// `Backend::next_wakeup`, but should not occur on normal Linux
+    /// Vulkan stacks.
+    Poll,
+}
+
+/// Submitted-but-not-yet-emitted PRESENT completion batch.
+pub(crate) struct PendingPresentBatch {
+    pub(crate) wait: PresentBatchWait,
+    /// Optional internal fence for degraded polling only. The hot fd
+    /// path does not need this for readiness.
+    pub(crate) ticket: Option<FenceTicket>,
+    /// Keeps the dedicated export-only semaphore alive until the
+    /// exported sync_file has fired.
+    pub(crate) signal: Option<PresentCompletionSignal>,
+    pub(crate) events: Vec<PendingPresentEntry>,
 }
 
 /// Wake-target lifetime pin variants. The drain dispatches signal

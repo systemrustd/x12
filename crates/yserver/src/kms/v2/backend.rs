@@ -228,14 +228,15 @@ pub struct KmsBackendV2 {
         HashMap<u32, std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>>,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
-    /// completions. Drained by `drain_completed_present_events` when
-    /// the inner `present_completion_epfd` reports readiness or the
-    /// `wakeup_eventfd` is poked. Each entry pins an Arc clone of the
-    /// wake primitive (xshmfence / syncobj) so the underlying
-    /// resource survives an intervening `XFixesDestroyFence` /
-    /// `FreeSyncobj`.
-    pub(crate) pending_present_events:
-        std::collections::VecDeque<crate::kms::v2::present_completion::PendingPresentEntry>,
+    /// completion batches. Drained by `drain_completed_present_events`
+    /// when the inner `present_completion_epfd` reports a submitted
+    /// batch's exported sync_file as readable, or when the degraded
+    /// fallback path pokes `wakeup_eventfd`. Each entry inside each
+    /// batch pins an Arc clone of the wake primitive (xshmfence /
+    /// syncobj) so the underlying resource survives an intervening
+    /// `XFixesDestroyFence` / `FreeSyncobj`.
+    pub(crate) pending_present_batches:
+        std::collections::VecDeque<crate::kms::v2::present_completion::PendingPresentBatch>,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
@@ -484,7 +485,7 @@ impl KmsBackendV2 {
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
-            pending_present_events: std::collections::VecDeque::new(),
+            pending_present_batches: std::collections::VecDeque::new(),
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -1008,7 +1009,7 @@ impl KmsBackendV2 {
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
-            pending_present_events: std::collections::VecDeque::new(),
+            pending_present_batches: std::collections::VecDeque::new(),
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -1623,7 +1624,10 @@ impl KmsBackendV2 {
     /// the deferred PRESENT completion queue.
     #[doc(hidden)]
     pub fn pending_present_events_len_for_tests(&self) -> usize {
-        self.pending_present_events.len()
+        self.pending_present_batches
+            .iter()
+            .map(|batch| batch.events.len())
+            .sum()
     }
 
     /// Stage 5 Task 6.1 — test-only: drain a single signal-check +
@@ -1653,35 +1657,167 @@ impl KmsBackendV2 {
         std::mem::take(&mut self.pending_completed_events_on_shutdown)
     }
 
+    fn fire_pending_present_entry(
+        &mut self,
+        entry: crate::kms::v2::present_completion::PendingPresentEntry,
+    ) -> yserver_core::backend::CompletedPresentEvent {
+        use crate::kms::v2::present_completion::PinnedWake;
+
+        match &entry.wake_pin {
+            PinnedWake::Pixmap(h) => {
+                if let Err(e) = self.dri3_trigger_fence_via_handle(h) {
+                    log::warn!("deferred IdleNotify: dri3_trigger_fence_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSynced { handle, value } => {
+                if let Err(e) = self.dri3_signal_syncobj_via_handle(handle, *value) {
+                    log::warn!("deferred IdleNotify: dri3_signal_syncobj_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::None => {}
+        }
+        entry.event
+    }
+
+    fn poke_present_completion_wakeup(&self, context: &str) {
+        match self.platform.wakeup_eventfd.write(1) {
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+            Err(e) => log::warn!("{context}: wakeup_eventfd write: {e}"),
+        }
+    }
+
+    fn register_pending_present_batch(
+        &mut self,
+        mut batch: crate::kms::v2::present_completion::PendingPresentBatch,
+    ) {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        use crate::kms::v2::present_completion::PresentBatchWait;
+
+        if batch.events.is_empty() {
+            return;
+        }
+
+        let should_wake = match &batch.wait {
+            PresentBatchWait::Fd(fd) => {
+                let event = nix::sys::epoll::EpollEvent::new(
+                    nix::sys::epoll::EpollFlags::EPOLLIN,
+                    u64::try_from(fd.as_raw_fd()).unwrap_or_default(),
+                );
+                match self.platform.present_completion_epfd.add(fd.as_fd(), event) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        log::warn!(
+                            "deferred PRESENT: epoll_ctl ADD sync_file fd failed: {e}; \
+                             using immediate drain fallback"
+                        );
+                        batch.wait = PresentBatchWait::Ready;
+                        true
+                    }
+                }
+            }
+            PresentBatchWait::Ready | PresentBatchWait::Poll => true,
+        };
+
+        self.pending_present_batches.push_back(batch);
+        if should_wake {
+            self.poke_present_completion_wakeup("register_pending_present_batch");
+        }
+    }
+
+    fn drain_engine_present_batches(&mut self) {
+        for batch in self.engine.drain_present_batches() {
+            self.register_pending_present_batch(batch);
+        }
+    }
+
+    fn pending_present_batch_ready(
+        batch: &crate::kms::v2::present_completion::PendingPresentBatch,
+        vk: Option<&std::sync::Arc<crate::kms::vk::device::VkContext>>,
+    ) -> bool {
+        use std::os::fd::AsFd;
+
+        use crate::kms::v2::present_completion::PresentBatchWait;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        match &batch.wait {
+            PresentBatchWait::Ready => true,
+            PresentBatchWait::Fd(fd) => {
+                let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+                match poll(&mut fds, PollTimeout::ZERO) {
+                    Ok(0) => false,
+                    Ok(_) => fds[0]
+                        .revents()
+                        .is_some_and(|r| r.intersects(PollFlags::POLLIN | PollFlags::POLLERR)),
+                    Err(e) => {
+                        log::warn!("deferred PRESENT: poll(sync_file fd): {e}");
+                        true
+                    }
+                }
+            }
+            PresentBatchWait::Poll => batch.ticket.as_ref().is_none_or(|ticket| match vk {
+                Some(v) => ticket.poll_signaled(v),
+                None => true,
+            }),
+        }
+    }
+
+    fn unregister_present_batch_fd(
+        &mut self,
+        batch: &crate::kms::v2::present_completion::PendingPresentBatch,
+    ) {
+        use std::os::fd::AsFd;
+
+        use crate::kms::v2::present_completion::PresentBatchWait;
+
+        let _keep_export_semaphore_alive_until_batch_drop = batch.signal.as_ref();
+        if let PresentBatchWait::Fd(fd) = &batch.wait
+            && let Err(e) = self.platform.present_completion_epfd.delete(fd.as_fd())
+        {
+            log::warn!("epoll_ctl DEL PRESENT sync_file fd: {e}");
+        }
+    }
+
+    fn force_drain_all_present_batches(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        let mut completed = Vec::new();
+        while let Some(batch) = self.pending_present_batches.pop_front() {
+            self.unregister_present_batch_fd(&batch);
+            for entry in batch.events {
+                completed.push(self.fire_pending_present_entry(entry));
+            }
+        }
+        completed
+    }
+
     /// Stage 5 Task 6.1 — algorithm body for `Backend::
     /// drain_completed_present_events`. Walks the front of
-    /// `pending_present_events`, popping entries whose `fence_fd` is
-    /// None or whose `ticket` has signaled (or all entries when
-    /// `platform.renderer_failed`). Fires the wake signal via the
-    /// Arc-pinned handle, unregisters + closes the per-entry FD, and
-    /// returns the public event payloads.
+    /// `pending_present_batches`, popping whole batches whose exported
+    /// sync_file is readable, whose ready sentinel fired, or whose
+    /// degraded polling ticket has signaled. Fires wake signals via the
+    /// Arc-pinned handles and returns the public event payloads.
     fn drain_completed_present_events_impl(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        use std::os::fd::AsFd;
-
-        use crate::kms::v2::present_completion::PinnedWake;
-
+        self.drain_engine_present_batches();
         // Drain the wakeup_eventfd to clear it. nix's EventFd::read
         // returns Ok(u64) with the accumulated counter; Err(EAGAIN)
-        // when zero — benign in either case because we re-poll the
-        // per-entry ticket signals anyway.
+        // when zero — benign in either case because we re-check batch
+        // readiness directly.
         match self.platform.wakeup_eventfd.read() {
             Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
             Err(e) => log::warn!("wakeup_eventfd read: {e}"),
         }
 
         let renderer_failed = self.platform.renderer_failed;
-        if renderer_failed && !self.pending_present_events.is_empty() {
-            log::warn!(
-                "renderer_failed: force-firing {} pending PRESENT entries",
-                self.pending_present_events.len()
-            );
+        if renderer_failed && !self.pending_present_batches.is_empty() {
+            let pending_events: usize = self
+                .pending_present_batches
+                .iter()
+                .map(|batch| batch.events.len())
+                .sum();
+            log::warn!("renderer_failed: force-firing {pending_events} pending PRESENT entries");
         }
 
         // Clone the Arc<VkContext> so the loop body can borrow `self`
@@ -1690,53 +1826,19 @@ impl KmsBackendV2 {
         let vk = self.platform.vk.as_ref().cloned();
 
         let mut completed = Vec::new();
-        while let Some(front) = self.pending_present_events.front() {
-            let ready = renderer_failed
-                || front.fence_fd.is_none()
-                || front.ticket.as_ref().is_none_or(|t| match vk.as_ref() {
-                    Some(v) => t.poll_signaled(v),
-                    // No vk attached (test fixture without Vk) —
-                    // can't poll, treat as ready so the queue can
-                    // drain instead of livelocking.
-                    None => true,
-                });
+        while let Some(front) = self.pending_present_batches.front() {
+            let ready = renderer_failed || Self::pending_present_batch_ready(front, vk.as_ref());
             if !ready {
                 break;
             }
             let entry = self
-                .pending_present_events
+                .pending_present_batches
                 .pop_front()
                 .expect("just peeked");
-
-            // Unregister the per-entry sync_file FD from the inner
-            // epoll. The FD itself is closed when `OwnedFd` drops at
-            // end of scope.
-            if let Some(fd) = entry.fence_fd.as_ref()
-                && let Err(e) = self.platform.present_completion_epfd.delete(fd.as_fd())
-            {
-                log::warn!("epoll_ctl DEL per-entry sync_file fd: {e}");
+            self.unregister_present_batch_fd(&entry);
+            for event in entry.events {
+                completed.push(self.fire_pending_present_entry(event));
             }
-
-            // Fire the wake signal via the held Arc.
-            match &entry.wake_pin {
-                PinnedWake::Pixmap(h) => {
-                    if let Err(e) = self.dri3_trigger_fence_via_handle(h) {
-                        log::warn!(
-                            "deferred IdleNotify: dri3_trigger_fence_via_handle failed: {e}"
-                        );
-                    }
-                }
-                PinnedWake::PixmapSynced { handle, value } => {
-                    if let Err(e) = self.dri3_signal_syncobj_via_handle(handle, *value) {
-                        log::warn!(
-                            "deferred IdleNotify: dri3_signal_syncobj_via_handle failed: {e}"
-                        );
-                    }
-                }
-                PinnedWake::None => {}
-            }
-
-            completed.push(entry.event);
         }
         completed
     }
@@ -1813,6 +1915,7 @@ impl KmsBackendV2 {
         {
             log::warn!("v2 disable_output: flush_cow_batch failed: {e:?}");
         }
+        self.drain_engine_present_batches();
         if let Err(e) = self
             .engine
             .flush_render_batch(&mut self.store, &mut self.platform)
@@ -1828,27 +1931,19 @@ impl KmsBackendV2 {
         self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
 
-        // Stage 5 Task 6.1: drain the pending PRESENT events queue
-        // unconditionally. After drain_all every cow_batch ticket is
-        // signaled or the renderer failed; first pop the ready
-        // entries via drain_completed_present_events_impl (which
-        // closes per-entry FDs + fires Arc wake signals), then
-        // force-fire any remaining unsignaled entries by closing
-        // their FDs and accumulating the event payloads. All
-        // accumulated events go to `pending_completed_events_on_shutdown`
-        // for the caller (lib.rs::run) to fan out to clients before
-        // the socket is torn down.
+        // Stage 5 Task 6.1: drain the pending PRESENT batch queue
+        // unconditionally. After drain_all every submitted paint
+        // ticket is signaled or the renderer failed; first pop ready
+        // batches via drain_completed_present_events_impl (which
+        // closes sync_file FDs + fires Arc wake signals), then
+        // force-fire any remaining unsignaled batches. All accumulated
+        // events go to `pending_completed_events_on_shutdown` for the
+        // caller (lib.rs::run) to fan out to clients before the socket
+        // is torn down.
         let completed = self.drain_completed_present_events_impl();
         self.pending_completed_events_on_shutdown.extend(completed);
-        use std::os::fd::AsFd;
-        while let Some(entry) = self.pending_present_events.pop_front() {
-            if let Some(fd) = entry.fence_fd.as_ref()
-                && let Err(e) = self.platform.present_completion_epfd.delete(fd.as_fd())
-            {
-                log::warn!("v2 disable_output: epoll_ctl DEL: {e}");
-            }
-            self.pending_completed_events_on_shutdown.push(entry.event);
-        }
+        let completed = self.force_drain_all_present_batches();
+        self.pending_completed_events_on_shutdown.extend(completed);
 
         // Flush the submit trace after the drains record their
         // final events, before platform teardown — a VkDevice
@@ -4282,11 +4377,28 @@ impl Backend for KmsBackendV2 {
     }
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
-        if self.scene.scene_structure_dirty {
-            Some(std::time::Instant::now())
+        let now = std::time::Instant::now();
+        let scene_deadline = if self.scene.scene_structure_dirty {
+            if self.scene.has_output_ready_for_submit() {
+                Some(now)
+            } else {
+                self.scene.earliest_retry_deadline()
+            }
         } else {
             self.scene.earliest_retry_deadline()
-        }
+        };
+        let needs_present_poll = self.pending_present_batches.iter().any(|batch| {
+            matches!(
+                batch.wait,
+                crate::kms::v2::present_completion::PresentBatchWait::Poll
+            )
+        });
+        let present_deadline = if needs_present_poll {
+            Some(now + std::time::Duration::from_millis(1))
+        } else {
+            None
+        };
+        scene_deadline.into_iter().chain(present_deadline).min()
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
@@ -4295,27 +4407,32 @@ impl Backend for KmsBackendV2 {
         // id; the scene_compose event of this tick (if it
         // submits) also carries this id.
         self.telemetry.advance_frame();
-        // Stage 5 Task 3 POC: flush pending COW copy_area batch
-        // before scene.tick reads from drawable storage. Engine
-        // also flushes opportunistically from other engine
-        // entry-points; this is the load-bearing flush since
-        // scene.tick's compose CB samples the dst.
-        if let Err(e) = self
-            .engine
-            .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 maybe_composite: flush_cow_batch failed: {e:?}");
+        let can_submit_scene =
+            self.scene.scene_structure_dirty && self.scene.has_output_ready_for_submit();
+        if can_submit_scene {
+            // Stage 5 Task 3 POC: flush pending COW copy_area batch
+            // only when a scene submit can actually consume it. If a
+            // pageflip is still pending, keep the batch open so drag
+            // workloads coalesce until the vblank-limited scanout path
+            // is ready for another frame.
+            if let Err(e) = self
+                .engine
+                .flush_cow_batch(&mut self.store, &mut self.platform)
+            {
+                log::warn!("v2 maybe_composite: flush_cow_batch failed: {e:?}");
+            }
+            self.drain_engine_present_batches();
+            // Stage 5 Task 3 (render-composite generalization): same
+            // load-bearing flush for the render batch — scene.tick
+            // samples dst.
+            if let Err(e) = self
+                .engine
+                .flush_render_batch(&mut self.store, &mut self.platform)
+            {
+                log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
+            }
         }
-        // Stage 5 Task 3 (render-composite generalization): same
-        // load-bearing flush for the render batch — scene.tick
-        // samples dst.
-        if let Err(e) = self
-            .engine
-            .flush_render_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
-        }
-        let result = if !self.scene.scene_structure_dirty {
+        let result = if !can_submit_scene {
             Ok(())
         } else {
             match self.scene.tick(
@@ -5316,6 +5433,7 @@ impl Backend for KmsBackendV2 {
             {
                 log::warn!("v2 release_overlay_window: flush_cow_batch failed: {e:?}");
             }
+            self.drain_engine_present_batches();
             if let Err(e) = self
                 .engine
                 .flush_render_batch(&mut self.store, &mut self.platform)
@@ -9020,61 +9138,26 @@ impl Backend for KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("vkSignalSemaphore: {e:?}")))
     }
 
-    /// Stage 5 Task 6.1 — capture the dst drawable's
-    /// `last_render_ticket` (the just-submitted fence of the
-    /// `backend.copy_area` that ran immediately before this enqueue)
-    /// and an `Arc` clone of the wake primitive, export a sync_file
-    /// FD from the ticket (when available), register the FD with the
-    /// inner epoll (or write the wakeup_eventfd if the fence already
-    /// signalled or there is no in-flight render on dst), and push a
-    /// `PendingPresentEntry` onto the queue. The main loop later
-    /// drives `drain_completed_present_events` which fires the wake
-    /// and returns the event payloads.
+    /// Stage 5 Task 6.1 — queue a deferred PRESENT completion.
     ///
-    /// We capture `dst.last_render_ticket` (set by
-    /// `engine.copy_area`'s `store.touch_render_fence` after
-    /// `end_and_submit_op`) rather than `engine.current_cow_batch_
-    /// ticket()` because the cow_batch's fence is *recorded but not
-    /// yet submitted* at this point — calling `vkGetFenceFdKHR(SYNC_
-    /// FD)` on an unsubmitted fence is undefined behaviour per
-    /// `VUID-VkFenceGetFdInfoKHR-handleType-01457` and hangs Turnip /
-    /// lavapipe in practice. The dst's `last_render_ticket` is set
-    /// from a submitted fence (regular `engine.copy_area` submits
-    /// immediately via `end_and_submit_op`).
-    ///
-    /// Safety net for the rare `dst == cow_id` corner (PRESENT::
-    /// Pixmap targeting the COW — hypothetical for current clients):
-    /// force-flush any open cow_batch so dst's `last_render_ticket`
-    /// gets a submitted fence first.
+    /// COW-targeted PRESENT attaches the completion payload to the
+    /// still-open COW copy batch. When that batch submits, it signals a
+    /// dedicated export-only semaphore in the same queue submission;
+    /// the exported sync_file FD drives completion without touching the
+    /// `FenceTicket` used for yserver's internal lifetime tracking.
+    /// Non-COW PRESENT falls back to one signal-only queue submit after
+    /// the already-submitted copy, relying on same-queue ordering.
     fn enqueue_present_completion(
         &mut self,
         event: yserver_core::backend::CompletedPresentEvent,
         dst_host_xid: u32,
     ) {
-        use std::os::fd::AsFd;
-
         use yserver_core::backend::PresentWake;
 
-        use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
+        use crate::kms::v2::present_completion::{
+            PendingPresentBatch, PendingPresentEntry, PinnedWake, PresentBatchWait,
+        };
 
-        // Safety net: if PRESENT::Pixmap dst happens to be the COW,
-        // force-flush any open cow_batch so `last_render_ticket` is
-        // up-to-date and points to a submitted fence.
-        if let Some(cow_id) = self.cow_id
-            && let Some(dst_id) = self.store.lookup(dst_host_xid)
-            && dst_id == cow_id
-            && let Err(e) = self
-                .engine
-                .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("enqueue_present_completion: flush_cow_batch failed: {e:?}");
-        }
-
-        let ticket = self
-            .store
-            .lookup(dst_host_xid)
-            .and_then(|id| self.store.get(id))
-            .and_then(|d| d.last_render_ticket.clone());
         let wake_pin = match &event.wake {
             PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
                 match self.dri3_xshmfence_handle(*idle_fence_xid) {
@@ -9095,48 +9178,82 @@ impl Backend for KmsBackendV2 {
             _ => PinnedWake::None,
         };
 
-        // Export sync_file FD from the ticket (if any). `None` when
-        // ticket is None (no cow_batch) OR when vkGetFenceFdKHR
-        // returned -1 (fence already signaled at export time). In
-        // both cases the wakeup_eventfd path drives the next drain.
-        let fence_fd = match (&ticket, self.platform.vk.as_ref()) {
-            (Some(t), Some(vk)) => match t.export_sync_file_fd(vk) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    log::warn!("enqueue_present_completion: vkGetFenceFdKHR(SYNC_FD): {e:?}");
-                    None
-                }
-            },
-            _ => None,
-        };
+        let mut entry = PendingPresentEntry { wake_pin, event };
 
-        if let Some(fd) = fence_fd.as_ref() {
-            if let Err(e) = self.platform.present_completion_epfd.add(
-                fd.as_fd(),
-                nix::sys::epoll::EpollEvent::new(nix::sys::epoll::EpollFlags::EPOLLIN, 0),
-            ) {
-                log::warn!("enqueue_present_completion: epoll_ctl ADD per-entry fd: {e}");
-            }
-        } else {
-            // No FD to wait on — write the eventfd so the loop drains
-            // on the next iteration.
-            match self.platform.wakeup_eventfd.write(1) {
-                Ok(_) => {}
-                Err(nix::errno::Errno::EAGAIN) => {}
-                Err(e) => log::warn!("enqueue_present_completion: wakeup_eventfd write: {e}"),
+        if let Some(cow_id) = self.cow_id
+            && self.store.lookup(dst_host_xid) == Some(cow_id)
+        {
+            match self.engine.attach_cow_present_completion(cow_id, entry) {
+                Ok(()) => return,
+                Err(returned) => entry = returned,
             }
         }
 
-        self.pending_present_events.push_back(PendingPresentEntry {
-            ticket,
-            wake_pin,
-            fence_fd,
-            event,
+        let fallback_ticket = self
+            .store
+            .lookup(dst_host_xid)
+            .and_then(|id| self.store.get(id))
+            .and_then(|d| d.last_render_ticket.clone());
+
+        let mut batch_ticket = fallback_ticket;
+        let (wait, signal) = match (
+            self.platform.acquire_present_completion_signal(),
+            self.platform.acquire_fence_ticket(),
+        ) {
+            (Ok(signal), Ok(ticket)) => {
+                match self
+                    .platform
+                    .submit_present_completion_signal(&signal, ticket.fence())
+                {
+                    Ok(()) => {
+                        batch_ticket = Some(ticket);
+                        match signal.export_sync_file_fd() {
+                            Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                            Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                            Err(e) => {
+                                log::warn!(
+                                    "enqueue_present_completion: vkGetSemaphoreFdKHR(SYNC_FD) failed: {e:?}; \
+                                     falling back to FenceTicket polling"
+                                );
+                                (PresentBatchWait::Poll, Some(signal))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "enqueue_present_completion: signal-only queue submit failed: {e:?}; \
+                             falling back to prior FenceTicket polling"
+                        );
+                        (PresentBatchWait::Poll, Some(signal))
+                    }
+                }
+            }
+            (Err(e), _) => {
+                log::warn!(
+                    "enqueue_present_completion: completion semaphore allocation failed: {e:?}; \
+                     falling back to FenceTicket polling"
+                );
+                (PresentBatchWait::Poll, None)
+            }
+            (Ok(_signal), Err(e)) => {
+                log::warn!(
+                    "enqueue_present_completion: completion fence allocation failed: {e:?}; \
+                     falling back to prior FenceTicket polling"
+                );
+                (PresentBatchWait::Poll, None)
+            }
+        };
+
+        self.register_pending_present_batch(PendingPresentBatch {
+            wait,
+            ticket: batch_ticket,
+            signal,
+            events: vec![entry],
         });
     }
 
-    /// Stage 5 Task 6.1 — drain entries whose cow_batch fence has
-    /// signalled (or all entries when `platform.renderer_failed`).
+    /// Stage 5 Task 6.1 — drain batches whose completion semaphore has
+    /// signalled (or all batches when `platform.renderer_failed`).
     /// Wake signals fire via the Arc-pinned handle inside the impl
     /// body before the events are returned to the caller.
     fn drain_completed_present_events(
@@ -9772,6 +9889,33 @@ mod tests {
         assert!(logged.contains("put_image_unknown_xid"));
         assert!(logged.contains("fill_rectangle_unknown_xid"));
         assert!(logged.contains("copy_area_unknown_xid"));
+    }
+
+    #[test]
+    fn v2_pending_present_completion_sets_poll_deadline() {
+        let mut b = KmsBackendV2::for_tests();
+        b.scene.scene_structure_dirty = false;
+        assert!(b.next_wakeup().is_none());
+
+        b.enqueue_present_completion(
+            yserver_core::backend::CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(0),
+                serial: 1,
+                host_xid: 0x1000,
+                dst_host_xid: 0x1001,
+                options: 0,
+                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            0x1001,
+        );
+
+        let deadline = b
+            .next_wakeup()
+            .expect("pending PRESENT completion must wake polling fallback");
+        assert!(
+            deadline <= std::time::Instant::now() + std::time::Duration::from_millis(2),
+            "pending PRESENT deadline should be near-term"
+        );
     }
 
     /// Spec: "boots far enough to service GetGeometry / InternAtom".

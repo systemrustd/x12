@@ -642,6 +642,25 @@ impl SceneCompositor {
             .min()
     }
 
+    /// Whether a dirty scene can submit to at least one output now.
+    ///
+    /// `maybe_composite` uses this before flushing deferred paint
+    /// batches. If every output is still waiting on a pageflip or a
+    /// commit-retry backoff, flushing paint would create GPU submit
+    /// traffic that cannot be scanned out yet and would fragment COW
+    /// batching under compositor drag workloads.
+    pub(crate) fn has_output_ready_for_submit(&self) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return true;
+        };
+        let now = std::time::Instant::now();
+        inner.outputs.iter().any(|o| {
+            o.pending_acks.is_empty()
+                && o.next_submit_retry_at
+                    .is_none_or(|deadline| now >= deadline)
+        })
+    }
+
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the
     /// pointer fast path. Returns `Hw` ONLY when every active
     /// output has retired its Sw→Hw transition AND no PendingAck

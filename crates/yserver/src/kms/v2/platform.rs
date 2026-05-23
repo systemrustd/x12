@@ -35,7 +35,7 @@
 
 use std::{
     io,
-    os::fd::{AsFd, AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
     path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
@@ -153,26 +153,6 @@ impl FenceTicket {
     pub(crate) fn fence(&self) -> vk::Fence {
         self.inner.fence
     }
-
-    /// Stage 5 Task 6.1: export the underlying `VkFence` as a Linux
-    /// sync_file FD via `vkGetFenceFdKHR(SYNC_FD)`. The returned FD
-    /// becomes `POLLIN`-readable when the fence signals.
-    ///
-    /// Returns `Ok(Some(fd))` for an unsignaled fence;
-    /// `Ok(None)` when `vkGetFenceFdKHR` returns -1 (the fence is
-    /// already signaled at export time — caller treats as
-    /// "drain immediately");
-    /// `Err(_)` on Vk failure.
-    pub(crate) fn export_sync_file_fd(
-        &self,
-        vk: &VkContext,
-    ) -> Result<Option<std::os::fd::OwnedFd>, vk::Result> {
-        let info = vk::FenceGetFdInfoKHR::default()
-            .fence(self.inner.fence)
-            .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-        let raw = unsafe { vk.external_fence_fd.get_fence_fd(&info)? };
-        crate::kms::vk::optional_sync_fd_from_vk(raw, "vkGetFenceFdKHR(SYNC_FD)")
-    }
 }
 
 impl Drop for FenceTicketInner {
@@ -216,6 +196,51 @@ impl Drop for FenceTicketInner {
             );
             pool.renderer_failed = true;
             pool.leaked_fences.push(self.fence);
+        }
+    }
+}
+
+/// Export-only binary semaphore for deferred PRESENT completion.
+///
+/// This object is deliberately separate from [`FenceTicket`].
+/// Exporting a sync fd is allowed to affect the source payload, so
+/// PRESENT completion uses this disposable semaphore while yserver's
+/// internal lifetime bookkeeping continues to poll the untouched
+/// `FenceTicket`.
+pub(crate) struct PresentCompletionSignal {
+    vk: Arc<VkContext>,
+    semaphore: vk::Semaphore,
+}
+
+impl PresentCompletionSignal {
+    #[must_use]
+    pub(crate) fn semaphore(&self) -> vk::Semaphore {
+        self.semaphore
+    }
+
+    pub(crate) fn export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(self.semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let raw = unsafe { self.vk.external_semaphore_fd.get_semaphore_fd(&info)? };
+        crate::kms::vk::optional_sync_fd_from_vk(raw, "vkGetSemaphoreFdKHR(SYNC_FD)")
+    }
+}
+
+fn create_present_completion_signal(
+    vk: Arc<VkContext>,
+) -> Result<PresentCompletionSignal, vk::Result> {
+    let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+        .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+    let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
+    Ok(PresentCompletionSignal { vk, semaphore })
+}
+
+impl Drop for PresentCompletionSignal {
+    fn drop(&mut self) {
+        unsafe {
+            self.vk.device.destroy_semaphore(self.semaphore, None);
         }
     }
 }
@@ -369,9 +394,8 @@ pub(crate) struct PageFlipRetirement {
 // ────────────────────────────────────────────────────────────────
 
 /// Stage 5 Task 6.1: epoll event-data token for the backend's
-/// wakeup_eventfd. Per-entry sync_file FDs use the entry's index
-/// (or a serial) as their token instead, distinguishing them from
-/// the wakeup_eventfd.
+/// wakeup_eventfd. Per-batch sync_file FDs use their raw fd as the
+/// token instead, distinguishing them from the wakeup_eventfd.
 pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
@@ -388,15 +412,14 @@ pub(crate) struct PlatformBackend {
     // Input side
     input_ctx: Option<crate::input::SendContext>,
 
-    /// Stage 5 Task 6.1: inner epoll FD aggregating per-entry
+    /// Stage 5 Task 6.1: inner epoll FD aggregating per-batch
     /// sync_file FDs for deferred PRESENT completion. Exposed via
     /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
     pub(crate) present_completion_epfd: nix::sys::epoll::Epoll,
 
-    /// Stage 5 Task 6.1: eventfd used to wake the main loop when an
-    /// already-signaled fence is enqueued (vkGetFenceFdKHR returned
-    /// -1) or any other force-wake condition arises. Registered with
+    /// Stage 5 Task 6.1: eventfd used to wake the main loop when a
+    /// PRESENT completion is enqueued. Registered with
     /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
     pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
 
@@ -1254,11 +1277,73 @@ impl PlatformBackend {
         cb: vk::CommandBuffer,
         signal_fence: vk::Fence,
     ) -> Result<(), vk::Result> {
+        self.submit_paint_cb_with_semaphore(cb, signal_fence, None)
+    }
+
+    /// Submit a paint command buffer, optionally signaling a
+    /// dedicated export-only semaphore for deferred PRESENT
+    /// completion in the same queue submission.
+    pub(crate) fn submit_paint_cb_with_semaphore(
+        &mut self,
+        cb: vk::CommandBuffer,
+        signal_fence: vk::Fence,
+        completion_signal: Option<vk::Semaphore>,
+    ) -> Result<(), vk::Result> {
         let Some(vk) = self.vk.as_ref() else {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         };
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        let sig_info;
+        let submit_base = vk::SubmitInfo2::default().command_buffer_infos(&cb_info);
+        let submit = if let Some(semaphore) = completion_signal {
+            sig_info = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            [submit_base.signal_semaphore_infos(&sig_info)]
+        } else {
+            [submit_base]
+        };
+        crate::vk_count!(queue_submit2);
+        match unsafe {
+            vk.device
+                .queue_submit2(vk.graphics_queue, &submit, signal_fence)
+        } {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.renderer_failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn acquire_present_completion_signal(
+        &self,
+    ) -> Result<PresentCompletionSignal, vk::Result> {
+        let vk = self
+            .vk
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        create_present_completion_signal(Arc::clone(vk))
+    }
+
+    /// Submit no command buffers, only signal `completion_signal` and
+    /// `signal_fence`.
+    /// Same-queue ordering makes this signal happen after all prior
+    /// copy/render submits, which is sufficient for the non-COW
+    /// PRESENT fallback where the copy already submitted before the
+    /// completion was enqueued.
+    pub(crate) fn submit_present_completion_signal(
+        &mut self,
+        completion_signal: &PresentCompletionSignal,
+        signal_fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let Some(vk) = self.vk.as_ref() else {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        let sig_info = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(completion_signal.semaphore())
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let submit = [vk::SubmitInfo2::default().signal_semaphore_infos(&sig_info)];
         crate::vk_count!(queue_submit2);
         match unsafe {
             vk.device
@@ -1584,52 +1669,6 @@ mod tests {
         let g = p.record_present(0, 0);
         p.commit_bo_present(0, 0, g); // bo_generations[0] is empty — no-op
         p.commit_bo_present(99, 99, g); // out-of-range — no-op
-    }
-
-    /// Stage 5 Task 6.1 — `FenceTicket::export_sync_file_fd` on a
-    /// submitted fence returns `Ok(Some(fd))`. The fence is submitted
-    /// by routing through a real `engine.copy_area` first (which calls
-    /// `end_and_submit_op` on its ticket); only then is
-    /// `vkGetFenceFdKHR(SYNC_FD)` well-defined per
-    /// `VUID-VkFenceGetFdInfoKHR-handleType-01457`. Calling it on a
-    /// never-submitted fence hangs lavapipe + Turnip — see the
-    /// `enqueue_present_completion` doc-comment for the design
-    /// rationale.
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn fence_ticket_export_sync_file_fd_after_submit_returns_some() {
-        use yserver_core::backend::Backend;
-        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skipping: no Vk: {e}");
-                return;
-            }
-        };
-        let vk = b.platform.vk.as_ref().expect("vk live").clone();
-        let src = b.create_pixmap(None, 32, 4, 4).expect("src pixmap");
-        let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
-        b.copy_area(None, src.as_raw(), dst.as_raw(), 0, 0, 0, 0, 4, 4)
-            .expect("copy_area");
-        // After copy_area, dst's last_render_ticket is the just-
-        // submitted ticket — fence has a queued signal op, so the
-        // sync_file export is well-defined.
-        let dst_id = b.store.lookup(dst.as_raw()).expect("dst in store");
-        let ticket = b
-            .store
-            .get(dst_id)
-            .and_then(|d| d.last_render_ticket.clone())
-            .expect("dst.last_render_ticket set by copy_area");
-        let fd_opt = ticket.export_sync_file_fd(&vk).expect("export ok");
-        // `Ok(Some(fd))` for an unsignaled-but-submitted fence;
-        // `Ok(None)` if the fence raced to signaled before the
-        // export call. Either is well-defined; the load-bearing
-        // assertion is that the call returns at all (didn't hang).
-        if let Some(fd) = fd_opt {
-            // OwnedFd Drop closes; ensure the value compiles +
-            // visibly stays alive past the export.
-            std::mem::drop(fd);
-        }
     }
 
     #[test]
