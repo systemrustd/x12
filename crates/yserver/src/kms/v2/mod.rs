@@ -14,6 +14,7 @@ pub(crate) mod engine;
 pub(crate) mod glyph_atlas;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
+pub(crate) mod present_completion;
 pub(crate) mod scene;
 pub(crate) mod store;
 pub(crate) mod submit_trace;
