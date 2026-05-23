@@ -129,14 +129,17 @@ A `FrameBuilder` is the new top-level abstraction on
   ops append into the open frame instead of submitting their
   own CB.
 - **ClosingWithCompose.** Scene-compose joined the open frame.
-  Triggered by `maybe_composite` when it observes
-  `scene_structure_dirty && has_output_ready_for_submit() &&
-  frame.is_open()`. Compose appends its own `RecordedOp::Compose`
-  entries (one per ready output) onto the same op list, then
-  the frame closes into a single primary CB that contains paint
-  draws + barriers + N compose render passes, submits once
-  with `KMS_FB_IN_FENCE_FD` exported per output, and signals
-  the frame ticket.
+  Triggered by `maybe_composite` when its compose-eligibility
+  gate fires AND `frame.is_open()`. The compose-eligibility
+  gate is `(scene_structure_dirty || any_output_has_pending_
+  failed_submit_or_retry()) && has_output_ready_for_submit()`
+  — see § "Per-output partial-failure handling" for the
+  partial-failure-retry rationale. Compose appends its own
+  `RecordedOp::Compose` entries (one per ready output) onto
+  the same op list, then the frame closes into a single
+  primary CB that contains paint draws + barriers + N
+  rendering instances, submits once with `KMS_FB_IN_FENCE_FD`
+  exported per output, and signals the frame ticket.
 
 The Closed → OpenForPaint transition is *lazy* — a request
 handler that never touches the paint path never allocates a
@@ -538,12 +541,30 @@ extend the `maybe_composite` gate to:
 
 where `any_output_has_pending_failed_submit_or_retry()`
 returns true while ANY output has a non-empty
-`failed_submit_bos` queue OR an unreached
-`next_submit_retry_at` deadline. This makes failed-output
-retry state dirty-equivalent for scheduling. The plan wires
-this through a `Scene::has_failed_outputs()`-shaped predicate
+`failed_submit_bos` queue OR `next_submit_retry_at.is_some()`
+— i.e. as long as a retry is *outstanding*, regardless of
+whether the deadline has been reached. (`has_output_ready_
+for_submit()` and the existing `earliest_retry_deadline()`
+control *when* the wake-up fires; the predicate controls
+whether scheduling is gated at all.) The dirty-or-retry
+predicate must NOT clear on "deadline reached"; it must clear
+on "retry attempted" (the retry path explicitly resets
+`next_submit_retry_at = None` and either re-pushes a new
+`failed_submit_bos` entry on re-failure or proceeds via the
+standard path on success).
+
+A simpler-but-wrong shape that this spec REJECTS: gating on
+"unreached deadline" alone. The shared frame fence may
+signal and drain `failed_submit_bos` before the deadline,
+flipping the predicate to false; once the deadline passes
+without an actual retry attempt, the retry would be lost.
+Persist the retry signal until the retry actually happens.
+
+This makes failed-output retry state dirty-equivalent for
+scheduling. The plan wires this through a
+`Scene::has_failed_outputs_pending_retry()`-shaped predicate
 (or equivalent). Spec does NOT mandate "leave
-scene_structure_dirty = true on partial failure" because
+`scene_structure_dirty = true` on partial failure" because
 muddling "scene state changed" with "output needs retry"
 confuses other consumers of the dirty bit; an explicit
 predicate is cleaner.
@@ -557,10 +578,16 @@ unbounded and paint never reaches the GPU.
 **Triggers, in order of "should be the common case":**
 
 1. **`maybe_composite` ready-output sweep** (the dominant path).
-   `scene_structure_dirty && has_output_ready_for_submit() &&
-   frame.is_open()` triggers `close_into_cb` with attached
-   compose. Paint + compose land in one CB, one submit. This is
-   the design's normal "one frame ⇒ one submit" path.
+   `(scene_structure_dirty ||
+   any_output_has_pending_failed_submit_or_retry()) &&
+   has_output_ready_for_submit() && frame.is_open()` triggers
+   `close_into_cb` with attached compose. Paint + compose land
+   in one CB, one submit. This is the design's normal "one
+   frame ⇒ one submit" path. The OR with the partial-failure
+   predicate keeps a stale failed output schedulable across
+   shared submits even when `scene_structure_dirty` has
+   already been cleared by a successful sibling output — see
+   § "Per-output partial-failure handling".
 1b. **PRESENT-completion semaphore attached.** When a COW
    PRESENT request attaches a `present_completion` semaphore
    to a paint op (today: `engine.rs:2460`-ish flush before
