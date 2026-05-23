@@ -513,6 +513,41 @@ retires), but correct. **No new failure mode is
 introduced;** partial failure is just routed through one
 shared ticket instead of per-output tickets.
 
+**Compositor schedulability across partial failure.** A
+distinct concern from BO/ticket bookkeeping: today
+`maybe_composite` gates on `scene_structure_dirty &&
+has_output_ready_for_submit()` (`backend.rs:4580`), and a
+successful output clears the global dirty bit
+(`scene.rs:850`). If output A's flip succeeded and output B's
+failed, B's only retry signal under today's per-output design
+is its own `next_submit_retry_at` deadline — which is fine
+because today each output's compose was independent. Under
+Phase B's shared submit, the dirty bit is cleared once for
+the whole frame even when output B needs a retry; without an
+explicit fix, B would stay stale until unrelated damage
+marks the scene dirty again.
+
+**Spec requirement.** The Phase B partial-failure path MUST
+extend the `maybe_composite` gate to:
+
+```
+(scene_structure_dirty
+    || any_output_has_pending_failed_submit_or_retry())
+&& has_output_ready_for_submit()
+```
+
+where `any_output_has_pending_failed_submit_or_retry()`
+returns true while ANY output has a non-empty
+`failed_submit_bos` queue OR an unreached
+`next_submit_retry_at` deadline. This makes failed-output
+retry state dirty-equivalent for scheduling. The plan wires
+this through a `Scene::has_failed_outputs()`-shaped predicate
+(or equivalent). Spec does NOT mandate "leave
+scene_structure_dirty = true on partial failure" because
+muddling "scene state changed" with "output needs retry"
+confuses other consumers of the dirty bit; an explicit
+predicate is cleaner.
+
 ### Frame close triggers
 
 Spec § Phase B open question 5. The open frame must close at
