@@ -695,7 +695,35 @@ impl RenderEngine {
     /// Drain every in-flight submit, waiting on the deepest
     /// ticket. Called at shutdown to ensure all CB / staging
     /// resources are reclaimed before pool destruction.
+    ///
+    /// PRECONDITION: callers must close any open cow/render batches
+    /// (via `flush_cow_batch` + `flush_render_batch`) BEFORE calling
+    /// `drain_all`, because those methods need `&mut DrawableStore`
+    /// which is not available here. The production call site
+    /// (`disable_output`) already satisfies this. Any open batch
+    /// that reaches here is dropped with a warning to avoid a
+    /// non-empty/no-ticket panic on `flush_submit_group(Shutdown)`.
     pub(crate) fn drain_all(&mut self, platform: &mut PlatformBackend) {
+        // Drop any open cow/render batch that reached us without being
+        // flushed. This should never happen when called from the
+        // production code path (disable_output closes batches first),
+        // but guards against shutdown-time panics if the invariant is
+        // violated (e.g. a future call site that forgets to close
+        // batches first).
+        if let Some(inner) = self.inner.as_mut() {
+            if inner.pending_cow_batch.take().is_some() {
+                log::warn!(
+                    "v2 drain_all: open cow_batch dropped without flush \
+                     (caller must close batches before drain_all)"
+                );
+            }
+            if inner.pending_render_batch.take().is_some() {
+                log::warn!(
+                    "v2 drain_all: open render_batch dropped without flush \
+                     (caller must close batches before drain_all)"
+                );
+            }
+        }
         // Flush any open SubmitGroup first; this commits parked ops
         // into `submitted` so the loop below sees the right set.
         if let Err(e) =
@@ -11131,5 +11159,115 @@ mod tests {
         engine.drain_all(&mut p);
         assert!(!p.submit_group_is_open(), "drained");
         assert_eq!(engine.pending_group_ops_count_for_tests(), 0);
+    }
+
+    /// Phase A fix — root cause #2: pageflip retire (T7) with an open
+    /// cow_batch must not leave the engine in a state where a subsequent
+    /// flush panics.
+    ///
+    /// Bug shape: open cow_batch holds ticket T1; a non-COW flush path
+    /// (T7 pageflip retire) fires and consumes T1 via queue_submit2;
+    /// the still-open batch then appends its CB to a now-ticket-less
+    /// group; the next flush panics at the "non-empty group has ticket"
+    /// invariant.
+    ///
+    /// Post-fix: `simulate_page_flip_complete_for_tests` replicates the
+    /// production `on_page_flip_ready` path — it calls flush_cow_batch +
+    /// flush_render_batch BEFORE flush_submit_group(PageflipRetire).
+    /// The cow_batch CB lands in the group under T1, then the flush
+    /// drains cleanly. No orphan batch state. A subsequent
+    /// cow_copy_area + flush completes without panic.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn pageflip_retire_with_open_cow_batch_does_not_panic() {
+        let mut b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Use XIDs that don't collide with the root drawable (xid=1) which
+        // for_tests_with_vk already allocates via init_root_storage.
+        let src = b
+            .engine
+            .create_pixmap(&mut b.store, &mut b.platform, 0xb001, 4, 4, 32)
+            .unwrap();
+        let cow = b
+            .engine
+            .create_pixmap(&mut b.store, &mut b.platform, 0xb002, 4, 4, 32)
+            .unwrap();
+
+        // Drain setup CBs (each create_pixmap's zero-fill).
+        b.engine_flush_submit_group_for_tests().unwrap();
+        b.engine.drain_all(&mut b.platform);
+        assert!(
+            !b.platform_submit_group_is_open_for_tests(),
+            "setup drained"
+        );
+
+        // Open a cow_batch: begin_op_cb opens the group's ticket.
+        // batch.cb is recorded but NOT yet appended to the group.
+        b.engine
+            .cow_copy_area(
+                &mut b.store,
+                &mut b.platform,
+                cow,
+                src,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                ash::vk::Offset2D::default(),
+            )
+            .unwrap();
+        assert!(
+            b.platform_submit_group_is_open_for_tests(),
+            "cow_batch opened the ticket"
+        );
+
+        // Drive the pageflip-complete hook. Post-fix: the wrapper calls
+        // flush_cow_batch first, so batch.cb lands in the group under
+        // the same T1 that flush_submit_group(PageflipRetire) then
+        // consumes. No panic.
+        b.simulate_page_flip_complete_for_tests()
+            .expect("pageflip retire with open cow_batch must not panic");
+
+        // Group is fully drained — no orphan batch state.
+        assert!(
+            !b.platform_submit_group_is_open_for_tests(),
+            "pageflip retire drained the group cleanly (no orphan batches)"
+        );
+        assert_eq!(
+            b.engine.pending_group_ops_count_for_tests(),
+            0,
+            "parked op graduated to submitted"
+        );
+
+        // Prove there's no lingering damage: a fresh cow_copy_area +
+        // flush must also complete without panic.
+        b.engine
+            .cow_copy_area(
+                &mut b.store,
+                &mut b.platform,
+                cow,
+                src,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                ash::vk::Offset2D::default(),
+            )
+            .unwrap();
+        b.engine_flush_submit_group_for_tests()
+            .expect("second flush after pageflip retire must not panic");
+
+        b.engine.drain_all(&mut b.platform);
     }
 }

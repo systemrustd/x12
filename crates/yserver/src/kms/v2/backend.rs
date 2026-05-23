@@ -1750,10 +1750,23 @@ impl KmsBackendV2 {
     /// Phase A T7: simulate the pageflip-retire frame-boundary flush
     /// without going through `on_page_flip_ready` (which calls
     /// `drain_page_flip_events` and would error on the test fixture's
-    /// `/dev/null` DRM device). Invokes exactly the same
-    /// `flush_submit_group(PageflipRetire)` call that the real handler
-    /// issues so tests can assert the frame-boundary flush invariant.
+    /// `/dev/null` DRM device). Replicates the full production
+    /// `on_page_flip_ready` close-then-flush sequence: flush_cow_batch
+    /// + flush_render_batch before flush_submit_group(PageflipRetire),
+    /// so regression tests exercise the real fix path.
     pub fn simulate_page_flip_complete_for_tests(&mut self) -> Result<(), ash::vk::Result> {
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("simulate_page_flip_complete_for_tests: flush_cow_batch failed: {e:?}");
+        }
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("simulate_page_flip_complete_for_tests: flush_render_batch failed: {e:?}");
+        }
         self.engine
             .flush_submit_group(
                 &mut self.platform,
@@ -4498,12 +4511,26 @@ impl Backend for KmsBackendV2 {
         self.engine.poll_retired(&self.platform);
         self.store.poll_pending_retire(&mut self.platform);
         self.sync_descriptor_pool_telemetry();
-        // Phase A T7: pageflip retire is a frame boundary — flush
-        // the SubmitGroup so an idle next tick (no
-        // scene_structure_dirty) does not leave paint CBs buffered
-        // until the next compose. Drive through the engine wrapper
-        // so parked pending_group_ops commit to `submitted`
+        // Phase A T7: pageflip retire is a frame boundary — close
+        // any open cow/render batch FIRST so their CBs land in the
+        // group under the same ticket that the subsequent flush will
+        // consume. Then flush the SubmitGroup so an idle next tick
+        // (no scene_structure_dirty) does not leave paint CBs
+        // buffered until the next compose. Drive through the engine
+        // wrapper so parked pending_group_ops commit to `submitted`
         // atomically.
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 on_page_flip_ready: flush_cow_batch failed: {e:?}");
+        }
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 on_page_flip_ready: flush_render_batch failed: {e:?}");
+        }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PageflipRetire,
@@ -9365,10 +9392,24 @@ impl Backend for KmsBackendV2 {
             }
         }
 
-        // Phase A: ensure all prior paint is on the queue BEFORE the
+        // Phase A: close any open cow/render batch FIRST so their CBs
+        // land in the group under the same ticket the flush will consume.
+        // Then ensure all prior paint is on the queue BEFORE the
         // signal-only submit. Engine-driven so any parked pending_group_ops
         // graduate to `submitted` atomically with the submit.
         // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 enqueue_present_completion: flush_cow_batch failed: {e:?}");
+        }
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 enqueue_present_completion: flush_render_batch failed: {e:?}");
+        }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,
