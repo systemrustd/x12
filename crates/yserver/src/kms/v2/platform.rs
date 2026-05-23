@@ -1407,6 +1407,15 @@ impl PlatformBackend {
         self.submit_group.set_max_size(n);
     }
 
+    /// Phase A T9: peek at the SubmitGroup's buffered entries in
+    /// append order. Allows ordering-invariant tests to assert that
+    /// CBs land in the group in chronological submission order without
+    /// requiring a flush that would destroy the snapshot.
+    #[cfg(test)]
+    pub(crate) fn submit_group_peek_entries_for_tests(&self) -> &[super::submit_group::GroupEntry] {
+        self.submit_group.peek_entries()
+    }
+
     /// Phase A: explicit flush of any buffered submit group. Issues one
     /// `vkQueueSubmit2` with all buffered CBs + signal semaphores,
     /// signaling the group's shared fence. Empty group → `Ok(FlushOutcome {

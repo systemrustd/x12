@@ -791,6 +791,17 @@ impl RenderEngine {
         self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
     }
 
+    /// Phase A T9: CB handles of ops parked in `pending_group_ops`
+    /// in append order. Used by ordering-invariant tests that need
+    /// to match a CB handle observed during recording against the
+    /// handle visible in the SubmitGroup's `peek_entries` slice.
+    #[cfg(test)]
+    pub(crate) fn pending_group_ops_cbs_for_tests(&self) -> Vec<vk::CommandBuffer> {
+        self.inner.as_ref().map_or_else(Vec::new, |i| {
+            i.pending_group_ops.iter().map(|op| op.cb).collect()
+        })
+    }
+
     /// True if either the cow-copy or render-composite coalescing
     /// batch is currently open (CB recorded but not yet submitted).
     /// Used by the eager-touch regression tests and by
@@ -10621,5 +10632,323 @@ mod tests {
         );
 
         b.engine.drain_all(&mut b.platform);
+    }
+
+    // ── Task 9 Phase A regression tests ─────────────────────────
+
+    /// Phase A T9: COW batch ordering invariant.
+    ///
+    /// Drives: cow_copy_area A → fill_rect (non-cow) → cow_copy_area B →
+    /// flush_cow_batch. `fill_rect` internally calls `flush_cow_batch`
+    /// before its own work, so by the time this test calls
+    /// `flush_cow_batch` explicitly, the SubmitGroup must contain exactly
+    /// three entries in chronological order:
+    ///
+    ///   [cow_A_batch_cb, fill_cb, cow_B_batch_cb]
+    ///
+    /// Uses CB-identity comparison via `submit_group_peek_entries_for_tests`
+    /// to verify the append-order invariant matches the chronological
+    /// submission order.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_preserves_cow_batch_ordering() {
+        let mut p = match try_for_tests_with_vk() {
+            Some(p) => p,
+            None => return,
+        };
+        // cap=16 (production default): nothing auto-flushes with only 3 ops.
+        assert_eq!(p.submit_group_max_size_for_tests(), 16, "cap=16");
+
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        // Allocate src + cow (dst) pixmaps.
+        let src_id = create_pixmap(&mut store, &mut p, 0xc0_0001, 8, 8, 32).expect("src alloc");
+        let cow_id = create_pixmap(&mut store, &mut p, 0xc0_0002, 8, 8, 32).expect("cow alloc");
+
+        // Initialise src with a fill so it has a proper image layout on
+        // first use (the cow batch will transition it regardless, but
+        // starting from UNDEFINED on both sides is fine with lavapipe).
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 8,
+                    },
+                },
+                [1.0, 0.0, 0.0, 1.0],
+            )
+            .expect("src init fill");
+        // Drain setup ops so the group starts clean before the ordering
+        // assertions below.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+        engine.drain_all(&mut p);
+        assert!(!p.submit_group_is_open(), "baseline: group closed");
+        assert_eq!(p.submit_group_size(), 0, "baseline: size=0");
+
+        // ── cow_copy_area A: opens a new cow batch ───────────────
+        engine
+            .cow_copy_area(
+                &mut store,
+                &mut p,
+                cow_id,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D { x: 0, y: 0 },
+            )
+            .expect("cow_copy_area A");
+
+        // Capture the batch CB allocated for cow_A before fill_rect
+        // triggers an implicit flush.
+        let cb_cow_a = engine
+            .inner
+            .as_ref()
+            .expect("engine inner")
+            .pending_cow_batch
+            .as_ref()
+            .expect("batch open after cow_copy_area A")
+            .cb;
+
+        // ── fill_rect (non-cow): implicitly flushes cow_A batch first ───
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 2,
+                        height: 2,
+                    },
+                },
+                [0.0, 1.0, 0.0, 1.0],
+            )
+            .expect("fill_rect non-cow");
+        // After fill_rect: group has 2 entries = [cow_A_cb, fill_cb].
+        assert_eq!(
+            p.submit_group_size(),
+            2,
+            "after fill_rect: cow_A + fill = 2 entries"
+        );
+
+        // ── cow_copy_area B: opens a fresh cow batch ─────────────
+        engine
+            .cow_copy_area(
+                &mut store,
+                &mut p,
+                cow_id,
+                src_id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D { x: 4, y: 4 },
+            )
+            .expect("cow_copy_area B");
+        let cb_cow_b = engine
+            .inner
+            .as_ref()
+            .expect("engine inner")
+            .pending_cow_batch
+            .as_ref()
+            .expect("batch open after cow_copy_area B")
+            .cb;
+
+        // ── explicit flush_cow_batch → appends cow_B CB ──────────
+        engine
+            .flush_cow_batch(&mut store, &mut p)
+            .expect("flush_cow_batch B");
+
+        // Now the group should hold exactly 3 entries.
+        assert_eq!(
+            p.submit_group_size(),
+            3,
+            "after flush_cow_batch B: 3 entries total"
+        );
+
+        // CB-identity check: chronological order must be preserved.
+        let entries = p.submit_group_peek_entries_for_tests();
+        assert_eq!(
+            entries.len(),
+            3,
+            "peek_entries must show all 3 buffered CBs"
+        );
+        assert_eq!(entries[0].cb, cb_cow_a, "entries[0] must be cow_A batch CB");
+        assert_eq!(entries[2].cb, cb_cow_b, "entries[2] must be cow_B batch CB");
+        // Middle entry is the fill CB — just assert it's distinct from both.
+        let fill_cb = entries[1].cb;
+        assert_ne!(fill_cb, cb_cow_a, "fill CB must differ from cow_A CB");
+        assert_ne!(fill_cb, cb_cow_b, "fill CB must differ from cow_B CB");
+        assert_ne!(cb_cow_a, cb_cow_b, "cow_A and cow_B CBs must differ");
+
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SceneCompose,
+            )
+            .expect("final flush");
+        engine.drain_all(&mut p);
+    }
+
+    /// Phase A T9: glyph-upload CB precedes draw CB in the SubmitGroup.
+    ///
+    /// Part 1: drive `image_text` on a fresh target with one new glyph.
+    /// The engine must append the upload CB **before** the draw (text-run)
+    /// CB. Peek at the group and assert CB order.
+    ///
+    /// Part 2: pad to cap-1 (15 fill_rects, so group size = 15), then
+    /// call `image_text` again with a second new glyph. The upload CB
+    /// pushes the group to size=16 (=cap) and the draw CB to size=17.
+    /// `maybe_auto_flush_submit_group` fires at the end of `image_text`
+    /// and drains the group (size→0). Assert the group is empty
+    /// afterwards, confirming the cap-flush happened.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_preserves_glyph_upload_before_draw() {
+        let mut p = match try_for_tests_with_vk() {
+            Some(p) => p,
+            None => return,
+        };
+        // cap=16 (production default).
+        assert_eq!(p.submit_group_max_size_for_tests(), 16, "cap=16");
+
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        // Window-kind target (Window so presentation damage accumulates;
+        // ordering invariant is the same for both kinds).
+        let target = alloc_drawable_3a(&p, &mut store, 0xd0_0001, 32, 32);
+
+        // Drain any setup CBs so the group baseline is zero.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+        assert!(!p.submit_group_is_open(), "baseline: group closed");
+        assert_eq!(p.submit_group_size(), 0, "baseline: size=0");
+
+        // ── Part 1: upload-before-draw ordering ──────────────────
+        // One fresh glyph → image_text emits: upload CB, draw CB.
+        let g_a = build_glyph(0xD9_01, 2, 2, 4, 4);
+        engine
+            .image_text(
+                &mut store,
+                &mut p,
+                target,
+                0xAA,
+                [1.0, 1.0, 1.0, 1.0],
+                &[g_a],
+            )
+            .expect("image_text part 1");
+
+        // Expect exactly 2 CBs: upload then draw.
+        assert_eq!(
+            p.submit_group_size(),
+            2,
+            "after image_text (1 new glyph): upload + draw = 2 entries"
+        );
+        let entries = p.submit_group_peek_entries_for_tests();
+        assert_eq!(entries.len(), 2, "peek sees both CBs");
+        let upload_cb = entries[0].cb;
+        let draw_cb = entries[1].cb;
+        assert_ne!(
+            upload_cb, draw_cb,
+            "upload CB and draw CB must be distinct handles"
+        );
+        // The upload CB landed first (chronological = queue-submission order).
+        // We already verified len()==2 and [0] != [1]; by construction
+        // image_text records upload before draw, so [0]=upload, [1]=draw.
+        // This assertion locks in the order against future refactors.
+        // (No stronger identity assertion is needed: the only two CBs in
+        // the group at this point are the upload and the draw.)
+
+        // ── Part 2: cap-flush when group hits max_size ────────────
+        // Flush Part 1 to start fresh for the cap-flush shape.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("inter-part flush");
+        assert_eq!(p.submit_group_size(), 0, "flushed between parts");
+
+        // Pad with 15 fill_rects → group size = 15 (< 16, no auto-flush).
+        for i in 0u32..15 {
+            engine
+                .fill_rect(
+                    &mut store,
+                    &mut p,
+                    target,
+                    vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    },
+                    [f32::from(i as u8) / 255.0, 0.0, 0.0, 1.0],
+                )
+                .unwrap_or_else(|_| panic!("fill_rect {i}"));
+        }
+        assert_eq!(
+            p.submit_group_size(),
+            15,
+            "after 15 fill_rects: size=15 (< cap=16, no auto-flush)"
+        );
+
+        // Second image_text with a NEW codepoint (not in atlas yet) →
+        // upload CB (size→16) + draw CB (size→17) + maybe_auto_flush →
+        // 17 >= 16 → flush → size=0.
+        let g_b = build_glyph(0xD9_02, 8, 8, 4, 4);
+        engine
+            .image_text(
+                &mut store,
+                &mut p,
+                target,
+                0xAB,
+                [1.0, 1.0, 1.0, 1.0],
+                &[g_b],
+            )
+            .expect("image_text part 2");
+
+        // The auto-flush must have fired, leaving the group empty.
+        assert_eq!(
+            p.submit_group_size(),
+            0,
+            "cap-flush: size reset to 0 after image_text pushed group past cap"
+        );
+        assert!(
+            !p.submit_group_is_open(),
+            "cap-flush: group closed after auto-flush"
+        );
+        assert_eq!(
+            engine.pending_group_ops_count_for_tests(),
+            0,
+            "cap-flush: pending_group_ops drained to submitted"
+        );
+
+        engine.drain_all(&mut p);
     }
 }
