@@ -3198,6 +3198,15 @@ impl RenderEngine {
         // prior submits including any pending COW batch.
         self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
+        // Phase A: drain any buffered paint group BEFORE allocating the
+        // readback CB. This ensures prior paint ops are queued/submitted
+        // so the readback observes them. Distinct from the second
+        // flush below — which signals the readback's own fence so
+        // ticket.wait() observes a queued signal-op. Both are needed:
+        // this one drains prior buffered paint; the second flushes the
+        // readback CB itself.
+        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)
+            .map_err(RenderError::Vk)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -3303,10 +3312,12 @@ impl RenderEngine {
         let raw: &[u8] = unsafe { std::slice::from_raw_parts(staging.mapped.as_ptr(), raw_size) };
         let out = pack_from_storage(raw, copy_w, copy_h, out_depth)?;
 
-        // Park CB + staging on `submitted`; they retire on the
-        // next `poll_retired` call (the fence is already signaled,
-        // so the retire happens at next poll — keeps the lifecycle
-        // book-keeping uniform).
+        // `get_image` is the ONLY exception to the
+        // `pending_group_ops`-on-paint-op rule. We push direct to
+        // `submitted` because the fence is already signaled (we waited
+        // on it above) and `staging.mapped` was read BEFORE we could
+        // have moved staging into `pending_group_ops` (lifetime
+        // requirement). `poll_retired` retires this op on the next tick.
         inner.acquire_generation += 1;
         let generation = inner.acquire_generation;
         inner.submitted.push_back(SubmittedOp {
@@ -10452,6 +10463,92 @@ mod tests {
             engine.pending_group_ops_count_for_tests(),
             0,
             "parked ops graduated to submitted",
+        );
+
+        engine.drain_all(&mut p);
+    }
+
+    /// Phase A T5: `get_image` must flush the SubmitGroup BEFORE
+    /// allocating the readback CB so prior buffered paint ops are
+    /// submitted and visible to the GPU copy.  With cap=16 the paint
+    /// op parks in `pending_group_ops` and never auto-flushes; without
+    /// the top-of-function flush the readback CB races the fill CB and
+    /// reads stale (uninitialised) memory.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_flushes_on_get_image_wait() {
+        let mut p = match try_for_tests_with_vk() {
+            Some(p) => p,
+            None => return,
+        };
+        p.submit_group_set_max_size_for_tests(16);
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        let dst = engine
+            .create_pixmap(&mut store, &mut p, 0xfade_0001, 4, 4, 32)
+            .expect("dst");
+        // Drain setup CBs so the group starts empty.
+        engine
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("baseline flush");
+        assert!(!p.submit_group_is_open(), "baseline drained");
+
+        // One paint, then get_image.  With cap=16 buffering, the paint
+        // sits in the group; get_image MUST flush before its synchronous
+        // wait, or the readback reads stale memory.
+        let color = decode_x11_pixel_bgra(0xdead_beef);
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                color,
+            )
+            .expect("fill");
+        // At this point the fill CB is parked in pending_group_ops
+        // (cap=16 means no auto-flush) and the group still has 1 entry
+        // buffered.
+        assert_eq!(p.submit_group_size(), 1, "paint buffered, not flushed");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut p,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        // After get_image: both flushes ran, group is drained.
+        assert!(!p.submit_group_is_open(), "get_image's flushes drained");
+        assert_eq!(p.submit_group_size(), 0);
+
+        // Load-bearing pixel check: BGRA8 little-endian wire bytes of
+        // 0xdead_beef.  If the top-of-function flush DIDN'T drain the
+        // buffered fill, the readback CB would race the fill CB and
+        // the output would be uninitialised memory or zeros.
+        assert_eq!(
+            &out[..4],
+            &[0xef, 0xbe, 0xad, 0xde],
+            "paint reached memory before readback (proves top flush worked)"
         );
 
         engine.drain_all(&mut p);
