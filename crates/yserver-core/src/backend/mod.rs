@@ -18,7 +18,7 @@ pub use params::{
 };
 pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, Dri3Caps, HostSocketStatus, PresentCaps,
-    XshmfenceHandle,
+    SyncobjHandle, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

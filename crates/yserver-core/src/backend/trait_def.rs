@@ -205,6 +205,18 @@ pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
     fn trigger(&self) -> std::io::Result<()>;
 }
 
+/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
+/// VkSemaphore. Concrete impl in `yserver::kms::v2::owned_semaphore::
+/// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
+/// PRESENT completion path so the underlying semaphore can be
+/// lifetime-pinned past `FreeSyncobj`.
+pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
+    /// Signal the timeline-semaphore at the given value. Mirrors
+    /// the body of the existing `Backend::dri3_signal_syncobj(xid,
+    /// value)` after its registry lookup.
+    fn signal(&self, value: u64) -> std::io::Result<()>;
+}
+
 /// The dynamic backend surface. `Send` is required so that
 /// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
 /// `T: Send`). `Sync` on the trait itself is not required because all
@@ -1314,6 +1326,24 @@ pub trait Backend: Send {
     /// Phase 4.2 design §3.3.2.
     fn dri3_signal_syncobj(&mut self, _syncobj_xid: u32, _value: u64) -> io::Result<()> {
         Err(io::Error::other("DRI3 SignalSyncobj unsupported"))
+    }
+
+    /// Stage 5 Task 6.1: take an Arc clone of the syncobj's
+    /// underlying VkSemaphore wrapper, suitable for deferred
+    /// completion paths that need to survive an intervening
+    /// `FreeSyncobj`.
+    fn dri3_syncobj_handle(&self, _syncobj_xid: u32) -> Option<std::sync::Arc<dyn SyncobjHandle>> {
+        None
+    }
+
+    /// Stage 5 Task 6.1: signal the syncobj timeline point via a held
+    /// Arc clone, bypassing xid lookup.
+    fn dri3_signal_syncobj_via_handle(
+        &mut self,
+        handle: &std::sync::Arc<dyn SyncobjHandle>,
+        value: u64,
+    ) -> std::io::Result<()> {
+        handle.signal(value)
     }
 
     /// Trigger an XSync `Fence` resource imported via DRI3

@@ -12,6 +12,7 @@ pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
 pub(crate) mod glyph_atlas;
+pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
 pub(crate) mod scene;
 pub(crate) mod store;

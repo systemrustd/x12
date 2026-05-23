@@ -224,7 +224,8 @@ pub struct KmsBackendV2 {
     /// path (sync_file fd → `VkSemaphore`) or `ImportSyncobj`
     /// (drm_syncobj fd → timeline `VkSemaphore`). Mirrors v1's
     /// `dri3_sync_resources` field shape.
-    pub(crate) dri3_sync_resources: HashMap<u32, ash::vk::Semaphore>,
+    pub(crate) dri3_sync_resources:
+        HashMap<u32, std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>>,
 
     /// Stage 5 Phase A — canonical cursor xid → immutable record map.
     /// Inserted by `create_cursor` / `create_glyph_cursor` /
@@ -8765,9 +8766,14 @@ impl Backend for KmsBackendV2 {
         };
         let semaphore = crate::kms::vk::sync::import_sync_file(vk, fd)
             .map_err(|e| io::Error::other(format!("import_sync_file: {e:?}")))?;
-        if let Some(prev) = self.dri3_sync_resources.insert(fence_xid, semaphore) {
-            unsafe { vk.device.destroy_semaphore(prev, None) };
-        }
+        let owned = std::sync::Arc::new(crate::kms::v2::owned_semaphore::OwnedSemaphore::new(
+            vk.clone(),
+            semaphore,
+        ));
+        // Replacing an entry drops the previous Arc here; if no other
+        // clone is outstanding, OwnedSemaphore::Drop calls
+        // vkDestroySemaphore.
+        let _ = self.dri3_sync_resources.insert(fence_xid, owned);
         Ok(())
     }
 
@@ -8794,13 +8800,24 @@ impl Backend for KmsBackendV2 {
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
     }
 
+    fn dri3_syncobj_handle(
+        &self,
+        syncobj_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
+        self.dri3_sync_resources
+            .get(&syncobj_xid)
+            .cloned()
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
+    }
+
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
         let Some(vk) = self.platform.vk.as_ref() else {
             return Err(io::Error::other("DRI3 FDFromFence: Vulkan unavailable"));
         };
-        let &semaphore = self.dri3_sync_resources.get(&fence_xid).ok_or_else(|| {
+        let arc = self.dri3_sync_resources.get(&fence_xid).ok_or_else(|| {
             io::Error::other(format!("DRI3 FDFromFence: unknown fence 0x{fence_xid:x}"))
         })?;
+        let semaphore = arc.semaphore();
         crate::kms::vk::sync::export_sync_file(vk, semaphore)
             .map_err(|e| io::Error::other(format!("export_sync_file: {e:?}")))
     }
@@ -8815,32 +8832,30 @@ impl Backend for KmsBackendV2 {
         };
         let semaphore = crate::kms::vk::sync::import_drm_syncobj(vk, fd)
             .map_err(|e| io::Error::other(format!("import_drm_syncobj: {e:?}")))?;
-        if let Some(prev) = self.dri3_sync_resources.insert(syncobj_xid, semaphore) {
-            unsafe { vk.device.destroy_semaphore(prev, None) };
-        }
+        let owned = std::sync::Arc::new(crate::kms::v2::owned_semaphore::OwnedSemaphore::new(
+            vk.clone(),
+            semaphore,
+        ));
+        // Arc Drop on the replaced entry handles vkDestroySemaphore if
+        // no other clone is outstanding.
+        let _ = self.dri3_sync_resources.insert(syncobj_xid, owned);
         Ok(())
     }
 
     fn dri3_free_syncobj(&mut self, syncobj_xid: u32) -> io::Result<()> {
-        let Some(vk) = self.platform.vk.as_ref() else {
-            return Err(io::Error::other("DRI3 FreeSyncobj: Vulkan unavailable"));
-        };
-        if let Some(sem) = self.dri3_sync_resources.remove(&syncobj_xid) {
-            unsafe { vk.device.destroy_semaphore(sem, None) };
-        }
+        // Vulkan no longer required here — Arc Drop calls
+        // vkDestroySemaphore when the last reference goes away.
+        let _ = self.dri3_sync_resources.remove(&syncobj_xid);
         Ok(())
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
-        let Some(vk) = self.platform.vk.as_ref() else {
-            return Err(io::Error::other("DRI3 SignalSyncobj: Vulkan unavailable"));
-        };
-        let &semaphore = self.dri3_sync_resources.get(&syncobj_xid).ok_or_else(|| {
+        let arc = self.dri3_sync_resources.get(&syncobj_xid).ok_or_else(|| {
             io::Error::other(format!(
                 "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
             ))
         })?;
-        crate::kms::vk::sync::signal_timeline(vk, semaphore, value)
+        arc.signal_vk(value)
             .map_err(|e| io::Error::other(format!("vkSignalSemaphore: {e:?}")))
     }
 
@@ -14275,5 +14290,28 @@ mod tests {
         // Accessor returns None now; but the caller's Arc clones
         // still pin the FenceMapping alive (no destructor panic).
         assert!(b.dri3_xshmfence_handle(xid).is_none());
+    }
+
+    #[test]
+    fn syncobj_handle_accessor_returns_arc_clone() {
+        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let xid = 0xAAAA_BBBB_u32;
+        let vk = b.platform.vk.as_ref().expect("vk live").clone();
+        let sem = crate::kms::v2::owned_semaphore::OwnedSemaphore::for_tests_dummy(vk);
+        b.dri3_sync_resources.insert(xid, std::sync::Arc::new(sem));
+        let h = b.dri3_syncobj_handle(xid).expect("handle present");
+        assert_eq!(std::sync::Arc::strong_count(&h), 2);
+        b.dri3_sync_resources.remove(&xid);
+        // Accessor returns None now; held Arc still pins the
+        // OwnedSemaphore alive (no destructor panic on drop).
+        assert!(b.dri3_syncobj_handle(xid).is_none());
+        drop(h); // OwnedSemaphore::Drop fires here; null guard
+        // skips destroy_semaphore.
     }
 }
