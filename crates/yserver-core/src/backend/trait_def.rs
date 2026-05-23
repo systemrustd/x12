@@ -1409,11 +1409,20 @@ pub trait Backend: Send {
     }
 
     /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The
-    /// backend captures the cow_batch fence ticket + an Arc-pinned
+    /// backend captures `dst_host_xid`'s `last_render_ticket` (the
+    /// submitted fence of the just-finished `copy_area`), an Arc-pinned
     /// clone of the wake primitive, and returns immediately. The
     /// drain hook later fires the wake signal + the event payload.
+    ///
+    /// `dst_host_xid` is the backend's drawable-lookup key — server-
+    /// internal host xid, NOT the client xid carried by `event.dst_
+    /// host_xid` (which is the client-side fan-out match key). The
+    /// two arguments are separate so the field semantics inside
+    /// `CompletedPresentEvent` stay client-facing for the event
+    /// payload.
+    ///
     /// Default impl is no-op so non-v2 backends opt out.
-    fn enqueue_present_completion(&mut self, _event: CompletedPresentEvent) {
+    fn enqueue_present_completion(&mut self, _event: CompletedPresentEvent, _dst_host_xid: u32) {
         // no-op
     }
 
@@ -1551,14 +1560,17 @@ mod present_completion_trait_tests {
     #[test]
     fn default_enqueue_present_completion_is_noop() {
         let mut backend = crate::backend::recording::RecordingBackend::new();
-        backend.enqueue_present_completion(CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
-            serial: 1,
-            host_xid: 0,
-            dst_host_xid: 0,
-            options: 0,
-            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-        });
+        backend.enqueue_present_completion(
+            CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(0),
+                serial: 1,
+                host_xid: 0,
+                dst_host_xid: 0,
+                options: 0,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            /* dst_host_xid */ 0,
+        );
         // No drain triggered; default impl swallows.
         assert!(backend.drain_completed_present_events().is_empty());
     }

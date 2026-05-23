@@ -5112,17 +5112,23 @@ fn handle_present_request(
                 // client-side window xid the client supplied to
                 // PRESENT::SelectInput). Cf. Task 10's legacy site
                 // which sources from `frame.window.0`/`frame.pixmap.0`
-                // (also client xids).
-                backend.enqueue_present_completion(crate::backend::CompletedPresentEvent {
-                    client_id,
-                    serial: req.serial,
-                    host_xid: req.pixmap,
-                    dst_host_xid: req.window,
-                    options: masked_options,
-                    wake: crate::backend::PresentWake::Pixmap {
-                        idle_fence_xid: req.idle_fence,
+                // (also client xids). The trailing `dst.host_xid()`
+                // is the backend's drawable-lookup key (server-
+                // internal host xid) needed by enqueue to read the
+                // dst drawable's `last_render_ticket`.
+                backend.enqueue_present_completion(
+                    crate::backend::CompletedPresentEvent {
+                        client_id,
+                        serial: req.serial,
+                        host_xid: req.pixmap,
+                        dst_host_xid: req.window,
+                        options: masked_options,
+                        wake: crate::backend::PresentWake::Pixmap {
+                            idle_fence_xid: req.idle_fence,
+                        },
                     },
-                });
+                    dst.host_xid(),
+                );
             }
             state
                 .present_msc
@@ -5283,18 +5289,22 @@ fn handle_present_request(
                         // once the GPU side has finished.
                         // See Task 12 site comment — host_xid/
                         // dst_host_xid carry client xids despite the
-                        // field names.
-                        backend.enqueue_present_completion(crate::backend::CompletedPresentEvent {
-                            client_id,
-                            serial: req.serial,
-                            host_xid: req.pixmap,
-                            dst_host_xid: req.window,
-                            options: masked_options,
-                            wake: crate::backend::PresentWake::PixmapSynced {
-                                release_syncobj: req.release_syncobj,
-                                release_value: req.release_value,
+                        // field names; the trailing `dst.host_xid()`
+                        // is the backend's drawable-lookup key.
+                        backend.enqueue_present_completion(
+                            crate::backend::CompletedPresentEvent {
+                                client_id,
+                                serial: req.serial,
+                                host_xid: req.pixmap,
+                                dst_host_xid: req.window,
+                                options: masked_options,
+                                wake: crate::backend::PresentWake::PixmapSynced {
+                                    release_syncobj: req.release_syncobj,
+                                    release_value: req.release_value,
+                                },
                             },
-                        });
+                            dst.host_xid(),
+                        );
                         true
                     }
             } else {

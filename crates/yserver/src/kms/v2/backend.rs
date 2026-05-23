@@ -9020,22 +9020,61 @@ impl Backend for KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("vkSignalSemaphore: {e:?}")))
     }
 
-    /// Stage 5 Task 6.1 — capture the current cow_batch ticket + an
-    /// Arc clone of the wake primitive, export a sync_file FD from
-    /// the ticket (when available), register the FD with the inner
-    /// epoll (or write the wakeup_eventfd if the fence already
-    /// signalled / there is no cow_batch in flight), and push a
+    /// Stage 5 Task 6.1 — capture the dst drawable's
+    /// `last_render_ticket` (the just-submitted fence of the
+    /// `backend.copy_area` that ran immediately before this enqueue)
+    /// and an `Arc` clone of the wake primitive, export a sync_file
+    /// FD from the ticket (when available), register the FD with the
+    /// inner epoll (or write the wakeup_eventfd if the fence already
+    /// signalled or there is no in-flight render on dst), and push a
     /// `PendingPresentEntry` onto the queue. The main loop later
     /// drives `drain_completed_present_events` which fires the wake
-    /// + returns the event payloads.
-    fn enqueue_present_completion(&mut self, event: yserver_core::backend::CompletedPresentEvent) {
+    /// and returns the event payloads.
+    ///
+    /// We capture `dst.last_render_ticket` (set by
+    /// `engine.copy_area`'s `store.touch_render_fence` after
+    /// `end_and_submit_op`) rather than `engine.current_cow_batch_
+    /// ticket()` because the cow_batch's fence is *recorded but not
+    /// yet submitted* at this point — calling `vkGetFenceFdKHR(SYNC_
+    /// FD)` on an unsubmitted fence is undefined behaviour per
+    /// `VUID-VkFenceGetFdInfoKHR-handleType-01457` and hangs Turnip /
+    /// lavapipe in practice. The dst's `last_render_ticket` is set
+    /// from a submitted fence (regular `engine.copy_area` submits
+    /// immediately via `end_and_submit_op`).
+    ///
+    /// Safety net for the rare `dst == cow_id` corner (PRESENT::
+    /// Pixmap targeting the COW — hypothetical for current clients):
+    /// force-flush any open cow_batch so dst's `last_render_ticket`
+    /// gets a submitted fence first.
+    fn enqueue_present_completion(
+        &mut self,
+        event: yserver_core::backend::CompletedPresentEvent,
+        dst_host_xid: u32,
+    ) {
         use std::os::fd::AsFd;
 
         use yserver_core::backend::PresentWake;
 
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
 
-        let ticket = self.engine.current_cow_batch_ticket();
+        // Safety net: if PRESENT::Pixmap dst happens to be the COW,
+        // force-flush any open cow_batch so `last_render_ticket` is
+        // up-to-date and points to a submitted fence.
+        if let Some(cow_id) = self.cow_id
+            && let Some(dst_id) = self.store.lookup(dst_host_xid)
+            && dst_id == cow_id
+            && let Err(e) = self
+                .engine
+                .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("enqueue_present_completion: flush_cow_batch failed: {e:?}");
+        }
+
+        let ticket = self
+            .store
+            .lookup(dst_host_xid)
+            .and_then(|id| self.store.get(id))
+            .and_then(|d| d.last_render_ticket.clone());
         let wake_pin = match &event.wake {
             PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
                 match self.dri3_xshmfence_handle(*idle_fence_xid) {

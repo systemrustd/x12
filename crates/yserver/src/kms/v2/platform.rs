@@ -1586,15 +1586,51 @@ mod tests {
         p.commit_bo_present(99, 99, g); // out-of-range — no-op
     }
 
-    // Stage 5 Task 6.1 note: a unit test that called
-    // `FenceTicket::export_sync_file_fd` on a freshly-acquired
-    // (never-submitted) fence was tried and dropped — vkGetFenceFdKHR
-    // with handle type SYNC_FD has a Vulkan valid-usage requirement
-    // that the fence "must have an associated fence signal operation
-    // that has been submitted for execution" (VUID-VkFenceGetFdInfoKHR-handleType-01457).
-    // Calling it on a never-submitted fence hangs lavapipe. Coverage of
-    // this method comes via the v2_acceptance suite's enqueue/drain
-    // path, where the fence is bound to a submitted cow_batch.
+    /// Stage 5 Task 6.1 — `FenceTicket::export_sync_file_fd` on a
+    /// submitted fence returns `Ok(Some(fd))`. The fence is submitted
+    /// by routing through a real `engine.copy_area` first (which calls
+    /// `end_and_submit_op` on its ticket); only then is
+    /// `vkGetFenceFdKHR(SYNC_FD)` well-defined per
+    /// `VUID-VkFenceGetFdInfoKHR-handleType-01457`. Calling it on a
+    /// never-submitted fence hangs lavapipe + Turnip — see the
+    /// `enqueue_present_completion` doc-comment for the design
+    /// rationale.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn fence_ticket_export_sync_file_fd_after_submit_returns_some() {
+        use yserver_core::backend::Backend;
+        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let vk = b.platform.vk.as_ref().expect("vk live").clone();
+        let src = b.create_pixmap(None, 32, 4, 4).expect("src pixmap");
+        let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+        b.copy_area(None, src.as_raw(), dst.as_raw(), 0, 0, 0, 0, 4, 4)
+            .expect("copy_area");
+        // After copy_area, dst's last_render_ticket is the just-
+        // submitted ticket — fence has a queued signal op, so the
+        // sync_file export is well-defined.
+        let dst_id = b.store.lookup(dst.as_raw()).expect("dst in store");
+        let ticket = b
+            .store
+            .get(dst_id)
+            .and_then(|d| d.last_render_ticket.clone())
+            .expect("dst.last_render_ticket set by copy_area");
+        let fd_opt = ticket.export_sync_file_fd(&vk).expect("export ok");
+        // `Ok(Some(fd))` for an unsignaled-but-submitted fence;
+        // `Ok(None)` if the fence raced to signaled before the
+        // export call. Either is well-defined; the load-bearing
+        // assertion is that the call returns at all (didn't hang).
+        if let Some(fd) = fd_opt {
+            // OwnedFd Drop closes; ensure the value compiles +
+            // visibly stays alive past the export.
+            std::mem::drop(fd);
+        }
+    }
 
     #[test]
     fn present_completion_epfd_present_at_init_and_poll_fds() {

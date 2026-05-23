@@ -2973,14 +2973,17 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
     for serial in 1..=3 {
         b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
             .expect("copy_area");
-        b.enqueue_present_completion(yserver_core::backend::CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
-            serial,
-            host_xid: src.as_raw(),
-            dst_host_xid: cow.as_raw(),
-            options: 0,
-            wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
-        });
+        b.enqueue_present_completion(
+            yserver_core::backend::CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(0),
+                serial,
+                host_xid: src.as_raw(),
+                dst_host_xid: cow.as_raw(),
+                options: 0,
+                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            cow.as_raw(),
+        );
     }
     assert_eq!(
         b.pending_present_events_len_for_tests(),
@@ -3023,14 +3026,17 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
     b.copy_area(None, src_pix.as_raw(), cow_pix.as_raw(), 0, 0, 0, 0, 4, 4)
         .expect("copy_area");
     let before = std::time::Instant::now();
-    b.enqueue_present_completion(CompletedPresentEvent {
-        client_id: yserver_protocol::x11::ClientId(0),
-        serial: 1,
-        host_xid: src_pix.as_raw(),
-        dst_host_xid: cow_pix.as_raw(),
-        options: 0,
-        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-    });
+    b.enqueue_present_completion(
+        CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial: 1,
+            host_xid: src_pix.as_raw(),
+            dst_host_xid: cow_pix.as_raw(),
+            options: 0,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        },
+        cow_pix.as_raw(),
+    );
     let elapsed = before.elapsed();
     assert!(
         elapsed.as_millis() < 50,
@@ -3059,17 +3065,20 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
     let cow_pix = b.create_pixmap(None, 32, 4, 4).expect("cow");
     b.copy_area(None, src_pix.as_raw(), cow_pix.as_raw(), 0, 0, 0, 0, 4, 4)
         .expect("copy");
-    b.enqueue_present_completion(CompletedPresentEvent {
-        client_id: yserver_protocol::x11::ClientId(0),
-        serial: 2,
-        host_xid: src_pix.as_raw(),
-        dst_host_xid: cow_pix.as_raw(),
-        options: 0,
-        wake: PresentWake::PixmapSynced {
-            release_syncobj: 0, // 0 = no wake object; just exercises enqueue
-            release_value: 42,
+    b.enqueue_present_completion(
+        CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial: 2,
+            host_xid: src_pix.as_raw(),
+            dst_host_xid: cow_pix.as_raw(),
+            options: 0,
+            wake: PresentWake::PixmapSynced {
+                release_syncobj: 0, // 0 = no wake object; just exercises enqueue
+                release_value: 42,
+            },
         },
-    });
+        cow_pix.as_raw(),
+    );
     // Drain may return entries quickly under lavapipe; assertion is
     // that enqueue didn't panic + the queue can be drained.
     let _drained = b.drain_completed_present_events_for_tests();
@@ -3096,14 +3105,17 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
     let cow = b.create_pixmap(None, 32, 4, 4).expect("cow");
     b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
         .expect("copy");
-    b.enqueue_present_completion(CompletedPresentEvent {
-        client_id: yserver_protocol::x11::ClientId(0),
-        serial: 1,
-        host_xid: src.as_raw(),
-        dst_host_xid: cow.as_raw(),
-        options: 0,
-        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-    });
+    b.enqueue_present_completion(
+        CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial: 1,
+            host_xid: src.as_raw(),
+            dst_host_xid: cow.as_raw(),
+            options: 0,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        },
+        cow.as_raw(),
+    );
 
     let pre_pending = b.pending_present_events_len_for_tests();
     assert!(
