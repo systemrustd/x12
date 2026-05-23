@@ -6949,6 +6949,15 @@ mod tests {
             )
             .unwrap();
 
+        // Drain setup ops (fill_rects) before snapshotting the baseline
+        // (cap=16 deferred-graduation: ops park in pending_group_ops).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+
         let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
 
         // Issue the four cow copy_areas — back-to-back, same dst.
@@ -6994,6 +7003,14 @@ mod tests {
             .flush_cow_batch(&mut store, &mut platform)
             .expect("flush ok");
         assert_eq!(flushed, Some(4), "flush should report 4 coalesced copies");
+
+        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush before count assertion");
 
         // After flush: submitted grew by exactly 1.
         let submitted_after = engine.inner.as_ref().unwrap().submitted.len();
@@ -7390,6 +7407,15 @@ mod tests {
             )
             .unwrap();
 
+        // Drain setup ops (fill_rects) before snapshotting the baseline
+        // (cap=16 deferred-graduation: ops park in pending_group_ops).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+
         let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
 
         // First composite — OP_OVER, drawable src, no mask, draws
@@ -7482,6 +7508,15 @@ mod tests {
             .flush_render_batch(&mut store, &mut platform)
             .expect("flush ok");
         assert_eq!(flushed, Some(2));
+
+        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush before count assertion");
+
         assert_eq!(
             engine.inner.as_ref().unwrap().submitted.len(),
             submitted_before + 1,
@@ -7959,7 +7994,14 @@ mod tests {
         const OP_SRC: u8 = 1;
         const OP_OVER: u8 = 3;
 
-        let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
+        // Drain setup ops (fill_rect on src) so pending_group_ops is
+        // clean before the batch assertions below.
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
 
         // Call with OP_OVER → opens batch.
         engine
@@ -8013,11 +8055,16 @@ mod tests {
             )
             .unwrap();
         // After: pending batch is the OP_SRC one (count 1);
-        // first batch already flushed (one SubmittedOp).
+        // first batch already flushed (one parked op).
+        // Under cap=16 deferred-graduation the OP_OVER op is parked
+        // in pending_group_ops (not yet in `submitted`). Flushing the
+        // submit group mid-test would corrupt the group's ticket
+        // invariant for the OP_SRC batch that still needs to append.
+        // Assert on pending_group_ops instead — same coalescing invariant.
         assert_eq!(
-            engine.inner.as_ref().unwrap().submitted.len(),
-            submitted_before + 1,
-            "key-mismatch should have flushed the first batch"
+            engine.pending_group_ops_count_for_tests(),
+            1,
+            "key-mismatch should have queued one op in pending_group_ops"
         );
         let pending_count = engine
             .inner
@@ -8110,6 +8157,13 @@ mod tests {
                 .is_none(),
             "no batch pending after Solid src"
         );
+        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush before count assertion");
         assert_eq!(
             engine.inner.as_ref().unwrap().submitted.len(),
             submitted_before + 1,
@@ -8620,6 +8674,13 @@ mod tests {
                 &glyphs,
             )
             .expect("ok");
+        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush before count assertion");
         // One upload + one consume.
         assert!(engine.pending_count() >= 2);
         engine.drain_all(&mut platform);
@@ -9732,6 +9793,15 @@ mod tests {
             )
             .expect("blue prefill");
 
+        // Drain setup op (blue prefill) before snapshotting the baseline
+        // (cap=16 deferred-graduation: ops park in pending_group_ops).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("setup flush");
+
         // Snapshot the SubmittedOp count BEFORE the batch call so we
         // can assert exactly +1 across the call regardless of what
         // prior ops are still in flight.
@@ -9768,6 +9838,14 @@ mod tests {
         engine
             .fill_rect_batch(&mut store, &mut platform, id, red, &rects)
             .expect("fill_rect_batch");
+
+        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        engine
+            .flush_submit_group(
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush before count assertion");
 
         let after = engine
             .inner
@@ -10291,7 +10369,10 @@ mod tests {
         // Drain any CBs buffered by create_pixmap (e.g. layout transitions).
         // With cap=16 the group may be open but not yet submitted.
         engine
-            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SyncBoundary)
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
             .expect("setup flush");
         assert!(!p.submit_group_is_open(), "setup drained");
 
@@ -10313,7 +10394,10 @@ mod tests {
             .expect("fill src");
         // Drain the fill CB before the batch assertions below.
         engine
-            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SyncBoundary)
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
             .expect("pre-composite flush");
         assert!(!p.submit_group_is_open(), "pre-composite drained");
 
@@ -10357,7 +10441,10 @@ mod tests {
 
         // Explicit flush — drains the group atomically.
         engine
-            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SceneCompose)
+            .flush_submit_group(
+                &mut p,
+                super::super::submit_group::FlushReason::SceneCompose,
+            )
             .expect("flush ok");
         assert_eq!(p.submit_group_size(), 0, "group drained");
         assert!(!p.submit_group_is_open(), "group closed");
