@@ -2663,6 +2663,54 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         yoga (sgm=18, 20, 25, 26 in peak rows) — confirmed
         platform-independent.
 
+    **2026-05-23 fuji Phase A capture** (Intel ANV / Mesa
+    `driver_id=INTEL_OPEN_SOURCE_MESA`, `connector=eDP-1` at
+    1920x1080, MATE drag, same Phase A branch `189e8dd`; 34
+    one-second buckets; clean Ctrl-Alt-Bsp zap shutdown). Third
+    green analogue platform alongside yoga + iMac:
+      - `queue_submit2/s` avg 1350 peak 1802 (well below bee
+        post-T6.1 peak 3304; squarely in the spec's Phase A
+        target band of 900-1500 on average, slightly above on
+        peaks).
+      - `paint_submits/s` avg 1284 peak 1719.
+      - `submit_group_size_avg` avg 5.61 peak 6.75 (between
+        yoga's 6.0-7.5 and iMac's 9-10.6 — Intel sits in the
+        middle).
+      - `submit_group_flushes/s` avg 276 peak 391.
+      - Flush-reason split: `present_completion_signal/s` avg
+        107 peak 149 (dominant, COW PRESENTs), `pageflip_retire/s`
+        58, `scene_compose/s` 58, `max_size/s` avg 46 peak 65
+        (**17% of all flushes** — between yoga's ~20% and iMac's
+        50-55%, so cap=16 is fine on Intel), `sync_boundary/s`
+        avg 7 peak 120 (bursty get_image), `shutdown/s` 0.
+      - `submit_group_aborts/s` = 0 throughout; no panics, no
+        `renderer_failed`.
+      - `active_descriptor_pool_count_high_water` = 2 (no ring
+        pressure). `active_staging_bytes_high_water` avg 7.6 MB
+        peak 8.3 MB (smaller envelope than yoga's 21.7 MB —
+        Intel is the lightest of the three on retention).
+      - `composite_submits/s` = `frame_present_count/s` = 58,
+        `missed_pageflips/s` = 0 across all buckets — display
+        path solid at 60 Hz.
+      - `cpu_fence_wait_ns/s` avg 96 ms with a single 3.2 s peak
+        bucket (`cpu_fence_wait_count/s` peak = 2 so it's one
+        get_image burst spanning a bucket boundary, not a hot-
+        loop wait).
+      - Histogram healthy across all six buckets; size-1 still
+        ~31% (cap=1 forced flushes — sync_boundary + the per-op
+        get_image / cow with attached completion paths), size-
+        13+ consistently populated → cap actually doing work.
+      - Same `submit_group_size_max_in_window > cap` anomaly
+        (sgm=17, 21, 24, 28, 36 in peak rows). Now reproduced
+        on yoga + iMac + fuji — fully platform-independent
+        telemetry-or-cap-check bug; worth filing as a real
+        defect rather than rounding.
+      - **Triangulation update:** bee freeze now has *three*
+        green analogues on the same `189e8dd` commit — yoga
+        (Adreno/Turnip), iMac (Polaris/GCN4/RADV), fuji
+        (Intel/ANV). The remaining shared variable between green
+        and frozen is RDNA2 RADV path × Arch Mesa-current.
+
     **2026-05-23 bee MATE-load freeze (UNRESOLVED, blocks Phase A
     T15 close):** with full Phase A in tree at `189e8dd`, yserver
     loads MATE and then freezes on bee (Ryzen 9 6900HX / RDNA2,
