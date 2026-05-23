@@ -464,9 +464,21 @@ pub fn run_core(
                     }
                 }
                 PRESENT_COMPLETION_TOKEN => {
-                    log::trace!(
-                        "core loop: PresentCompletion fd ready (drain wiring lands in Task 11)"
-                    );
+                    let completed = backend.drain_completed_present_events();
+                    for entry in completed {
+                        if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake
+                            && idle_fence_xid != 0
+                            && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
+                        {
+                            f.triggered = true;
+                        }
+                        // Wake-signal already fired inside the backend's drain via
+                        // the Arc-pinned handle; we only do X11-side event fan-out
+                        // here.
+                        crate::core_loop::process_request::fire_present_completion_events(
+                            state, &entry,
+                        );
+                    }
                 }
                 tok if let Some(client_id) = token_to_client(tok) => {
                     // I3: WRITABLE-readiness on a client writer fd.
