@@ -3478,8 +3478,10 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     // skip the step gracefully if fontconfig can't find it in this
     // environment (the step is exercised opportunistically).
     let font_set = if let Ok((font_handle, _metrics)) = b.open_font(None, "fixed") {
-        let mut ds = DrawState::default();
-        ds.font = Some(font_handle);
+        let ds = DrawState {
+            font: Some(font_handle),
+            ..DrawState::default()
+        };
         b.apply_draw_state(None, &ds).expect("apply_draw_state");
         // image_text8 body: 8 bytes of header (drawable+gc, unused here)
         // + x(2,LE) + y(2,LE) + text bytes.
