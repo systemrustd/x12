@@ -375,7 +375,7 @@ submit_group: SubmitGroup::new(),
 ```
 
 Also add the `FlushOutcome` type with its **full** shape from the
-start. Task 11 only wires the deferred-queue drain that bumps
+start. Task 3.5 only wires the deferred-queue drain that bumps
 telemetry; landing all three fields here keeps the platform body
 coherent across tasks (Codex round-4 finding: piecemeal extension
 breaks the platform return paths):
@@ -383,7 +383,7 @@ breaks the platform return paths):
 ```rust
 /// Phase A: result of a `flush_submit_group` call. Same shape on
 /// both Ok and Err paths; the `aborted` flag distinguishes them.
-/// Task 11 hooks the deferred-queue drain that consumes this.
+/// Task 3.5 hooks the deferred-queue drain that consumes this.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FlushOutcome {
     pub(crate) flushed_entries: usize,
@@ -674,7 +674,7 @@ pub(crate) fn flush_submit_group(
     // Drain the platform's last_flush_outcome regardless of Ok/Err
     // — both branches in platform's flush_submit_group populate it
     // before returning. The engine queues it for backend telemetry
-    // drain (Task 11 wires that side).
+    // drain (Task 3.5 wires that side).
     if let Some(outcome) = platform.take_last_flush_outcome() {
         if let Some(inner) = self.inner.as_mut() {
             inner.pending_flush_outcomes.push(outcome);
@@ -708,7 +708,7 @@ pub(crate) fn flush_submit_group(
 
 (`FlushOutcome` is the full type defined in Task 2 — all three
 fields land at once so this wrapper signature is stable across
-Tasks 2-11. Task 11 wires `pending_flush_outcomes` →
+Tasks 2 and 3.5. Task 3.5 wires `pending_flush_outcomes` →
 `Telemetry::record_submit_group_*`. Add the field now:
 
 ```rust
@@ -1242,6 +1242,418 @@ the assertion.
 ```bash
 git add crates/yserver/src/kms/v2/engine.rs crates/yserver/src/kms/v2/platform.rs crates/yserver/src/kms/v2/submit_group.rs crates/yserver/src/kms/vk/call_stats.rs
 git commit -m "feat(v2): switch paint submits to shared-ticket SubmitGroup append (max_size=1)"
+```
+
+---
+
+### Task 3.5: Telemetry counters — group size + flush-reason histogram
+
+**Files:**
+- Modify: `crates/yserver/src/kms/v2/telemetry.rs`
+- Modify: `crates/yserver/src/kms/v2/platform.rs:flush_submit_group`
+  (emit counters)
+- Modify: `crates/yserver/src/kms/v2/backend.rs:maybe_composite`
+  (advance the active-resource gauges)
+
+**Why land telemetry here (between the atomic switch and the
+behavior-changing tasks).** After Task 3 the SubmitGroup wrapper is
+live at `max_size=1` — bit-identical to today's per-op submit
+cadence, every flush has size=1 + reason=`MaxSize`. With telemetry
+wired now, Tasks 4-11 each become individually observable on bee:
+T4 lands and `SceneCompose` reason appears, T5 adds `SyncBoundary`,
+T6 adds `PresentCompletionSignal`, T7 adds `PageflipRetire`, and
+the size histogram shifts from `[N,0,0,0,0,0]` toward the multi-CB
+distribution. Task 3.6 then captures a wrapper-only HW baseline
+before any behavior changes start.
+
+Spec § "Phase A telemetry" lists the counters. We add:
+- `submit_group_size_max` / `submit_group_size_total` /
+  `submit_group_flushes` (avg = total / flushes)
+- `submit_group_flush_reason_{sync_boundary,present_completion_signal,
+   scene_compose,pageflip_retire,max_size,shutdown}` (lifetime
+   counters)
+- `submit_group_aborts` (lifetime, bumped when `flush_submit_group`
+  returns Err)
+- Histogram: 6 buckets — [1,2,4,8,12,16+] — stored as `[u64; 6]`
+- `active_descriptor_pool_count` (gauge sampled per second)
+- `active_staging_bytes` / `active_scratch_bytes` (gauge, sum across
+  in-flight SubmittedOps' `staging.size + scratch.size` — sampled
+  per second)
+
+- [ ] **Step 1: Extend the `Bucket` struct**
+
+In `telemetry.rs`, add to `Bucket`:
+
+```rust
+pub(crate) submit_group_flushes: u64,
+pub(crate) submit_group_aborts: u64,
+pub(crate) submit_group_size_max_in_window: u64,
+pub(crate) submit_group_size_total: u64,
+pub(crate) submit_group_hist: [u64; 6], // [1,2,4,8,12,16+]
+pub(crate) submit_group_flush_reason_sync_boundary: u64,
+pub(crate) submit_group_flush_reason_present_completion_signal: u64,
+pub(crate) submit_group_flush_reason_scene_compose: u64,
+pub(crate) submit_group_flush_reason_pageflip_retire: u64,
+pub(crate) submit_group_flush_reason_max_size: u64,
+pub(crate) submit_group_flush_reason_shutdown: u64,
+pub(crate) active_descriptor_pool_count_high_water: u64,
+pub(crate) active_staging_bytes_high_water: u64,
+pub(crate) active_scratch_bytes_high_water: u64,
+```
+
+(Mirror in `lifetime` — same fields exist on both `bucket` and
+`lifetime`.)
+
+- [ ] **Step 2: Add the recording sites**
+
+In `telemetry.rs`, append to the `// ── Counter sites ─` block:
+
+```rust
+pub(crate) fn record_submit_group_flush(
+    &mut self,
+    size: usize,
+    reason: super::submit_group::FlushReason,
+) {
+    let s = u64::try_from(size).unwrap_or(u64::MAX);
+    self.bucket.submit_group_flushes += 1;
+    self.lifetime.submit_group_flushes += 1;
+    self.bucket.submit_group_size_total += s;
+    self.lifetime.submit_group_size_total += s;
+    if s > self.bucket.submit_group_size_max_in_window {
+        self.bucket.submit_group_size_max_in_window = s;
+    }
+    if s > self.lifetime.submit_group_size_max_in_window {
+        self.lifetime.submit_group_size_max_in_window = s;
+    }
+    let bucket_idx = match size {
+        0 | 1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=12 => 4,
+        _ => 5,
+    };
+    self.bucket.submit_group_hist[bucket_idx] += 1;
+    self.lifetime.submit_group_hist[bucket_idx] += 1;
+    use super::submit_group::FlushReason as R;
+    let (b, l) = match reason {
+        R::SyncBoundary => (
+            &mut self.bucket.submit_group_flush_reason_sync_boundary,
+            &mut self.lifetime.submit_group_flush_reason_sync_boundary,
+        ),
+        R::PresentCompletionSignal => (
+            &mut self.bucket.submit_group_flush_reason_present_completion_signal,
+            &mut self.lifetime.submit_group_flush_reason_present_completion_signal,
+        ),
+        R::SceneCompose => (
+            &mut self.bucket.submit_group_flush_reason_scene_compose,
+            &mut self.lifetime.submit_group_flush_reason_scene_compose,
+        ),
+        R::PageflipRetire => (
+            &mut self.bucket.submit_group_flush_reason_pageflip_retire,
+            &mut self.lifetime.submit_group_flush_reason_pageflip_retire,
+        ),
+        R::MaxSize => (
+            &mut self.bucket.submit_group_flush_reason_max_size,
+            &mut self.lifetime.submit_group_flush_reason_max_size,
+        ),
+        R::Shutdown => (
+            &mut self.bucket.submit_group_flush_reason_shutdown,
+            &mut self.lifetime.submit_group_flush_reason_shutdown,
+        ),
+    };
+    *b += 1;
+    *l += 1;
+}
+
+pub(crate) fn record_submit_group_abort(&mut self) {
+    self.bucket.submit_group_aborts += 1;
+    self.lifetime.submit_group_aborts += 1;
+}
+
+pub(crate) fn record_active_descriptor_pool_high_water(&mut self, n: u64) {
+    if n > self.bucket.active_descriptor_pool_count_high_water {
+        self.bucket.active_descriptor_pool_count_high_water = n;
+    }
+    if n > self.lifetime.active_descriptor_pool_count_high_water {
+        self.lifetime.active_descriptor_pool_count_high_water = n;
+    }
+}
+
+pub(crate) fn record_active_staging_high_water(&mut self, bytes: u64) {
+    if bytes > self.bucket.active_staging_bytes_high_water {
+        self.bucket.active_staging_bytes_high_water = bytes;
+    }
+    if bytes > self.lifetime.active_staging_bytes_high_water {
+        self.lifetime.active_staging_bytes_high_water = bytes;
+    }
+}
+
+pub(crate) fn record_active_scratch_high_water(&mut self, bytes: u64) {
+    if bytes > self.bucket.active_scratch_bytes_high_water {
+        self.bucket.active_scratch_bytes_high_water = bytes;
+    }
+    if bytes > self.lifetime.active_scratch_bytes_high_water {
+        self.lifetime.active_scratch_bytes_high_water = bytes;
+    }
+}
+```
+
+- [ ] **Step 3: Extend the per-second log emitter**
+
+In `maybe_emit`'s `log::info!` call (around lines 211-255), append
+to the format string and arguments:
+
+```text
+ submit_group_flushes/s={} submit_group_aborts/s={} \
+ submit_group_size_avg={:.2} submit_group_size_max_in_window={} \
+ submit_group_hist={:?} \
+ submit_group_flush_reason_sync_boundary/s={} \
+ submit_group_flush_reason_present_completion_signal/s={} \
+ submit_group_flush_reason_scene_compose/s={} \
+ submit_group_flush_reason_pageflip_retire/s={} \
+ submit_group_flush_reason_max_size/s={} \
+ submit_group_flush_reason_shutdown/s={} \
+ active_descriptor_pool_count_high_water={} \
+ active_staging_bytes_high_water={} \
+ active_scratch_bytes_high_water={}
+```
+
+With the avg computed as:
+
+```rust
+let group_avg = if b.submit_group_flushes > 0 {
+    #[allow(clippy::cast_precision_loss)]
+    (b.submit_group_size_total as f64 / b.submit_group_flushes as f64)
+} else {
+    0.0
+};
+```
+
+And `b.submit_group_hist` formatted via `{:?}`.
+
+- [ ] **Step 4: Wire emission sites via deferred-queue (engine has no telemetry borrow)**
+
+The `FlushOutcome` type + `last_flush_outcome` stash on
+`PlatformBackend` + `pending_flush_outcomes` queue on
+`RenderEngineInner` already landed in Tasks 2 and 3 (round-4
+fix: type lands once with its final shape). This step only adds
+the drain API + wires backend telemetry consumption.
+
+Add `RenderEngine::drain_flush_outcomes`:
+
+```rust
+pub(crate) fn drain_flush_outcomes(
+    &mut self,
+) -> Vec<super::platform::FlushOutcome> {
+    self.inner
+        .as_mut()
+        .map(|i| std::mem::take(&mut i.pending_flush_outcomes))
+        .unwrap_or_default()
+}
+```
+
+Backend drains the queue + bumps telemetry once per tick. In
+`backend.rs::maybe_composite`, alongside the existing
+`drain_cow_telemetry()` / `drain_render_telemetry()` calls (~line
+4481):
+
+```rust
+for outcome in self.engine.drain_flush_outcomes() {
+    if outcome.aborted {
+        self.telemetry.record_submit_group_abort();
+    } else {
+        self.telemetry.record_submit_group_flush(
+            outcome.flushed_entries,
+            outcome.reason,
+        );
+    }
+}
+```
+
+No engine method takes `&mut Telemetry`; ownership stays with
+backend. The deferred queue closes the gap.
+
+In `backend.rs::maybe_composite`, ONCE per second (gate on
+`telemetry.maybe_emit` window — easiest: sample on every tick, the
+high-water aggregator handles bursts):
+
+```rust
+// Phase A telemetry retention gauges.
+let pool_count = u64::try_from(self.engine.descriptor_pool_ring_pool_count()).unwrap_or(u64::MAX);
+self.telemetry.record_active_descriptor_pool_high_water(pool_count);
+let (staging_bytes, scratch_bytes) = self.engine.active_resource_bytes();
+self.telemetry.record_active_staging_high_water(staging_bytes);
+self.telemetry.record_active_scratch_high_water(scratch_bytes);
+```
+
+Add `active_resource_bytes` to `RenderEngine` (production telemetry,
+no `_for_tests` suffix). Codex round-5 finding 3: sum BOTH
+`inner.submitted` AND `inner.pending_group_ops` — parked ops hold
+the same staging/scratch lifetime as in-flight ones, and they're
+part of the Phase A retention pressure we want to measure:
+
+```rust
+pub(crate) fn active_resource_bytes(&self) -> (u64, u64) {
+    let Some(inner) = self.inner.as_ref() else { return (0, 0); };
+    let staging_submitted: u64 = inner
+        .submitted
+        .iter()
+        .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
+        .sum();
+    let staging_parked: u64 = inner
+        .pending_group_ops
+        .iter()
+        .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
+        .sum();
+    let scratch_submitted: u64 = inner
+        .submitted
+        .iter()
+        .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+        .sum();
+    let scratch_parked: u64 = inner
+        .pending_group_ops
+        .iter()
+        .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+        .sum();
+    (staging_submitted + staging_parked, scratch_submitted + scratch_parked)
+}
+```
+
+(Add `size_bytes()` to `ScratchImage` if missing — compute from
+its image extent + format at construction time and store.)
+
+- [ ] **Step 5: Run the v2 suite — expect PASS**
+
+```bash
+cargo test -p yserver kms::v2:: -- --nocapture
+cargo test -p yserver --test v2_acceptance -- --ignored --nocapture
+```
+
+Expected: PASS. Add a logic unit test for the histogram bucketing:
+
+```rust
+#[test]
+fn telemetry_submit_group_hist_buckets_correctly() {
+    let mut t = Telemetry::new();
+    use crate::kms::v2::submit_group::FlushReason;
+    for size in [1, 2, 4, 8, 12, 16, 32] {
+        t.record_submit_group_flush(size, FlushReason::SceneCompose);
+    }
+    assert_eq!(t.lifetime.submit_group_hist[0], 1); // 1
+    assert_eq!(t.lifetime.submit_group_hist[1], 1); // 2
+    assert_eq!(t.lifetime.submit_group_hist[2], 1); // 4
+    assert_eq!(t.lifetime.submit_group_hist[3], 1); // 8
+    assert_eq!(t.lifetime.submit_group_hist[4], 1); // 12
+    assert_eq!(t.lifetime.submit_group_hist[5], 2); // 16, 32
+}
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/yserver/src/kms/v2/telemetry.rs crates/yserver/src/kms/v2/platform.rs crates/yserver/src/kms/v2/engine.rs crates/yserver/src/kms/v2/backend.rs
+git commit -m "feat(v2): telemetry for SubmitGroup size, flush reasons, retention high-water"
+```
+
+---
+
+### Task 3.6: Bee HW wrapper-overhead baseline (cap=1, no behavior changes)
+
+**Files:**
+- Test recipe: existing `just yserver-mate-hw-telemetry` (no Justfile
+  changes).
+- Update: `docs/status.md` (append a baseline capture entry).
+
+This task is a hardware gate; sandbox cannot acquire DRM master.
+The user drives the recipe; the agent triages the resulting
+telemetry log. (Per user feedback: don't offer to run *-hw recipes
+myself — `bee` repros are user-driven, I analyze.)
+
+The intermediate state at end-of-T3.5 is "shared-ticket +
+append-only with `max_size=1`, telemetry counters wired." All
+flushes are size=1, reason=`MaxSize`. This capture:
+
+- **Pins the wrapper-overhead cost.** `queue_submit2/s` should be
+  approximately the pre-Phase-A baseline (~3304 peak). The cap=1
+  auto-flush path executes `vkQueueSubmit2` once per paint op,
+  same as today — but it now goes through the SubmitGroup
+  buffer + drain machinery. If `queue_submit2/s` regresses by
+  > 15 % vs the 3304 baseline, the wrapper's per-call overhead
+  is load-bearing and needs investigation before bumping the
+  cap in T4.
+- **Establishes a counter-equipped baseline** for per-task
+  comparison across T4-T11.
+- **Validates the telemetry plumbing under real load** — no
+  panics, no NaN avg, histogram bucketing sane, deferred-queue
+  drain in `maybe_composite` doesn't starve.
+
+- [ ] **Step 1: Brief the user with the gate**
+
+Print to the conversation:
+
+> Phase A telemetry has landed at `max_size=1` — no behavior
+> changes yet. The SubmitGroup wrapper executes one CB per submit,
+> same cadence as pre-Phase-A. Please run
+> `just yserver-mate-hw-telemetry` on bee for a 30-second MATE drag
+> session, then share `yserver-hw-mate.log`. This pins the
+> wrapper-overhead baseline before the cap bumps in T4.
+
+- [ ] **Step 2: Parse the per-second telemetry lines**
+
+Expected shape at cap=1:
+- `queue_submit2/s` peak ~ 2800-3500 (within ~15 % of the
+  pre-Phase-A 3304 baseline; wrapper is bit-identical in cadence).
+- `submit_group_flushes/s` ≈ `queue_submit2/s` (one flush per
+  submit at cap=1).
+- `submit_group_size_avg` ≈ 1.0.
+- `submit_group_size_max_in_window` = 1.
+- `submit_group_hist` ≈ `[N, 0, 0, 0, 0, 0]` (all flushes land in
+  the size-1 bucket).
+- `submit_group_flush_reason_max_size/s` ≈
+  `submit_group_flushes/s` (every flush is cap-driven; no
+  trigger-based flushes wired yet).
+- `submit_group_flush_reason_{sync_boundary,present_completion_signal,scene_compose,pageflip_retire,shutdown}/s`
+  = 0 (those triggers land in T4-T7, plus shutdown which only
+  fires on `drain_all` at exit).
+- `submit_group_aborts/s` = 0.
+- `active_descriptor_pool_count_high_water` ≤ pre-Phase-A
+  baseline (cap=1 means one CB in flight per group, identical
+  retention envelope to today).
+- `active_staging_bytes_high_water` / `active_scratch_bytes_high_water`
+  ≤ pre-Phase-A retention.
+
+**Stop-and-investigate conditions** (do NOT proceed to T4 if):
+- `queue_submit2/s` is > 3800 (> 15 % regression — wrapper is
+  adding per-call latency).
+- `submit_group_aborts/s` > 0 (any abort means the platform's
+  `queue_submit2` is returning Err on bee; this didn't happen
+  pre-Phase-A so it would be a wrapper-induced bug).
+- `active_descriptor_pool_count_high_water` > pre-Phase-A
+  retention + 10 % (cap=1 should NOT pressure the ring).
+
+- [ ] **Step 3: Append a baseline entry to `docs/status.md`**
+
+Under "Followup filed: submit-rate reduction on bee", append a
+bullet:
+
+```text
+- 2026-05-XX bee wrapper-overhead baseline (cap=1, Phase A T3.5
+  + T3.6 landed): queue_submit2/s peak <N>, submit_group_size_avg
+  1.0, all flushes via MaxSize reason. Wrapper machinery itself
+  adds <X> % overhead vs the 3304 pre-Phase-A baseline; <within
+  envelope | needs investigation>. Proceeding to T4 (cap=16 +
+  scene-compose flush).
+```
+
+If the wrapper-overhead is > 15 %, halt and re-open the spec's
+"Phase A open questions" before continuing.
+
+- [ ] **Step 4: Commit the status update**
+
+```bash
+git add docs/status.md
+git commit -m "docs(status): bee 2026-05-XX cap=1 wrapper-overhead baseline"
 ```
 
 ---
@@ -2143,313 +2555,6 @@ git commit -m "test(v2): submit failure drops parked ops, short-circuits subsequ
 
 ---
 
-### Task 11: Telemetry counters — group size + flush-reason histogram
-
-**Files:**
-- Modify: `crates/yserver/src/kms/v2/telemetry.rs`
-- Modify: `crates/yserver/src/kms/v2/platform.rs:flush_submit_group`
-  (emit counters)
-- Modify: `crates/yserver/src/kms/v2/backend.rs:maybe_composite`
-  (advance the active-resource gauges)
-
-Spec § "Phase A telemetry" lists the counters. We add:
-- `submit_group_size_max` / `submit_group_size_total` /
-  `submit_group_flushes` (avg = total / flushes)
-- `submit_group_flush_reason_{sync_boundary,present_completion_signal,
-   scene_compose,pageflip_retire,max_size,shutdown}` (lifetime
-   counters)
-- `submit_group_aborts` (lifetime, bumped when `flush_submit_group`
-  returns Err)
-- Histogram: 6 buckets — [1,2,4,8,12,16+] — stored as `[u64; 6]`
-- `active_descriptor_pool_count` (gauge sampled per second)
-- `active_staging_bytes` / `active_scratch_bytes` (gauge, sum across
-  in-flight SubmittedOps' `staging.size + scratch.size` — sampled
-  per second)
-
-- [ ] **Step 1: Extend the `Bucket` struct**
-
-In `telemetry.rs`, add to `Bucket`:
-
-```rust
-pub(crate) submit_group_flushes: u64,
-pub(crate) submit_group_aborts: u64,
-pub(crate) submit_group_size_max_in_window: u64,
-pub(crate) submit_group_size_total: u64,
-pub(crate) submit_group_hist: [u64; 6], // [1,2,4,8,12,16+]
-pub(crate) submit_group_flush_reason_sync_boundary: u64,
-pub(crate) submit_group_flush_reason_present_completion_signal: u64,
-pub(crate) submit_group_flush_reason_scene_compose: u64,
-pub(crate) submit_group_flush_reason_pageflip_retire: u64,
-pub(crate) submit_group_flush_reason_max_size: u64,
-pub(crate) submit_group_flush_reason_shutdown: u64,
-pub(crate) active_descriptor_pool_count_high_water: u64,
-pub(crate) active_staging_bytes_high_water: u64,
-pub(crate) active_scratch_bytes_high_water: u64,
-```
-
-(Mirror in `lifetime` — same fields exist on both `bucket` and
-`lifetime`.)
-
-- [ ] **Step 2: Add the recording sites**
-
-In `telemetry.rs`, append to the `// ── Counter sites ─` block:
-
-```rust
-pub(crate) fn record_submit_group_flush(
-    &mut self,
-    size: usize,
-    reason: super::submit_group::FlushReason,
-) {
-    let s = u64::try_from(size).unwrap_or(u64::MAX);
-    self.bucket.submit_group_flushes += 1;
-    self.lifetime.submit_group_flushes += 1;
-    self.bucket.submit_group_size_total += s;
-    self.lifetime.submit_group_size_total += s;
-    if s > self.bucket.submit_group_size_max_in_window {
-        self.bucket.submit_group_size_max_in_window = s;
-    }
-    if s > self.lifetime.submit_group_size_max_in_window {
-        self.lifetime.submit_group_size_max_in_window = s;
-    }
-    let bucket_idx = match size {
-        0 | 1 => 0,
-        2 => 1,
-        3..=4 => 2,
-        5..=8 => 3,
-        9..=12 => 4,
-        _ => 5,
-    };
-    self.bucket.submit_group_hist[bucket_idx] += 1;
-    self.lifetime.submit_group_hist[bucket_idx] += 1;
-    use super::submit_group::FlushReason as R;
-    let (b, l) = match reason {
-        R::SyncBoundary => (
-            &mut self.bucket.submit_group_flush_reason_sync_boundary,
-            &mut self.lifetime.submit_group_flush_reason_sync_boundary,
-        ),
-        R::PresentCompletionSignal => (
-            &mut self.bucket.submit_group_flush_reason_present_completion_signal,
-            &mut self.lifetime.submit_group_flush_reason_present_completion_signal,
-        ),
-        R::SceneCompose => (
-            &mut self.bucket.submit_group_flush_reason_scene_compose,
-            &mut self.lifetime.submit_group_flush_reason_scene_compose,
-        ),
-        R::PageflipRetire => (
-            &mut self.bucket.submit_group_flush_reason_pageflip_retire,
-            &mut self.lifetime.submit_group_flush_reason_pageflip_retire,
-        ),
-        R::MaxSize => (
-            &mut self.bucket.submit_group_flush_reason_max_size,
-            &mut self.lifetime.submit_group_flush_reason_max_size,
-        ),
-        R::Shutdown => (
-            &mut self.bucket.submit_group_flush_reason_shutdown,
-            &mut self.lifetime.submit_group_flush_reason_shutdown,
-        ),
-    };
-    *b += 1;
-    *l += 1;
-}
-
-pub(crate) fn record_submit_group_abort(&mut self) {
-    self.bucket.submit_group_aborts += 1;
-    self.lifetime.submit_group_aborts += 1;
-}
-
-pub(crate) fn record_active_descriptor_pool_high_water(&mut self, n: u64) {
-    if n > self.bucket.active_descriptor_pool_count_high_water {
-        self.bucket.active_descriptor_pool_count_high_water = n;
-    }
-    if n > self.lifetime.active_descriptor_pool_count_high_water {
-        self.lifetime.active_descriptor_pool_count_high_water = n;
-    }
-}
-
-pub(crate) fn record_active_staging_high_water(&mut self, bytes: u64) {
-    if bytes > self.bucket.active_staging_bytes_high_water {
-        self.bucket.active_staging_bytes_high_water = bytes;
-    }
-    if bytes > self.lifetime.active_staging_bytes_high_water {
-        self.lifetime.active_staging_bytes_high_water = bytes;
-    }
-}
-
-pub(crate) fn record_active_scratch_high_water(&mut self, bytes: u64) {
-    if bytes > self.bucket.active_scratch_bytes_high_water {
-        self.bucket.active_scratch_bytes_high_water = bytes;
-    }
-    if bytes > self.lifetime.active_scratch_bytes_high_water {
-        self.lifetime.active_scratch_bytes_high_water = bytes;
-    }
-}
-```
-
-- [ ] **Step 3: Extend the per-second log emitter**
-
-In `maybe_emit`'s `log::info!` call (around lines 211-255), append
-to the format string and arguments:
-
-```text
- submit_group_flushes/s={} submit_group_aborts/s={} \
- submit_group_size_avg={:.2} submit_group_size_max_in_window={} \
- submit_group_hist={:?} \
- submit_group_flush_reason_sync_boundary/s={} \
- submit_group_flush_reason_present_completion_signal/s={} \
- submit_group_flush_reason_scene_compose/s={} \
- submit_group_flush_reason_pageflip_retire/s={} \
- submit_group_flush_reason_max_size/s={} \
- submit_group_flush_reason_shutdown/s={} \
- active_descriptor_pool_count_high_water={} \
- active_staging_bytes_high_water={} \
- active_scratch_bytes_high_water={}
-```
-
-With the avg computed as:
-
-```rust
-let group_avg = if b.submit_group_flushes > 0 {
-    #[allow(clippy::cast_precision_loss)]
-    (b.submit_group_size_total as f64 / b.submit_group_flushes as f64)
-} else {
-    0.0
-};
-```
-
-And `b.submit_group_hist` formatted via `{:?}`.
-
-- [ ] **Step 4: Wire emission sites via deferred-queue (engine has no telemetry borrow)**
-
-The `FlushOutcome` type + `last_flush_outcome` stash on
-`PlatformBackend` + `pending_flush_outcomes` queue on
-`RenderEngineInner` already landed in Tasks 2 and 3 (round-4
-fix: type lands once with its final shape). This step only adds
-the drain API + wires backend telemetry consumption.
-
-Add `RenderEngine::drain_flush_outcomes`:
-
-```rust
-pub(crate) fn drain_flush_outcomes(
-    &mut self,
-) -> Vec<super::platform::FlushOutcome> {
-    self.inner
-        .as_mut()
-        .map(|i| std::mem::take(&mut i.pending_flush_outcomes))
-        .unwrap_or_default()
-}
-```
-
-Backend drains the queue + bumps telemetry once per tick. In
-`backend.rs::maybe_composite`, alongside the existing
-`drain_cow_telemetry()` / `drain_render_telemetry()` calls (~line
-4481):
-
-```rust
-for outcome in self.engine.drain_flush_outcomes() {
-    if outcome.aborted {
-        self.telemetry.record_submit_group_abort();
-    } else {
-        self.telemetry.record_submit_group_flush(
-            outcome.flushed_entries,
-            outcome.reason,
-        );
-    }
-}
-```
-
-No engine method takes `&mut Telemetry`; ownership stays with
-backend. The deferred queue closes the gap.
-
-In `backend.rs::maybe_composite`, ONCE per second (gate on
-`telemetry.maybe_emit` window — easiest: sample on every tick, the
-high-water aggregator handles bursts):
-
-```rust
-// Phase A telemetry retention gauges.
-let pool_count = u64::try_from(self.engine.descriptor_pool_ring_pool_count()).unwrap_or(u64::MAX);
-self.telemetry.record_active_descriptor_pool_high_water(pool_count);
-let (staging_bytes, scratch_bytes) = self.engine.active_resource_bytes();
-self.telemetry.record_active_staging_high_water(staging_bytes);
-self.telemetry.record_active_scratch_high_water(scratch_bytes);
-```
-
-Add `active_resource_bytes` to `RenderEngine` (production telemetry,
-no `_for_tests` suffix). Codex round-5 finding 3: sum BOTH
-`inner.submitted` AND `inner.pending_group_ops` — parked ops hold
-the same staging/scratch lifetime as in-flight ones, and they're
-part of the Phase A retention pressure we want to measure:
-
-```rust
-pub(crate) fn active_resource_bytes(&self) -> (u64, u64) {
-    let Some(inner) = self.inner.as_ref() else { return (0, 0); };
-    let sum_staging = |it: &dyn Iterator<Item = &SubmittedOp>| -> u64 {
-        // Workaround: closure can't take a trait object as state;
-        // inline the iter below instead.
-        0
-    };
-    let _ = sum_staging;
-    let staging_submitted: u64 = inner
-        .submitted
-        .iter()
-        .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
-        .sum();
-    let staging_parked: u64 = inner
-        .pending_group_ops
-        .iter()
-        .map(|op| op.staging.as_ref().map_or(0, |s| s.size))
-        .sum();
-    let scratch_submitted: u64 = inner
-        .submitted
-        .iter()
-        .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
-        .sum();
-    let scratch_parked: u64 = inner
-        .pending_group_ops
-        .iter()
-        .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
-        .sum();
-    (staging_submitted + staging_parked, scratch_submitted + scratch_parked)
-}
-```
-
-(Add `size_bytes()` to `ScratchImage` if missing — compute from
-its image extent + format at construction time and store.)
-
-- [ ] **Step 5: Run the v2 suite — expect PASS**
-
-```bash
-cargo test -p yserver kms::v2:: -- --nocapture
-cargo test -p yserver --test v2_acceptance -- --ignored --nocapture
-```
-
-Expected: PASS. Add a logic unit test for the histogram bucketing:
-
-```rust
-#[test]
-fn telemetry_submit_group_hist_buckets_correctly() {
-    let mut t = Telemetry::new();
-    use crate::kms::v2::submit_group::FlushReason;
-    for size in [1, 2, 4, 8, 12, 16, 32] {
-        t.record_submit_group_flush(size, FlushReason::SceneCompose);
-    }
-    assert_eq!(t.lifetime.submit_group_hist[0], 1); // 1
-    assert_eq!(t.lifetime.submit_group_hist[1], 1); // 2
-    assert_eq!(t.lifetime.submit_group_hist[2], 1); // 4
-    assert_eq!(t.lifetime.submit_group_hist[3], 1); // 8
-    assert_eq!(t.lifetime.submit_group_hist[4], 1); // 12
-    assert_eq!(t.lifetime.submit_group_hist[5], 2); // 16, 32
-}
-```
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/yserver/src/kms/v2/telemetry.rs crates/yserver/src/kms/v2/platform.rs crates/yserver/src/kms/v2/engine.rs crates/yserver/src/kms/v2/backend.rs
-git commit -m "feat(v2): telemetry for SubmitGroup size, flush reasons, retention high-water"
-```
-
----
-
 ### Task 12: Mixed-sequence smoke test
 
 **Files:**
@@ -2716,8 +2821,14 @@ average):
 - `active_descriptor_pool_count_high_water` — expect ≤ prior baseline
   + small headroom
 
-Compare against the pre-Phase-A baseline in `status.md` § "2026-05-23
-bee hardware close" (peak `queue_submit2/s = 3304`).
+Compare against BOTH baselines now on record:
+- The pre-Phase-A baseline (peak `queue_submit2/s = 3304`) in
+  `status.md` § "2026-05-23 bee hardware close" — measures the
+  whole-Phase-A win (wrapper-overhead + behavior changes
+  combined).
+- The Task 3.6 wrapper-only baseline (cap=1) — isolates the
+  win attributable to behavior changes (cap bump + the four
+  flush triggers) by netting out wrapper-overhead.
 
 - [ ] **Step 3: Update `docs/status.md` with the post-Phase-A
   capture entry**
@@ -2740,7 +2851,7 @@ git commit -m "docs(status): bee 2026-05-XX post-Phase-A submit-rate capture"
 
 Follow standard PR flow (commit-commands:commit-push-pr or manual
 `gh pr create`). PR body summarises:
-- The 15-task arc + final bee numbers.
+- The 16-task arc (T1, T2, T3, T3.5, T3.6, T4-T10, T12-T15 — T11 slot is empty because telemetry moved up to T3.5) + both bee captures (T3.6 wrapper baseline, T15 final).
 - The Model A1 shared-fence + fatal-on-failure decisions vs the
   spec's enumerated alternatives.
 - Out-of-scope items punted to Phase B per spec (op-list frame
@@ -2767,16 +2878,17 @@ task:
 | Fence ownership Model A1 (shared ticket) | Task 3 |
 | Ordering invariants (cow_batch, render_batch, glyph upload) | Task 9 |
 | Frame-submit error propagation (mutation rollback via `pending_group_ops` deferral) | Task 3 + Task 10 |
-| Phase A telemetry (size histogram, flush_reason counters, retention high-water) | Task 11 |
+| Phase A telemetry (size histogram, flush_reason counters, retention high-water) | Task 3.5 |
 | Phase A acceptance tests (11 spec'd tests) | Tasks 4, 5, 6, 8, 9, 10, 12, 13 |
-| Bee hardware gate | Task 15 |
+| Bee hardware wrapper-overhead baseline (cap=1) | Task 3.6 |
+| Bee hardware post-Phase-A capture | Task 15 |
 
 **Placeholder scan** — no TBD / "fill in later" / "similar to" /
 "add appropriate handling" instances; every code block is complete.
 
 **Type consistency** — `FlushReason` enum is identical across all
 tasks. `FlushOutcome` lands with its full
-`{ flushed_entries, reason, aborted }` shape in Task 2; Task 11
+`{ flushed_entries, reason, aborted }` shape in Task 2; Task 3.5
 only adds the `RenderEngine::drain_flush_outcomes` drain + backend
 telemetry consumption — it does NOT redefine the type.
 
@@ -2785,11 +2897,18 @@ telemetry consumption — it does NOT redefine the type.
   shared-ticket + append-only + engine-driven flush + parked-ops
   rollback. Bisect from Task 3 if anything later regresses.
 - Tasks 4-13 add code that compiles+runs after Task 3.
-- `FlushOutcome`'s shape is stable from Task 2 onward; Task 11
+- Task 3.5 (telemetry) lands BEFORE the behavior-changing tasks so
+  T4-T11 can be observed individually on bee captures. All
+  prerequisite types (`FlushReason`, `FlushOutcome`,
+  `pending_flush_outcomes`, `last_flush_outcome`) land in T1-T3,
+  so T3.5 has no forward dependencies.
+- `FlushOutcome`'s shape is stable from Task 2 onward; Task 3.5
   only wires the drain + telemetry consumption. No signature
   refactor required mid-arc.
-- Task 15 (hw smoke) is the ONLY task the agent cannot self-drive;
-  brief the user.
+- Tasks 3.6 and 15 (hw smoke) are the ONLY tasks the agent cannot
+  self-drive; brief the user. T3.6 pins the wrapper-overhead
+  baseline at cap=1 before any behavior changes; T15 quantifies
+  the post-Phase-A win.
 
 **Codex review fixes applied 2026-05-23 (round 1)**:
 - Task 3 squashed the original Task 3 (ticket source) and Task 4
@@ -2857,13 +2976,13 @@ telemetry consumption — it does NOT redefine the type.
   drop on submit failure — clients waiting on CompleteNotify
   would hang forever even though `renderer_failed` is set.
   (Codex round-3 finding 2.)
-- Task 11 telemetry wiring switched to a **deferred-queue
+- Task 3.5 telemetry wiring switched to a **deferred-queue
   pattern** (`RenderEngine::drain_flush_outcomes`) parallel to
   `cow_flush_records` / `render_flush_records`. Backend drains
   the queue once per `maybe_composite` tick. Engine methods do
   NOT take `&mut Telemetry`; ownership stays with backend.
   (Codex round-3 finding 3: engine had no telemetry borrow.)
-- `FlushOutcome` extended in Task 11 to include `reason` +
+- `FlushOutcome` extended in Task 3.5 to include `reason` +
   `aborted` fields; Task 2's placeholder body updated accordingly.
 - Borrow-factoring note added to Task 3 Step 8 + Task 5 Step 3:
   `inner = self.inner.as_mut()` must be released around mid-body
@@ -2884,7 +3003,7 @@ telemetry consumption — it does NOT redefine the type.
   three fields (`flushed_entries`, `reason`, `aborted`) land at
   once. Every return path in `platform.flush_submit_group`
   (empty-group, Vk-less fixture, Ok queue_submit2, Err
-  queue_submit2) populates all three. Task 11 no longer
+  queue_submit2) populates all three. Task 3.5 no longer
   redefines the type. (Codex round-4 finding 2.)
 - Task 3 Step 8's COW-PRESENT-failure code block rewritten in
   paste-safe form with explicit `let inner = self.inner.as_mut()`
@@ -2905,7 +3024,7 @@ telemetry consumption — it does NOT redefine the type.
   would have made Task 10's failure assertions inconsistent with
   what the real failure path produces. (Codex round-5 finding 1.)
 - Self-review summary's `FlushOutcome` provenance + cross-task
-  dependency text cleaned of the "Task 11 touches signature
+  dependency text cleaned of the "Task 3.5 touches signature
   shape" claim — the type is stable from Task 2. (Codex round-5
   finding 2 doc drift.)
 - `RenderEngine::active_resource_bytes` (renamed from
@@ -2961,3 +3080,20 @@ telemetry consumption — it does NOT redefine the type.
   `AGENTS.md`: `cargo +nightly fmt` and **regular** clippy (NOT
   pedantic). Project-specific guidance overrides the global
   CLAUDE.md pedantic default. (Codex round-8 nit.)
+
+**User feedback applied 2026-05-23 (post round-8)**:
+- Telemetry moved from Task 11 to **Task 3.5** — lands
+  immediately after the atomic switch, so T4-T11 each become
+  individually observable on bee captures (every new flush
+  trigger shows up as a new `submit_group_flush_reason_*`
+  reading). All prerequisite types (`FlushReason`,
+  `FlushOutcome`, `pending_flush_outcomes`,
+  `last_flush_outcome`) already land in T1-T3, so T3.5 has no
+  forward dependencies — the move is purely a position change.
+- **New Task 3.6** inserted: a wrapper-overhead HW baseline
+  capture on bee at `max_size=1` with telemetry counters wired
+  but no behavior changes yet. Pins the cost of the SubmitGroup
+  buffer + drain machinery in isolation (expected ≈ pre-Phase-A
+  3304 baseline; > 15 % regression halts the arc before T4 bumps
+  the cap). Existing Task 15 is now framed as the post-Phase-A
+  capture; T3.6 is the wrapper-only baseline.
