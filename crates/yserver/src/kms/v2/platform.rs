@@ -153,6 +153,26 @@ impl FenceTicket {
     pub(crate) fn fence(&self) -> vk::Fence {
         self.inner.fence
     }
+
+    /// Stage 5 Task 6.1: export the underlying `VkFence` as a Linux
+    /// sync_file FD via `vkGetFenceFdKHR(SYNC_FD)`. The returned FD
+    /// becomes `POLLIN`-readable when the fence signals.
+    ///
+    /// Returns `Ok(Some(fd))` for an unsignaled fence;
+    /// `Ok(None)` when `vkGetFenceFdKHR` returns -1 (the fence is
+    /// already signaled at export time — caller treats as
+    /// "drain immediately");
+    /// `Err(_)` on Vk failure.
+    pub(crate) fn export_sync_file_fd(
+        &self,
+        vk: &VkContext,
+    ) -> Result<Option<std::os::fd::OwnedFd>, vk::Result> {
+        let info = vk::FenceGetFdInfoKHR::default()
+            .fence(self.inner.fence)
+            .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let raw = unsafe { vk.external_fence_fd.get_fence_fd(&info)? };
+        crate::kms::vk::optional_sync_fd_from_vk(raw, "vkGetFenceFdKHR(SYNC_FD)")
+    }
 }
 
 impl Drop for FenceTicketInner {
@@ -1498,4 +1518,14 @@ mod tests {
         p.commit_bo_present(0, 0, g); // bo_generations[0] is empty — no-op
         p.commit_bo_present(99, 99, g); // out-of-range — no-op
     }
+
+    // Stage 5 Task 6.1 note: a unit test that called
+    // `FenceTicket::export_sync_file_fd` on a freshly-acquired
+    // (never-submitted) fence was tried and dropped — vkGetFenceFdKHR
+    // with handle type SYNC_FD has a Vulkan valid-usage requirement
+    // that the fence "must have an associated fence signal operation
+    // that has been submitted for execution" (VUID-VkFenceGetFdInfoKHR-handleType-01457).
+    // Calling it on a never-submitted fence hangs lavapipe. Coverage of
+    // this method comes via the v2_acceptance suite's enqueue/drain
+    // path, where the fence is bound to a submitted cow_batch.
 }

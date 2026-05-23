@@ -44,7 +44,10 @@ fn owned_fd_from_vk(raw_fd: i32, call: &str) -> Result<OwnedFd, ash_vk::Result> 
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
-fn optional_sync_fd_from_vk(raw_fd: i32, call: &str) -> Result<Option<OwnedFd>, ash_vk::Result> {
+pub(crate) fn optional_sync_fd_from_vk(
+    raw_fd: i32,
+    call: &str,
+) -> Result<Option<OwnedFd>, ash_vk::Result> {
     if raw_fd == -1 {
         return Ok(None);
     }
