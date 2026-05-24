@@ -573,3 +573,55 @@ mod touched_tests {
         assert_eq!(t.len(), 2);
     }
 }
+
+/// Pending glyph cache inserts. `composite_glyphs`'s upload path
+/// already calls `V2GlyphAtlas::pack` (shelf advance, monotonic — the
+/// slot stays consumed even if the frame fails), but `insert_entry`
+/// (cache commit) is deferred here. Close-success drains this and
+/// calls `V2GlyphAtlas::insert_entry` on the atlas; close-failure
+/// drops the list — the slot leaks but the cache stays consistent
+/// (next paint re-packs).
+#[derive(Debug, Default)]
+pub(crate) struct PendingGlyphInserts {
+    pub(crate) entries: Vec<(GlyphKey, AtlasEntry)>,
+}
+
+impl PendingGlyphInserts {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn push(&mut self, key: GlyphKey, entry: AtlasEntry) {
+        self.entries.push((key, entry));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod glyph_insert_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_is_empty() {
+        assert_eq!(PendingGlyphInserts::new().len(), 0);
+    }
+
+    #[test]
+    fn push_appends_in_order() {
+        let mut p = PendingGlyphInserts::new();
+        p.push(
+            GlyphKey { font_xid: 1, codepoint: 65 },
+            AtlasEntry { atlas_x: 0, atlas_y: 0, w: 8, h: 12, pen_left: 0, pen_top: 0 },
+        );
+        p.push(
+            GlyphKey { font_xid: 1, codepoint: 66 },
+            AtlasEntry { atlas_x: 8, atlas_y: 0, w: 8, h: 12, pen_left: 0, pen_top: 0 },
+        );
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.entries[0].0.codepoint, 65);
+        assert_eq!(p.entries[1].0.codepoint, 66);
+    }
+}
