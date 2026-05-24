@@ -4609,6 +4609,22 @@ impl Backend for KmsBackendV2 {
             {
                 log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
             }
+            // Phase B Invariant M3: close any open frame BEFORE legacy compose
+            // records. compose samples drawable storage at record time
+            // (scene.rs:1307), so the open frame's layout + ticket-touch overlays
+            // must be committed before the compose CB lands. Retires at sub-phase
+            // B.4 when compose itself ports into the frame builder.
+            // NOTE: integration test for M3 lives in Task 23's mixed-sequence
+            // smoke (v2_frame_builder_mixed_sequence_smoke); Task 13 only adds
+            // the wiring. Until Task 15 ports composite_glyphs into the frame
+            // builder, no frame can be open, so this call is a no-op.
+            if let Err(e) = self.engine.close_open_frame(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::v2::frame_builder::CloseReason::LegacyScCompose,
+            ) {
+                log::warn!("v2 maybe_composite: close_open_frame failed: {e:?}");
+            }
             // Phase A Task 4: flush the SubmitGroup so scene.tick
             // observes all paint CBs already submitted to the queue.
             // Compose stays on its own dedicated `vkQueueSubmit2`
