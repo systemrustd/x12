@@ -6903,7 +6903,7 @@ fn begin_op_cb(
             // SAFETY: cb was begun but never submitted; safe to
             // free in Recording state.
             unsafe { device.free_command_buffers(pool, &[cb]) };
-            return Err(e.into());
+            return Err(RenderError::Vk(e));
         }
     };
     Ok((cb, ticket))
