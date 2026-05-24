@@ -1067,6 +1067,45 @@ impl RenderEngine {
         }
     }
 
+    /// Phase B Invariant M2: close the open frame (if any) BEFORE a
+    /// non-ported paint op records its own CB. The non-ported op
+    /// samples committed `Drawable::storage.current_layout` and
+    /// `last_render_ticket`; without the close, it would race against
+    /// the deferred frame on the GPU. Retires when every paint op is
+    /// ported (end of sub-phase B.3 at the latest).
+    ///
+    /// Fast path: no frame open → no-op. Preserves existing
+    /// batch-coalescing discipline in `render_composite`,
+    /// `cow_copy_area`, etc.
+    ///
+    /// Slow path: frame open → flush pre-existing batches first
+    /// (chronological ordering: pre-frame batches must submit before
+    /// the frame's CB), then close the frame. Each non-ported op's
+    /// own batch prelude runs afterward against an empty batch state.
+    pub(crate) fn close_open_frame_for_non_ported_op(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), RenderError> {
+        let frame_open = self
+            .inner
+            .as_ref()
+            .is_some_and(|i| i.frame_builder.is_open());
+        if !frame_open {
+            return Ok(());
+        }
+        self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
+        match self.close_open_frame(
+            store,
+            platform,
+            super::frame_builder::CloseReason::NonPortedPaintOp,
+        )? {
+            super::frame_builder::CloseOutcome::Submitted { .. }
+            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+        }
+    }
+
     /// Count of in-flight submits awaiting retirement. Tests use
     /// this to assert the lifecycle book-keeping.
     pub(crate) fn pending_count(&self) -> usize {
@@ -1473,6 +1512,10 @@ impl RenderEngine {
         rect: vk::Rect2D,
         color: [f32; 4],
     ) -> Result<(), RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         self.fill_rect_batch(store, platform, target, color, &[rect])
     }
 
@@ -1499,6 +1542,10 @@ impl RenderEngine {
         color: [f32; 4],
         rects: &[vk::Rect2D],
     ) -> Result<(), RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         // Flush pending COW copy_area batch so its CB submits in
         // queue order before this fill (same-queue ordering = our
         // correctness guarantee).
@@ -1714,6 +1761,10 @@ impl RenderEngine {
         use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
         use yserver_core::backend::GcFunction;
 
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         if rects.is_empty() {
             return Ok(());
         }
@@ -1951,6 +2002,10 @@ impl RenderEngine {
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
@@ -2289,6 +2344,10 @@ impl RenderEngine {
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
@@ -3332,6 +3391,10 @@ impl RenderEngine {
         src_bytes: &[u8],
         src_depth: u8,
     ) -> Result<(), RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         if src_extent.width == 0 || src_extent.height == 0 {
             return Ok(());
         }
@@ -3679,6 +3742,10 @@ impl RenderEngine {
         foreground_rgba: [f32; 4],
         rendered: &[PreparedGlyph],
     ) -> Result<ImageTextStats, RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         let mut stats = ImageTextStats::default();
         if rendered.is_empty() {
             return Ok(stats);
@@ -4383,6 +4450,10 @@ impl RenderEngine {
             render_pipeline::{StdPictOp, record_solid_color_clear},
         };
 
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         let mut stats = CompositeStats::default();
         if rects.is_empty() {
             return Ok(stats);
@@ -4947,6 +5018,10 @@ impl RenderEngine {
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<CompositeStats, RenderError> {
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         self.render_composite(
             store,
             platform,
@@ -5032,6 +5107,10 @@ impl RenderEngine {
             trap_pipeline::TrapDrawPushConsts,
         };
 
+        // Phase B Invariant M2: close any open composite_glyphs frame
+        // first (no-op if no frame open). Preserves existing
+        // batch-coalescing semantics in the common case.
+        self.close_open_frame_for_non_ported_op(store, platform)?;
         let mut stats = CompositeStats::default();
         if instance_count == 0 {
             return Ok(stats);
