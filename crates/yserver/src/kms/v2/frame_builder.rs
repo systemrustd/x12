@@ -517,3 +517,59 @@ mod layout_tests {
         assert_eq!(a.current_in_frame_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
     }
 }
+
+/// Per-frame snapshot of `Drawable::last_render_ticket` taken at first
+/// append-in-frame. Close-failure restores each entry; close-success
+/// is a no-op (the frame ticket already overwrote the slot via
+/// `store.touch_render_fence` at append-time).
+#[derive(Debug, Default)]
+pub(crate) struct TouchedDrawables {
+    /// `None` value = drawable had no prior ticket before this frame.
+    pub(crate) snapshots: HashMap<DrawableId, Option<FenceTicket>>,
+}
+
+impl TouchedDrawables {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the first-touch pre-frame ticket. Subsequent calls on
+    /// the same id are no-ops (the first snapshot is the load-bearing
+    /// one — it captures the value the engine needs to restore on
+    /// close-failure).
+    pub(crate) fn first_touch(
+        &mut self,
+        id: DrawableId,
+        prior_ticket: Option<FenceTicket>,
+    ) {
+        self.snapshots.entry(id).or_insert(prior_ticket);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.snapshots.len()
+    }
+}
+
+#[cfg(test)]
+mod touched_tests {
+    use super::*;
+
+    #[test]
+    fn first_touch_records_prior_ticket_only_once() {
+        let mut t = TouchedDrawables::new();
+        t.first_touch(DrawableId::for_tests(1), None);
+        assert_eq!(t.len(), 1);
+        // Subsequent calls do not overwrite (a later op on the same
+        // drawable should not lose the originally-captured prior).
+        t.first_touch(DrawableId::for_tests(1), None);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn separate_drawables_track_independently() {
+        let mut t = TouchedDrawables::new();
+        t.first_touch(DrawableId::for_tests(1), None);
+        t.first_touch(DrawableId::for_tests(2), None);
+        assert_eq!(t.len(), 2);
+    }
+}
