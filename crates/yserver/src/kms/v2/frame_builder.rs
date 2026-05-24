@@ -114,7 +114,19 @@ impl FrameBuilder {
 #[derive(Debug)]
 pub(crate) struct OpenFrame {
     pub(crate) ticket: FenceTicket,
-    pub(crate) close_reason_on_open: Option<CloseReason>, // unused in B.1; reserved for B.4
+    pub(crate) ops: Vec<RecordedOp>,
+    pub(crate) pins: FramePinSet,
+    pub(crate) layouts: FrameLayoutTable,
+    pub(crate) touched: TouchedDrawables,
+    pub(crate) pending_glyph_inserts: PendingGlyphInserts,
+    /// Snapshot of `V2GlyphAtlas::last_render_ticket` taken at the first
+    /// glyph append-in-frame. `Some(None)` means "the atlas had no
+    /// prior ticket" — distinct from `None` which means "not yet
+    /// touched in this frame".
+    pub(crate) atlas_prev_ticket_snapshot: Option<Option<FenceTicket>>,
+    /// Glyph uploads recorded in this frame; bumped each push.
+    pub(crate) glyph_uploads_in_frame: u32,
+    pub(crate) close_reason_on_open: Option<CloseReason>, // reserved for B.4
 }
 
 #[cfg(test)]
@@ -623,5 +635,31 @@ mod glyph_insert_tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p.entries[0].0.codepoint, 65);
         assert_eq!(p.entries[1].0.codepoint, 66);
+    }
+}
+
+#[cfg(test)]
+mod open_frame_tests {
+    use super::*;
+    use super::super::platform::FenceTicket;
+
+    #[test]
+    fn open_frame_aggregates_all_overlays() {
+        let frame = OpenFrame {
+            ticket: FenceTicket::for_tests_stub(),
+            ops: Vec::new(),
+            pins: FramePinSet::new(),
+            layouts: FrameLayoutTable::new(),
+            touched: TouchedDrawables::new(),
+            pending_glyph_inserts: PendingGlyphInserts::new(),
+            atlas_prev_ticket_snapshot: None,
+            glyph_uploads_in_frame: 0,
+            close_reason_on_open: None,
+        };
+        assert!(frame.ops.is_empty());
+        assert_eq!(frame.pins.len(), 0);
+        assert_eq!(frame.touched.len(), 0);
+        assert_eq!(frame.pending_glyph_inserts.len(), 0);
+        assert_eq!(frame.glyph_uploads_in_frame, 0);
     }
 }

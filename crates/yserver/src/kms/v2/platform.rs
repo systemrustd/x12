@@ -185,6 +185,23 @@ impl FenceTicket {
     pub(crate) fn fence(&self) -> vk::Fence {
         self.inner.fence
     }
+
+    /// Test-only constructor: returns a ticket whose `poll_signaled`
+    /// returns `true` and `wait` returns `Ok(())` without ever touching
+    /// a real VkDevice. Built with a null fence, `signaled_cache` pre-set
+    /// to `true`, and a dangling pool Weak so Drop becomes a no-op.
+    /// Use ONLY in unit tests that need a `FenceTicket` value without
+    /// constructing a real fence.
+    #[cfg(test)]
+    pub(crate) fn for_tests_stub() -> Self {
+        Self {
+            inner: Arc::new(FenceTicketInner {
+                fence: vk::Fence::null(),
+                signaled_cache: AtomicBool::new(true),
+                pool: Weak::<Mutex<FencePoolInner>>::new(),
+            }),
+        }
+    }
 }
 
 impl Drop for FenceTicketInner {
