@@ -618,6 +618,12 @@ struct RenderEngineInner {
     /// Phase B.1: monotonic frame sequence for telemetry attribution.
     /// Bumped on every `FrameBuilder::close_into_cb` success.
     frame_seq: u64,
+    /// Phase B.1: per-frame deferred op-list recorder. `Closed` is
+    /// the hot path; transitions to `OpenForPaint` only when a ported
+    /// paint op (composite_glyphs in B.1) appends. Embedded so the
+    /// engine can drive open/close from its existing paint entry
+    /// points (Tasks 12-20 wire the transitions).
+    frame_builder: super::frame_builder::FrameBuilder,
 }
 
 impl RenderEngine {
@@ -662,6 +668,7 @@ impl RenderEngine {
                 pending_flush_outcomes: Vec::new(),
                 pending_frames: std::collections::VecDeque::new(),
                 frame_seq: 0,
+                frame_builder: super::frame_builder::FrameBuilder::new(),
             }),
         })
     }
@@ -3575,7 +3582,10 @@ impl RenderEngine {
                     // Each upload owns its own staging slice for the
                     // CB's lifetime (Stage 3 plan §"Cross-cutting" §3).
                     let upload_bytes = (w_u as u64) * (h_u as u64);
-                    let staging = Arc::new(StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?);
+                    let staging = Arc::new(StagingBuffer::new(
+                        Arc::clone(&inner.vk),
+                        upload_bytes.max(1),
+                    )?);
                     // SAFETY: staging.size ≥ upload_bytes ≥ pixels.len()
                     // (per the pre-condition that PreparedGlyph.pixels
                     // is row-major w×h). mapped is host-coherent.
@@ -3890,7 +3900,10 @@ impl RenderEngine {
                     }
                     stats.atlas_interns += 1;
                     let upload_bytes = u64::from(g.w) * u64::from(g.h);
-                    let staging = Arc::new(StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?);
+                    let staging = Arc::new(StagingBuffer::new(
+                        Arc::clone(&inner.vk),
+                        upload_bytes.max(1),
+                    )?);
                     let copy_len = (g.w as usize) * (g.h as usize);
                     let src_slice = if g.pixels.len() >= copy_len {
                         &g.pixels[..copy_len]

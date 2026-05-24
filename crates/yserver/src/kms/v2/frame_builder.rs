@@ -73,6 +73,27 @@ pub(crate) struct FrameBuilder {
     max_pinned_resources_per_frame: usize,
 }
 
+/// Frame-close outcome surfaced to the engine. `Submitted` carries
+/// the same `FlushOutcome` Phase A's `flush_submit_group` returned
+/// (number of entries flushed, reason); the frame builder produces
+/// one such outcome per close. `AlreadyClosed` means "frame was already
+/// closed; nothing to do".
+#[derive(Debug)]
+pub(crate) enum CloseOutcome {
+    /// Frame closed and submitted (one CB through SubmitGroup
+    /// auto-flush). Carries the frame ticket the caller will record
+    /// for retirement.
+    Submitted {
+        frame_seq: u64,
+        op_count: usize,
+        pin_count: usize,
+        ticket: FenceTicket,
+        reason: CloseReason,
+    },
+    /// Close requested but frame was already closed. No-op.
+    AlreadyClosed,
+}
+
 impl FrameBuilder {
     pub(crate) fn new() -> Self {
         Self {
@@ -106,6 +127,89 @@ impl FrameBuilder {
 
     pub(crate) fn max_pinned_resources_per_frame(&self) -> usize {
         self.max_pinned_resources_per_frame
+    }
+
+    /// Open a new frame, acquiring the shared `FenceTicket` from
+    /// `SubmitGroup::open_with`. Panics if the frame is already open
+    /// (caller is responsible for checking `is_open()` first).
+    pub(crate) fn open_for_paint(&mut self, ticket: FenceTicket) {
+        assert!(
+            !self.is_open(),
+            "FrameBuilder::open_for_paint while already open — caller must check is_open()"
+        );
+        self.state = FrameState::OpenForPaint;
+        self.lifetime_opens = self.lifetime_opens.wrapping_add(1);
+        self.open = Some(Box::new(OpenFrame {
+            ticket,
+            ops: Vec::new(),
+            pins: FramePinSet::new(),
+            layouts: FrameLayoutTable::new(),
+            touched: TouchedDrawables::new(),
+            pending_glyph_inserts: PendingGlyphInserts::new(),
+            atlas_prev_ticket_snapshot: None,
+            glyph_uploads_in_frame: 0,
+            close_reason_on_open: None,
+        }));
+    }
+
+    /// Take the open frame for replay. Returns `None` if not open.
+    /// Caller is responsible for calling either `complete_close_success`
+    /// or `complete_close_failure` afterwards to update the lifetime
+    /// counter and bring the FrameBuilder back to `Closed`.
+    pub(crate) fn take_open_for_close(&mut self, reason: CloseReason) -> Option<Box<OpenFrame>> {
+        if !self.is_open() {
+            return None;
+        }
+        let mut frame = self.open.take().expect("is_open implies Some");
+        frame.close_reason_on_open = Some(reason);
+        Some(frame)
+    }
+
+    /// Finalise close-success path. The caller has already submitted
+    /// the CB and committed overlays/pins/inserts into engine + atlas
+    /// state; this updates the FrameBuilder's bookkeeping.
+    pub(crate) fn complete_close_success(&mut self) {
+        debug_assert!(matches!(self.state, FrameState::OpenForPaint));
+        self.state = FrameState::Closed;
+        self.lifetime_closes = self.lifetime_closes.wrapping_add(1);
+        // `self.open` is already None (take_open_for_close moved it).
+    }
+
+    /// Finalise close-failure path. The caller has already rolled back
+    /// engine/atlas state and set `platform.renderer_failed`; this
+    /// updates the FrameBuilder's bookkeeping.
+    pub(crate) fn complete_close_failure(&mut self) {
+        debug_assert!(matches!(self.state, FrameState::OpenForPaint));
+        self.state = FrameState::Closed;
+        self.lifetime_closes = self.lifetime_closes.wrapping_add(1);
+    }
+
+    /// True if the next append would push the pin set past the
+    /// per-frame ceiling. Caller checks this and forces a close
+    /// (`reason = PinCeiling`) BEFORE the new op's append.
+    pub(crate) fn would_exceed_pin_ceiling(&self, new_pins: usize) -> bool {
+        match self.open.as_ref() {
+            None => false, // no frame open → nothing to exceed
+            Some(open) => open.pins.len() + new_pins > self.max_pinned_resources_per_frame,
+        }
+    }
+
+    /// `#[cfg(test)]` peek at the op list in append order.
+    #[cfg(test)]
+    pub(crate) fn peek_ops(&self) -> Option<&[RecordedOp]> {
+        self.open.as_ref().map(|o| o.ops.as_slice())
+    }
+
+    /// `#[cfg(test)]` op count.
+    #[cfg(test)]
+    pub(crate) fn op_count(&self) -> usize {
+        self.open.as_ref().map_or(0, |o| o.ops.len())
+    }
+
+    /// `#[cfg(test)]` pin count.
+    #[cfg(test)]
+    pub(crate) fn pin_count(&self) -> usize {
+        self.open.as_ref().map_or(0, |o| o.pins.len())
     }
 }
 
@@ -177,7 +281,6 @@ mod state_tests {
 
 // The rest of this module — RecordedOp, FramePinSet, FrameLayoutTable,
 // FrameSubmittedRecord — lands in subsequent tasks (see below).
-
 
 use ash::vk;
 
@@ -490,9 +593,15 @@ mod layout_tests {
     #[test]
     fn first_touch_drawable_snapshots_pre_frame_and_in_frame_equal() {
         let mut t = FrameLayoutTable::new();
-        t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        t.first_touch_drawable(
+            DrawableId::for_tests(7),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
         let entry = t.drawables.get(&DrawableId::for_tests(7)).unwrap();
-        assert_eq!(entry.pre_frame_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(
+            entry.pre_frame_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
         assert_eq!(
             entry.current_in_frame_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
@@ -503,8 +612,14 @@ mod layout_tests {
     fn second_touch_does_not_overwrite_pre_frame() {
         let mut t = FrameLayoutTable::new();
         t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::UNDEFINED);
-        t.set_drawable_in_frame(DrawableId::for_tests(7), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-        t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        t.set_drawable_in_frame(
+            DrawableId::for_tests(7),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        t.first_touch_drawable(
+            DrawableId::for_tests(7),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
         let entry = t.drawables.get(&DrawableId::for_tests(7)).unwrap();
         assert_eq!(entry.pre_frame_layout, vk::ImageLayout::UNDEFINED);
         assert_eq!(
@@ -516,7 +631,10 @@ mod layout_tests {
     #[test]
     fn current_layout_for_drawable_falls_back_to_storage_when_untouched() {
         let t = FrameLayoutTable::new();
-        let got = t.current_layout_for_drawable(DrawableId::for_tests(8), vk::ImageLayout::PRESENT_SRC_KHR);
+        let got = t.current_layout_for_drawable(
+            DrawableId::for_tests(8),
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
         assert_eq!(got, vk::ImageLayout::PRESENT_SRC_KHR);
     }
 
@@ -527,7 +645,10 @@ mod layout_tests {
         t.set_atlas_in_frame(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         let a = t.atlas.unwrap();
         assert_eq!(a.pre_frame_layout, vk::ImageLayout::UNDEFINED);
-        assert_eq!(a.current_in_frame_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(
+            a.current_in_frame_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        );
     }
 }
 
@@ -550,11 +671,7 @@ impl TouchedDrawables {
     /// the same id are no-ops (the first snapshot is the load-bearing
     /// one — it captures the value the engine needs to restore on
     /// close-failure).
-    pub(crate) fn first_touch(
-        &mut self,
-        id: DrawableId,
-        prior_ticket: Option<FenceTicket>,
-    ) {
+    pub(crate) fn first_touch(&mut self, id: DrawableId, prior_ticket: Option<FenceTicket>) {
         self.snapshots.entry(id).or_insert(prior_ticket);
     }
 
@@ -626,12 +743,32 @@ mod glyph_insert_tests {
     fn push_appends_in_order() {
         let mut p = PendingGlyphInserts::new();
         p.push(
-            GlyphKey { font_xid: 1, codepoint: 65 },
-            AtlasEntry { atlas_x: 0, atlas_y: 0, w: 8, h: 12, pen_left: 0, pen_top: 0 },
+            GlyphKey {
+                font_xid: 1,
+                codepoint: 65,
+            },
+            AtlasEntry {
+                atlas_x: 0,
+                atlas_y: 0,
+                w: 8,
+                h: 12,
+                pen_left: 0,
+                pen_top: 0,
+            },
         );
         p.push(
-            GlyphKey { font_xid: 1, codepoint: 66 },
-            AtlasEntry { atlas_x: 8, atlas_y: 0, w: 8, h: 12, pen_left: 0, pen_top: 0 },
+            GlyphKey {
+                font_xid: 1,
+                codepoint: 66,
+            },
+            AtlasEntry {
+                atlas_x: 8,
+                atlas_y: 0,
+                w: 8,
+                h: 12,
+                pen_left: 0,
+                pen_top: 0,
+            },
         );
         assert_eq!(p.len(), 2);
         assert_eq!(p.entries[0].0.codepoint, 65);
@@ -641,8 +778,8 @@ mod glyph_insert_tests {
 
 #[cfg(test)]
 mod open_frame_tests {
-    use super::*;
     use super::super::platform::FenceTicket;
+    use super::*;
 
     #[test]
     fn open_frame_aggregates_all_overlays() {
@@ -662,6 +799,63 @@ mod open_frame_tests {
         assert_eq!(frame.touched.len(), 0);
         assert_eq!(frame.pending_glyph_inserts.len(), 0);
         assert_eq!(frame.glyph_uploads_in_frame, 0);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn open_for_paint_transitions_to_open_state_and_bumps_lifetime_opens() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub());
+        assert!(fb.is_open());
+        assert_eq!(fb.lifetime_opens(), 1);
+        assert_eq!(fb.lifetime_closes(), 0);
+        assert_eq!(fb.op_count(), 0);
+    }
+
+    #[test]
+    fn take_open_for_close_returns_frame_and_records_reason() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub());
+        let frame = fb
+            .take_open_for_close(CloseReason::NonPortedPaintOp)
+            .expect("frame open");
+        assert_eq!(frame.close_reason_on_open, Some(CloseReason::NonPortedPaintOp));
+    }
+
+    #[test]
+    fn complete_close_success_bumps_lifetime_closes_and_returns_to_closed() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub());
+        let _ = fb.take_open_for_close(CloseReason::SceneCompose);
+        fb.complete_close_success();
+        assert!(!fb.is_open());
+        assert_eq!(fb.lifetime_closes(), 1);
+    }
+
+    #[test]
+    fn would_exceed_pin_ceiling_false_when_closed() {
+        let fb = FrameBuilder::new();
+        assert!(!fb.would_exceed_pin_ceiling(10_000));
+    }
+
+    #[test]
+    fn would_exceed_pin_ceiling_true_when_open_and_over_default_ceiling() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub());
+        assert!(fb.would_exceed_pin_ceiling(1025));
+        assert!(!fb.would_exceed_pin_ceiling(1024));
+    }
+
+    #[test]
+    #[should_panic(expected = "while already open")]
+    fn open_for_paint_panics_when_already_open() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub());
     }
 }
 
