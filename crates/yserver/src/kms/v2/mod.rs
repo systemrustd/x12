@@ -11,6 +11,7 @@ mod backend;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
+pub(crate) mod frame_builder;
 pub(crate) mod glyph_atlas;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
