@@ -471,11 +471,12 @@ use std::sync::Arc;
 /// clones (one per glyph upload). B.2 extends with sync objects,
 /// semaphores, and Mechanism 3 retired scratch `BatchResource`s.
 ///
-/// `Debug` is implemented manually in Task 2 (extending the derived
-/// shape with a `retired_resources_count` field) because
-/// `Box<dyn BatchResource>` already requires `Debug` per the trait
-/// definition, so derive works for now and Task 2 swaps in the manual
-/// impl alongside the unit tests.
+/// `Debug` is derived: `BatchResource: Send + std::fmt::Debug` (see
+/// `paint_batch.rs:146`), so `Box<dyn BatchResource>` is `Debug` and
+/// `#[derive(Debug)]` on `FramePinSet` works directly. The derived impl
+/// prints the full Vec contents — implementors of `BatchResource`
+/// typically emit just the variant name (the Vk handles inside are not
+/// interesting), so this stays terse.
 #[derive(Debug, Default)]
 pub(crate) struct FramePinSet {
     pub(crate) staging_buffers: Vec<Arc<super::engine::StagingBuffer>>,
@@ -530,12 +531,12 @@ impl FramePinSet {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.staging_buffers.len()
+        self.staging_buffers.len() + self.retired_resources.len()
     }
 
     #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn is_empty(&self) -> bool {
-        self.staging_buffers.is_empty()
+        self.staging_buffers.is_empty() && self.retired_resources.is_empty()
     }
 }
 
@@ -552,6 +553,27 @@ mod pin_tests {
         let p = FramePinSet::new();
         assert_eq!(p.len(), 0);
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn adopt_retired_pushes_to_retired_resources() {
+        let mut set = FramePinSet::new();
+        assert_eq!(set.retired_resources.len(), 0);
+        // Pure-unit-test scope: wrap a no-op BatchResource fake. See
+        // `paint_batch.rs:146` for the trait shape — `release` is
+        // `self: Box<Self>` so the no-op simply drops the Box. The
+        // test never calls `release`; it only verifies bookkeeping.
+        #[derive(Debug)]
+        struct FakeRetired;
+        impl crate::kms::scheduler::paint_batch::BatchResource for FakeRetired {
+            fn release(self: Box<Self>, _vk: &crate::kms::vk::device::VkContext) {
+                // No-op: test never invokes this path.
+            }
+        }
+        set.adopt_retired(Box::new(FakeRetired));
+        assert_eq!(set.retired_resources.len(), 1);
+        assert_eq!(set.len(), 1);
+        assert!(!set.is_empty());
     }
 }
 
