@@ -1204,6 +1204,15 @@ impl RenderEngine {
             .map_or(0, |i| i.frame_builder.lifetime_closes())
     }
 
+    /// Phase B.1 Task 21: monotonic count of all FrameBuilder opens
+    /// since init. Delta-tracked by `KmsBackendV2::drain_frame_builder_telemetry`
+    /// to emit one `record_frame_builder_open` per new open.
+    pub(crate) fn frame_builder_lifetime_opens(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.frame_builder.lifetime_opens())
+    }
+
     /// Phase B.1 Task 15: test introspection — monotonic frame_seq
     /// counter. Bumped by `close_open_frame` on every successful close.
     pub(crate) fn engine_frame_seq(&self) -> u64 {

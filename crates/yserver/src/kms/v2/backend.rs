@@ -270,6 +270,12 @@ pub struct KmsBackendV2 {
     /// is shown on screen. Driven by `update_effective_cursor`;
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
     pub(crate) effective_cursor_xid: Option<u32>,
+
+    /// Phase B.1 Task 21: lifetime-opens count seen at the last
+    /// `drain_frame_builder_telemetry` call. Delta tracking lets the
+    /// drain helper emit one `record_frame_builder_open` per new open
+    /// without requiring a separate event queue.
+    last_drained_fb_opens: u64,
 }
 
 impl KmsBackendV2 {
@@ -492,6 +498,7 @@ impl KmsBackendV2 {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            last_drained_fb_opens: 0,
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -1016,6 +1023,7 @@ impl KmsBackendV2 {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            last_drained_fb_opens: 0,
         }
     }
 
@@ -1595,6 +1603,41 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Phase B.1 Task 21: drain queued `FrameCloseEvent`s into the
+    /// per-second telemetry. Called from every site that drives a
+    /// frame close (maybe_composite, enqueue_present_completion,
+    /// get_image, shutdown/disable_output, render_composite_glyphs).
+    ///
+    /// Opens are delta-tracked via `last_drained_fb_opens` — the
+    /// drain emits one `record_frame_builder_open` for each new open
+    /// since the previous call without requiring a separate event queue.
+    ///
+    /// The drain is idempotent: calling it multiple times in a row is
+    /// harmless (the event queue and delta are both empty after the
+    /// first call).
+    fn drain_frame_builder_telemetry(&mut self) {
+        // Delta-track opens (FrameBuilder doesn't queue open events;
+        // we infer them from the monotonic lifetime counter).
+        let current_opens = self.engine.frame_builder_lifetime_opens();
+        let delta_opens = current_opens.saturating_sub(self.last_drained_fb_opens);
+        for _ in 0..delta_opens {
+            self.telemetry.record_frame_builder_open();
+        }
+        self.last_drained_fb_opens = current_opens;
+
+        // Drain the close-event queue.
+        for event in self.engine.drain_frame_close_events() {
+            self.telemetry.record_frame_builder_close(
+                event.reason,
+                event.ops_in_frame,
+                event.glyph_uploads_in_frame,
+            );
+            self.telemetry.record_frame_builder_active_pins_high_water(
+                u64::try_from(event.pin_count).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
     /// Stage 5 Task 4 layer 1: test-side accessor to the ring's
     /// pool residency. Used by the acceptance harness to assert
     /// steady-state pool count stays small after warm-up.
@@ -2110,6 +2153,8 @@ impl KmsBackendV2 {
         // each subsystem's book-keeping reclaims its handles
         // against the still-live pool.
         self.engine.shutdown(&mut self.store, &mut self.platform);
+        // Phase B.1 Task 21: drain close events emitted by shutdown.
+        self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
 
@@ -4746,6 +4791,8 @@ impl Backend for KmsBackendV2 {
             .record_active_staging_high_water(staging_bytes);
         self.telemetry
             .record_active_scratch_high_water(scratch_bytes);
+        // Phase B.1 Task 21: drain frame-builder close events into telemetry.
+        self.drain_frame_builder_telemetry();
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit();
         result
@@ -6824,7 +6871,7 @@ impl Backend for KmsBackendV2 {
             },
         };
         let start = std::time::Instant::now();
-        match self
+        let result = match self
             .engine
             .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
         {
@@ -6849,7 +6896,12 @@ impl Backend for KmsBackendV2 {
                 log::warn!("v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",);
                 Ok(None)
             }
-        }
+        };
+        // Phase B.1 Task 21: engine.get_image calls close_open_frame
+        // (SyncWait reason) before blocking on the fence; drain the
+        // resulting close event into telemetry.
+        self.drain_frame_builder_telemetry();
+        result
     }
 
     fn clear_area(
@@ -8325,6 +8377,9 @@ impl Backend for KmsBackendV2 {
                 log::warn!("v2 composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
             }
         }
+        // Phase B.1 Task 21: composite_glyphs may open a frame;
+        // drain any resulting close events into telemetry.
+        self.drain_frame_builder_telemetry();
         Ok(())
     }
 
@@ -9484,6 +9539,8 @@ impl Backend for KmsBackendV2 {
         ) {
             log::warn!("v2 enqueue_present_completion: close_open_frame failed: {e:?}");
         }
+        // Phase B.1 Task 21: drain frame-builder close events into telemetry.
+        self.drain_frame_builder_telemetry();
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,

@@ -95,6 +95,35 @@ pub struct Bucket {
     /// individual `render_composite` calls folded into batches.
     /// Pre-fix each call would have produced its own `paint_submit`.
     pub render_composites_coalesced: u64,
+    // ── Phase B.1 Task 21: frame builder counters ───────────────
+    /// Number of frame opens in this window.
+    pub(crate) frame_builder_opens: u64,
+    /// Number of frame closes in this window.
+    pub(crate) frame_builder_closes: u64,
+    /// Per-close-reason counters (matches `CloseReason` variants).
+    pub(crate) frame_builder_close_reason_scene_compose: u64,
+    pub(crate) frame_builder_close_reason_non_ported_paint_op: u64,
+    pub(crate) frame_builder_close_reason_legacy_sc_compose: u64,
+    pub(crate) frame_builder_close_reason_present_completion_signal: u64,
+    pub(crate) frame_builder_close_reason_sync_wait: u64,
+    pub(crate) frame_builder_close_reason_timeout: u64,
+    pub(crate) frame_builder_close_reason_shutdown: u64,
+    pub(crate) frame_builder_close_reason_pin_ceiling: u64,
+    /// Sum of ops_in_frame across all closes in the window.
+    pub(crate) frame_builder_ops_per_frame_total: u64,
+    /// Max ops_in_frame seen in the current bucket window.
+    pub(crate) frame_builder_ops_per_frame_max_in_window: u64,
+    /// Ops-per-frame histogram. Buckets: [0..=1, 2..=3, 4..=7, 8..=15,
+    /// 16..=31, 32..=63, 64..=127, 128+].
+    pub(crate) frame_builder_ops_per_frame_hist: [u64; 8],
+    /// High-water mark of pin_count seen across all closes.
+    pub(crate) frame_builder_active_pins_high_water: u64,
+    /// Number of frame closes that followed a Vk error (abort path).
+    pub(crate) frame_builder_aborts: u64,
+    /// Sum of glyph_uploads_in_frame across all closes in the window.
+    pub(crate) frame_builder_glyph_uploads_per_frame_total: u64,
+    /// Max glyph_uploads_in_frame seen in the current bucket window.
+    pub(crate) frame_builder_glyph_uploads_per_frame_max_in_window: u64,
     // ── Phase A: SubmitGroup size + flush-reason histogram ───────
     /// Number of SubmitGroup flushes that actually submitted at
     /// least one entry (non-abort). Per-second + lifetime.
@@ -319,6 +348,34 @@ impl Telemetry {
             self.lifetime.active_staging_bytes_high_water,
             self.lifetime.active_scratch_bytes_high_water,
         );
+        #[allow(clippy::cast_precision_loss)]
+        let fb_ops_avg =
+            b.frame_builder_ops_per_frame_total as f64 / b.frame_builder_closes.max(1) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let fb_glyph_avg = b.frame_builder_glyph_uploads_per_frame_total as f64
+            / b.frame_builder_closes.max(1) as f64;
+        log::info!(
+            "v2_telemetry: frame_builder_opens={} closes={} aborts={} \
+             ops/frame_avg={fb_ops_avg:.1} max={} hist={:?} \
+             glyph_uploads/frame_avg={fb_glyph_avg:.1} max={} active_pins_hw={} \
+             close_reasons[scene_compose={} non_ported={} legacy_sc={} \
+             present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={}]",
+            b.frame_builder_opens,
+            b.frame_builder_closes,
+            b.frame_builder_aborts,
+            b.frame_builder_ops_per_frame_max_in_window,
+            b.frame_builder_ops_per_frame_hist,
+            b.frame_builder_glyph_uploads_per_frame_max_in_window,
+            b.frame_builder_active_pins_high_water,
+            b.frame_builder_close_reason_scene_compose,
+            b.frame_builder_close_reason_non_ported_paint_op,
+            b.frame_builder_close_reason_legacy_sc_compose,
+            b.frame_builder_close_reason_present_completion_signal,
+            b.frame_builder_close_reason_sync_wait,
+            b.frame_builder_close_reason_timeout,
+            b.frame_builder_close_reason_shutdown,
+            b.frame_builder_close_reason_pin_ceiling,
+        );
         self.bucket = Bucket::default();
         self.last_emit = now;
     }
@@ -509,6 +566,119 @@ impl Telemetry {
             .saturating_add(u64::from(coalesced));
         self.lifetime.paint_submits += 1;
         self.lifetime.queue_submit2 += 1;
+    }
+
+    // ── Phase B.1 Task 21: frame builder recording sites ─────────
+
+    /// Bumped once per `FrameBuilder::open_for_paint` (delta-tracked
+    /// via `KmsBackendV2::drain_frame_builder_telemetry`).
+    pub(crate) fn record_frame_builder_open(&mut self) {
+        self.bucket.frame_builder_opens += 1;
+        self.lifetime.frame_builder_opens += 1;
+    }
+
+    /// Record one frame close with the given reason and per-frame stats.
+    /// Updates per-close-reason counters, ops histogram, glyph-upload
+    /// totals, and max-in-window gauges in both the current bucket and
+    /// the lifetime aggregate.
+    pub(crate) fn record_frame_builder_close(
+        &mut self,
+        reason: super::frame_builder::CloseReason,
+        ops_in_frame: usize,
+        glyph_uploads_in_frame: u32,
+    ) {
+        self.bucket.frame_builder_closes += 1;
+        self.lifetime.frame_builder_closes += 1;
+        let ops = u64::try_from(ops_in_frame).unwrap_or(u64::MAX);
+        self.bucket.frame_builder_ops_per_frame_total += ops;
+        self.lifetime.frame_builder_ops_per_frame_total += ops;
+        if ops > self.bucket.frame_builder_ops_per_frame_max_in_window {
+            self.bucket.frame_builder_ops_per_frame_max_in_window = ops;
+        }
+        if ops > self.lifetime.frame_builder_ops_per_frame_max_in_window {
+            self.lifetime.frame_builder_ops_per_frame_max_in_window = ops;
+        }
+        let hist_idx = match ops_in_frame {
+            0 | 1 => 0,
+            2..=3 => 1,
+            4..=7 => 2,
+            8..=15 => 3,
+            16..=31 => 4,
+            32..=63 => 5,
+            64..=127 => 6,
+            _ => 7,
+        };
+        self.bucket.frame_builder_ops_per_frame_hist[hist_idx] += 1;
+        self.lifetime.frame_builder_ops_per_frame_hist[hist_idx] += 1;
+        let uploads = u64::from(glyph_uploads_in_frame);
+        self.bucket.frame_builder_glyph_uploads_per_frame_total += uploads;
+        self.lifetime.frame_builder_glyph_uploads_per_frame_total += uploads;
+        if uploads > self.bucket.frame_builder_glyph_uploads_per_frame_max_in_window {
+            self.bucket.frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
+        }
+        if uploads > self.lifetime.frame_builder_glyph_uploads_per_frame_max_in_window {
+            self.lifetime.frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
+        }
+        use super::frame_builder::CloseReason as R;
+        let (b, l) = match reason {
+            R::SceneCompose => (
+                &mut self.bucket.frame_builder_close_reason_scene_compose,
+                &mut self.lifetime.frame_builder_close_reason_scene_compose,
+            ),
+            R::NonPortedPaintOp => (
+                &mut self.bucket.frame_builder_close_reason_non_ported_paint_op,
+                &mut self.lifetime.frame_builder_close_reason_non_ported_paint_op,
+            ),
+            R::LegacyScCompose => (
+                &mut self.bucket.frame_builder_close_reason_legacy_sc_compose,
+                &mut self.lifetime.frame_builder_close_reason_legacy_sc_compose,
+            ),
+            R::PresentCompletionSignal => (
+                &mut self
+                    .bucket
+                    .frame_builder_close_reason_present_completion_signal,
+                &mut self
+                    .lifetime
+                    .frame_builder_close_reason_present_completion_signal,
+            ),
+            R::SyncWait => (
+                &mut self.bucket.frame_builder_close_reason_sync_wait,
+                &mut self.lifetime.frame_builder_close_reason_sync_wait,
+            ),
+            R::Timeout => (
+                &mut self.bucket.frame_builder_close_reason_timeout,
+                &mut self.lifetime.frame_builder_close_reason_timeout,
+            ),
+            R::Shutdown => (
+                &mut self.bucket.frame_builder_close_reason_shutdown,
+                &mut self.lifetime.frame_builder_close_reason_shutdown,
+            ),
+            R::PinCeiling => (
+                &mut self.bucket.frame_builder_close_reason_pin_ceiling,
+                &mut self.lifetime.frame_builder_close_reason_pin_ceiling,
+            ),
+        };
+        *b += 1;
+        *l += 1;
+    }
+
+    /// Bumped when a frame close followed a Vk error (abort path). In
+    /// B.1 the abort signal is inferred from the drain caller; see
+    /// `KmsBackendV2::drain_frame_builder_telemetry`.
+    pub(crate) fn record_frame_builder_abort(&mut self) {
+        self.bucket.frame_builder_aborts += 1;
+        self.lifetime.frame_builder_aborts += 1;
+    }
+
+    /// Update the pin-count high-water mark. Called once per drained
+    /// `FrameCloseEvent` with `event.pin_count` cast to u64.
+    pub(crate) fn record_frame_builder_active_pins_high_water(&mut self, n: u64) {
+        if n > self.bucket.frame_builder_active_pins_high_water {
+            self.bucket.frame_builder_active_pins_high_water = n;
+        }
+        if n > self.lifetime.frame_builder_active_pins_high_water {
+            self.lifetime.frame_builder_active_pins_high_water = n;
+        }
     }
 
     // ── Phase A: SubmitGroup + retention recording sites ─────────
