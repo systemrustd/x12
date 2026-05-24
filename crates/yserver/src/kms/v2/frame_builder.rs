@@ -174,7 +174,16 @@ impl FrameBuilder {
     /// Open a new frame, acquiring the shared `FenceTicket` from
     /// `SubmitGroup::open_with`. Panics if the frame is already open
     /// (caller is responsible for checking `is_open()` first).
-    pub(crate) fn open_for_paint(&mut self, ticket: FenceTicket) {
+    ///
+    /// `frame_generation` is the captured-at-open value of the
+    /// engine's `acquire_generation` watermark. Every descriptor
+    /// acquisition routed through
+    /// `acquire_descriptor_set_for_frame_or_op` while this frame is
+    /// open tags the descriptor pool with `frame_generation`; the
+    /// SubmittedOp pushed at close uses the same value. The retire
+    /// path's `release_up_to(generation)` then correctly retires
+    /// exactly the frame's pools (Phase B.2 Mechanism 2 watermark).
+    pub(crate) fn open_for_paint(&mut self, ticket: FenceTicket, frame_generation: u64) {
         assert!(
             !self.is_open(),
             "FrameBuilder::open_for_paint while already open — caller must check is_open()"
@@ -183,6 +192,7 @@ impl FrameBuilder {
         self.lifetime_opens = self.lifetime_opens.wrapping_add(1);
         self.open = Some(Box::new(OpenFrame {
             ticket,
+            frame_generation,
             ops: Vec::new(),
             pins: FramePinSet::new(),
             layouts: FrameLayoutTable::new(),
@@ -295,6 +305,17 @@ impl FrameBuilder {
 #[derive(Debug)]
 pub(crate) struct OpenFrame {
     pub(crate) ticket: FenceTicket,
+    /// Phase B.2 Mechanism 2: captured-at-open value of
+    /// `RenderEngineInner::acquire_generation`. The engine bumps
+    /// `acquire_generation` once at `open_for_paint` and stores the
+    /// resulting value here; every descriptor acquisition during the
+    /// open frame uses this value via
+    /// `acquire_descriptor_set_for_frame_or_op`, and the
+    /// `SubmittedOp` pushed at close also uses this value. Replaces
+    /// the legacy "bump at close" timing so the descriptor pool's
+    /// `release_up_to(generation)` watermark coincides with frame
+    /// retirement.
+    pub(crate) frame_generation: u64,
     pub(crate) ops: Vec<RecordedOp>,
     pub(crate) pins: FramePinSet,
     pub(crate) layouts: FrameLayoutTable,
@@ -980,6 +1001,7 @@ mod open_frame_tests {
     fn open_frame_aggregates_all_overlays() {
         let frame = OpenFrame {
             ticket: FenceTicket::for_tests_stub(),
+            frame_generation: 0,
             ops: Vec::new(),
             pins: FramePinSet::new(),
             layouts: FrameLayoutTable::new(),
@@ -1005,7 +1027,7 @@ mod lifecycle_tests {
     #[test]
     fn open_for_paint_transitions_to_open_state_and_bumps_lifetime_opens() {
         let mut fb = FrameBuilder::new();
-        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
         assert!(fb.is_open());
         assert_eq!(fb.lifetime_opens(), 1);
         assert_eq!(fb.lifetime_closes(), 0);
@@ -1015,7 +1037,7 @@ mod lifecycle_tests {
     #[test]
     fn take_open_for_close_returns_frame_and_records_reason() {
         let mut fb = FrameBuilder::new();
-        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
         let frame = fb
             .take_open_for_close(CloseReason::NonPortedPaintOp)
             .expect("frame open");
@@ -1028,7 +1050,7 @@ mod lifecycle_tests {
     #[test]
     fn complete_close_success_bumps_lifetime_closes_and_returns_to_closed() {
         let mut fb = FrameBuilder::new();
-        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
         let _ = fb.take_open_for_close(CloseReason::SceneCompose);
         fb.complete_close_success();
         assert!(!fb.is_open());
@@ -1044,7 +1066,7 @@ mod lifecycle_tests {
     #[test]
     fn would_exceed_pin_ceiling_true_when_open_and_over_default_ceiling() {
         let mut fb = FrameBuilder::new();
-        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
         assert!(fb.would_exceed_pin_ceiling(1025));
         assert!(!fb.would_exceed_pin_ceiling(1024));
     }
@@ -1053,8 +1075,26 @@ mod lifecycle_tests {
     #[should_panic(expected = "while already open")]
     fn open_for_paint_panics_when_already_open() {
         let mut fb = FrameBuilder::new();
-        fb.open_for_paint(FenceTicket::for_tests_stub());
-        fb.open_for_paint(FenceTicket::for_tests_stub());
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
+    }
+
+    /// Phase B.2 Mechanism 2: `open_for_paint` stores the
+    /// caller-supplied `frame_generation` verbatim on the OpenFrame.
+    /// Every descriptor acquisition during the open frame consumes
+    /// this value via `acquire_descriptor_set_for_frame_or_op`; the
+    /// close-path SubmittedOp uses the same value. The retire walk's
+    /// `release_up_to(generation)` then retires exactly the frame's
+    /// pools.
+    #[test]
+    fn open_for_paint_records_frame_generation() {
+        let mut fb = FrameBuilder::new();
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 42);
+        assert_eq!(
+            fb.open.as_ref().expect("open").frame_generation,
+            42,
+            "OpenFrame::frame_generation must capture the caller's value verbatim"
+        );
     }
 }
 

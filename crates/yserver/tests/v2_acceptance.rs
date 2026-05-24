@@ -3736,3 +3736,92 @@ fn v2_frame_builder_renderer_failed_on_submit_failure() {
 fn v2_frame_builder_mixed_sequence_smoke() {
     // TODO: implement once composite_glyphs_for_tests is fully wired.
 }
+
+/// Phase B.2 Task 3 (Mechanism 2 watermark): every descriptor
+/// acquisition during an open frame tags the active descriptor pool
+/// with the frame's captured `frame_generation`; an acquisition with
+/// no frame open bumps `acquire_generation` and uses the new value.
+///
+/// Drives the engine directly via the
+/// `engine_*_for_tests` / `descriptor_pool_ring_*_for_tests` test
+/// helpers added in this task — no real paint op required. The
+/// scenario:
+///   1. Seed `acquire_generation = 10`.
+///   2. Open a frame → bumps to 11, captures `frame_generation = 11`.
+///   3. Two acquires while the frame is open both tag the pool with 11.
+///   4. Close the frame.
+///   5. One more acquire (no frame open) bumps `acquire_generation`
+///      to 12 and tags the pool with 12.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn acquire_descriptor_uses_frame_generation_when_open() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    // (1) Seed a known baseline so the assertions below are
+    //     deterministic and don't depend on test ordering.
+    be.engine_acquire_generation_set_for_tests(10);
+
+    // (2) Open a frame end-to-end (acquire the platform's submit-group
+    //     ticket + drive the engine's open_for_paint). The engine bumps
+    //     `acquire_generation` once and stamps the value as the frame's
+    //     `frame_generation`.
+    be.engine_open_frame_for_paint_for_tests()
+        .expect("engine_open_frame_for_paint_for_tests");
+    let frame_gen = be
+        .engine_open_frame_generation_for_tests()
+        .expect("frame is open");
+    assert_eq!(
+        frame_gen, 11,
+        "open_for_paint must bump acquire_generation (10 -> 11) and capture it"
+    );
+
+    // Build a transient layout for the acquires below.
+    let layout = be
+        .engine_create_test_descriptor_set_layout_for_tests()
+        .expect("create_descriptor_set_layout");
+
+    // (3) Two acquires while the frame is open. Both must tag the
+    //     active pool with the same captured frame_generation (11).
+    let _ds1 = be
+        .engine_acquire_descriptor_set_for_frame_or_op_for_tests(layout)
+        .expect("acquire #1");
+    let _ds2 = be
+        .engine_acquire_descriptor_set_for_frame_or_op_for_tests(layout)
+        .expect("acquire #2");
+    assert_eq!(
+        be.descriptor_pool_ring_high_water_generation_for_tests(),
+        frame_gen,
+        "both acquires must tag the descriptor pool with the open frame's \
+         frame_generation (Phase B.2 Mechanism 2 watermark invariant)",
+    );
+
+    // (4) Close the frame.
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("close_open_frame");
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after close_open_frame_for_timeout"
+    );
+
+    // (5) Acquire one more without an open frame. The helper falls
+    //     through to the legacy per-op fallback branch — bump
+    //     acquire_generation and use the new value (12).
+    let _ds3 = be
+        .engine_acquire_descriptor_set_for_frame_or_op_for_tests(layout)
+        .expect("acquire #3 post-close");
+    assert_eq!(
+        be.descriptor_pool_ring_high_water_generation_for_tests(),
+        12,
+        "post-close acquire (no frame open) must bump acquire_generation \
+         from 11 to 12 and tag the pool with the new value",
+    );
+
+    be.engine_destroy_descriptor_set_layout_for_tests(layout);
+}

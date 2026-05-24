@@ -101,6 +101,21 @@ impl DescriptorPoolRing {
         self.lifetime_resets
     }
 
+    /// Phase B.2 Task 3 test introspection: max `high_water_generation`
+    /// across all currently-resident pools (Active or InFlight). Used
+    /// by the Mechanism 2 watermark integration test to assert that
+    /// every `acquire_set` during an open frame tags the active pool
+    /// with the frame's captured `frame_generation`.
+    ///
+    /// Returns `0` if no pool has yet been acquired against.
+    pub(crate) fn max_high_water_generation(&self) -> u64 {
+        self.pools
+            .iter()
+            .map(|s| s.high_water_generation)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Acquire one descriptor set with `layout`, tagging the issuing
     /// pool with `generation`. Spec § "Architecture" / § "Internals
     /// on acquire_set": (1) ensure an Active pool exists + has

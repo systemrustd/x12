@@ -1746,6 +1746,139 @@ impl KmsBackendV2 {
         self.engine.engine_frame_seq()
     }
 
+    /// Phase B.2 Task 3 (Mechanism 2 watermark): set the engine's
+    /// `acquire_generation` field directly. Used by the integration
+    /// test to seed a known baseline before exercising the
+    /// frame-open + descriptor-acquire dance, so the captured
+    /// `frame_generation` assertions are deterministic.
+    pub fn engine_acquire_generation_set_for_tests(&mut self, value: u64) {
+        self.engine.set_acquire_generation_for_tests(value);
+    }
+
+    /// Phase B.2 Task 3: open a frame end-to-end (acquire the
+    /// platform's submit-group ticket via
+    /// `submit_group_ticket_or_open`, then drive the engine's
+    /// `open_for_paint`). Combines the two steps so the test
+    /// surface doesn't need to expose the crate-private
+    /// `FenceTicket` type. The engine bumps `acquire_generation`
+    /// and stamps the resulting value on the OpenFrame as
+    /// `frame_generation` (Phase B.2 Mechanism 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the platform's fence pool or Vk context is
+    /// missing (test fixture built without Vk).
+    pub fn engine_open_frame_for_paint_for_tests(&mut self) -> Result<(), ash::vk::Result> {
+        let ticket = self.platform.submit_group_ticket_or_open()?;
+        self.engine.open_frame_for_paint_for_tests(ticket);
+        Ok(())
+    }
+
+    /// Phase B.2 Task 3: read the open frame's captured
+    /// `frame_generation`. Returns `None` if no frame is open.
+    pub fn engine_open_frame_generation_for_tests(&self) -> Option<u64> {
+        self.engine.open_frame_generation()
+    }
+
+    /// Phase B.2 Task 3: call
+    /// `RenderEngineInner::acquire_descriptor_set_for_frame_or_op`
+    /// against `layout`. Used by the Mechanism 2 integration test
+    /// to confirm the helper tags the active descriptor pool with
+    /// the open frame's `frame_generation` (or bumps
+    /// `acquire_generation` when no frame is open).
+    ///
+    /// # Errors
+    ///
+    /// Propagates `vkAllocateDescriptorSets` / `vkResetDescriptorPool`
+    /// errors verbatim.
+    pub fn engine_acquire_descriptor_set_for_frame_or_op_for_tests(
+        &mut self,
+        layout: ash::vk::DescriptorSetLayout,
+    ) -> Result<ash::vk::DescriptorSet, ash::vk::Result> {
+        self.engine
+            .acquire_descriptor_set_for_frame_or_op_for_tests(layout)
+    }
+
+    /// Phase B.2 Task 3: build a transient
+    /// `vk::DescriptorSetLayout` (single COMBINED_IMAGE_SAMPLER
+    /// binding, fragment-stage) for the Mechanism 2 integration
+    /// test to feed into
+    /// `engine_acquire_descriptor_set_for_frame_or_op_for_tests`.
+    /// The caller is responsible for calling
+    /// `engine_destroy_descriptor_set_layout_for_tests` after the
+    /// test finishes (the layout outlives the descriptor sets;
+    /// pool reset on backend drop reclaims the sets, but the
+    /// layout handle leaks if not explicitly destroyed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the platform has no Vk context (test
+    /// fixture built without Vk) or `vkCreateDescriptorSetLayout`
+    /// fails.
+    pub fn engine_create_test_descriptor_set_layout_for_tests(
+        &self,
+    ) -> Result<ash::vk::DescriptorSetLayout, ash::vk::Result> {
+        let vk = self
+            .platform
+            .vk
+            .as_ref()
+            .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let bindings = [ash::vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(ash::vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(ash::vk::ShaderStageFlags::FRAGMENT)];
+        let info = ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: VkContext.device is a valid device handle for the
+        //         platform's lifetime; layout creation has no
+        //         outstanding-handle preconditions.
+        unsafe { vk.device.create_descriptor_set_layout(&info, None) }
+    }
+
+    /// Phase B.2 Task 3: destroy a layout created via
+    /// `engine_create_test_descriptor_set_layout_for_tests`.
+    pub fn engine_destroy_descriptor_set_layout_for_tests(
+        &self,
+        layout: ash::vk::DescriptorSetLayout,
+    ) {
+        let Some(vk) = self.platform.vk.as_ref() else {
+            return;
+        };
+        // SAFETY: layout was created by the corresponding
+        //         `create_descriptor_set_layout` helper above on
+        //         this same device; no descriptor sets remain
+        //         active that reference it after the ring's pool
+        //         reset on backend drop.
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    /// Phase B.2 Task 3: descriptor pool ring's max
+    /// `high_water_generation` across all resident pools. Returns 0
+    /// before the first acquire. Used by the Mechanism 2 integration
+    /// test to assert each acquire tagged the pool with the
+    /// frame's captured `frame_generation`.
+    pub fn descriptor_pool_ring_high_water_generation_for_tests(&self) -> u64 {
+        self.engine.descriptor_pool_ring_high_water_generation()
+    }
+
+    /// Phase B.2 Task 3: unconditionally close the open frame with
+    /// `CloseReason::Timeout`. The integration test uses this to
+    /// transition from frame-open → frame-closed without waiting
+    /// on a wall-clock timeout.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the engine's close-path error (rare; renderer
+    /// failure or Vk submit error).
+    pub fn engine_close_open_frame_for_timeout_for_tests(&mut self) -> Result<(), ash::vk::Result> {
+        self.engine
+            .close_open_frame_for_timeout_for_tests(&mut self.store, &mut self.platform)
+            .map_err(|e| match e {
+                crate::kms::v2::engine::RenderError::Vk(r) => r,
+                _ => ash::vk::Result::ERROR_UNKNOWN,
+            })
+    }
+
     /// Phase A T6: size of the current SubmitGroup (number of CBs
     /// buffered and not yet submitted to the Vulkan queue).
     /// Exposed for v2_acceptance regression tests.

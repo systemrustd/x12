@@ -785,6 +785,76 @@ impl RenderEngineInner {
         );
         boxed.release(&self.vk);
     }
+
+    /// Phase B.2 Mechanism 2: acquire a descriptor set tagged with
+    /// the right generation watermark. When a frame is open, every
+    /// acquire shares the frame's captured `frame_generation`; the
+    /// SubmittedOp pushed at close carries the same value, so the
+    /// retire walk's `release_up_to(op.generation)` retires exactly
+    /// the frame's pools. When no frame is open (legacy per-op
+    /// fallback path), bump `acquire_generation` and use the new
+    /// value — same shape as the pre-B.2 code.
+    ///
+    /// **Load-bearing safety invariant** (codex round 3 finding 3):
+    /// `DescriptorPoolRing::acquire_set(layout, generation)` only
+    /// allocates from pools whose state is `Active` (currently
+    /// growing — never seen `vkResetDescriptorPool`) OR was just
+    /// transitioned `Free → Active` via `ensure_active_with_capacity`
+    /// after the ring's `release_up_to` reset it. The ring's
+    /// `release_up_to(retired_watermark)` only resets pools whose
+    /// `high_water_generation <= retired_watermark` (via
+    /// `vkResetDescriptorPool`), and Vulkan
+    /// VUID-vkResetDescriptorPool-descriptorPool-00313 mandates that
+    /// all CBs referencing the pool's sets must have completed
+    /// execution before reset. Therefore:
+    ///
+    /// - **Active pool case:** allocating from a still-growing pool
+    ///   produces a handle to backing storage that has NEVER been
+    ///   written to by `vkAllocateDescriptorSets` before; no prior
+    ///   CB can possibly reference it.
+    /// - **Just-reset pool case:** the reset guarantees no in-flight
+    ///   CB depends on any of the pool's prior sets; the new
+    ///   `vkAllocateDescriptorSets` call produces fresh handles
+    ///   whose backing storage is also CB-independent.
+    ///
+    /// Either way, the descriptor set returned by `acquire_set` has
+    /// zero in-flight CB dependencies. `vkUpdateDescriptorSets`
+    /// against it at op-append time is safe per Vulkan host-mutation
+    /// rules (VUID-vkUpdateDescriptorSets-pDescriptorWrites-06493):
+    /// the targeted set must not be used by any pending command
+    /// buffer.
+    ///
+    /// **This invariant is load-bearing for B.2.** If a future
+    /// refactor changes the ring to recycle descriptor sets without
+    /// going through reset (e.g. a hypothetical "fast-reuse" path),
+    /// `vkUpdateDescriptorSets`-at-append would become unsafe. The
+    /// audit at
+    /// `crates/yserver/src/kms/v2/descriptor_pool_ring.rs` (Task 3
+    /// audit gate) confirms the current ring matches this invariant.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `vkAllocateDescriptorSets` / `vkResetDescriptorPool`
+    /// errors verbatim. Callers convert to `RenderError::Vk`.
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 3: helper lands now for B.3+ render-composite porting. \
+                  Task 11 in B.2 routes render_composite through \
+                  RenderPipeline::allocate_descriptor_for_views_into_ring, \
+                  not this helper. The frame-open branch becomes hot in B.3."
+    )]
+    pub(crate) fn acquire_descriptor_set_for_frame_or_op(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let generation = if let Some(open) = self.frame_builder.open.as_ref() {
+            open.frame_generation
+        } else {
+            self.acquire_generation = self.acquire_generation.saturating_add(1);
+            self.acquire_generation
+        };
+        self.descriptor_pool_ring.acquire_set(layout, generation)
+    }
 }
 
 impl RenderEngine {
@@ -1262,10 +1332,16 @@ impl RenderEngine {
         }
 
         // Park a SubmittedOp into pending_group_ops.
+        //
+        // Phase B.2 Mechanism 2: consume the frame's captured-at-open
+        // `frame_generation` instead of bumping at close. Every
+        // descriptor acquisition that ran during the open frame
+        // tagged the descriptor pool with this same value, so the
+        // retire walk's `release_up_to(op.generation)` retires
+        // exactly the frame's pools (and no others).
         {
             let inner = self.inner.as_mut().expect("inner");
-            inner.acquire_generation += 1;
-            let generation = inner.acquire_generation;
+            let generation = open_frame.frame_generation;
             inner.pending_group_ops.push(SubmittedOp {
                 cb,
                 ticket: frame_ticket.clone(),
@@ -1523,6 +1599,96 @@ impl RenderEngine {
         self.inner
             .as_ref()
             .map_or(0, |i| i.descriptor_pool_ring.pool_count())
+    }
+
+    /// Phase B.2 Task 3 test introspection: maximum `high_water_generation`
+    /// across the descriptor pool ring's resident pools. The Mechanism 2
+    /// integration test reads this to assert that every `acquire_set`
+    /// during an open frame tags the active pool with the frame's
+    /// captured `frame_generation`.
+    pub(crate) fn descriptor_pool_ring_high_water_generation(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.descriptor_pool_ring.max_high_water_generation())
+    }
+
+    /// Phase B.2 Task 3 test introspection: set `acquire_generation`
+    /// directly. The Mechanism 2 integration test uses this to seed
+    /// a known baseline before opening a frame so the assertions on
+    /// the captured `frame_generation` are deterministic.
+    pub(crate) fn set_acquire_generation_for_tests(&mut self, value: u64) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.acquire_generation = value;
+        }
+    }
+
+    /// Phase B.2 Task 3 test introspection: read the open frame's
+    /// captured `frame_generation`. Returns `None` if no frame is
+    /// open. Used by the Mechanism 2 watermark integration test to
+    /// confirm the open-time bump landed.
+    pub(crate) fn open_frame_generation(&self) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.frame_builder.open.as_ref().map(|o| o.frame_generation))
+    }
+
+    /// Phase B.2 Task 3 test introspection: drive the engine's
+    /// frame-builder open path. Bumps `acquire_generation` and calls
+    /// `FrameBuilder::open_for_paint(ticket, frame_generation)` —
+    /// the same shape the production callers use. Used by the
+    /// Mechanism 2 integration test to exercise the watermark
+    /// without going through a real paint op.
+    pub(crate) fn open_frame_for_paint_for_tests(&mut self, ticket: FenceTicket) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        debug_assert!(
+            !inner.frame_builder.is_open(),
+            "open_frame_for_paint_for_tests while a frame is open"
+        );
+        inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+        let frame_generation = inner.acquire_generation;
+        inner.frame_builder.open_for_paint(ticket, frame_generation);
+    }
+
+    /// Phase B.2 Task 3 test introspection: invoke
+    /// `RenderEngineInner::acquire_descriptor_set_for_frame_or_op`
+    /// with a caller-supplied layout. Returns the raw Vk handle.
+    /// The Mechanism 2 integration test uses this to assert the
+    /// helper's behavior (uses `open.frame_generation` when a frame
+    /// is open; bumps `acquire_generation` otherwise).
+    pub(crate) fn acquire_descriptor_set_for_frame_or_op_for_tests(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        inner.acquire_descriptor_set_for_frame_or_op(layout)
+    }
+
+    /// Phase B.2 Task 3 test introspection: close the open frame
+    /// with `CloseReason::Timeout`. Mirrors
+    /// `close_open_frame_if_timed_out` but unconditionally closes
+    /// (so the test doesn't have to wait for the wall-clock timeout
+    /// to elapse).
+    pub(crate) fn close_open_frame_for_timeout_for_tests(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), RenderError> {
+        if !self
+            .inner
+            .as_ref()
+            .is_some_and(|i| i.frame_builder.is_open())
+        {
+            return Ok(());
+        }
+        match self.close_open_frame(store, platform, super::frame_builder::CloseReason::Timeout)? {
+            super::frame_builder::CloseOutcome::Submitted { .. }
+            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+        }
     }
 
     /// Phase A Task 3.5: drain all queued `FlushOutcome` records
@@ -4892,13 +5058,21 @@ impl RenderEngine {
         // (3) Open the frame if not open. `submit_group_ticket_or_open`
         //     either returns the existing shared ticket (if a sibling
         //     op already opened the group) or opens a fresh one.
+        //
+        //     Phase B.2 Mechanism 2: bump `acquire_generation` once at
+        //     open and capture the resulting value on the OpenFrame.
+        //     Every descriptor acquisition during the open frame uses
+        //     this captured value; the close-path SubmittedOp uses the
+        //     same value.
         if !inner.frame_builder.is_open() {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
             let ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
-            inner.frame_builder.open_for_paint(ticket);
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
         }
         let inner = self.inner.as_mut().expect("inner");
 
@@ -5010,10 +5184,17 @@ impl RenderEngine {
                 platform,
                 super::frame_builder::CloseReason::PinCeiling,
             )?;
-            // Re-open a fresh frame.
+            // Re-open a fresh frame. Phase B.2 Mechanism 2: bump
+            // acquire_generation at open and capture the value on
+            // the fresh OpenFrame (same shape as the initial open
+            // above).
             let new_ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
-            inner.frame_builder.open_for_paint(new_ticket);
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner
+                .frame_builder
+                .open_for_paint(new_ticket, frame_generation);
             let frame_ticket_reopened = inner
                 .frame_builder
                 .open
