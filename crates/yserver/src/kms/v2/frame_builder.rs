@@ -381,3 +381,139 @@ mod op_tests {
         assert_eq!(op.insert_entry.pen_top, 14);
     }
 }
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LayoutOverlayEntry {
+    pub(crate) pre_frame_layout: vk::ImageLayout,
+    pub(crate) current_in_frame_layout: vk::ImageLayout,
+}
+
+/// Per-frame layout overlay. Mutated on each `record_layout_transition`
+/// from a ported paint op (none in B.1 — the text pipeline's recorder
+/// embeds its own barriers — but the structure is the load-bearing
+/// answer to open question 3 and lands in B.1 so B.2 can fold ported
+/// `render_composite` / `render_fill` paths in without re-architecting).
+///
+/// Atlas image layout is tracked separately: the overlay carries a
+/// single `Option<LayoutOverlayEntry>` for the atlas because there's
+/// exactly one atlas per engine, and `V2GlyphAtlas::current_layout`
+/// is the single source of truth that the commit step writes back.
+#[derive(Debug, Default)]
+pub(crate) struct FrameLayoutTable {
+    pub(crate) drawables: HashMap<DrawableId, LayoutOverlayEntry>,
+    pub(crate) atlas: Option<LayoutOverlayEntry>,
+}
+
+impl FrameLayoutTable {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// First-touch snapshot for a drawable. `pre_frame_layout` is the
+    /// value the caller read out of `Drawable::storage.current_layout`
+    /// at the moment of first append-in-frame.
+    pub(crate) fn first_touch_drawable(
+        &mut self,
+        id: DrawableId,
+        pre_frame_layout: vk::ImageLayout,
+    ) {
+        self.drawables.entry(id).or_insert(LayoutOverlayEntry {
+            pre_frame_layout,
+            current_in_frame_layout: pre_frame_layout,
+        });
+    }
+
+    pub(crate) fn set_drawable_in_frame(&mut self, id: DrawableId, layout: vk::ImageLayout) {
+        if let Some(entry) = self.drawables.get_mut(&id) {
+            entry.current_in_frame_layout = layout;
+        } else {
+            debug_assert!(
+                false,
+                "set_drawable_in_frame without first_touch_drawable for {:?}",
+                id
+            );
+        }
+    }
+
+    pub(crate) fn first_touch_atlas(&mut self, pre_frame_layout: vk::ImageLayout) {
+        if self.atlas.is_none() {
+            self.atlas = Some(LayoutOverlayEntry {
+                pre_frame_layout,
+                current_in_frame_layout: pre_frame_layout,
+            });
+        }
+    }
+
+    pub(crate) fn set_atlas_in_frame(&mut self, layout: vk::ImageLayout) {
+        match self.atlas.as_mut() {
+            Some(entry) => entry.current_in_frame_layout = layout,
+            None => debug_assert!(false, "set_atlas_in_frame without first_touch_atlas"),
+        }
+    }
+
+    /// Query the effective layout for `id` from the perspective of
+    /// the next in-frame op that will touch it. Falls back to
+    /// `storage_fallback` (the caller passes
+    /// `drawable.storage.current_layout` if the drawable isn't in
+    /// the overlay yet).
+    pub(crate) fn current_layout_for_drawable(
+        &self,
+        id: DrawableId,
+        storage_fallback: vk::ImageLayout,
+    ) -> vk::ImageLayout {
+        match self.drawables.get(&id) {
+            Some(entry) => entry.current_in_frame_layout,
+            None => storage_fallback,
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn first_touch_drawable_snapshots_pre_frame_and_in_frame_equal() {
+        let mut t = FrameLayoutTable::new();
+        t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let entry = t.drawables.get(&DrawableId::for_tests(7)).unwrap();
+        assert_eq!(entry.pre_frame_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(
+            entry.current_in_frame_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+    }
+
+    #[test]
+    fn second_touch_does_not_overwrite_pre_frame() {
+        let mut t = FrameLayoutTable::new();
+        t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::UNDEFINED);
+        t.set_drawable_in_frame(DrawableId::for_tests(7), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        t.first_touch_drawable(DrawableId::for_tests(7), vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let entry = t.drawables.get(&DrawableId::for_tests(7)).unwrap();
+        assert_eq!(entry.pre_frame_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(
+            entry.current_in_frame_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+    }
+
+    #[test]
+    fn current_layout_for_drawable_falls_back_to_storage_when_untouched() {
+        let t = FrameLayoutTable::new();
+        let got = t.current_layout_for_drawable(DrawableId::for_tests(8), vk::ImageLayout::PRESENT_SRC_KHR);
+        assert_eq!(got, vk::ImageLayout::PRESENT_SRC_KHR);
+    }
+
+    #[test]
+    fn atlas_first_touch_then_set_in_frame() {
+        let mut t = FrameLayoutTable::new();
+        t.first_touch_atlas(vk::ImageLayout::UNDEFINED);
+        t.set_atlas_in_frame(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let a = t.atlas.unwrap();
+        assert_eq!(a.pre_frame_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(a.current_in_frame_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+}
