@@ -2790,6 +2790,130 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         model. See `2026-05-23-frame-builder-submit-rate-design.md`
         § "Phase B" for the design sketch.
 
+  - **Phase B sub-phase B.1 — IMPLEMENTED 2026-05-24.** Plan
+    `docs/superpowers/plans/2026-05-24-frame-builder-phase-b1.md`
+    landed in 25 commits on `feature/frame-builder-submit-rate`
+    (`eb399c2` … `ea24914` + lint cleanup `f6dd508`). Spec
+    `docs/superpowers/specs/2026-05-24-frame-builder-phase-b-design.md`.
+
+    **Structural changes:**
+      - New `FrameBuilder` on `RenderEngine` (`Closed ↔ OpenForPaint`
+        lifecycle), with `RecordedOp` enum (`CompositeGlyphs`,
+        `GlyphUpload`, `LayoutTransition`), `FramePinSet` (Arc-pinned
+        `StagingBuffer`), `FrameLayoutTable` (pre-frame/in-frame
+        snapshot for rollback), `TouchedDrawables`,
+        `PendingGlyphInserts`, `FrameSubmittedRecord`, `CloseReason`
+        (8 variants), `CloseOutcome`, `FrameCloseEvent`.
+      - **Invariant M1**: `SubmitGroup::new()` default cap 16 → 1.
+        Every queue submission carries exactly one CB for the
+        duration of B.1–B.4. Bee MATE survives this trivially
+        (the `cap=1` row from the 2026-05-23 capture). Other
+        platforms see a temporary submit-rate regression that
+        recovers at B.5 when SubmitGroup retires entirely. The
+        legacy `YSERVER_SUBMIT_GROUP_MAX_SIZE` env override was
+        removed (it could re-enable the multi-CB shape that bee
+        faults on).
+      - **Invariant M2**: `RenderEngine::close_open_frame_for_non_ported_op`
+        helper wired at the top of every non-ported paint op
+        (`fill_rect`, `fill_rect_batch`, `logic_fill`, `copy_area`,
+        `cow_copy_area`, `put_image`, `image_text`, `render_composite`,
+        `render_fill_rectangles`, `render_traps_or_tris`). No-op when
+        no frame is open (preserves existing batch coalescing); when
+        a frame is open, flushes cow/render batches first then
+        closes.
+      - **Invariant M3**: `maybe_composite` closes the open frame
+        before flushing the legacy compose path.
+      - **Close triggers wired** (8): M2, M3, PRESENT-completion at
+        `enqueue_present_completion`, get_image SyncWait, 16 ms
+        timeout (env knob `YSERVER_FRAME_BUILDER_TIMEOUT_MS`),
+        shutdown via new `RenderEngine::shutdown`, pin-set ceiling
+        (1024 default, log-once latch).
+      - **`composite_glyphs` ported** through the FrameBuilder.
+        Glyph upload commands + draw commands record into one CB
+        per frame, submitted via the SubmitGroup's cap=1 auto-flush
+        — one `vkQueueSubmit2` per frame's composite_glyphs burst,
+        regardless of glyph miss count.
+      - **3-pass close walk** in `RenderEngine::close_open_frame`:
+        resource pass (no-op in B.1) → record pass → finalise pass.
+        Commit-after-`flush_submit_group`-Ok ordering. All 4 error
+        paths roll back drawable layouts, drawable `last_render_ticket`,
+        atlas layout, and atlas `last_render_ticket`; pending glyph
+        inserts drop on failure.
+      - **`pending_frames` retirement queue** parallel to
+        `submitted`. `poll_retired` drains both. The frame's
+        `Arc<StagingBuffer>` pins drop only after the frame's
+        FenceTicket signals.
+      - **Telemetry**: `frame_builder_opens` / `closes` / `aborts` /
+        `ops_per_frame_total|max|hist[8]` / `glyph_uploads_per_frame_*`
+        / `active_pins_high_water` / 8 per-CloseReason counters.
+        `drain_frame_builder_telemetry()` helper invoked at every
+        close-driving backend site (`maybe_composite`,
+        `enqueue_present_completion`, `get_image`, `disable_output`,
+        `render_composite_glyphs`).
+      - **Gate**: `YSERVER_FRAME_BUILDER` defaults ON (Task 24's
+        `ea24914` flips the bee fix into production); set
+        `YSERVER_FRAME_BUILDER=off` (or `0`/`false`/`no`) as the
+        kill-switch.
+
+    **Spec-side closure (5 codex review rounds applied to the plan
+    before any implementation landed):**
+      - Commit-after-flush-Ok ordering (R1).
+      - M2 batch ordering relative to existing cow/render batches (R1).
+      - Layout overlay first-touch at append time (R1).
+      - Gate-flip isolated to a single bisect-clean commit (R1).
+      - PRESENT-completion close trigger at the real semaphore submit
+        site (`backend.rs::enqueue_present_completion`), not the
+        unrelated `attach_cow_present_completion` (R1).
+      - Atlas rollback invoked from every error path (R2).
+      - Pin-ceiling enforcement with pre-pass HashSet dedupe before
+        any pack/allocate (R2/R3/R4).
+      - M2 helper conditional on frame-open to preserve batch
+        coalescing (R3).
+      - Telemetry drain coverage at every close-driving call site
+        (R3).
+      - Pixel-length validation before atlas pack (R5).
+
+    **Acceptance:**
+      - **Implementation gates** (already validated): all 25 commits
+        green at HEAD; `cargo build -p yserver` clean; `cargo test
+        --workspace` shows 1038 tests passing (the existing 242
+        `kms::v2` lib tests, plus 23 new `frame_builder` unit tests
+        across state/op/pin/layout/touched/glyph_insert/open_frame/
+        lifecycle modules); `cargo +nightly fmt` clean;
+        `cargo clippy -- -W clippy::pedantic` clean on the B.1
+        surface (pre-existing warnings outside B.1 left alone for
+        independent cleanup).
+      - **Hardware gates** (user-driven, pending):
+        - **bee MATE-load survival** — boot MATE with default
+          `YSERVER_FRAME_BUILDER=on`, drag for 30 s, expect zero
+          `ERROR_DEVICE_LOST` and zero RADV GPUVM faults. Same
+          telemetry + submit-trace harness as the 2026-05-23
+          capture; compare composite_glyphs submit rate.
+        - **yoga / iMac / fuji regression check** — same MATE drag,
+          expect no new `ERROR_DEVICE_LOST` and `queue_submit2/s`
+          ≤ Phase A peak. Non-glyph paint ops on these platforms
+          regress temporarily (cap=1) and recover at B.5.
+        - **silence dual-output regression check** — confirm both
+          outputs present correctly via the existing per-output
+          compose path (B.1 doesn't fold compose; single-output
+          is the only flavor exercised).
+
+    **Open follow-ups:**
+      - Two integration tests (`v2_frame_builder_renderer_failed_on_submit_failure`,
+        `v2_frame_builder_mixed_sequence_smoke`) are SCAFFOLDED as
+        `#[ignore]` placeholders pending end-to-end test-side glyph
+        fabrication helpers. Structural correctness is verified by
+        spec review of Task 12's 4 error-path rollbacks + Task 14's
+        M2 wiring + Task 15's first-touch overlays.
+      - Q1 (op variant sizing — 256 B test gate enforced).
+      - Q3 (gate retirement timing) — env var stays as kill-switch
+        through B.4; final removal at B.5 alongside SubmitGroup
+        deletion.
+      - Q5 (semaphore export ordering) — the implementation preserves
+        the submit-then-export shape Phase A established; the Q5
+        SYNC_FD pass-through test is deferred to the scaffolded
+        renderer-failed integration test bucket.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
