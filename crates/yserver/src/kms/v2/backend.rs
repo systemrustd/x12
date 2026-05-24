@@ -1627,11 +1627,17 @@ impl KmsBackendV2 {
 
         // Drain the close-event queue.
         for event in self.engine.drain_frame_close_events() {
-            self.telemetry.record_frame_builder_close(
-                event.reason,
-                event.ops_in_frame,
-                event.glyph_uploads_in_frame,
-            );
+            if event.aborted {
+                self.telemetry.record_frame_builder_abort();
+            } else {
+                self.telemetry.record_frame_builder_close(
+                    event.reason,
+                    event.ops_in_frame,
+                    event.glyph_uploads_in_frame,
+                );
+            }
+            // Aborts also record pin_count high water — those pins existed
+            // before the failure dropped them.
             self.telemetry.record_frame_builder_active_pins_high_water(
                 u64::try_from(event.pin_count).unwrap_or(u64::MAX),
             );

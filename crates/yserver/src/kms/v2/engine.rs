@@ -936,7 +936,20 @@ impl RenderEngine {
         let cb = {
             let inner = self.inner.as_mut().expect("inner");
             match begin_op_cb(inner, platform) {
-                Ok((cb, _ticket)) => cb,
+                Ok((cb, op_ticket)) => {
+                    // Phase B.1 invariant: the begin_op_cb ticket MUST be the
+                    // same fence the frame opened against. If they diverge,
+                    // the SubmitGroup was flushed mid-frame (no current
+                    // code path does that, but a future regression would
+                    // park pins on the wrong fence).
+                    debug_assert_eq!(
+                        op_ticket.fence(),
+                        frame_ticket.fence(),
+                        "begin_op_cb returned a different fence than the open frame's — \
+                         SubmitGroup was flushed mid-frame?"
+                    );
+                    cb
+                }
                 Err(e) => {
                     rollback_pre_submit(store, &mut open_frame);
                     let inner_post = self.inner.as_mut().expect("inner");
@@ -945,6 +958,17 @@ impl RenderEngine {
                         open_frame.layouts.atlas,
                         open_frame.atlas_prev_ticket_snapshot.clone(),
                     );
+                    if inner_post.pending_frame_close_events.len() < 1024 {
+                        inner_post.pending_frame_close_events.push(
+                            super::frame_builder::FrameCloseEvent {
+                                reason,
+                                ops_in_frame: open_frame.ops.len(),
+                                glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                                pin_count: open_frame.pins.len(),
+                                aborted: true,
+                            },
+                        );
+                    }
                     inner_post.frame_builder.complete_close_failure();
                     return Err(e);
                 }
@@ -984,6 +1008,17 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            if inner_post.pending_frame_close_events.len() < 1024 {
+                inner_post.pending_frame_close_events.push(
+                    super::frame_builder::FrameCloseEvent {
+                        reason,
+                        ops_in_frame: open_frame.ops.len(),
+                        glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                        pin_count: open_frame.pins.len(),
+                        aborted: true,
+                    },
+                );
+            }
             inner_post.frame_builder.complete_close_failure();
             return Err(e);
         }
@@ -1009,6 +1044,17 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            if inner_post.pending_frame_close_events.len() < 1024 {
+                inner_post.pending_frame_close_events.push(
+                    super::frame_builder::FrameCloseEvent {
+                        reason,
+                        ops_in_frame: open_frame.ops.len(),
+                        glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                        pin_count: open_frame.pins.len(),
+                        aborted: true,
+                    },
+                );
+            }
             inner_post.frame_builder.complete_close_failure();
             return Err(e);
         }
@@ -1061,6 +1107,7 @@ impl RenderEngine {
                                 ops_in_frame: op_count,
                                 glyph_uploads_in_frame: glyph_uploads,
                                 pin_count,
+                                aborted: false,
                             },
                         );
                     }
@@ -1092,6 +1139,7 @@ impl RenderEngine {
                             ops_in_frame,
                             glyph_uploads_in_frame,
                             pin_count,
+                            aborted: true,
                         });
                 }
                 inner.frame_builder.complete_close_failure();
@@ -1179,6 +1227,14 @@ impl RenderEngine {
     /// flip via this method.
     pub(crate) fn set_frame_builder_enabled(&mut self, enabled: bool) {
         if let Some(inner) = self.inner.as_mut() {
+            // Phase B.1 invariant: flipping the gate while a frame is
+            // open would route subsequent composite_glyphs to the legacy
+            // path without closing the open frame first — undefined
+            // ordering. Test fixtures must close+drain before toggling.
+            debug_assert!(
+                !inner.frame_builder.is_open(),
+                "set_frame_builder_enabled while a frame is open — close+drain first"
+            );
             inner.frame_builder_enabled = enabled;
         }
     }
@@ -6832,11 +6888,24 @@ fn begin_op_cb(
     let cb = unsafe { device.allocate_command_buffers(&alloc_info)? }[0];
     let begin =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    unsafe { device.begin_command_buffer(cb, &begin)? };
+    if let Err(e) = unsafe { device.begin_command_buffer(cb, &begin) } {
+        // SAFETY: cb was just allocated from `pool`, never submitted;
+        // safe to free in Initial state.
+        unsafe { device.free_command_buffers(pool, &[cb]) };
+        return Err(e.into());
+    }
     // Phase A: shared ticket comes from the open submit group. With
     // max_size = 1, the group auto-closes after one append; with
     // max_size > 1 (post-Task 4), N appends share the same ticket.
-    let ticket = platform.submit_group_ticket_or_open()?;
+    let ticket = match platform.submit_group_ticket_or_open() {
+        Ok(t) => t,
+        Err(e) => {
+            // SAFETY: cb was begun but never submitted; safe to
+            // free in Recording state.
+            unsafe { device.free_command_buffers(pool, &[cb]) };
+            return Err(e.into());
+        }
+    };
     Ok((cb, ticket))
 }
 

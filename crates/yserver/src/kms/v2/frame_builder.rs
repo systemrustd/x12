@@ -941,4 +941,9 @@ pub(crate) struct FrameCloseEvent {
     pub(crate) ops_in_frame: usize,
     pub(crate) glyph_uploads_in_frame: u32,
     pub(crate) pin_count: usize,
+    /// Phase B.1: `true` if this close came from a failure path
+    /// (`renderer_failed`, flush_submit_group Err, recorder error).
+    /// Drained by the backend telemetry helper which routes to
+    /// `record_frame_builder_abort()`.
+    pub(crate) aborted: bool,
 }
