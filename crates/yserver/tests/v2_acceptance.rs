@@ -3687,3 +3687,51 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
     // early-returns without firing M3 because the scene's dirty bit
     // isn't set in this minimal test fixture.
 }
+
+/// Phase B.1 Task 22: forced submit failure rolls back overlays.
+///
+/// SCAFFOLDED — needs full test-side glyph fabrication + helpers
+/// (composite_glyphs_for_tests, synth_n_unique_glyphs, force_next_submit_failure,
+/// drawable_current_layout_for_tests, drawable_last_render_ticket_for_tests,
+/// renderer_failed_for_tests, glyph_atlas_lookup_for_tests).
+///
+/// Intent: trip the close-failure path inside `RenderEngine::close_open_frame`
+/// (via Phase A's `force_next_submit_failure_for_integration_tests` latch),
+/// then assert:
+/// - `renderer_failed` is set on the platform.
+/// - dst drawable's `last_render_ticket` restored to pre-frame value.
+/// - dst drawable's `storage.current_layout` restored to pre-frame value.
+/// - The atlas cache does NOT contain the glyph keys we would have inserted
+///   (pending_glyph_inserts dropped on failure).
+///
+/// The structural correctness is verified by spec review of Task 12's
+/// 4 error-path rollbacks + Task 15's first-touch overlay snapshots.
+/// This integration test will exercise it end-to-end once the test
+/// infrastructure catches up.
+#[test]
+#[ignore = "scaffold — needs test-side glyph fabrication + helpers"]
+fn v2_frame_builder_renderer_failed_on_submit_failure() {
+    // TODO: implement once composite_glyphs_for_tests is fully wired.
+}
+
+/// Phase B.1 Task 23: realistic ordering produces exactly the expected
+/// sequence of submits.
+///
+/// SCAFFOLDED — needs `composite_glyphs_for_tests`, `synth_n_unique_glyphs`,
+/// `fill_rect_for_tests`, `platform_queue_submit2_count_for_tests`,
+/// `frame_builder_is_open_for_tests` (last one exists from Task 15).
+///
+/// Intent: exercise the M2 close-on-non-ported-paint path:
+/// 1. fill_rect (non-ported) → SubmitGroup cap=1 → 1 submit, no frame.
+/// 2. composite_glyphs (ported) → opens the frame, no submit yet.
+/// 3. fill_rect again → M2 closes the frame (1 submit) + fill_rect submits (1 submit) = 2.
+///
+/// Asserts the submit count delta sequence: 0 → 1 → 1 → 3.
+///
+/// The structural correctness is verified by spec review of Task 14's
+/// M2 wiring at 10 entry points + Task 13's M3 wiring.
+#[test]
+#[ignore = "scaffold — needs test-side glyph + fill_rect helpers"]
+fn v2_frame_builder_mixed_sequence_smoke() {
+    // TODO: implement once composite_glyphs_for_tests is fully wired.
+}
