@@ -581,13 +581,12 @@ struct RenderEngineInner {
     /// into, then the composite pass samples as a mask. Grows on
     /// demand (per-bbox). Lazy.
     ///
-    /// NOTE: `ensure_image_size_returning_old` returns the old image
-    /// as a `BatchResource` for the caller to defer-release;
-    /// v2 currently drops the returned `Box<dyn BatchResource>` on
-    /// the floor — same shape as the `dst_readback` grow leak in
-    /// Stage 3c.2. A real fix needs a per-engine retired-resources
-    /// list that drains on next `poll_retired`. Tracked for the
-    /// Stage 5 polish cycle.
+    /// Growth previously dropped the returned
+    /// `Box<dyn BatchResource>` on the floor; B.2 Task 1
+    /// ([`RenderEngineInner::adopt_retired_resource_for_gpu_retirement`])
+    /// now routes it to the right fence-gated owner so the old
+    /// backing's Vk handles are released only after the fence that
+    /// last sampled them signals.
     mask_scratch: Option<crate::kms::vk::mask_scratch::MaskScratch>,
     /// Stage 3c: drawable view cache (plan §1). Keyed by
     /// `(DrawableId, SamplerConfig, SwizzleClass)`. Views are
@@ -724,6 +723,27 @@ impl RenderEngineInner {
     ///   AND `submitted` is empty. Safe because no in-flight CB
     ///   can still be sampling the retired backing.
     ///
+    ///   **M1 invariant assumption:** case (c) additionally
+    ///   requires that `pending_group_ops` is empty at call time.
+    ///   Under the Phase B M1 invariant (`submit_group_max_size = 1`
+    ///   in production → auto-flush per op via
+    ///   [`Self::maybe_auto_flush_submit_group`]), the parked
+    ///   `Vec<SubmittedOp>` is drained at every op boundary, so a
+    ///   grow that fires inside a paint op finds it empty by the
+    ///   time the engine returns to a quiescent state. Tests that
+    ///   raise the cap (e.g. `submit_group_max_size_for_tests(16)`)
+    ///   can violate this invariant by leaving a previous paint
+    ///   op's CB parked in `pending_group_ops` with a reference to
+    ///   the OLD scratch's `vk::Image` handle; case (c) would then
+    ///   destroy that handle before the parked CB submits. If a
+    ///   later sub-phase (B.3+) relaxes M1 to allow cap>1 in
+    ///   production, this helper must grow a fourth tier that
+    ///   routes the retired Box onto
+    ///   `pending_group_ops.back_mut()`'s retired-resources slot
+    ///   (the type would need a `SubmittedOp`-style extension).
+    ///   The `debug_assert!` below catches the regression in
+    ///   debug builds.
+    ///
     /// `None` input is a no-op (the common case: no grow fired).
     #[allow(
         dead_code,
@@ -750,6 +770,19 @@ impl RenderEngineInner {
             return;
         }
         // (c) Nothing in flight — safe to release immediately.
+        //     M1 invariant: pending_group_ops MUST be empty here.
+        //     If a future sub-phase relaxes cap=1 auto-flush and a
+        //     parked op's CB still references the retired backing,
+        //     this release would destroy a live Vk handle. See the
+        //     docstring above for the fix shape (fourth tier onto
+        //     pending_group_ops.back_mut()).
+        debug_assert!(
+            self.pending_group_ops.is_empty(),
+            "adopt_retired_resource_for_gpu_retirement case (c): \
+             pending_group_ops must be empty under M1 (cap=1 \
+             auto-flush per op). If B.3+ relaxes M1, add a fourth \
+             tier that routes onto pending_group_ops.back_mut()."
+        );
         boxed.release(&self.vk);
     }
 }
