@@ -615,6 +615,11 @@ struct RenderEngineInner {
     /// frame builder is in play. Walked by `poll_retired` and
     /// `drain_all`.
     pending_frames: std::collections::VecDeque<super::frame_builder::FrameSubmittedRecord>,
+    /// Phase B.1: telemetry events from close paths. Drained by the
+    /// backend via `RenderEngine::drain_frame_close_events()`. Task 21
+    /// wires the consumer side. Bounded at 1024 to prevent unbounded
+    /// growth if maybe_composite stops ticking.
+    pending_frame_close_events: Vec<super::frame_builder::FrameCloseEvent>,
     /// Phase B.1: monotonic frame sequence for telemetry attribution.
     /// Bumped on every `FrameBuilder::close_into_cb` success.
     frame_seq: u64,
@@ -667,6 +672,7 @@ impl RenderEngine {
                 pending_group_ops: Vec::new(),
                 pending_flush_outcomes: Vec::new(),
                 pending_frames: std::collections::VecDeque::new(),
+                pending_frame_close_events: Vec::new(),
                 frame_seq: 0,
                 frame_builder: super::frame_builder::FrameBuilder::new(),
             }),
@@ -852,6 +858,213 @@ impl RenderEngine {
                 .map_err(RenderError::Vk)?;
         }
         Ok(())
+    }
+
+    /// Phase B.1 Task 21: drain queued FrameCloseEvents for telemetry.
+    /// Returns empty when no events queued (or when engine is stubbed).
+    pub(crate) fn drain_frame_close_events(
+        &mut self,
+    ) -> Vec<super::frame_builder::FrameCloseEvent> {
+        self.inner
+            .as_mut()
+            .map(|i| std::mem::take(&mut i.pending_frame_close_events))
+            .unwrap_or_default()
+    }
+
+    /// Phase B.1 Task 12: close the open frame (if any) for `reason`,
+    /// replay its op list into ONE primary CB, submit through the
+    /// SubmitGroup (cap=1 → one vkQueueSubmit2), and ONLY THEN park
+    /// the pin set onto `pending_frames` + commit overlays. On any
+    /// failure before submit-success, the local OpenFrame drops
+    /// (pins evaporate, overlays evaporate); rollback writes
+    /// `pre_frame_layout` values back to storage where the recorder
+    /// already mutated them.
+    pub(crate) fn close_open_frame(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        reason: super::frame_builder::CloseReason,
+    ) -> Result<super::frame_builder::CloseOutcome, RenderError> {
+        // Take the open frame from the FrameBuilder.
+        let (mut open_frame, frame_seq) = {
+            let inner = match self.inner.as_mut() {
+                Some(i) => i,
+                None => return Ok(super::frame_builder::CloseOutcome::AlreadyClosed),
+            };
+            let Some(open_frame_box) = inner.frame_builder.take_open_for_close(reason) else {
+                return Ok(super::frame_builder::CloseOutcome::AlreadyClosed);
+            };
+            inner.frame_seq = inner.frame_seq.wrapping_add(1);
+            (*open_frame_box, inner.frame_seq)
+        };
+        let frame_ticket = open_frame.ticket.clone();
+
+        // Allocate the primary CB.
+        let cb = {
+            let inner = self.inner.as_mut().expect("inner");
+            match begin_op_cb(inner, platform) {
+                Ok((cb, _ticket)) => cb,
+                Err(e) => {
+                    rollback_pre_submit(store, &mut open_frame);
+                    let inner_post = self.inner.as_mut().expect("inner");
+                    rollback_atlas(
+                        inner_post,
+                        open_frame.layouts.atlas,
+                        open_frame.atlas_prev_ticket_snapshot.clone(),
+                    );
+                    inner_post.frame_builder.complete_close_failure();
+                    return Err(e);
+                }
+            }
+        };
+
+        // Pass 1 (resource) — no-op in B.1.
+        // Pass 2 (record) — record each op into cb.
+        let record_result: Result<(), RenderError> = {
+            let inner = self.inner.as_mut().expect("inner");
+            let mut acc: Result<(), RenderError> = Ok(());
+            for op in &open_frame.ops {
+                if let Err(e) = emit_recorded_op_into_cb(inner, store, cb, &open_frame.pins, op) {
+                    acc = Err(e);
+                    break;
+                }
+            }
+            acc
+        };
+
+        if let Err(e) = record_result {
+            // CB never appended to SubmitGroup. Free it ourselves.
+            {
+                let inner = self.inner.as_mut().expect("inner");
+                let device = &inner.vk.device;
+                if let Some(pool) = platform.ops_command_pool_handle() {
+                    // SAFETY: cb was allocated from `pool` and never
+                    // submitted; safe to free in Recording state.
+                    unsafe { device.free_command_buffers(pool, &[cb]) };
+                }
+            }
+            rollback_pre_submit(store, &mut open_frame);
+            platform.renderer_failed = true;
+            let inner_post = self.inner.as_mut().expect("inner");
+            rollback_atlas(
+                inner_post,
+                open_frame.layouts.atlas,
+                open_frame.atlas_prev_ticket_snapshot.clone(),
+            );
+            inner_post.frame_builder.complete_close_failure();
+            return Err(e);
+        }
+
+        // End CB + append to SubmitGroup. Does NOT vkQueueSubmit2 yet.
+        let append_result = {
+            let inner = self.inner.as_mut().expect("inner");
+            end_and_submit_op(inner, platform, cb, &frame_ticket)
+        };
+        if let Err(e) = append_result {
+            {
+                let inner = self.inner.as_mut().expect("inner");
+                let device = &inner.vk.device;
+                if let Some(pool) = platform.ops_command_pool_handle() {
+                    unsafe { device.free_command_buffers(pool, &[cb]) };
+                }
+            }
+            rollback_pre_submit(store, &mut open_frame);
+            platform.renderer_failed = true;
+            let inner_post = self.inner.as_mut().expect("inner");
+            rollback_atlas(
+                inner_post,
+                open_frame.layouts.atlas,
+                open_frame.atlas_prev_ticket_snapshot.clone(),
+            );
+            inner_post.frame_builder.complete_close_failure();
+            return Err(e);
+        }
+
+        // Park a SubmittedOp into pending_group_ops.
+        {
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation += 1;
+            let generation = inner.acquire_generation;
+            inner.pending_group_ops.push(SubmittedOp {
+                cb,
+                ticket: frame_ticket.clone(),
+                staging: None,
+                scratch: None,
+                atlas_ticket: None,
+                generation,
+            });
+        }
+
+        // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
+        let flush_outcome =
+            self.flush_submit_group(platform, super::submit_group::FlushReason::FrameBuilder);
+
+        match flush_outcome {
+            Ok(_) => {
+                // Commit-after-Ok.
+                let op_count = open_frame.ops.len();
+                let glyph_uploads = open_frame.glyph_uploads_in_frame;
+                let pin_count = open_frame.pins.len();
+                {
+                    let inner = self.inner.as_mut().expect("inner");
+                    inner
+                        .pending_frames
+                        .push_back(super::frame_builder::FrameSubmittedRecord {
+                            ticket: frame_ticket.clone(),
+                            pins: std::mem::take(&mut open_frame.pins),
+                            frame_seq,
+                        });
+                    commit_close_success(
+                        inner,
+                        std::mem::take(&mut open_frame.layouts),
+                        std::mem::take(&mut open_frame.touched),
+                        std::mem::take(&mut open_frame.pending_glyph_inserts),
+                        &frame_ticket,
+                    );
+                    if inner.pending_frame_close_events.len() < 1024 {
+                        inner.pending_frame_close_events.push(
+                            super::frame_builder::FrameCloseEvent {
+                                reason,
+                                ops_in_frame: op_count,
+                                glyph_uploads_in_frame: glyph_uploads,
+                                pin_count,
+                            },
+                        );
+                    }
+                    inner.frame_builder.complete_close_success();
+                }
+                Ok(super::frame_builder::CloseOutcome::Submitted {
+                    frame_seq,
+                    op_count,
+                    pin_count,
+                    ticket: frame_ticket,
+                    reason,
+                })
+            }
+            Err(e) => {
+                // Platform's abort_flush already freed CBs + set renderer_failed.
+                rollback_pre_submit(store, &mut open_frame);
+                let atlas_overlay = open_frame.layouts.atlas;
+                let atlas_prev = open_frame.atlas_prev_ticket_snapshot.clone();
+                let ops_in_frame = open_frame.ops.len();
+                let glyph_uploads_in_frame = open_frame.glyph_uploads_in_frame;
+                let pin_count = open_frame.pins.len();
+                let inner = self.inner.as_mut().expect("inner");
+                rollback_atlas(inner, atlas_overlay, atlas_prev);
+                if inner.pending_frame_close_events.len() < 1024 {
+                    inner
+                        .pending_frame_close_events
+                        .push(super::frame_builder::FrameCloseEvent {
+                            reason,
+                            ops_in_frame,
+                            glyph_uploads_in_frame,
+                            pin_count,
+                        });
+                }
+                inner.frame_builder.complete_close_failure();
+                Err(RenderError::Vk(e))
+            }
+        }
     }
 
     /// Count of in-flight submits awaiting retirement. Tests use
@@ -5902,6 +6115,162 @@ fn end_and_submit_op_with_signal(
     Ok(())
 }
 
+/// Phase B.1 Task 12: replay a single `RecordedOp` into `cb`. Caller
+/// holds `&mut inner` and `&mut store`; this function consumes the
+/// recorder-side state captured at append-time and emits the GPU
+/// commands necessary to honour it.
+fn emit_recorded_op_into_cb(
+    inner: &mut RenderEngineInner,
+    store: &mut DrawableStore,
+    cb: vk::CommandBuffer,
+    pins: &super::frame_builder::FramePinSet,
+    op: &super::frame_builder::RecordedOp,
+) -> Result<(), RenderError> {
+    use super::frame_builder::RecordedOp as Op;
+    match op {
+        Op::GlyphUpload(up) => {
+            let atlas = inner.glyph_atlas.as_mut().ok_or(RenderError::NoVk)?;
+            let staging_buffer = pins.staging_buffers[up.staging_pin_idx.0 as usize].buffer;
+            atlas.record_upload(cb, staging_buffer, up.atlas_x, up.atlas_y, up.w, up.h);
+            Ok(())
+        }
+        Op::CompositeGlyphs(cg) => {
+            let atlas_extent = inner
+                .glyph_atlas
+                .as_ref()
+                .ok_or(RenderError::NoVk)?
+                .extent();
+            // Clone the Vk handle owner so the recorder call doesn't
+            // alias `inner.text_pipeline` against `&inner.vk`.
+            let vk = inner.vk.clone();
+            let drawable = store
+                .get_mut(cg.dst_id)
+                .ok_or(RenderError::UnknownDrawable(cg.dst_id))?;
+            let glyphs_view: Vec<crate::kms::vk::ops::text::TextGlyph> = cg
+                .glyphs
+                .iter()
+                .map(|g| crate::kms::vk::ops::text::TextGlyph {
+                    entry: super::glyph_atlas::AtlasEntry {
+                        atlas_x: g.atlas_x,
+                        atlas_y: g.atlas_y,
+                        w: g.w,
+                        h: g.h,
+                        pen_left: 0,
+                        pen_top: 0,
+                    },
+                    dst_x: g.dst_x,
+                    dst_y: g.dst_y,
+                })
+                .collect();
+            let mut adapter = StorageTextTarget {
+                extent: drawable.storage.extent,
+                image: drawable.storage.image,
+                image_view: drawable.storage.image_view,
+                current_layout: drawable.storage.current_layout,
+            };
+            let pipeline = inner.text_pipeline.as_ref().ok_or(RenderError::NoVk)?;
+            crate::kms::vk::ops::text::record_text_run_scissored(
+                &vk,
+                cb,
+                &mut adapter,
+                crate::kms::vk::ops::text::TextAtlas {
+                    extent: atlas_extent,
+                },
+                pipeline,
+                &glyphs_view,
+                cg.foreground_rgba,
+                &cg.clip_scissors,
+            )?;
+            // Pipeline borrow ends here; mutate storage now.
+            drawable.storage.current_layout = adapter.current_layout;
+            Ok(())
+        }
+        Op::LayoutTransition(lt) => {
+            let drawable = store
+                .get_mut(lt.drawable_id)
+                .ok_or(RenderError::UnknownDrawable(lt.drawable_id))?;
+            drawable.record_layout_transition(
+                &inner.vk,
+                cb,
+                lt.target_layout,
+                lt.src_stage,
+                lt.src_access,
+                lt.dst_stage,
+                lt.dst_access,
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Phase B.1 Task 12: commit recorder-side state to engine + atlas
+/// after `flush_submit_group` returned Ok.
+///
+/// - Drawable layout commit: no-op — the recorder already wrote
+///   `Drawable::storage.current_layout` directly at append time.
+/// - Touched-drawable `last_render_ticket` commit: no-op — the
+///   recorder already called `store.touch_render_fence` at append.
+/// - Glyph cache inserts: drained here onto the atlas.
+/// - Atlas last_render_ticket: stamped with the closed frame's ticket.
+fn commit_close_success(
+    inner: &mut RenderEngineInner,
+    layouts: super::frame_builder::FrameLayoutTable,
+    touched: super::frame_builder::TouchedDrawables,
+    pending: super::frame_builder::PendingGlyphInserts,
+    frame_ticket: &FenceTicket,
+) {
+    let _ = layouts;
+    let _ = touched;
+    if let Some(atlas) = inner.glyph_atlas.as_mut() {
+        for (key, entry) in pending.entries {
+            atlas.insert_entry(key, entry);
+        }
+        atlas.set_last_render_ticket(frame_ticket.clone());
+    }
+}
+
+/// Phase B.1 Task 12: rollback drawable-side state to pre-frame on
+/// any close-time failure. Walks the layout overlay + touched-set
+/// to undo any in-frame mutations the recorder already wrote into
+/// the store. Atlas-side rollback is handled by `rollback_atlas`.
+fn rollback_pre_submit(
+    store: &mut DrawableStore,
+    open_frame: &mut super::frame_builder::OpenFrame,
+) {
+    for (id, entry) in open_frame.layouts.drawables.drain() {
+        if let Some(d) = store.get_mut(id) {
+            d.storage.current_layout = entry.pre_frame_layout;
+        }
+    }
+    for (id, prior) in open_frame.touched.snapshots.drain() {
+        if let Some(d) = store.get_mut(id) {
+            d.last_render_ticket = prior;
+        }
+    }
+}
+
+/// Phase B.1 Task 12: rollback atlas-side state to pre-frame on any
+/// close-time failure. Restores the pre-frame layout (if the frame
+/// touched the atlas) and the pre-frame `last_render_ticket`
+/// snapshot (if the frame snapshotted it).
+fn rollback_atlas(
+    inner: &mut RenderEngineInner,
+    layouts_atlas: Option<super::frame_builder::LayoutOverlayEntry>,
+    atlas_prev_ticket_snapshot: Option<Option<FenceTicket>>,
+) {
+    if let Some(atlas) = inner.glyph_atlas.as_mut() {
+        if let Some(entry) = layouts_atlas {
+            atlas.set_current_layout(entry.pre_frame_layout);
+        }
+        if let Some(prior) = atlas_prev_ticket_snapshot {
+            match prior {
+                Some(t) => atlas.set_last_render_ticket(t),
+                None => atlas.clear_last_render_ticket(),
+            }
+        }
+    }
+}
+
 fn color_layers() -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -6333,6 +6702,24 @@ pub(crate) fn decode_x11_pixel_server_alpha(pixel: u32, depth: u8) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_open_frame_with_no_open_frame_returns_already_closed() {
+        let mut engine = RenderEngine::stub();
+        let mut store = DrawableStore::stub();
+        let mut platform = PlatformBackend::for_tests();
+        let out = engine
+            .close_open_frame(
+                &mut store,
+                &mut platform,
+                super::super::frame_builder::CloseReason::Shutdown,
+            )
+            .expect("close on a closed frame must Ok");
+        assert!(matches!(
+            out,
+            super::super::frame_builder::CloseOutcome::AlreadyClosed
+        ));
+    }
 
     #[test]
     fn stub_engine_declines_paint_ops() {

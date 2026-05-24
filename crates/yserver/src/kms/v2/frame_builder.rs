@@ -284,8 +284,10 @@ mod state_tests {
 
 use ash::vk;
 
-use super::glyph_atlas::{AtlasEntry, GlyphKey};
-use super::store::DrawableId;
+use super::{
+    glyph_atlas::{AtlasEntry, GlyphKey},
+    store::DrawableId,
+};
 
 /// Index into `OpenFrame::pins.staging_buffers`. Saved on `RecordedOp`
 /// payloads so close-time replay can fetch the right pinned buffer.
@@ -778,8 +780,7 @@ mod glyph_insert_tests {
 
 #[cfg(test)]
 mod open_frame_tests {
-    use super::super::platform::FenceTicket;
-    use super::*;
+    use super::{super::platform::FenceTicket, *};
 
     #[test]
     fn open_frame_aggregates_all_overlays() {
@@ -823,7 +824,10 @@ mod lifecycle_tests {
         let frame = fb
             .take_open_for_close(CloseReason::NonPortedPaintOp)
             .expect("frame open");
-        assert_eq!(frame.close_reason_on_open, Some(CloseReason::NonPortedPaintOp));
+        assert_eq!(
+            frame.close_reason_on_open,
+            Some(CloseReason::NonPortedPaintOp)
+        );
     }
 
     #[test]
@@ -872,4 +876,16 @@ pub(crate) struct FrameSubmittedRecord {
     /// Lifetime count snapshot — telemetry uses this to attribute the
     /// retirement to the closing frame.
     pub(crate) frame_seq: u64,
+}
+
+/// Telemetry event published by `RenderEngine::close_open_frame` and
+/// drained by the backend at every close-driving site (maybe_composite,
+/// enqueue_present_completion, get_image, shutdown, render_composite_glyphs).
+/// Task 21 wires telemetry counters off this stream.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameCloseEvent {
+    pub(crate) reason: CloseReason,
+    pub(crate) ops_in_frame: usize,
+    pub(crate) glyph_uploads_in_frame: u32,
+    pub(crate) pin_count: usize,
 }
