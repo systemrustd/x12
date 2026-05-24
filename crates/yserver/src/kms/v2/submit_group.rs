@@ -24,6 +24,11 @@ pub(crate) enum FlushReason {
     PageflipRetire,
     MaxSize,
     Shutdown,
+    /// Phase B.1: a frame-builder close drove this flush. Used by
+    /// `RenderEngine::close_open_frame` regardless of the underlying
+    /// `CloseReason`; the close-reason histogram is reported
+    /// separately under `frame_builder_close_reason_*`.
+    FrameBuilder,
 }
 
 /// Single buffered command-buffer entry. Mirrors the inputs to the
@@ -44,21 +49,26 @@ pub(crate) struct SubmitGroup {
     /// cleared on `flush`. None when group is empty.
     ticket: Option<FenceTicket>,
     /// Hard cap on `entries.len()` before append forces a
-    /// `MaxSize` flush. Default 16 per spec; tuned from telemetry.
+    /// `MaxSize` flush. Phase B Invariant M1: default 1 for the
+    /// duration of B.1–B.4; recovers at B.5.
     max_size: usize,
 }
 
 impl SubmitGroup {
     pub(crate) fn new() -> Self {
-        // Default 16: paint CBs accumulate until a load-bearing
-        // flush trigger (scene compose, PRESENT signal, get_image,
-        // pageflip retire) or the cap is hit. Task 4 raised this
-        // from 1 → 16 alongside the scene-compose flush in
-        // `maybe_composite`.
+        // Phase B Invariant M1: every queue submission carries at
+        // most ONE command buffer for the duration of the B.1 → B.4
+        // sub-phase rollout. The frame builder collapses paint into
+        // one CB per frame itself; non-ported paint ops fall back
+        // to the pre-Phase-A per-op submit cadence. Bee MATE survives
+        // this trivially (see status.md § "2026-05-23 bee MATE-load
+        // freeze" — the cap=1 row); other platforms see a temporary
+        // submit-rate regression that recovers in B.5 when the
+        // SubmitGroup retires entirely.
         Self {
             entries: Vec::new(),
             ticket: None,
-            max_size: 16,
+            max_size: 1,
         }
     }
 
@@ -131,12 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_group_is_empty_and_closed_with_default_max_size_sixteen() {
+    fn fresh_group_is_empty_and_closed_with_default_max_size_one() {
         let g = SubmitGroup::new();
         assert!(!g.is_open());
         assert_eq!(g.size(), 0);
-        // Task 4 raised default from 1 → 16.
-        assert_eq!(g.max_size(), 16);
+        // Phase B Invariant M1: default is 1 for the duration of B.1–B.4.
+        assert_eq!(g.max_size(), 1);
     }
 
     #[test]

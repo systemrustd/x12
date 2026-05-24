@@ -116,6 +116,7 @@ pub struct Bucket {
     pub(crate) submit_group_flush_reason_pageflip_retire: u64,
     pub(crate) submit_group_flush_reason_max_size: u64,
     pub(crate) submit_group_flush_reason_shutdown: u64,
+    pub(crate) submit_group_flush_reason_frame_builder: u64,
     // ── Phase A: retention high-water gauges ─────────────────────
     /// High-water mark of descriptor pool ring pool count sampled
     /// each tick.
@@ -273,6 +274,7 @@ impl Telemetry {
              submit_group_flush_reason_pageflip_retire/s={} \
              submit_group_flush_reason_max_size/s={} \
              submit_group_flush_reason_shutdown/s={} \
+             submit_group_flush_reason_frame_builder/s={} \
              active_descriptor_pool_count_high_water={} \
              active_staging_bytes_high_water={} \
              active_scratch_bytes_high_water={}",
@@ -312,6 +314,7 @@ impl Telemetry {
             b.submit_group_flush_reason_pageflip_retire,
             b.submit_group_flush_reason_max_size,
             b.submit_group_flush_reason_shutdown,
+            b.submit_group_flush_reason_frame_builder,
             self.lifetime.active_descriptor_pool_count_high_water,
             self.lifetime.active_staging_bytes_high_water,
             self.lifetime.active_scratch_bytes_high_water,
@@ -567,6 +570,10 @@ impl Telemetry {
             R::Shutdown => (
                 &mut self.bucket.submit_group_flush_reason_shutdown,
                 &mut self.lifetime.submit_group_flush_reason_shutdown,
+            ),
+            R::FrameBuilder => (
+                &mut self.bucket.submit_group_flush_reason_frame_builder,
+                &mut self.lifetime.submit_group_flush_reason_frame_builder,
             ),
         };
         *b += 1;

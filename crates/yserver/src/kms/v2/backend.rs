@@ -1687,6 +1687,14 @@ impl KmsBackendV2 {
         self.platform.submit_group_set_max_size_for_tests(n);
     }
 
+    /// Phase B.1 Task 10: read back the SubmitGroup max_size as
+    /// currently configured on the platform. Exposed as `pub` (not
+    /// `#[cfg(test)]`) so the external `v2_acceptance` integration-test
+    /// crate can assert Invariant M1 directly.
+    pub fn platform_submit_group_max_size_for_tests(&self) -> usize {
+        self.platform.submit_group_max_size()
+    }
+
     /// Phase A T10: inject a `queue_submit2` failure on the next
     /// `flush_submit_group` call. Delegates to a non-`#[cfg(test)]`
     /// method on `PlatformBackend` so this wrapper is visible from

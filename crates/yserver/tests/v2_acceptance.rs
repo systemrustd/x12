@@ -3540,3 +3540,24 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
         "renderer_failed must remain false throughout"
     );
 }
+
+/// Phase B.1 Task 10 — Invariant M1: `SubmitGroup::new()` defaults
+/// to max_size=1 for the duration of the B.1–B.4 sub-phase rollout.
+/// This test pins the regression so that any future accidental revert
+/// of the default is caught before it reaches a review.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_platform_open_pins_submit_group_max_size_to_one() {
+    let backend = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    assert_eq!(
+        backend.platform_submit_group_max_size_for_tests(),
+        1,
+        "Phase B Invariant M1: SubmitGroup max_size must be 1 in B.1–B.4"
+    );
+}
