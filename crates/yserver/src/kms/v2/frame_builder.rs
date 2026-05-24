@@ -176,7 +176,8 @@ mod state_tests {
 }
 
 // The rest of this module — RecordedOp, FramePinSet, FrameLayoutTable,
-// FrameSubmittedRecord — lands in subsequent tasks.
+// FrameSubmittedRecord — lands in subsequent tasks (see below).
+
 
 use ash::vk;
 
@@ -662,4 +663,19 @@ mod open_frame_tests {
         assert_eq!(frame.pending_glyph_inserts.len(), 0);
         assert_eq!(frame.glyph_uploads_in_frame, 0);
     }
+}
+
+/// One in-flight frame's resource pin set, parked until the frame's
+/// `FenceTicket` signals. Walked by `RenderEngine::poll_retired` next
+/// to the existing `submitted` queue; both gate retirement on the same
+/// ticket. Drop order: when the ticket signals, the record drops, its
+/// `pins.staging_buffers` Arcs decrement, and any `StagingBuffer`
+/// whose Arc refcount hits zero releases its Vk handles.
+#[derive(Debug)]
+pub(crate) struct FrameSubmittedRecord {
+    pub(crate) ticket: FenceTicket,
+    pub(crate) pins: FramePinSet,
+    /// Lifetime count snapshot — telemetry uses this to attribute the
+    /// retirement to the closing frame.
+    pub(crate) frame_seq: u64,
 }

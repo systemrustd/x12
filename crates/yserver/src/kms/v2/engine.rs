@@ -610,6 +610,14 @@ struct RenderEngineInner {
     /// Phase A: FlushOutcome records produced by flush_submit_group.
     /// Drained by the backend telemetry path (Task 3.5).
     pending_flush_outcomes: Vec<super::platform::FlushOutcome>,
+    /// Phase B.1: in-flight frames awaiting retirement. Parallel to
+    /// `submitted`; both gate on the same `FenceTicket`s when the
+    /// frame builder is in play. Walked by `poll_retired` and
+    /// `drain_all`.
+    pending_frames: std::collections::VecDeque<super::frame_builder::FrameSubmittedRecord>,
+    /// Phase B.1: monotonic frame sequence for telemetry attribution.
+    /// Bumped on every `FrameBuilder::close_into_cb` success.
+    frame_seq: u64,
 }
 
 impl RenderEngine {
@@ -652,6 +660,8 @@ impl RenderEngine {
                 pending_present_batches: Vec::new(),
                 pending_group_ops: Vec::new(),
                 pending_flush_outcomes: Vec::new(),
+                pending_frames: std::collections::VecDeque::new(),
+                frame_seq: 0,
             }),
         })
     }
@@ -701,6 +711,16 @@ impl RenderEngine {
             // generation <= op.generation transition InFlight → Free
             // via vkResetDescriptorPool.
             inner.descriptor_pool_ring.release_up_to(op.generation);
+        }
+        // Phase B.1: walk pending_frames. Same ticket-signaled monotonicity
+        // argument as the `submitted` loop above (same-queue submission
+        // order signals tickets in order).
+        while let Some(front) = inner.pending_frames.front() {
+            if !front.ticket.poll_signaled(&inner.vk) {
+                break;
+            }
+            // The Arcs inside the record drop here, releasing pinned resources.
+            let _ = inner.pending_frames.pop_front().expect("non-empty");
         }
     }
 
@@ -759,6 +779,15 @@ impl RenderEngine {
             }
             drop(op.staging.take());
             inner.descriptor_pool_ring.release_up_to(op.generation);
+        }
+        // Phase B.1: drain in-flight frame pins. wait() ensures Vk-side
+        // completion before the Arc<StagingBuffer> drops would otherwise
+        // race with GPU reads. Off-hot-path; one wait per pending frame
+        // is fine at shutdown.
+        while let Some(record) = inner.pending_frames.pop_front() {
+            let _ = record.ticket.wait(&inner.vk);
+            // Record drops; pins drop; Arcs decrement.
+            drop(record);
         }
     }
 
@@ -5792,6 +5821,10 @@ impl Drop for RenderEngine {
                 // pool's own Drop destroys the pool, which
                 // implicitly frees all its CBs (Vulkan spec).
                 let _ = op.cb;
+            }
+            for record in inner.pending_frames.drain(..) {
+                let _ = record.ticket.wait(&inner.vk);
+                drop(record); // pins (Arcs) decrement here
             }
         }
     }
