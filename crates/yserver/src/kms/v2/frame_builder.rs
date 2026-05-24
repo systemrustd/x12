@@ -4,9 +4,9 @@
 //! `FrameBuilder` owns a `Closed ↔ OpenForPaint` lifecycle. Paint
 //! entry points that have been ported (`composite_glyphs` in B.1)
 //! append `RecordedOp`s; a close trigger (Invariant M2 / M3, the
-//! existing get_image / PRESENT-completion sync points, a timeout,
+//! existing `get_image` / PRESENT-completion sync points, a timeout,
 //! shutdown, or a pin-set ceiling) replays the op list as ONE primary
-//! command buffer, submits it via the SubmitGroup (cap=1, so the
+//! command buffer, submits it via the `SubmitGroup` (cap=1, so the
 //! submit auto-flushes immediately), and parks the frame's resource
 //! pins on a `pending_frames` queue gated by the submit's
 //! `FenceTicket`.
@@ -50,7 +50,7 @@ pub(crate) enum CloseReason {
     PinCeiling,
 }
 
-/// FrameBuilder lifecycle. `Closed` is the hot path for X11 traffic
+/// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
 /// that doesn't touch the paint surface (event-only requests, idle).
 /// `OpenForPaint` is where every recorded op accumulates between
 /// the first paint and a close trigger.
