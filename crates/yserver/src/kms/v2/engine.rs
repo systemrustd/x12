@@ -633,6 +633,10 @@ struct RenderEngineInner {
     /// path. Default OFF until Task 24 flips it ON. Tests override via
     /// `set_frame_builder_enabled`.
     frame_builder_enabled: bool,
+    /// Phase B.1 close trigger 4: cached timeout duration. Read once
+    /// at engine construction from YSERVER_FRAME_BUILDER_TIMEOUT_MS
+    /// (default 16 ms). Hot-path check in maybe_composite.
+    frame_builder_timeout: std::time::Duration,
 }
 
 impl RenderEngine {
@@ -683,6 +687,8 @@ impl RenderEngine {
                     .as_deref()
                     .and_then(|s| s.to_str())
                     .is_some_and(|s| matches!(s, "1" | "on" | "true" | "yes")),
+                frame_builder_timeout:
+                    super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
             }),
         })
     }
@@ -1108,6 +1114,31 @@ impl RenderEngine {
             store,
             platform,
             super::frame_builder::CloseReason::NonPortedPaintOp,
+        )? {
+            super::frame_builder::CloseOutcome::Submitted { .. }
+            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+        }
+    }
+
+    /// Phase B.1 close trigger 4: close the open frame if its open
+    /// duration has exceeded the cached timeout. No-op if no frame
+    /// open or below threshold. Called by maybe_composite at the
+    /// top of every tick.
+    pub(crate) fn close_open_frame_if_timed_out(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), RenderError> {
+        let timed_out = self.inner.as_ref().is_some_and(|i| {
+            i.frame_builder.open_for_at_least(i.frame_builder_timeout)
+        });
+        if !timed_out {
+            return Ok(());
+        }
+        match self.close_open_frame(
+            store,
+            platform,
+            super::frame_builder::CloseReason::Timeout,
         )? {
             super::frame_builder::CloseOutcome::Submitted { .. }
             | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),

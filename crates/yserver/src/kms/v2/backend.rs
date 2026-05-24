@@ -4610,6 +4610,15 @@ impl Backend for KmsBackendV2 {
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
+        // Phase B.1 close trigger 4: if a frame has been open past the
+        // timeout (16 ms default), force a close to release pinned
+        // resources. No-op if no frame open or below threshold.
+        if let Err(e) = self.engine.close_open_frame_if_timed_out(
+            &mut self.store,
+            &mut self.platform,
+        ) {
+            log::warn!("v2 maybe_composite: timeout close failed: {e:?}");
+        }
         // One main-loop tick = one frame_id. Submit events
         // recorded between calls share the surrounding tick's
         // id; the scene_compose event of this tick (if it

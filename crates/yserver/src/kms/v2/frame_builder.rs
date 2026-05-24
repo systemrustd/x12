@@ -17,6 +17,8 @@
 //! `engine.rs::FrameBuilder::close_into_cb_*` because it needs the
 //! engine's CB pool + atlas + drawable-store access.
 
+use std::time::{Duration, Instant};
+
 use super::platform::FenceTicket;
 
 /// Why a frame closed. Bumped into telemetry on every close so the
@@ -152,6 +154,7 @@ impl FrameBuilder {
             atlas_prev_ticket_snapshot: None,
             glyph_uploads_in_frame: 0,
             close_reason_on_open: None,
+            opened_at: Instant::now(),
         }));
     }
 
@@ -197,6 +200,27 @@ impl FrameBuilder {
         }
     }
 
+    /// Phase B.1 close trigger 4: true if the frame has been open for
+    /// at least `dur` (used by `maybe_composite` to drive the timeout
+    /// close once per tick if needed).
+    pub(crate) fn open_for_at_least(&self, dur: Duration) -> bool {
+        match self.open.as_ref() {
+            None => false,
+            Some(o) => o.opened_at.elapsed() >= dur,
+        }
+    }
+
+    /// Phase B.1 close trigger 4: read the timeout duration from
+    /// `YSERVER_FRAME_BUILDER_TIMEOUT_MS` env var, default 16 ms
+    /// (one vblank at 60 Hz).
+    pub(crate) fn timeout_from_env_default_16ms() -> Duration {
+        let ms = std::env::var("YSERVER_FRAME_BUILDER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(16);
+        Duration::from_millis(ms)
+    }
+
     /// `#[cfg(test)]` peek at the op list in append order.
     #[cfg(test)]
     pub(crate) fn peek_ops(&self) -> Option<&[RecordedOp]> {
@@ -234,6 +258,9 @@ pub(crate) struct OpenFrame {
     /// Glyph uploads recorded in this frame; bumped each push.
     pub(crate) glyph_uploads_in_frame: u32,
     pub(crate) close_reason_on_open: Option<CloseReason>, // reserved for B.4
+    /// Phase B.1 Task 18: wall-clock instant the frame was opened.
+    /// Used by `open_for_at_least` to drive the timeout close trigger.
+    pub(crate) opened_at: Instant,
 }
 
 #[cfg(test)]
@@ -797,6 +824,7 @@ mod open_frame_tests {
             atlas_prev_ticket_snapshot: None,
             glyph_uploads_in_frame: 0,
             close_reason_on_open: None,
+            opened_at: std::time::Instant::now(),
         };
         assert!(frame.ops.is_empty());
         assert_eq!(frame.pins.len(), 0);
