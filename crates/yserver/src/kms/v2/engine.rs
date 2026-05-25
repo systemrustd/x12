@@ -6366,7 +6366,7 @@ impl RenderEngine {
         mask_pict_format: u32,
         dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
-        use crate::kms::vk::render_pipeline::StdPictOp;
+        use crate::kms::vk::{ops::render as vk_render, render_pipeline::StdPictOp};
 
         let stats = CompositeStats::default();
         if rects.is_empty() {
@@ -6418,7 +6418,7 @@ impl RenderEngine {
             );
             return Ok(stats);
         }
-        let _dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
+        let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
 
         // Map the protocol op byte to the pipeline cache's enum.
         let Some(std_op) = StdPictOp::from_u8(op) else {
@@ -6562,20 +6562,324 @@ impl RenderEngine {
         }
         store.touch_render_fence(dst_id, frame_ticket.clone());
 
-        // STUB — Tasks 10-13 fill in src/mask resolution, scratch
-        // pinning, descriptor acquisition, op record, emit. Suppress
-        // unused-binding warnings for the parameters consumed by
-        // later tasks while preserving the public signature.
+        // (5) Resolve solid scratch views directly — these are 1×1
+        //     engine-owned `SolidColorImage`s that never grow, so no
+        //     pin / no ticket-touch is needed (Pitfall 4b). Engine
+        //     `Drop` destroys them at shutdown after all frames have
+        //     closed.
+        let inner = self.inner.as_ref().expect("inner");
+        let solid_src_view = inner
+            .solid_src_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let solid_mask_view = inner
+            .solid_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let white_mask_view = inner
+            .white_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+
+        // (5b) Self-alias readback view (src or mask == dst). Phase
+        //      9A already grew the scratch slot if needed; here we
+        //      just query the view. `view()` takes `&mut self`
+        //      because it may lazily build the no-alpha variant on
+        //      first `dst_has_alpha=false` call against this scratch
+        //      instance, so we re-borrow `inner` mutably.
+        let src_alias_view = if self_alias_used {
+            let inner = self.inner.as_ref().expect("inner");
+            debug_assert!(
+                inner.src_alias_readback.as_ref().is_some_and(|rb| rb.fits(
+                    dst_format,
+                    dst_extent.width,
+                    dst_extent.height,
+                )),
+                "Phase 9A failed to grow src_alias_readback to required size",
+            );
+            let inner = self.inner.as_mut().expect("inner");
+            match inner
+                .src_alias_readback
+                .as_mut()
+                .expect("ensured")
+                .view(dst_format, dst_has_alpha)
+            {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => {
+                    log::warn!(
+                        "v2 render_composite (frame_builder): \
+                         src_alias_readback view None — skipping"
+                    );
+                    return Ok(stats);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 render_composite (frame_builder): \
+                         src_alias_readback view build failed: {e:?}"
+                    );
+                    return Ok(stats);
+                }
+            }
+        } else {
+            None
+        };
+
+        // (6) dst_readback view when the op needs the shader-side
+        //     blend (Disjoint/Conjoint). Phase 9A already grew if
+        //     needed; same `&mut self` re-borrow as src_alias above.
+        let dst_readback_view = if needs_dst_readback {
+            let inner = self.inner.as_ref().expect("inner");
+            debug_assert!(
+                inner.dst_readback.as_ref().is_some_and(|rb| rb.fits(
+                    dst_format,
+                    dst_extent.width,
+                    dst_extent.height,
+                )),
+                "Phase 9A failed to grow dst_readback to required size",
+            );
+            let inner = self.inner.as_mut().expect("inner");
+            match inner
+                .dst_readback
+                .as_mut()
+                .expect("ensured")
+                .view(dst_format, dst_has_alpha)
+            {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => {
+                    log::warn!(
+                        "v2 render_composite (frame_builder): \
+                         dst_readback view None — skipping"
+                    );
+                    return Ok(stats);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 render_composite (frame_builder): \
+                         dst_readback view build failed: {e:?}"
+                    );
+                    return Ok(stats);
+                }
+            }
+        } else {
+            None
+        };
+
+        // (7) Resolve src view + extent + (optional) clear colour.
+        //     Mirrors `render_composite_legacy` (Drawable / Solid /
+        //     Gradient / None branches), with the addition of:
+        //
+        //     - per-Drawable `store.touch_render_fence` (frame-wide
+        //       ticket pin),
+        //     - per-Drawable `open.touched.first_touch` + layout
+        //       `first_touch_drawable` snapshot for close-failure
+        //       rollback.
+        //
+        //     dst was first-touched in step (4) above; we skip the
+        //     touch when src/mask resolves to dst (self-alias case
+        //     — the descriptor binding rides `src_alias_view`
+        //     resolved in step 5b instead of the drawable view
+        //     cache, so the cache lookup is skipped too).
+        //
+        //     Gradient sources resolve through `inner.picture_paint`
+        //     which is engine-owned and CPU-immutable for the
+        //     picture's lifetime (codex R3 finding 9). No ticket-
+        //     touch / pin: the engine holds the LUT past frame
+        //     close, and `picture_paint_remove` cannot run mid-paint.
+        let mut src_clear_color: Option<[f32; 4]> = None;
+        let mut mask_clear_color: Option<[f32; 4]> = None;
+        let mut src_is_synthetic_1x1 = false;
+        let mut mask_is_synthetic_1x1 = false;
+        let mut src_picture_xform: Option<vk_render::AffineXform> = None;
+        let mut mask_picture_xform: Option<vk_render::AffineXform> = None;
+
+        let (src_view, src_extent) = if src_self_alias {
+            // Self-alias: bind the alias scratch instead of dst's
+            // drawable view. dst was already first-touched in
+            // step (4); no additional touch here.
+            (
+                src_alias_view.expect("set when self_alias_used"),
+                dst_extent,
+            )
+        } else {
+            match src {
+                ResolvedSource::Drawable(id) => {
+                    // Snapshot prior + layout BEFORE first_touch so we
+                    // capture the pre-frame state.
+                    let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
+                    let pre_layout = store
+                        .get(id)
+                        .map(|d| d.storage.current_layout)
+                        .unwrap_or(vk::ImageLayout::UNDEFINED);
+                    {
+                        let inner = self.inner.as_mut().expect("inner");
+                        let open = inner.frame_builder.open.as_mut().expect("just opened");
+                        open.touched.first_touch(id, prior);
+                        open.layouts.first_touch_drawable(id, pre_layout);
+                    }
+                    store.touch_render_fence(id, frame_ticket.clone());
+
+                    let info = drawable_for_render_view(store, id)
+                        .ok_or(RenderError::UnknownDrawable(id))?;
+                    // Audit #4: pict_format-aware swizzle so an
+                    // xRGB32 source on a depth-32 storage picks the
+                    // BgraNoAlpha (force α=ONE) sample view.
+                    let class =
+                        swizzle_class_for_pict_format(info.format, info.depth, src_pict_format);
+                    let sampler = sampler_config_for_repeat(src_repeat);
+                    let inner = self.inner.as_mut().expect("inner");
+                    let view = ensure_drawable_view(
+                        &inner.vk,
+                        &mut inner.drawable_view_cache,
+                        id,
+                        info.image,
+                        info.format,
+                        sampler,
+                        class,
+                    )?;
+                    (view, info.extent)
+                }
+                ResolvedSource::Solid(color) => {
+                    src_clear_color = Some(color);
+                    src_is_synthetic_1x1 = true;
+                    (
+                        solid_src_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
+                ResolvedSource::Gradient(xid) => {
+                    let inner = self.inner.as_ref().expect("inner");
+                    match inner.picture_paint.get(&xid) {
+                        Some(PicturePaintState::Gradient(g)) => {
+                            src_picture_xform = Some(g.axis_projection);
+                            (g.image_view(), g.extent())
+                        }
+                        None => {
+                            log::debug!(
+                                "v2 render_composite (frame_builder) gap: \
+                                 gradient picture 0x{xid:x} missing from \
+                                 engine.picture_paint (LUT build likely failed)"
+                            );
+                            return Ok(stats);
+                        }
+                    }
+                }
+                ResolvedSource::None => {
+                    log::debug!(
+                        "v2 render_composite (frame_builder) gap: src is \
+                         None (protocol requires src)"
+                    );
+                    return Ok(stats);
+                }
+            }
+        };
+
+        // (8) Resolve mask view + extent. Same shape as src.
+        let (mask_view, mask_extent) = if mask_self_alias {
+            (
+                src_alias_view.expect("set when self_alias_used"),
+                dst_extent,
+            )
+        } else {
+            match mask {
+                ResolvedSource::Drawable(id) => {
+                    let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
+                    let pre_layout = store
+                        .get(id)
+                        .map(|d| d.storage.current_layout)
+                        .unwrap_or(vk::ImageLayout::UNDEFINED);
+                    {
+                        let inner = self.inner.as_mut().expect("inner");
+                        let open = inner.frame_builder.open.as_mut().expect("just opened");
+                        open.touched.first_touch(id, prior);
+                        open.layouts.first_touch_drawable(id, pre_layout);
+                    }
+                    store.touch_render_fence(id, frame_ticket.clone());
+
+                    let info = drawable_for_render_view(store, id)
+                        .ok_or(RenderError::UnknownDrawable(id))?;
+                    // Audit #4: same pict_format-aware swizzle as src.
+                    let class =
+                        swizzle_class_for_pict_format(info.format, info.depth, mask_pict_format);
+                    let sampler = sampler_config_for_repeat(mask_repeat);
+                    let inner = self.inner.as_mut().expect("inner");
+                    let view = ensure_drawable_view(
+                        &inner.vk,
+                        &mut inner.drawable_view_cache,
+                        id,
+                        info.image,
+                        info.format,
+                        sampler,
+                        class,
+                    )?;
+                    (view, info.extent)
+                }
+                ResolvedSource::Solid(color) => {
+                    mask_clear_color = Some(color);
+                    mask_is_synthetic_1x1 = true;
+                    (
+                        solid_mask_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
+                ResolvedSource::Gradient(xid) => {
+                    let inner = self.inner.as_ref().expect("inner");
+                    match inner.picture_paint.get(&xid) {
+                        Some(PicturePaintState::Gradient(g)) => {
+                            mask_picture_xform = Some(g.axis_projection);
+                            (g.image_view(), g.extent())
+                        }
+                        None => {
+                            log::debug!(
+                                "v2 render_composite (frame_builder) gap: \
+                                 gradient mask picture 0x{xid:x} missing \
+                                 from engine.picture_paint (LUT build likely \
+                                 failed)"
+                            );
+                            return Ok(stats);
+                        }
+                    }
+                }
+                ResolvedSource::None => {
+                    mask_is_synthetic_1x1 = true;
+                    (
+                        white_mask_view,
+                        vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                    )
+                }
+            }
+        };
+
+        // STUB — Tasks 11-13 fill in descriptor acquisition, op
+        // record, emit. Suppress unused-binding warnings for the
+        // parameters + locals consumed by later tasks.
         let _ = (
             clip_rects,
-            src_repeat,
-            mask_repeat,
             src_transform,
             mask_transform,
             mask_component_alpha,
-            src_pict_format,
-            mask_pict_format,
-            frame_ticket,
+            src_view,
+            mask_view,
+            src_extent,
+            mask_extent,
+            src_clear_color,
+            mask_clear_color,
+            src_is_synthetic_1x1,
+            mask_is_synthetic_1x1,
+            src_picture_xform,
+            mask_picture_xform,
+            dst_readback_view,
         );
         Ok(stats)
     }
