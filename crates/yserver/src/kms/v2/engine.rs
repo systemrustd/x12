@@ -2554,21 +2554,25 @@ impl RenderEngine {
         fg: u32,
         rects: &[Rectangle16],
     ) -> Result<(), RenderError> {
-        use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
         use yserver_core::backend::GcFunction;
 
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // N9 order: empty-input fast-paths → renderer_failed →
+        // flush_render_batch → preflight → cache ensure → open →
+        // prelude → push.
         if rects.is_empty() {
             return Ok(());
         }
-        self.flush_render_batch(store, platform)?;
         if matches!(function, GcFunction::NoOp) {
             return Ok(());
         }
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        self.flush_render_batch(store, platform)?;
 
+        // Preflight: read format via shared borrow; build pipeline cache
+        // for the dst format if not already present (preserve the
+        // `ensure_logic_fill_cache` helper verbatim per N6).
         let format = {
             let d = store
                 .get(target)
@@ -2580,30 +2584,18 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
-            return Err(RenderError::RendererFailed);
-        }
-        let cache = inner
-            .logic_fill_caches
-            .get_mut(&format)
-            .expect("ensured above");
-        let pipeline = cache.get(function, opaque_alpha).map_err(|e| {
-            log::warn!("v2 logic_fill: pipeline build failed for {function:?}: {e:?}");
-            RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
-        })?;
-        let pipeline_layout = cache.pipeline_layout();
-
-        let Some(drawable) = store.get_mut(target) else {
+        let Some(drawable) = store.get(target) else {
             return Err(RenderError::UnknownDrawable(target));
         };
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
+        let dst_pre_layout = drawable.storage.current_layout;
+        let prior_dst_ticket = drawable.last_render_ticket.clone();
 
-        // Unpack the X11 wire pixel. Same shape as v1's
-        // `try_vk_fill_with_function`: R8_UNORM dst (depth 1 / 8)
-        // takes fg in color[0]; BGRA8_UNORM dst takes BGR in 0..3.
-        // Alpha forced opaque — the pipeline's write mask handles
-        // the opaque-alpha policy.
+        // Unpack the X11 wire pixel (preserve legacy at engine.rs:2546-2560).
+        // R8_UNORM dst (depth 1/8) takes fg in color[0]; BGRA8 dst takes BGR
+        // in channels 0..3. Alpha forced opaque — the pipeline write mask
+        // handles the opaque-alpha policy.
         let color = if format == vk::Format::R8_UNORM {
             [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
         } else {
@@ -2615,9 +2607,8 @@ impl RenderEngine {
             ]
         };
 
-        // Clamp each rect to dst extent + drop empties up-front, so
-        // the recorder's per-rect scissor + draw never sees a bogus
-        // rect. Mirrors v1's pre-record clamp loop.
+        // Clamp rects to dst extent + drop empties (preserve legacy
+        // filter_map at engine.rs:2562-2588).
         let vk_rects: Vec<vk::Rect2D> = rects
             .iter()
             .filter_map(|r| {
@@ -2643,133 +2634,55 @@ impl RenderEngine {
             return Ok(());
         }
 
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
-        let device = &inner.vk.device;
-
-        // Transition target → COLOR_ATTACHMENT_OPTIMAL. Same producer
-        // mask shape as fill_rect (SHADER_SAMPLED_READ + TRANSFER_WRITE
-        // + COLOR_ATTACHMENT_WRITE) so a prior compose-read / put_image
-        // / paint drains correctly per cross-cutting §2.
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ
-                | vk::AccessFlags2::TRANSFER_WRITE
-                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
-
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent,
-        };
-        let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let rendering_info = vk::RenderingInfo::default()
-            .render_area(render_area)
-            .layer_count(1)
-            .color_attachments(&color_attachment);
-        let viewport = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            #[allow(clippy::cast_precision_loss)]
-            width: extent.width as f32,
-            #[allow(clippy::cast_precision_loss)]
-            height: extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-
-        let dst_vp = [
-            #[allow(clippy::cast_precision_loss)]
-            {
-                extent.width as f32
-            },
-            #[allow(clippy::cast_precision_loss)]
-            {
-                extent.height as f32
-            },
-        ];
-        let damage_rects: Vec<vk::Rect2D> = vk_rects.clone();
-        unsafe {
-            device.cmd_begin_rendering(cb, &rendering_info);
-            device.cmd_set_viewport(cb, 0, &viewport);
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
-
-            for r in &vk_rects {
-                let scissor = [*r];
-                device.cmd_set_scissor(cb, 0, &scissor);
-                let pc = LogicFillPushConsts {
-                    dst_origin: [
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            r.offset.x as f32
-                        },
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            r.offset.y as f32
-                        },
-                    ],
-                    dst_size: [
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            r.extent.width as f32
-                        },
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            r.extent.height as f32
-                        },
-                    ],
-                    viewport: dst_vp,
-                    _pad: [0.0, 0.0],
-                    fg_color: color,
-                };
-                device.cmd_push_constants(
-                    cb,
-                    pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    pc.as_bytes(),
-                );
-                device.cmd_draw(cb, 4, 1, 0, 0);
-            }
-            device.cmd_end_rendering(cb);
+        // Open frame if not already open (same pattern as fill_rect_batch).
+        if !inner.frame_builder.is_open() {
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
         }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
 
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
-
-        end_and_submit_op(inner, platform, cb, &ticket)?;
-        store.touch_render_fence(target, ticket.clone());
-        for r in &damage_rects {
+        // Prelude: first_touch + first_touch_drawable + touch_render_fence
+        // + per-rect damage.
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(target, prior_dst_ticket);
+            open.layouts.first_touch_drawable(target, dst_pre_layout);
+        }
+        store.touch_render_fence(target, frame_ticket.clone());
+        for r in &vk_rects {
             store.damage(target, *r);
         }
-        inner.acquire_generation += 1;
-        let generation = inner.acquire_generation;
-        inner.pending_group_ops.push(SubmittedOp {
-            cb,
-            ticket,
-            staging: None,
-            scratch: Vec::new(),
-            atlas_ticket: None,
-            generation,
-            retired_resources: Vec::new(),
+
+        // Build RecordedLogicFill payload and append to the open frame.
+        let payload = Box::new(super::frame_builder::RecordedLogicFill {
+            dst_id: target,
+            dst_image_view: image_view,
+            dst_extent: extent,
+            dst_format: format,
+            dst_old_layout: dst_pre_layout,
+            logic_mode: function,
+            opaque_alpha,
+            color,
+            rects: vk_rects,
         });
-        // `inner` borrow released. Auto-flush.
-        self.maybe_auto_flush_submit_group(platform)?;
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::LogicFill(payload),
+                &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+            );
+        }
         Ok(())
     }
 
@@ -7919,9 +7832,7 @@ fn emit_recorded_op_into_cb(
         Op::CopyArea(ca) => emit_recorded_copy_area_into_cb(inner, cb, ca),
         Op::PutImage(pi) => emit_recorded_put_image_into_cb(inner, cb, pins, pi),
         Op::FillRect(fr) => emit_recorded_fill_rect_into_cb(inner, store, cb, fr),
-        Op::LogicFill(_) => {
-            unimplemented!("Phase B.3 Task 10: emit_recorded_logic_fill_into_cb")
-        }
+        Op::LogicFill(lf) => emit_recorded_logic_fill_into_cb(inner, store, cb, lf),
         Op::ImageText(_) => {
             unimplemented!("Phase B.3 Task 14: emit_recorded_image_text_into_cb")
         }
@@ -8517,6 +8428,120 @@ fn emit_recorded_fill_rect_into_cb(
     }
 
     // Post-barrier: dst → SHADER_READ_ONLY_OPTIMAL (N1 terminal layout).
+    barrier_to_layout(
+        device,
+        cb,
+        dst_image,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    Ok(())
+}
+
+/// Phase B.3 Task 10: replay a `RecordedLogicFill` into the frame CB.
+///
+/// Mirrors engine.rs pre-B.3 `logic_fill` emit body (lines ~2593-2697):
+/// - pipeline re-resolved FRESH via `inner.logic_fill_caches[dst_format]
+///   .get(logic_mode, opaque_alpha)` (cache is engine-owned + stable per N6).
+/// - Single `cmd_set_viewport` OUTSIDE the per-rect loop (N6 invariant).
+/// - Push constants match legacy shape: dst_origin, dst_size, viewport,
+///   _pad, fg_color.
+fn emit_recorded_logic_fill_into_cb(
+    inner: &mut RenderEngineInner,
+    store: &DrawableStore,
+    cb: vk::CommandBuffer,
+    lf: &super::frame_builder::RecordedLogicFill,
+) -> Result<(), RenderError> {
+    use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
+    let device = &inner.vk.device;
+    let dst_image = store
+        .get(lf.dst_id)
+        .ok_or(RenderError::UnknownDrawable(lf.dst_id))?
+        .storage
+        .image;
+    let cache = inner
+        .logic_fill_caches
+        .get_mut(&lf.dst_format)
+        .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+    let pipeline = cache
+        .get(lf.logic_mode, lf.opaque_alpha)
+        .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+    let pipeline_layout = cache.pipeline_layout();
+
+    // N6 pre-barrier: drain prior compose / put_image / paint writes via
+    // ALL_COMMANDS producer mask (exact shape from legacy at
+    // engine.rs:2649-2663).
+    barrier_to_layout(
+        device,
+        cb,
+        dst_image,
+        lf.dst_old_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+    );
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: lf.dst_extent,
+    };
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(lf.dst_image_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(render_area)
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    #[allow(clippy::cast_precision_loss)]
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: lf.dst_extent.width as f32,
+        height: lf.dst_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    #[allow(clippy::cast_precision_loss)]
+    let dst_vp = [lf.dst_extent.width as f32, lf.dst_extent.height as f32];
+    unsafe {
+        device.cmd_begin_rendering(cb, &rendering_info);
+        // N6: single cmd_set_viewport OUTSIDE the per-rect loop
+        // (legacy at engine.rs:2702 sets it once before the for loop).
+        device.cmd_set_viewport(cb, 0, &viewport);
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        for r in &lf.rects {
+            let scissor = [*r];
+            device.cmd_set_scissor(cb, 0, &scissor);
+            #[allow(clippy::cast_precision_loss)]
+            let pc = LogicFillPushConsts {
+                dst_origin: [r.offset.x as f32, r.offset.y as f32],
+                dst_size: [r.extent.width as f32, r.extent.height as f32],
+                viewport: dst_vp,
+                _pad: [0.0, 0.0],
+                fg_color: lf.color,
+            };
+            device.cmd_push_constants(
+                cb,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc.as_bytes(),
+            );
+            device.cmd_draw(cb, 4, 1, 0, 0);
+        }
+        device.cmd_end_rendering(cb);
+    }
+    // Post-barrier: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
     barrier_to_layout(
         device,
         cb,

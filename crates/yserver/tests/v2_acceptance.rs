@@ -4844,3 +4844,90 @@ fn v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
         "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
     );
 }
+
+/// Phase B.3 Task 10 acceptance gate: two consecutive `logic_fill`
+/// calls in the same open frame produce exactly ONE `SubmittedOp` +
+/// ONE `vkQueueSubmit2`. Pre-B.3 each call submitted independently.
+///
+/// Also verifies `CloseReason::NonPortedPaintOp` is NOT fired —
+/// `logic_fill` now extends the open frame rather than closing it via
+/// `close_open_frame_for_non_ported_op`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Drain any setup CBs so the counter snapshot is at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    let rects = [yserver::kms::cpu_types::Rectangle16 {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+    }];
+
+    // Both calls must accumulate into the same open frame.
+    be.engine_logic_fill_for_tests(
+        dst,
+        yserver_core::backend::GcFunction::Xor,
+        /* opaque_alpha */ true,
+        0xFF00FF,
+        &rects,
+    )
+    .expect("first logic_fill");
+    be.engine_logic_fill_for_tests(
+        dst,
+        yserver_core::backend::GcFunction::And,
+        true,
+        0x00FF00,
+        &rects,
+    )
+    .expect("second logic_fill");
+
+    // The frame must still be open — logic_fill extends, doesn't close.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame must survive two logic_fill calls (not closed by M2 path)"
+    );
+
+    // Force-close via the Timeout helper (one flush = one vkQueueSubmit2).
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two logic_fill calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "logic_fill must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+
+    // Frame must be closed after the force-close.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+}
