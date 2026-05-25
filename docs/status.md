@@ -2594,6 +2594,80 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         check-accelerated falls back to llvmpipe / skips GL —
         does not block the session.
 
+    **air hardware capture 2026-05-25** (Apple M1, Asahi ALARM
+    kernel 6.19.14-2-1-ARCH, single output eDP-1 @ 2560x1600, MATE
+    session ~35 s). First yserver-v2 run on aarch64 / Apple Silicon.
+    Bootstrap required one fix on the `asahi` branch: Asahi exposes
+    a split-driver layout — `/dev/dri/card0` is the `asahi` GPU
+    (render-only, `MODE_GETRESOURCES → EOPNOTSUPP`) and
+    `/dev/dri/card2` is `apple-drm` (KMS). `resolve_drm_device` in
+    `lib.rs` only probed card0/card1 and didn't distinguish render-
+    only nodes; now it scans `/dev/dri/card*` and keeps the first
+    whose `resource_handles()` succeeds (commit `90c5c57`). The
+    Stage 4d.3 DRI3 dev-walk fallback already handled the
+    parent-mismatch case so `/dev/dri/renderD128` (asahi GPU) gets
+    picked up cleanly for Vulkan + DRI3 from apple-drm's card2.
+    After the resolver fix: clean bootstrap
+    (`driver_id=MESA_AGXV`, scanout modifier=0x0 linear fallback —
+    apple-drm doesn't advertise modifier-friendly tilings, same
+    shape as the rx580 RADV and NVIDIA proprietary fallbacks), no
+    v2 gaps logged, no `not yet implemented` warns. HW cursor
+    plane found via legacy `set_cursor2` fallback: `cursor: found
+    0/1 atomic cursor planes; remaining CRTCs will use legacy
+    ioctls` — apple-drm doesn't expose an atomic cursor plane;
+    the 64×64 ARGB8888 cursor still works via the legacy path.
+    Atomic-commit despite `DRM_CLIENT_CAP_ATOMIC` rejection works
+    end-to-end — confirms the hopeful comment in `drm/device.rs`'s
+    `enable_atomic_capabilities`. 35 telemetry buckets:
+      - `paint_submits/s` avg 1,552 peak 9,496;
+        `queue_submit2/s` avg 1,618 peak 9,554. Steady-state
+        below bee's post-Task-6.1 ceiling (3,304) and nvidia's
+        ceiling (3,216); the peak (9,554) shows the workload
+        bursts harder than nvidia/bee but the bursts don't
+        accumulate — frame production tracks composite at 60 Hz
+        without backpressure.
+      - `composite_submits/s` avg 53 peak 61,
+        `frame_present_count/s` tracks 1:1;
+        `missed_pageflips/s = 0` across all buckets. Display
+        path solid.
+      - `cpu_fence_wait_ns/s` avg 1.44 ms peak 31.7 ms; non-zero
+        but well below bee/silence pre-Task-6.1. Task 6.1
+        deferred-PRESENT semaphore-batch design holds on AGX.
+      - `descriptor_pool_creates/s` 2 across the whole run
+        (warmup only); `descriptor_pool_resets/s` avg 4.6 peak
+        9. Ring recycles as designed on a 4th driver
+        (Mesa AGX-V joins RADV, NVIDIA, Turnip).
+      - Cow coalescing: `cow_batches_flushed/s` avg 77 peak 160;
+        `cow_copies_coalesced/s` avg 591 peak 1,102 (avg
+        `copies/batch ≈ 7.7`, matching nvidia). Render
+        coalescing: `render_batches_flushed/s` avg 368 peak
+        1,951; `render_composites_coalesced/s` avg 523 peak
+        2,069 (avg `composites/batch ≈ 1.34`).
+      - `storage_allocations/s` avg 443 peak 1,887 (single
+        output @ 2560x1600; matches nvidia's 495/881 shape on
+        the same workload — full-output redirected backings
+        missing the ≤128px PixmapPool bucket cap). Task 5
+        territory.
+      - From the submit trace (`yserver-mate.submit.tsv`, 57 k
+        rows): `composite_glyphs` avg_batch 10.30 peak 62;
+        `render_traps` avg_batch 17.06 peak 39; `copy_area`
+        avg_batch 3.97 peak 26 (cow target dominates as
+        elsewhere); `render_composite` avg_batch 1.34 peak 6;
+        **`render_fill` avg_batch 1.24** (17,897 rows) — same
+        largest unexploited coalesce surface as nvidia and bee.
+      - **Damage-saturation bug reproduces** on a 4th hardware
+        class: `damage_fraction = 1.000` in several buckets,
+        `full_redraw_fallback/s ≈ 0`. Same `pick_repaint_region`
+        correctness gap silence first surfaced 2026-05-22 —
+        AGX joins RADV/silence and NVIDIA/proprietary. Did not
+        visibly smear on this run.
+      - User subjective: **completely lag-free** under the same
+        MATE drag workload that lags on bee. Bee remains the
+        sole hardware where steady-state submit rate binds the
+        user-perceived envelope; the M1's aarch64 ioctl path
+        and/or asahi GPU submit path absorb the load that
+        Rembrandt's amdgpu round-trip cannot.
+
     **2026-05-23 bee wrapper-overhead baseline (Phase A T3.5 + T3.6
     landed):** `queue_submit2/s` peak **2457** (pre-Phase-A peak was
     3304; ~25 % lower already, likely workload variance + the
@@ -3321,60 +3395,3 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       - iMac / fuji regression checks.
       - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
         intel, lavapipe) — no new validation VUIDs.
-
-### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
-
-v1 stays in tree past Stage 3 close. Deletion happens only when
-**all** hold: v2 has been the default for ≥1 month, no v2-only
-regression open, Stage 4 landed and validated on hardware,
-measured perf gates pass (correctness gates v1 fails + no
-regression on v1's good cases + headroom gates where v2 should
-be measurably better), maintenance cost felt to outweigh
-fallback value.
-
----
-
-## Followups not on the v2 critical path
-
-See `known-issues.md` for the full ticklist. Highlights tracked
-here for awareness during stage planning:
-
-- [ ] **`disable_output` atomic EINVAL** — recurring shutdown
-  warn; disarm path mitigates but per-property split is the real
-  fix. Survives the rewrite (lives in `PlatformBackend`'s
-  shutdown sequence).
-- [~] **Per-glyph queue_wait_idle in `GlyphAtlas::intern`** —
-  v1-era TODO. Stage 3 plan §3a removes the persistent staging
-  buffer + per-upload wait by routing through arena slices
-  owned by `SubmittedOp`. Landed when 3a-atlas+text commits.
-- [ ] **AMD-specific investigation** — bee + adapta-mate-cc
-  catastrophic mouse lag. Independent of model choice (submit-
-  rate bound). Tackled via separate perf plans built on v2; see
-  spec's per-hardware-class expectations.
-- [~] **GTK wheel-scroll warm-up race** — non-deterministic
-  initial-app residual after the XI2 valuator-scroll fix.
-  Unrelated to rendering; lives at `process_request.rs` /
-  pointer-event pump. Unaffected by v2.
-- [x] **~~Nested-DE 25 s startup stall under host GNOME-Wayland~~**
-  — FIXED 2026-05-21. caja blocked the full GDBus 25 s timeout in
-  `StartServiceByName("org.freedesktop.portal.Desktop")` because
-  the host's xdg-desktop-portal-documents held
-  `/run/user/1000/doc` FUSE-mounted, so the nested portal couldn't
-  fully come up. All `yserver-{mate,xfce,cinnamon}-hw*` Justfile
-  recipes plus `tools/profile-mate.sh` now allocate an isolated
-  `XDG_RUNTIME_DIR=$(mktemp -d)` per run. See `known-issues.md`
-  for the full diagnostic chain and reproduction recipe.
-
----
-
-## Source-of-truth pointers
-
-- v2 spec: `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`
-- v1 rendering re-architecture HLD:
-  `docs/superpowers/specs/2026-05-12-rendering-rearchitecture-hld.md`
-  (v2 supersedes in motivation; the v1 delivered work — Phases
-  3-5, pool, GPU traps — is still in tree on `graphics-followups`)
-- Cross-cutting bugs: `known-issues.md`
-- v1 history: `status-archive-2026-05-15.md`
-- Pre-rework history: `status-archive-2026-05-13.md`
-- Per-skill memory: `~/.claude/projects/-home-jos-Projects-yserver/memory/MEMORY.md`

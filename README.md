@@ -37,6 +37,23 @@ See [`docs/test-status.md`](docs/test-status.md) for the latest xts5
   for current gaps, and [`docs/xts-baseline.md`](docs/xts-baseline.md)
   for the run-by-run xts working log.
 
+## Hardware tested
+
+`yserver` (standalone DRM/KMS) has been driven end-to-end against a
+MATE / xfce4 desktop on:
+
+- **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
+  (Polaris/GCN4, RADV).
+- **Intel** — i5-7200U (Kaby Lake, ANV).
+- **NVIDIA** — proprietary driver.
+- **ARM** — Snapdragon X1 (Adreno X1, Turnip); Apple M1 on Asahi
+  Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
+- **Virtual** — virtio-gpu inside `virtme-ng` (lavapipe and Venus
+  passthrough) — the dev loop.
+
+See [`docs/status.md`](docs/status.md) under Stage 5 for the
+per-hardware telemetry captures and bottleneck split.
+
 ## Layout
 
 - `crates/yserver-protocol` — wire-format types, request/reply parsing.
