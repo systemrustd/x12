@@ -2353,28 +2353,31 @@ impl RenderEngine {
         rect: vk::Rect2D,
         color: [f32; 4],
     ) -> Result<(), RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // Phase B.3 (N4): one-line delegate — fill_rect_batch carries the
+        // new frame-builder body. The old close_open_frame_for_non_ported_op
+        // call is DELETED; fill_rect now extends the open frame instead of
+        // closing it.
         self.fill_rect_batch(store, platform, target, color, &[rect])
     }
 
-    /// Fill every rect in `rects` on `target` with `color`, recording
-    /// all clears into a **single** CB + a **single** submit + a
-    /// **single** `SubmittedOp` (Stage 3f.15 stroke-op aggregation).
-    /// `vkCmdClearAttachments` natively accepts a slice of `ClearRect`,
-    /// so PolySegment / PolyLine / PolyRectangle stroke fan-outs that
-    /// previously paid N submits collapse to one.
+    /// Fill every rect in `rects` on `target` with `color`, accumulating
+    /// ONE `RecordedFillRect` into the open frame (Phase B.3 N4 — the
+    /// entire rect slice is ONE op, not split per-rect). `fill_rect` is
+    /// a one-line delegate here with N=1.
+    ///
+    /// Body order per N9: empty-input fast-path → `renderer_failed` →
+    /// `flush_render_batch` → preflight (clamp+filter) → open frame if
+    /// not open → first_touch + ticket-touch + damage →
+    /// `push_op_and_set_layouts` with `(target, SHADER_READ_ONLY_OPTIMAL)`.
     ///
     /// Zero-sized rects are filtered up-front; if the slice contains
     /// only empties (or is empty), the call short-circuits without
-    /// touching the queue.
+    /// touching the frame.
     ///
     /// # Errors
     ///
     /// - `NoVk`, `UnknownDrawable`, `RendererFailed`, or any
-    ///   propagated `vk::Result` from CB allocation / submit.
+    ///   propagated `vk::Result` from CB allocation (on frame open).
     pub(crate) fn fill_rect_batch(
         &mut self,
         store: &mut DrawableStore,
@@ -2383,28 +2386,35 @@ impl RenderEngine {
         color: [f32; 4],
         rects: &[vk::Rect2D],
     ) -> Result<(), RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
-        self.flush_render_batch(store, platform)?;
-        let Some(inner) = self.inner.as_mut() else {
-            return Err(RenderError::NoVk);
-        };
+        // Phase B.3 (N9): empty-input fast-path — BEFORE flush_render_batch.
+        if rects.is_empty() {
+            return Ok(());
+        }
+        // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        let Some(drawable) = store.get_mut(target) else {
+        // Phase B.3 (N9): flush pending_render_batch at entry. May close an
+        // open frame (chronological X11 ordering with pre-existing batches).
+        // NO flush_cow_batch — that helper is deleted in Task 4.
+        self.flush_render_batch(store, platform)?;
+
+        // Preflight: read target metadata WITHOUT mutating the frame.
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        let Some(drawable) = store.get(target) else {
             return Err(RenderError::UnknownDrawable(target));
         };
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
-        // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
-        // investigation). Logs every fill_rect_batch with target id
-        // + color + caller-side rects, so we can spot any path that
-        // overwrites a redirected backing with the depth-24 default
-        // (0,0,0,1) color or any other clear. Remove once the
-        // backing-reset cause is identified.
+        let format = drawable.storage.format;
+        let dst_pre_layout = drawable.storage.current_layout;
+        let prior_dst_ticket = drawable.last_render_ticket.clone();
+
+        // Diagnostic trace (preserved from legacy body — useful for the
+        // "opaque black backing" investigation). Logs every fill_rect_batch
+        // with target id + color + caller-side rects.
         if log::log_enabled!(target: "yserver::kms::v2::fill", log::Level::Trace) {
             let depth = drawable.depth;
             log::trace!(
@@ -2415,9 +2425,8 @@ impl RenderEngine {
             );
         }
 
-        // Clamp + drop empties up front. Doing this before begin_op_cb
-        // means an all-empty batch doesn't allocate a CB or burn a
-        // fence ticket.
+        // Clamp + drop empties up front. Doing this before any frame
+        // mutation means an all-empty batch short-circuits cleanly.
         let clamped: Vec<vk::Rect2D> = rects
             .iter()
             .map(|r| clamp_rect(*r, extent))
@@ -2427,105 +2436,54 @@ impl RenderEngine {
             return Ok(());
         }
 
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
-        let device = &inner.vk.device;
-
-        // Transition target → COLOR_ATTACHMENT_OPTIMAL. Producer
-        // mask includes SHADER_SAMPLED_READ (compose's prior read)
-        // and TRANSFER_WRITE (prior put_image) so a follow-on
-        // paint after compose-read drains correctly per cross-
-        // cutting §2 write-after-read note.
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ
-                | vk::AccessFlags2::TRANSFER_WRITE
-                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
-
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent,
-        };
-        let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let rendering_info = vk::RenderingInfo::default()
-            .render_area(render_area)
-            .layer_count(1)
-            .color_attachments(&color_attachment);
-
-        let attachments = [vk::ClearAttachment::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .color_attachment(0)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue { float32: color },
-            })];
-        let clear_rects: Vec<vk::ClearRect> = clamped
-            .iter()
-            .map(|r| {
-                vk::ClearRect::default()
-                    .rect(*r)
-                    .base_array_layer(0)
-                    .layer_count(1)
-            })
-            .collect();
-
-        unsafe {
-            device.cmd_begin_rendering(cb, &rendering_info);
-            let viewport = [vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                #[allow(clippy::cast_precision_loss)]
-                width: extent.width as f32,
-                #[allow(clippy::cast_precision_loss)]
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }];
-            device.cmd_set_viewport(cb, 0, &viewport);
-            let scissor = [render_area];
-            device.cmd_set_scissor(cb, 0, &scissor);
-
-            device.cmd_clear_attachments(cb, &attachments, &clear_rects);
-            device.cmd_end_rendering(cb);
+        // Open the frame if not already open (mirror copy_area / put_image
+        // pattern at engine.rs:5278-5287).
+        if !inner.frame_builder.is_open() {
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
         }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
 
-        // Return target to SHADER_READ_ONLY_OPTIMAL.
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
-
-        end_and_submit_op(inner, platform, cb, &ticket)?;
-        store.touch_render_fence(target, ticket.clone());
+        // Prelude: first_touch + ticket-touch + damage.
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(target, prior_dst_ticket);
+            open.layouts.first_touch_drawable(target, dst_pre_layout);
+        }
+        store.touch_render_fence(target, frame_ticket.clone());
         for r in &clamped {
             store.damage(target, *r);
         }
-        inner.acquire_generation += 1;
-        let generation = inner.acquire_generation;
-        inner.pending_group_ops.push(SubmittedOp {
-            cb,
-            ticket,
-            staging: None,
-            scratch: Vec::new(),
-            atlas_ticket: None,
-            generation,
-            retired_resources: Vec::new(),
+
+        // Phase B.3 (N4): ONE RecordedFillRect per call carrying the entire
+        // clamped rect slice. Splitting per-rect would be new behavior.
+        let payload = Box::new(super::frame_builder::RecordedFillRect {
+            dst_id: target,
+            dst_image_view: image_view,
+            dst_extent: extent,
+            dst_format: format,
+            dst_old_layout: dst_pre_layout,
+            color,
+            rects: clamped,
         });
-        // `inner` borrow released. Auto-flush.
-        self.maybe_auto_flush_submit_group(platform)?;
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::FillRect(payload),
+                &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+            );
+        }
         Ok(())
     }
 
@@ -7960,7 +7918,7 @@ fn emit_recorded_op_into_cb(
         // Phase B.3 — CopyArea implemented in Task 2; stubs for later tasks.
         Op::CopyArea(ca) => emit_recorded_copy_area_into_cb(inner, cb, ca),
         Op::PutImage(pi) => emit_recorded_put_image_into_cb(inner, cb, pins, pi),
-        Op::FillRect(_) => unimplemented!("Phase B.3 Task 8: emit_recorded_fill_rect_into_cb"),
+        Op::FillRect(fr) => emit_recorded_fill_rect_into_cb(inner, store, cb, fr),
         Op::LogicFill(_) => {
             unimplemented!("Phase B.3 Task 10: emit_recorded_logic_fill_into_cb")
         }
@@ -8458,6 +8416,115 @@ fn emit_recorded_put_image_into_cb(
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         vk::PipelineStageFlags2::COPY,
         vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    Ok(())
+}
+
+/// Phase B.3 Task 8: replay a deferred `RecordedFillRect` into the
+/// frame's command buffer. Uses `cmd_clear_attachments` directly —
+/// NO composite pipeline, NO descriptor (codex round-7 catch —
+/// earlier drafts erroneously routed through composite).
+///
+/// `load_op = LOAD` is LOAD-BEARING per N4: outside-rect pixels must
+/// be preserved. `DONT_CARE` would invalidate the entire render area.
+///
+/// Pre-barrier producer mask mirrors the legacy path at the old
+/// engine.rs fill_rect_batch body: `ALL_COMMANDS /
+/// SHADER_SAMPLED_READ | TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE`
+/// drains any prior compose reads / put_image writes / fill writes
+/// on the same image.
+fn emit_recorded_fill_rect_into_cb(
+    inner: &mut RenderEngineInner,
+    store: &DrawableStore,
+    cb: vk::CommandBuffer,
+    fr: &super::frame_builder::RecordedFillRect,
+) -> Result<(), RenderError> {
+    let device = &inner.vk.device;
+    // Resolve the dst vk::Image at emit time — the payload carries
+    // dst_id so we can look it up from the store. The storage image is
+    // stable for the drawable's lifetime; no invalidation risk.
+    let dst_image = store
+        .get(fr.dst_id)
+        .ok_or(RenderError::UnknownDrawable(fr.dst_id))?
+        .storage
+        .image;
+
+    // FILL pre-barrier: drain prior writes / reads on dst, then
+    // transition to COLOR_ATTACHMENT_OPTIMAL for the clear pass.
+    // Mirror the legacy fill_rect_batch barrier at the old body.
+    barrier_to_layout(
+        device,
+        cb,
+        dst_image,
+        fr.dst_old_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+    );
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: fr.dst_extent,
+    };
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(fr.dst_image_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD) // LOAD-BEARING per N4
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(render_area)
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    let attachments = [vk::ClearAttachment::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .color_attachment(0)
+        .clear_value(vk::ClearValue {
+            color: vk::ClearColorValue { float32: fr.color },
+        })];
+    let clear_rects: Vec<vk::ClearRect> = fr
+        .rects
+        .iter()
+        .map(|r| {
+            vk::ClearRect::default()
+                .rect(*r)
+                .base_array_layer(0)
+                .layer_count(1)
+        })
+        .collect();
+    unsafe {
+        device.cmd_begin_rendering(cb, &rendering_info);
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            #[allow(clippy::cast_precision_loss)]
+            width: fr.dst_extent.width as f32,
+            #[allow(clippy::cast_precision_loss)]
+            height: fr.dst_extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        device.cmd_set_viewport(cb, 0, &viewport);
+        let scissor = [render_area];
+        device.cmd_set_scissor(cb, 0, &scissor);
+        device.cmd_clear_attachments(cb, &attachments, &clear_rects);
+        device.cmd_end_rendering(cb);
+    }
+
+    // Post-barrier: dst → SHADER_READ_ONLY_OPTIMAL (N1 terminal layout).
+    barrier_to_layout(
+        device,
+        cb,
+        dst_image,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         vk::PipelineStageFlags2::FRAGMENT_SHADER,
         vk::AccessFlags2::SHADER_SAMPLED_READ,
     );
@@ -12047,8 +12114,16 @@ mod tests {
     /// ONE submit + ONE `SubmittedOp`. Drives 3 disjoint rects on a
     /// 16×4 BGRA8 dst pre-cleared to blue, fills them red, and
     /// asserts (a) the dst observes red inside each rect and blue
-    /// outside, and (b) `inner.submitted` grew by exactly 1 across
-    /// the batch call.
+    /// outside, and (b) `inner.submitted` grew by exactly 1 across the
+    /// two fill calls (blue-prefill + red-batch) after the frame closes.
+    ///
+    /// Phase B.3 update: fill_rect / fill_rect_batch now append to the
+    /// open frame instead of submitting immediately. The count assertion
+    /// is now gated on closing the frame first (via
+    /// `close_open_frame_for_timeout_for_tests`), then asserting submitted
+    /// grew by the expected count. The pixel-correctness assertions are
+    /// unchanged — `get_image` closes any open frame internally (via
+    /// `close_open_frame(SyncWait)`) so they still observe all fills.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn fill_rect_batch_one_submit_for_n_rects() {
@@ -12073,7 +12148,8 @@ mod tests {
             .unwrap();
 
         // Pre-fill the dst with blue so we can see the batch-painted
-        // rects against a known background.
+        // rects against a known background. Phase B.3: this now appends
+        // to the open frame instead of submitting a per-op CB.
         let blue = decode_x11_pixel_bgra(0xFF_00_00_FF);
         engine
             .fill_rect(
@@ -12091,8 +12167,13 @@ mod tests {
             )
             .expect("blue prefill");
 
-        // Drain setup op (blue prefill) before snapshotting the baseline
-        // (cap=16 deferred-graduation: ops park in pending_group_ops).
+        // Close the blue-prefill frame so the red-batch starts in a
+        // fresh frame. This mirrors the production sequence where
+        // fill_rect is followed by a different op that closes the frame.
+        // After close + flush, the blue-prefill SubmittedOp is in submitted.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close blue-prefill frame");
         engine
             .flush_submit_group(
                 &mut platform,
@@ -12100,9 +12181,8 @@ mod tests {
             )
             .expect("setup flush");
 
-        // Snapshot the SubmittedOp count BEFORE the batch call so we
-        // can assert exactly +1 across the call regardless of what
-        // prior ops are still in flight.
+        // Snapshot the SubmittedOp count BEFORE the red batch so we
+        // can assert exactly +1 (the red frame) across the call.
         let before = engine
             .inner
             .as_ref()
@@ -12137,7 +12217,11 @@ mod tests {
             .fill_rect_batch(&mut store, &mut platform, id, red, &rects)
             .expect("fill_rect_batch");
 
-        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
+        // Phase B.3: close the open frame (red batch) before asserting
+        // the SubmittedOp count — the op is now frame-resident until close.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close red-batch frame");
         engine
             .flush_submit_group(
                 &mut platform,
@@ -12153,8 +12237,8 @@ mod tests {
         assert_eq!(
             after,
             before + 1,
-            "fill_rect_batch must produce exactly one SubmittedOp regardless of rect count \
-             (before={before}, after={after})"
+            "fill_rect_batch (red rects) must produce exactly ONE SubmittedOp \
+             regardless of rect count — N4 invariant (before={before}, after={after})"
         );
 
         let out = engine

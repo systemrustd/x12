@@ -4761,3 +4761,86 @@ fn v2_frame_builder_put_image_collapses_two_in_one_frame() {
         "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
     );
 }
+
+/// Phase B.3 Task 8 acceptance gate: two consecutive `fill_rect_batch`
+/// calls in the same open frame produce exactly ONE `SubmittedOp` +
+/// ONE `vkQueueSubmit2`. Pre-B.3 each call submitted independently.
+///
+/// The test also verifies `CloseReason::NonPortedPaintOp` is NOT
+/// fired — fill_rect_batch now extends the open frame rather than
+/// closing it via `close_open_frame_for_non_ported_op`.
+#[test]
+#[ignore = "requires Vk fixture — gated to v2_acceptance harness"]
+fn v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(128, 128)
+        .expect("allocate dst pixmap");
+
+    // Drain any setup CBs so the counter snapshot is at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    let rects1 = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+    }];
+    let rects2 = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 32, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+    }];
+
+    // Both calls must accumulate into the same open frame.
+    be.engine_fill_rect_batch_for_tests(dst, [1.0, 0.0, 0.0, 1.0], &rects1)
+        .expect("first fill_rect_batch");
+    be.engine_fill_rect_batch_for_tests(dst, [0.0, 1.0, 0.0, 1.0], &rects2)
+        .expect("second fill_rect_batch");
+
+    // The frame must still be open — fill_rect_batch extends, doesn't close.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame must survive two fill_rect_batch calls (not closed by M2 path)"
+    );
+
+    // Force-close via the Timeout helper (one flush = one vkQueueSubmit2).
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two fill_rect_batch calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "fill_rect_batch must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+
+    // Frame must be closed after the force-close.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+}

@@ -2337,6 +2337,29 @@ impl KmsBackendV2 {
             .map_err(|e| std::io::Error::other(format!("engine_put_image_for_tests: {e:?}")))
     }
 
+    /// B.3 Task 8 — test-only: invoke `engine.fill_rect_batch` against
+    /// the given `dst_xid` with `color` and `rects`. Returns `Err` if
+    /// `dst_xid` doesn't resolve in the store or if the engine call fails.
+    #[allow(
+        dead_code,
+        reason = "used by v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame"
+    )]
+    pub fn engine_fill_rect_batch_for_tests(
+        &mut self,
+        dst_xid: u32,
+        color: [f32; 4],
+        rects: &[ash::vk::Rect2D],
+    ) -> Result<(), std::io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_fill_rect_batch_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        self.engine
+            .fill_rect_batch(&mut self.store, &mut self.platform, dst_id, color, rects)
+            .map_err(|e| std::io::Error::other(format!("engine_fill_rect_batch_for_tests: {e:?}")))
+    }
+
     /// B.3 Task 4 — test-only: attach a synthetic PRESENT completion
     /// to the open frame's cow slot (via `engine.attach_cow_present_completion`)
     /// without a real X PRESENT client. Returns `true` if the attach
