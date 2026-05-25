@@ -4422,3 +4422,92 @@ fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
          Vec (got len={scratch_len})",
     );
 }
+
+/// Phase B.3 Task 2 (N1, N8, N9): two consecutive `copy_area` calls in the
+/// same open frame produce exactly ONE `SubmittedOp` / `vkQueueSubmit2`. Before
+/// B.3, each `copy_area` closed the open frame (M2), submitted its own CB, and
+/// opened a fresh one — producing N submits for N calls. After B.3 the calls
+/// accumulate into the already-open frame and collapse to one submit on close.
+///
+/// Invariants exercised:
+/// - N9: `flush_render_batch` is called at entry; the frame stays open.
+/// - N1: both dst and src overlays are set to `SHADER_READ_ONLY_OPTIMAL`.
+/// - N8: no self-overlap scratch allocated (disjoint src/dst).
+/// - M2: `close_open_frame_for_non_ported_op` is GONE — copy_area extends the
+///   frame instead of closing it.
+///
+/// Counter: per-backend `telemetry.lifetime.submit_group_flushes` (delta == 1
+/// for the one forced-close flush — parallel-safe).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_copy_area_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let src = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate src pixmap");
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Drain any baseline flush outcomes (setup CBs from pixmap allocation)
+    // so the per-backend counter snapshot is at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    let src_rect = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+    };
+
+    // Two copy_area calls — both must append into the same open frame
+    // WITHOUT closing it in between (the old M2 close is gone in B.3).
+    be.engine_copy_area_for_tests(src, dst, src_rect, ash::vk::Offset2D { x: 0, y: 0 })
+        .expect("first copy_area");
+    be.engine_copy_area_for_tests(src, dst, src_rect, ash::vk::Offset2D { x: 32, y: 0 })
+        .expect("second copy_area");
+
+    // Frame should still be open — copy_area extends, doesn't close.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame should survive two copy_area calls"
+    );
+
+    // Force-close via the Timeout helper (one flush = one vkQueueSubmit2).
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+    close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two copy_area calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "copy_area must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+
+    // Frame must be closed.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+}

@@ -2778,31 +2778,33 @@ impl RenderEngine {
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // Phase B.3 (N9): empty-input fast-path FIRST — before any flush.
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
-        // Flush pending COW batch before any non-cow copy_area.
-        self.flush_cow_batch(store, platform)?;
-        self.flush_render_batch(store, platform)?;
-        let Some(inner) = self.inner.as_mut() else {
-            return Err(RenderError::NoVk);
-        };
+        // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        // Read src + dst metadata first (without holding a mutable
-        // borrow into store across both transitions).
+        // Phase B.3 (N9): flush pending_cow_batch (deleted in Task 4 — keep for
+        // now so this compiles until that atomic deletion lands).
+        self.flush_cow_batch(store, platform)?;
+        // Phase B.3 (N9): flush pending_render_batch at entry. May close an
+        // open frame (chronological X11 ordering with pre-existing batches).
+        self.flush_render_batch(store, platform)?;
+
+        // Preflight: read src + dst metadata + format check WITHOUT mutating
+        // anything in the open frame. inner borrow is scoped.
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
         let (src_image, src_extent, src_format) = {
             let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
             (d.storage.image, d.storage.extent, d.storage.format)
         };
-        let (dst_extent, dst_format) = {
+        let (dst_image, dst_extent, dst_format) = {
             let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
-            (d.storage.extent, d.storage.format)
+            (d.storage.image, d.storage.extent, d.storage.format)
         };
         if src_format != dst_format {
             return Err(RenderError::UnsupportedDepth(0));
@@ -2811,6 +2813,8 @@ impl RenderEngine {
         // Clamp src_rect to src extent.
         let src_rect = clamp_rect(src_rect, src_extent);
         // Project to dst: compute the dst rect (clamped to dst extent).
+        // Preserve legacy arithmetic VERBATIM from the pre-B.3 body —
+        // these expressions handle X11 wire negative offsets correctly.
         let dst_pos_clamped = vk::Offset2D {
             x: dst_pos.x.max(0),
             y: dst_pos.y.max(0),
@@ -2842,249 +2846,110 @@ impl RenderEngine {
             },
         };
 
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
-        let device = &inner.vk.device;
+        // Phase B.3 (N8): allocate self-overlap scratch FIRST, BEFORE any
+        // open-frame state mutation. Allocation failure returns Err with the
+        // frame untouched (no rollback needed).
+        let self_overlap_scratch: Option<ScratchImage> = if src == dst {
+            Some(allocate_scratch_image(
+                &inner.vk.clone(),
+                platform,
+                copy_w,
+                copy_h,
+                src_format,
+            )?)
+        } else {
+            None
+        };
 
-        if src == dst {
-            // Same-image overlap path: scratch image at copy_w ×
-            // copy_h, format matches src.
-            let scratch =
-                allocate_scratch_image(&inner.vk.clone(), platform, copy_w, copy_h, src_format)?;
-            // src → TRANSFER_SRC; scratch starts UNDEFINED →
-            // TRANSFER_DST.
-            {
-                let src_d = store.get_mut(src).expect("src missing post-lookup");
-                src_d.record_layout_transition(
-                    &inner.vk,
-                    cb,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::SHADER_SAMPLED_READ
-                        | vk::AccessFlags2::TRANSFER_WRITE
-                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                );
-            }
-            // scratch UNDEFINED → TRANSFER_DST_OPTIMAL.
-            barrier_to_layout(
-                device,
-                cb,
-                scratch.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            );
-            // Copy src_rect → scratch (offset 0,0).
-            let region1 = [vk::ImageCopy::default()
-                .src_subresource(color_layers())
-                .src_offset(vk::Offset3D {
-                    x: src_rect.offset.x,
-                    y: src_rect.offset.y,
-                    z: 0,
-                })
-                .dst_subresource(color_layers())
-                .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .extent(vk::Extent3D {
-                    width: copy_w,
-                    height: copy_h,
-                    depth: 1,
-                })];
-            unsafe {
-                device.cmd_copy_image(
-                    cb,
-                    src_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    scratch.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region1,
-                );
-            }
-            // scratch TRANSFER_DST → TRANSFER_SRC.
-            barrier_to_layout(
-                device,
-                cb,
-                scratch.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            );
-            // src → TRANSFER_DST (it's also dst).
-            {
-                let d = store.get_mut(src).expect("src missing");
-                d.record_layout_transition(
-                    &inner.vk,
-                    cb,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                );
-            }
-            // Copy scratch → src at dst_rect.
-            let region2 = [vk::ImageCopy::default()
-                .src_subresource(color_layers())
-                .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .dst_subresource(color_layers())
-                .dst_offset(vk::Offset3D {
-                    x: dst_rect.offset.x,
-                    y: dst_rect.offset.y,
-                    z: 0,
-                })
-                .extent(vk::Extent3D {
-                    width: copy_w,
-                    height: copy_h,
-                    depth: 1,
-                })];
-            unsafe {
-                device.cmd_copy_image(
-                    cb,
-                    scratch.image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    src_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region2,
-                );
-            }
-            // src → SHADER_READ_ONLY.
-            {
-                let d = store.get_mut(src).expect("src missing");
-                d.record_layout_transition(
-                    &inner.vk,
-                    cb,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                    vk::AccessFlags2::SHADER_SAMPLED_READ,
-                );
-            }
-            end_and_submit_op(inner, platform, cb, &ticket)?;
-            store.touch_render_fence(src, ticket.clone());
-            store.damage(src, dst_rect);
-            inner.acquire_generation += 1;
-            let generation = inner.acquire_generation;
-            inner.pending_group_ops.push(SubmittedOp {
-                cb,
-                ticket,
-                staging: None,
-                scratch: vec![scratch],
-                atlas_ticket: None,
-                generation,
-                retired_resources: Vec::new(),
-            });
-            // `inner` borrow released. Auto-flush.
-            self.maybe_auto_flush_submit_group(platform)?;
-            return Ok(());
+        // Open the frame if not already open. Phase B.2 Mechanism 2: bump
+        // acquire_generation at open + capture on OpenFrame. Mirror of
+        // composite_glyphs_via_frame_builder at engine.rs:5315-5323.
+        if !inner.frame_builder.is_open() {
+            // Release the inner borrow before calling the platform method
+            // (which doesn't need it). Same `let _ = inner` pattern as line 5318.
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
         }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
 
-        // Disjoint-image path: src → TRANSFER_SRC, dst → TRANSFER_DST.
+        // Prelude state: first-touch + layout overlay for BOTH dst and src
+        // (per N1's single-terminal layout + ticket-touch discipline).
+        let dst_pre_layout = store
+            .get(dst)
+            .map(|d| d.storage.current_layout)
+            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        let src_pre_layout = if src == dst {
+            dst_pre_layout
+        } else {
+            store
+                .get(src)
+                .map(|d| d.storage.current_layout)
+                .unwrap_or(vk::ImageLayout::UNDEFINED)
+        };
+        let prior_dst_ticket = store.get(dst).and_then(|d| d.last_render_ticket.clone());
+        let prior_src_ticket = if src == dst {
+            prior_dst_ticket.clone()
+        } else {
+            store.get(src).and_then(|d| d.last_render_ticket.clone())
+        };
         {
-            let d = store.get_mut(src).expect("src missing");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-                    | vk::AccessFlags2::TRANSFER_WRITE
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            );
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(dst, prior_dst_ticket);
+            open.layouts.first_touch_drawable(dst, dst_pre_layout);
+            if src != dst {
+                open.touched.first_touch(src, prior_src_ticket);
+                open.layouts.first_touch_drawable(src, src_pre_layout);
+            }
         }
-        {
-            let d = store.get_mut(dst).expect("dst missing");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-                    | vk::AccessFlags2::TRANSFER_WRITE
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            );
+        store.touch_render_fence(dst, frame_ticket.clone());
+        if src != dst {
+            store.touch_render_fence(src, frame_ticket.clone());
         }
-        let region = [vk::ImageCopy::default()
-            .src_subresource(color_layers())
-            .src_offset(vk::Offset3D {
-                x: src_rect.offset.x,
-                y: src_rect.offset.y,
-                z: 0,
-            })
-            .dst_subresource(color_layers())
-            .dst_offset(vk::Offset3D {
-                x: dst_rect.offset.x,
-                y: dst_rect.offset.y,
-                z: 0,
-            })
-            .extent(vk::Extent3D {
-                width: copy_w,
-                height: copy_h,
-                depth: 1,
-            })];
-        unsafe {
-            let dst_image = store.get(dst).expect("dst missing").storage.image;
-            device.cmd_copy_image(
-                cb,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
-            );
-        }
-        // Return src + dst to SHADER_READ_ONLY.
-        {
-            let d = store.get_mut(src).expect("src missing");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
-        }
-        {
-            let d = store.get_mut(dst).expect("dst missing");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
-        }
-        end_and_submit_op(inner, platform, cb, &ticket)?;
-        store.touch_render_fence(src, ticket.clone());
-        store.touch_render_fence(dst, ticket.clone());
         store.damage(dst, dst_rect);
-        inner.acquire_generation += 1;
-        let generation = inner.acquire_generation;
-        inner.pending_group_ops.push(SubmittedOp {
-            cb,
-            ticket,
-            staging: None,
-            scratch: Vec::new(),
-            atlas_ticket: None,
-            generation,
-            retired_resources: Vec::new(),
+
+        // Phase B.3 (N1 + N8): append the op + set BOTH dst and src overlays
+        // to SHADER_READ_ONLY_OPTIMAL (single-terminal-layout rule). For
+        // self-overlap (src == dst), only one entry needed (idempotent).
+        let payload = Box::new(super::frame_builder::RecordedCopyArea {
+            dst_id: dst,
+            src_id: src,
+            src_rect,
+            dst_rect,
+            src_format,
+            src_extent,
+            dst_extent,
+            src_image,
+            dst_image,
+            src_old_layout: src_pre_layout,
+            dst_old_layout: dst_pre_layout,
+            self_overlap_scratch,
         });
-        // `inner` borrow released. Auto-flush.
-        self.maybe_auto_flush_submit_group(platform)?;
+        let layout_updates: &[(DrawableId, vk::ImageLayout)] = if src == dst {
+            &[(dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+        } else {
+            &[
+                (dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                (src, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            ]
+        };
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::CopyArea(payload),
+                layout_updates,
+            );
+        }
         Ok(())
     }
 
@@ -8541,8 +8406,8 @@ fn emit_recorded_op_into_cb(
             Ok(())
         }
         Op::RenderComposite(rc) => emit_recorded_render_composite_into_cb(inner, cb, pins, rc),
-        // Phase B.3 stubs — implemented per-op in Phases 2-5.
-        Op::CopyArea(_) => unimplemented!("Phase B.3 Task 2: emit_recorded_copy_area_into_cb"),
+        // Phase B.3 — CopyArea implemented in Task 2; stubs for later tasks.
+        Op::CopyArea(ca) => emit_recorded_copy_area_into_cb(inner, cb, ca),
         Op::PutImage(_) => unimplemented!("Phase B.3 Task 6: emit_recorded_put_image_into_cb"),
         Op::FillRect(_) => unimplemented!("Phase B.3 Task 8: emit_recorded_fill_rect_into_cb"),
         Op::LogicFill(_) => {
@@ -8743,6 +8608,229 @@ fn emit_recorded_render_composite_into_cb(
     let mut target = target;
     vk_render::record_render_composite_close(&inner.vk, cb, &mut target);
 
+    Ok(())
+}
+
+/// Phase B.3 Task 2 (N1, N8): replay a deferred `RecordedCopyArea` into the
+/// frame's command buffer. Mirrors the legacy `copy_area` barrier shapes
+/// EXACTLY: self-overlap path mirrors engine.rs:2814-2918 (three-barrier
+/// sequence); disjoint path mirrors engine.rs:2951-3045 (two-barrier
+/// sequence). Terminal layout for BOTH src and dst is
+/// `SHADER_READ_ONLY_OPTIMAL` (N1 single-terminal-layout rule).
+///
+/// The exact stage/access masks mirror the legacy paths: the producer mask
+/// (src_access on pre-barriers) is `SHADER_SAMPLED_READ | TRANSFER_WRITE |
+/// COLOR_ATTACHMENT_WRITE` to drain prior compose/fill/put-image writes on the
+/// same image — a simpler `TRANSFER_WRITE only` mask would recreate the
+/// B.2-class RAW hazard.
+///
+/// The `self_overlap_scratch` image in the payload is allocated by the
+/// `copy_area` append path (N8 allocation-first) and owned by
+/// `RecordedCopyArea::self_overlap_scratch` until the close-path scratch walk
+/// moves it into `SubmittedOp::scratch`. This function READS the scratch
+/// but does NOT mutate its ownership — `ca` is `&RecordedCopyArea` (not `&mut`).
+fn emit_recorded_copy_area_into_cb(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    ca: &super::frame_builder::RecordedCopyArea,
+) -> Result<(), RenderError> {
+    let device = &inner.vk.device;
+    if let Some(scratch) = ca.self_overlap_scratch.as_ref() {
+        // Self-overlap: mirror engine.rs:2814-2918's three-barrier sequence.
+        // (1) src → TRANSFER_SRC_OPTIMAL (drains prior compose/fill/put-image writes).
+        barrier_to_layout(
+            device,
+            cb,
+            ca.src_image,
+            ca.src_old_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        // (2) scratch UNDEFINED → TRANSFER_DST_OPTIMAL.
+        barrier_to_layout(
+            device,
+            cb,
+            scratch.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        // Copy src_rect → scratch (at offset 0,0).
+        let region1 = [vk::ImageCopy::default()
+            .src_subresource(color_layers())
+            .src_offset(vk::Offset3D {
+                x: ca.src_rect.offset.x,
+                y: ca.src_rect.offset.y,
+                z: 0,
+            })
+            .dst_subresource(color_layers())
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width: ca.dst_rect.extent.width,
+                height: ca.dst_rect.extent.height,
+                depth: 1,
+            })];
+        unsafe {
+            device.cmd_copy_image(
+                cb,
+                ca.src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                scratch.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region1,
+            );
+        }
+        // (3a) scratch TRANSFER_DST → TRANSFER_SRC.
+        barrier_to_layout(
+            device,
+            cb,
+            scratch.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        // (3b) src (== dst) TRANSFER_SRC → TRANSFER_DST.
+        barrier_to_layout(
+            device,
+            cb,
+            ca.src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        // Copy scratch → src (== dst) at dst_rect.
+        let region2 = [vk::ImageCopy::default()
+            .src_subresource(color_layers())
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(color_layers())
+            .dst_offset(vk::Offset3D {
+                x: ca.dst_rect.offset.x,
+                y: ca.dst_rect.offset.y,
+                z: 0,
+            })
+            .extent(vk::Extent3D {
+                width: ca.dst_rect.extent.width,
+                height: ca.dst_rect.extent.height,
+                depth: 1,
+            })];
+        unsafe {
+            device.cmd_copy_image(
+                cb,
+                scratch.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                ca.src_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region2,
+            );
+        }
+        // (4) src (== dst) → SHADER_READ_ONLY_OPTIMAL (N1 terminal-layout rule).
+        barrier_to_layout(
+            device,
+            cb,
+            ca.src_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        );
+        return Ok(());
+    }
+
+    // Disjoint case: two-barrier pre-sequence + copy + two-barrier post-sequence.
+    // Pre-barriers: src → TRANSFER_SRC, dst → TRANSFER_DST (exact N1 masks).
+    barrier_to_layout(
+        device,
+        cb,
+        ca.src_image,
+        ca.src_old_layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_READ,
+    );
+    barrier_to_layout(
+        device,
+        cb,
+        ca.dst_image,
+        ca.dst_old_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    );
+    let region = [vk::ImageCopy::default()
+        .src_subresource(color_layers())
+        .src_offset(vk::Offset3D {
+            x: ca.src_rect.offset.x,
+            y: ca.src_rect.offset.y,
+            z: 0,
+        })
+        .dst_subresource(color_layers())
+        .dst_offset(vk::Offset3D {
+            x: ca.dst_rect.offset.x,
+            y: ca.dst_rect.offset.y,
+            z: 0,
+        })
+        .extent(vk::Extent3D {
+            width: ca.dst_rect.extent.width,
+            height: ca.dst_rect.extent.height,
+            depth: 1,
+        })];
+    unsafe {
+        device.cmd_copy_image(
+            cb,
+            ca.src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            ca.dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+    }
+    // Post-barriers: BOTH src and dst → SHADER_READ_ONLY_OPTIMAL (N1).
+    barrier_to_layout(
+        device,
+        cb,
+        ca.src_image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_READ,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    barrier_to_layout(
+        device,
+        cb,
+        ca.dst_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
     Ok(())
 }
 

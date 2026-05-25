@@ -2247,6 +2247,65 @@ impl KmsBackendV2 {
         self.telemetry.lifetime.submit_group_flushes
     }
 
+    /// Phase B.3 Task 2 (N1, N8, N9): read the lifetime
+    /// `frame_builder_close_reason_non_ported_paint_op` counter after
+    /// draining pending flush outcomes. Used by the copy_area collapse
+    /// integration test to assert that copy_area no longer fires the
+    /// M2 close (CloseReason::NonPortedPaintOp).
+    pub fn telemetry_close_reason_non_ported_for_tests(&mut self) -> u64 {
+        // Drain flush outcomes into telemetry first (same drain pattern as
+        // telemetry_submit_group_flushes_for_tests above).
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        self.telemetry
+            .lifetime
+            .frame_builder_close_reason_non_ported_paint_op
+    }
+
+    /// Phase B.3 Task 2 (N1, N8, N9): drive `engine.copy_area` directly
+    /// against the store + platform using DrawableIds resolved from host
+    /// xids. Mirror of `render_composite_for_tests`. Used by the copy_area
+    /// collapse integration test.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if either xid doesn't resolve in the store, or if
+    /// the engine call fails.
+    pub fn engine_copy_area_for_tests(
+        &mut self,
+        src_xid: u32,
+        dst_xid: u32,
+        src_rect: ash::vk::Rect2D,
+        dst_pos: ash::vk::Offset2D,
+    ) -> Result<(), std::io::Error> {
+        let Some(src_id) = self.store.lookup(src_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_copy_area_for_tests: src xid 0x{src_xid:x} not in store"
+            )));
+        };
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_copy_area_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        self.engine
+            .copy_area(
+                &mut self.store,
+                &mut self.platform,
+                src_id,
+                dst_id,
+                src_rect,
+                dst_pos,
+            )
+            .map_err(|e| std::io::Error::other(format!("engine_copy_area_for_tests: {e:?}")))
+    }
+
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
     /// queued past `disable_output` so the caller (lib.rs::run) can
     /// fan them out to clients before tearing down the socket.
