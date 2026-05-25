@@ -2331,7 +2331,16 @@ impl KmsBackendV2 {
         use crate::kms::v2::present_completion::PresentBatchWait;
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-        match &batch.wait {
+        // B.2-context fix (vkdebug VUID-vkDestroySemaphore-semaphore-05149):
+        // sync_file readiness alone is NOT sufficient to drop the batch
+        // (which destroys `batch.signal` — the export semaphore — via
+        // PresentCompletionSignal::Drop). Vulkan requires the queue
+        // submit fence to signal before any of its semaphores are
+        // destroyed; the sync_file becomes readable as soon as the
+        // KMS pageflip retires, which can be before the GPU compose
+        // CB's fence signals. Gate every wait variant additionally on
+        // the ticket having signaled when one is present.
+        let sync_ready = match &batch.wait {
             PresentBatchWait::Ready => true,
             PresentBatchWait::Fd(fd) => {
                 let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
@@ -2346,10 +2355,19 @@ impl KmsBackendV2 {
                     }
                 }
             }
-            PresentBatchWait::Poll => batch.ticket.as_ref().is_none_or(|ticket| match vk {
-                Some(v) => ticket.poll_signaled(v),
-                None => true,
-            }),
+            PresentBatchWait::Poll => true,
+        };
+        if !sync_ready {
+            return false;
+        }
+        // Even if the sync_file signaled / Ready variant, the
+        // Vulkan-side fence must have signaled too before we let the
+        // batch (and its export semaphore) drop. Skip the ticket
+        // check only when no ticket was attached (degraded path).
+        match (&batch.ticket, vk) {
+            (Some(ticket), Some(v)) => ticket.poll_signaled(v),
+            (Some(_), None) => false,
+            (None, _) => true,
         }
     }
 

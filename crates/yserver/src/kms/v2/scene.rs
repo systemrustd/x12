@@ -785,9 +785,23 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        let vk = inner.vk.clone();
         for o in &mut inner.outputs {
-            // Release all in-use slots — the pool ring's Drop
-            // does device_wait_idle anyway.
+            // B.2-context fix (codex audit followup): wait for any
+            // in-flight compose fences before resetting their
+            // descriptor-pool slots. `disable_output` runs
+            // device_wait_idle later, but we hit
+            // vkResetDescriptorPool BEFORE that wait. Wait on each
+            // ack's ticket here to keep VUID-vkResetDescriptorPool-
+            // descriptorPool-00313 satisfied during teardown too.
+            for ack in &o.pending_acks {
+                if let Some(t) = ack.ticket.as_ref() {
+                    let _ = t.wait(&vk);
+                }
+            }
+            for (_, ticket) in o.pending_pool_releases.drain(..) {
+                let _ = ticket.wait(&vk);
+            }
             while let Some(slot) = o.pool_slots.pop_front() {
                 o.pool_ring.release(slot);
             }

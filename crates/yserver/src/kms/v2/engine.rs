@@ -2117,6 +2117,11 @@ impl RenderEngine {
                 log::error!("v2 ensure_render_assets: solid_src init-clear submit failed: {e:?}");
                 RenderError::Vk(e)
             })?;
+            log::info!(
+                "v2 ensure_render_assets: solid_src_image image={:?} view={:?}",
+                s.image(),
+                s.image_view(),
+            );
             inner.solid_src_image = Some(s);
         }
         if inner.solid_mask_image.is_none() {
@@ -2132,6 +2137,11 @@ impl RenderEngine {
                 log::error!("v2 ensure_render_assets: solid_mask init-clear submit failed: {e:?}");
                 RenderError::Vk(e)
             })?;
+            log::info!(
+                "v2 ensure_render_assets: solid_mask_image image={:?} view={:?}",
+                s.image(),
+                s.image_view(),
+            );
             inner.solid_mask_image = Some(s);
         }
         if inner.white_mask_image.is_none() {
@@ -2147,6 +2157,11 @@ impl RenderEngine {
                 log::error!("v2 ensure_render_assets: white-clear submit failed: {e:?}");
                 RenderError::Vk(e)
             })?;
+            log::info!(
+                "v2 ensure_render_assets: white_mask_image image={:?} view={:?}",
+                s.image(),
+                s.image_view(),
+            );
             inner.white_mask_image = Some(s);
         }
         if inner.dst_readback.is_none() {
