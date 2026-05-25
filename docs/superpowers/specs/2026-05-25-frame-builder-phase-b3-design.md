@@ -627,6 +627,52 @@ Skipping the fast-path placement (i.e., flushing first regardless of input) woul
 
 The flush call can itself close an open frame (since `flush_render_batch` may submit a CB), so it precedes the open-frame mutation just like `allocate_scratch_image` does in N8.
 
+### N10 — COW PRESENT-completion attachment migrates to OpenFrame
+
+(Codex round-13 catch.) `PendingCowBatch` carries TWO load-bearing slots:
+1. The cow_copy_area enqueue queue (cb, ticket, dst, srcs, damage, count) — replaced by frame-builder per-frame collapse per N9.
+2. `present_completions: Vec<PendingPresentEntry>` — X11 PRESENT extension completion attachments, set by `attach_cow_present_completion` (engine.rs:3581) and drained at flush time into `pending_present_batches` (engine.rs:3497-3567).
+
+Deleting `pending_cow_batch` without migrating (2) would break PRESENT-completion attachment for COW presents. The frame builder MUST replace this attachment surface.
+
+**Migration design (load-bearing):**
+
+1. **New slot on OpenFrame.** Add `OpenFrame::pending_present_completions: Vec<PendingPresentEntry>` (defaults empty, no per-cow_id keying — all entries share the open frame's ticket at close).
+
+2. **Rewrite `attach_cow_present_completion(cow_id, entry)`:**
+   ```
+   pub(crate) fn attach_cow_present_completion(
+       &mut self,
+       cow_id: DrawableId,
+       entry: PendingPresentEntry,
+   ) -> Result<(), PendingPresentEntry> {
+       let Some(inner) = self.inner.as_mut() else { return Err(entry); };
+       let Some(open) = inner.frame_builder.open.as_mut() else { return Err(entry); };
+       // Match the legacy dst-equality check: only attach if the open frame
+       // currently holds any RecordedCopyArea (or other op) writing to cow_id.
+       // The cheapest check is open.touched.contains(cow_id); cow ops first-touch
+       // cow_id during their append, so post-append the touched set carries the id.
+       if !open.touched.contains_for_lookup(cow_id) {
+           return Err(entry);
+       }
+       open.pending_present_completions.push(entry);
+       Ok(())
+   }
+   ```
+   The backend (backend.rs:9904) call site is unchanged — the helper's signature stays the same; only the body changes.
+
+3. **Close-success transfer.** In `close_open_frame`'s post-flush_submit_group path (the `Ok(_)` branch around engine.rs:1470+), after the SubmittedOp is pushed but before commit_close_success runs: if `open_frame.pending_present_completions` is non-empty, build a `PendingPresentBatch` mirroring the legacy flush_cow_batch logic (engine.rs:3497-3567):
+   - If the open frame's ticket carries a sufficient signal (or the completion semaphore can be allocated), wait = `PresentBatchWait::Semaphore { ... }`; else wait = `PresentBatchWait::Poll`.
+   - events = drained `pending_present_completions`.
+   - Push onto `EngineInner::pending_present_batches`.
+   - This is a NEW code path in close_open_frame, not just a deletion. It is the load-bearing replacement for engine.rs:3497-3567.
+
+4. **Close-failure semantics.** If flush_submit_group fails, the open frame's `pending_present_completions` drops with the OpenFrame. Each `PendingPresentEntry` should self-handle drop cleanly (the X PRESENT semantics treat missing completion events as "lost" — same as pre-B.3 behavior when flush_cow_batch returned Err).
+
+5. **Test helper.** `has_pending_batches_for_tests` (engine.rs:1717-1722) currently checks `pending_cow_batch.is_some() || pending_render_batch.is_some()`. Replace with `frame_builder.open.is_some() || pending_render_batch.is_some()`. Behavioral meaning is preserved: "is there any in-flight work the frame builder hasn't committed yet?".
+
+The cow_copy_area task in Phase 2 covers the full deletion + migration as one atomic commit (per N9's atomicity requirement — partial deletion leaves dangling references that don't compile).
+
 ## Frame close triggers after B.3
 
 Pre-B.3 close-reason histogram has 9 triggers (per B.2 Task 1's `CloseReason::ScratchGrow` addition):
@@ -668,17 +714,22 @@ After B.3 rip-and-replace:
 - **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) Empty/no-op fast-path return (e.g., zero rects, empty staging buffer). (2) `renderer_failed` check. (3) **`flush_render_batch` per N9** (no `flush_cow_batch` — `pending_cow_batch` is being deleted in B.3; see N9 + the cow_copy_area task below). (4) Preflight (dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (5) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (6) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (7) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (8) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
 - **Integration test.** Two-call collapse test (`v2_frame_builder_<op>_collapses_two_in_one_frame`) — assert two consecutive `<op>` calls in the same frame produce one SubmittedOp, not two.
 
-`cow_copy_area`'s body task ALSO deletes the `pending_cow_batch` infrastructure (atomic with the rewrite — partial deletion would leave dangling references that don't compile):
+`cow_copy_area`'s body task is ATOMIC — it rewrites cow_copy_area, deletes the `pending_cow_batch` infrastructure, AND migrates the PRESENT-completion attachment surface per N10. All in one commit because partial deletion leaves dangling references that don't compile.
 
-1. Rewrite the `cow_copy_area` body to append a `RecordedCopyArea` to the frame builder (same shape as `copy_area`'s body, just resolving the cow Drawable via the existing `current_layout_for_drawable(store, cow_id)` accessor per N3 — no special cow handling otherwise).
-2. Delete the `pending_cow_batch` field from `EngineInner` (and any helper structs).
-3. Delete the `flush_cow_batch` helper function.
-4. Delete every `flush_cow_batch(store, platform)?` call site in `engine.rs` (the 6 other ops being rewritten will already have these lines dropped as part of their N9 entry-flush replacement).
-5. Delete any cow-batch-specific telemetry, state machines, and stale-dst flush hooks (engine.rs:3168, 3196, 3412 region — all become unreachable).
+Steps:
+1. Rewrite the `cow_copy_area` body to append a `RecordedCopyArea` to the frame builder (same shape as `copy_area`'s body, resolving the cow Drawable via the existing `current_layout_for_drawable(store, cow_id)` accessor per N3 — no special cow handling otherwise).
+2. **Add `OpenFrame::pending_present_completions: Vec<PendingPresentEntry>` slot (per N10).**
+3. **Rewrite `attach_cow_present_completion(cow_id, entry)` body to push into `frame_builder.open.pending_present_completions` when the open frame has any op touching `cow_id` (per N10). Helper signature is unchanged — backend call site at backend.rs:9904 stays as-is.**
+4. **Extend `close_open_frame`'s post-`flush_submit_group` success path to drain `pending_present_completions` into a new `PendingPresentBatch` on `pending_present_batches` (per N10, mirroring engine.rs:3497-3567 — semaphore allocation if the frame's signal isn't already sufficient, else Poll wait).**
+5. Delete the `pending_cow_batch` field from `EngineInner` (and any helper structs).
+6. Delete the `flush_cow_batch` helper function.
+7. Delete every `flush_cow_batch(store, platform)?` call site in `engine.rs` (the 6 other ops being rewritten will already have these lines dropped as part of their N9 entry-flush replacement; the backend's fallback site at backend.rs:9920 — outside the attach helper — also needs the line removed).
+8. Delete any cow-batch-specific telemetry, state machines, and stale-dst flush hooks (engine.rs:3168, 3196, 3412 region — all become unreachable).
+9. **Update `has_pending_batches_for_tests` (engine.rs:1717-1722) to check `frame_builder.open.is_some() || pending_render_batch.is_some()` (per N10 minor catch).**
 
 The frame builder's per-frame collapse subsumes the pre-B.3 same-dst cow batching: multiple `cow_copy_area` calls with the same dst in one frame all append to the open frame and emit into one CB at close. Different-dst calls within a frame are also handled by the frame builder (each dst tracks its own layout via the overlay per B.2 Task 4).
 
-The cow_copy_area integration test `v2_frame_builder_cow_copy_area_collapses_two_in_one_frame` should assert: (a) two same-dst cow_copy_areas in one frame produce one SubmittedOp; (b) the cow's `storage.current_layout` updates correctly via `commit_close_success`; (c) no `pending_cow_batch`-related symbol survives in the compiled binary (the helper / field / call sites are all gone).
+The cow_copy_area integration test `v2_frame_builder_cow_copy_area_collapses_two_in_one_frame` should assert: (a) two same-dst cow_copy_areas in one frame produce one SubmittedOp; (b) the cow's `storage.current_layout` updates correctly via `commit_close_success`; (c) no `pending_cow_batch`-related symbol survives in the compiled binary (the helper / field / call sites are all gone); (d) **PRESENT-completion attach during a frame containing cow_copy_areas correctly delivers a CompletedPresentEvent when the frame retires (per N10).**
 
 `copy_area`'s body rewrite handles the self-overlap subcase per N8:
 
