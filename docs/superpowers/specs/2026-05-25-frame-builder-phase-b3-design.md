@@ -46,7 +46,7 @@ The legacy site is still counted in the per-source telemetry breakdown — see t
 
 ## Architecture
 
-B.3 is a *replication* phase, not a new-mechanisms phase. All B.2 infrastructure is reused as-is:
+B.3 is *almost entirely* a replication phase. All B.2 infrastructure is reused as-is:
 
 - `BatchResource` retired-scratch routing via `RenderEngineInner::adopt_retired_resource_for_gpu_retirement` (B.2 Task 1).
 - Mechanism 2 descriptor watermark via `OpenFrame::frame_generation` (B.2 Task 3). Captured at open, consumed by every descriptor acquire during the open frame, watermark released on retire.
@@ -55,7 +55,9 @@ B.3 is a *replication* phase, not a new-mechanisms phase. All B.2 infrastructure
 - Per-op `RecordedOp::*` enum variants on `open_frame.ops` (B.2 Task 6).
 - Per-op `emit_recorded_*_into_cb` helpers dispatched from `emit_recorded_op_into_cb` (B.2 Task 12).
 
-The B.3 contribution is: 5–7 new `RecordedOp::*` variants, one `_via_frame_builder` body per op, one `emit_recorded_*_into_cb` per op variant, four new family gates, and the per-source telemetry breakdown.
+The single net-new mechanism (codex round-7) is the LIVE concrete-scratch slot for `copy_area`'s self-overlap path, per N8 — `OpenFrame::live_scratches: Vec<ScratchImage>` collected at append time and drained into `SubmittedOp::scratches: Vec<ScratchImage>` at close. This is a one-field structural extension of an existing legacy slot (the legacy `SubmittedOp::scratch: Option<ScratchImage>` becomes a Vec); it is NOT a new mechanism class.
+
+The B.3 contribution is: 6 new `RecordedOp::*` variants, one `_via_frame_builder` body per op, one `emit_recorded_*_into_cb` per op variant, four new family gates, the per-source telemetry breakdown, and the N8 live-scratch slot extension.
 
 ### The four op families
 
@@ -84,34 +86,87 @@ The exact stage/access masks for these barriers MUST mirror the legacy paths' sh
 
 `put_image` differs: the src is a `StagingBuffer` Arc (cloned into the open frame's pin set via `open.pins.pin_staging`), and the emit uses `cmd_copy_buffer_to_image`. Distinct variant `RecordedPutImage`. No src image to barrier — staging buffers have no layout transition; only the dst gets the pre/post pair.
 
-**FILL family** — `fill_rect`, `fill_rect_batch`, `logic_fill`. Recording shape mirrors B.2's render_composite — solid-color shader via the existing `RenderPipeline` cache, descriptor per op, open + draws + close:
+**FILL family** — `fill_rect`, `fill_rect_batch`, `logic_fill`. NOT a composite-pipeline path. Legacy `fill_rect_batch` (engine.rs:2360-2401) uses `cmd_clear_attachments` directly: pure REPLACE semantics, no blending, no shader, no descriptor. (Earlier drafts of this spec routed FILL through the composite pipeline with `StdPictOp::Src or Over` — that was wrong; `Over` would preserve dst for translucent fills and the composite shader's `src × mask × blend` adds nothing over a straight clear. Codex round-7 catch.)
+
+`fill_rect` and `fill_rect_batch` recording shape:
 
 ```
 emit_recorded_fill_into_cb:
-  record_solid_color_clear(solid_src_image, color)   // per-op clear at emit time
-  pipeline_get(StdPictOp::Src or Over, dst_format, ...)
-  record_render_composite_open_with_old_layout(dst, dst_old_layout, pipeline)
-  bind descriptor (src=solid_src_view, mask=white_mask_view, dst=white_mask_view)
-  cmd_draw per (clip_scissor × rect)
-  record_render_composite_close(dst)
+  pipeline_barrier2(dst dst_old_layout → COLOR_ATTACHMENT_OPTIMAL)
+  cmd_begin_rendering(dst color attachment, load=DONT_CARE, store=STORE)
+  cmd_set_viewport / cmd_set_scissor(per-rect render_area)
+  cmd_clear_attachments(color=solid color, clear_rect slice = all rects)
+  cmd_end_rendering
+  pipeline_barrier2(dst COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL)
 ```
 
-`fill_rect` and `fill_rect_batch` share the composite-pipeline shape above. `logic_fill` is structurally different: it uses its own `LogicFillPipelineCache` (engine.rs:2453) with a logic-op render pass and push constants, NOT the composite pipeline cache, and writes no descriptor sets (engine.rs:2530, 2593-2697). The recorded payload for `logic_fill` carries the GC logic-mode + pipeline-cache key + push-constant payload; the emit replays a logic-op render pass open + draw + close. Same family (all are "fills") but two distinct recording sub-shapes inside it.
+No pipeline bind, no descriptor, no shader draw. The payload carries `dst_id` + dst extent/format + color + the pre-clamped rect-slice + `dst_old_layout`. `fill_rect_batch` carries N≥1 rects; `fill_rect` carries N=1.
+
+`logic_fill` is structurally different again: it uses `LogicFillPipelineCache` (engine.rs:2453) with its own logic-op render pass and push constants, NOT the composite pipeline cache AND NOT `cmd_clear_attachments` (engine.rs:2530, 2593-2697). The recorded payload for `logic_fill` carries the GC logic-mode + pipeline-cache key + push-constant payload; the emit replays a logic-op render pass open + draw + close. Same family (all are "fills") but THREE distinct recording sub-shapes inside it (cmd_clear_attachments for fill_rect/fill_rect_batch vs logic_op pipeline for logic_fill).
 
 **MASK family** — `render_traps_or_tris` only. Two-stage CB (trap raster into mask scratch + render composite sampling that scratch). Recording shape:
 
 ```
 emit_recorded_render_traps_or_tris_into_cb:
-  ensure mask scratch is in COLOR_ATTACHMENT_OPTIMAL for trap raster
-  record_trap_or_tri_raster pipeline into mask scratch (CLEAR + edge raster)
-  pipeline_barrier2(mask scratch COLOR_ATTACHMENT → SHADER_READ_ONLY)
-  record_render_composite_open_with_old_layout(dst, ...)
-  bind descriptor (src + mask_scratch_view + dst)
-  cmd_draw
-  record_render_composite_close(dst)
+  // ── Source resolve (engine.rs:7356-7400) ──
+  resolve src_view / src_extent at emit time from engine caches:
+    Drawable(id) → ensure_drawable_view(id, sampler, swizzle_class)
+    Solid(color) → solid_src_view + (1×1 extent); record_solid_color_clear(solid_src, color)
+    Gradient(xid) → engine.picture_paint[xid].image_view() + extent + intrinsic xform
+  resolve mask_view / mask_extent FRESH from engine.mask_scratch  // never pinned
+  resolve dst_view from store.get(dst_id).storage
+
+  // ── Trap raster phase (engine.rs:7531-7647) ──
+  pipeline_barrier2(mask scratch  current_layout → COLOR_ATTACHMENT_OPTIMAL)
+  cmd_begin_rendering(mask scratch attachment_view, load=CLEAR, render_area=bbox)
+  cmd_bind_pipeline(trap or tri pipeline per prim_kind)
+  cmd_bind_vertex_buffers(instance_buf — pinned vertex pool)
+  cmd_push_constants(TrapDrawPushConsts { mask_extent, bbox_origin, bbox_size })
+  cmd_set_viewport / cmd_set_scissor(bbox)
+  cmd_draw(4 verts, instance_count)
+  cmd_end_rendering
+
+  // ── Composite phase (engine.rs:7665-7710) ──
+  pipeline_barrier2(mask scratch COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL)
+  optional: dst_readback.record_copy_from(dst) when needs_dst_readback
+  composite_attrs = CompositeAttrs {
+      src_extent, mask_extent (FRESH from engine.mask_scratch),
+      src_repeat (PAD if src_is_synthetic_1x1 else legacy mapping),
+      mask_repeat = REPEAT_NONE,
+      src_force_opaque (X RENDER PictFormat α=ONE forcing),
+      mask_force_opaque = false,
+      src_xform = compose(src_picture_xform, user_src_xform),
+      mask_xform = IDENTITY,
+  }
+  record_render_composite open(dst, dst_old_layout) → bind composite pipeline
+  bind descriptor (src_view, mask_view, dst_view)
+  cmd_draw(per-rect)
+  record_render_composite close(dst → SHADER_READ_ONLY_OPTIMAL)
 ```
 
-The mask scratch lives in `EngineInner::mask_scratch` (already present), and its retired backing routes via `adopt_retired_resource_for_gpu_retirement` if growth fires (already wired by B.2 Task 1 plumbing — `MaskScratch` implements `BatchResource`).
+The recorded variant payload MUST carry every input above that's resolved at append time (not at emit time):
+
+- `dst_id` + `dst_old_layout`
+- src kind (Drawable(id) / Solid(color) / Gradient(xid)) — emit re-resolves view
+- `src_clear_color: Option<[f32;4]>` — Some when src is Solid (emit calls `record_solid_color_clear`)
+- `src_picture_xform: Option<AffineXform>` — Some when src is Gradient (gradient's intrinsic axis projection, captured at append from `picture_paint.get(xid)`)
+- `src_is_synthetic_1x1: bool` — drives the PAD-vs-legacy repeat override
+- `src_repeat: u32`, `mask_repeat: u32` (legacy enum values from `repeat_to_shader_const`)
+- `src_force_opaque: bool` (resolved via `resolve_force_opaque_pict_format`)
+- `user_src_xform: AffineXform` (from `RenderSetPictureTransform`)
+- `prim_kind: TrapPrimKind` (Trapezoid vs Triangle)
+- `bbox_x/y/w/h: i32/u32` (mask render bbox)
+- `mask_off_x/y: i32` (composite-stage mask offset)
+- per-rect `CompositeRect` slice (src_x/y, mask_x/y, dst_x/y, w/h) — the composite-stage draw inputs
+- `instance_count: u32` (trap edge count)
+- `needs_dst_readback: bool` + readback metadata
+- `vertex_pool_pin: ...` (the trap/tri vertex buffer Arc — pinned via `open.pins`)
+
+Skipping any of these would replay against stale or wrong inputs (codex round-7 catch: solid sources would replay with whatever the solid_src image last held, gradient sources would skip the intrinsic xform, force-opaque / repeat decisions would be wrong).
+
+**Mask scratch ownership (MEDIUM ownership fix, codex round-7).** The current/live `EngineInner::mask_scratch` is engine-owned mutable state used directly at emit time. The recorded variant does NOT pin mask_scratch — it MUST resolve `engine.mask_scratch` fresh inside `emit_recorded_render_traps_or_tris_into_cb`, taking the current `image()`, `attachment_view()`, `image_view()`, `extent()`, and `current_layout()` as inputs to the two stages. (An earlier draft of the spec carried a `mask_scratch_pin_idx` — that conflates "live scratch used by replay" with "old grown-away backing awaiting fence release". The two are different concepts.)
+
+Only the GROWN-AWAY old backing routes through `BatchResource`. When the mask-scratch peek-grow (Phase 9A) in `render_traps_or_tris_via_frame_builder` fires, `ensure_returning_old` returns a `Box<dyn BatchResource>` for the prior backing; that Box routes via `adopt_retired_resource_for_gpu_retirement` to either the closing frame's `SubmittedOp::retired_resources` (case b — newest in-flight fence owner) or `EngineInner::pending_retired_resources_for_next_submit` (case a) — same flow B.2 Task 1 wired. The current `mask_scratch` after grow stays as engine-owned state, used by all subsequent ops in this frame and beyond.
 
 **GLYPH family** — `image_text` only. NOT a mask-scratch op; structurally identical to B.1's `composite_glyphs_via_frame_builder`. Uses `V2GlyphAtlas` + `TextPipeline`, uploads glyph misses into the atlas via per-glyph staging buffers, then records a text-run draw against the atlas (engine.rs:4529, 4611, 4641, 4711). Recording shape mirrors B.1's `RecordedCompositeGlyphs` + `RecordedGlyphUpload` pair:
 
@@ -138,12 +193,12 @@ Reuses B.1's `RecordedGlyphUpload` variant verbatim for the upload side; only th
 
 | Variant | Box-wrapped? | Family | Notes |
 |---------|--------------|--------|-------|
-| `RecordedCopyArea(Box<RecordedCopyArea>)` | yes | TRANSFER | covers copy_area + cow_copy_area; payload carries `dst_id: DrawableId` (cow is a regular DrawableId per N3) + `src_id: DrawableId` + sub-rect + `dst_old_layout` + `src_old_layout` + `self_overlap_scratch_pin_idx: Option<u32>` (Some when src_id == dst_id, references the scratch image pinned in FramePinSet per N1's self-overlap subcase) |
+| `RecordedCopyArea(Box<RecordedCopyArea>)` | yes | TRANSFER | covers copy_area + cow_copy_area; payload carries `dst_id: DrawableId` (cow is a regular DrawableId per N3) + `src_id: DrawableId` + sub-rect + `dst_old_layout` + `src_old_layout` + `self_overlap_scratch: Option<LiveScratchImage>` (Some when src_id == dst_id; this is a LIVE concrete `ScratchImage` owned by the recorded variant, NOT a `FramePinSet::retired_resources` slot — see N1's self-overlap subcase and N8 for the ownership model) |
 | `RecordedPutImage(Box<RecordedPutImage>)` | yes | TRANSFER | `staging_pin_idx` (B.1 `pin_staging` style) + `dst_id: DrawableId` + sub-rect + `dst_old_layout` (no src image layout — staging buffers have no layout per N1) |
-| `RecordedFillRect(Box<RecordedFillRect>)` | yes | FILL | **`dst_id: DrawableId`** + dst metadata (extent, format — needed for the render pass) + op + color + rect-slice + clip + descriptor + `dst_old_layout`; covers fill_rect_batch as N≥1 rect-slice per N4. The dst_id is the overlay key for layout resolve and the BatchResource pin source — codex round-6 flagged that omitting it makes the variant un-emittable. |
+| `RecordedFillRect(Box<RecordedFillRect>)` | yes | FILL | **`dst_id: DrawableId`** + dst extent + dst format + color + pre-clamped rect-slice (covers fill_rect as N=1 and fill_rect_batch as N≥1 per N4) + `dst_old_layout`. NO pipeline, NO descriptor, NO clip — uses `cmd_clear_attachments` directly (codex round-7 catch — earlier drafts erroneously routed through the composite pipeline). |
 | `RecordedLogicFill(Box<RecordedLogicFill>)` | yes | FILL | **`dst_id: DrawableId`** + GC logic mode + dst_format (cache key) + color + pre-clamped rect-slice + dst extent + `dst_old_layout`; NO X RENDER picture-clip input, NO descriptor handle. Uses `LogicFillPipelineCache` directly per N6. |
-| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | **`dst_id: DrawableId`** + dst extent + `dst_old_layout` + foreground color + glyphs `Vec<{atlas_x, atlas_y, w, h, dst_x, dst_y}>` (same shape as B.1's RecordedCompositeGlyphs); NO atlas-key, NO clip. Companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads. |
-| `RecordedRenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>)` | yes | MASK | **`dst_id: DrawableId`** + `mask_scratch_pin_idx` (mask image pinned into FramePinSet, retired via BatchResource on fence) + trap/tri vertex pool + dst extent + `dst_old_layout` (single variant covers both raster + composite stages per N5) |
+| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | **`dst_id: DrawableId`** + dst extent + `dst_old_layout` + foreground color + glyphs `Vec<{atlas_x, atlas_y, w, h, dst_x, dst_y}>` (same shape as B.1's RecordedCompositeGlyphs); NO atlas-key, NO clip. Companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads. dst format MUST be `B8G8R8A8_UNORM` — runs on other formats are dropped append-side per legacy gate (engine.rs:4515-4526) and N7. |
+| `RecordedRenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>)` | yes | MASK | **`dst_id: DrawableId`** + `dst_old_layout` + src kind discriminant (Drawable(id) / Solid(color) / Gradient(xid)) + `src_clear_color: Option<[f32;4]>` (Solid only) + `src_picture_xform: Option<AffineXform>` (Gradient only — intrinsic axis projection snapped at append) + `src_is_synthetic_1x1: bool` + `src_repeat: u32` + `mask_repeat: u32` + `src_force_opaque: bool` + `user_src_xform: AffineXform` + `prim_kind: TrapPrimKind` + bbox (x,y,w,h) + mask_offset (x,y) + per-rect `CompositeRect` slice + `instance_count: u32` + `needs_dst_readback: bool` + `vertex_pool_pin` (trap/tri vertex buffer Arc pinned via `open.pins`). NO `mask_scratch_pin_idx` — emit re-resolves `engine.mask_scratch` fresh per N5. Single variant covers both raster + composite stages. |
 
 No `RecordedFillRectBatch` variant — `fill_rect_batch` produces one `RecordedFillRect` per call carrying the entire rect slice (N4 decision).
 
@@ -182,16 +237,16 @@ For freshly-allocated dst in `UNDEFINED`, the pre-barrier becomes `UNDEFINED →
 
 **LOAD-BEARING — exact stage/access masks (codex round-6 catch).** The high-level pseudocode in §Architecture is intentionally abstract; the implementation MUST mirror the legacy paths' barrier shapes precisely. These are not interchangeable with the simpler "dst_access_mask = TRANSFER_WRITE" shape — the legacy paths chose these masks specifically to drain prior compose / fill / put-image writes on the same image, the same class of producer-mask requirement that caused B.2's RAW hazard at vkCmdBeginRendering.
 
-For `copy_area` / `cow_copy_area` pre-barrier (mirror engine.rs:2951-style, both src AND dst):
+For `copy_area` / `cow_copy_area` pre-barrier (mirror engine.rs:2951-3032 — both src AND dst):
 
 ```
 pipeline_barrier2(
     src_stage    = ALL_COMMANDS,
     src_access   = SHADER_SAMPLED_READ | TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE,
-    dst_stage    = COPY (or BLIT, matching legacy choice),
-    dst_access   = TRANSFER_READ  (for src image)  / TRANSFER_WRITE  (for dst image),
-    old_layout   = src_old_layout / dst_old_layout (from overlay),
-    new_layout   = TRANSFER_SRC_OPTIMAL / TRANSFER_DST_OPTIMAL,
+    dst_stage    = COPY,
+    dst_access   = TRANSFER_READ  (for src image)  /  TRANSFER_WRITE  (for dst image),
+    old_layout   = src_old_layout  /  dst_old_layout  (from overlay),
+    new_layout   = TRANSFER_SRC_OPTIMAL  /  TRANSFER_DST_OPTIMAL,
 )
 ```
 
@@ -200,10 +255,10 @@ For `copy_area` / `cow_copy_area` post-barrier (mirror legacy's exit shape — b
 ```
 pipeline_barrier2(
     src_stage    = COPY,
-    src_access   = TRANSFER_READ  (for src)  / TRANSFER_WRITE  (for dst),
-    dst_stage    = FRAGMENT_SHADER (or ALL_COMMANDS, matching legacy),
+    src_access   = TRANSFER_READ  (for src)  /  TRANSFER_WRITE  (for dst),
+    dst_stage    = FRAGMENT_SHADER,
     dst_access   = SHADER_SAMPLED_READ,
-    old_layout   = TRANSFER_SRC_OPTIMAL / TRANSFER_DST_OPTIMAL,
+    old_layout   = TRANSFER_SRC_OPTIMAL  /  TRANSFER_DST_OPTIMAL,
     new_layout   = SHADER_READ_ONLY_OPTIMAL,
 )
 ```
@@ -225,7 +280,23 @@ For `put_image` post-barrier: identical shape to copy_area's dst post-barrier.
 
 The implementer MUST cross-reference engine.rs:2951 (copy_area), engine.rs:3300 (cow_copy_area), engine.rs:4210 (put_image) at implementation time and replicate the producer src_access bits verbatim. Generic "TRANSFER_WRITE only" producer masks would recreate the B.2-class RAW hazard against prior frame-builder ops that wrote to the same image (a `render_composite` writing the dst followed by a `copy_area` reading it in the SAME frame would race without `COLOR_ATTACHMENT_WRITE` in the src_access).
 
-**Same-image scratch subcase** (copy_area self-overlap): when src_id == dst_id, the legacy path uses a temporary scratch image. The B.3 port MUST preserve this path — the recorded op carries a `self_overlap_scratch_pin_idx: Option<u32>` referencing a scratch pinned into `FramePinSet::retired_resources` (or a sibling slot if necessary). The emit's barrier sequence then has THREE transitions instead of two: dst → TRANSFER_SRC, scratch → TRANSFER_DST, copy dst → scratch; barrier scratch → TRANSFER_SRC, dst → TRANSFER_DST, copy scratch → dst; barrier dst → SHADER_READ_ONLY, scratch retired via BatchResource on frame fence. This is the most complex TRANSFER emit path; the spec calls it out so the implementer does not assume the simple two-barrier shape covers it.
+**Same-image scratch subcase** (copy_area self-overlap): when src_id == dst_id, the legacy path uses a temporary scratch image (engine.rs:2814-2918). The B.3 port MUST preserve this path. See N8 for the LIVE concrete-scratch ownership model (the scratch image is NOT a `FramePinSet::retired_resources` Box; an earlier draft of the spec said so and codex round-7 caught it).
+
+The emit's barrier sequence has THREE pairs instead of two:
+
+```
+emit_copy_area_self_overlap_into_cb (engine.rs:2814-2918 mirror):
+  barrier src                 SHADER_READ_ONLY → TRANSFER_SRC_OPTIMAL
+  barrier scratch.image       UNDEFINED        → TRANSFER_DST_OPTIMAL  (TOP_OF_PIPE / NONE → COPY / TRANSFER_WRITE)
+  cmd_copy_image src@TRANSFER_SRC  →  scratch@TRANSFER_DST  (src_rect → scratch[0,0])
+  barrier scratch             TRANSFER_DST     → TRANSFER_SRC_OPTIMAL
+  barrier src                 TRANSFER_SRC     → TRANSFER_DST_OPTIMAL
+  cmd_copy_image scratch@TRANSFER_SRC → src@TRANSFER_DST (scratch → src@dst_rect)
+  barrier src                 TRANSFER_DST     → SHADER_READ_ONLY_OPTIMAL
+  // scratch lives as long as the SubmittedOp; drops in retirement.
+```
+
+This is the most complex TRANSFER emit path; the spec calls it out so the implementer does not assume the simple two-barrier shape covers it.
 
 ### N2 — put_image staging buffer pin uses the existing B.1 slot
 
@@ -367,6 +438,36 @@ Without (1)+(3), a failed close after an image_text frame would leak a stale `la
 
 The audit comparison: B.1's `composite_glyphs_via_frame_builder` (engine.rs:5605-5618) already does this exact dance for the X RENDER composite_glyphs path. image_text's body is mechanically the same with a different draw call at emit-time (text run vs composite-glyphs).
 
+**Target-format gate (LOAD-BEARING — codex round-7 catch).** Legacy `image_text` drops the run unless the dst format is `vk::Format::B8G8R8A8_UNORM` (engine.rs:4515-4526). The text pipeline is built only for that format; depth-1/8 storages (and any non-BGRA8) cannot be text-run targets. The B.3 port MUST preserve this gate APPEND-SIDE inside `image_text_via_frame_builder`:
+
+```rust
+let target_format = store.get(target).expect("checked").storage.format;
+if target_format != vk::Format::B8G8R8A8_UNORM {
+    log::warn!("v2 image_text (frame_builder): target format {target_format:?} unsupported — dropping run");
+    return Ok(stats);  // identical short-circuit as legacy
+}
+```
+
+The gate fires BEFORE any atlas first-touch snapshot, any glyph upload, any op append — there is no rollback path needed because nothing was recorded. The recorded `RecordedImageText` variant implicitly carries the invariant `dst_format == B8G8R8A8_UNORM` (validated append-side). Phase 5's integration test SHOULD include a depth-32 (R8 / depth-1) target negative-test verifying the run is dropped without atlas mutation.
+
+### N8 — Live concrete-scratch pin model (separate from BatchResource)
+
+(Surfaced by codex round-7.) The frame builder has two distinct pin lifetimes for non-drawable images:
+
+1. **B.2 BatchResource `retired_resources`** — Box<dyn BatchResource> slots for *grown-away old backings* (e.g., mask_scratch's previous extent after a peek-grow). The new backing replaces engine state, the old backing rides the closing frame's `SubmittedOp::retired_resources` (or `pending_retired_resources_for_next_submit`) to be released after the fence signals. Used for grow events.
+
+2. **LIVE concrete-scratch slot** (this invariant) — a per-op one-shot scratch image that the recorded op uses DURING its emit and that must remain addressable until the owning `SubmittedOp` retires. This is `copy_area`'s self-overlap scratch (engine.rs:225-229, 291-310, 2814-2918). Concrete RAII type (`ScratchImage` with `Drop` that calls `destroy_image` + `free_memory`), NOT a `Box<dyn BatchResource>`. Used for per-op temporary resources.
+
+The two coexist. The legacy `SubmittedOp` struct already has both slots — `scratch: Option<ScratchImage>` (case 2) AND `retired_resources: Vec<Box<dyn BatchResource>>` (case 1). The B.3 frame-builder port preserves both slots without conflation.
+
+**Allocation timing.** The self-overlap scratch is allocated at APPEND time inside `copy_area_via_frame_builder` when `src == dst` is detected. It lives inside the `RecordedCopyArea` variant payload (as `self_overlap_scratch: Option<LiveScratchImage>`). At close time, when the recorded op's payload moves into the `SubmittedOp`, the scratch must be transferred to `SubmittedOp::scratch` — NOT dropped, NOT routed to `retired_resources`. (`LiveScratchImage` is a rename / wrapper of the existing `ScratchImage` type; we can either reuse the existing type and a sibling slot in the variant, or wrap it; whichever is mechanically simpler — the load-bearing requirement is the ownership transfer to SubmittedOp at close.)
+
+**Multi-op frames.** If a single frame contains multiple `copy_area` self-overlap ops, each gets its own scratch image. `OpenFrame` carries them in their respective `RecordedCopyArea` payloads. At close, they're collected into a `Vec<ScratchImage>` on the SubmittedOp (the existing slot becomes `scratch: Vec<ScratchImage>` instead of `Option<...>` — a minor structural extension, gated to the B.3 surface).
+
+**Close-failure rollback.** If close fails, the scratches in the recorded payloads drop (their `Drop` impl calls `destroy_image`/`free_memory` immediately, since no fence ticket references them yet). This is correct: nothing was submitted, so no fence dependency exists.
+
+**Why this matters.** Routing the scratch through `FramePinSet::retired_resources` (the codex round-7 spec mistake) would either (a) lose addressability at emit time — the Box<dyn> slot is for retirement bookkeeping, not for live CB references; or (b) destroy the scratch too early — `retired_resources` releases at fence-retire, but `BatchResource::release()` is `Drop`-ish and might fire while emit is still constructing the CB. The live-scratch slot bypasses both problems by keeping the concrete `ScratchImage` addressable until `SubmittedOp` itself retires.
+
 ## Frame close triggers after B.3
 
 Pre-B.3 close-reason histogram has 9 triggers (per B.2 Task 1's `CloseReason::ScratchGrow` addition):
@@ -483,26 +584,34 @@ This task lands BEFORE the ports begin. A bee-side run with the breakdown reveal
 
 `cow_copy_area`'s body task uses the existing `current_layout_for_drawable(store, cow_id)` accessor — no special cow handling beyond resolving the cow Drawable from the dispatch (per N3).
 
+`copy_area`'s body task additionally detects `src_id == dst_id` (self-overlap) and allocates a `ScratchImage` (engine.rs:8901 `allocate_scratch_image`) at append time, storing it in `RecordedCopyArea::self_overlap_scratch: Option<ScratchImage>` per N8. The frame-builder close transfers the scratch to the closing `SubmittedOp` — NOT into `FramePinSet::retired_resources` (see N8 for why). A new sibling slot (e.g., `OpenFrame::live_scratches: Vec<ScratchImage>`) collects scratches across multiple self-overlap ops in one frame, then drains into `SubmittedOp::scratches: Vec<ScratchImage>` at close. (The legacy `SubmittedOp::scratch: Option<ScratchImage>` becomes `scratches: Vec<ScratchImage>` — a one-field structural extension.)
+
 `put_image`'s body task additionally clones the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2).
 
 ### Phase 3 — FILL family (12 tasks: 4 per op × 3 ops)
 
 **For each of `fill_rect`, `fill_rect_batch`, `logic_fill`:** the same 4-task shape (dispatch split, `_via_frame_builder` body, emit, integration test + drop wrapper M2 close).
 
-The recording shape diverges within the family (per N6):
+The recording shape diverges within the family (codex round-7 correction — earlier drafts routed fill_rect through the composite pipeline; that was wrong):
 
-- `fill_rect` + `fill_rect_batch`: body uses the existing `RenderPipeline` cache + descriptor pool ring (same call sites as B.2 Task 11), with `src=solid_src_image`, `mask=white_mask_image`, `dst=white_mask_image` (no readback, no mask). Emit calls `record_solid_color_clear` for the solid_src and runs the standard composite open/draws/close triplet.
-- `logic_fill`: body uses `LogicFillPipelineCache` (engine.rs:2453) — distinct from the composite pipeline. The recorded payload carries GC logic mode + dst_format + color + pre-clamped rect slice + dst metadata + dst_old_layout. Emit records a logic-op render pass with push constants directly; NO descriptor traffic, NO picture-clip input. See N6 for the full barrier shape.
+- `fill_rect` + `fill_rect_batch`: body uses **NEITHER the composite pipeline NOR the LogicFill pipeline** — it uses `cmd_clear_attachments` directly (engine.rs:2360-2401). NO descriptor pool, NO pipeline bind, NO shader, NO blend. Pure REPLACE semantics. Recorded payload: `dst_id` + dst extent/format + color + pre-clamped rect slice + `dst_old_layout`. Emit: pre-barrier dst → COLOR_ATTACHMENT_OPTIMAL, begin_rendering with load=DONT_CARE, set viewport+scissor, `cmd_clear_attachments(color, rect_slice)`, end_rendering, post-barrier dst → SHADER_READ_ONLY_OPTIMAL.
+- `logic_fill`: body uses `LogicFillPipelineCache` (engine.rs:2453) — distinct from BOTH the composite pipeline AND `cmd_clear_attachments`. The recorded payload carries `dst_id` + GC logic mode + dst_format + color + pre-clamped rect slice + dst extent + `dst_old_layout`. Emit records a logic-op render pass with push constants directly; NO descriptor traffic, NO picture-clip input. See N6 for the full barrier shape.
+
+Three distinct emit sub-shapes inside FILL: cmd_clear_attachments (fill_rect/fill_rect_batch), logic_op render pass (logic_fill). The "FILL family" name groups them by op-source-type (all are solid-color fills) and gate, not by emit mechanics.
 
 `fill_rect_batch`'s body records ONE `RecordedFillRect` per `fill_rect_batch` call carrying the entire rect slice (per N4). Multiple `fill_rect_batch` calls in one frame each become their own recorded op; the frame builder collapses across calls. The wrapper M2 close drops.
 
 ### Phase 4 — MASK family (4 tasks: render_traps_or_tris only)
 
-**For `render_traps_or_tris`:** the same 4-task shape. Body peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9 — close-before-grow if frame has prior ops, then ensure_returning_old + adopt). Append a single `RecordedOp::RenderTrapsOrTris` carrying both stages' inputs.
+**For `render_traps_or_tris`:** the same 4-task shape. Body peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9 — close-before-grow if frame has prior ops, then ensure_returning_old + adopt the OLD backing as a `BatchResource` per N8 case 1). Body resolves the full source-state set at append time per the catalog (codex round-7): src kind discriminant, `src_clear_color` for Solid, `src_picture_xform` for Gradient (snapped from `picture_paint.get(xid)` since gradients are CPU-immutable per B.2 R3), `src_is_synthetic_1x1`, src/mask repeat enums, `src_force_opaque`, user_src_xform, prim_kind, bbox, mask_offset, per-rect `CompositeRect` slice, instance_count, needs_dst_readback, vertex pool pin. Append a single `RecordedOp::RenderTrapsOrTris` carrying ALL of these. Append-side MUST NOT carry a `mask_scratch_pin_idx` — emit re-resolves `engine.mask_scratch` fresh per N5.
 
-Emit replays the two-stage CB: (a) trap edge raster into mask scratch via the trap pipeline; (b) standard composite open+draws+close sampling the mask scratch view (per N5).
+Emit replays the two-stage CB:
+- **Resolve src/dst views fresh** from engine caches at emit time (Drawable via `ensure_drawable_view`, Gradient via `picture_paint[xid].image_view()`, Solid via `solid_src_view` + `record_solid_color_clear`).
+- **Resolve mask_view + mask_extent + current_layout fresh** from `engine.mask_scratch` (per N5 mask scratch ownership).
+- **(a) Trap raster** — barrier mask → COLOR_ATTACHMENT, begin_rendering(bbox, load=CLEAR), bind trap/tri pipeline per `prim_kind`, bind vertex buffer, push `TrapDrawPushConsts`, set viewport+scissor (bbox), `cmd_draw(4, instance_count)`, end_rendering. Barrier mask → SHADER_READ_ONLY.
+- **(b) Composite phase** — optional `dst_readback.record_copy_from(dst)` when `needs_dst_readback`. Compose `combined_src_xform = compose(src_picture_xform, user_src_xform)`. Effective src_repeat = `REPEAT_PAD` when `src_is_synthetic_1x1`, else the recorded `src_repeat`. Build `CompositeAttrs { src_extent, mask_extent (fresh), src_repeat (effective), mask_repeat = REPEAT_NONE, src_force_opaque, mask_force_opaque = false, src_xform = combined, mask_xform = IDENTITY }`. Standard composite open+draws+close sampling the mask scratch view.
 
-Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequence `(small, large, large)` spanning frames F1 + F2 — the grow inherently triggers `close-before-grow` between op 1 and op 2, so F1 closes before the grow and F2 reopens against M1).
+Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequence `(small, large, large)` spanning frames F1 + F2 — the grow inherently triggers `close-before-grow` between op 1 and op 2, so F1 closes before the grow and F2 reopens against M1). Also includes a **solid-source-equivalence test** asserting that a Solid-src trap op replays with `record_solid_color_clear` writing the correct color before composite (catches the "stale 1×1 solid contents" replay bug codex round-7 flagged).
 
 ### Phase 5 — GLYPH family (4 tasks: image_text only)
 
@@ -511,6 +620,8 @@ Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequenc
 Emit replays per N7: B.1's existing `Op::GlyphUpload` match arm in `emit_recorded_op_into_cb` (engine.rs:8425-8439, a match arm, NOT a separate function) handles the upload side; the new `Op::ImageText` arm in the same dispatch records the text-pipeline draw against the atlas, mirroring B.1's `Op::CompositeGlyphs` arm (engine.rs:8440-8478).
 
 Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced beyond what B.1 already enforces for composite_glyphs.
+
+**Required target-format gate** (per N7's LOAD-BEARING addition, codex round-7 catch): `image_text_via_frame_builder`'s body task MUST early-return `Ok(stats)` when the dst format is not `vk::Format::B8G8R8A8_UNORM` (mirror engine.rs:4515-4526). The gate fires BEFORE any atlas first-touch snapshot, glyph upload, or op append — so no rollback is needed. Phase 5's body task MUST include this gate; Phase 5's integration test MUST include a negative-test asserting a depth-1 or depth-32 target drops the run without atlas mutation (no `last_render_ticket` change, no staging pin added).
 
 **Required atlas transactional discipline** (per N7's LOAD-BEARING addition): `image_text_via_frame_builder`'s body task MUST call the same first-touch-atlas snapshot helper that `composite_glyphs_via_frame_builder` does (engine.rs:5314 style — snapshot `atlas_prev_ticket_snapshot` + `layouts.first_touch_atlas`). The existing `commit_close_success` (engine.rs:8780) and `rollback_atlas` (engine.rs:8838) paths handle the rest. Skipping the snapshot would leak a stale `last_render_ticket` on close failure — recreates a B.2-class transaction bug. Phase 5's integration test MUST exercise a close-failure path (e.g., via `platform_force_next_submit_failure_for_tests`) AND verify that the atlas's `last_render_ticket` rolls back to its pre-frame value.
 
