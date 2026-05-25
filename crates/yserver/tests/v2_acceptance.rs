@@ -4281,3 +4281,70 @@ fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
     );
 }
 
+/// Phase B.2 Task 18: injected submit failure during close (a)
+/// trips `renderer_failed`, (b) restores the drawable's pre-frame
+/// `current_layout` via the overlay's `rollback_pre_submit` path.
+///
+/// Snapshots the dst layout BEFORE issuing the first render_composite
+/// (UNDEFINED for a fresh pixmap, since storage's layout starts at
+/// UNDEFINED until a real op promotes it). After the failed close,
+/// the layout must be restored to that snapshot — the overlay's
+/// `first_touch_drawable` captured `UNDEFINED` as the pre-frame
+/// value, and rollback writes it back to storage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Snapshot the pre-frame layout BEFORE the render_composite — for
+    // a fresh pixmap this is UNDEFINED, which the overlay captures as
+    // the rollback target via `first_touch_drawable`.
+    let pre_layout = be.drawable_current_layout_for_tests(dst);
+
+    // Arm the next vkQueueSubmit2 to fail.
+    be.platform_force_next_submit_failure_for_tests();
+
+    let r = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 64, 64);
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // Reset the sub-gate BEFORE assertions (Task 11 pattern).
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    // The render_composite itself records into the frame builder
+    // without submitting; it should succeed (no error visible until
+    // the close-path submit fires).
+    r.expect("render_composite_for_tests (records into open frame)");
+    // The close-walk must surface the submit error.
+    assert!(
+        close_result.is_err(),
+        "engine_close_open_frame_for_timeout_for_tests must propagate the injected submit failure"
+    );
+
+    assert!(
+        be.platform_renderer_failed_for_tests(),
+        "injected submit failure must trip renderer_failed",
+    );
+    assert_eq!(
+        be.drawable_current_layout_for_tests(dst),
+        pre_layout,
+        "rollback_pre_submit must restore the drawable's pre-frame current_layout",
+    );
+
+    // Frame must be closed (failure path still drives the close).
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after the close-walk fails",
+    );
+}

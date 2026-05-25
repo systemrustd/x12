@@ -1902,6 +1902,22 @@ impl KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("render_fill_rectangles_for_tests: {e:?}")))
     }
 
+    /// Phase B.2 Task 18: read the drawable's current Vk image layout.
+    /// Used by the submit-failure rollback test to snapshot the
+    /// pre-frame layout and assert that `rollback_pre_submit` restored
+    /// it after the close-walk failed.
+    ///
+    /// Returns `vk::ImageLayout::UNDEFINED` if `dst_xid` doesn't
+    /// resolve in the store (rare; production code always inserts
+    /// before any layout transition).
+    pub fn drawable_current_layout_for_tests(&self, dst_xid: u32) -> ash::vk::ImageLayout {
+        self.store
+            .get_by_xid(dst_xid)
+            .map_or(ash::vk::ImageLayout::UNDEFINED, |d| {
+                d.storage.current_layout
+            })
+    }
+
     /// Phase B.2 Task 11: typed peek of the open frame's recorded
     /// `RenderComposite` ops' `dst_old_layout` field, in append order.
     /// Used by the second-op-in-frame overlay test to assert that
