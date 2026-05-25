@@ -156,62 +156,27 @@ At emit time, `inner.frame_builder.open.pins.staging_buffers[idx].buffer` is the
 
 This is mechanically identical to B.1's composite_glyphs glyph-upload path — reuse, don't redefine.
 
-### N3 — cow_copy_area uses a cow-specific overlay slot
+### N3 — cow_copy_area's dst is a Drawable; no new overlay machinery needed
 
-The cow (compositor-owned buffer for the scanout) is not a `Drawable` in the store — it has its own lifecycle managed by `PlatformBackend::cow`. `cow_copy_area_via_frame_builder` writes to the cow image, not to a drawable's storage.
+(Earlier draft of this spec proposed a separate `OpenFrame::cow_layout_in_frame` slot; codex audit found that to be the wrong model and the section was rewritten.)
 
-To preserve in-frame layout tracking across multiple `cow_copy_area` calls within one frame, add a cow-layout overlay slot:
+The COW is allocated as a normal Drawable in the v2 store (see `backend.rs` around `allocate_cow_backing` and the v2 store's cow registration). `cow_copy_area` reads and writes it through `store.get(cow_id)` / `store.get_mut(cow_id)` like any other drawable (engine.rs:3118, 3302, 3452); scene compose samples it via the standard `storage.sample_view` (scene.rs:1741); destroy paths gate on `last_render_ticket` like any drawable. `PlatformBackend` has present-generation state for the cow (`record_present`, `commit_bo_present`) but no separate cow-layout API — none is needed.
 
-```rust
-// in OpenFrame:
-pub(crate) cow_layout_in_frame: Option<vk::ImageLayout>,
-```
+This means cow_copy_area's frame-builder port needs **no new overlay machinery**: the existing `current_layout_for_drawable(store, cow_id)` accessor and the existing `commit_close_success`'s drawables walk handle the cow's in-frame layout the same way they handle any other drawable. The recorded op carries the cow's `DrawableId` like any other; `push_op_and_set_layouts` updates the cow's overlay entry in the same map.
 
-`current_layout_for_drawable`'s cow analog:
+What this **does** mean for the cow_copy_area port: the dispatcher needs to know whether the destination is "a regular drawable" (copy_area path) or "the cow" (cow_copy_area path). The existing legacy split between `copy_area` and `cow_copy_area` is preserved at the dispatch level (separate wrapper functions, separate `_via_frame_builder` bodies), but both record the same `RecordedCopyArea` variant with `dst_id: DrawableId` referring to either kind of drawable. Two `cow_copy_area` calls in one frame collapse correctly because both touch the same DrawableId in the overlay.
 
-```rust
-impl RenderEngineInner {
-    /// Returns the cow image's in-frame layout, falling back to the
-    /// platform-side cow layout if the cow has not been touched in
-    /// this frame. Mirrors `current_layout_for_drawable` for the cow
-    /// image (which is NOT a Drawable but has identical layout-
-    /// tracking needs across `cow_copy_area` ops in one frame).
-    pub(crate) fn current_layout_for_cow(
-        &self,
-        platform: &PlatformBackend,
-    ) -> vk::ImageLayout {
-        let storage_fallback = platform.cow_current_layout();
-        match self.frame_builder.open.as_ref().and_then(|o| o.cow_layout_in_frame) {
-            Some(l) => l,
-            None => storage_fallback,
-        }
-    }
-}
-```
+### N4 — fill_rect_batch is already the coalesced unit (one CB per call)
 
-`commit_close_success` extends to commit the cow overlay back:
+(Earlier draft claimed `fill_rect_batch` "already batches multiple fill_rect calls with matching attrs" — codex audit found that to be inaccurate. Decision moved from "deferred to implementation" to spec-time-final.)
 
-```rust
-// after the drawables and atlas walks:
-if let Some(cow_layout) = layouts.cow_layout_in_frame {
-    platform.set_cow_current_layout(cow_layout);
-}
-```
+The existing `fill_rect_batch` (engine.rs:2274) is already the coalesced unit: ONE call records one CB that clears a slice of rects with one color (engine.rs:2321, 2364, 2413). There is no cross-call coalesce key for fills; `pending_render_batch` and `RenderBatchKey` belong exclusively to `render_composite` batching (engine.rs:3623, 3697).
 
-Without this, two `cow_copy_area` calls in the same frame would each see the pre-frame cow layout as their src/dst old-layout — emitting wrong barriers and possibly producing wrong rendering or validation errors.
+**Decision (final):** `fill_rect_batch_via_frame_builder` records ONE `RecordedFillRect`-style op per `fill_rect_batch` call, carrying the entire rect slice. Multiple `fill_rect_batch` calls within one frame collapse via the frame builder (each call appends its own op), but each call remains a single recorded op — preserving the existing "one CB per fill_rect_batch call" granularity at the per-op level while enabling frame-level collapse.
 
-### N4 — fill_rect_batch's coalesce key may conflict with frame-builder collapsing
+Splitting a `fill_rect_batch` call into one recorded op per individual rect would be new behavior, NOT preservation of existing architecture. Rejected.
 
-`fill_rect_batch` already batches multiple fill_rect calls with matching attrs (op, color, dst). Its existing coalesce key is similar to the frame builder's "this op fits in the current frame" check.
-
-Under B.3, `fill_rect_batch_via_frame_builder` records one `RecordedFillRect` per call (or one per coalesced batch — TBD at implementation). Either way:
-
-- If `fill_rect_batch` calls produce one `RecordedFillRect` each, the frame builder collapses them naturally (multiple ops in one frame).
-- If they produce one `RecordedFillRect` per coalesced batch (existing behavior), the frame builder still collapses across batches.
-
-The pre-port `pending_render_batch` (`engine.rs:3957`'s flush) becomes a dead-code path that B.5 will remove. B.3 doesn't delete it — just bypasses it under sub-gate=ON.
-
-Decision deferred to implementation: if there's a clean win to dropping the per-op pending_render_batch under B.3 (e.g., the frame builder's collapse already does what render_batch was doing), prefer dropping it. Otherwise keep render_batch as a legacy fallback for `_FILL` sub-gate=OFF.
+The `pending_render_batch` (engine.rs:3982's `flush_render_batch`) is *render_composite-only* infrastructure and is unaffected by the FILL family port. It stays as the B.2 sub-gate=OFF fallback for render_composite; B.5 removes it when render_composite_legacy goes away.
 
 ### N5 — render_traps_or_tris has its own pipeline + scratch
 
@@ -222,6 +187,8 @@ Unlike fill_rect (which reuses render_composite's pipeline), render_traps_or_tri
 If recorded as one op, the variant holds both stages' inputs (trap pipeline params + composite descriptor + draws). If two, the `RecordedTrapRaster` + `RecordedTrapComposite` variants need consistent op-pair ordering (no other ops interleaved between them within the same frame).
 
 Decision: ONE op variant covering both stages. Simpler emit, no inter-op ordering constraints to enforce.
+
+The MASK family implementation MUST include an integration test exercising "two mask ops in the same frame followed by a mask scratch grow" — i.e., op N records with mask_scratch instance M0, op N+1 needs a larger mask_scratch and triggers Phase 9A's close-before-grow, then a third op records against M1. Validates that the per-frame mask_scratch view stays consistent through grow events.
 
 ## Frame close triggers after B.3
 
@@ -277,17 +244,24 @@ The aggregate `non_ported_total` is kept (= sum of the 8) for backward-compat wi
 
 This task lands BEFORE the ports begin. A bee-side run with the breakdown reveals which sources actually dominate — guides per-op port priority and lets us measure progress after each family flips ON.
 
-## Task structure (38 tasks, 6 phases)
+## Task structure (39 tasks, 6 phases)
 
-### Phase 0 — Telemetry breakdown (1 task)
+### Phase 0 — Telemetry breakdown (2 tasks)
 
-**Task 1: Per-source non_ported breakdown.**
+(Codex audit split: the breakdown touches three surfaces — `CloseReason` API, helper signature + 8 call sites, and the telemetry counter/log/test surface. Splitting into API plumbing first, then telemetry wiring, keeps each commit reviewable.)
+
+**Task 1a: `NonPortedSource` enum + helper signature + call sites.**
 - Add `NonPortedSource` enum to `frame_builder.rs`.
-- Replace single bucket with 8 per-source buckets in `telemetry.rs`.
 - Change `close_open_frame_for_non_ported_op` signature to take `source: NonPortedSource`.
-- Update all 8 call sites with the correct variant.
-- Extend telemetry log line.
-- Unit test: each call increments the right bucket.
+- Update all 8 call sites in `engine.rs` (lines 2255, 2285, 2505, 2747, 3091, 4140, 4498, 7215) with the correct variant; the `render_composite_legacy` site (5877) gets a `NonPortedSource::Legacy` or equivalent.
+- Plumb `source` through to `FrameCloseEvent` (no telemetry-counter change yet — just carry the data).
+
+**Task 1b: Telemetry buckets + log line + tests.**
+- Replace single `frame_builder_close_reason_non_ported_paint_op` bucket with 8 per-source buckets in `telemetry.rs` (+1 for `Legacy` if we tag the kill-switch path separately).
+- Extend `record_frame_builder_close` to fan out by `source`.
+- Extend the `v2_telemetry:` log line with the per-source breakdown.
+- Unit test: each `NonPortedSource` variant increments the right bucket.
+- Keep the aggregate `non_ported_total` field (= sum of all sources) for backward-compat with downstream analyzers.
 
 ### Phase 1 — Foundation (2 tasks)
 
@@ -297,13 +271,13 @@ This task lands BEFORE the ports begin. A bee-side run with the breakdown reveal
 - Backend test setters.
 - Default-OFF unit tests (matching B.2's pattern with env-var skip guard).
 
-**Task 3: New RecordedOp variants + cow overlay slot.**
-- Add `RecordedCopyArea`, `RecordedPutImage`, `RecordedFillRect`, `RecordedLogicFill`, `RecordedImageText`, `RecordedRenderTrapsOrTris` struct stubs + enum variants. (`RecordedFillRectBatch` deferred — added only if implementation needs it.)
+**Task 3: New RecordedOp variants.**
+- Add `RecordedCopyArea`, `RecordedPutImage`, `RecordedFillRect`, `RecordedLogicFill`, `RecordedImageText`, `RecordedRenderTrapsOrTris` struct stubs + enum variants. (`RecordedFillRectBatch` deferred — added only if implementation needs it; per N4, the default is one `RecordedFillRect`-style op per `fill_rect_batch` call.)
 - Box-wrap each variant.
 - Size-budget tests per variant.
-- Add `OpenFrame::cow_layout_in_frame: Option<vk::ImageLayout>` field + `current_layout_for_cow` engine helper.
-- Add `commit_close_success` cow-overlay writeback.
 - Stub `unimplemented!()` arms in `emit_recorded_op_into_cb` for each new variant.
+
+(No new `OpenFrame` field — cow_copy_area uses the existing drawable overlay machinery per N3.)
 
 ### Phase 2 — TRANSFER family (12 tasks: 4 per op × 3 ops)
 
@@ -314,9 +288,9 @@ This task lands BEFORE the ports begin. A bee-side run with the breakdown reveal
 - **`emit_recorded_<op>_into_cb`.** Barriers + transfer + barriers-back. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
 - **Integration test + drop wrapper M2 close.** Two-call collapse test (`v2_frame_builder_<op>_collapses_two_in_one_frame`). Remove the `self.close_open_frame_for_non_ported_op(...)?` call from the op's wrapper.
 
-`cow_copy_area`'s body task additionally wires the cow-overlay first_touch + set.
+`cow_copy_area`'s body task uses the existing `current_layout_for_drawable(store, cow_id)` accessor — no special cow handling beyond resolving the cow Drawable from the dispatch (per N3).
 
-`put_image`'s body task additionally clones the staging Arc into `frame_builder.open.pins.staging_buffers`.
+`put_image`'s body task additionally clones the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2).
 
 ### Phase 3 — FILL family (12 tasks: 4 per op × 3 ops)
 
@@ -324,7 +298,7 @@ This task lands BEFORE the ports begin. A bee-side run with the breakdown reveal
 
 Same 4-task shape. The body uses the existing `RenderPipeline` cache + descriptor pool ring (same call sites as B.2 Task 11), with `src=solid_src_image`, `mask=white_mask_image`, `dst=white_mask_image` (no readback, no mask). The emit calls `record_solid_color_clear` for the solid_src and runs the standard composite open/draws/close triplet.
 
-`fill_rect_batch`'s body decides at implementation time whether to record one variant per batched fill_rect (collapses via frame builder) or one per coalesced batch (mirrors legacy). Either way, the wrapper M2 close drops.
+`fill_rect_batch`'s body records ONE `RecordedFillRect` per `fill_rect_batch` call carrying the entire rect slice (per N4). Multiple `fill_rect_batch` calls in one frame each become their own recorded op; the frame builder collapses across calls. The wrapper M2 close drops.
 
 `logic_fill` carries the GC logic mode through to the recorded payload; emit selects the appropriate pipeline variant.
 
@@ -376,22 +350,18 @@ The emit replays the two-stage CB: (a) mask scratch fill (transfer for image_tex
 
 These remain unresolved at design time and ride along to implementation:
 
-1. **`fill_rect_batch` recording granularity.** One `RecordedFillRect` per batched fill (clean frame-builder collapse, drops the per-engine `pending_render_batch`) vs one per coalesced batch (preserves existing batching). Decision at implementation when the actual `fill_rect_batch` callers are inspected.
+1. **`render_traps_or_tris` one-vs-two recorded ops.** Currently planned as one variant covering both stages (per N5). If the two-stage CB is too dense to fit in one payload (>512B), split into `RecordedTrapRaster` + `RecordedTrapComposite` with consistent pairing enforcement at append+emit. Re-evaluate after the body lands.
 
-2. **`render_traps_or_tris` one-vs-two recorded ops.** Currently planned as one variant covering both stages. If the two-stage CB is too dense to fit in one payload (>512B), split into `RecordedTrapRaster` + `RecordedTrapComposite` with consistent pairing enforcement at append+emit. Re-evaluate after the body lands.
+2. **`logic_fill` pipeline variants.** GC logic modes (Copy, And, Or, Xor, …) map to render pipeline variants. The existing `_legacy` path handles this; ensure the via_frame_builder path's pipeline cache lookup keys on the logic mode correctly.
 
-3. **cow_copy_area's interaction with the cow's own layout state machine.** `PlatformBackend::cow` already tracks the cow's "is it presented" lifecycle. The new `cow_layout_in_frame` overlay must compose with that without double-counting. Audit at implementation.
-
-4. **`logic_fill` pipeline variants.** GC logic modes (Copy, And, Or, Xor, …) map to render pipeline variants. The existing `_legacy` path handles this; ensure the via_frame_builder path's pipeline cache lookup keys on the logic mode correctly.
-
-5. **`close_open_frame_for_non_ported_op` removal timing.** Phase 5 Task N-1 removes the dead call site in `render_composite_legacy`. The helper function itself stays until B.5 (where `render_composite_legacy` is removed). Optionally: rename the helper to `close_open_frame_legacy_kill_switch_path` to clarify its scope shrinks under B.3.
+3. **`close_open_frame_for_non_ported_op` removal timing.** Phase 5 Task N-1 removes the dead call site in `render_composite_legacy`. The helper function itself stays until B.5 (where `render_composite_legacy` is removed). Optionally: rename the helper to `close_open_frame_legacy_kill_switch_path` to clarify its scope shrinks under B.3.
 
 ## Risk register
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | Validation VUIDs in MASK family emit (mask scratch + composite cross-barrier) | Medium | High (silent corruption) | Bee vkdebug pass after MASK family ports land, before flipping `_MASK` default ON. |
-| cow_copy_area's cow-layout overlay double-counts with platform.cow state | Medium | Medium (rendering glitches) | Implementation-time audit; isolated integration test with two cow_copy_area in one frame. |
+| cow_copy_area's dispatcher wires `cow_id` to wrong DrawableStore entry | Low | High (corruption — wrong drawable's storage written) | Resolved at spec-time per N3 (cow is a regular Drawable in store). Integration test: two `cow_copy_area` calls in one frame collapse correctly and the cow's `storage.current_layout` updates via the standard `commit_close_success` walk. |
 | put_image staging-buffer Arc not pinned to the right fence (UAF if staging buffer drops before frame retires) | Low | High (GPU fault) | B.1's pin-set mechanism is proven; mirror exactly. Test with concurrent destroy of the source Pixmap mid-frame. |
 | Per-source telemetry breakdown introduces a hot-path branch | Very low | Very low (perf) | The branch is once per non_ported close (~100/s); negligible. |
 | `fill_rect_batch` decision goes wrong (over- or under-batches) | Medium | Medium (lower coalesce or extra closes) | Re-measurable: the per-source telemetry will show fill_rect vs fill_rect_batch counts; pick the option that maximizes frame-builder absorption. |
