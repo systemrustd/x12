@@ -1277,6 +1277,21 @@ impl RenderEngine {
         };
         let frame_ticket = open_frame.ticket.clone();
 
+        // Phase B.2 Task 14: count RenderComposite ops once for the
+        // telemetry close-event. `open_frame.ops` is not mutated
+        // between this point and any of the 5 close-event push sites
+        // below (success + 4 error paths: begin_op_cb err, record err,
+        // end_and_submit err, flush_submit_group err), so a single
+        // tally is safe and avoids re-walking the op list on each path.
+        let renders_in_frame: u32 = u32::try_from(
+            open_frame
+                .ops
+                .iter()
+                .filter(|op| matches!(op, super::frame_builder::RecordedOp::RenderComposite(_)))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+
         // Allocate the primary CB.
         let cb = {
             let inner = self.inner.as_mut().expect("inner");
@@ -1317,6 +1332,7 @@ impl RenderEngine {
                                 reason,
                                 ops_in_frame: open_frame.ops.len(),
                                 glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                                renders_in_frame,
                                 pin_count: open_frame.pins.len(),
                                 aborted: true,
                             },
@@ -1374,6 +1390,7 @@ impl RenderEngine {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                        renders_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
                     });
@@ -1416,6 +1433,7 @@ impl RenderEngine {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                        renders_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
                     });
@@ -1479,6 +1497,7 @@ impl RenderEngine {
                                 reason,
                                 ops_in_frame: op_count,
                                 glyph_uploads_in_frame: glyph_uploads,
+                                renders_in_frame,
                                 pin_count,
                                 aborted: false,
                             },
@@ -1517,6 +1536,7 @@ impl RenderEngine {
                             reason,
                             ops_in_frame,
                             glyph_uploads_in_frame,
+                            renders_in_frame,
                             pin_count,
                             aborted: true,
                         });

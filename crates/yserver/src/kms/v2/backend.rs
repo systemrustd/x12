@@ -1634,6 +1634,7 @@ impl KmsBackendV2 {
                     event.reason,
                     event.ops_in_frame,
                     event.glyph_uploads_in_frame,
+                    event.renders_in_frame,
                 );
             }
             // Aborts also record pin_count high water — those pins existed
@@ -1642,6 +1643,17 @@ impl KmsBackendV2 {
                 u64::try_from(event.pin_count).unwrap_or(u64::MAX),
             );
         }
+    }
+
+    /// Phase B.2 Task 14 test helper: drive
+    /// `drain_frame_builder_telemetry` from a test so the queued
+    /// `FrameCloseEvent`s feed into lifetime counters without
+    /// requiring a full main-loop tick. Mirrors the role of
+    /// `telemetry_submit_group_flushes_for_tests` for the
+    /// frame-close-event side of the telemetry pipeline.
+    #[doc(hidden)]
+    pub fn drain_frame_builder_telemetry_for_tests(&mut self) {
+        self.drain_frame_builder_telemetry();
     }
 
     /// Stage 5 Task 4 layer 1: test-side accessor to the ring's
@@ -15385,6 +15397,77 @@ mod tests {
         // Accessor returns None now; but the caller's Arc clones
         // still pin the FenceMapping alive (no destructor panic).
         assert!(b.dri3_xshmfence_handle(xid).is_none());
+    }
+
+    /// Phase B.2 Task 14: three `render_composite` calls in the same
+    /// open frame, then a forced close. After the backend drains the
+    /// queued `FrameCloseEvent` into telemetry, the lifetime
+    /// `frame_builder_renders_per_frame_max_in_window` gauge must
+    /// reflect ≥ 3 (the count of `RecordedOp::RenderComposite` ops
+    /// recorded into the closing frame). Exercises the full path:
+    /// engine populates `renders_in_frame` at the close-event push
+    /// site → backend's `drain_frame_builder_telemetry` reads it →
+    /// `record_frame_builder_close` accumulates into the bucket +
+    /// lifetime gauges.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn v2_frame_builder_renders_per_frame_telemetry_records_max() {
+        let mut be = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        be.set_frame_builder_enabled_for_tests(true);
+        be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+        let dst = be
+            .allocate_test_pixmap_bgra(64, 64)
+            .expect("allocate_test_pixmap_bgra");
+
+        // Drain any baseline close events from pixmap allocation so the
+        // lifetime gauge snapshot is taken at a clean baseline.
+        be.engine_flush_submit_group_for_tests()
+            .expect("setup drain");
+
+        // Three solid-fill composites into the same dst. All three ops
+        // append into the same open frame under the sub-gate.
+        let r1 = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 64, 64);
+        let r2 = be.render_composite_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 64, 64);
+        let r3 = be.render_composite_for_tests(dst, [0.0, 0.0, 1.0, 1.0], 64, 64);
+
+        // Force frame close via the Timeout helper; this runs the
+        // close-walk that pushes the FrameCloseEvent.
+        let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+        // Reset the process-level sub-gate IMMEDIATELY so neighbouring
+        // tests in the same cargo-test binary are not routed through
+        // the frame-builder composite path.
+        be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+        r1.expect("first render_composite_for_tests");
+        r2.expect("second render_composite_for_tests");
+        r3.expect("third render_composite_for_tests");
+        close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+        // Drain queued FrameCloseEvent → telemetry. Reuse the existing
+        // helper that drains flush outcomes + close events as a side
+        // effect of returning submit_group_flushes.
+        let _ = be.telemetry_submit_group_flushes_for_tests();
+        be.drain_frame_builder_telemetry_for_tests();
+
+        assert!(
+            be.telemetry
+                .lifetime
+                .frame_builder_renders_per_frame_max_in_window
+                >= 3,
+            "lifetime renders_per_frame_max_in_window must reflect the \
+             three RenderComposite ops recorded in the closing frame; got {}",
+            be.telemetry
+                .lifetime
+                .frame_builder_renders_per_frame_max_in_window,
+        );
     }
 
     #[test]

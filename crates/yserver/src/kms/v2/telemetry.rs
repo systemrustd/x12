@@ -130,6 +130,15 @@ pub struct Bucket {
     pub(crate) frame_builder_glyph_uploads_per_frame_total: u64,
     /// Max `glyph_uploads_in_frame` seen in the current bucket window.
     pub(crate) frame_builder_glyph_uploads_per_frame_max_in_window: u64,
+    /// Phase B.2 Task 14: sum of `renders_in_frame` (count of
+    /// `RecordedOp::RenderComposite` ops) across all closes in the
+    /// window. Mirrors the `glyph_uploads_per_frame_total` shape;
+    /// divide by `frame_builder_closes` for the per-frame average
+    /// rendered in the `v2_telemetry:` log line.
+    pub(crate) frame_builder_renders_per_frame_total: u64,
+    /// Phase B.2 Task 14: max `renders_in_frame` seen in the current
+    /// bucket window. Mirrors `glyph_uploads_per_frame_max_in_window`.
+    pub(crate) frame_builder_renders_per_frame_max_in_window: u64,
     // ── Phase A: SubmitGroup size + flush-reason histogram ───────
     /// Number of SubmitGroup flushes that actually submitted at
     /// least one entry (non-abort). Per-second + lifetime.
@@ -360,10 +369,14 @@ impl Telemetry {
         #[allow(clippy::cast_precision_loss)]
         let fb_glyph_avg = b.frame_builder_glyph_uploads_per_frame_total as f64
             / b.frame_builder_closes.max(1) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let fb_renders_avg =
+            b.frame_builder_renders_per_frame_total as f64 / b.frame_builder_closes.max(1) as f64;
         log::info!(
             "v2_telemetry: frame_builder_opens={} closes={} aborts={} \
              ops/frame_avg={fb_ops_avg:.1} max={} hist={:?} \
-             glyph_uploads/frame_avg={fb_glyph_avg:.1} max={} active_pins_hw={} \
+             glyph_uploads/frame_avg={fb_glyph_avg:.1} max={} \
+             renders/frame_avg={fb_renders_avg:.1} max={} active_pins_hw={} \
              close_reasons[scene_compose={} non_ported={} legacy_sc={} \
              present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={} \
              scratch_grow={}]",
@@ -373,6 +386,7 @@ impl Telemetry {
             b.frame_builder_ops_per_frame_max_in_window,
             b.frame_builder_ops_per_frame_hist,
             b.frame_builder_glyph_uploads_per_frame_max_in_window,
+            b.frame_builder_renders_per_frame_max_in_window,
             b.frame_builder_active_pins_high_water,
             b.frame_builder_close_reason_scene_compose,
             b.frame_builder_close_reason_non_ported_paint_op,
@@ -594,6 +608,7 @@ impl Telemetry {
         reason: super::frame_builder::CloseReason,
         ops_in_frame: usize,
         glyph_uploads_in_frame: u32,
+        renders_in_frame: u32,
     ) {
         use super::frame_builder::CloseReason as R;
         self.bucket.frame_builder_closes += 1;
@@ -637,6 +652,24 @@ impl Telemetry {
         {
             self.lifetime
                 .frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
+        }
+        // Phase B.2 Task 14: accumulate per-frame render counts the
+        // same way glyph_uploads_per_frame does — bucket + lifetime
+        // totals, max-in-window gauges in both.
+        let renders = u64::from(renders_in_frame);
+        self.bucket.frame_builder_renders_per_frame_total = self
+            .bucket
+            .frame_builder_renders_per_frame_total
+            .saturating_add(renders);
+        self.lifetime.frame_builder_renders_per_frame_total = self
+            .lifetime
+            .frame_builder_renders_per_frame_total
+            .saturating_add(renders);
+        if renders > self.bucket.frame_builder_renders_per_frame_max_in_window {
+            self.bucket.frame_builder_renders_per_frame_max_in_window = renders;
+        }
+        if renders > self.lifetime.frame_builder_renders_per_frame_max_in_window {
+            self.lifetime.frame_builder_renders_per_frame_max_in_window = renders;
         }
         let (b, l) = match reason {
             R::SceneCompose => (
@@ -931,6 +964,43 @@ mod tests {
         t.record_descriptor_pool_reset(3);
         assert_eq!(t.lifetime.descriptor_pool_creates, 2);
         assert_eq!(t.lifetime.descriptor_pool_resets, 3);
+    }
+
+    /// Phase B.2 Task 14 step 9: smoke test that the `ScratchGrow`
+    /// close-reason bucket actually increments when
+    /// `record_frame_builder_close` is called with that variant. The
+    /// bucket field was added by Task 1; this test makes sure the
+    /// `record_frame_builder_close` match arm + bucket field stay in
+    /// lockstep with `CloseReason::ScratchGrow` going forward, so the
+    /// telemetry log line never silently drops a close reason.
+    #[test]
+    fn v2_telemetry_record_frame_builder_close_counts_scratch_grow() {
+        let mut t = Telemetry::new();
+        t.record_frame_builder_close(
+            crate::kms::v2::frame_builder::CloseReason::ScratchGrow,
+            /* ops_in_frame = */ 0,
+            /* glyph_uploads_in_frame = */ 0,
+            /* renders_in_frame = */ 0,
+        );
+        assert_eq!(t.lifetime.frame_builder_close_reason_scratch_grow, 1);
+        assert_eq!(t.bucket.frame_builder_close_reason_scratch_grow, 1);
+    }
+
+    /// Phase B.2 Task 14: `record_frame_builder_close` accumulates the
+    /// renders-per-frame total (sum across closes) and tracks the
+    /// max-in-window gauge in both the bucket and lifetime aggregates.
+    /// Pure telemetry test — no Vk needed.
+    #[test]
+    fn v2_telemetry_record_frame_builder_close_accumulates_renders_per_frame() {
+        let mut t = Telemetry::new();
+        use crate::kms::v2::frame_builder::CloseReason as R;
+        t.record_frame_builder_close(R::SceneCompose, 0, 0, 3);
+        t.record_frame_builder_close(R::SceneCompose, 0, 0, 7);
+        t.record_frame_builder_close(R::SceneCompose, 0, 0, 1);
+        assert_eq!(t.lifetime.frame_builder_renders_per_frame_total, 11);
+        assert_eq!(t.bucket.frame_builder_renders_per_frame_total, 11);
+        assert_eq!(t.lifetime.frame_builder_renders_per_frame_max_in_window, 7);
+        assert_eq!(t.bucket.frame_builder_renders_per_frame_max_in_window, 7);
     }
 
     #[test]

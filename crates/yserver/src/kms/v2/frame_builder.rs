@@ -1240,6 +1240,12 @@ pub(crate) struct FrameCloseEvent {
     pub(crate) reason: CloseReason,
     pub(crate) ops_in_frame: usize,
     pub(crate) glyph_uploads_in_frame: u32,
+    /// Phase B.2 Task 14: count of `RecordedOp::RenderComposite` ops
+    /// recorded in the closing frame. Mirrors `glyph_uploads_in_frame`
+    /// for the render-composite path so the telemetry log line can
+    /// surface `renders/frame_avg=X.Y max=Z` alongside the existing
+    /// `glyph_uploads/frame_*` series.
+    pub(crate) renders_in_frame: u32,
     pub(crate) pin_count: usize,
     /// Phase B.1: `true` if this close came from a failure path
     /// (`renderer_failed`, flush_submit_group Err, recorder error).
