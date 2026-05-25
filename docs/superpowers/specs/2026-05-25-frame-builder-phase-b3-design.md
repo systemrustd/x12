@@ -463,6 +463,7 @@ This means `logic_fill` and `emit_recorded_logic_fill_into_cb` are structurally 
 
 ```
 on append (logic_fill):
+  flush_cow_batch + flush_render_batch    // N9 entry rule (legacy at engine.rs:2509-2511)
   ensure logic-fill assets
   clamp each rect to dst extent
   // opaque_alpha is a CALLER-provided parameter to logic_fill (GC state) —
@@ -609,7 +610,7 @@ Confirmed legacy call sites (mandatory mirror — codex audit):
 
 The flush calls can themselves close an open frame (since `flush_render_batch` may submit a CB), so they precede the open-frame mutation just like `allocate_scratch_image` does in N8.
 
-`cow_copy_area` is structurally different: it ENQUEUES into `pending_cow_batch`, it does not flush it. The rewrite preserves that. The `flush_cow_batch` + `flush_render_batch` calls at the TOP of the rewrite apply to FOLLOW-ON ops; cow_copy_area's own enqueue happens after the flushes (clearing OTHER pending state) but before its append.
+**`cow_copy_area` is the N9 exception (codex round-11 catch).** It ENQUEUES into `pending_cow_batch` rather than appending to the frame builder, so flushing the cow batch at entry would defeat same-dst collapse. Legacy `cow_copy_area` does ONLY `flush_render_batch` at entry (engine.rs:3095) — NOT `flush_cow_batch`. The cow batch flushes mid-body only for the stale-dst case (engine.rs:3168, 3196, 3412). The rewrite preserves this exactly: `cow_copy_area`'s entry calls `flush_render_batch` ONLY, not `flush_cow_batch`. The 8-op N9 invariant therefore reads: "every B.3 body MUST flush both pending batches at entry EXCEPT `cow_copy_area`, which flushes only `pending_render_batch`."
 
 ## Frame close triggers after B.3
 
@@ -649,7 +650,7 @@ After B.3 rip-and-replace:
 
 **For each of `copy_area`, `cow_copy_area`, `put_image`:**
 
-- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) **`flush_cow_batch` + `flush_render_batch`** per N9 — mandatory mirror of the legacy ordering rule. (2) preflight (renderer_failed check, dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (3) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (4) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (5) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (6) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
+- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) **Entry flushes per N9**: `copy_area` and `put_image` call `flush_cow_batch` + `flush_render_batch`; `cow_copy_area` calls ONLY `flush_render_batch` (the N9 exception — flushing cow_batch at entry would defeat same-dst collapse). (2) preflight (renderer_failed check, dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (3) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (4) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (5) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (6) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
 - **Integration test.** Two-call collapse test (`v2_frame_builder_<op>_collapses_two_in_one_frame`) — assert two consecutive `<op>` calls in the same frame produce one SubmittedOp, not two.
 
 `cow_copy_area`'s body task uses the existing `current_layout_for_drawable(store, cow_id)` accessor — no special cow handling beyond resolving the cow Drawable from the dispatch (per N3).
