@@ -275,6 +275,18 @@ struct OutputSceneState {
     /// `pool_slots[i]`. Released to the ring on flip retirement.
     pool_slots: VecDeque<usize>,
     pending_acks: VecDeque<PendingAck>,
+    /// Fence-gated descriptor-pool slot releases. At
+    /// `handle_page_flip_complete` we want to pop the matching
+    /// `pool_slots` entry and free it, but the compose CB's Vulkan
+    /// fence may not have signaled yet (pageflip retirement is
+    /// driven by KMS VBLANK, not by GPU completion). Releasing the
+    /// pool slot early calls `vkResetDescriptorPool` while the
+    /// compose CB still binds its descriptors — VUID-vkReset-
+    /// DescriptorPool-descriptorPool-00313. The fix: defer the
+    /// release to this queue and drain it on the next opportunity
+    /// (next tick / pageflip-complete) once `ticket.poll_signaled`
+    /// returns true. Mirrors `failed_submit_bos` / `retire_failed_submit_bos`.
+    pending_pool_releases: VecDeque<(usize, FenceTicket)>,
     /// GPU-submitted frames whose atomic commit was rejected.
     /// Keep both BO and descriptor-pool slot alive until the
     /// compose fence signals, then recycle them locally because
@@ -477,6 +489,7 @@ impl SceneCompositor {
                 output_idx: i,
                 pool_ring: ring,
                 pool_slots: VecDeque::with_capacity(4),
+                pending_pool_releases: VecDeque::with_capacity(4),
                 pending_acks: VecDeque::with_capacity(4),
                 failed_submit_bos: VecDeque::with_capacity(4),
                 damage_history: BufferAgeRing::new(bo_depth + 1),
@@ -898,9 +911,27 @@ impl SceneCompositor {
             state
                 .damage_history
                 .push(ack.generation, ack.submitted_output_damage);
-            // Release the matching pool slot.
+            // Release the matching pool slot — but only after the
+            // compose CB's Vulkan fence has signaled. Pageflip
+            // retirement is driven by KMS VBLANK, not by GPU
+            // completion; if the GPU is still executing the compose
+            // CB when this pageflip lands, releasing the pool slot
+            // immediately calls vkResetDescriptorPool on a pool
+            // whose descriptors are still bound to that CB
+            // (VUID-vkResetDescriptorPool-descriptorPool-00313).
+            // Fence-gate: if signaled now, release immediately;
+            // otherwise defer to `pending_pool_releases` for the
+            // drain pass to handle on a later tick.
             if let Some(slot) = state.pool_slots.pop_front() {
-                state.pool_ring.release(slot);
+                match &ack.ticket {
+                    None => state.pool_ring.release(slot),
+                    Some(t) if t.poll_signaled(&inner.vk) => {
+                        state.pool_ring.release(slot);
+                    }
+                    Some(t) => {
+                        state.pending_pool_releases.push_back((slot, t.clone()));
+                    }
+                }
             }
             // Commit the BO's new last_present_generation in the
             // platform (the buffer-age pick uses this on next
@@ -1134,6 +1165,30 @@ fn retire_failed_submit_bos(
     state.failed_submit_bos = remaining;
 }
 
+/// Drain the deferred descriptor-pool slot releases queued by
+/// `handle_page_flip_complete` when the compose fence hadn't yet
+/// signaled at pageflip-retirement time. Mirrors
+/// `retire_failed_submit_bos`'s walk-once-poll-or-defer shape.
+/// Slots whose fence has now signaled are returned to the ring;
+/// the rest stay queued for the next drain.
+fn drain_pending_pool_releases(
+    state: &mut OutputSceneState,
+    vk: &crate::kms::vk::device::VkContext,
+) {
+    if state.pending_pool_releases.is_empty() {
+        return;
+    }
+    let mut remaining = VecDeque::with_capacity(state.pending_pool_releases.len());
+    while let Some((slot, ticket)) = state.pending_pool_releases.pop_front() {
+        if ticket.poll_signaled(vk) {
+            state.pool_ring.release(slot);
+        } else {
+            remaining.push_back((slot, ticket));
+        }
+    }
+    state.pending_pool_releases = remaining;
+}
+
 #[allow(clippy::too_many_lines)]
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
@@ -1168,6 +1223,13 @@ fn tick_one_output(
         let vk = Arc::clone(&inner.vk);
         let s = inner.outputs.get_mut(output_idx).expect("range");
         retire_failed_submit_bos(s, output_idx, platform, vk.as_ref());
+        // B.2-context fix (vkdebug VUID-vkResetDescriptorPool-00313):
+        // drain any deferred descriptor-pool slot releases whose
+        // compose fence has now signaled. Deferred entries are
+        // queued at `handle_page_flip_complete` when the GPU hadn't
+        // yet finished the compose CB at KMS pageflip time;
+        // releasing the slot then would have tripped the VUID.
+        drain_pending_pool_releases(s, vk.as_ref());
         if !s.pending_acks.is_empty() {
             return Ok(false);
         }
