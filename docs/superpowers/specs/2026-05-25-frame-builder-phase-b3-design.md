@@ -463,7 +463,10 @@ This means `logic_fill` and `emit_recorded_logic_fill_into_cb` are structurally 
 
 ```
 on append (logic_fill):
-  flush_cow_batch + flush_render_batch    // N9 entry rule (legacy at engine.rs:2509-2511)
+  // empty-input fast-path returns + renderer_failed check happen BEFORE this point
+  flush_render_batch    // N9 entry rule (was flush_cow_batch + flush_render_batch
+                        // in legacy at engine.rs:2509-2511; flush_cow_batch removed
+                        // when pending_cow_batch is deleted in the cow_copy_area task)
   ensure logic-fill assets
   clamp each rect to dst extent
   // opaque_alpha is a CALLER-provided parameter to logic_fill (GC state) —
@@ -593,24 +596,36 @@ If `allocate_scratch_image` fails at step (3), nothing in the open frame has bee
 
 **Why allocation-first.** Reversing the order (mutate first, then allocate) means a transient memory-pressure failure at allocation time leaves the frame mid-mutated: the dst and src have updated touched/layout snapshots, but no op was appended to match. The next op in the same frame would observe stale snapshots that disagree with the actual recorded ops; close-success commit-writeback would commit a layout that no recorded op transitioned to. This is exactly the bug class codex round-8 flagged.
 
-### N9 — Every B.3 body MUST flush pending cow + render batches at entry
+### N9 — Every B.3 body MUST flush pending_render_batch at entry; pending_cow_batch is deleted
 
-(Codex round-10 catch.) Every pre-B.3 paint body starts with `flush_cow_batch` + `flush_render_batch` calls to preserve chronological X11 order. The pending `pending_cow_batch` (`flush_cow_batch`, engine.rs:?) carries deferred cow `copy_area`s; the pending `pending_render_batch` (`flush_render_batch`, engine.rs:3982) carries deferred X RENDER composite_glyphs / render_composite batches. Both must submit BEFORE any subsequent paint op records its own CB — that's the same-queue-ordering correctness guarantee.
+(Codex round-10 catch; cow_copy_area resolution in round-12.) Every pre-B.3 paint body starts with `flush_cow_batch` + `flush_render_batch` calls to preserve chronological X11 order. After B.3, `pending_cow_batch` is DELETED entirely (its sole enqueuer, `cow_copy_area`, is ported to the frame builder), so `flush_cow_batch` and its call sites also vanish. `pending_render_batch` (`flush_render_batch`, engine.rs:3982) still exists post-B.3 — it carries deferred ops from `render_composite_legacy` (B.2's kept kill-switch fallback at engine.rs:5877), and lives until B.5 deletes that fallback.
 
-Confirmed legacy call sites (mandatory mirror — codex audit):
-- `fill_rect_batch` — engine.rs:2286-2290
-- `logic_fill` — engine.rs:2509-2511
-- `copy_area` — engine.rs:2751-2753
-- `put_image` — engine.rs:4144-4146
-- `image_text` — engine.rs:4503-4505
-- `render_traps_or_tris` — engine.rs:7224-7226
-- B.1's `composite_glyphs_via_frame_builder` — engine.rs:5205-5214 (proves the frame-builder path also needs them, NOT just the legacy paths)
+The N9 invariant after B.3 reads:
 
-**The rip-and-replace rewrite of each B.3 body MUST preserve both flush calls at the top.** Order: `flush_cow_batch` first, then `flush_render_batch`. Position: immediately after the existing renderer_failed / inner checks (or wherever the pre-B.3 body had them — replicate verbatim). Skipping this is a class of "mixed sequences replay in wrong order" bug — e.g., `cow_copy_area` (deferred into pending_cow_batch) followed by `copy_area` (B.3 frame-builder append) would record the second op's CB BEFORE the cow batch submits, violating X11 chronological order.
+> Every B.3 rewritten body MUST call `flush_render_batch` at entry, immediately after empty/no-op fast-path returns (per the round-12 placement clarification below). `pending_cow_batch` no longer exists — there is no flush_cow_batch to call.
 
-The flush calls can themselves close an open frame (since `flush_render_batch` may submit a CB), so they precede the open-frame mutation just like `allocate_scratch_image` does in N8.
+Confirmed legacy call sites that informed this rule (mandatory pattern source — codex audit):
+- `fill_rect_batch` — engine.rs:2286-2290 (drops flush_cow_batch line, keeps flush_render_batch)
+- `logic_fill` — engine.rs:2509-2511 (same)
+- `copy_area` — engine.rs:2751-2753 (same)
+- `put_image` — engine.rs:4144-4146 (same)
+- `image_text` — engine.rs:4503-4505 (same)
+- `render_traps_or_tris` — engine.rs:7224-7226 (same)
+- B.1's `composite_glyphs_via_frame_builder` — engine.rs:5205-5214 (proves the frame-builder path also needs the flush, NOT just the legacy paths)
 
-**`cow_copy_area` is the N9 exception (codex round-11 catch).** It ENQUEUES into `pending_cow_batch` rather than appending to the frame builder, so flushing the cow batch at entry would defeat same-dst collapse. Legacy `cow_copy_area` does ONLY `flush_render_batch` at entry (engine.rs:3095) — NOT `flush_cow_batch`. The cow batch flushes mid-body only for the stale-dst case (engine.rs:3168, 3196, 3412). The rewrite preserves this exactly: `cow_copy_area`'s entry calls `flush_render_batch` ONLY, not `flush_cow_batch`. The 8-op N9 invariant therefore reads: "every B.3 body MUST flush both pending batches at entry EXCEPT `cow_copy_area`, which flushes only `pending_render_batch`."
+**Why pending_cow_batch can be deleted.** Pre-B.3, `cow_copy_area` enqueued into `pending_cow_batch` to collapse same-dst cow_copy_areas into one CB. The pre-B.3 frame builder couldn't see cow_copy_areas because they bypassed it entirely. In B.3, `cow_copy_area` becomes a normal `RecordedCopyArea` append — the frame builder's own coalescing (multiple ops per frame collapse into one CB at close) replaces the pending_cow_batch's same-dst collapse. Multiple cow_copy_areas in one frame still produce one CB; cross-frame cow_copy_areas naturally split per close trigger.
+
+The pre-B.3 stale-dst flush behavior (engine.rs:3168, 3196, 3412 — flush when the next cow_copy_area targets a different dst) is also subsumed: the frame builder's overlay-resolved layout tracking handles per-drawable state correctly across different `dst_id`s within a single frame, with one terminal SHADER_READ_ONLY_OPTIMAL per drawable per frame (per N1's single-terminal rule).
+
+**Empty/no-op fast-path placement (LOAD-BEARING — codex round-12 catch).** The flush call goes AFTER the empty/zero-rects fast-path returns but BEFORE any open-frame mutation. Legacy precedent at multiple sites:
+- `copy_area` returns early on empty rect BEFORE flush (engine.rs:2748).
+- `logic_fill` returns early on empty rects BEFORE flush (engine.rs:2506).
+- `image_text` returns early on empty glyph list BEFORE flush (engine.rs:4500).
+- `cow_copy_area` returns early on empty rect BEFORE flush (engine.rs:3092).
+
+Skipping the fast-path placement (i.e., flushing first regardless of input) would force pending_render_batch to drain on every empty call, changing batching cadence and adding latency to no-op paint ops. The body order is therefore: empty-input fast-path return → renderer_failed check → flush_render_batch → preflight / allocation / mutation per N8 → push_op_and_set_layouts.
+
+The flush call can itself close an open frame (since `flush_render_batch` may submit a CB), so it precedes the open-frame mutation just like `allocate_scratch_image` does in N8.
 
 ## Frame close triggers after B.3
 
@@ -650,10 +665,20 @@ After B.3 rip-and-replace:
 
 **For each of `copy_area`, `cow_copy_area`, `put_image`:**
 
-- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) **Entry flushes per N9**: `copy_area` and `put_image` call `flush_cow_batch` + `flush_render_batch`; `cow_copy_area` calls ONLY `flush_render_batch` (the N9 exception — flushing cow_batch at entry would defeat same-dst collapse). (2) preflight (renderer_failed check, dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (3) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (4) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (5) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (6) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
+- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) Empty/no-op fast-path return (e.g., zero rects, empty staging buffer). (2) `renderer_failed` check. (3) **`flush_render_batch` per N9** (no `flush_cow_batch` — `pending_cow_batch` is being deleted in B.3; see N9 + the cow_copy_area task below). (4) Preflight (dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (5) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (6) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (7) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (8) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
 - **Integration test.** Two-call collapse test (`v2_frame_builder_<op>_collapses_two_in_one_frame`) — assert two consecutive `<op>` calls in the same frame produce one SubmittedOp, not two.
 
-`cow_copy_area`'s body task uses the existing `current_layout_for_drawable(store, cow_id)` accessor — no special cow handling beyond resolving the cow Drawable from the dispatch (per N3).
+`cow_copy_area`'s body task ALSO deletes the `pending_cow_batch` infrastructure (atomic with the rewrite — partial deletion would leave dangling references that don't compile):
+
+1. Rewrite the `cow_copy_area` body to append a `RecordedCopyArea` to the frame builder (same shape as `copy_area`'s body, just resolving the cow Drawable via the existing `current_layout_for_drawable(store, cow_id)` accessor per N3 — no special cow handling otherwise).
+2. Delete the `pending_cow_batch` field from `EngineInner` (and any helper structs).
+3. Delete the `flush_cow_batch` helper function.
+4. Delete every `flush_cow_batch(store, platform)?` call site in `engine.rs` (the 6 other ops being rewritten will already have these lines dropped as part of their N9 entry-flush replacement).
+5. Delete any cow-batch-specific telemetry, state machines, and stale-dst flush hooks (engine.rs:3168, 3196, 3412 region — all become unreachable).
+
+The frame builder's per-frame collapse subsumes the pre-B.3 same-dst cow batching: multiple `cow_copy_area` calls with the same dst in one frame all append to the open frame and emit into one CB at close. Different-dst calls within a frame are also handled by the frame builder (each dst tracks its own layout via the overlay per B.2 Task 4).
+
+The cow_copy_area integration test `v2_frame_builder_cow_copy_area_collapses_two_in_one_frame` should assert: (a) two same-dst cow_copy_areas in one frame produce one SubmittedOp; (b) the cow's `storage.current_layout` updates correctly via `commit_close_success`; (c) no `pending_cow_batch`-related symbol survives in the compiled binary (the helper / field / call sites are all gone).
 
 `copy_area`'s body rewrite handles the self-overlap subcase per N8:
 
@@ -669,7 +694,7 @@ The existing `close_open_frame_for_non_ported_op` call at the top of each legacy
 
 ### Phase 3 — FILL family (6 tasks: 2 per op × 3 ops)
 
-**For each of `fill_rect`, `fill_rect_batch`, `logic_fill`:** same 2-task shape — body rewrite + integration test. Each body rewrite MUST start with `flush_cow_batch` + `flush_render_batch` per N9 before any open-frame work.
+**For each of `fill_rect`, `fill_rect_batch`, `logic_fill`:** same 2-task shape — body rewrite + integration test. Each body rewrite MUST call `flush_render_batch` at entry per N9 (after empty-input fast-path returns and renderer_failed check; no `flush_cow_batch` — that infrastructure is deleted in the cow_copy_area task).
 
 The recording shape diverges within the family (codex round-7 correction — earlier drafts routed fill_rect through the composite pipeline; that was wrong):
 
@@ -684,7 +709,7 @@ Three distinct emit sub-shapes inside FILL: cmd_clear_attachments (fill_rect/fil
 
 **For `render_traps_or_tris`:** same 2-task shape — body rewrite + integration test. The body's responsibilities (per the full N5 RecordedRenderTrapsOrTris payload listing) are:
 
-0. **Flush pre-existing batches** (per N9 — load-bearing X11 chronological-order invariant). Call `self.flush_cow_batch(store, platform)?` then `self.flush_render_batch(store, platform)?` BEFORE any open-frame work. Mirrors legacy at engine.rs:7224-7226 and B.1's composite_glyphs body at engine.rs:5205-5214.
+0. **Flush pending_render_batch** (per N9 — load-bearing X11 chronological-order invariant). After empty-input fast-path returns and renderer_failed check, call `self.flush_render_batch(store, platform)?` BEFORE any open-frame work. No `flush_cow_batch` — pending_cow_batch is deleted in the cow_copy_area task. Mirrors legacy at engine.rs:7224-7226 and B.1's composite_glyphs body at engine.rs:5205-5214 (minus the flush_cow_batch line).
 1. Preflight checks (renderer_failed, store.get(dst), `std_op = StdPictOp::from_u8(op)`, dst_format/dst_depth/dst_has_alpha, self-alias gate per engine.rs:7270-7273).
 2. Allocate the per-instance vertex buffer (`StagingBuffer::new_with_usage` for VERTEX_BUFFER usage). This is an allocation that may fail — done BEFORE any open-frame mutation, mirroring N8's allocation-first rule.
 3. **Peek-grow mask scratch** (Phase 9A from B.2 Task 9 — close-before-grow if frame has prior ops, then `ensure_image_size_returning_old` + `adopt_retired_resource_for_gpu_retirement` adopting the OLD backing as `BatchResource` per N8 case 1).
@@ -709,7 +734,7 @@ Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequenc
 
 ### Phase 5 — GLYPH family (2 tasks: image_text only)
 
-**For `image_text`:** same 2-task shape — body rewrite + integration test. Body STARTS with `flush_cow_batch` + `flush_render_batch` per N9 (matching legacy at engine.rs:4503-4505), then lazily ensures the `V2GlyphAtlas` + `TextPipeline` (mirroring B.1's composite_glyphs body), packs glyph misses into the atlas with per-glyph staging-buffer pins via `open.pins.pin_staging`, appends `RecordedOp::GlyphUpload` variants per miss (B.1 variant — REUSED), then appends `RecordedOp::ImageText`.
+**For `image_text`:** same 2-task shape — body rewrite + integration test. Body: empty-input fast-path return → renderer_failed check → `flush_render_batch` per N9 (no `flush_cow_batch` — deleted in cow_copy_area task) → lazily ensures the `V2GlyphAtlas` + `TextPipeline` (mirroring B.1's composite_glyphs body) → packs glyph misses into the atlas with per-glyph staging-buffer pins via `open.pins.pin_staging` → appends `RecordedOp::GlyphUpload` variants per miss (B.1 variant — REUSED) → appends `RecordedOp::ImageText`.
 
 Emit replays per N7: B.1's existing `Op::GlyphUpload` match arm in `emit_recorded_op_into_cb` (engine.rs:8425-8439, a match arm, NOT a separate function) handles the upload side; the new `Op::ImageText` arm in the same dispatch records the text-pipeline draw against the atlas, mirroring B.1's `Op::CompositeGlyphs` arm (engine.rs:8440-8478).
 
