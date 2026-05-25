@@ -342,6 +342,12 @@ pub(crate) struct OpenFrame {
     /// engine.rs:3556-3567's flush_cow_batch failure path — never silent
     /// drop, the X PRESENT protocol observes the events regardless of
     /// submit success).
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 4 wires up attach_cow_present_completion + close-path \
+                  drain; the slot lands in Task 1 so the OpenFrame shape is stable \
+                  before Task 4's atomic cow_copy_area rewrite."
+    )]
     pub(crate) pending_present_completions: Vec<super::present_completion::PendingPresentEntry>,
 }
 
@@ -538,6 +544,12 @@ pub(crate) struct RecordedRenderComposite {
 /// gradients are CPU-immutable per B.2 R3 finding 9) + the intrinsic axis
 /// projection snapped here at append.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 12 (render_traps_or_tris body rewrite) constructs these \
+              variants; the discriminant lands in Task 1 so the RecordedRenderTrapsOrTris \
+              payload + emit dispatch can match exhaustively before Task 12."
+)]
 pub(crate) enum RecordedTrapSrcKind {
     Drawable {
         id: DrawableId,
@@ -557,6 +569,12 @@ pub(crate) enum RecordedTrapSrcKind {
 /// slot is the SINGLE source of truth for the per-op scratch lifetime —
 /// see Pitfall 7 + N8 + Task 1's close-path scratch walk.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Tasks 2 (copy_area) + 4 (cow_copy_area) populate these fields; \
+              the payload lands in Task 1 so close_open_frame's scratch walk + the \
+              emit dispatch can match exhaustively."
+)]
 pub(crate) struct RecordedCopyArea {
     pub(crate) dst_id: DrawableId,
     pub(crate) src_id: DrawableId,
@@ -582,6 +600,11 @@ pub(crate) struct RecordedCopyArea {
 /// `open.pins.pin_staging` at append; emit fetches the buffer handle from
 /// `pins.staging_buffers[staging_pin_idx.0 as usize].buffer`.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 6 (put_image body rewrite) populates these fields; the \
+              payload lands in Task 1 so the emit dispatch can match exhaustively."
+)]
 pub(crate) struct RecordedPutImage {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_rect: vk::Rect2D,
@@ -597,6 +620,12 @@ pub(crate) struct RecordedPutImage {
 /// rewrote the spec). `load_op = LOAD` is LOAD-BEARING per the FILL
 /// pseudocode in the spec — outside-rect pixels must be preserved.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 8 (fill_rect / fill_rect_batch body rewrite) populates \
+              these fields; the payload lands in Task 1 so the emit dispatch can \
+              match exhaustively."
+)]
 pub(crate) struct RecordedFillRect {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_image_view: vk::ImageView,
@@ -612,6 +641,11 @@ pub(crate) struct RecordedFillRect {
 /// `opaque_alpha` is a caller-provided GC parameter (cache key), NOT
 /// derived from `dst_format` — codex round-8 catch.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 10 (logic_fill body rewrite) populates these fields; the \
+              payload lands in Task 1 so the emit dispatch can match exhaustively."
+)]
 pub(crate) struct RecordedLogicFill {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_image_view: vk::ImageView,
@@ -629,6 +663,11 @@ pub(crate) struct RecordedLogicFill {
 /// emit calls into the text-pipeline path. `dst_format == B8G8R8A8_UNORM`
 /// is implicit (append-side gate per N7).
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 14 (image_text body rewrite) populates these fields; the \
+              payload lands in Task 1 so the emit dispatch can match exhaustively."
+)]
 pub(crate) struct RecordedImageText {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_extent: vk::Extent2D,
@@ -642,6 +681,12 @@ pub(crate) struct RecordedImageText {
 /// composite pipeline, and descriptor set fresh; none of those four are
 /// recorded.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 Task 12 (render_traps_or_tris body rewrite) populates these \
+              fields; the payload lands in Task 1 so the emit dispatch can match \
+              exhaustively."
+)]
 pub(crate) struct RecordedRenderTrapsOrTris {
     // Dst identity and layout (N1 / B.2).
     pub(crate) dst_id: DrawableId,
@@ -711,11 +756,41 @@ pub(crate) enum RecordedOp {
     )]
     LayoutTransition(RecordedLayoutTransition),
     // Phase B.3 — all Box-wrapped per the size-budget rule.
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Tasks 2 + 4 (copy_area + cow_copy_area) construct this \
+                  variant; lands in Task 1 so dst_id() + emit dispatch match exhaustively."
+    )]
     CopyArea(Box<RecordedCopyArea>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 6 (put_image) constructs this variant; lands in Task 1 \
+                  so dst_id() + emit dispatch match exhaustively."
+    )]
     PutImage(Box<RecordedPutImage>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 8 (fill_rect / fill_rect_batch) constructs this variant; \
+                  lands in Task 1 so dst_id() + emit dispatch match exhaustively."
+    )]
     FillRect(Box<RecordedFillRect>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 10 (logic_fill) constructs this variant; lands in Task 1 \
+                  so dst_id() + emit dispatch match exhaustively."
+    )]
     LogicFill(Box<RecordedLogicFill>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 14 (image_text) constructs this variant; lands in Task 1 \
+                  so dst_id() + emit dispatch match exhaustively."
+    )]
     ImageText(Box<RecordedImageText>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 12 (render_traps_or_tris) constructs this variant; lands \
+                  in Task 1 so dst_id() + emit dispatch match exhaustively."
+    )]
     RenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>),
 }
 
@@ -726,6 +801,12 @@ impl RecordedOp {
     /// whether to attach the completion to the open frame (per the spec's
     /// N10 — `touched` is the wrong predicate because it includes sampled-
     /// only references).
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 Task 4 wires up attach_cow_present_completion to call this \
+                  helper; the predicate lands in Task 1 so the exhaustive match \
+                  catches a future variant addition at compile time before Task 4."
+    )]
     pub(crate) fn dst_id(&self) -> Option<DrawableId> {
         match self {
             RecordedOp::CompositeGlyphs(g) => Some(g.dst_id),
