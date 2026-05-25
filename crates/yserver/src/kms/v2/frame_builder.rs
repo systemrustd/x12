@@ -556,6 +556,32 @@ pub(crate) enum RecordedOp {
     LayoutTransition(RecordedLayoutTransition),
 }
 
+impl OpenFrame {
+    /// Phase B.2 Pitfall 6 / codex round 4 finding 3: append a recorded
+    /// op and apply the post-op overlay updates in a SINGLE critical
+    /// section so no reentrant code path can observe `ops.len() = N+1`
+    /// with the overlay still at the N-th op's value.
+    ///
+    /// `drawable_layout_updates` is the (id, post-op layout) tuple list
+    /// for every drawable the recorded op transitions. For
+    /// `render_composite`, that's `&[(dst_id, SHADER_READ_ONLY_OPTIMAL)]`
+    /// (one entry, the post-`record_render_composite_close` layout). The
+    /// helper is the ONLY caller-facing path that mutates `ops` +
+    /// `layouts` in tandem — Task 11 routes through this; B.3+ ports
+    /// extend the layout-updates slice as they touch additional
+    /// drawables.
+    pub(crate) fn push_op_and_set_layouts(
+        &mut self,
+        op: RecordedOp,
+        drawable_layout_updates: &[(DrawableId, vk::ImageLayout)],
+    ) {
+        self.ops.push(op);
+        for (id, layout) in drawable_layout_updates {
+            self.layouts.set_drawable_in_frame(*id, *layout);
+        }
+    }
+}
+
 use std::sync::Arc;
 
 /// Resource pins held alive across a frame. Mechanism 1 of spec

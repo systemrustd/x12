@@ -1797,6 +1797,78 @@ impl KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("render_composite_empty_for_tests: {e:?}")))
     }
 
+    /// Phase B.2 Task 11: drive a single-rect Solid-src `render_composite`
+    /// against `dst_xid`. The rect covers the full dst extent (Solid
+    /// fill at op=SRC). Used by the second-op-in-frame overlay test:
+    /// two successive calls share the same dst, so op #2 must observe
+    /// op #1's post-op layout via the overlay (Pitfall 5+6).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve in the store, or if
+    /// the engine call fails (Vk error, missing pipeline, etc.).
+    pub fn render_composite_for_tests(
+        &mut self,
+        dst_xid: u32,
+        color: [f32; 4],
+        width: u32,
+        height: u32,
+    ) -> Result<(), io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(io::Error::other(format!(
+                "render_composite_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        const OP_SRC: u8 = 1;
+        let rect = crate::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width,
+            height,
+        };
+        self.engine
+            .render_composite(
+                &mut self.store,
+                &mut self.platform,
+                OP_SRC,
+                super::engine::ResolvedSource::Solid(color),
+                super::engine::ResolvedSource::None,
+                dst_id,
+                std::slice::from_ref(&rect),
+                None,
+                crate::kms::cpu_types::Repeat::Pad,
+                crate::kms::cpu_types::Repeat::Pad,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .map(|_| ())
+            .map_err(|e| io::Error::other(format!("render_composite_for_tests: {e:?}")))
+    }
+
+    /// Phase B.2 Task 11: typed peek of the open frame's recorded
+    /// `RenderComposite` ops' `dst_old_layout` field, in append order.
+    /// Used by the second-op-in-frame overlay test to assert that
+    /// op #2 reads the overlay-resolved post-op layout of op #1
+    /// (SHADER_READ_ONLY_OPTIMAL) rather than the stale storage value.
+    ///
+    /// The `RecordedRenderComposite` payload is `pub(crate)` so the
+    /// integration test cannot match on it directly; this returns the
+    /// minimum scalar needed for the assertion.
+    pub fn frame_builder_peek_render_composite_dst_old_layouts_for_tests(
+        &self,
+    ) -> Vec<ash::vk::ImageLayout> {
+        self.engine
+            .frame_builder_peek_render_composite_dst_old_layouts()
+    }
+
     /// Phase B.1 Task 15: is the frame builder currently open?
     pub fn frame_builder_is_open_for_tests(&self) -> bool {
         self.engine.frame_builder_is_open()

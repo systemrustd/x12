@@ -3870,3 +3870,73 @@ fn v2_frame_builder_render_composite_via_fb_opens_frame() {
          (rects.is_empty() early return)",
     );
 }
+
+/// Phase B.2 Task 11 step 5: two sequential `render_composite` calls
+/// against the same dst, under the `render_composite_via_frame_builder`
+/// sub-gate. Op #1 reads dst's pre-frame layout (UNDEFINED for a fresh
+/// pixmap). Op #2 must read the OVERLAY's post-op layout for dst —
+/// `SHADER_READ_ONLY_OPTIMAL`, which is the layout the recorded
+/// composite-close transition will leave dst at — NOT the stale
+/// `storage.current_layout` (still UNDEFINED during recording).
+///
+/// Pitfall 5+6 / codex round 4 finding 3: the overlay update at
+/// op-append must be one write per op, to the POST-op layout, and
+/// `push_op_and_set_layouts` is the atomicity helper that bundles the
+/// ops.push + overlay write into a single critical section.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_read_only() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Drive two solid-fill composites into the same dst under the
+    // frame-builder sub-gate. Both ops append into the same open
+    // frame; neither flushes mid-call.
+    let r1 = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 64, 64);
+    let r2 = be.render_composite_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 64, 64);
+
+    // Snapshot the overlay-resolved dst_old_layout for both ops
+    // BEFORE flipping the sub-gate back, because the peek walks the
+    // current open frame.
+    let layouts = be.frame_builder_peek_render_composite_dst_old_layouts_for_tests();
+
+    // Reset the process-level sub-gate IMMEDIATELY so neighbouring
+    // tests in the same cargo-test binary are not routed through the
+    // frame-builder composite path.
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    r1.expect("first render_composite_for_tests");
+    r2.expect("second render_composite_for_tests");
+
+    assert_eq!(
+        layouts.len(),
+        2,
+        "expected two RecordedRenderComposite ops in the open frame, got {layouts:?}",
+    );
+    assert_eq!(
+        layouts[1],
+        ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        "second op-in-frame must resolve dst_old_layout via the overlay — \
+         it reads SHADER_READ_ONLY_OPTIMAL (the post-op layout op #1's recorded \
+         close transition will leave dst at), NOT the stale storage value",
+    );
+    // Specifically NOT COLOR_ATTACHMENT_OPTIMAL — that's an intermediate
+    // in-CB state never observable across ops at append-time.
+    assert_ne!(
+        layouts[1],
+        ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        "COLOR_ATTACHMENT_OPTIMAL is an in-CB transient — must not surface as \
+         a cross-op dst_old_layout (Pitfall 6)",
+    );
+}

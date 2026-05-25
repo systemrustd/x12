@@ -1634,6 +1634,33 @@ impl RenderEngine {
             .map_or(0, |i| i.frame_builder.lifetime_closes())
     }
 
+    /// Phase B.2 Task 11: test introspection — walk the open frame's
+    /// recorded op list and return each
+    /// `RecordedOp::RenderComposite`'s `dst_old_layout` in append
+    /// order. Returns an empty vec if no frame is open. Used by the
+    /// second-op-in-frame overlay test (see
+    /// `KmsBackendV2::frame_builder_peek_render_composite_dst_old_layouts_for_tests`).
+    /// The `RecordedRenderComposite` payload is `pub(crate)` so the
+    /// integration crate cannot match on it directly — this returns
+    /// the minimum scalar needed for the assertion.
+    pub(crate) fn frame_builder_peek_render_composite_dst_old_layouts(
+        &self,
+    ) -> Vec<vk::ImageLayout> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        let Some(open) = inner.frame_builder.open.as_ref() else {
+            return Vec::new();
+        };
+        open.ops
+            .iter()
+            .filter_map(|op| match op {
+                super::frame_builder::RecordedOp::RenderComposite(rc) => Some(rc.dst_old_layout),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Phase B.1 Task 21: monotonic count of all `FrameBuilder` opens
     /// since init. Delta-tracked by `KmsBackendV2::drain_frame_builder_telemetry`
     /// to emit one `record_frame_builder_open` per new open.
@@ -6107,61 +6134,26 @@ impl RenderEngine {
                 dst_readback_view,
             )?;
 
-        // Synthetic 1×1 scratches use PAD so the single texel
-        // covers the whole rect. Otherwise honour the user repeat.
-        let effective_src_repeat = if src_is_synthetic_1x1 {
-            crate::kms::vk::render_pipeline::REPEAT_PAD
-        } else {
-            crate::kms::backend::repeat_to_shader_const(src_repeat)
-        };
-        let effective_mask_repeat = if mask_is_synthetic_1x1 {
-            crate::kms::vk::render_pipeline::REPEAT_PAD
-        } else {
-            crate::kms::backend::repeat_to_shader_const(mask_repeat)
-        };
-
-        // Affine transforms. For Drawable / Solid sources the
-        // picture-side transform is identity. For gradient sources
-        // (Stage 3f.13) the gradient picture's `axis_projection`
-        // maps dst-pixel → LUT-pixel; compose with the user's
-        // `RenderSetPictureTransform` so the user-defined
-        // dst-space → picture-space mapping applies first, then
-        // the gradient projection. Matches v1's `compose_affines(
-        // intrinsic, user)` shape.
-        let user_src_xform =
-            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
-        let user_mask_xform =
-            crate::kms::backend::pixman_transform_to_affine(mask_transform.as_ref(), mask_extent);
-        let combined_src_xform = match src_picture_xform {
-            Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
-            None => user_src_xform,
-        };
-        let combined_mask_xform = match mask_picture_xform {
-            Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_mask_xform),
-            None => user_mask_xform,
-        };
-
-        // X11 Render PictFormat: pictures with `alpha_mask = 0`
-        // (RGB24 / XRGB32) must sample α = 1.0 regardless of storage.
-        // Audit #4 (2026-05-19): use the pict_format-aware variant
-        // so xRGB32-on-depth-32 pictures pin α=ONE — pre-fix the
-        // engine relied on depth alone and treated depth-32 storage
-        // as ARGB even when the picture declared xRGB32. Solid /
-        // Gradient / None carry their own α and don't need the
-        // override.
-        let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
-        let mask_force_opaque = resolve_force_opaque_pict_format(store, &mask, mask_pict_format);
-
-        let attrs = vk_render::CompositeAttrs {
+        // Phase B.2 Task 11: build CompositeAttrs via the shared
+        // helper so `render_composite_via_frame_builder` records a
+        // payload that reproduces this construction byte-for-byte.
+        let attrs = build_render_composite_attrs(
+            store,
+            &src,
+            &mask,
+            src_pict_format,
+            mask_pict_format,
             src_extent,
             mask_extent,
-            src_repeat: effective_src_repeat,
-            mask_repeat: effective_mask_repeat,
-            src_force_opaque,
-            mask_force_opaque,
-            src_xform: combined_src_xform,
-            mask_xform: combined_mask_xform,
-        };
+            src_repeat,
+            mask_repeat,
+            src_is_synthetic_1x1,
+            mask_is_synthetic_1x1,
+            src_picture_xform,
+            mask_picture_xform,
+            src_transform.as_ref(),
+            mask_transform.as_ref(),
+        );
 
         // Build clip scissor list. None / empty → single
         // full-extent scissor (full dst paint). Multi-rect clips
@@ -6389,7 +6381,7 @@ impl RenderEngine {
         //
         //     Resolve dst metadata. Scoped so the `&self.inner` borrow
         //     is released before any later `as_mut()` re-borrow.
-        let (_dst_image, _dst_view, dst_extent, dst_format, dst_depth) = {
+        let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
             let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
             if platform.renderer_failed {
                 return Err(RenderError::RendererFailed);
@@ -6861,26 +6853,144 @@ impl RenderEngine {
             }
         };
 
-        // STUB — Tasks 11-13 fill in descriptor acquisition, op
-        // record, emit. Suppress unused-binding warnings for the
-        // parameters + locals consumed by later tasks.
-        let _ = (
-            clip_rects,
-            src_transform,
-            mask_transform,
-            mask_component_alpha,
-            src_view,
-            mask_view,
+        // (9) PHASE B.2 Task 11 Step 1: pipeline lookup + descriptor
+        //     acquisition. The pipeline cache `get` takes `&mut self`
+        //     (builds on cache-miss); release that borrow BEFORE
+        //     reaching for `allocate_descriptor_for_views_into_ring`
+        //     so the descriptor-pool-ring sibling borrow doesn't
+        //     alias.
+        let inner = self.inner.as_mut().expect("inner");
+        let _pipeline_handle = inner
+            .render_pipelines
+            .as_mut()
+            .expect("ensured")
+            .get(std_op, dst_format, dst_has_alpha, mask_component_alpha)
+            .map_err(|e| {
+                log::warn!(
+                    "v2 render_composite (frame_builder): pipeline build failed \
+                     for op {op}: {e:?}"
+                );
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        // Mechanism 2: every descriptor acquisition during the open
+        // frame uses the captured `frame_generation`. Read it via the
+        // OpenFrame (set at open time, not re-bumped per op).
+        let frame_generation = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .frame_generation;
+        let src_for_descriptor = src_alias_view.unwrap_or(src_view);
+        let mask_for_descriptor = mask_view;
+        let dst_for_descriptor = dst_readback_view.unwrap_or(dst_view);
+        let descriptor_set = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .allocate_descriptor_for_views_into_ring(
+                &mut inner.descriptor_pool_ring,
+                frame_generation,
+                src_for_descriptor,
+                mask_for_descriptor,
+                dst_for_descriptor,
+            )
+            .map_err(RenderError::Vk)?;
+
+        // (10) Step 2: resolve dst_old_layout via the overlay
+        //      accessor. Pitfall 5 — for the 2nd op-in-frame, the
+        //      overlay reflects op 1's post-op layout
+        //      (SHADER_READ_ONLY_OPTIMAL); reading
+        //      `store.get(dst_id).storage.current_layout` directly
+        //      would return the STALE pre-frame value because
+        //      storage is intentionally not mutated during recording.
+        let inner = self.inner.as_ref().expect("inner");
+        let dst_old_layout = inner.current_layout_for_drawable(store, dst_id);
+
+        // (11) Step 3: build the replay-ready CompositeAttrs via the
+        //      shared helper extracted from `_legacy`. The payload
+        //      records this verbatim; close-time replay feeds it to
+        //      `record_render_composite_draws` unchanged.
+        let attrs = build_render_composite_attrs(
+            store,
+            &src,
+            &mask,
+            src_pict_format,
+            mask_pict_format,
             src_extent,
             mask_extent,
-            src_clear_color,
-            mask_clear_color,
+            src_repeat,
+            mask_repeat,
             src_is_synthetic_1x1,
             mask_is_synthetic_1x1,
             src_picture_xform,
             mask_picture_xform,
-            dst_readback_view,
+            src_transform.as_ref(),
+            mask_transform.as_ref(),
         );
+
+        // (12) Step 4: append RecordedOp::RenderComposite via the
+        //      atomicity helper. Pitfall 6 / codex round 4 finding 3 —
+        //      `push_op_and_set_layouts` is the ONLY path that mutates
+        //      ops + overlay in tandem. The overlay update is ONE write
+        //      per op, to the POST-op layout the recorder's close-
+        //      transition will leave dst at (SHADER_READ_ONLY_OPTIMAL).
+        //      No intermediate COLOR_ATTACHMENT_OPTIMAL write — that's
+        //      an in-CB transient never observable across ops.
+        let recorded = super::frame_builder::RecordedRenderComposite {
+            op,
+            dst_id,
+            dst_image,
+            dst_view,
+            dst_extent,
+            dst_format,
+            dst_has_alpha,
+            dst_old_layout,
+            src_view,
+            mask_view,
+            src_alias_view,
+            dst_readback_view,
+            attrs,
+            src_clear_color,
+            mask_clear_color,
+            mask_component_alpha,
+            needs_dst_readback,
+            rects: rects.to_vec().into_boxed_slice(),
+            clip_rects: clip_rects.map(|r| r.to_vec().into_boxed_slice()),
+            descriptor_set,
+        };
+        {
+            let inner = self.inner.as_mut().expect("inner");
+            let open = inner.frame_builder.open.as_mut().expect("just opened");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::RenderComposite(Box::new(recorded)),
+                &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+            );
+        }
+
+        // (13) Step 5: damage bookkeeping + recorded-draws stat.
+        //      Damage is committed AT APPEND TIME (matches `_legacy`
+        //      shape) so subsequent damage queries from non-paint
+        //      paths see the union eagerly; close-on-failure rolls
+        //      damage back via the layout-overlay-rollback that
+        //      `close_open_frame` performs on the touched set.
+        let mut stats = stats;
+        stats.recorded_draws = u32::try_from(rects.len()).unwrap_or(u32::MAX);
+        for cr in rects {
+            #[allow(clippy::cast_possible_wrap)]
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: cr.dst_x,
+                    y: cr.dst_y,
+                },
+                extent: vk::Extent2D {
+                    width: cr.width,
+                    height: cr.height,
+                },
+            };
+            store.damage(dst_id, clamp_rect(rect, dst_extent));
+        }
+
         Ok(stats)
     }
 
@@ -7706,6 +7816,81 @@ fn resolve_force_opaque_pict_format(
             store.get(*id).is_some_and(|d| d.depth == 24)
         }
         ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => false,
+    }
+}
+
+/// Phase B.2 Task 11 (USER-codex U-R11.F1+F2 / U-R12.F2): shared
+/// `CompositeAttrs` builder lifted out of `render_composite_legacy` so
+/// `render_composite_via_frame_builder` records an attrs payload that
+/// reproduces the legacy pre-call construction byte-for-byte. The
+/// recorded payload is replayed at close-time by
+/// `record_render_composite_draws` (via `record_render_composite_open_with_old_layout`
+/// in B.2 Task 12) so any divergence here would alter pixel output
+/// relative to the pre-frame-builder path.
+///
+/// Inputs mirror the per-call locals the legacy body has already
+/// resolved (synthetic-1x1 flags, gradient picture transforms, user
+/// pict-transforms, pict-format-aware force-opaque flags). The helper
+/// does NOT pack repeat / force-opaque into `RenderPushConsts`-style
+/// bits — `record_render_composite_draws` handles that at emit time.
+#[allow(clippy::too_many_arguments)]
+fn build_render_composite_attrs(
+    store: &DrawableStore,
+    src: &ResolvedSource,
+    mask: &ResolvedSource,
+    src_pict_format: u32,
+    mask_pict_format: u32,
+    src_extent: vk::Extent2D,
+    mask_extent: vk::Extent2D,
+    src_repeat: Repeat,
+    mask_repeat: Repeat,
+    src_is_synthetic_1x1: bool,
+    mask_is_synthetic_1x1: bool,
+    src_picture_xform: Option<crate::kms::vk::ops::render::AffineXform>,
+    mask_picture_xform: Option<crate::kms::vk::ops::render::AffineXform>,
+    src_transform: Option<&PictTransform>,
+    mask_transform: Option<&PictTransform>,
+) -> crate::kms::vk::ops::render::CompositeAttrs {
+    // Synthetic 1×1 scratches use PAD so the single texel covers the
+    // whole rect. Otherwise pass the bare shader repeat constant.
+    let effective_src_repeat = if src_is_synthetic_1x1 {
+        crate::kms::vk::render_pipeline::REPEAT_PAD
+    } else {
+        crate::kms::backend::repeat_to_shader_const(src_repeat)
+    };
+    let effective_mask_repeat = if mask_is_synthetic_1x1 {
+        crate::kms::vk::render_pipeline::REPEAT_PAD
+    } else {
+        crate::kms::backend::repeat_to_shader_const(mask_repeat)
+    };
+
+    // Compose gradient picture's intrinsic xform with the user's
+    // RenderSetPictureTransform — matches v1's `compose_affines(
+    // intrinsic, user)` shape.
+    let user_src_xform = crate::kms::backend::pixman_transform_to_affine(src_transform, src_extent);
+    let user_mask_xform =
+        crate::kms::backend::pixman_transform_to_affine(mask_transform, mask_extent);
+    let combined_src_xform = match src_picture_xform {
+        Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
+        None => user_src_xform,
+    };
+    let combined_mask_xform = match mask_picture_xform {
+        Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_mask_xform),
+        None => user_mask_xform,
+    };
+
+    let src_force_opaque = resolve_force_opaque_pict_format(store, src, src_pict_format);
+    let mask_force_opaque = resolve_force_opaque_pict_format(store, mask, mask_pict_format);
+
+    crate::kms::vk::ops::render::CompositeAttrs {
+        src_extent,
+        mask_extent,
+        src_repeat: effective_src_repeat,
+        mask_repeat: effective_mask_repeat,
+        src_force_opaque,
+        mask_force_opaque,
+        src_xform: combined_src_xform,
+        mask_xform: combined_mask_xform,
     }
 }
 
