@@ -63,20 +63,26 @@ The B.3 contribution is: 5–7 new `RecordedOp::*` variants, one `_via_frame_bui
 
 The 8 ports group by recording shape:
 
-**TRANSFER family** — `copy_area`, `cow_copy_area`, `put_image`. Recording shape:
+**TRANSFER family** — `copy_area`, `cow_copy_area`, `put_image`. Recording shape (high-level; see N1 for exact load-bearing barrier access masks):
 
 ```
 emit_recorded_transfer_into_cb:
-  pipeline_barrier2(src image → TRANSFER_SRC_OPTIMAL, dst image → TRANSFER_DST_OPTIMAL)
+  pipeline_barrier2(<see N1 for exact stage/access mask shape>:
+                    src image  src_old_layout → TRANSFER_SRC_OPTIMAL
+                    dst image  dst_old_layout → TRANSFER_DST_OPTIMAL)
   cmd_copy_image / cmd_copy_buffer_to_image
-  pipeline_barrier2(dst → SHADER_READ_ONLY_OPTIMAL, src → its prior layout)
+  pipeline_barrier2(<see N1 for exact stage/access mask shape>:
+                    dst image  TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+                    src image  TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL)
 ```
 
-No descriptor, no draw, no render pass. The payload carries dst image+layout, src image+layout (where applicable), and the rect/region descriptors.
+No descriptor, no draw, no render pass. The payload carries dst image+old-layout, src image+old-layout (where applicable), and the rect/region descriptors. **Terminal layout is SHADER_READ_ONLY_OPTIMAL for BOTH src and dst per N1** (an earlier draft said "src → its prior layout" but N1's single-terminal rule wins — the spec is corrected here for consistency).
 
-`copy_area` and `cow_copy_area` share recording shape — one `RecordedCopyArea` variant covers both. The dispatcher decides which dst to resolve (drawable storage vs cow image).
+The exact stage/access masks for these barriers MUST mirror the legacy paths' shapes precisely (engine.rs:2951 for copy_area's pre/post barrier, engine.rs:3300 for cow_copy_area, engine.rs:4210 for put_image). See N1 below for the mandate.
 
-`put_image` differs: the src is a `StagingBuffer` Arc (cloned into the open frame's pin set), and the emit uses `cmd_copy_buffer_to_image`. Distinct variant `RecordedPutImage`.
+`copy_area` and `cow_copy_area` share recording shape — one `RecordedCopyArea` variant covers both. The dispatcher decides which dst to resolve (drawable storage vs cow image — both are DrawableIds per N3).
+
+`put_image` differs: the src is a `StagingBuffer` Arc (cloned into the open frame's pin set via `open.pins.pin_staging`), and the emit uses `cmd_copy_buffer_to_image`. Distinct variant `RecordedPutImage`. No src image to barrier — staging buffers have no layout transition; only the dst gets the pre/post pair.
 
 **FILL family** — `fill_rect`, `fill_rect_batch`, `logic_fill`. Recording shape mirrors B.2's render_composite — solid-color shader via the existing `RenderPipeline` cache, descriptor per op, open + draws + close:
 
@@ -132,12 +138,12 @@ Reuses B.1's `RecordedGlyphUpload` variant verbatim for the upload side; only th
 
 | Variant | Box-wrapped? | Family | Notes |
 |---------|--------------|--------|-------|
-| `RecordedCopyArea(Box<RecordedCopyArea>)` | yes | TRANSFER | covers copy_area + cow_copy_area; payload carries `dst_id: DrawableId` (cow is a regular DrawableId per N3) + src_id + sub-rect + dst_old_layout |
-| `RecordedPutImage(Box<RecordedPutImage>)` | yes | TRANSFER | staging_pin_idx (B.1 `pin_staging` style) + dst_id + sub-rect + dst_old_layout |
-| `RecordedFillRect(Box<RecordedFillRect>)` | yes | FILL | op + color + rect-slice + clip + descriptor + dst_old_layout; covers fill_rect_batch as N≥1 rect-slice per N4 |
-| `RecordedLogicFill(Box<RecordedLogicFill>)` | yes | FILL | GC logic mode + dst_format (cache key) + color + pre-clamped rect-slice + dst metadata + dst_old_layout; NO X RENDER picture-clip input, NO descriptor handle. Uses `LogicFillPipelineCache` directly per N6. |
-| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | dst metadata + dst_old_layout + foreground color + glyphs Vec<{atlas_x, atlas_y, w, h, dst_x, dst_y}> (same shape as B.1's RecordedCompositeGlyphs); NO atlas-key, NO clip. Companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads. |
-| `RecordedRenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>)` | yes | MASK | trap/tri vertex pool + mask scratch view + dst (single variant covers both raster + composite stages per N5) |
+| `RecordedCopyArea(Box<RecordedCopyArea>)` | yes | TRANSFER | covers copy_area + cow_copy_area; payload carries `dst_id: DrawableId` (cow is a regular DrawableId per N3) + `src_id: DrawableId` + sub-rect + `dst_old_layout` + `src_old_layout` + `self_overlap_scratch_pin_idx: Option<u32>` (Some when src_id == dst_id, references the scratch image pinned in FramePinSet per N1's self-overlap subcase) |
+| `RecordedPutImage(Box<RecordedPutImage>)` | yes | TRANSFER | `staging_pin_idx` (B.1 `pin_staging` style) + `dst_id: DrawableId` + sub-rect + `dst_old_layout` (no src image layout — staging buffers have no layout per N1) |
+| `RecordedFillRect(Box<RecordedFillRect>)` | yes | FILL | **`dst_id: DrawableId`** + dst metadata (extent, format — needed for the render pass) + op + color + rect-slice + clip + descriptor + `dst_old_layout`; covers fill_rect_batch as N≥1 rect-slice per N4. The dst_id is the overlay key for layout resolve and the BatchResource pin source — codex round-6 flagged that omitting it makes the variant un-emittable. |
+| `RecordedLogicFill(Box<RecordedLogicFill>)` | yes | FILL | **`dst_id: DrawableId`** + GC logic mode + dst_format (cache key) + color + pre-clamped rect-slice + dst extent + `dst_old_layout`; NO X RENDER picture-clip input, NO descriptor handle. Uses `LogicFillPipelineCache` directly per N6. |
+| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | **`dst_id: DrawableId`** + dst extent + `dst_old_layout` + foreground color + glyphs `Vec<{atlas_x, atlas_y, w, h, dst_x, dst_y}>` (same shape as B.1's RecordedCompositeGlyphs); NO atlas-key, NO clip. Companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads. |
+| `RecordedRenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>)` | yes | MASK | **`dst_id: DrawableId`** + `mask_scratch_pin_idx` (mask image pinned into FramePinSet, retired via BatchResource on fence) + trap/tri vertex pool + dst extent + `dst_old_layout` (single variant covers both raster + composite stages per N5) |
 
 No `RecordedFillRectBatch` variant — `fill_rect_batch` produces one `RecordedFillRect` per call carrying the entire rect slice (N4 decision).
 
@@ -162,17 +168,64 @@ Cross-family bisect works as: leave one or two gates ON, flip the others OFF, ob
 
 These are net-new to B.3. All B.2 invariants (M1, M3, ticket-touch, renderer_failed fatal-after-failure, descriptor watermark, layout overlay, atomic push) apply verbatim.
 
-### N1 — TRANSFER ops normalize to SHADER_READ_ONLY_OPTIMAL at end
+### N1 — TRANSFER ops normalize to SHADER_READ_ONLY_OPTIMAL at end + mirror legacy barrier shapes exactly
 
 B.2's render_composite always leaves dst in `SHADER_READ_ONLY_OPTIMAL` post-op (via `record_render_composite_close`). The overlay tracking assumes one terminal layout per drawable.
 
-TRANSFER ops naturally transit through `TRANSFER_DST_OPTIMAL` during the copy. To preserve the single-terminal-layout assumption:
+**Terminal layout rule.** TRANSFER ops naturally transit through `TRANSFER_DST_OPTIMAL` (and `TRANSFER_SRC_OPTIMAL` for the src side of copy_area / cow_copy_area). To preserve the single-terminal-layout assumption:
 
-> Every TRANSFER op's emit MUST emit a final barrier `TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL` for dst before returning, and the corresponding append's overlay update MUST set dst to `SHADER_READ_ONLY_OPTIMAL`.
+> Every TRANSFER op's emit MUST emit a final barrier transitioning dst (and src when it was transitioned) to `SHADER_READ_ONLY_OPTIMAL` before returning. The corresponding append's overlay update MUST set BOTH dst and (if applicable) src to `SHADER_READ_ONLY_OPTIMAL` via `push_op_and_set_layouts(op, &[(dst_id, SHADER_READ_ONLY_OPTIMAL), (src_id, SHADER_READ_ONLY_OPTIMAL)])`.
 
-Same for src: if the TRANSFER op transitions src to `TRANSFER_SRC_OPTIMAL` for the copy, the emit's final barrier MUST return src to `SHADER_READ_ONLY_OPTIMAL` (assuming src came from there; the overlay-resolved `src_old_layout` carries the prior value). For freshly-allocated src in `UNDEFINED`, this becomes a `UNDEFINED → SHADER_READ_ONLY_OPTIMAL` transition which is legal.
+Earlier drafts said "src → its prior layout" — that's wrong. The single-terminal-layout invariant supersedes; if a later op needs src in a different layout it issues its own barrier from SHADER_READ_ONLY.
 
-The append-time overlay update for src uses the same `push_op_and_set_layouts(op, &[(dst_id, SHADER_READ_ONLY_OPTIMAL), (src_id, SHADER_READ_ONLY_OPTIMAL)])` shape — two drawable updates per op.
+For freshly-allocated dst in `UNDEFINED`, the pre-barrier becomes `UNDEFINED → TRANSFER_DST_OPTIMAL` which is legal.
+
+**LOAD-BEARING — exact stage/access masks (codex round-6 catch).** The high-level pseudocode in §Architecture is intentionally abstract; the implementation MUST mirror the legacy paths' barrier shapes precisely. These are not interchangeable with the simpler "dst_access_mask = TRANSFER_WRITE" shape — the legacy paths chose these masks specifically to drain prior compose / fill / put-image writes on the same image, the same class of producer-mask requirement that caused B.2's RAW hazard at vkCmdBeginRendering.
+
+For `copy_area` / `cow_copy_area` pre-barrier (mirror engine.rs:2951-style, both src AND dst):
+
+```
+pipeline_barrier2(
+    src_stage    = ALL_COMMANDS,
+    src_access   = SHADER_SAMPLED_READ | TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE,
+    dst_stage    = COPY (or BLIT, matching legacy choice),
+    dst_access   = TRANSFER_READ  (for src image)  / TRANSFER_WRITE  (for dst image),
+    old_layout   = src_old_layout / dst_old_layout (from overlay),
+    new_layout   = TRANSFER_SRC_OPTIMAL / TRANSFER_DST_OPTIMAL,
+)
+```
+
+For `copy_area` / `cow_copy_area` post-barrier (mirror legacy's exit shape — both src AND dst back to SHADER_READ_ONLY):
+
+```
+pipeline_barrier2(
+    src_stage    = COPY,
+    src_access   = TRANSFER_READ  (for src)  / TRANSFER_WRITE  (for dst),
+    dst_stage    = FRAGMENT_SHADER (or ALL_COMMANDS, matching legacy),
+    dst_access   = SHADER_SAMPLED_READ,
+    old_layout   = TRANSFER_SRC_OPTIMAL / TRANSFER_DST_OPTIMAL,
+    new_layout   = SHADER_READ_ONLY_OPTIMAL,
+)
+```
+
+For `put_image` pre-barrier (mirror engine.rs:4210 — DST only; staging buffers have no layout):
+
+```
+pipeline_barrier2(
+    src_stage    = ALL_COMMANDS,
+    src_access   = SHADER_SAMPLED_READ | COLOR_ATTACHMENT_WRITE,
+    dst_stage    = COPY,
+    dst_access   = TRANSFER_WRITE,
+    old_layout   = dst_old_layout,
+    new_layout   = TRANSFER_DST_OPTIMAL,
+)
+```
+
+For `put_image` post-barrier: identical shape to copy_area's dst post-barrier.
+
+The implementer MUST cross-reference engine.rs:2951 (copy_area), engine.rs:3300 (cow_copy_area), engine.rs:4210 (put_image) at implementation time and replicate the producer src_access bits verbatim. Generic "TRANSFER_WRITE only" producer masks would recreate the B.2-class RAW hazard against prior frame-builder ops that wrote to the same image (a `render_composite` writing the dst followed by a `copy_area` reading it in the SAME frame would race without `COLOR_ATTACHMENT_WRITE` in the src_access).
+
+**Same-image scratch subcase** (copy_area self-overlap): when src_id == dst_id, the legacy path uses a temporary scratch image. The B.3 port MUST preserve this path — the recorded op carries a `self_overlap_scratch_pin_idx: Option<u32>` referencing a scratch pinned into `FramePinSet::retired_resources` (or a sibling slot if necessary). The emit's barrier sequence then has THREE transitions instead of two: dst → TRANSFER_SRC, scratch → TRANSFER_DST, copy dst → scratch; barrier scratch → TRANSFER_SRC, dst → TRANSFER_DST, copy scratch → dst; barrier dst → SHADER_READ_ONLY, scratch retired via BatchResource on frame fence. This is the most complex TRANSFER emit path; the spec calls it out so the implementer does not assume the simple two-barrier shape covers it.
 
 ### N2 — put_image staging buffer pin uses the existing B.1 slot
 
@@ -210,11 +263,9 @@ The `pending_render_batch` (engine.rs:3982's `flush_render_batch`) is *render_co
 
 Unlike fill_rect (which reuses render_composite's pipeline), render_traps_or_tris uses a dedicated `trap_pipeline` lazily initialized by `ensure_trap_assets` (engine.rs:2186) along with the `mask_scratch: Option<MaskScratch>` slot.
 
-`render_traps_or_tris_via_frame_builder` peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9), records the trap raster + composite as ONE recorded op (or two — TBD), and the emit replays the two-stage CB.
+**Decision (final):** `render_traps_or_tris_via_frame_builder` peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9) and records the trap raster + composite as ONE recorded op. The variant `RecordedRenderTrapsOrTris` holds both stages' inputs (trap pipeline params + mask-scratch metadata + composite descriptor + per-rect draw inputs). The emit replays the two-stage CB.
 
-If recorded as one op, the variant holds both stages' inputs (trap pipeline params + composite descriptor + draws). If two, the `RecordedTrapRaster` + `RecordedTrapComposite` variants need consistent op-pair ordering (no other ops interleaved between them within the same frame).
-
-Decision: ONE op variant covering both stages. Simpler emit, no inter-op ordering constraints to enforce.
+A two-op split (`RecordedTrapRaster` + `RecordedTrapComposite`) was rejected: it would impose pairing-ordering constraints at append+emit (no other ops interleaved between them within the same frame) that the single-op shape avoids. Only payload size remains an implementation-time consideration; see Open Questions.
 
 The MASK family implementation MUST include an integration test exercising a mask scratch grow across frame boundaries (codex R3.4 — the test must explicitly cross frames; Phase 9A's close-before-grow rule means "two mask ops then a grow" inherently spans 2 frames, not 1).
 
@@ -303,6 +354,16 @@ on emit (close-time replay):
 ```
 
 Atlas-pin-ceiling logic from B.1 applies: the per-frame ceiling protects against unbounded staging-buffer accumulation. image_text's port reuses B.1's pin_ceiling counter; no new counter needed.
+
+**Atlas transactional discipline (LOAD-BEARING — codex round-6 catch).** The B.1 `composite_glyphs_via_frame_builder` path is not just "pin staging + append" — it carries a transactional state contract that `image_text` MUST also honor:
+
+1. **First-touch snapshot.** On the first atlas-touching op-append within an open frame, snapshot the atlas's pre-frame state: `atlas_prev_ticket_snapshot = atlas.last_render_ticket().cloned()` (engine.rs:5314-style) AND `open.layouts.first_touch_atlas(atlas.current_layout())` to seed the overlay's atlas entry.
+
+2. **Close-success commit.** `commit_close_success` already stamps the atlas's `last_render_ticket` to the closed frame's ticket and commits the overlay's atlas layout to `V2GlyphAtlas::current_layout` (engine.rs:8780-style). image_text's port must NOT bypass this — the existing close-success path handles atlas commits for any frame that touched the atlas, regardless of whether composite_glyphs, image_text, or both touched it.
+
+3. **Close-failure rollback.** On close failure, the atlas's `last_render_ticket` rolls back to `atlas_prev_ticket_snapshot` and the atlas's layout rolls back to its pre-frame value (engine.rs:8838-style — `rollback_atlas`). image_text's port relies on the existing rollback path — no new rollback code, but its append MUST register first-touch correctly so the rollback knows what to restore.
+
+Without (1)+(3), a failed close after an image_text frame would leak a stale `last_render_ticket` on the atlas (pointing at a ticket that never signals) — a B.2-class transaction bug. The remediation is purely append-side: ensure `image_text_via_frame_builder` calls the same `first_touch_atlas` snapshot helper that `composite_glyphs_via_frame_builder` does, on its first atlas-touching op. No new helper needed; the existing one is the contract.
 
 The audit comparison: B.1's `composite_glyphs_via_frame_builder` (engine.rs:5605-5618) already does this exact dance for the X RENDER composite_glyphs path. image_text's body is mechanically the same with a different draw call at emit-time (text run vs composite-glyphs).
 
@@ -450,6 +511,8 @@ Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequenc
 Emit replays per N7: B.1's existing `Op::GlyphUpload` match arm in `emit_recorded_op_into_cb` (engine.rs:8425-8439, a match arm, NOT a separate function) handles the upload side; the new `Op::ImageText` arm in the same dispatch records the text-pipeline draw against the atlas, mirroring B.1's `Op::CompositeGlyphs` arm (engine.rs:8440-8478).
 
 Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced beyond what B.1 already enforces for composite_glyphs.
+
+**Required atlas transactional discipline** (per N7's LOAD-BEARING addition): `image_text_via_frame_builder`'s body task MUST call the same first-touch-atlas snapshot helper that `composite_glyphs_via_frame_builder` does (engine.rs:5314 style — snapshot `atlas_prev_ticket_snapshot` + `layouts.first_touch_atlas`). The existing `commit_close_success` (engine.rs:8780) and `rollback_atlas` (engine.rs:8838) paths handle the rest. Skipping the snapshot would leak a stale `last_render_ticket` on close failure — recreates a B.2-class transaction bug. Phase 5's integration test MUST exercise a close-failure path (e.g., via `platform_force_next_submit_failure_for_tests`) AND verify that the atlas's `last_render_ticket` rolls back to its pre-frame value.
 
 ### Phase 6 — Wrap-up (3 tasks)
 
