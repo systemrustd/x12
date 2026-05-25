@@ -3087,6 +3087,54 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         site (engine.rs:744 in `poll_retired`); B.2 doesn't add new
         retire sites.
 
+  - **Phase B sub-phase B.3 — IMPLEMENTED 2026-05-25.** Plan
+    `docs/superpowers/plans/2026-05-25-frame-builder-phase-b3.md`
+    landed in commits `67ff198` … `2300db1` on
+    `feature/frame-builder-submit-rate`. Spec
+    `docs/superpowers/specs/2026-05-25-frame-builder-phase-b3-design.md`.
+
+    All 8 remaining non-ported paint ops (`copy_area`, `cow_copy_area`,
+    `put_image`, `fill_rect`, `fill_rect_batch`, `logic_fill`,
+    `image_text`, `render_traps_or_tris`) are now FrameBuilder-resident.
+    M2's only remaining call site is `render_composite_legacy`
+    (engine.rs:~5877) behind the
+    `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` kill-switch — with the
+    switch ON (default), zero non_ported close events fire in steady
+    state.
+
+    **Mechanism changes:**
+      - `SubmittedOp::scratch` is `Vec<ScratchImage>` (was
+        `Option<ScratchImage>`). Single self-overlap scratch lives on
+        `RecordedCopyArea` from append until the close-path walk
+        migrates it into the vec (N8).
+      - `pending_cow_batch` and `flush_cow_batch` infrastructure
+        DELETED. X PRESENT completions for COW frames now migrate to
+        `OpenFrame::pending_present_completions`, acquired via
+        `PresentCompletionSignal` BEFORE the submit (N10 — three-branch
+        close-path: acquire signal pre-submit, drain post-flush-success,
+        force-enqueue degraded `PendingPresentBatch` on flush-failure;
+        never silent-drop).
+
+    **Bug found in user testing (yoga):**
+      - Task 12 hotfix at `2300db1`: `frame_generation` was re-fetched
+        from the already-`take()`n `OpenFrame` option inside the emit
+        dispatch for `RecordedOp::RenderTrapsOrTris`, causing a panic.
+        Fix: thread `frame_generation` through the emit dispatch instead
+        of re-fetching.
+
+    **Bee hardware-smoke gate (NOT YET — pending capture):**
+      - `close_reasons[non_ported]/s` → ≤ 10 (vs ~900–1100 pre-B.3).
+      - `submit_group_flushes/s` drop by 30–50 % beyond B.2's ~75 %
+        absorption. Combined with B.2: target ~200–400 submits/s on
+        bee MATE drag (Phase B end-state target).
+      - `ops/frame_avg` rises from B.2's ~1.7 to ~4–8.
+      - `frame_builder_aborts/s = 0`.
+      - silence (dual-output) regression check — no scene-compose
+        regression, no ERROR_DEVICE_LOST, no fault chains.
+      - yoga / iMac / fuji regression checks.
+      - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
+        intel, lavapipe) — no new validation VUIDs.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
