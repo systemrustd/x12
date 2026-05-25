@@ -8579,6 +8579,26 @@ fn emit_recorded_render_composite_into_cb(
         );
     }
 
+    // (2b) Shader-side dst readback copy: Saturate and the
+    //      Disjoint/Conjoint families bind binding 2 (`dst_tex`) and
+    //      expect it to contain a snapshot of dst before this op. The
+    //      append path only ensures/resolves the scratch view and writes
+    //      the descriptor; the actual transition+copy must replay here,
+    //      in command-buffer order, before the draw samples it.
+    if rc.needs_dst_readback {
+        let rb = inner
+            .dst_readback
+            .as_mut()
+            .expect("dst_readback: ensured at op-append in render_composite_via_frame_builder");
+        rb.record_copy_from(
+            cb,
+            rc.dst_image,
+            rc.dst_old_layout,
+            rc.dst_format,
+            rc.dst_extent,
+        );
+    }
+
     // (3) Pipeline lookup. The cache `get` takes `&mut self`; the borrow
     //     is released before the open barrier emission so `&inner.vk`
     //     can be re-borrowed safely.
@@ -8628,27 +8648,24 @@ fn emit_recorded_render_composite_into_cb(
     //     its borrow lifetime is the function scope.
     let full_extent_scissor;
     let clip_scissors: &[vk::Rect2D] = match rc.clip_rects.as_deref() {
-        Some(cr) if !cr.is_empty() => {
-            // Pre-built scissor list — convert from `Rectangle16` to
-            // `vk::Rect2D` once via the shared helper. Owned for the
-            // call's borrow lifetime.
+        Some(cr) => {
+            // Important distinction:
+            // - `None` => no picture clip, paint everywhere
+            // - `Some([])` => empty picture clip, paint nothing
+            //
+            // B.2 originally collapsed both into the same fallback,
+            // which let replayed ops redraw whole-frame damage after
+            // `SetPictureClipRectangles(n=0)`.
             let owned = build_render_clip_scissors(Some(cr), rc.dst_extent);
             if owned.is_empty() {
-                // All clips fell outside the dst — legacy returns Ok
-                // before recording draws; mirror that by closing without
-                // a draw and letting `record_render_composite_close`
-                // emit the `to_read` transition (the open already moved
-                // dst to COLOR_ATTACHMENT_OPTIMAL, so the close runs
-                // unconditionally).
                 let mut target = target;
                 vk_render::record_render_composite_close(&inner.vk, cb, &mut target);
                 return Ok(());
             }
-            // Stash the owned Vec on the stack-local and bind the slice.
             full_extent_scissor = owned;
             full_extent_scissor.as_slice()
         }
-        _ => {
+        None => {
             full_extent_scissor = vec![vk::Rect2D {
                 offset: vk::Offset2D::default(),
                 extent: rc.dst_extent,

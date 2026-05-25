@@ -3003,17 +3003,45 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         `cargo test --workspace` green; `cargo +nightly fmt` + plain
         `cargo clippy --workspace --all-targets` clean on the B.2
         surface (AGENTS.md: no pedantic by default).
-      - **Hardware gates** (user-driven, pending):
-        - **bee MATE-load smoothness — PENDING.** Boot MATE with default
-          `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE=on`, drag for 30 s,
-          expect `queue_submit2/s` peak < 1000/s on bee (post-Phase-A
-          baseline was 2300/s; spec target by end of B.4 is 200-400/s,
-          B.2 alone should hit 600-1000/s). User-side smoothness
-          observation: 1-second initial-drag hitch should ease (warm
-          cache loop now amortises across the frame).
-        - **bee MATE-load survival — PENDING.** Same telemetry harness;
-          `frame_builder_aborts/s = 0` throughout (no
-          new failure mode under load).
+      - **Hardware gates:**
+        - **bee MATE-load correctness / survival — PASS 2026-05-25**
+          (captures `yserver-hw-mate.log`,
+          `yserver-hw-mate-vkdebug.log`, `yserver-mate.submit.tsv`).
+          Post-fix bee boot reaches MATE, renders correctly, and
+          survives drag with no `ERROR_DEVICE_LOST`, no panics, and
+          `frame_builder_aborts=0` throughout. The last load-bearing
+          replay bug was B.2's treatment of
+          `SetPictureClipRectangles(n=0)`: backend storage correctly
+          distinguished `clip=None` ("paint everywhere") from
+          `clip=Some([])` ("empty clip, paint nothing"), but
+          `emit_recorded_render_composite_into_cb` collapsed both to
+          the same full-extent scissor fallback. On bee this replayed
+          empty-clipped composites as whole-target redraws, producing
+          the "icons appear briefly, then window goes shadow-only"
+          failure. Fix: preserve the distinction at replay time —
+          `Some(empty)` now closes without drawing, `None` still uses
+          full-extent scissor. After that fix the B.2 path is
+          functionally correct on bee.
+        - **bee MATE-load smoothness — NOT YET (2026-05-25 telemetry).**
+          The new run is slightly better subjectively than B.1 but
+          still laggy, and the telemetry says why. Over the captured
+          drag window, `queue_submit2/s` averaged **2266** and peaked
+          at **2959**; `paint_submits/s` averaged **2190** and peaked
+          at **2881**. CPU fence waits are no longer the problem
+          (`cpu_fence_wait_ns/s` avg **15 ms**, peak **44 ms**), so
+          the remaining lag is still submit-rate pressure on bee. The
+          frame builder itself is healthy but not yet dominant:
+          `frame_builder_opens/s` averages **897** (peak **1137**),
+          `renders/frame_avg` averages **1.67** (peak **4**), while
+          `close_reasons[non_ported]` still averages **873/s** (peak
+          **1115/s**). Combined with Phase-B invariant M1
+          (`submit_group_size_max_in_window=1` every sample;
+          `submit_group_size_avg≈0.93-0.95`), this means B.2 is
+          constantly forced to close the frame for still-unported ops,
+          and each close becomes its own `vkQueueSubmit2`. Net:
+          correctness is fixed, but smoothness still waits on later
+          B-phases that reduce `non_ported` close pressure; this is no
+          longer a fence-wait bug.
         - **yoga / iMac / fuji regression check — PENDING.** Same drag,
           no new `ERROR_DEVICE_LOST`, no fault chains. Expected to
           IMPROVE on these platforms vs B.1 (cap=1 reverts to per-op
@@ -3023,6 +3051,32 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
           render_composite → frame builder.
 
     **Open follow-ups:**
+      - 2026-05-25 bee vkdebug follow-up: latest post-B.2 run no
+        longer reports descriptor-pool reset, semaphore-destroy, or
+        shader-demote VUIDs. Remaining hard VUID was sampled-image
+        layout on a newly allocated `dst_readback` scratch during
+        `op=13` (`PictOpSaturate`) composites: append-time wrote the
+        descriptor for binding 2, but deferred replay only copied the
+        self-alias scratch and skipped the normal `dst -> dst_readback`
+        copy, leaving the scratch globally `UNDEFINED` at draw submit.
+        Local follow-up replays `DstReadback::record_copy_from` for
+        every recorded composite with `needs_dst_readback`, before the
+        draw. The earlier FreePixmap close-boundary guard remains as a
+        conservative lifetime fence for already-recorded descriptor
+        views. Hardware re-test pending.
+      - 2026-05-25 bee post-fix telemetry follow-up: B.2 now renders
+        correctly on bee, but submit pressure remains fundamentally a
+        `non_ported` close problem, not a sync problem. The captured
+        run (`yserver-hw-mate.log` + `yserver-mate.submit.tsv`) shows
+        `queue_submit2/s` avg **2266** peak **2959** with
+        `cpu_fence_wait_ns/s` avg **15 ms** peak **44 ms**. Frame
+        builder close telemetry points at the real limiter:
+        `close_reasons[non_ported]` avg **873/s** peak **1115/s**,
+        while `submit_group_size_max_in_window=1` confirms M1 is still
+        forcing one-submit-per-close. So B.2 has cleared the replay
+        correctness work; smoothness now depends on later B-phase
+        porting that keeps more paint inside the frame instead of
+        closing for legacy ops.
       - Q1 (op variant sizing) — measured at B.2 close;
         `RecordedRenderComposite` is 264 B, well under the 512 B
         budget. No Box-`rects` follow-up needed.
