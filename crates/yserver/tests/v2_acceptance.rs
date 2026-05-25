@@ -3940,3 +3940,88 @@ fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_r
          a cross-op dst_old_layout (Pitfall 6)",
     );
 }
+
+/// Phase B.2 Task 12: two consecutive `render_composite` calls against
+/// the same dst, under the `render_composite_via_frame_builder`
+/// sub-gate, collapse into ONE `flush_submit_group` (and therefore ONE
+/// `vkQueueSubmit2`) on frame close.
+///
+/// This is the close-time replay's load-bearing invariant: the frame
+/// builder defers per-op submits and emits a single CB at close time
+/// (`Timeout` here, forced via the test helper). The plan calls this
+/// out as the headline win of Phase B.2 — render_composite submit
+/// rate halves when the workload coalesces two paints in one tick.
+///
+/// Counter used: per-backend `telemetry.lifetime.submit_group_flushes`
+/// (via `telemetry_submit_group_flushes_for_tests`). This is the
+/// parallel-safe counter — process-global `vkQueueSubmit2` count
+/// includes the engine's lazy `run_one_shot_op` asset-init submits
+/// AND would interleave with other tests' submits in a parallel
+/// test-runner. The per-backend counter only ticks when this
+/// backend's `flush_submit_group` runs (the frame-builder collapse
+/// target).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(128, 128)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Drain any baseline flush outcomes (e.g. setup CBs / cow zero-fill
+    // from pixmap allocation) so the per-backend counter snapshot is
+    // taken at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre = be.telemetry_submit_group_flushes_for_tests();
+
+    // Two solid-fill composites into the same dst. Both ops append into
+    // the same open frame (cap=1 group + sub-gate ON); neither flushes
+    // mid-call.
+    let r1 = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 128, 128);
+    let r2 = be.render_composite_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 128, 128);
+
+    // Force frame close via the Timeout helper (unconditional close).
+    // This runs the close-walk: emit each RecordedOp into the frame CB,
+    // end + submit the CB, drain pending_group_ops → submitted, then
+    // call flush_submit_group → vkQueueSubmit2 exactly once.
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // Reset the process-level sub-gate IMMEDIATELY so neighbouring tests
+    // in the same cargo-test binary are not routed through the frame-
+    // builder composite path.
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    r1.expect("first render_composite_for_tests");
+    r2.expect("second render_composite_for_tests");
+    close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+    let post = be.telemetry_submit_group_flushes_for_tests();
+    let delta = post - pre;
+    assert_eq!(
+        delta, 1,
+        "two render_composite in one frame must collapse into ONE \
+         flush_submit_group / vkQueueSubmit2 on close (got delta={delta})",
+    );
+
+    // Frame must be closed after the helper returns.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+
+    // And the renderer must still be healthy (no submit failure).
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false through the close-replay path",
+    );
+}

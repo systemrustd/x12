@@ -469,8 +469,12 @@ pub(crate) struct RecordedGlyphUpload {
 #[derive(Debug)]
 #[allow(
     dead_code,
-    reason = "B.2 Task 6 lands the payload + enum variant; \
-              op-append (Task 11) and emit (Task 12) populate / consume the fields"
+    reason = "Phase B.2 — several payload fields (dst_id, src_view, mask_view, \
+              dst_readback_view, needs_dst_readback) are write-only post-Task-12: \
+              the descriptor write happens at append-time (Task 11), the close-time \
+              replay (Task 12) re-uses the cached descriptor_set + dst_image/view/extent. \
+              The append-time-only fields stay on the payload for Debug introspection + \
+              future B.3 ports that may need to re-resolve at emit-time."
 )]
 pub(crate) struct RecordedRenderComposite {
     pub(crate) op: u8,
@@ -541,12 +545,6 @@ pub(crate) enum RecordedOp {
     /// `RecordedOp` slot — the 0/1 alloc per emitted op is acceptable
     /// vs the per-frame `Vec<RecordedOp>` padding cost the alternative
     /// would impose.
-    #[allow(
-        dead_code,
-        reason = "B.2 Task 6 lands the variant; op-append (Task 11) and emit (Task 12) \
-                  exercise this path. Pre-Task 11 the frame builder only sees CompositeGlyphs / \
-                  GlyphUpload appends from the B.1 text-pipeline path."
-    )]
     RenderComposite(Box<RecordedRenderComposite>),
     #[allow(
         dead_code,

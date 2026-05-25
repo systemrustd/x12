@@ -192,9 +192,34 @@ pub fn record_render_composite_open<T: CompositeTarget + ?Sized>(
     dst: &mut T,
     pipeline: vk::Pipeline,
 ) -> Result<(), vk::Result> {
+    let old_layout = dst.current_layout();
+    record_render_composite_open_with_old_layout(vk, cb, dst, pipeline, old_layout)
+}
+
+/// Phase B.2 Task 12: same shape as [`record_render_composite_open`]
+/// but takes `old_layout` explicitly instead of reading
+/// `dst.current_layout()`. Used by the v2 frame builder so the
+/// overlay's `current_in_frame_layout` (resolved at op-append
+/// time) drives the `to_color` barrier instead of
+/// `dst.current_layout()` (which reflects `storage.current_layout`
+/// and is stale during deferred recording — see Pitfall 5 in
+/// `docs/superpowers/plans/2026-05-24-frame-builder-phase-b2.md`).
+///
+/// **Non-mutating contract:** this overload does NOT call
+/// `dst.set_current_layout` anywhere — the `dst: &T` shared
+/// reference makes that mechanical. Storage layout commit under
+/// B.2 deferred recording happens via `commit_close_success`
+/// (engine.rs) reading the frame overlay back into
+/// `Drawable::storage.current_layout` on a successful submit.
+pub fn record_render_composite_open_with_old_layout<T: CompositeTarget + ?Sized>(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    dst: &T,
+    pipeline: vk::Pipeline,
+    old_layout: vk::ImageLayout,
+) -> Result<(), vk::Result> {
     let extent = dst.extent();
     let device = &vk.device;
-    let old_layout = dst.current_layout();
     let dst_image = dst.vk_image();
     let dst_view = dst.vk_image_view();
 

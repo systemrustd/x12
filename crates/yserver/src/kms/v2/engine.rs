@@ -6883,7 +6883,18 @@ impl RenderEngine {
             .frame_generation;
         let src_for_descriptor = src_alias_view.unwrap_or(src_view);
         let mask_for_descriptor = mask_view;
-        let dst_for_descriptor = dst_readback_view.unwrap_or(dst_view);
+        // Pitfall (Task 12 audit): when `!needs_dst_readback`, binding 2
+        // (`dst_tex`) is bound but never sampled (the Disjoint/Conjoint
+        // shader path is the only consumer). Match legacy's
+        // `dst_readback_view.unwrap_or(white_mask_view)` shape here —
+        // `white_mask_view` is engine-owned, sized 1×1, and always in
+        // `SHADER_READ_ONLY_OPTIMAL` (transitioned once at backend
+        // init), so it satisfies the descriptor write's declared image
+        // layout. Earlier drafts used `dst_view` which is in
+        // `COLOR_ATTACHMENT_OPTIMAL` between open / close — a latent
+        // VUID-Vkpipeline-image-layout-mismatch waiting for validation
+        // layers to trip on it.
+        let dst_for_descriptor = dst_readback_view.unwrap_or(white_mask_view);
         let descriptor_set = inner
             .render_pipelines
             .as_ref()
@@ -8397,15 +8408,230 @@ fn emit_recorded_op_into_cb(
             );
             Ok(())
         }
-        // B.2 Task 6: variant exists, but op-append (Task 11) and emit
-        // (Task 12) are not wired yet. The sub-gate
-        // `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` is still default-OFF
-        // through the rest of B.2, so this arm is unreachable until
-        // Task 11 starts pushing the variant.
-        Op::RenderComposite(_) => unimplemented!(
-            "RecordedOp::RenderComposite emit lands in B.2 Task 12; \
-             Task 6 only lands the payload + variant"
-        ),
+        Op::RenderComposite(rc) => emit_recorded_render_composite_into_cb(inner, cb, pins, rc),
+    }
+}
+
+/// Phase B.2 Task 12: replay a deferred `RecordedRenderComposite`
+/// into the frame's command buffer. Mirrors `render_composite_legacy`'s
+/// CB-recording shape (lines ~6200-6280) BUT:
+///
+/// - takes the dst's old layout from the **recorded payload** rather
+///   than `Drawable::storage.current_layout` (Pitfall 5 — the latter is
+///   stale during deferred recording across multiple ops in one frame),
+/// - operates against a [`RecordedCompositeTarget`] adapter that holds
+///   the pre-resolved image / view / extent (no `&mut DrawableStore`
+///   read; the descriptor + views were resolved at append-time and
+///   pinned by the frame).
+///
+/// The barrier emission is **identical** to the legacy path: exactly
+/// one `to_color` (open) + one `to_read` (close). No double-barrier,
+/// no manual barrier outside the recorder helpers. See plan §Task 12
+/// Step 4 + Pitfall 5+6.
+fn emit_recorded_render_composite_into_cb(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    _pins: &super::frame_builder::FramePinSet,
+    rc: &super::frame_builder::RecordedRenderComposite,
+) -> Result<(), RenderError> {
+    use crate::kms::vk::{
+        ops::render as vk_render,
+        render_pipeline::{StdPictOp, record_solid_color_clear},
+    };
+
+    // (1) Synthetic 1×1 src/mask clears (`record_solid_color_clear`
+    //     internally transitions the scratch to SHADER_READ_ONLY).
+    //     Per Pitfall 4b, the engine-owned `solid_src_image` /
+    //     `solid_mask_image` are never grown — the same `SolidColorImage`
+    //     handles the descriptor write at op-append captured. The clear
+    //     fires per-op at emit time, rewriting the 1×1 texel for THIS
+    //     op's source colour.
+    if let Some(c) = rc.src_clear_color {
+        let solid = inner.solid_src_image.as_mut().expect(
+            "solid_src_image: ensure_render_assets ran in render_composite_via_frame_builder",
+        );
+        record_solid_color_clear(&inner.vk, cb, solid, c);
+    }
+    if let Some(c) = rc.mask_clear_color {
+        let solid = inner.solid_mask_image.as_mut().expect(
+            "solid_mask_image: ensure_render_assets ran in render_composite_via_frame_builder",
+        );
+        record_solid_color_clear(&inner.vk, cb, solid, c);
+    }
+
+    // (2) Self-alias copy: dst → src_alias_readback scratch. Same as
+    //     legacy `render_composite_legacy` lines ~6223-6230. The copy
+    //     RESTORES dst's old layout after the transfer (per
+    //     `DstReadback::record_copy_from`'s contract), so the subsequent
+    //     `to_color` open barrier sees the same `dst_old_layout` it
+    //     would have seen without the scratch path.
+    //
+    //     Pitfall 4: under B.2 grow semantics, the `src_alias_readback`
+    //     here is the SAME `DstReadback` instance the op-append site
+    //     resolved its view against. Growth-during-frame is handled by
+    //     the via_fb path's "close + grow + adopt + reopen" sequence
+    //     before this emit runs.
+    if rc.src_alias_view.is_some() {
+        let rb = inner.src_alias_readback.as_mut().expect(
+            "src_alias_readback: ensured at op-append in render_composite_via_frame_builder",
+        );
+        rb.record_copy_from(
+            cb,
+            rc.dst_image,
+            rc.dst_old_layout,
+            rc.dst_format,
+            rc.dst_extent,
+        );
+    }
+
+    // (3) Pipeline lookup. The cache `get` takes `&mut self`; the borrow
+    //     is released before the open barrier emission so `&inner.vk`
+    //     can be re-borrowed safely.
+    let std_op = StdPictOp::from_u8(rc.op).expect("op validated at append in via_frame_builder");
+    let pipeline = inner
+        .render_pipelines
+        .as_mut()
+        .expect("render_pipelines: ensured at op-append")
+        .get(
+            std_op,
+            rc.dst_format,
+            rc.dst_has_alpha,
+            rc.mask_component_alpha,
+        )
+        .map_err(|e| {
+            log::warn!("emit_recorded_render_composite: pipeline get failed: {e:?}");
+            RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })?;
+    let pipeline_layout = inner
+        .render_pipelines
+        .as_ref()
+        .expect("render_pipelines: ensured at op-append")
+        .pipeline_layout();
+
+    // (4) Open: emit the dst `to_color` barrier using the pre-resolved
+    //     overlay-driven old layout. Pitfall 5 — `record_render_composite_open`
+    //     reads `dst.current_layout()` which is `storage.current_layout`
+    //     (stale across multi-op frames); the `_with_old_layout` overload
+    //     takes `old_layout` explicitly and does NOT mutate the target.
+    let target = RecordedCompositeTarget {
+        image: rc.dst_image,
+        view: rc.dst_view,
+        extent: rc.dst_extent,
+    };
+    vk_render::record_render_composite_open_with_old_layout(
+        &inner.vk,
+        cb,
+        &target,
+        pipeline,
+        rc.dst_old_layout,
+    )
+    .map_err(RenderError::Vk)?;
+
+    // (5) Per-rect draws. clip_rects=None → single full-extent scissor
+    //     (matches legacy `build_render_clip_scissors`'s None branch).
+    //     The full-extent fallback's `vk::Rect2D` is locally owned so
+    //     its borrow lifetime is the function scope.
+    let full_extent_scissor;
+    let clip_scissors: &[vk::Rect2D] = match rc.clip_rects.as_deref() {
+        Some(cr) if !cr.is_empty() => {
+            // Pre-built scissor list — convert from `Rectangle16` to
+            // `vk::Rect2D` once via the shared helper. Owned for the
+            // call's borrow lifetime.
+            let owned = build_render_clip_scissors(Some(cr), rc.dst_extent);
+            if owned.is_empty() {
+                // All clips fell outside the dst — legacy returns Ok
+                // before recording draws; mirror that by closing without
+                // a draw and letting `record_render_composite_close`
+                // emit the `to_read` transition (the open already moved
+                // dst to COLOR_ATTACHMENT_OPTIMAL, so the close runs
+                // unconditionally).
+                let mut target = target;
+                vk_render::record_render_composite_close(&inner.vk, cb, &mut target);
+                return Ok(());
+            }
+            // Stash the owned Vec on the stack-local and bind the slice.
+            full_extent_scissor = owned;
+            full_extent_scissor.as_slice()
+        }
+        _ => {
+            full_extent_scissor = vec![vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: rc.dst_extent,
+            }];
+            full_extent_scissor.as_slice()
+        }
+    };
+    vk_render::record_render_composite_draws(
+        &inner.vk,
+        cb,
+        pipeline_layout,
+        rc.descriptor_set,
+        rc.dst_extent,
+        &rc.attrs,
+        &rc.rects,
+        clip_scissors,
+    );
+
+    // (6) Close: emit `cmd_end_rendering` + dst `to_read` barrier back to
+    //     `SHADER_READ_ONLY_OPTIMAL`. The recorder calls
+    //     `target.set_current_layout(SHADER_READ_ONLY_OPTIMAL)` —
+    //     intentional no-op on `RecordedCompositeTarget` (Pitfall 4b
+    //     audit); storage layout commit happens via
+    //     `commit_close_success`'s overlay walk on submit success.
+    let mut target = target;
+    vk_render::record_render_composite_close(&inner.vk, cb, &mut target);
+
+    Ok(())
+}
+
+/// Phase B.2 Task 12: no-storage [`CompositeTarget`] adapter used at
+/// emit-time to replay a `RecordedRenderComposite`. Carries the
+/// pre-resolved image / view / extent the op was recorded against; the
+/// payload's `dst_old_layout` is supplied separately via
+/// [`vk_render::record_render_composite_open_with_old_layout`].
+///
+/// Two semantic properties of this adapter:
+///
+/// - `current_layout()` returns `COLOR_ATTACHMENT_OPTIMAL` as a
+///   constant. The open overload uses the explicit `old_layout`
+///   parameter, so the trait read is structurally unused by the open
+///   path. `record_render_composite_close` does NOT read
+///   `current_layout()` either — it hard-codes
+///   `COLOR_ATTACHMENT_OPTIMAL` as the to_read barrier's old layout
+///   (render.rs:~377). Returning the same constant keeps the adapter
+///   honest about the layout the image IS in between open and close.
+/// - `set_current_layout` is a NO-OP. The recorder's close transition
+///   calls `dst.set_current_layout(SHADER_READ_ONLY_OPTIMAL)` (codex R5
+///   audit catch); under B.2's deferred-recording rule storage layout
+///   is NEVER mutated during recording — `commit_close_success` walks
+///   the frame's `FrameLayoutTable` overlay and writes the post-op
+///   layout back to `Drawable::storage.current_layout` only on submit
+///   success. Mutating the adapter would be a write-to-the-void.
+struct RecordedCompositeTarget {
+    image: vk::Image,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+}
+
+impl CompositeTarget for RecordedCompositeTarget {
+    fn vk_image(&self) -> vk::Image {
+        self.image
+    }
+    fn vk_image_view(&self) -> vk::ImageView {
+        self.view
+    }
+    fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+    fn current_layout(&self) -> vk::ImageLayout {
+        // See struct doc — `_with_old_layout` doesn't read this; the
+        // close path doesn't read it either. Return the layout the
+        // image IS in between open and close (a constant) as
+        // defence-in-depth against a future refactor that adds a read.
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    }
+    fn set_current_layout(&mut self, _layout: vk::ImageLayout) {
+        // Intentional no-op — see struct doc. Codex R5 audit point.
     }
 }
 

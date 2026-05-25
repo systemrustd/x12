@@ -2141,6 +2141,22 @@ impl KmsBackendV2 {
             .map(|_| ())
     }
 
+    /// Phase B.2 Task 12: read the global `vkQueueSubmit2` counter
+    /// from `vk::call_stats`. Used as a coarse process-level submit
+    /// counter when telemetry-side accounting would miss out-of-band
+    /// submits (e.g. `run_one_shot_op` for asset init, which bypasses
+    /// the submit-group entirely).
+    ///
+    /// The counter is process-global and monotonic across all tests;
+    /// callers MUST capture the value at the start of their test
+    /// scope and assert on the delta. For parallel-safe lifecycle
+    /// counts use `telemetry_submit_group_flushes_for_tests` instead —
+    /// it's per-backend and only ticks on `flush_submit_group`
+    /// outcomes (which is the frame-builder collapse target).
+    pub fn platform_queue_submit2_count_for_tests(&self) -> u64 {
+        crate::kms::vk::call_stats::queue_submit2_count()
+    }
+
     /// Phase A T12: drain pending flush outcomes into telemetry, then
     /// return `telemetry.lifetime.submit_group_flushes`. Using the
     /// per-backend lifetime counter instead of the global
