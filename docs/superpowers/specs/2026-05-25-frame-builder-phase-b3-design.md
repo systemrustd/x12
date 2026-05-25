@@ -441,7 +441,7 @@ The recording shape diverges within the family (per N6):
 
 Emit replays the two-stage CB: (a) trap edge raster into mask scratch via the trap pipeline; (b) standard composite open+draws+close sampling the mask scratch view (per N5).
 
-Includes the "two mask ops in one frame + mask scratch grow" integration test (per N5 review note).
+Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequence `(small, large, large)` spanning frames F1 + F2 — the grow inherently triggers `close-before-grow` between op 1 and op 2, so F1 closes before the grow and F2 reopens against M1).
 
 ### Phase 5 — GLYPH family (4 tasks: image_text only)
 
