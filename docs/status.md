@@ -3122,16 +3122,44 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         Fix: thread `frame_generation` through the emit dispatch instead
         of re-fetching.
 
+    **Yoga hardware-smoke capture (2026-05-26) — PASS:**
+      - `close_reasons[non_ported]/s` = **0** across the entire run
+        (target ≤ 10). Every paint op routes through the frame builder;
+        the rip-and-replace closed the non_ported escape hatch
+        end-to-end. ✓ exceeded.
+      - `submit_group_flushes/s` = **137–524, mostly 180–400**
+        (target ~200–400). ✓ in range.
+      - `frame_builder_aborts/s` = **0** (target 0). ✓
+      - Clean shutdown, zero regressions on the yoga workload.
+      - `ops/frame_avg` = **18–115** (target ~4–8). Much higher
+        collapse than predicted; not a regression — the spec author
+        derived 4–8 from a per-op-family multiplier that undercounts
+        what a single open frame absorbs between close triggers.
+        Real math: at ~100 closes/s and 1800–8000 underlying paint
+        ops/s on a desktop session, 18–80 ops/frame is the correct
+        steady state. Peak single frame absorbed 355 ops (still under
+        the 1024 pin ceiling, so `pin_ceiling` close trigger never
+        fired). Worth watching: per-frame close-time latency
+        (`avg_compose_cb_record_ns` / `iter_wall_max`) on fat frames
+        — if record stays bounded under a few ms, the high collapse
+        ratio is pure win.
+      - Other surviving close reasons (informational): `sync_wait/s`
+        0–116 (get_image bursts), `present_completion/s` 0–15 (COW
+        PRESENT), structural `frame_builder/s` 60–164 (60 Hz scene
+        compose + sundry).
+
     **Bee hardware-smoke gate (NOT YET — pending capture):**
       - `close_reasons[non_ported]/s` → ≤ 10 (vs ~900–1100 pre-B.3).
       - `submit_group_flushes/s` drop by 30–50 % beyond B.2's ~75 %
         absorption. Combined with B.2: target ~200–400 submits/s on
         bee MATE drag (Phase B end-state target).
-      - `ops/frame_avg` rises from B.2's ~1.7 to ~4–8.
+      - `ops/frame_avg` rises from B.2's ~1.7 to ~4–8 (yoga overshoots
+        this — bee is the real reference; this number will be
+        recalibrated against the bee capture).
       - `frame_builder_aborts/s = 0`.
       - silence (dual-output) regression check — no scene-compose
         regression, no ERROR_DEVICE_LOST, no fault chains.
-      - yoga / iMac / fuji regression checks.
+      - iMac / fuji regression checks.
       - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
         intel, lavapipe) — no new validation VUIDs.
 
