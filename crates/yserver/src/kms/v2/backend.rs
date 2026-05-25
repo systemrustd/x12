@@ -1723,6 +1723,21 @@ impl KmsBackendV2 {
         self.engine.set_frame_builder_enabled(enabled);
     }
 
+    /// Phase B.2 Task 5: flip the process-level
+    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate at runtime.
+    /// Independent of the B.1 main gate above. Production reads the
+    /// env var on first access; tests flip via this wrapper.
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Phase B.2 Task 5: wrapper lands ahead of its first \
+                  test caller; Task 6+ (render-composite route + \
+                  integration tests) consume it."
+    )]
+    pub(crate) fn set_frame_builder_render_composite_enabled_for_tests(&self, on: bool) {
+        super::engine::set_frame_builder_render_composite_enabled_for_tests(on);
+    }
+
     /// Phase B.1 Task 15: is the frame builder currently open?
     pub fn frame_builder_is_open_for_tests(&self) -> bool {
         self.engine.frame_builder_is_open()

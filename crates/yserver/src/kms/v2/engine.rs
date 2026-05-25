@@ -904,6 +904,48 @@ impl RenderEngineInner {
     }
 }
 
+/// Phase B.2 Task 5: process-level sub-gate for the
+/// `render_composite_via_frame_builder` path. Independent of B.1's
+/// main `YSERVER_FRAME_BUILDER` knob (which is read at engine
+/// construction into `RenderEngineInner::frame_builder_enabled`) so
+/// the gate-flip at Task 20 is a single isolated commit.
+///
+/// Production reads `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` on first
+/// access; tests flip via [`set_frame_builder_render_composite_enabled_for_tests`].
+/// Default OFF during the B.2 implementation window.
+static FRAME_BUILDER_RENDER_COMPOSITE: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+    std::sync::OnceLock::new();
+
+/// Phase B.2 Task 5: runtime check for the render-composite sub-gate.
+/// Reads `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` on first call and
+/// caches the result in [`FRAME_BUILDER_RENDER_COMPOSITE`].
+fn frame_builder_render_composite_enabled() -> bool {
+    let cell = FRAME_BUILDER_RENDER_COMPOSITE.get_or_init(|| {
+        let on = match std::env::var("YSERVER_FRAME_BUILDER_RENDER_COMPOSITE")
+            .ok()
+            .as_deref()
+        {
+            Some("on" | "1" | "true" | "yes") => true,
+            Some("off" | "0" | "false" | "no") => false,
+            // Default OFF during the B.2 implementation window. Task 20
+            // flips this default to ON.
+            _ => false,
+        };
+        std::sync::atomic::AtomicBool::new(on)
+    });
+    cell.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Phase B.2 Task 5: test override for the render-composite sub-gate.
+/// Mirrors `RenderEngine::set_frame_builder_enabled` but at the
+/// process-level cell (the sub-gate is not per-engine).
+#[cfg(test)]
+pub(crate) fn set_frame_builder_render_composite_enabled_for_tests(on: bool) {
+    let cell =
+        FRAME_BUILDER_RENDER_COMPOSITE.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+    cell.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl RenderEngine {
     /// Production constructor. Borrows the platform's `VkContext`
     /// (cloned `Arc`); CB allocation goes through the platform's
@@ -8066,6 +8108,36 @@ pub(crate) fn decode_x11_pixel_server_alpha(pixel: u32, depth: u8) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase B.2 Task 5: the process-level
+    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate is OFF by
+    /// default during the B.2 implementation window. Task 20 flips
+    /// the default to ON.
+    ///
+    /// Process-state caveat: `FRAME_BUILDER_RENDER_COMPOSITE` is a
+    /// `OnceLock<AtomicBool>` — once another test calls
+    /// `set_frame_builder_render_composite_enabled_for_tests(true)`,
+    /// the value persists for the rest of the process. To keep this
+    /// test deterministic regardless of execution order, we don't
+    /// rely on "first call wins"; instead, we run when no `on` env
+    /// override is set AND when no other test has yet flipped the
+    /// cell — which is the contract at Task 5: no caller exists yet.
+    #[test]
+    fn frame_builder_render_composite_defaults_off() {
+        // Skip if the developer set the env var to opt into ON for a
+        // local run — the test is asserting the *default*, not the
+        // current process state under overrides.
+        if matches!(
+            std::env::var("YSERVER_FRAME_BUILDER_RENDER_COMPOSITE")
+                .ok()
+                .as_deref(),
+            Some("on" | "1" | "true" | "yes"),
+        ) {
+            return;
+        }
+        let on = super::frame_builder_render_composite_enabled();
+        assert!(!on, "default OFF expected");
+    }
 
     #[test]
     fn close_open_frame_with_no_open_frame_returns_already_closed() {
