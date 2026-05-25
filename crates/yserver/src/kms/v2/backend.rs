@@ -1542,36 +1542,6 @@ impl KmsBackendV2 {
 
     /// Stage 5 Task 3 POC: drain the engine's cow-batch flush
     /// records (since the last drain), bump telemetry counters,
-    /// emit one submit-trace event per flush. Called once per
-    /// `maybe_composite` tick after the explicit flush + after
-    /// `scene.tick` (the latter may have triggered an
-    /// engine-internal flush via its compose CB build).
-    fn drain_cow_telemetry(&mut self) {
-        let records = self.engine.drain_cow_flush_records();
-        if records.is_empty() {
-            return;
-        }
-        let target_id = self.cow_id.map_or(0_u64, super::store::DrawableId::as_u64);
-        for coalesced in records {
-            self.telemetry.record_cow_batch_flushed(coalesced);
-            // One trace event per flush; batch_size = coalesced
-            // count so the analysis can answer "how big are
-            // batches?".
-            self.telemetry.record_submit_event(SubmitEvent {
-                frame_id: 0,
-                kind: SubmitKind::CopyArea,
-                target_kind: TargetKind::Cow,
-                target_id,
-                batch_size: coalesced,
-                op: SubmitOp::None,
-                src_class: SrcClass::None,
-                mask_class: SrcClass::None,
-                pipeline_id: None,
-                flags: SubmitFlags::NONE,
-            });
-        }
-    }
-
     /// Stage 5 Task 3 (render-composite generalization): drain
     /// the engine's render-batch flush records, bump telemetry
     /// counters, emit one submit-trace event per flush.
@@ -2190,16 +2160,10 @@ impl KmsBackendV2 {
     /// without going through `on_page_flip_ready` (which calls
     /// `drain_page_flip_events` and would error on the test fixture's
     /// `/dev/null` DRM device). Replicates the full production
-    /// `on_page_flip_ready` close-then-flush sequence: flush_cow_batch
-    /// + flush_render_batch before flush_submit_group(PageflipRetire),
-    /// so regression tests exercise the real fix path.
+    /// `on_page_flip_ready` close-then-flush sequence: flush_render_batch
+    /// before flush_submit_group(PageflipRetire), so regression tests
+    /// exercise the real fix path.
     pub fn simulate_page_flip_complete_for_tests(&mut self) -> Result<(), ash::vk::Result> {
-        if let Err(e) = self
-            .engine
-            .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("simulate_page_flip_complete_for_tests: flush_cow_batch failed: {e:?}");
-        }
         if let Err(e) = self
             .engine
             .flush_render_batch(&mut self.store, &mut self.platform)
@@ -2304,6 +2268,89 @@ impl KmsBackendV2 {
                 dst_pos,
             )
             .map_err(|e| std::io::Error::other(format!("engine_copy_area_for_tests: {e:?}")))
+    }
+
+    /// B.3 Task 4 — test-only: call `engine.cow_copy_area` against the
+    /// registered `cow_id`, using the given src xid, src_rect, and
+    /// dst_pos. Returns Err if no cow_id is registered or if the engine
+    /// call fails.
+    pub fn engine_cow_copy_area_for_tests(
+        &mut self,
+        src_xid: u32,
+        src_rect: ash::vk::Rect2D,
+        dst_pos: ash::vk::Offset2D,
+    ) -> Result<(), std::io::Error> {
+        let cow_id = self.cow_id.ok_or_else(|| {
+            std::io::Error::other(
+                "engine_cow_copy_area_for_tests: no cow_id registered; \
+                 call get_overlay_window first",
+            )
+        })?;
+        let src_id = self.store.lookup(src_xid).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "engine_cow_copy_area_for_tests: src xid 0x{src_xid:x} not in store"
+            ))
+        })?;
+        self.engine
+            .cow_copy_area(
+                &mut self.store,
+                &mut self.platform,
+                cow_id,
+                src_id,
+                src_rect,
+                dst_pos,
+            )
+            .map_err(|e| std::io::Error::other(format!("engine_cow_copy_area_for_tests: {e:?}")))
+    }
+
+    /// B.3 Task 4 — test-only: attach a synthetic PRESENT completion
+    /// to the open frame's cow slot (via `engine.attach_cow_present_completion`)
+    /// without a real X PRESENT client. Returns `true` if the attach
+    /// succeeded (the cow_id is written in the open frame's ops list),
+    /// `false` if attach returned Err (no open frame, or frame doesn't
+    /// write to cow_id).
+    ///
+    /// The synthetic entry carries `wake_pin: PinnedWake::None` and an
+    /// event with `serial = synthetic_serial`; the `CompletedPresentEvent`
+    /// fields other than serial are zeroed/defaulted.
+    #[allow(
+        dead_code,
+        reason = "used by v2_frame_builder_cow_copy_area_delivers_present_completion"
+    )]
+    pub fn attach_synthetic_present_completion_to_cow_for_tests(
+        &mut self,
+        synthetic_serial: u32,
+    ) -> bool {
+        use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+        use yserver_protocol::x11::ClientId;
+
+        let cow_id = match self.cow_id {
+            Some(id) => id,
+            None => return false,
+        };
+        let entry = PendingPresentEntry {
+            wake_pin: PinnedWake::None,
+            event: CompletedPresentEvent {
+                client_id: ClientId(0),
+                serial: synthetic_serial,
+                host_xid: 0,
+                dst_host_xid: 0,
+                options: 0,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+        };
+        self.engine
+            .attach_cow_present_completion(cow_id, entry)
+            .is_ok()
+    }
+
+    /// B.3 Task 4 — test-only: call `engine.drain_all` (waits on all
+    /// in-flight fence tickets so PRESENT completions become Ready).
+    /// Used after force-closing a frame to age out the fence ticket
+    /// before asserting on `drain_completed_present_events_for_tests`.
+    pub fn engine_drain_all_for_tests(&mut self) {
+        self.engine.drain_all(&mut self.platform);
     }
 
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
@@ -2581,16 +2628,10 @@ impl KmsBackendV2 {
     /// Propagates the first per-output `drm::modeset::disable_output`
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
-        // Stage 5 Task 6.1: explicitly flush open cow/render batches
+        // Stage 5 Task 6.1: explicitly flush open render batches
         // before drain_all walks the submitted queue. drain_all only
         // waits on already-submitted CBs; an open pending batch
         // wouldn't be there yet.
-        if let Err(e) = self
-            .engine
-            .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 disable_output: flush_cow_batch failed: {e:?}");
-        }
         self.drain_engine_present_batches();
         if let Err(e) = self
             .engine
@@ -5046,19 +5087,13 @@ impl Backend for KmsBackendV2 {
         self.store.poll_pending_retire(&mut self.platform);
         self.sync_descriptor_pool_telemetry();
         // Phase A T7: pageflip retire is a frame boundary — close
-        // any open cow/render batch FIRST so their CBs land in the
-        // group under the same ticket that the subsequent flush will
+        // any open render batch FIRST so its CBs land in the group
+        // under the same ticket that the subsequent flush will
         // consume. Then flush the SubmitGroup so an idle next tick
         // (no scene_structure_dirty) does not leave paint CBs
         // buffered until the next compose. Drive through the engine
         // wrapper so parked pending_group_ops commit to `submitted`
         // atomically.
-        if let Err(e) = self
-            .engine
-            .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 on_page_flip_ready: flush_cow_batch failed: {e:?}");
-        }
         if let Err(e) = self
             .engine
             .flush_render_batch(&mut self.store, &mut self.platform)
@@ -5123,21 +5158,9 @@ impl Backend for KmsBackendV2 {
         let can_submit_scene =
             self.scene.scene_structure_dirty && self.scene.has_output_ready_for_submit();
         if can_submit_scene {
-            // Stage 5 Task 3 POC: flush pending COW copy_area batch
-            // only when a scene submit can actually consume it. If a
-            // pageflip is still pending, keep the batch open so drag
-            // workloads coalesce until the vblank-limited scanout path
-            // is ready for another frame.
-            if let Err(e) = self
-                .engine
-                .flush_cow_batch(&mut self.store, &mut self.platform)
-            {
-                log::warn!("v2 maybe_composite: flush_cow_batch failed: {e:?}");
-            }
+            // Stage 5 Task 3 (render-composite generalization): flush
+            // the render batch — scene.tick samples dst.
             self.drain_engine_present_batches();
-            // Stage 5 Task 3 (render-composite generalization): same
-            // load-bearing flush for the render batch — scene.tick
-            // samples dst.
             if let Err(e) = self
                 .engine
                 .flush_render_batch(&mut self.store, &mut self.platform)
@@ -5214,12 +5237,6 @@ impl Backend for KmsBackendV2 {
                 }
             }
         };
-        // Stage 5 Task 3 POC: drain cow-batch flush records and
-        // emit telemetry + trace events for each flush since the
-        // last drain (covers both the explicit flush above and
-        // any engine-internal flushes triggered by paint paths
-        // that ran since the previous tick).
-        self.drain_cow_telemetry();
         self.drain_render_telemetry();
         // Phase A Task 3.5: drain SubmitGroup flush outcomes and
         // route each to the matching telemetry counter.
@@ -6187,16 +6204,6 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            // Stage 5 Task 3 POC: flush any pending COW batch
-            // BEFORE clearing cow_id and releasing storage —
-            // otherwise the flush would record a `touch_render_fence`
-            // against a drawable that's about to disappear.
-            if let Err(e) = self
-                .engine
-                .flush_cow_batch(&mut self.store, &mut self.platform)
-            {
-                log::warn!("v2 release_overlay_window: flush_cow_batch failed: {e:?}");
-            }
             self.drain_engine_present_batches();
             if let Err(e) = self
                 .engine
@@ -6204,7 +6211,6 @@ impl Backend for KmsBackendV2 {
             {
                 log::warn!("v2 release_overlay_window: flush_render_batch failed: {e:?}");
             }
-            self.drain_cow_telemetry();
             self.drain_render_telemetry();
             // Drop the scene entry FIRST so subsequent `build_scene`
             // calls during a still-in-flight retire window can't
@@ -7014,11 +7020,9 @@ impl Backend for KmsBackendV2 {
             return Ok(());
         }
         // Stage 5 Task 3 POC: route copy_area to COW through the
-        // coalescing path. Marco's compositor pump is the hot
+        // frame-builder path. Marco's compositor pump is the hot
         // workload (silence trace: 47k of 62k copy_areas target
-        // COW). Telemetry + trace for cow-routed copies happens
-        // at flush time via `drain_cow_telemetry`; per-call
-        // bumps are suppressed here.
+        // COW). Telemetry for cow-routed copies is deferred.
         let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
 
         let mut all_ok = true;
@@ -9974,18 +9978,12 @@ impl Backend for KmsBackendV2 {
             }
         }
 
-        // Phase A: close any open cow/render batch FIRST so their CBs
-        // land in the group under the same ticket the flush will consume.
+        // Phase A: close any open render batch FIRST so its CBs land
+        // in the group under the same ticket the flush will consume.
         // Then ensure all prior paint is on the queue BEFORE the
         // signal-only submit. Engine-driven so any parked pending_group_ops
         // graduate to `submitted` atomically with the submit.
         // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
-        if let Err(e) = self
-            .engine
-            .flush_cow_batch(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 enqueue_present_completion: flush_cow_batch failed: {e:?}");
-        }
         if let Err(e) = self
             .engine
             .flush_render_batch(&mut self.store, &mut self.platform)

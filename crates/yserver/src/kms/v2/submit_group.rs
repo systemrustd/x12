@@ -36,9 +36,9 @@ pub(crate) enum FlushReason {
 #[derive(Debug)]
 pub(crate) struct GroupEntry {
     pub(crate) cb: vk::CommandBuffer,
-    /// Optional COW present-completion semaphore. Today's
-    /// `flush_cow_batch` attaches this; the group simply appends it
-    /// to the eventual submit's `signal_semaphore_infos`.
+    /// Optional COW present-completion semaphore. Attached by
+    /// `close_open_frame` (N10 path); the group appends it to the
+    /// eventual submit's `signal_semaphore_infos`.
     pub(crate) signal: Option<vk::Semaphore>,
 }
 

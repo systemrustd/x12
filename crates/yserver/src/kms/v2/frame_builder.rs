@@ -338,10 +338,9 @@ pub(crate) struct OpenFrame {
     /// `pending_present_batches` (alongside the acquired
     /// `PresentCompletionSignal`'s semaphore queued on the submit).
     /// Force-enqueued as a degraded `PendingPresentBatch { wait: Ready,
-    /// ticket: None, signal: None, events }` on close-failure (mirror
-    /// engine.rs:3556-3567's flush_cow_batch failure path — never silent
-    /// drop, the X PRESENT protocol observes the events regardless of
-    /// submit success).
+    /// ticket: None, signal: None, events }` on close-failure — never
+    /// silent drop; the X PRESENT protocol observes the events
+    /// regardless of submit success.
     #[allow(
         dead_code,
         reason = "Phase B.3 Task 4 wires up attach_cow_present_completion + close-path \

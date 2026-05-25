@@ -3437,8 +3437,8 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     b.copy_area(None, src_xid, cow_xid, 0, 0, 0, 0, 8, 8)
         .expect("cow copy_area");
 
-    // Step 2: fill_rectangle on non-cow dst → flush_cow_batch fires
-    // (appends cow CB to group), then the fill CB appends after it.
+    // Step 2: fill_rectangle on non-cow dst → flush_render_batch fires
+    // (appends any pending CB to group), then the fill CB appends after it.
     b.fill_rectangle(None, dst_xid, 0xFF_00_00_FF, 0, 0, 8, 8)
         .expect("fill_rectangle");
 
@@ -3499,10 +3499,9 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     let _ = font_set; // suppress unused-variable warning
 
     // Step 5: get_image — sync barrier.
-    // Internally: flush_cow_batch (no-op), flush_render_batch (closes
-    // the render batch CB → appends to group), then two
-    // flush_submit_group calls:
-    //   [A] SyncBoundary — drains all buffered CBs (cow+fill+composite+glyph*)
+    // Internally: flush_render_batch (closes the render batch CB →
+    // appends to group), then two flush_submit_group calls:
+    //   [A] SyncBoundary — drains all buffered CBs (fill+composite+glyph*)
     //   [B] SyncBoundary — submits the readback CB itself
     let _ = b
         .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
@@ -4509,5 +4508,156 @@ fn v2_frame_builder_copy_area_collapses_two_in_one_frame() {
     assert!(
         !be.frame_builder_is_open_for_tests(),
         "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+}
+
+// ── Task 4: cow_copy_area frame-builder integration tests ─────────────
+
+/// B.3 Task 4 acceptance gate (collapse): two consecutive `cow_copy_area`
+/// calls in the same open frame produce exactly ONE `vkQueueSubmit2`
+/// (one `flush_submit_group` call). Pre-B.3 each call submitted its own
+/// `PendingCowBatch` CB independently.
+///
+/// The test creates a COW drawable via `get_overlay_window`, issues two
+/// `cow_copy_area` calls, confirms the frame is still open, force-closes
+/// via the timeout helper, and asserts submit_group_flushes delta == 1.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_cow_copy_area_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    // Allocate the COW drawable (get_overlay_window registers it at the
+    // well-known COMPOSITE_OVERLAY_WINDOW xid; backend wires cow_id to it).
+    be.get_overlay_window(None).expect("get_overlay_window");
+
+    let src = be
+        .allocate_test_pixmap_bgra(256, 256)
+        .expect("allocate src pixmap");
+
+    // Drain any setup CBs (zero-fills from pixmap allocation).
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+
+    let src_rect = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 64,
+            height: 64,
+        },
+    };
+
+    // Two cow_copy_area calls — both must append into the same open frame.
+    be.engine_cow_copy_area_for_tests(src, src_rect, ash::vk::Offset2D { x: 0, y: 0 })
+        .expect("first cow_copy_area");
+    be.engine_cow_copy_area_for_tests(src, src_rect, ash::vk::Offset2D { x: 64, y: 0 })
+        .expect("second cow_copy_area");
+
+    // Frame should still be open — cow_copy_area extends, doesn't close.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame should survive two cow_copy_area calls"
+    );
+
+    // Force-close via the Timeout helper (one flush = one vkQueueSubmit2).
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("engine_close_open_frame_for_timeout_for_tests");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two cow_copy_area calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+
+    // Frame must be closed.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+}
+
+/// B.3 Task 4 acceptance gate (PRESENT-completion N10): a
+/// `cow_copy_area` followed by `attach_cow_present_completion` inside
+/// an open frame correctly delivers a `CompletedPresentEvent` when
+/// the frame retires (the event is NOT dropped on flush-success).
+///
+/// Uses `attach_synthetic_present_completion_to_cow_for_tests` to
+/// inject a fake completion entry without a real X PRESENT client.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_cow_copy_area_delivers_present_completion() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    // Allocate the COW drawable.
+    be.get_overlay_window(None).expect("get_overlay_window");
+
+    let src = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate src pixmap");
+
+    // Drain setup CBs.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    let src_rect = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+    };
+
+    // cow_copy_area opens the frame and writes to cow_id.
+    be.engine_cow_copy_area_for_tests(src, src_rect, ash::vk::Offset2D::default())
+        .expect("cow_copy_area");
+
+    // Frame must be open (cow_copy_area extends it, doesn't close).
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must be open after cow_copy_area"
+    );
+
+    // Attach a synthetic PRESENT completion (N10 predicate fires because
+    // cow_id is written in the open frame).
+    let synthetic_serial = 0xB3_CAFE_u32;
+    let attached = be.attach_synthetic_present_completion_to_cow_for_tests(synthetic_serial);
+    assert!(
+        attached,
+        "attach_synthetic_present_completion_to_cow_for_tests must succeed \
+         (cow_id is written in the open frame)"
+    );
+
+    // Force-close the frame. The close-path drains pending_present_completions
+    // into a PendingPresentBatch with the exported sync_file fd.
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    // Drain any present batches that became ready (the frame ticket
+    // retires immediately in the lavapipe environment via drain_all).
+    be.engine_drain_all_for_tests();
+
+    // The synthetic completion event must appear in the drained set.
+    let events = be.drain_completed_present_events_for_tests();
+    assert!(
+        events.iter().any(|e| e.serial == synthetic_serial),
+        "synthetic PRESENT completion (serial=0x{synthetic_serial:x}) must be delivered \
+         after frame retires; got {} events: {events:?}",
+        events.len(),
     );
 }

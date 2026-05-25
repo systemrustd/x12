@@ -117,29 +117,6 @@ impl From<vk::Result> for RenderError {
 ///   `vkCmdCopyImage`, accumulates dst damage.
 /// - Subsequent appends record only `vkCmdCopyImage` (and a new
 ///   src transition if the src hasn't appeared in this batch
-///   before).
-/// - `flush_cow_batch` records exit transitions (all `srcs`
-///   → `SHADER_READ_ONLY_OPTIMAL`, `dst` → same), ends the CB,
-///   submits via `platform.submit_paint_cb`, pushes one
-///   `SubmittedOp`, clones the ticket onto every touched drawable
-///   via `store.touch_render_fence`, applies accumulated damage.
-///
-/// Invariant: every same-queue submit recorded BEFORE the next
-/// scene compose pass observes the dst is correct iff the flush
-/// runs first. Backend ensures this by calling `flush_cow_batch`
-/// at the top of every other engine op (via the wrapping
-/// methods) and at the top of `maybe_composite` before
-/// `scene.tick`.
-struct PendingCowBatch {
-    cb: vk::CommandBuffer,
-    ticket: FenceTicket,
-    dst: DrawableId,
-    srcs_in_batch: HashSet<DrawableId>,
-    dst_damage: Vec<vk::Rect2D>,
-    coalesced_count: u32,
-    present_completions: Vec<PendingPresentEntry>,
-}
-
 /// Stage 5 Task 3 (render-composite generalization): conservative
 /// aggregation key. Two consecutive `render_composite` calls
 /// coalesce into one CB iff every field of their keys is equal.
@@ -169,9 +146,8 @@ struct RenderBatchKey {
     mask_component_alpha: bool,
 }
 
-/// Pending RENDER composite batch. Mirrors `PendingCowBatch`
-/// shape: long-lived CB across N appends, exit transitions +
-/// submit at flush. Differs in that `cmd_begin_rendering` is
+/// Pending RENDER composite batch: long-lived CB across N appends,
+/// exit transitions + submit at flush. `cmd_begin_rendering` is
 /// active across the whole batch (one pair per flush) and the
 /// pipeline + descriptor set bound once at batch start serve
 /// every append.
@@ -626,26 +602,12 @@ struct RenderEngineInner {
     /// and stamped onto the resulting `SubmittedOp` so the retirement
     /// loop can call `release_up_to(op.generation)`.
     acquire_generation: u64,
-    /// Stage 5 Task 3 POC: pending COW `copy_area` batch. See
-    /// [`PendingCowBatch`] above for the lifecycle. `None` between
-    /// flushes; `Some` once `cow_copy_area` has appended at least
-    /// one copy.
-    pending_cow_batch: Option<PendingCowBatch>,
-    /// Stage 5 Task 3 POC: flush-records queue. Every successful
-    /// `flush_cow_batch` pushes the coalesced count of the
-    /// just-submitted batch. Backend drains this once per
-    /// `maybe_composite` tick via [`Self::drain_cow_flush_records`]
-    /// to bump telemetry counters + emit submit-trace events for
-    /// both backend-initiated flushes and engine-internal flushes
-    /// (triggered when a non-cow op interleaves a cow batch).
-    cow_flush_records: Vec<u32>,
     /// Stage 5 Task 3 (render-composite generalization): pending
     /// render batch. See [`PendingRenderBatch`] above.
     pending_render_batch: Option<PendingRenderBatch>,
-    /// Stage 5 Task 3: flush-records queue parallel to
-    /// `cow_flush_records`. Each render-batch flush pushes one
-    /// record carrying op + has_mask + coalesced_count so the
-    /// backend drain can emit a parametrised submit trace event.
+    /// Stage 5 Task 3: flush-records queue. Each render-batch flush
+    /// pushes one record carrying op + has_mask + coalesced_count so
+    /// the backend drain can emit a parametrised submit trace event.
     render_flush_records: Vec<RenderFlushRecord>,
     /// Stage 5 Task 6.1: submitted COW PRESENT-completion batches
     /// whose sync_file fds still need to be registered with the
@@ -997,8 +959,6 @@ impl RenderEngine {
                 logic_fill_caches: HashMap::new(),
                 descriptor_pool_ring,
                 acquire_generation: 0,
-                pending_cow_batch: None,
-                cow_flush_records: Vec::new(),
                 pending_render_batch: None,
                 render_flush_records: Vec::new(),
                 pending_present_batches: Vec::new(),
@@ -1120,27 +1080,21 @@ impl RenderEngine {
     /// ticket. Called at shutdown to ensure all CB / staging
     /// resources are reclaimed before pool destruction.
     ///
-    /// PRECONDITION: callers must close any open cow/render batches
-    /// (via `flush_cow_batch` + `flush_render_batch`) BEFORE calling
-    /// `drain_all`, because those methods need `&mut DrawableStore`
-    /// which is not available here. The production call site
-    /// (`disable_output`) already satisfies this. Any open batch
-    /// that reaches here is dropped with a warning to avoid a
-    /// non-empty/no-ticket panic on `flush_submit_group(Shutdown)`.
+    /// PRECONDITION: callers must close any open render batches
+    /// (via `flush_render_batch`) BEFORE calling `drain_all`,
+    /// because that method needs `&mut DrawableStore` which is not
+    /// available here. The production call site (`disable_output`)
+    /// already satisfies this. Any open batch that reaches here is
+    /// dropped with a warning to avoid a non-empty/no-ticket panic
+    /// on `flush_submit_group(Shutdown)`.
     pub(crate) fn drain_all(&mut self, platform: &mut PlatformBackend) {
-        // Drop any open cow/render batch that reached us without being
+        // Drop any open render batch that reached us without being
         // flushed. This should never happen when called from the
         // production code path (disable_output closes batches first),
         // but guards against shutdown-time panics if the invariant is
         // violated (e.g. a future call site that forgets to close
         // batches first).
         if let Some(inner) = self.inner.as_mut() {
-            if inner.pending_cow_batch.take().is_some() {
-                log::warn!(
-                    "v2 drain_all: open cow_batch dropped without flush \
-                     (caller must close batches before drain_all)"
-                );
-            }
             if inner.pending_render_batch.take().is_some() {
                 log::warn!(
                     "v2 drain_all: open render_batch dropped without flush \
@@ -1413,10 +1367,66 @@ impl RenderEngine {
             return Err(e);
         }
 
+        // Phase B.3 (N10) — branch (a) PRE-SUBMIT: acquire PresentCompletionSignal
+        // BEFORE end_and_submit_op_with_signal so the semaphore is queued on the
+        // submit's signal list. Acquiring after submit means the semaphore is
+        // never queued; the exported sync_file fd would never fire (Pitfall 8).
+        let completion_signal: Option<PresentCompletionSignal> = {
+            let pending_count = open_frame.pending_present_completions.len();
+            if pending_count == 0 {
+                None
+            } else {
+                match platform.acquire_present_completion_signal() {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // Signal-acquire failure: route through the same
+                        // append-failure rollback (free CB + rollback + mark failed).
+                        {
+                            let inner = self.inner.as_mut().expect("inner");
+                            let device = &inner.vk.device;
+                            if let Some(pool) = platform.ops_command_pool_handle() {
+                                unsafe { device.free_command_buffers(pool, &[cb]) };
+                            }
+                        }
+                        rollback_pre_submit(store, &mut open_frame);
+                        platform.renderer_failed = true;
+                        let inner_post = self.inner.as_mut().expect("inner");
+                        rollback_atlas(
+                            inner_post,
+                            open_frame.layouts.atlas,
+                            open_frame.atlas_prev_ticket_snapshot.clone(),
+                        );
+                        for r in open_frame.pins.retired_resources.drain(..) {
+                            r.release(&inner_post.vk);
+                        }
+                        if inner_post.pending_frame_close_events.len() < 1024 {
+                            inner_post.pending_frame_close_events.push(
+                                super::frame_builder::FrameCloseEvent {
+                                    reason,
+                                    ops_in_frame: open_frame.ops.len(),
+                                    glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
+                                    renders_in_frame,
+                                    pin_count: open_frame.pins.len(),
+                                    aborted: true,
+                                },
+                            );
+                        }
+                        inner_post.frame_builder.complete_close_failure();
+                        return Err(RenderError::Vk(e));
+                    }
+                }
+            }
+        };
+        let completion_semaphore = completion_signal
+            .as_ref()
+            .map(PresentCompletionSignal::semaphore);
+
         // End CB + append to SubmitGroup. Does NOT vkQueueSubmit2 yet.
+        // Uses end_and_submit_op_with_signal so the completion semaphore
+        // (if any) is queued on the submit's signal list.
         let append_result = {
             let inner = self.inner.as_mut().expect("inner");
-            end_and_submit_op(inner, platform, cb, &frame_ticket)
+            end_and_submit_op_with_signal(inner, platform, cb, &frame_ticket, completion_semaphore)
         };
         if let Err(e) = append_result {
             {
@@ -1453,6 +1463,8 @@ impl RenderEngine {
                     });
             }
             inner_post.frame_builder.complete_close_failure();
+            // completion_signal drops with the local — submit never
+            // queued the signal-op so the fd would never fire.
             return Err(e);
         }
 
@@ -1506,6 +1518,41 @@ impl RenderEngine {
                 let pin_count = open_frame.pins.len();
                 {
                     let inner = self.inner.as_mut().expect("inner");
+                    // Phase B.3 (N10) branch (b) POST-FLUSH SUCCESS: drain
+                    // pending_present_completions into a PendingPresentBatch
+                    // alongside the exported sync_file fd from the signal
+                    // we queued on the submit. The batch keeps the signal
+                    // alive until the fd fires.
+                    let drained_completions: Vec<super::present_completion::PendingPresentEntry> =
+                        std::mem::take(&mut open_frame.pending_present_completions);
+                    if !drained_completions.is_empty() {
+                        let (wait, signal) = match completion_signal {
+                            Some(signal) => match signal.export_sync_file_fd() {
+                                Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                                Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                                Err(e) => {
+                                    log::warn!(
+                                        "B.3 close_open_frame: vkGetSemaphoreFdKHR(SYNC_FD) \
+                                         failed: {e:?}; falling back to FenceTicket polling"
+                                    );
+                                    (PresentBatchWait::Poll, Some(signal))
+                                }
+                            },
+                            None => {
+                                // Non-empty completions but no signal — only possible if
+                                // the pending_count check above returned 0 but something
+                                // was pushed between the check and here. Treat as Ready.
+                                (PresentBatchWait::Ready, None)
+                            }
+                        };
+                        let ticket = inner.submitted.back().map(|op| op.ticket.clone());
+                        inner.pending_present_batches.push(PendingPresentBatch {
+                            wait,
+                            ticket,
+                            signal,
+                            events: drained_completions,
+                        });
+                    }
                     inner
                         .pending_frames
                         .push_back(super::frame_builder::FrameSubmittedRecord {
@@ -1552,6 +1599,22 @@ impl RenderEngine {
                 let glyph_uploads_in_frame = open_frame.glyph_uploads_in_frame;
                 let pin_count = open_frame.pins.len();
                 let inner = self.inner.as_mut().expect("inner");
+                // Phase B.3 (N10) branch (c) POST-FLUSH FAILURE: force-enqueue
+                // a degraded PendingPresentBatch BEFORE returning Err.
+                // Never silent-drop — X PRESENT protocol observes events regardless
+                // of submit success (Pitfall 8). The completion_signal drops with
+                // the local; the failed submit never queued a signal-op so the fd
+                // would never fire anyway.
+                let drained_completions: Vec<super::present_completion::PendingPresentEntry> =
+                    std::mem::take(&mut open_frame.pending_present_completions);
+                if !drained_completions.is_empty() {
+                    inner.pending_present_batches.push(PendingPresentBatch {
+                        wait: PresentBatchWait::Ready,
+                        ticket: None,
+                        signal: None,
+                        events: drained_completions,
+                    });
+                }
                 rollback_atlas(inner, atlas_overlay, atlas_prev);
                 // Phase B.2 Mechanism 3 (defensive): release any
                 // retired BatchResources attached to the open frame's
@@ -1604,7 +1667,6 @@ impl RenderEngine {
         if !frame_open {
             return Ok(());
         }
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         match self.close_open_frame(
             store,
@@ -1747,15 +1809,18 @@ impl RenderEngine {
         })
     }
 
-    /// True if either the cow-copy or render-composite coalescing
-    /// batch is currently open (CB recorded but not yet submitted).
-    /// Used by the eager-touch regression tests and by
+    /// True if either the frame builder has an open frame OR a render-
+    /// composite coalescing batch is currently open (CB recorded but
+    /// not yet submitted). Used by the eager-touch regression tests and by
     /// `KmsBackendV2::has_pending_batches_for_tests` (the wrapper
     /// the v2_acceptance test asserts on).
+    ///
+    /// Phase B.3 (N10): the frame builder's open frame is the
+    /// equivalent of "pending COW work" after the cow-batch deletion.
     pub fn has_pending_batches_for_tests(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|i| i.pending_cow_batch.is_some() || i.pending_render_batch.is_some())
+            .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some())
     }
 
     /// Stage 5 Task 4 layer 1: lifetime count of `vkCreateDescriptorPool`
@@ -2320,10 +2385,6 @@ impl RenderEngine {
         // first (no-op if no frame open). Preserves existing
         // batch-coalescing semantics in the common case.
         self.close_open_frame_for_non_ported_op(store, platform)?;
-        // Flush pending COW copy_area batch so its CB submits in
-        // queue order before this fill (same-queue ordering = our
-        // correctness guarantee).
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -2543,8 +2604,6 @@ impl RenderEngine {
         if rects.is_empty() {
             return Ok(());
         }
-        // Flush pending COW batch before any non-cow paint.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         if matches!(function, GcFunction::NoOp) {
             return Ok(());
@@ -2786,9 +2845,6 @@ impl RenderEngine {
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        // Phase B.3 (N9): flush pending_cow_batch (deleted in Task 4 — keep for
-        // now so this compiles until that atomic deletion lands).
-        self.flush_cow_batch(store, platform)?;
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
         self.flush_render_batch(store, platform)?;
@@ -2955,23 +3011,16 @@ impl RenderEngine {
 
     // ── Op: cow_copy_area (Stage 5 Task 3 POC) ──────────────────
 
-    /// Coalescing variant of [`Self::copy_area`] for the COMPOSITE
-    /// Overlay Window. Marco's `XCopyArea(backing, COW, …)` pump
-    /// produces runs of 12-50 consecutive copy_areas to the same
-    /// dst per frame (silence trace 2026-05-22: 47k of 62k = 75 %
-    /// of all `copy_area` events target COW). This entry-point
-    /// appends to a long-lived [`PendingCowBatch`] instead of
-    /// recording-then-submitting per call. The batch flushes via
-    /// [`Self::flush_cow_batch`] at the end of `maybe_composite`
-    /// (before `scene.tick`) and at the top of every other engine
-    /// op (so layout transitions and SubmittedOp retirement run in
-    /// the right order).
+    /// Phase B.3 (N3, N9, N10): coalescing variant of [`Self::copy_area`]
+    /// for the Composite Overlay Window. Per N3, the cow is a regular
+    /// [`DrawableId`] registered in the store like any other drawable;
+    /// this function forwards to [`Self::copy_area`] directly.
     ///
-    /// Same-image overlap (`src == dst`) is rare for COW workloads
-    /// and not worth the scratch-image plumbing in batched form;
-    /// callers should fall back to [`Self::copy_area`] in that
-    /// case (which itself flushes the pending batch first via
-    /// the caller's wrapper).
+    /// Same-image overlap (`src == cow_id`) is defended with an explicit
+    /// error (legacy invariant at engine.rs:3109-3111 preserved).
+    ///
+    /// The frame-builder's per-frame collapse (multiple ops in one
+    /// submitted CB) provides COW coalescing.
     ///
     /// # Errors
     ///
@@ -2987,499 +3036,35 @@ impl RenderEngine {
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // N9: empty-input fast-path FIRST.
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
-        // Flush pending render batch before opening / appending to a
-        // cow batch (different CB family, can't intermix).
-        self.flush_render_batch(store, platform)?;
-        let Some(inner) = self.inner.as_mut() else {
-            return Err(RenderError::NoVk);
-        };
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        // Sanity: same-image overlap not handled in batched path.
-        // Callers are expected to route to the regular `copy_area`
-        // in that case; defend with an explicit check anyway since
-        // letting the same id appear as both src and dst inside the
-        // batch would tangle the layout-transition tracking.
+        // N9: flush pending_render_batch at entry.
+        self.flush_render_batch(store, platform)?;
+
+        // Sanity: same-image overlap not handled on the cow path
+        // (legacy invariant at engine.rs:3109-3111). The regular
+        // copy_area's self-overlap scratch path would handle it, but
+        // cow workloads never have src == cow_id in practice.
         if src == cow_id {
             return Err(RenderError::UnsupportedDepth(0));
         }
 
-        // Read src + dst metadata.
-        let (src_image, src_extent, src_format) = {
-            let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
-            (d.storage.image, d.storage.extent, d.storage.format)
-        };
-        let (dst_extent, dst_format) = {
-            let d = store
-                .get(cow_id)
-                .ok_or(RenderError::UnknownDrawable(cow_id))?;
-            (d.storage.extent, d.storage.format)
-        };
-        if src_format != dst_format {
-            return Err(RenderError::UnsupportedDepth(0));
-        }
-
-        // Clamp / project — mirrors the disjoint-image arithmetic
-        // in `copy_area`.
-        let src_rect = clamp_rect(src_rect, src_extent);
-        let dst_pos_clamped = vk::Offset2D {
-            x: dst_pos.x.max(0),
-            y: dst_pos.y.max(0),
-        };
-        let copy_w = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.x))
-                + i32::try_from(src_rect.extent.width).unwrap_or(0))
-            .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX))
-                - dst_pos_clamped.x,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.width);
-        let copy_h = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.y))
-                + i32::try_from(src_rect.extent.height).unwrap_or(0))
-            .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX))
-                - dst_pos_clamped.y,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.height);
-        if copy_w == 0 || copy_h == 0 {
-            return Ok(());
-        }
-        let dst_rect = vk::Rect2D {
-            offset: dst_pos_clamped,
-            extent: vk::Extent2D {
-                width: copy_w,
-                height: copy_h,
-            },
-        };
-
-        // If a batch is already open but its dst differs from
-        // cow_id, callers have violated the contract (different
-        // COW drawable mid-batch). Defend by flushing the old
-        // batch + starting fresh. In practice cow_id is stable
-        // across an entire session (re-allocation only when
-        // refcount hits 0 between sessions).
-        let needs_flush_stale_batch = inner
-            .pending_cow_batch
-            .as_ref()
-            .is_some_and(|b| b.dst != cow_id);
-        if needs_flush_stale_batch {
-            self.flush_cow_batch(store, platform)?;
-            let inner_after_flush = self
-                .inner
-                .as_mut()
-                .expect("inner present after flush_cow_batch");
-            return Self::cow_copy_area_open_first(
-                inner_after_flush,
-                platform,
-                store,
-                cow_id,
-                src,
-                src_image,
-                src_rect,
-                dst_rect,
-            );
-        }
-
-        if inner.pending_cow_batch.is_none() {
-            return Self::cow_copy_area_open_first(
-                inner, platform, store, cow_id, src, src_image, src_rect, dst_rect,
-            );
-        }
-
-        // Existing batch, same dst — append.
-        let cb = inner
-            .pending_cow_batch
-            .as_ref()
-            .expect("pending batch present in append path")
-            .cb;
-
-        // If src not yet in batch, record SHADER_READ → TRANSFER_SRC.
-        let need_src_transition = !inner
-            .pending_cow_batch
-            .as_ref()
-            .expect("pending batch present")
-            .srcs_in_batch
-            .contains(&src);
-        if need_src_transition {
-            let d = store.get_mut(src).expect("src missing post-lookup");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-                    | vk::AccessFlags2::TRANSFER_WRITE
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            );
-            // Stage 5 Task 3 fix: touch src's render fence the
-            // moment its layout transition + copy land in the
-            // batch CB — see open-first branch for the rationale.
-            let batch_ticket = inner
-                .pending_cow_batch
-                .as_ref()
-                .expect("pending batch present")
-                .ticket
-                .clone();
-            inner
-                .pending_cow_batch
-                .as_mut()
-                .expect("pending batch present")
-                .srcs_in_batch
-                .insert(src);
-            store.touch_render_fence(src, batch_ticket);
-        }
-
-        // Record the copy.
-        let region = [vk::ImageCopy::default()
-            .src_subresource(color_layers())
-            .src_offset(vk::Offset3D {
-                x: src_rect.offset.x,
-                y: src_rect.offset.y,
-                z: 0,
-            })
-            .dst_subresource(color_layers())
-            .dst_offset(vk::Offset3D {
-                x: dst_rect.offset.x,
-                y: dst_rect.offset.y,
-                z: 0,
-            })
-            .extent(vk::Extent3D {
-                width: copy_w,
-                height: copy_h,
-                depth: 1,
-            })];
-        let dst_image = store
-            .get(cow_id)
-            .ok_or(RenderError::UnknownDrawable(cow_id))?
-            .storage
-            .image;
-        unsafe {
-            inner.vk.device.cmd_copy_image(
-                cb,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
-            );
-        }
-
-        let batch = inner
-            .pending_cow_batch
-            .as_mut()
-            .expect("pending batch present");
-        batch.dst_damage.push(dst_rect);
-        batch.coalesced_count = batch.coalesced_count.saturating_add(1);
-        Ok(())
+        // Per N3: cow_id is a regular DrawableId — forward to copy_area.
+        // The frame builder's per-frame collapse provides coalescing.
+        self.copy_area(store, platform, src, cow_id, src_rect, dst_pos)
     }
 
-    /// Open a fresh `PendingCowBatch` with the first copy already
-    /// recorded. Called from [`Self::cow_copy_area`] when no batch
-    /// is currently pending.
-    #[allow(clippy::too_many_arguments)]
-    fn cow_copy_area_open_first(
-        inner: &mut RenderEngineInner,
-        platform: &mut PlatformBackend,
-        store: &mut DrawableStore,
-        cow_id: DrawableId,
-        src: DrawableId,
-        src_image: vk::Image,
-        src_rect: vk::Rect2D,
-        dst_rect: vk::Rect2D,
-    ) -> Result<(), RenderError> {
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
-        // dst → TRANSFER_DST.
-        {
-            let d = store
-                .get_mut(cow_id)
-                .ok_or(RenderError::UnknownDrawable(cow_id))?;
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-                    | vk::AccessFlags2::TRANSFER_WRITE
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            );
-        }
-        // src → TRANSFER_SRC.
-        {
-            let d = store.get_mut(src).expect("src missing post-lookup");
-            d.record_layout_transition(
-                &inner.vk,
-                cb,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-                    | vk::AccessFlags2::TRANSFER_WRITE
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            );
-        }
-        // Record the copy.
-        let region = [vk::ImageCopy::default()
-            .src_subresource(color_layers())
-            .src_offset(vk::Offset3D {
-                x: src_rect.offset.x,
-                y: src_rect.offset.y,
-                z: 0,
-            })
-            .dst_subresource(color_layers())
-            .dst_offset(vk::Offset3D {
-                x: dst_rect.offset.x,
-                y: dst_rect.offset.y,
-                z: 0,
-            })
-            .extent(vk::Extent3D {
-                width: dst_rect.extent.width,
-                height: dst_rect.extent.height,
-                depth: 1,
-            })];
-        let dst_image = store
-            .get(cow_id)
-            .ok_or(RenderError::UnknownDrawable(cow_id))?
-            .storage
-            .image;
-        unsafe {
-            inner.vk.device.cmd_copy_image(
-                cb,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
-            );
-        }
-        let mut srcs = HashSet::new();
-        srcs.insert(src);
-        // Stage 5 Task 3 fix (UAF on Rembrandt iGPU, 2026-05-22):
-        // touch the batch ticket onto src + dst the moment a CB
-        // recording references them. The flush-time touch in
-        // `flush_cow_batch` is no longer load-bearing for src-side
-        // lifetime — between this open and the flush, a stray
-        // FreePixmap(src) would otherwise see no live render
-        // ticket on src and destroy the VkImage while the
-        // batch CB still copies from it.
-        store.touch_render_fence(cow_id, ticket.clone());
-        store.touch_render_fence(src, ticket.clone());
-        inner.pending_cow_batch = Some(PendingCowBatch {
-            cb,
-            ticket,
-            dst: cow_id,
-            srcs_in_batch: srcs,
-            dst_damage: vec![dst_rect],
-            coalesced_count: 1,
-            present_completions: Vec::new(),
-        });
-        Ok(())
-    }
-
-    /// Flush the pending COW `copy_area` batch (if any). Records
-    /// exit layout transitions for every src in the batch + the
-    /// dst, ends the CB, submits via `platform.submit_paint_cb`,
-    /// pushes one [`SubmittedOp`], clones the fence ticket onto
-    /// every touched drawable, and applies accumulated dst damage.
-    ///
-    /// Returns `Some(coalesced_count)` if a batch was flushed,
-    /// `None` if there was nothing pending. Caller uses the count
-    /// for telemetry (`record_cow_copies_coalesced`).
-    ///
-    /// Must be called before any subsequent engine op that
-    /// observes drawable layout state (composite, fill, get_image,
-    /// non-cow copy_area, etc.) AND before `scene.tick` so the
-    /// compose CB reads the correct dst contents. Backend wrappers
-    /// are responsible for calling this.
-    ///
-    /// # Errors
-    ///
-    /// `Vk` for any Vk failure during end/submit. If the platform
-    /// already has `renderer_failed = true`, the batch is dropped
-    /// without submission and `None` is returned (caller's job is
-    /// to be tearing down anyway).
-    pub(crate) fn flush_cow_batch(
-        &mut self,
-        store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
-    ) -> Result<Option<u32>, RenderError> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(None);
-        };
-        let Some(batch) = inner.pending_cow_batch.take() else {
-            return Ok(None);
-        };
-        if platform.renderer_failed {
-            // Drop the batch; CB will be freed at command-pool
-            // destruction. Ticket dropped here; FencePool's drop
-            // path handles the rest.
-            log::debug!(
-                "v2 flush_cow_batch: renderer_failed; dropping batch \
-                 (coalesced {} copies)",
-                batch.coalesced_count,
-            );
-            return Ok(None);
-        }
-
-        // Exit transitions: each src TRANSFER_SRC → SHADER_READ,
-        // dst TRANSFER_DST → SHADER_READ. ALL_COMMANDS dst stage
-        // matches the existing `copy_area` exit shape.
-        for src in &batch.srcs_in_batch {
-            let d = store
-                .get_mut(*src)
-                .ok_or(RenderError::UnknownDrawable(*src))?;
-            d.record_layout_transition(
-                &inner.vk,
-                batch.cb,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
-        }
-        {
-            let d = store
-                .get_mut(batch.dst)
-                .ok_or(RenderError::UnknownDrawable(batch.dst))?;
-            d.record_layout_transition(
-                &inner.vk,
-                batch.cb,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
-        }
-
-        let completion_signal = if batch.present_completions.is_empty() {
-            None
-        } else {
-            Some(platform.acquire_present_completion_signal()?)
-        };
-        let completion_semaphore = completion_signal
-            .as_ref()
-            .map(PresentCompletionSignal::semaphore);
-
-        // End + submit (append to group).
-        end_and_submit_op_with_signal(
-            inner,
-            platform,
-            batch.cb,
-            &batch.ticket,
-            completion_semaphore,
-        )?;
-
-        // CPU-side bookkeeping: clone ticket onto every touched
-        // drawable, apply accumulated damage, push pending SubmittedOp.
-        store.touch_render_fence(batch.dst, batch.ticket.clone());
-        for src in &batch.srcs_in_batch {
-            store.touch_render_fence(*src, batch.ticket.clone());
-        }
-        for rect in &batch.dst_damage {
-            store.damage(batch.dst, *rect);
-        }
-        inner.acquire_generation += 1;
-        let generation = inner.acquire_generation;
-        let coalesced_count = batch.coalesced_count;
-        let present_completions = batch.present_completions;
-        inner.pending_group_ops.push(SubmittedOp {
-            cb: batch.cb,
-            ticket: batch.ticket,
-            staging: None,
-            scratch: Vec::new(),
-            atlas_ticket: None,
-            generation,
-            retired_resources: Vec::new(),
-        });
-        inner.cow_flush_records.push(coalesced_count);
-        // `inner` borrow released after this block. Free to call self.* below.
-
-        // TODO(T3-carryover): no regression test covers the
-        // `has_completion_signal == true` branch below. The intended test
-        // (`flush_cow_batch_with_present_completion_flushes_before_export`)
-        // needs `install_synthetic_cow_for_tests` +
-        // `attach_synthetic_present_completion_to_cow_for_tests` helpers
-        // which don't exist yet. Without coverage, the
-        // VUID-VkFenceGetFdInfoKHR-handleType-01457 hazard
-        // (semaphore signal-op must be queued before
-        // vkGetSemaphoreFdKHR) is verified end-to-end on bee MATE
-        // captures only. Add the synthetic helpers + the test before
-        // Phase B's frame builder lands.
-        let has_completion_signal = !present_completions.is_empty();
-        if has_completion_signal {
-            // Phase A Step 8: semaphore-bearing COW batch must flush
-            // before the caller's vkGetSemaphoreFdKHR(SYNC_FD) so the
-            // signal op is queued.
-            match self.flush_submit_group(
-                platform,
-                super::submit_group::FlushReason::PresentCompletionSignal,
-            ) {
-                Ok(_) => {
-                    let inner = self.inner.as_mut().expect("post-flush");
-                    let (wait, signal) = match completion_signal {
-                        Some(signal) => match signal.export_sync_file_fd() {
-                            Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
-                            Ok(None) => (PresentBatchWait::Ready, Some(signal)),
-                            Err(e) => {
-                                log::warn!(
-                                    "v2 flush_cow_batch: vkGetSemaphoreFdKHR(SYNC_FD) failed: \
-                                     {e:?}; falling back to FenceTicket polling"
-                                );
-                                (PresentBatchWait::Poll, Some(signal))
-                            }
-                        },
-                        None => (PresentBatchWait::Ready, None),
-                    };
-                    // The ticket was committed to `submitted` by
-                    // flush_submit_group; use it from there.
-                    let ticket = inner.submitted.back().map(|op| op.ticket.clone());
-                    inner.pending_present_batches.push(PendingPresentBatch {
-                        wait,
-                        ticket,
-                        signal,
-                        events: present_completions,
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "v2 flush_cow_batch: PresentCompletionSignal flush failed: {e:?}; \
-                         force-firing {} PRESENT completion events",
-                        present_completions.len(),
-                    );
-                    let inner = self.inner.as_mut().expect("post-failed-flush");
-                    inner.pending_present_batches.push(PendingPresentBatch {
-                        wait: PresentBatchWait::Ready,
-                        ticket: None,
-                        signal: None,
-                        events: present_completions,
-                    });
-                    return Err(RenderError::Vk(e));
-                }
-            }
-        } else {
-            // No PRESENT completion attached → max-size auto-flush.
-            // The cow_batch CB stays in the group to collapse with
-            // subsequent ops.
-            self.maybe_auto_flush_submit_group(platform)?;
-        }
-        Ok(Some(coalesced_count))
-    }
-
+    /// Phase B.3 (N10): attach a PRESENT-completion entry to the open frame
+    /// if and only if the frame has an op that WRITES to `cow_id`. Returns
+    /// `Err(entry)` if no open frame exists or the frame doesn't write to
+    /// `cow_id` (predicate is `RecordedOp::dst_id() == Some(cow_id)`, NOT
+    /// `touched` — touched includes sampled-only references that would
+    /// attach completions to frames that never wrote the cow).
     pub(crate) fn attach_cow_present_completion(
         &mut self,
         cow_id: DrawableId,
@@ -3488,13 +3073,15 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(entry);
         };
-        let Some(batch) = inner.pending_cow_batch.as_mut() else {
+        let Some(open) = inner.frame_builder.open.as_mut() else {
             return Err(entry);
         };
-        if batch.dst != cow_id {
+        // N10 predicate: writes, NOT just touched.
+        let writes_to_cow = open.ops.iter().any(|op| op.dst_id() == Some(cow_id));
+        if !writes_to_cow {
             return Err(entry);
         }
-        batch.present_completions.push(entry);
+        open.pending_present_completions.push(entry);
         Ok(())
     }
 
@@ -3503,21 +3090,6 @@ impl RenderEngine {
             return Vec::new();
         };
         std::mem::take(&mut inner.pending_present_batches)
-    }
-
-    /// Drain the queue of cow-batch flush records (one `u32` per
-    /// flush, value = `coalesced_count` of that batch). Backend
-    /// calls this once per `maybe_composite` tick to bump
-    /// telemetry counters + emit one submit-trace event per
-    /// flush. Returns the drained vector (in flush order).
-    /// Engine-internal flushes (triggered by a non-cow op
-    /// interleaving a cow batch) and backend-initiated flushes
-    /// both contribute records.
-    pub(crate) fn drain_cow_flush_records(&mut self) -> Vec<u32> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Vec::new();
-        };
-        std::mem::take(&mut inner.cow_flush_records)
     }
 
     // ── Op: render-composite batched path (Stage 5 Task 3) ──────
@@ -4043,8 +3615,6 @@ impl RenderEngine {
         if src_extent.width == 0 || src_extent.height == 0 {
             return Ok(());
         }
-        // Flush pending COW batch first.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -4205,7 +3775,6 @@ impl RenderEngine {
     ) -> Result<Vec<u8>, RenderError> {
         // get_image is a synchronous CPU readback — must see all
         // prior submits including any pending COW batch.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         // Phase B.1 close trigger 2: close any open frame before the
         // readback's ticket.wait(). The frame's CB must submit before the
@@ -4402,8 +3971,6 @@ impl RenderEngine {
         if rendered.is_empty() {
             return Ok(stats);
         }
-        // Flush pending COW batch first.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -4770,8 +4337,6 @@ impl RenderEngine {
         if glyphs.is_empty() {
             return Ok(stats);
         }
-        // Flush pending COW batch first.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -5112,7 +4677,6 @@ impl RenderEngine {
         //     frame stays OPEN across composite_glyphs calls, so a
         //     sequence like `cow_copy_area → composite_glyphs` would
         //     see the cow batch pending; flush it here defensively.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
 
         // (1) Resolve dst format gating — identical to legacy.
@@ -5782,9 +5346,6 @@ impl RenderEngine {
             return Ok(stats);
         }
 
-        // Flush pending COW batch first.
-        self.flush_cow_batch(store, platform)?;
-
         // Stage 5 Task 3: try the batched path. If eligible
         // AND a same-key batch is pending (or none is pending),
         // appends in-line and returns deferred-to-batch stats.
@@ -6360,7 +5921,6 @@ impl RenderEngine {
         // (0) Flush pre-existing cow/render batches so they submit
         //     under their own (per-op) ticket before this call opens a
         //     frame.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
 
         // (1) Lazy-init RENDER assets (pipelines, solid 1x1 images,
@@ -7123,8 +6683,6 @@ impl RenderEngine {
         if bbox_w == 0 || bbox_h == 0 {
             return Ok(stats);
         }
-        // Flush pending COW batch first.
-        self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
 
         self.ensure_render_assets(platform)?;
@@ -10109,482 +9667,6 @@ mod tests {
 
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn cow_copy_area_coalesces_four_srcs_into_one_submit() {
-        // Stage 5 Task 3 POC: simulate marco's compositor pump.
-        // Four 4×4 src pixmaps filled with distinct colours;
-        // one 16×4 dst standing in for COW. Four `cow_copy_area`
-        // calls place each src into a different dst column.
-        // After `flush_cow_batch`, dst contains all four colours
-        // AND `inner.submitted` grew by exactly 1 (one CB, not
-        // four).
-        let Some(mut platform) = live_platform() else {
-            eprintln!("no VkContext available — skipping");
-            return;
-        };
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&platform).expect("engine");
-
-        let colours: [(u32, [f32; 4]); 4] = [
-            (0xFF_FF_00_00, decode_x11_pixel_bgra(0xFF_FF_00_00)), // red
-            (0xFF_00_FF_00, decode_x11_pixel_bgra(0xFF_00_FF_00)), // green
-            (0xFF_00_00_FF, decode_x11_pixel_bgra(0xFF_00_00_FF)), // blue
-            (0xFF_FF_FF_00, decode_x11_pixel_bgra(0xFF_FF_FF_00)), // yellow
-        ];
-
-        let mut srcs = Vec::with_capacity(4);
-        for (i, (_pixel, rgba)) in colours.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, reason = "0..4 fits u32")]
-            let xid = 0x100_u32 + i as u32;
-            let storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-            let id = store
-                .allocate(
-                    xid,
-                    super::super::store::DrawableKind::Pixmap,
-                    32,
-                    false,
-                    storage,
-                )
-                .unwrap();
-            engine
-                .fill_rect(
-                    &mut store,
-                    &mut platform,
-                    id,
-                    vk::Rect2D {
-                        offset: vk::Offset2D::default(),
-                        extent: vk::Extent2D {
-                            width: 4,
-                            height: 4,
-                        },
-                    },
-                    *rgba,
-                )
-                .unwrap();
-            srcs.push(id);
-        }
-
-        // Dst: 16×4 BGRA8 standing in for COW.
-        let cow_storage = platform.allocate_drawable_storage(16, 4, 32).unwrap();
-        let cow_id = store
-            .allocate(
-                0x200,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                cow_storage,
-            )
-            .unwrap();
-        // Clear dst to black so the test sees the writes
-        // distinctly.
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 16,
-                        height: 4,
-                    },
-                },
-                [0.0, 0.0, 0.0, 1.0],
-            )
-            .unwrap();
-
-        // Drain setup ops (fill_rects) before snapshotting the baseline
-        // (cap=16 deferred-graduation: ops park in pending_group_ops).
-        engine
-            .flush_submit_group(
-                &mut platform,
-                super::super::submit_group::FlushReason::SyncBoundary,
-            )
-            .expect("setup flush");
-
-        let submitted_before = engine.inner.as_ref().unwrap().submitted.len();
-
-        // Issue the four cow copy_areas — back-to-back, same dst.
-        for (i, src_id) in srcs.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, reason = "0..4 small")]
-            let dst_x = 4 * i as i32;
-            engine
-                .cow_copy_area(
-                    &mut store,
-                    &mut platform,
-                    cow_id,
-                    *src_id,
-                    vk::Rect2D {
-                        offset: vk::Offset2D::default(),
-                        extent: vk::Extent2D {
-                            width: 4,
-                            height: 4,
-                        },
-                    },
-                    vk::Offset2D { x: dst_x, y: 0 },
-                )
-                .unwrap();
-        }
-
-        // Before flush: no submit yet for the batch.
-        let submitted_mid_batch = engine.inner.as_ref().unwrap().submitted.len();
-        assert_eq!(
-            submitted_mid_batch, submitted_before,
-            "cow batch must not submit per-append — saw new SubmittedOp(s) before flush"
-        );
-        // Pending batch should be Some with coalesced_count == 4.
-        let count_pending = engine
-            .inner
-            .as_ref()
-            .unwrap()
-            .pending_cow_batch
-            .as_ref()
-            .map(|b| b.coalesced_count);
-        assert_eq!(count_pending, Some(4));
-
-        // Flush.
-        let flushed = engine
-            .flush_cow_batch(&mut store, &mut platform)
-            .expect("flush ok");
-        assert_eq!(flushed, Some(4), "flush should report 4 coalesced copies");
-
-        // Graduate pending_group_ops → submitted (cap=16 deferred-graduation).
-        engine
-            .flush_submit_group(
-                &mut platform,
-                super::super::submit_group::FlushReason::SyncBoundary,
-            )
-            .expect("flush before count assertion");
-
-        // After flush: submitted grew by exactly 1.
-        let submitted_after = engine.inner.as_ref().unwrap().submitted.len();
-        assert_eq!(
-            submitted_after,
-            submitted_before + 1,
-            "flush_cow_batch must emit one SubmittedOp for the whole batch"
-        );
-
-        // Flush records contains one entry of value 4.
-        let records = engine.drain_cow_flush_records();
-        assert_eq!(records, vec![4]);
-
-        // Read dst back; expect four 4-wide columns of distinct
-        // colours.
-        let out = engine
-            .get_image(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 16,
-                        height: 4,
-                    },
-                },
-                32,
-            )
-            .unwrap();
-        for (i, (pixel, _rgba)) in colours.iter().enumerate() {
-            let want_r = ((pixel >> 16) & 0xFF) as u8;
-            let want_g = ((pixel >> 8) & 0xFF) as u8;
-            let want_b = (pixel & 0xFF) as u8;
-            for y in 0..4 {
-                for x in 0..4 {
-                    let dst_x = i * 4 + x;
-                    let off = (y * 16 + dst_x) * 4;
-                    assert_eq!(
-                        &out[off..off + 4],
-                        &[want_b, want_g, want_r, 0xFF],
-                        "column {i} at ({dst_x},{y})"
-                    );
-                }
-            }
-        }
-
-        engine.drain_all(&mut platform);
-    }
-
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn cow_copy_area_repeated_src_skips_redundant_transition() {
-        // Stage 5 Task 3 POC: appending the same src twice into
-        // one batch should record only one SHADER_READ → TRANSFER_SRC
-        // transition (the second append finds the src already in
-        // `srcs_in_batch`). Coverage check: just verify the batch
-        // doesn't grow its src set on the second append.
-        let Some(mut platform) = live_platform() else {
-            eprintln!("no VkContext available — skipping");
-            return;
-        };
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&platform).expect("engine");
-
-        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let src_id = store
-            .allocate(
-                0x1,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                src_storage,
-            )
-            .unwrap();
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                decode_x11_pixel_bgra(0xFF_FF_00_00),
-            )
-            .unwrap();
-
-        let cow_storage = platform.allocate_drawable_storage(8, 4, 32).unwrap();
-        let cow_id = store
-            .allocate(
-                0x2,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                cow_storage,
-            )
-            .unwrap();
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 8,
-                        height: 4,
-                    },
-                },
-                [0.0, 0.0, 0.0, 1.0],
-            )
-            .unwrap();
-
-        // Append src into cow at offset 0.
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut platform,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 0, y: 0 },
-            )
-            .unwrap();
-        // Append same src again at offset 4.
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut platform,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 4, y: 0 },
-            )
-            .unwrap();
-
-        // Batch contains one src in its dedupe set, count == 2.
-        let batch = engine.inner.as_ref().unwrap().pending_cow_batch.as_ref();
-        let batch = batch.expect("pending batch present");
-        assert_eq!(batch.srcs_in_batch.len(), 1);
-        assert!(batch.srcs_in_batch.contains(&src_id));
-        assert_eq!(batch.coalesced_count, 2);
-        assert_eq!(batch.dst_damage.len(), 2);
-
-        // Flush + verify both halves of dst show src colour.
-        engine.flush_cow_batch(&mut store, &mut platform).unwrap();
-        let out = engine
-            .get_image(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 8,
-                        height: 4,
-                    },
-                },
-                32,
-            )
-            .unwrap();
-        for y in 0..4 {
-            for x in 0..8 {
-                let off = (y * 8 + x) * 4;
-                assert_eq!(
-                    &out[off..off + 4],
-                    &[0x00, 0x00, 0xFF, 0xFF],
-                    "expected red at ({x},{y})"
-                );
-            }
-        }
-
-        engine.drain_all(&mut platform);
-    }
-
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn cow_copy_area_flush_via_non_cow_op() {
-        // Stage 5 Task 3 POC: triggering a non-cow engine op (here
-        // `fill_rect` on an unrelated drawable) while a cow batch
-        // is pending must auto-flush the cow batch first via the
-        // per-method `flush_cow_batch` hook. After the fill_rect
-        // returns, cow's dst contents must reflect the prior
-        // cow_copy_area (i.e. flush happened before the fill's
-        // own submit so same-queue order is preserved).
-        let Some(mut platform) = live_platform() else {
-            eprintln!("no VkContext available — skipping");
-            return;
-        };
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&platform).expect("engine");
-
-        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let src_id = store
-            .allocate(
-                0x1,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                src_storage,
-            )
-            .unwrap();
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                decode_x11_pixel_bgra(0xFF_00_FF_00),
-            )
-            .unwrap();
-        let cow_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let cow_id = store
-            .allocate(
-                0x2,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                cow_storage,
-            )
-            .unwrap();
-        let other_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let other_id = store
-            .allocate(
-                0x3,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                other_storage,
-            )
-            .unwrap();
-
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut platform,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 0, y: 0 },
-            )
-            .unwrap();
-
-        // Pending batch present.
-        assert!(engine.inner.as_ref().unwrap().pending_cow_batch.is_some());
-
-        // Non-cow fill_rect on `other_id` — should auto-flush
-        // the pending cow batch first.
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                other_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                decode_x11_pixel_bgra(0xFF_00_00_FF),
-            )
-            .unwrap();
-
-        // Pending batch cleared by the auto-flush.
-        assert!(engine.inner.as_ref().unwrap().pending_cow_batch.is_none());
-        // Flush record present (drained here).
-        let records = engine.drain_cow_flush_records();
-        assert_eq!(records, vec![1]);
-
-        // Cow's contents must reflect the copy (same-queue order
-        // guarantees fill_rect's submit didn't race ahead).
-        let out = engine
-            .get_image(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                32,
-            )
-            .unwrap();
-        for y in 0..4 {
-            for x in 0..4 {
-                let off = (y * 4 + x) * 4;
-                assert_eq!(
-                    &out[off..off + 4],
-                    &[0x00, 0xFF, 0x00, 0xFF],
-                    "expected green at ({x},{y})"
-                );
-            }
-        }
-
-        engine.drain_all(&mut platform);
-    }
-
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
     fn render_composite_batch_coalesces_two_same_key_calls() {
         // Stage 5 Task 3 (render-composite generalization): two
         // consecutive render_composite calls with same
@@ -11074,105 +10156,6 @@ mod tests {
 
         engine
             .flush_render_batch(&mut store, &mut platform)
-            .expect("flush ok");
-        engine.drain_all(&mut platform);
-    }
-
-    /// Same invariant, cow `copy_area` batch shape. The bug exists
-    /// in the cow path too (`flush_cow_batch` defers
-    /// `touch_render_fence` for every `srcs_in_batch` member).
-    #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn cow_copy_area_open_marks_src_last_render_ticket_immediately() {
-        let Some(mut platform) = live_platform() else {
-            eprintln!("no VkContext available — skipping");
-            return;
-        };
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&platform).expect("engine");
-
-        let src_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let src_id = store
-            .allocate(
-                0x1,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                src_storage,
-            )
-            .unwrap();
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                decode_x11_pixel_bgra(0xFF_FF_00_00),
-            )
-            .unwrap();
-        engine.drain_all(&mut platform);
-
-        let cow_storage = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-        let cow_id = store
-            .allocate(
-                0x2,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                cow_storage,
-            )
-            .unwrap();
-        engine
-            .fill_rect(
-                &mut store,
-                &mut platform,
-                cow_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                [0.0, 0.0, 0.0, 1.0],
-            )
-            .unwrap();
-
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut platform,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 0, y: 0 },
-            )
-            .unwrap();
-
-        // The hostile FreePixmap. Pre-fix this returns Destroyed.
-        let decision = store.decref(&mut platform, src_id);
-        assert_eq!(
-            decision,
-            super::super::store::RetireDecision::PendingFence,
-            "FreePixmap(src) between cow_copy_area open and \
-             flush_cow_batch must NOT destroy src — pending \
-             batch CB still copies from it. Got {decision:?}",
-        );
-
-        engine
-            .flush_cow_batch(&mut store, &mut platform)
             .expect("flush ok");
         engine.drain_all(&mut platform);
     }
@@ -13855,182 +12838,6 @@ mod tests {
         b.engine.drain_all(&mut b.platform);
     }
 
-    // ── Task 9 Phase A regression tests ─────────────────────────
-
-    /// Phase A T9: COW batch ordering invariant.
-    ///
-    /// Drives: cow_copy_area A → fill_rect (non-cow) → cow_copy_area B →
-    /// flush_cow_batch. `fill_rect` internally calls `flush_cow_batch`
-    /// before its own work, so by the time this test calls
-    /// `flush_cow_batch` explicitly, the SubmitGroup must contain exactly
-    /// three entries in chronological order:
-    ///
-    ///   [cow_A_batch_cb, fill_cb, cow_B_batch_cb]
-    ///
-    /// Uses CB-identity comparison via `submit_group_peek_entries_for_tests`
-    /// to verify the append-order invariant matches the chronological
-    /// submission order.
-    #[test]
-    #[ignore = "lavapipe vk"]
-    fn submit_group_preserves_cow_batch_ordering() {
-        let mut p = match try_for_tests_with_vk() {
-            Some(p) => p,
-            None => return,
-        };
-        // cap=16 (production default): nothing auto-flushes with only 3 ops.
-        assert_eq!(p.submit_group_max_size_for_tests(), 16, "cap=16");
-
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&p).expect("engine");
-
-        // Allocate src + cow (dst) pixmaps.
-        let src_id = create_pixmap(&mut store, &mut p, 0xc0_0001, 8, 8, 32).expect("src alloc");
-        let cow_id = create_pixmap(&mut store, &mut p, 0xc0_0002, 8, 8, 32).expect("cow alloc");
-
-        // Initialise src with a fill so it has a proper image layout on
-        // first use (the cow batch will transition it regardless, but
-        // starting from UNDEFINED on both sides is fine with lavapipe).
-        engine
-            .fill_rect(
-                &mut store,
-                &mut p,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 8,
-                        height: 8,
-                    },
-                },
-                [1.0, 0.0, 0.0, 1.0],
-            )
-            .expect("src init fill");
-        // Drain setup ops so the group starts clean before the ordering
-        // assertions below.
-        engine
-            .flush_submit_group(
-                &mut p,
-                super::super::submit_group::FlushReason::SyncBoundary,
-            )
-            .expect("setup flush");
-        engine.drain_all(&mut p);
-        assert!(!p.submit_group_is_open(), "baseline: group closed");
-        assert_eq!(p.submit_group_size(), 0, "baseline: size=0");
-
-        // ── cow_copy_area A: opens a new cow batch ───────────────
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut p,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 0, y: 0 },
-            )
-            .expect("cow_copy_area A");
-
-        // Capture the batch CB allocated for cow_A before fill_rect
-        // triggers an implicit flush.
-        let cb_cow_a = engine
-            .inner
-            .as_ref()
-            .expect("engine inner")
-            .pending_cow_batch
-            .as_ref()
-            .expect("batch open after cow_copy_area A")
-            .cb;
-
-        // ── fill_rect (non-cow): implicitly flushes cow_A batch first ───
-        engine
-            .fill_rect(
-                &mut store,
-                &mut p,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 2,
-                        height: 2,
-                    },
-                },
-                [0.0, 1.0, 0.0, 1.0],
-            )
-            .expect("fill_rect non-cow");
-        // After fill_rect: group has 2 entries = [cow_A_cb, fill_cb].
-        assert_eq!(
-            p.submit_group_size(),
-            2,
-            "after fill_rect: cow_A + fill = 2 entries"
-        );
-
-        // ── cow_copy_area B: opens a fresh cow batch ─────────────
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut p,
-                cow_id,
-                src_id,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D { x: 4, y: 4 },
-            )
-            .expect("cow_copy_area B");
-        let cb_cow_b = engine
-            .inner
-            .as_ref()
-            .expect("engine inner")
-            .pending_cow_batch
-            .as_ref()
-            .expect("batch open after cow_copy_area B")
-            .cb;
-
-        // ── explicit flush_cow_batch → appends cow_B CB ──────────
-        engine
-            .flush_cow_batch(&mut store, &mut p)
-            .expect("flush_cow_batch B");
-
-        // Now the group should hold exactly 3 entries.
-        assert_eq!(
-            p.submit_group_size(),
-            3,
-            "after flush_cow_batch B: 3 entries total"
-        );
-
-        // CB-identity check: chronological order must be preserved.
-        let entries = p.submit_group_peek_entries_for_tests();
-        assert_eq!(
-            entries.len(),
-            3,
-            "peek_entries must show all 3 buffered CBs"
-        );
-        assert_eq!(entries[0].cb, cb_cow_a, "entries[0] must be cow_A batch CB");
-        assert_eq!(entries[2].cb, cb_cow_b, "entries[2] must be cow_B batch CB");
-        // Middle entry is the fill CB — just assert it's distinct from both.
-        let fill_cb = entries[1].cb;
-        assert_ne!(fill_cb, cb_cow_a, "fill CB must differ from cow_A CB");
-        assert_ne!(fill_cb, cb_cow_b, "fill CB must differ from cow_B CB");
-        assert_ne!(cb_cow_a, cb_cow_b, "cow_A and cow_B CBs must differ");
-
-        engine
-            .flush_submit_group(
-                &mut p,
-                super::super::submit_group::FlushReason::SceneCompose,
-            )
-            .expect("final flush");
-        engine.drain_all(&mut p);
-    }
-
     /// Phase A T9: glyph-upload CB precedes draw CB in the SubmitGroup.
     ///
     /// Part 1: drive `image_text` on a fresh target with one new glyph.
@@ -14259,209 +13066,6 @@ mod tests {
             after_resets >= mid_resets,
             "reset count must be non-decreasing after fence retires"
         );
-    }
-
-    /// Phase A T15: empty flush must NOT consume an open-batch ticket.
-    ///
-    /// Regression test for the {ticket=None, entries=non-empty} panic state.
-    /// Sequence:
-    ///   1. `cow_copy_area` opens a batch (ticket=Some, entries=empty).
-    ///   2. An empty flush fires (simulating PageflipRetire while batch is
-    ///      still mid-recording). Pre-fix: ticket dropped here → bug state.
-    ///      Post-fix: ticket survives.
-    ///   3. `flush_cow_batch` appends batch.cb to the group.
-    ///   4. A final flush drains normally (pre-fix: panics; post-fix: Ok).
-    #[test]
-    #[ignore = "lavapipe vk"]
-    fn empty_flush_preserves_open_batch_ticket() {
-        let Some(mut p) = try_for_tests_with_vk() else {
-            return;
-        };
-        let mut store = DrawableStore::new();
-        let mut engine = RenderEngine::new(&p).expect("engine");
-
-        let src = engine
-            .create_pixmap(&mut store, &mut p, 0x1, 4, 4, 32)
-            .unwrap();
-        let cow = engine
-            .create_pixmap(&mut store, &mut p, 0x2, 4, 4, 32)
-            .unwrap();
-
-        // Drain setup CBs (each create_pixmap's zero-fill).
-        engine
-            .flush_submit_group(
-                &mut p,
-                super::super::submit_group::FlushReason::SyncBoundary,
-            )
-            .unwrap();
-        engine.drain_all(&mut p);
-        assert!(!p.submit_group_is_open(), "setup drained");
-
-        // Open a cow_batch: begin_op_cb opens the group's ticket.
-        // batch.cb is recorded but NOT yet appended to the group.
-        engine
-            .cow_copy_area(
-                &mut store,
-                &mut p,
-                cow,
-                src,
-                vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                vk::Offset2D::default(),
-            )
-            .unwrap();
-        // Invariant: ticket open, entries still empty (batch.cb not yet
-        // appended to the group — that happens in flush_cow_batch).
-        assert!(p.submit_group_is_open(), "cow_batch opened the ticket");
-        assert_eq!(p.submit_group_size(), 0, "batch.cb not yet appended");
-
-        // Empty flush (simulating PageflipRetire firing while cow_batch is
-        // still mid-recording).  Pre-fix: ticket consumed → bug state.
-        // Post-fix: ticket survives.
-        engine
-            .flush_submit_group(
-                &mut p,
-                super::super::submit_group::FlushReason::PageflipRetire,
-            )
-            .unwrap();
-        assert!(
-            p.submit_group_is_open(),
-            "empty flush must preserve open batch ticket"
-        );
-        assert_eq!(p.submit_group_size(), 0);
-
-        // flush_cow_batch appends batch.cb to the group.
-        // Pre-fix: the subsequent flush_submit_group panics at
-        // "non-empty group has ticket".  Post-fix: this completes Ok.
-        engine
-            .flush_cow_batch(&mut store, &mut p)
-            .expect("must not panic");
-
-        // Drain — verify clean end-state.
-        engine
-            .flush_submit_group(
-                &mut p,
-                super::super::submit_group::FlushReason::SceneCompose,
-            )
-            .unwrap();
-        engine.drain_all(&mut p);
-        assert!(!p.submit_group_is_open(), "drained");
-        assert_eq!(engine.pending_group_ops_count_for_tests(), 0);
-    }
-
-    /// Phase A fix — root cause #2: pageflip retire (T7) with an open
-    /// cow_batch must not leave the engine in a state where a subsequent
-    /// flush panics.
-    ///
-    /// Bug shape: open cow_batch holds ticket T1; a non-COW flush path
-    /// (T7 pageflip retire) fires and consumes T1 via queue_submit2;
-    /// the still-open batch then appends its CB to a now-ticket-less
-    /// group; the next flush panics at the "non-empty group has ticket"
-    /// invariant.
-    ///
-    /// Post-fix: `simulate_page_flip_complete_for_tests` replicates the
-    /// production `on_page_flip_ready` path — it calls flush_cow_batch +
-    /// flush_render_batch BEFORE flush_submit_group(PageflipRetire).
-    /// The cow_batch CB lands in the group under T1, then the flush
-    /// drains cleanly. No orphan batch state. A subsequent
-    /// cow_copy_area + flush completes without panic.
-    #[test]
-    #[ignore = "lavapipe vk"]
-    fn pageflip_retire_with_open_cow_batch_does_not_panic() {
-        let mut b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skipping: no Vk: {e}");
-                return;
-            }
-        };
-        // Use XIDs that don't collide with the root drawable (xid=1) which
-        // for_tests_with_vk already allocates via init_root_storage.
-        let src = b
-            .engine
-            .create_pixmap(&mut b.store, &mut b.platform, 0xb001, 4, 4, 32)
-            .unwrap();
-        let cow = b
-            .engine
-            .create_pixmap(&mut b.store, &mut b.platform, 0xb002, 4, 4, 32)
-            .unwrap();
-
-        // Drain setup CBs (each create_pixmap's zero-fill).
-        b.engine_flush_submit_group_for_tests().unwrap();
-        b.engine.drain_all(&mut b.platform);
-        assert!(
-            !b.platform_submit_group_is_open_for_tests(),
-            "setup drained"
-        );
-
-        // Open a cow_batch: begin_op_cb opens the group's ticket.
-        // batch.cb is recorded but NOT yet appended to the group.
-        b.engine
-            .cow_copy_area(
-                &mut b.store,
-                &mut b.platform,
-                cow,
-                src,
-                ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
-                    extent: ash::vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                ash::vk::Offset2D::default(),
-            )
-            .unwrap();
-        assert!(
-            b.platform_submit_group_is_open_for_tests(),
-            "cow_batch opened the ticket"
-        );
-
-        // Drive the pageflip-complete hook. Post-fix: the wrapper calls
-        // flush_cow_batch first, so batch.cb lands in the group under
-        // the same T1 that flush_submit_group(PageflipRetire) then
-        // consumes. No panic.
-        b.simulate_page_flip_complete_for_tests()
-            .expect("pageflip retire with open cow_batch must not panic");
-
-        // Group is fully drained — no orphan batch state.
-        assert!(
-            !b.platform_submit_group_is_open_for_tests(),
-            "pageflip retire drained the group cleanly (no orphan batches)"
-        );
-        assert_eq!(
-            b.engine.pending_group_ops_count_for_tests(),
-            0,
-            "parked op graduated to submitted"
-        );
-
-        // Prove there's no lingering damage: a fresh cow_copy_area +
-        // flush must also complete without panic.
-        b.engine
-            .cow_copy_area(
-                &mut b.store,
-                &mut b.platform,
-                cow,
-                src,
-                ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
-                    extent: ash::vk::Extent2D {
-                        width: 4,
-                        height: 4,
-                    },
-                },
-                ash::vk::Offset2D::default(),
-            )
-            .unwrap();
-        b.engine_flush_submit_group_for_tests()
-            .expect("second flush after pageflip retire must not panic");
-
-        b.engine.drain_all(&mut b.platform);
     }
 
     // ────────────────────────────────────────────────────────────
