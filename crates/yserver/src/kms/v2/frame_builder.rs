@@ -431,6 +431,7 @@ pub(crate) struct RecordedTextGlyph {
 #[derive(Debug)]
 pub(crate) struct RecordedCompositeGlyphs {
     pub(crate) dst_id: DrawableId,
+    pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) foreground_rgba: [f32; 4],
     pub(crate) glyphs: Vec<RecordedTextGlyph>,
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
@@ -1010,6 +1011,7 @@ mod op_tests {
         };
         let op = RecordedCompositeGlyphs {
             dst_id: DrawableId::for_tests(1),
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
             foreground_rgba: [1.0, 0.0, 0.0, 1.0],
             glyphs: vec![glyph],
             clip_scissors: vec![scissor],
@@ -1121,6 +1123,7 @@ mod op_tests {
         // CompositeGlyphs → Some(id7).
         let composite_glyphs = RecordedOp::CompositeGlyphs(RecordedCompositeGlyphs {
             dst_id: id7,
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
             foreground_rgba: [0.0; 4],
             glyphs: Vec::new(),
             clip_scissors: Vec::new(),

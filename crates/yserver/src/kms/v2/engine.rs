@@ -2430,7 +2430,7 @@ impl RenderEngine {
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
         let format = drawable.storage.format;
-        let dst_pre_layout = drawable.storage.current_layout;
+        let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
         // Diagnostic trace (preserved from legacy body — useful for the
@@ -2610,7 +2610,7 @@ impl RenderEngine {
         };
         let extent = drawable.storage.extent;
         let image_view = drawable.storage.image_view;
-        let dst_pre_layout = drawable.storage.current_layout;
+        let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
         // Unpack the X11 wire pixel (preserve legacy at engine.rs:2546-2560).
@@ -2835,17 +2835,11 @@ impl RenderEngine {
 
         // Prelude state: first-touch + layout overlay for BOTH dst and src
         // (per N1's single-terminal layout + ticket-touch discipline).
-        let dst_pre_layout = store
-            .get(dst)
-            .map(|d| d.storage.current_layout)
-            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        let dst_pre_layout = inner.current_layout_for_drawable(store, dst);
         let src_pre_layout = if src == dst {
             dst_pre_layout
         } else {
-            store
-                .get(src)
-                .map(|d| d.storage.current_layout)
-                .unwrap_or(vk::ImageLayout::UNDEFINED)
+            inner.current_layout_for_drawable(store, src)
         };
         let prior_dst_ticket = store.get(dst).and_then(|d| d.last_render_ticket.clone());
         let prior_src_ticket = if src == dst {
@@ -3546,7 +3540,7 @@ impl RenderEngine {
 
         let dst_extent = drawable.storage.extent;
         let dst_image = drawable.storage.image;
-        let dst_pre_layout = drawable.storage.current_layout;
+        let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
         // Clamp the put rect to the storage extent. Per Stage 2
@@ -3936,10 +3930,7 @@ impl RenderEngine {
             .ticket
             .clone();
         let prior_dst_ticket = store.get(target).and_then(|d| d.last_render_ticket.clone());
-        let dst_pre_frame_layout = store
-            .get(target)
-            .map(|d| d.storage.current_layout)
-            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        let dst_pre_frame_layout = inner.current_layout_for_drawable(store, target);
         {
             let open = inner.frame_builder.open.as_mut().expect("just opened");
             open.touched.first_touch(target, prior_dst_ticket);
@@ -4700,10 +4691,7 @@ impl RenderEngine {
             .ticket
             .clone();
         let prior_dst_ticket = store.get(dst_id).and_then(|d| d.last_render_ticket.clone());
-        let dst_pre_frame_layout = store
-            .get(dst_id)
-            .map(|d| d.storage.current_layout)
-            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        let dst_pre_frame_layout = inner.current_layout_for_drawable(store, dst_id);
         {
             let open = inner.frame_builder.open.as_mut().expect("just opened");
             open.touched.first_touch(dst_id, prior_dst_ticket);
@@ -4814,10 +4802,7 @@ impl RenderEngine {
                 .expect("just opened")
                 .ticket
                 .clone();
-            let dst_pre_layout_reopened = store
-                .get(dst_id)
-                .map(|d| d.storage.current_layout)
-                .unwrap_or(vk::ImageLayout::UNDEFINED);
+            let dst_pre_layout_reopened = inner.current_layout_for_drawable(store, dst_id);
             let atlas_pre_layout_reopened = inner
                 .glyph_atlas
                 .as_ref()
@@ -5098,17 +5083,24 @@ impl RenderEngine {
 
         // (9) Append the draw op. No damage_rect carried — damage was
         //     already mutated at append time above.
-        inner.frame_builder.open.as_mut().expect("open").ops.push(
-            super::frame_builder::RecordedOp::CompositeGlyphs(
-                super::frame_builder::RecordedCompositeGlyphs {
-                    dst_id,
-                    foreground_rgba,
-                    glyphs: glyphs_to_draw,
-                    clip_scissors,
-                    damage_rect: None,
-                },
-            ),
-        );
+        inner
+            .frame_builder
+            .open
+            .as_mut()
+            .expect("open")
+            .push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::CompositeGlyphs(
+                    super::frame_builder::RecordedCompositeGlyphs {
+                        dst_id,
+                        dst_old_layout: dst_pre_frame_layout,
+                        foreground_rgba,
+                        glyphs: glyphs_to_draw,
+                        clip_scissors,
+                        damage_rect: None,
+                    },
+                ),
+                &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+            );
 
         // (10) Do NOT auto-close. Frame closes via M2 (next non-ported
         //      op), M3 (maybe_composite), timeout, sync_wait, or
@@ -6029,10 +6021,7 @@ impl RenderEngine {
             .ticket
             .clone();
         let prior_dst_ticket = store.get(dst_id).and_then(|d| d.last_render_ticket.clone());
-        let dst_pre_frame_layout = store
-            .get(dst_id)
-            .map(|d| d.storage.current_layout)
-            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        let dst_pre_frame_layout = inner.current_layout_for_drawable(store, dst_id);
         {
             let open = inner.frame_builder.open.as_mut().expect("just opened");
             open.touched.first_touch(dst_id, prior_dst_ticket);
@@ -6188,10 +6177,10 @@ impl RenderEngine {
                     // Snapshot prior + layout BEFORE first_touch so we
                     // capture the pre-frame state.
                     let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
-                    let pre_layout = store
-                        .get(id)
-                        .map(|d| d.storage.current_layout)
-                        .unwrap_or(vk::ImageLayout::UNDEFINED);
+                    let pre_layout = {
+                        let inner = self.inner.as_ref().expect("inner");
+                        inner.current_layout_for_drawable(store, id)
+                    };
                     {
                         let inner = self.inner.as_mut().expect("inner");
                         let open = inner.frame_builder.open.as_mut().expect("just opened");
@@ -6268,10 +6257,10 @@ impl RenderEngine {
             match mask {
                 ResolvedSource::Drawable(id) => {
                     let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
-                    let pre_layout = store
-                        .get(id)
-                        .map(|d| d.storage.current_layout)
-                        .unwrap_or(vk::ImageLayout::UNDEFINED);
+                    let pre_layout = {
+                        let inner = self.inner.as_ref().expect("inner");
+                        inner.current_layout_for_drawable(store, id)
+                    };
                     {
                         let inner = self.inner.as_mut().expect("inner");
                         let open = inner.frame_builder.open.as_mut().expect("just opened");
@@ -7730,7 +7719,7 @@ fn emit_recorded_op_into_cb(
                 extent: drawable.storage.extent,
                 image: drawable.storage.image,
                 image_view: drawable.storage.image_view,
-                current_layout: drawable.storage.current_layout,
+                current_layout: cg.dst_old_layout,
             };
             let pipeline = inner.text_pipeline.as_ref().ok_or(RenderError::NoVk)?;
             crate::kms::vk::ops::text::record_text_run_scissored(
