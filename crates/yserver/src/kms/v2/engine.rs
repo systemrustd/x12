@@ -2089,17 +2089,48 @@ impl RenderEngine {
             })?;
             inner.render_pipelines = Some(cache);
         }
+        // B.2 fix (vkdebug VUID-vkCmdDraw-None-09600): the per-op
+        // `record_solid_color_clear` emits a barrier with
+        // `old_layout = solid.current_layout()`. Validation tracks
+        // layouts across CB boundaries: if the image is still in
+        // UNDEFINED globally (never transitioned via any submitted CB),
+        // the expectation that the barrier consumes "the layout
+        // recorded at descriptor-write time" fails when the descriptor
+        // declares SHADER_READ_ONLY. The white-mask path below already
+        // seeded its image to SHADER_READ_ONLY via a one-shot clear;
+        // mirror that for solid_src/solid_mask. Cost: two extra
+        // synchronous submits at engine init.
+        let pool_for_init_clears = platform.ops_command_pool_handle().ok_or_else(|| {
+            log::error!("v2 ensure_render_assets: no ops_command_pool for solid-image init clears");
+            RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })?;
         if inner.solid_src_image.is_none() {
-            let s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
+            let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
                 log::error!("v2 ensure_render_assets: solid_src SolidColorImage failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
+                record_solid_color_clear(vk, cb, &mut s, [0.0, 0.0, 0.0, 0.0]);
+                Ok(())
+            })
+            .map_err(|e| {
+                log::error!("v2 ensure_render_assets: solid_src init-clear submit failed: {e:?}");
+                RenderError::Vk(e)
             })?;
             inner.solid_src_image = Some(s);
         }
         if inner.solid_mask_image.is_none() {
-            let s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
+            let mut s = SolidColorImage::new(Arc::clone(&inner.vk)).map_err(|e| {
                 log::error!("v2 ensure_render_assets: solid_mask SolidColorImage failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
+                record_solid_color_clear(vk, cb, &mut s, [0.0, 0.0, 0.0, 0.0]);
+                Ok(())
+            })
+            .map_err(|e| {
+                log::error!("v2 ensure_render_assets: solid_mask init-clear submit failed: {e:?}");
+                RenderError::Vk(e)
             })?;
             inner.solid_mask_image = Some(s);
         }
@@ -2108,11 +2139,7 @@ impl RenderEngine {
                 log::error!("v2 ensure_render_assets: white_mask SolidColorImage failed: {e:?}");
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
-            let pool = platform.ops_command_pool_handle().ok_or_else(|| {
-                log::error!("v2 ensure_render_assets: no ops_command_pool for white-clear");
-                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
-            })?;
-            crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool, |vk, cb| {
+            crate::kms::vk::ops::run_one_shot_op(&inner.vk, pool_for_init_clears, |vk, cb| {
                 record_solid_color_clear(vk, cb, &mut s, [1.0, 1.0, 1.0, 1.0]);
                 Ok(())
             })

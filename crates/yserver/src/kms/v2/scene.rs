@@ -2496,7 +2496,15 @@ fn record_v2_command_buffer(
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(to_color_src_access)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            // B.2 fix (vkdebug READ_AFTER_WRITE at vkCmdBeginRendering):
+            // include COLOR_ATTACHMENT_READ so the loadOp=LOAD that
+            // begin_rendering performs is synchronized against the
+            // layout-transition's write. Validation surfaces this
+            // hazard with the message "must allow
+            // COLOR_ATTACHMENT_READ accesses at COLOR_ATTACHMENT_OUTPUT".
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+            )
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(bo.vk_image)
