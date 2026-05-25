@@ -1905,14 +1905,39 @@ impl RenderEngine {
             .map_err(|_| RenderError::NoVk)
     }
 
-    /// Stage 3b: drop any GPU-side state cached for `host_pic`.
-    /// `KmsBackendV2::render_free_picture` calls this after
-    /// removing the picture record from `KmsCore.pictures`. Stage
-    /// 3f.13's `PicturePaintState::Gradient` drops its
-    /// [`GradientPicture`] (image / view / memory) on remove.
+    /// Stage 3b + B.2 fix: drop any GPU-side state cached for
+    /// `host_pic`. `KmsBackendV2::render_free_picture` calls this
+    /// after removing the picture record from `KmsCore.pictures`.
+    ///
+    /// **B.2 fix**: under sub-gate=ON, render_composite may have
+    /// recorded the gradient's view into a descriptor on an open
+    /// frame whose CB has not yet been submitted. Dropping the
+    /// `GradientPicture` synchronously here would destroy the Vk
+    /// image while still bound to a CB referenced from the open
+    /// frame builder — once the frame later closes + submits, the
+    /// GPU samples the freed image and TCP-faults. The fix routes
+    /// the boxed `GradientPicture` through
+    /// `adopt_retired_resource_for_gpu_retirement`, deferring the
+    /// release to the right fence: (a) open frame's pin set,
+    /// (b) submitted.back's SubmittedOp, or (c) immediate release
+    /// only if neither is in flight. `GradientPicture::release`
+    /// destroys the Vk handles; its `Drop` is a debug_assert.
+    ///
+    /// `SolidFill` variants carry no Vk handles, so they fall
+    /// through the standard HashMap::remove drop with no fence
+    /// gating needed.
     pub(crate) fn picture_paint_remove(&mut self, host_pic: u32) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.picture_paint.remove(&host_pic);
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(state) = inner.picture_paint.remove(&host_pic) else {
+            return;
+        };
+        match state {
+            PicturePaintState::Gradient(gradient) => {
+                inner.adopt_retired_resource_for_gpu_retirement(Some(Box::new(gradient)
+                    as Box<dyn crate::kms::scheduler::paint_batch::BatchResource>));
+            }
         }
     }
 

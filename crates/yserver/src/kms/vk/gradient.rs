@@ -83,6 +83,18 @@ pub struct Stop {
 /// Evaluated gradient. Owns its `VkImage` + view + memory; also
 /// remembers the dst-pixel → image-pixel projection that turns a
 /// composite call into a regular textured draw.
+///
+/// **Lifetime contract (B.2 fix):** `GradientPicture` implements
+/// [`crate::kms::scheduler::paint_batch::BatchResource`]; the Vk
+/// handles are destroyed in `release(self: Box<Self>, &VkContext)`,
+/// NOT in `Drop`. The free path in
+/// `KmsBackendV2::render_free_picture` boxes the picture and routes
+/// it through `adopt_retired_resource_for_gpu_retirement` so the
+/// destruction defers to whichever fence is in flight (open frame's
+/// pin set, latest SubmittedOp, or immediate release if nothing is
+/// in flight). This prevents the B.2 use-after-free where the frame
+/// builder defers a CB submission past `RenderFreePicture` and the
+/// GPU samples freed memory. Drop is a debug-only assert.
 pub struct GradientPicture {
     vk: Arc<VkContext>,
     image: vk::Image,
@@ -91,6 +103,22 @@ pub struct GradientPicture {
     extent: vk::Extent2D,
     /// dst-pixel → gradient-image-pixel affine.
     pub axis_projection: AffineXform,
+    /// Set to `true` by `release`; Drop checks this to catch missed
+    /// adopt-to-fence routings (would otherwise silently leak Vk
+    /// handles AND risk a UAF if a CB still references them).
+    released: bool,
+}
+
+impl std::fmt::Debug for GradientPicture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GradientPicture")
+            .field("image", &self.image)
+            .field("view", &self.view)
+            .field("extent", &self.extent)
+            .field("axis_projection", &self.axis_projection)
+            .field("released", &self.released)
+            .finish()
+    }
 }
 
 impl GradientPicture {
@@ -157,6 +185,7 @@ impl GradientPicture {
             image,
             view,
             memory,
+            released: false,
             extent: vk::Extent2D {
                 width: LUT_LEN,
                 height: 1,
@@ -235,6 +264,7 @@ impl GradientPicture {
             image,
             view,
             memory,
+            released: false,
             extent: vk::Extent2D {
                 width: RADIAL_SIDE,
                 height: RADIAL_SIDE,
@@ -244,13 +274,49 @@ impl GradientPicture {
     }
 }
 
+impl crate::kms::scheduler::paint_batch::BatchResource for GradientPicture {
+    fn release(mut self: Box<Self>, vk: &VkContext) {
+        // B.2 fix: Vk destruction lives here, NOT in Drop. The free
+        // path in `KmsBackendV2::render_free_picture` boxes the
+        // picture and routes it through
+        // `adopt_retired_resource_for_gpu_retirement` so this fires
+        // only after the in-flight fence (open frame's pin set, or
+        // submitted.back's SubmittedOp, or immediately if nothing is
+        // in flight) signals. By then, no CB references the view.
+        unsafe {
+            vk.device.destroy_image_view(self.view, None);
+            vk.device.destroy_image(self.image, None);
+            vk.device.free_memory(self.memory, None);
+        }
+        self.released = true;
+    }
+}
+
 impl Drop for GradientPicture {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            self.vk.device.destroy_image_view(self.view, None);
-            self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+        // B.2 fix: catches missed routings. If this fires, the free
+        // path forgot to call BatchResource::release — the picture
+        // was dropped directly (HashMap::remove without routing
+        // through adopt_retired_resource_for_gpu_retirement). That
+        // would leak the Vk handles AND, more importantly, mask the
+        // very UAF the BatchResource pattern is meant to prevent.
+        debug_assert!(
+            self.released,
+            "GradientPicture dropped without release — caller forgot \
+             to route through adopt_retired_resource_for_gpu_retirement \
+             (B.2 UAF risk; see gradient.rs Lifetime contract)"
+        );
+        // In release builds, fall back to the prior queue_wait_idle +
+        // destroy so we still free the handles (preserves prior B.1
+        // behaviour at the cost of a one-frame stall). The
+        // debug_assert above will have caught the bug in CI.
+        if !self.released {
+            unsafe {
+                let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
+                self.vk.device.destroy_image_view(self.view, None);
+                self.vk.device.destroy_image(self.image, None);
+                self.vk.device.free_memory(self.memory, None);
+            }
         }
     }
 }
