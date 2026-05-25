@@ -803,7 +803,7 @@ After B.3 rip-and-replace:
 Steps:
 1. Rewrite the `cow_copy_area` body to append a `RecordedCopyArea` to the frame builder (same shape as `copy_area`'s body, resolving the cow Drawable via the existing `current_layout_for_drawable(store, cow_id)` accessor per N3 — no special cow handling otherwise).
 2. **Add `OpenFrame::pending_present_completions: Vec<PendingPresentEntry>` slot (per N10).**
-3. **Rewrite `attach_cow_present_completion(cow_id, entry)` body to push into `frame_builder.open.pending_present_completions` when the open frame has any op touching `cow_id` (per N10). Helper signature is unchanged — backend call site at backend.rs:9904 stays as-is.**
+3. **Rewrite `attach_cow_present_completion(cow_id, entry)` body to push into `frame_builder.open.pending_present_completions` when the open frame has any op WRITING to `cow_id` (per N10's `RecordedOp::dst_id() == Some(cow_id)` predicate — NOT just "touching"; the touched set includes read-only references, which is the wrong semantic — codex round-14 caught this earlier). Helper signature is unchanged — backend call site at backend.rs:9904 stays as-is.**
 4. **Extend `close_open_frame` with FULL three-branch PRESENT plumbing (per N10):**
    - **(a) Pre-submit**: BEFORE `end_and_submit_op` (engine.rs:1408), acquire `PresentCompletionSignal` if `open_frame.pending_present_completions` is non-empty, extract its `vk::Semaphore`, and call `end_and_submit_op_with_signal` instead of `end_and_submit_op`. If signal-acquire fails or the with_signal call fails, route through the existing append-failure rollback at engine.rs:1410-1446 (8 cleanup steps — events drop with OpenFrame, mirroring pre-B.3 pre-submit failure behavior).
    - **(b) Post-`flush_submit_group` SUCCESS**: drain `pending_present_completions` into a new `PendingPresentBatch { wait, ticket, signal, events }` on `pending_present_batches`. `wait` derives from `signal.export_sync_file_fd()` per legacy at engine.rs:3534-3555 (Fd/Ready/Poll).
@@ -899,6 +899,7 @@ Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced 
 - `cargo +nightly fmt --check` clean.
 - `cargo clippy --workspace --all-targets` (plain, NOT pedantic) clean for the B.3 surface.
 - Each integration test in Phase 2/3/4 demonstrates two-op collapse-to-one-submit for its op.
+- Phase 5 image_text integration test demonstrates: (a) two consecutive image_text calls in one frame collapse to one SubmittedOp; (b) atlas first-touch snapshot + close-failure rollback restore atlas `last_render_ticket`; (c) non-BGRA8 target negative-test drops the run without atlas mutation; (d) PRESENT-completion delivery on a frame containing image_text (per N10 atomic test).
 
 ### Hardware gates (user-driven, after Task 19)
 
