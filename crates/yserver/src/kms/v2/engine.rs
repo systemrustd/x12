@@ -5638,8 +5638,86 @@ impl RenderEngine {
     /// `recorded_draws = 0` — the op silently no-ops, matching
     /// v1's `try_vk_render_composite` shape.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_composite(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        src: ResolvedSource,
+        mask: ResolvedSource,
+        dst_id: DrawableId,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        clip_rects: Option<&[Rectangle16]>,
+        src_repeat: Repeat,
+        mask_repeat: Repeat,
+        src_transform: Option<PictTransform>,
+        mask_transform: Option<PictTransform>,
+        mask_component_alpha: bool,
+        src_pict_format: u32,
+        mask_pict_format: u32,
+        dst_pict_format: u32,
+    ) -> Result<CompositeStats, RenderError> {
+        // Phase B.2 Task 8: dispatch by the render-composite sub-gate.
+        //
+        // Per USER-codex finding 5, the dispatcher does NOT call the
+        // M2 `close_open_frame_for_non_ported_op` here — the close
+        // stays inside `render_composite_legacy` only. Under sub-
+        // gate=OFF the legacy path runs and the close fires as
+        // before; under sub-gate=ON `render_composite_via_frame_builder`
+        // IS the frame builder, so closing the open frame at the top
+        // would defeat the point.
+        if !frame_builder_render_composite_enabled() {
+            return self.render_composite_legacy(
+                store,
+                platform,
+                op,
+                src,
+                mask,
+                dst_id,
+                rects,
+                clip_rects,
+                src_repeat,
+                mask_repeat,
+                src_transform,
+                mask_transform,
+                mask_component_alpha,
+                src_pict_format,
+                mask_pict_format,
+                dst_pict_format,
+            );
+        }
+        self.render_composite_via_frame_builder(
+            store,
+            platform,
+            op,
+            src,
+            mask,
+            dst_id,
+            rects,
+            clip_rects,
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
+        )
+    }
+
+    /// Phase B.2 Task 8: legacy (pre-frame-builder) composite path.
+    /// Body is the historical `render_composite` body verbatim,
+    /// including the M2 `close_open_frame_for_non_ported_op` at the
+    /// top. Selected by `render_composite` when the
+    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate is OFF
+    /// (default during the B.2 implementation window).
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`render_composite`].
+    #[allow(clippy::too_many_arguments)]
+    fn render_composite_legacy(
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
@@ -6238,6 +6316,66 @@ impl RenderEngine {
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
         Ok(stats)
+    }
+
+    /// Phase B.2 Task 8: frame-builder composite path skeleton.
+    ///
+    /// Stub returning an empty [`CompositeStats`]; selected by
+    /// [`Self::render_composite`] when the
+    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate is ON
+    /// (test-only during the B.2 implementation window). Subsequent
+    /// tasks (9-13) replace this body with the prelude → scratch
+    /// peek → open + touch → encode → close pipeline. The dispatcher
+    /// deliberately does NOT call the M2 close before invoking this:
+    /// under sub-gate=ON this method IS the frame builder, so the
+    /// open frame must remain open across consecutive composites.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`render_composite`]; the stub itself is
+    /// infallible.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unnecessary_wraps)]
+    fn render_composite_via_frame_builder(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        src: ResolvedSource,
+        mask: ResolvedSource,
+        dst_id: DrawableId,
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+        clip_rects: Option<&[Rectangle16]>,
+        src_repeat: Repeat,
+        mask_repeat: Repeat,
+        src_transform: Option<PictTransform>,
+        mask_transform: Option<PictTransform>,
+        mask_component_alpha: bool,
+        src_pict_format: u32,
+        mask_pict_format: u32,
+        dst_pict_format: u32,
+    ) -> Result<CompositeStats, RenderError> {
+        // STUB — Tasks 9-13 fill in. Discard every parameter so the
+        // signature stays stable while the body is empty.
+        let _ = (
+            store,
+            platform,
+            op,
+            src,
+            mask,
+            dst_id,
+            rects,
+            clip_rects,
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
+        );
+        Ok(CompositeStats::default())
     }
 
     // ── Op: render_fill_rectangles (Stage 3c) ───────────────────
