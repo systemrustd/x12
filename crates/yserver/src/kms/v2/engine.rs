@@ -7025,10 +7025,15 @@ impl RenderEngine {
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<CompositeStats, RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // Phase B Invariant M2: no wrapper-level
+        // `close_open_frame_for_non_ported_op` here — this wrapper
+        // delegates to `render_composite`, which under sub-gate=ON
+        // routes to `render_composite_via_frame_builder` (the frame
+        // builder itself, must NOT close) and under sub-gate=OFF
+        // routes to `render_composite_legacy` (does the M2 close at
+        // its top, per Task 8). A wrapper-level close here would
+        // defeat the collapse of two `render_fill_rectangles` calls
+        // into one frame under sub-gate=ON.
         self.render_composite(
             store,
             platform,
