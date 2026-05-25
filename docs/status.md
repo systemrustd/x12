@@ -2950,6 +2950,89 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         SYNC_FD pass-through test is deferred to the scaffolded
         renderer-failed integration test bucket.
 
+  - **Phase B sub-phase B.2 — IMPLEMENTED 2026-05-25.** Plan
+    `docs/superpowers/plans/2026-05-24-frame-builder-phase-b2.md`
+    landed in 19 commits on `feature/frame-builder-submit-rate`
+    (`70512d0` … `dbb540d`). Spec
+    `docs/superpowers/specs/2026-05-24-frame-builder-phase-b-design.md`.
+
+    Commit chain in order (Task 1 → Task 20):
+    `70512d0`, `b6b3d4b`, `5d4266c`, `f13baac`, `7526716`,
+    `21a3f52`, `6994658`, `61eb2ad`, `157fa4e`, `fb57a83`,
+    `f9852e4`, `d31b5d1`, `a9813d8`, `cff6e62`, `9e6ecca`,
+    `a3dd080`, `e80adfb`, `7125002`, `dbb540d` (default-ON flip).
+
+    **Structural changes:**
+      - Mechanism 3 (retired-scratch pinning via existing BatchResource
+        trait): `EngineInner` scratch slots stay as `Option<DstReadback>` /
+        `Option<MaskScratch>` / `Option<SolidColorImage>` (no Arc-wrap;
+        the existing `&mut`-mutating record APIs stay unchanged). The
+        existing `ensure_returning_old` already returns
+        `Option<Box<dyn BatchResource>>` on growth; B.2 routes the Box
+        into the open frame's `retired_resources: Vec<Box<dyn BatchResource>>`
+        pin slot instead of dropping it on the floor. The Box's Drop
+        destroys the Vk handles after the frame ticket signals.
+        Closes the existing retired-scratch leak documented at
+        `engine.rs:529-535`.
+      - Mechanism 2 (descriptor pool ring watermark): `OpenFrame::frame_generation`
+        captured at `open_for_paint` from a bumped `acquire_generation`;
+        all per-op descriptor acquisitions during the frame use that
+        generation; `release_up_to(frame_generation)` at retire releases
+        only the frame's pools.
+      - Layout overlay flips to source-of-truth: open-frame paint ops
+        read `current_in_frame_for_drawable` via the new
+        `RenderEngineInner::current_layout_for_drawable` accessor.
+        Second `render_composite` op-in-frame sees the prior op's
+        post-transition layout, not stale `storage.current_layout`.
+      - `RecordedOp::RenderComposite` + `RecordedRenderComposite`
+        payload — all resolved view handles, descriptor set, rects,
+        clip.
+      - `render_composite_via_frame_builder` + `render_composite_legacy`
+        dispatch behind `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE`
+        sub-gate. Default ON after Task 20.
+      - `emit_recorded_render_composite_into_cb` close-time replay.
+      - M2 `close_open_frame_for_non_ported_op` removed from
+        `render_composite` and `render_fill_rectangles` entry points
+        (they ARE the frame builder now). M2 still wraps the remaining
+        8 non-ported entry points until B.3.
+      - Telemetry: `frame_builder_renders_per_frame_total` /
+        `_max_in_window`, drained at every close-driving backend site.
+
+    **Acceptance:**
+      - **Implementation gates** (already validated): `cargo build` clean;
+        `cargo test --workspace` green; `cargo +nightly fmt` + plain
+        `cargo clippy --workspace --all-targets` clean on the B.2
+        surface (AGENTS.md: no pedantic by default).
+      - **Hardware gates** (user-driven, pending):
+        - **bee MATE-load smoothness — PENDING.** Boot MATE with default
+          `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE=on`, drag for 30 s,
+          expect `queue_submit2/s` peak < 1000/s on bee (post-Phase-A
+          baseline was 2300/s; spec target by end of B.4 is 200-400/s,
+          B.2 alone should hit 600-1000/s). User-side smoothness
+          observation: 1-second initial-drag hitch should ease (warm
+          cache loop now amortises across the frame).
+        - **bee MATE-load survival — PENDING.** Same telemetry harness;
+          `frame_builder_aborts/s = 0` throughout (no
+          new failure mode under load).
+        - **yoga / iMac / fuji regression check — PENDING.** Same drag,
+          no new `ERROR_DEVICE_LOST`, no fault chains. Expected to
+          IMPROVE on these platforms vs B.1 (cap=1 reverts to per-op
+          submit; B.2 collapses RENDER → one submit per frame).
+        - **silence dual-output regression check — PENDING.** Same
+          drag, confirm both outputs paint correctly under
+          render_composite → frame builder.
+
+    **Open follow-ups:**
+      - Q1 (op variant sizing) — measured at B.2 close;
+        `RecordedRenderComposite` is 264 B, well under the 512 B
+        budget. No Box-`rects` follow-up needed.
+      - Q3 (gate retirement) — env knob stays as kill-switch through
+        B.5.
+      - DescriptorPoolRing Mechanism 2 watermark wire-through —
+        validated via the existing `release_up_to(op.generation)` call
+        site (engine.rs:744 in `poll_retired`); B.2 doesn't add new
+        retire sites.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
