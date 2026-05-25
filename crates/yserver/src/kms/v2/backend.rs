@@ -8071,21 +8071,6 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         host_pic: u32,
     ) -> io::Result<()> {
-        // B.2 fix: a gradient may still be bound to a descriptor in an
-        // open frame builder. `GradientPicture::drop` (called by
-        // `picture_paint_remove` below) destroys the Vk image+view+
-        // memory; its `queue_wait_idle` safety net is a no-op when the
-        // referencing CB hasn't been submitted yet (the frame builder
-        // defers submit). Force a close+submit first so the CB is in
-        // flight when Drop's wait runs. Log + continue on failure —
-        // the picture entry must come out either way (no other path
-        // will retire the picture map entry).
-        if let Err(e) = self
-            .engine
-            .close_open_frame_for_non_ported_op(&mut self.store, &mut self.platform)
-        {
-            log::warn!("v2 render_free_picture: close_open_frame_for_non_ported_op failed: {e:?}");
-        }
         // Drop the record; if it was a Drawable variant, decref the
         // backing drawable in the store. SolidFill / Gradient
         // variants have no backing drawable — they own only the
