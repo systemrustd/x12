@@ -1865,6 +1865,43 @@ impl KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("render_composite_for_tests: {e:?}")))
     }
 
+    /// Phase B.2 Task 17: drive `render_fill_rectangles` directly
+    /// against `dst_xid`. The wrapper delegates to `render_composite`
+    /// with `ResolvedSource::Solid(color)` (see
+    /// `engine::render_fill_rectangles`); under sub-gate=ON this
+    /// routes through the frame builder, so two calls into the same
+    /// open frame collapse into a single submit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve in the store, or if
+    /// the engine call fails (Vk error, missing pipeline, etc.).
+    pub fn render_fill_rectangles_for_tests(
+        &mut self,
+        dst_xid: u32,
+        op: u8,
+        color: [f32; 4],
+        rects: &[crate::kms::vk::ops::render::CompositeRect],
+    ) -> Result<(), io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(io::Error::other(format!(
+                "render_fill_rectangles_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        self.engine
+            .render_fill_rectangles(
+                &mut self.store,
+                &mut self.platform,
+                op,
+                color,
+                dst_id,
+                rects,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| io::Error::other(format!("render_fill_rectangles_for_tests: {e:?}")))
+    }
+
     /// Phase B.2 Task 11: typed peek of the open frame's recorded
     /// `RenderComposite` ops' `dst_old_layout` field, in append order.
     /// Used by the second-op-in-frame overlay test to assert that

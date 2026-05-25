@@ -4167,3 +4167,117 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
     );
 }
 
+/// Phase B.2 Task 17: `render_fill_rectangles` routes through the
+/// frame builder by delegating to `render_composite` (with
+/// `ResolvedSource::Solid`). After Task 13 dropped the wrapper-level
+/// M2 close, two `render_fill_rectangles` calls into the same dst
+/// share one open frame and collapse into a single `vkQueueSubmit2`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Drain setup CBs so the per-backend counter baseline is clean.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre = be.telemetry_submit_group_flushes_for_tests();
+
+    // PictOp::Over (3) + a 3-rect run, then a 2-rect run. Both
+    // routed through render_composite → frame builder.
+    let rects_a = [
+        yserver::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 16,
+            height: 16,
+        },
+        yserver::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 16,
+            dst_y: 0,
+            width: 16,
+            height: 16,
+        },
+        yserver::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 32,
+            dst_y: 0,
+            width: 16,
+            height: 16,
+        },
+    ];
+    let rects_b = [
+        yserver::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 16,
+            width: 32,
+            height: 16,
+        },
+        yserver::kms::vk::ops::render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 32,
+            dst_y: 16,
+            width: 32,
+            height: 16,
+        },
+    ];
+
+    let r1 = be.render_fill_rectangles_for_tests(dst, 3, [1.0, 0.0, 0.0, 1.0], &rects_a);
+    let r2 = be.render_fill_rectangles_for_tests(dst, 3, [0.0, 1.0, 0.0, 1.0], &rects_b);
+
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // Reset the sub-gate BEFORE assertions (Task 11 pattern).
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    r1.expect("first render_fill_rectangles_for_tests");
+    r2.expect("second render_fill_rectangles_for_tests");
+    close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+    let post = be.telemetry_submit_group_flushes_for_tests();
+    let delta = post - pre;
+    assert_eq!(
+        delta, 1,
+        "two render_fill_rectangles in one frame must collapse via the \
+         render_composite delegate into ONE flush_submit_group (got delta={delta})",
+    );
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false through the close-replay path",
+    );
+}
+
