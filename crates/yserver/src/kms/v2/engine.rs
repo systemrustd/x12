@@ -1317,8 +1317,16 @@ impl RenderEngine {
         let record_result: Result<(), RenderError> = {
             let inner = self.inner.as_mut().expect("inner");
             let mut acc: Result<(), RenderError> = Ok(());
+            let frame_generation = open_frame.frame_generation;
             for op in &open_frame.ops {
-                if let Err(e) = emit_recorded_op_into_cb(inner, store, cb, &open_frame.pins, op) {
+                if let Err(e) = emit_recorded_op_into_cb(
+                    inner,
+                    store,
+                    cb,
+                    &open_frame.pins,
+                    frame_generation,
+                    op,
+                ) {
                     acc = Err(e);
                     break;
                 }
@@ -7665,6 +7673,7 @@ fn emit_recorded_op_into_cb(
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
     pins: &super::frame_builder::FramePinSet,
+    frame_generation: u64,
     op: &super::frame_builder::RecordedOp,
 ) -> Result<(), RenderError> {
     use super::frame_builder::RecordedOp as Op;
@@ -7749,7 +7758,7 @@ fn emit_recorded_op_into_cb(
         Op::LogicFill(lf) => emit_recorded_logic_fill_into_cb(inner, store, cb, lf),
         Op::ImageText(it) => emit_recorded_image_text_into_cb(inner, store, cb, it),
         Op::RenderTrapsOrTris(rt) => {
-            emit_recorded_render_traps_or_tris_into_cb(inner, store, cb, pins, rt)
+            emit_recorded_render_traps_or_tris_into_cb(inner, store, cb, pins, frame_generation, rt)
         }
     }
 }
@@ -8562,6 +8571,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
     pins: &super::frame_builder::FramePinSet,
+    frame_generation: u64,
     rt: &super::frame_builder::RecordedRenderTrapsOrTris,
 ) -> Result<(), RenderError> {
     use crate::kms::vk::{
@@ -8668,15 +8678,10 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         .expect("render_pipelines: ensured at append")
         .pipeline_layout();
 
-    // Allocate descriptor set FRESH via B.2 Mechanism 2 watermark from
-    // open_frame.frame_generation. `acquire_generation` was bumped at
-    // frame-open; re-use from the open frame here.
-    let frame_generation = inner
-        .frame_builder
-        .open
-        .as_ref()
-        .expect("open frame present during emit")
-        .frame_generation;
+    // Allocate descriptor set FRESH via B.2 Mechanism 2 watermark.
+    // `frame_generation` is threaded from the close path's local copy of
+    // `open_frame.frame_generation` — inner.frame_builder.open is None by
+    // the time the emit dispatch loop runs (take_open_for_close clears it).
     let descriptor_set = inner
         .render_pipelines
         .as_ref()

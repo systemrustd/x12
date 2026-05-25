@@ -5368,3 +5368,59 @@ fn v2_frame_builder_render_traps_or_tris_solid_source_replays_color() {
         "renderer_failed must remain false after Solid-src trap emit",
     );
 }
+
+/// Phase B.3 Task 12 hotfix: `emit_recorded_render_traps_or_tris_into_cb`
+/// previously read `inner.frame_builder.open.as_ref().expect(...)` to
+/// obtain `frame_generation`, but `take_open_for_close` clears that Option
+/// BEFORE the emit dispatch loop runs.  Force-closing a frame that contains
+/// a `RecordedOp::RenderTrapsOrTris` panicked on yoga MATE startup as soon
+/// as GTK XRender Trapezoids fired.
+///
+/// The fix threads `frame_generation: u64` through
+/// `emit_recorded_op_into_cb` from the close path's local variable (which
+/// holds the value after `take_open_for_close`).  This test opens a frame
+/// via `engine_render_traps_or_tris_for_tests`, force-closes it, and asserts
+/// no panic and no renderer failure.  "Didn't panic" IS the assertion.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_generation_lookup() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    be.engine_render_traps_or_tris_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 32, 32)
+        .expect("render_traps_or_tris");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must be open after render_traps_or_tris",
+    );
+
+    // Prior to the hotfix this panicked at
+    // `.expect("open frame present during emit")` inside
+    // `emit_recorded_render_traps_or_tris_into_cb` because
+    // `inner.frame_builder.open` is None by the time emit runs.
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close must not panic: frame_generation threaded through emit dispatch");
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false after hotfix-safe trap emit",
+    );
+}
