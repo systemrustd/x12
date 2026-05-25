@@ -491,7 +491,7 @@ Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced 
 
 These remain unresolved at design time and ride along to implementation:
 
-1. **`render_traps_or_tris` one-vs-two recorded ops.** Currently planned as one variant covering both stages (per N5). If the two-stage CB is too dense to fit in one payload (>512B), split into `RecordedTrapRaster` + `RecordedTrapComposite` with consistent pairing enforcement at append+emit. Re-evaluate after the body lands.
+1. **`render_traps_or_tris` payload size threshold.** N5 finalizes ONE recorded op covering both stages. The only outstanding question is the size budget: if `RecordedRenderTrapsOrTris` exceeds 512B (the size-budget assertion limit), the variant will need additional Box-wrapping of inner fields (e.g., the trap vertex pool, the clip list) to stay under the limit. NOT a structural redesign — the single-op decision is final per N5; this is a payload layout detail to settle at implementation when the actual field set is sized.
 
 2. **`logic_fill` pipeline variants.** GC logic modes (Copy, And, Or, Xor, …) map to render pipeline variants. The existing `_legacy` path handles this; ensure the via_frame_builder path's pipeline cache lookup keys on the logic mode correctly.
 
@@ -505,7 +505,7 @@ These remain unresolved at design time and ride along to implementation:
 | cow_copy_area's dispatcher wires `cow_id` to wrong DrawableStore entry | Low | High (corruption — wrong drawable's storage written) | Resolved at spec-time per N3 (cow is a regular Drawable in store). Integration test: two `cow_copy_area` calls in one frame collapse correctly and the cow's `storage.current_layout` updates via the standard `commit_close_success` walk. |
 | put_image staging-buffer Arc not pinned to the right fence (UAF if staging buffer drops before frame retires) | Low | High (GPU fault) | B.1's pin-set mechanism is proven; mirror exactly. Test with concurrent destroy of the source Pixmap mid-frame. |
 | Per-source telemetry breakdown introduces a hot-path branch | Very low | Very low (perf) | The branch is once per non_ported close (~100/s); negligible. |
-| `fill_rect_batch` decision goes wrong (over- or under-batches) | Medium | Medium (lower coalesce or extra closes) | Re-measurable: the per-source telemetry will show fill_rect vs fill_rect_batch counts; pick the option that maximizes frame-builder absorption. |
+| `fill_rect_batch` implementer splits per-rect instead of preserving per-call | Low | Medium (extra recorded ops, no behavior change in output) | Decision is final at spec time per N4: one `RecordedFillRect` per `fill_rect_batch` call carrying the entire rect slice. Splitting per-rect would be new behavior, not preservation. Reviewer enforces the rule at implementation; per-source telemetry confirms one bucket-hit per call. |
 
 ## References
 
