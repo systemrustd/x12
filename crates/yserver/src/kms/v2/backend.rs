@@ -2398,6 +2398,73 @@ impl KmsBackendV2 {
             .map_err(|e| std::io::Error::other(format!("engine_logic_fill_for_tests: {e:?}")))
     }
 
+    /// Phase B.3 Task 12 (N5): drive `engine.render_traps_or_tris` directly
+    /// against the store + platform using a DrawableId resolved from a host xid.
+    /// Uses a single-trapezoid solid-src op (PictOp 1 = Src, one trapezoid
+    /// instance, small bbox). Mirror of `render_composite_for_tests`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve in the store, or if
+    /// the engine call fails.
+    pub fn engine_render_traps_or_tris_for_tests(
+        &mut self,
+        dst_xid: u32,
+        color: [f32; 4],
+        bbox_w: u32,
+        bbox_h: u32,
+    ) -> Result<(), std::io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_render_traps_or_tris_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        // Pack one minimal trapezoid instance: 4× f32 pairs (top, bottom, left,
+        // right edges) = 32 bytes. The actual shape doesn't matter for the
+        // frame-builder collapse test — we just need a non-empty, non-zero bbox.
+        let instance_data = [0u8; 32];
+        self.engine
+            .render_traps_or_tris(
+                &mut self.store,
+                &mut self.platform,
+                1, // PictOp_Src
+                super::engine::ResolvedSource::Solid(color),
+                dst_id,
+                super::engine::TrapPrimKind::Trapezoid,
+                &instance_data,
+                1,
+                (0, 0, bbox_w, bbox_h),
+                None,
+                crate::kms::cpu_types::Repeat::Pad,
+                None,
+                0,
+                0,
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                std::io::Error::other(format!("engine_render_traps_or_tris_for_tests: {e:?}"))
+            })
+    }
+
+    /// Phase B.3 Task 12 (N5): read the lifetime
+    /// `frame_builder_close_reason_scratch_grow` counter after draining
+    /// pending flush outcomes. Used by the cross-frame mask-grow integration
+    /// test to assert that close-before-grow fires exactly once during the
+    /// 3-op (small, large, large) sequence.
+    pub fn telemetry_close_reason_scratch_grow_for_tests(&mut self) -> u64 {
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        self.telemetry
+            .lifetime
+            .frame_builder_close_reason_scratch_grow
+    }
+
     /// B.3 Task 4 — test-only: attach a synthetic PRESENT completion
     /// to the open frame's cow slot (via `engine.attach_cow_present_completion`)
     /// without a real X PRESENT client. Returns `true` if the attach

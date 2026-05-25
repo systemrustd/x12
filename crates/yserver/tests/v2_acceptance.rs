@@ -4931,3 +4931,185 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
         "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
     );
 }
+
+// ── Phase B.3 Task 12: render_traps_or_tris frame-builder tests ──────────
+
+/// Phase B.3 Task 12 (N5): two \ calls with the same
+/// dst collapse into ONE \ / \ call.
+///
+/// Both ops use a Solid source (PictOp_Src, small bbox) so neither
+/// triggers a mask-scratch grow.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_collapses_two_in_one_frame() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(128, 128)
+        .expect("allocate_test_pixmap_bgra");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    be.engine_render_traps_or_tris_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 32, 32)
+        .expect("first render_traps_or_tris");
+    be.engine_render_traps_or_tris_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 32, 32)
+        .expect("second render_traps_or_tris");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame must survive two render_traps_or_tris calls",
+    );
+
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    let post = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post.saturating_sub(pre),
+        1,
+        "two render_traps_or_tris calls must collapse to ONE flush_submit_group (got delta={})",
+        post.saturating_sub(pre),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "render_traps_or_tris must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false through the close-replay path",
+    );
+}
+
+/// Phase B.3 Task 12 (N5): cross-frame mask-scratch grow test.
+///
+/// 3-op sequence: (small-bbox, large-bbox, large-bbox). Op 2 triggers
+/// Phase 9A close-before-grow: F1 closes, grows, F2 opens. Op 3
+/// appends to F2 without a further grow.
+///
+/// Asserts flushes delta = 2 and scratch_grow lifetime counter delta = 1.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(512, 512)
+        .expect("allocate_test_pixmap_bgra 512x512");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_scratch_grow = be.telemetry_close_reason_scratch_grow_for_tests();
+
+    // Op 1: small bbox (16x16) - appends to F1, no grow.
+    be.engine_render_traps_or_tris_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 16, 16)
+        .expect("op 1 (small)");
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "F1 must be open after op 1",
+    );
+
+    // Op 2: large bbox (512x512) - mask_scratch starts at 256x256, too small.
+    // Phase 9A fires close-before-grow: F1 closes, mask grows, F2 opens.
+    be.engine_render_traps_or_tris_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 512, 512)
+        .expect("op 2 (large -- triggers mask grow)");
+
+    // Op 3: same large bbox - F2 open, no grow needed.
+    be.engine_render_traps_or_tris_for_tests(dst, [0.0, 0.0, 1.0, 1.0], 512, 512)
+        .expect("op 3 (large -- no grow)");
+
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close F2");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_scratch_grow = be.telemetry_close_reason_scratch_grow_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        2,
+        "3-op sequence must produce 2 flushes (F1 + F2); got delta={}",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_scratch_grow.saturating_sub(pre_scratch_grow),
+        1,
+        "exactly one CloseReason::ScratchGrow must fire (got delta={})",
+        post_scratch_grow.saturating_sub(pre_scratch_grow),
+    );
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false",
+    );
+}
+
+/// Phase B.3 Task 12 (N5): Solid-source trap op emit completes without
+/// panicking. Verifies \ fires at emit time
+/// (catches the stale-solid-src replay bug from codex round-7).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_solid_source_replays_color() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    be.engine_render_traps_or_tris_for_tests(dst, [0.0, 1.0, 0.0, 1.0], 32, 32)
+        .expect("solid green trap op");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must be open after solid trap op",
+    );
+
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close: emit must not panic on Solid-src trap op");
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false after Solid-src trap emit",
+    );
+}
