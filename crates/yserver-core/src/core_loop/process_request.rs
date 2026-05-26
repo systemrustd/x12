@@ -402,7 +402,25 @@ fn mirror_shape_to_host_state(
     kind: u8,
 ) {
     use yserver_protocol::x11::shape as x11shape;
-    if kind != x11shape::KIND_BOUNDING && kind != x11shape::KIND_CLIP {
+    // Mirror Bounding, Clip, AND Input shapes to the backend. Pre-fix
+    // (2026-05-26 adapta-nokto investigation): only Bounding/Clip were
+    // mirrored, so the backend's `core.shape_input` never reflected a
+    // window's SHAPE Input region. That broke v2's `cursor_inside_shape`
+    // hit-test for windows with non-default Input shapes — notably
+    // adapta-nokto's MATE panel menu, which sets a shrunken Input shape
+    // (`{x=16, y=12, w=188, h=227}` inside a 220x260 window) to make
+    // the CSS box-shadow margin click-through. Without the Input shape
+    // in the backend, `window_under_cursor` HIT the menu in its shadow
+    // zone (window-local Y < 12), the protocol-layer fanout's hit-test
+    // disagreed (it correctly excluded the shadow), and the Enter
+    // event yserver emitted on the menu's host xid got re-routed by
+    // the fanout to whatever's structurally under the cursor (the
+    // panel) — never reaching the menu's client. GTK menu hover
+    // state machine never engaged → no highlight, no click.
+    if kind != x11shape::KIND_BOUNDING
+        && kind != x11shape::KIND_CLIP
+        && kind != x11shape::KIND_INPUT
+    {
         return;
     }
     let Some(w) = state.resources.window(window) else {
