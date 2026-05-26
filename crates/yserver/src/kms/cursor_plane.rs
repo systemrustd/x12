@@ -423,6 +423,7 @@ impl CursorPlane {
     }
 
     /// True iff the plane is currently bound on at least one CRTC.
+    #[allow(dead_code)] // diagnostic accessor; no v2 production callers
     #[must_use]
     pub fn is_visible(&self) -> bool {
         self.visible.values().any(|&v| v)
@@ -435,12 +436,14 @@ impl CursorPlane {
     }
 
     /// Cursor plane width in pixels (driver-reported).
+    #[allow(dead_code)] // diagnostic accessor; no v2 production callers
     #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Cursor plane height in pixels (driver-reported).
+    #[allow(dead_code)] // diagnostic accessor; no v2 production callers
     #[must_use]
     pub fn height(&self) -> u32 {
         self.height

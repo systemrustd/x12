@@ -298,7 +298,7 @@ impl GradientPicture {
     }
 }
 
-impl crate::kms::scheduler::paint_batch::BatchResource for GradientPicture {
+impl crate::kms::v2::batch_resource::BatchResource for GradientPicture {
     fn release(self: Box<Self>, _vk: &VkContext) {
         // B.3 hotfix 2: dropping the Box drops this Arc clone.
         // If this was the last clone, GradientPictureResources::drop

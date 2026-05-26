@@ -230,7 +230,7 @@ struct SubmittedOp {
     /// slot above. Empty for ops that did not adopt a retired
     /// resource — which is the common case under B.2 (`ensure_*_old`
     /// returns `Ok(None)` when no grow fires).
-    retired_resources: Vec<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
+    retired_resources: Vec<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
 }
 
 impl SubmittedOp {
@@ -247,7 +247,7 @@ impl SubmittedOp {
     )]
     fn append_retired_scratch(
         &mut self,
-        boxed: Box<dyn crate::kms::scheduler::paint_batch::BatchResource>,
+        boxed: Box<dyn crate::kms::v2::batch_resource::BatchResource>,
     ) {
         self.retired_resources.push(boxed);
     }
@@ -257,7 +257,7 @@ impl SubmittedOp {
     /// `release(&vk)` per Box.
     fn drain_retired_scratch(
         &mut self,
-    ) -> std::vec::Drain<'_, Box<dyn crate::kms::scheduler::paint_batch::BatchResource>> {
+    ) -> std::vec::Drain<'_, Box<dyn crate::kms::v2::batch_resource::BatchResource>> {
         self.retired_resources.drain(..)
     }
 }
@@ -665,7 +665,7 @@ impl RenderEngineInner {
     /// `crates/yserver/src/kms/scheduler/paint_batch.rs:146-147`).
     /// The trait does NOT implement `Drop` for Vk-handle teardown;
     /// dropping a `Box<dyn BatchResource>` without calling
-    /// [`release`](crate::kms::scheduler::paint_batch::BatchResource::release)
+    /// [`release`](crate::kms::v2::batch_resource::BatchResource::release)
     /// would LEAK the underlying Vk handles. Every retirement path
     /// MUST call `boxed.release(&inner.vk)` explicitly.
     ///
@@ -726,7 +726,7 @@ impl RenderEngineInner {
     )]
     pub(crate) fn adopt_retired_resource_for_gpu_retirement(
         &mut self,
-        retired: Option<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
+        retired: Option<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
     ) {
         let Some(boxed) = retired else { return };
         // (a) Open frame — adopt into its pin set.
@@ -1739,7 +1739,7 @@ impl RenderEngine {
                             } = rt.src_kind
                         {
                             open_frame.pins.adopt_retired(Box::new(picture.clone())
-                                as Box<dyn crate::kms::scheduler::paint_batch::BatchResource>);
+                                as Box<dyn crate::kms::v2::batch_resource::BatchResource>);
                         }
                     }
                     inner
@@ -2223,8 +2223,9 @@ impl RenderEngine {
         };
         match state {
             PicturePaintState::Gradient(gradient) => {
-                inner.adopt_retired_resource_for_gpu_retirement(Some(Box::new(gradient)
-                    as Box<dyn crate::kms::scheduler::paint_batch::BatchResource>));
+                inner
+                    .adopt_retired_resource_for_gpu_retirement(Some(Box::new(gradient)
+                        as Box<dyn crate::kms::v2::batch_resource::BatchResource>));
             }
         }
     }

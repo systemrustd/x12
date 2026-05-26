@@ -436,43 +436,9 @@ impl RenderPipelineCache {
         Ok(p)
     }
 
-    /// Per-batch descriptor allocation. Allocates the descriptor
-    /// set from the supplied `BatchDescriptorArena` (whose chunks
-    /// live until the batch retires) and binds `src_view` (binding
-    /// 0) + `mask_view` (binding 1) + `dst_view` (binding 2),
-    /// sharing the linear sampler. Caller picks views — for "no
-    /// mask" pass the backend-shared white-mask scratch view; for
-    /// fixed-function ops that don't read dst, pass the white-mask
-    /// scratch as `dst_view` (it's unused by the shader).
-    ///
-    /// 3F-1 introduced this arena-backed variant for
-    /// `try_vk_render_composite`; 3F-2 migrated
-    /// `try_vk_render_traps_or_tris` onto it and removed the legacy
-    /// shared-pool path. All `RENDER` callers now go through this
-    /// entry point — the per-batch arena owns the pool, so resetting
-    /// for the next batch never invalidates sets still referenced by
-    /// un-submitted CB commands.
-    pub fn allocate_descriptor_for_views_into(
-        &self,
-        arena: &mut crate::kms::scheduler::batch_descriptor_arena::BatchDescriptorArena,
-        src_view: vk::ImageView,
-        mask_view: vk::ImageView,
-        dst_view: vk::ImageView,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        let set = arena.allocate_set(self.descriptor_set_layout)?;
-        write_views_into_descriptor_set(
-            self.vk.as_ref(),
-            set,
-            self.sampler,
-            src_view,
-            mask_view,
-            dst_view,
-        );
-        Ok(set)
-    }
-
-    /// Stage 5 Task 4 layer 1: ring-backed sibling of
-    /// `allocate_descriptor_for_views_into`. Allocates the descriptor
+    /// Stage 5 Task 4 layer 1: ring-backed descriptor allocation.
+    /// The arena-backed sibling went away with v1 (2026-05-26); v2
+    /// uses this exclusively. Allocates the descriptor
     /// set from the engine's long-lived `DescriptorPoolRing` (whose
     /// pools recycle on retirement) and writes the three view
     /// bindings via the shared `write_views_into_descriptor_set`
@@ -500,8 +466,8 @@ impl RenderPipelineCache {
     }
 }
 
-/// Shared between `allocate_descriptor_for_views_into` and the ring
-/// sibling. Takes a pre-allocated `vk::DescriptorSet` and writes the
+/// Used by `allocate_descriptor_for_views_into_ring`. Takes a
+/// pre-allocated `vk::DescriptorSet` and writes the
 /// three `COMBINED_IMAGE_SAMPLER` bindings (src=0, mask=1, dst=2)
 /// with the shared linear sampler.
 ///

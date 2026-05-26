@@ -1,13 +1,13 @@
-//! Rendering-model-v2 backend (Stage 1b skeleton, paint paths
-//! stubbed; spec at
+//! Rendering-model-v2 backend (spec at
 //! `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 //!
-//! Lives alongside the v1 `KmsBackend`; both implement the
-//! `Backend` trait and embed the shared `KmsCore` for protocol
-//! bookkeeping. Startup picks v1 or v2 via `YSERVER_RENDER_MODEL`
-//! (see `kms::dispatch::KmsBackendKind`).
+//! The sole rendering backend since v1 retired 2026-05-26 (Phase
+//! B.3 close). Implements the `Backend` trait directly; `lib.rs`
+//! constructs `KmsBackendV2` at startup.
 
 mod backend;
+pub(crate) mod batch_resource;
+pub(crate) mod composite_pool_ring;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;

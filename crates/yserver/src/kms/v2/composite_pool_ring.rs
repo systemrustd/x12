@@ -54,6 +54,7 @@ impl SlotTracker {
         self.in_use[slot] = false;
     }
 
+    #[cfg(test)]
     fn slots_in_use(&self) -> usize {
         self.in_use.iter().filter(|&&b| b).count()
     }
@@ -131,11 +132,6 @@ impl CompositePoolRing {
     /// `descriptor_set_layout`.
     pub fn pool_at(&self, slot: usize) -> vk::DescriptorPool {
         self.pools[slot]
-    }
-
-    /// Number of slots currently in use. Test/diagnostic helper.
-    pub fn slots_in_use(&self) -> usize {
-        self.tracker.slots_in_use()
     }
 }
 

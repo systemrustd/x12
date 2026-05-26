@@ -71,7 +71,7 @@ use super::{
 };
 use crate::kms::{
     core::KmsCore,
-    scheduler::composite_pool_ring::CompositePoolRing,
+    v2::composite_pool_ring::CompositePoolRing,
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},

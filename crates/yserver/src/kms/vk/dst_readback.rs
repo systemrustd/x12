@@ -26,7 +26,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::device::VkContext;
-use crate::kms::scheduler::paint_batch::BatchResource;
+use crate::kms::v2::batch_resource::BatchResource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DstReadbackError {

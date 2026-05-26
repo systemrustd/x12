@@ -176,7 +176,11 @@ pub fn run() -> io::Result<()> {
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
-    let mut backend = crate::kms::KmsBackendKind::open_from_env(&device_path)?;
+    // v1 retired 2026-05-26; v2 is the only rendering backend now.
+    // Previously this went through `KmsBackendKind::open_from_env` which
+    // routed on `YSERVER_RENDER_MODEL`. With v1 gone, the env knob is
+    // gone too — instantiate v2 directly.
+    let mut backend = crate::kms::v2::KmsBackendV2::open(&device_path)?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -296,7 +300,7 @@ pub fn run() -> io::Result<()> {
         rx,
         sender,
         &mut state,
-        backend.as_dyn_backend_mut(),
+        &mut backend,
         Some(listener),
         &alloc,
     );

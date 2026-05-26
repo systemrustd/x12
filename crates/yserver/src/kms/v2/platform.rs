@@ -756,8 +756,6 @@ impl PlatformBackend {
                 y: 0,
                 width: 800,
                 height: 600,
-                damage: crate::kms::scheduler::damage::OutputDamageState::new(),
-                composite_pools: None,
             }],
             fb_w: 800,
             fb_h: 600,

@@ -883,7 +883,7 @@ pub(crate) struct FramePinSet {
     /// `submitted.back` instead. The field is wired now so the
     /// helper compiles; B.3+ may populate it when mid-frame retire
     /// becomes possible.
-    pub(crate) retired_resources: Vec<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
+    pub(crate) retired_resources: Vec<Box<dyn crate::kms::v2::batch_resource::BatchResource>>,
 }
 
 impl FramePinSet {
@@ -914,7 +914,7 @@ impl FramePinSet {
     )]
     pub(crate) fn adopt_retired(
         &mut self,
-        boxed: Box<dyn crate::kms::scheduler::paint_batch::BatchResource>,
+        boxed: Box<dyn crate::kms::v2::batch_resource::BatchResource>,
     ) {
         self.retired_resources.push(boxed);
     }
@@ -954,7 +954,7 @@ mod pin_tests {
         // test never calls `release`; it only verifies bookkeeping.
         #[derive(Debug)]
         struct FakeRetired;
-        impl crate::kms::scheduler::paint_batch::BatchResource for FakeRetired {
+        impl crate::kms::v2::batch_resource::BatchResource for FakeRetired {
             fn release(self: Box<Self>, _vk: &crate::kms::vk::device::VkContext) {
                 // No-op: test never invokes this path.
             }

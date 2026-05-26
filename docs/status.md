@@ -35,11 +35,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
 - Active dev branch: `master`. All v2 work (Stages 1–4 + Stage 5
   Task 3 + Task 4 layer 1) has been fast-forwarded from
   `rendering-model-v2` → `cow-authoritative-mode` → `perf` into
-  `master`; HEAD `4ecb271`. `YSERVER_RENDER_MODEL=v2` is the
-  **boot default** as of `3afa5bd` (2026-05-17 — previously the
-  status doc claimed v2 default but `dispatch.rs` had v1 as the
-  fallthrough; three smoke sessions silently tested v1). v1
-  still selectable via `YSERVER_RENDER_MODEL=v1`.
+  `master`. **v1 retired 2026-05-26** after Phase B.3 closed
+  across the hardware matrix (bee/yoga/silence/air/nvidia). The
+  v1 `KmsBackend` struct + all its impl blocks, the `KmsBackendKind`
+  dispatcher, the `YSERVER_RENDER_MODEL` env knob, and the
+  4 stub modules (compositor / render / event / fonts) were
+  deleted: 14,596 lines removed across 14 files. What remains in
+  `kms/backend.rs` is ~650 lines of shared helpers (rasterisers,
+  wire-byte readers, `ClipMaskCache`, `OutputLayout`, `platform_init`,
+  `parse_add_glyphs`) still consumed by v2. The `kms/scheduler/`
+  subdir survives the deletion because v2 still uses
+  `damage::OutputDamageState` (as a dead-stored field on
+  `OutputLayout`) and `paint_batch::BatchResource` (the v2 frame
+  builder's retire-pin trait); a follow-up cleanup can fold those
+  into v2 proper.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
