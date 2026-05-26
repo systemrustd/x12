@@ -12,6 +12,134 @@ from.
 
 ## Input, grabs, event routing
 
+- [~] **GTK wheel scroll needs another app to open first (residual
+      after XI2-valuator-scroll fix).** Largely fixed 2026-05-15 by
+      adding XIScrollClass + scroll valuators 2/3 to the master
+      pointer's XIQueryDevice reply, emitting XI_Motion events with
+      cumulative scroll-axis values on each wheel click, and
+      reporting the current counter as the axis's `value` field so
+      mid-session clients pick up the right baseline. Caja now
+      scrolls from the first click in its default view.
+      Residual: the FIRST app a yserver session opens
+      occasionally doesn't scroll on its initial scrolls. The
+      trigger to unstick is **any scroll event reaching any GTK
+      target** — scrolling on the MATE desktop (caja-managed)
+      counts even though it produces no visible scroll. After
+      that, scrolling works everywhere for the rest of the
+      session. Non-deterministic: across three test runs, two
+      needed the warm-up and one worked first try.
+      Wire is delta-correct now (Relative mode, ±1 per click,
+      NoEmulation flag, valuator 2/3 declared). The race appears
+      to be between yserver emitting XI_Motion-with-scroll-axis
+      and GDK's XI2 device-init handshake completing — if GDK
+      hasn't finished caching the device's scroll classes when
+      the first event arrives, the event is dropped. Real Xorg
+      may avoid this by sending some initial axis state with
+      XI_HierarchyChanged or by serializing XIQueryDevice replies
+      against subsequent events.
+      User workaround: scroll once on the desktop or in any
+      other GTK app to prime. Filed for follow-up; not worth
+      blocking on.
+- [~] **Cinnamon click-to-focus replay path was incomplete on the
+      XI2 side.** Surfaced 2026-05-26 while validating
+      `cinnamon-settings`: the settings window activated on click,
+      but the clicked row/button never received the press. Trace
+      logs showed the focus-grab owner immediately sending
+      `XIAllowEvents(deviceid=2, mode=ReplayDevice)` after each
+      activation click. The first fix wired ReplayDevice through the
+      core replay helper, but the deeper bug was that
+      `XIPassiveGrabDevice` had been recorded with `pointer_mode=1`
+      unconditionally, so muffin's sync passive grabs never froze the
+      ButtonPress in the first place. yserver therefore leaked the
+      XI2 press to the unfocused target before focus activation and
+      had nothing useful to replay afterward. Fixed in the current
+      tree by preserving XI2 passive-grab modes, withholding the
+      initial XI2 ButtonPress from non-grab-owner clients when the
+      grab is synchronous, and replaying the XI2 press to the natural
+      target on `XIAllowEvents(mode=2)`. Added a regression test that
+      models the full sequence. The earlier attached-slave XI2
+      topology cleanup remains useful hardening for Cinnamon/GTK, but
+      it was not the direct cause of the dead clicks. Follow-up trace
+      data exposed a second bug in the focus path: once muffin
+      focused the toplevel, `cinnamon-settings` moved focus into an
+      inferior child window and yserver reported that as a generic
+      top-level focus loss (`FocusOut detail=NotifyAncestor`) instead
+      of the correct ancestor-chain transition (`NotifyInferior` on
+      the parent, `NotifyAncestor` on the child). Cinnamon then
+      cleared `_NET_ACTIVE_WINDOW`, so the focused window looked like
+      it was deactivating under the pointer on every click. Current
+      tree fixes both core and XI2 focus fanout to use real
+      ancestor-chain details and keeps the child as the active
+      keyboard focus; regression coverage was added for the
+      top-level -> child move. A follow-up working Xorg `x11trace`
+      showed the remaining click stream now matches closely on the
+      wire, so routing/replay/focus are no longer the obvious
+      blockers. The clearest remaining mismatch was protocol
+      negotiation: yserver still advertised XI 2.2 while Xorg
+      negotiated XI 2.4 for the same clients. Current tree now
+      negotiates `XIQueryVersion` like Xorg for a 2.4-capable
+      server, with regression coverage for 2.4/2.3 replies. Another
+      Xorg diff then exposed a second metadata gap: GTK selects
+      `XI_DeviceChangedMask` on the root window and Xorg immediately
+      sends a master-pointer `XI_DeviceChanged` event with labeled
+      button/valuator classes; yserver had been sending none, and its
+      `XIQueryDevice` pointer classes were still unlabeled. Current
+      tree now bootstraps that `XI_DeviceChanged` event and labels the
+      virtual pointer classes with Xorg-style atoms. Build/test
+      validation is green.
+
+      **Cinnamon runtime re-test 2026-05-26 PM — input path now
+      verified good, symptom moved.** Captured one-click trace of
+      `cinnamon-settings applets` clicking on the Themes category.
+      The XI2 press reaches `cinnamon-settings` cleanly (client 052
+      in the xtrace, window 0x3500006, single press + single release
+      at the correct coords). GTK's click handler runs through to
+      completion on the app side: `GrabServer` / `XIQueryPointer`×3 /
+      `UngrabServer` / `GetInputFocus` / `XIChangeCursor`, then
+      `ChangeProperty WM_NAME = "System Settings > Themes"`, then 7×
+      `MIT-SHM::Attach` for the new panel's buffers. muffin observes
+      the property change and repaints the decoration — the user
+      sees the **title bar update to "System Settings > Themes"**.
+      But `cinnamon-settings` issues no further draw calls after the
+      SHM attaches — no `PutImage`, no `RENDER::Composite`, no
+      `CopyArea` to window 0x3500006. The user sees the **categories
+      grid still rendered**; only the title changed. Symptom is
+      identical with a 2 s post-click wait and with a longer wait,
+      so it is not just panel-load latency.
+
+      Conclusion: **this is not a yserver input / focus / protocol
+      bug anymore**. cinnamon-settings's Python click handler is
+      hanging between "title updated + SHM attached" and "draw new
+      panel". Suspects (none confirmed): a blocked DBus call from
+      the panel-load code (color-manager, accountsservice, polkit),
+      a slow `Gtk.IconTheme` / theme enumeration, a GSettings read
+      that hangs because the underlying daemon misbehaves under
+      yserver. Open follow-up: capture a Python stack via
+      `py-spy dump --pid <cinnamon-settings-pid>` (or
+      `strace -p <pid> -e trace=recvmsg,poll` for the syscall view)
+      while the broken state is on screen. That will name the
+      blocked frame and we can decide whether it's a yserver-visible
+      bug after all (e.g. a missing event the daemon waits on) or
+      strictly a Cinnamon-side issue worth handing back to Cinnamon
+      upstream. Until then, downgrade priority — MATE is the
+      validated desktop, Cinnamon's click activation works on the
+      wire and the next step is process-side diagnosis.
+- [x] **GTK file-manager right-click popup offset + rubber-band
+      anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
+      `ea7c186`: the XIQueryPointer reply encoder placed the BOOL
+      `same_screen` field in byte 1 (pad0) instead of byte 32 per
+      the XI2 spec, and stuffed an extra `mask` u16 where
+      `buttons_len` belongs. Every XI2 client read
+      `same_screen=false`, which routes GTK's popup-placement
+      through the "pointer on a different screen" branch — that
+      branch treats pointer-root coords as window-local input to
+      `XTranslateCoordinates`, double-adding the window's root
+      origin. Pinpointed via x11trace capture (see
+      `just yserver-xfce-hw-trace`). The earlier "X-only by 640"
+      observation from the partial 2026-05-15 diagnosis was a
+      coincidence of single-output 1920×1080 geometry where the
+      panel was at the top; in dual-output 5120×1440 both axes
+      were misplaced.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
@@ -501,6 +629,51 @@ that the host hides for us.
       signal handler that explicitly calls the console restore
       before re-raising, and propagate the K_OFF restore through
       panic hooks too.
+- [ ] **Clean MATE logout leaves the console wedged.** Surfaced
+      2026-05-26 on M2 Asahi (Apple Silicon, AGX-V) and reproduced
+      on silence (i9 13900k + RX580 / GCN4 / RADV). Workflow: launch
+      MATE via `just yserver-mate-hw…`, log out via the MATE session
+      menu (clean session-end, not a zap). Expected: yserver
+      `Drop` runs, console returns. Observed: screen stays on the
+      last yserver frame, **`chvt` hangs** when issued from SSH,
+      `sudo kbd_mode -a` does not restore input, only a reboot
+      recovers. `dmesg` is clean (no DRM/AGX fence timeouts, no
+      `*ERROR*`), so the GPU pipeline is not wedged — the failure
+      is in userspace VT state. Both affected machines have
+      vendor-modern DRM drivers (Apple AGX kernel + Mesa AGX-V on
+      one, amdgpu/RADV/GCN4 on the other), suggesting it's not a
+      single-vendor quirk; more likely `console::Drop` /
+      `disable_output` is not getting all the way through when the
+      caller exits via the session-end path. Hypothesis to verify:
+      mate-session's terminating yserver doesn't go through the
+      signalfd `Message::Shutdown` drain (so `disable_output` /
+      `ConsoleGuard::Drop` partial-fires), OR fbcon was unbound at
+      startup and isn't being rebound on this exit path. Repro is
+      stable on both machines so a single diagnostic run with
+      strace + `/sys/class/vtconsole/vtcon*/bind` capture
+      pre/post-exit should pin it down. Recovery for now:
+      SysRq SAK (`Alt+SysRq+K`) kills the wedged session on the
+      current VT and rebuilds the console — works on silence
+      (standard PC keyboard with a SysRq key). On the MacBook (no
+      dedicated SysRq, the Fn-key remapping fights the combo), SAK
+      is impractical and the only recovery is `sudo systemctl
+      reboot` from SSH. Distinct from the SIGSEGV / SIGABRT
+      case above — this is a *clean* session-end, not a crash.
+- [x] **~~P0: KMS teardown leaves DRM state that breaks Wayland host
+      sessions.~~ FIXED via failure-path disarm (2026-05-13).**
+      Diagnosis was correct: yserver's `disable_output` left
+      framebuffers bound to CRTCs that the host Wayland compositor
+      (labwc/dms/Sway) then couldn't recover. Fix landed via the KMS
+      teardown plan
+      (`docs/superpowers/plans/2026-05-13-kms-teardown-fix.md`,
+      results at
+      `docs/superpowers/plans/2026-05-13-kms-teardown-fix-results.md`):
+      6-step shutdown sequence + per-output `disarm` paths on
+      `ScanoutBo` and `drm::buffer::Buffer` so failed atomic disables
+      no longer cascade into `destroy_framebuffer` on KMS-held FBs.
+      Hardware-validated: dms+labwc session recovers cleanly when
+      user switches back to F1 after running yserver on F3. Kernel
+      `atomic remove_fb failed with -22` WARN is gone.
 - [ ] **Atomic `disable_output` returns EINVAL on AMD Polaris
       (residual bug after the P0 fix).**
       `crates/yserver/src/drm/modeset.rs:387` builds a single atomic
