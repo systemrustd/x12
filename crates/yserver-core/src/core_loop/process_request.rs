@@ -7626,34 +7626,34 @@ fn handle_xi2_request(
             return Ok(RequestOutcome::Handled);
         }
         54 => {
-            // XIPassiveGrabDevice body: time(4) + grab_window(4) +
+            // XIPassiveGrabDevice body (per X11/extensions/XI2proto.h
+            // `xXIPassiveGrabDeviceReq`): time(4) + grab_window(4) +
             // cursor(4) + detail(4) + deviceid(2) + num_modifiers(2)
-            // + grab_type(1) + grab_mode(1) + paired_device_mode(1)
-            // + owner_events(1) + mask_len(2) + pad(2) + mask + mods.
+            // + mask_len(2) + grab_type(1) + grab_mode(1) +
+            // paired_device_mode(1) + owner_events(1) + pad1(2) +
+            // mask(mask_len*4) + modifiers(num_modifiers*4).
             //
             // GrabType: Button=0, Keycode=1, Enter=2, FocusIn=3,
             // TouchBegin=4. Button and Keycode map onto core X11
             // PassiveButtonGrab / KeyGrab; the other three are no-ops
             // for now (yserver doesn't synthesise core X11 Enter/
             // FocusIn passive grabs).
-            let (grab_window, detail, deviceid, num_modifiers, grab_type) = if body.len() >= 22 {
-                (
-                    u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
-                    u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
-                    u16::from_le_bytes([body[16], body[17]]),
-                    u16::from_le_bytes([body[18], body[19]]),
-                    body[20],
-                )
-            } else {
-                (0, 0, 0, 0, 0xff)
-            };
-            let mask_len = if body.len() >= 24 {
-                u16::from_le_bytes([body[22], body[23]]) as usize
-            } else {
-                0
-            };
-            // Modifiers tail starts after the mask (mask_len * 4 bytes).
-            let mods_start = 24 + mask_len * 4;
+            let (grab_window, detail, deviceid, num_modifiers, mask_len, grab_type) =
+                if body.len() >= 23 {
+                    (
+                        u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                        u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
+                        u16::from_le_bytes([body[16], body[17]]),
+                        u16::from_le_bytes([body[18], body[19]]),
+                        u16::from_le_bytes([body[20], body[21]]) as usize,
+                        body[22],
+                    )
+                } else {
+                    (0, 0, 0, 0, 0, 0xff)
+                };
+            // Modifiers tail starts after the header (28) and the mask
+            // (mask_len * 4 bytes).
+            let mods_start = 28 + mask_len * 4;
             let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
             if num_modifiers == 0 {
                 // "no modifiers" — single grab with modifier-mask 0.
@@ -16460,23 +16460,27 @@ mod tests {
         let _peer = install_client(&mut state, CLIENT_ID);
         let mut backend = RecordingBackend::new();
 
-        // Helper to build XIPassiveGrabDevice body.
+        // Helper to build XIPassiveGrabDevice body per
+        // `xXIPassiveGrabDeviceReq` in X11/extensions/XI2proto.h:
+        // time, grab_window, cursor, detail, deviceid, num_modifiers,
+        // mask_len, grab_type, grab_mode, paired_device_mode,
+        // owner_events, pad1, mask, modifiers.
         fn build_body(window: u32, detail: u32, grab_type: u8, modifiers: &[u32]) -> Vec<u8> {
             #[allow(clippy::cast_possible_truncation)]
             let num_modifiers = modifiers.len() as u16;
-            let mut b = Vec::with_capacity(24 + modifiers.len() * 4);
+            let mut b = Vec::with_capacity(28 + modifiers.len() * 4);
             b.extend_from_slice(&0u32.to_le_bytes()); // time
             b.extend_from_slice(&window.to_le_bytes());
             b.extend_from_slice(&0u32.to_le_bytes()); // cursor
             b.extend_from_slice(&detail.to_le_bytes());
             b.extend_from_slice(&2u16.to_le_bytes()); // deviceid (pointer; harmless for keycode)
             b.extend_from_slice(&num_modifiers.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes()); // mask_len
             b.push(grab_type);
             b.push(1); // grab_mode async
             b.push(1); // paired async
             b.push(0); // owner_events
-            b.extend_from_slice(&0u16.to_le_bytes()); // mask_len
-            b.extend_from_slice(&[0u8; 2]); // pad
+            b.extend_from_slice(&0u16.to_le_bytes()); // pad1
             for m in modifiers {
                 b.extend_from_slice(&m.to_le_bytes());
             }
@@ -16603,6 +16607,70 @@ mod tests {
                 .iter()
                 .any(|g| g.button == 1 && g.modifiers == 0x8000)
         );
+    }
+
+    /// Regression test for the XIPassiveGrabDevice field-offset bug.
+    /// `mask_len` and `grab_type` were swapped: a real client (muffin,
+    /// xfwm4) sending mask_len=2 + grab_type=Keycode(1) was mis-parsed
+    /// as grab_type=Enter(2), silently dropping every keyboard
+    /// accelerator. The body here matches `xXIPassiveGrabDeviceReq`
+    /// in `X11/extensions/XI2proto.h` byte-for-byte with mask_len=2,
+    /// which is what real WM clients send.
+    #[test]
+    fn xi_passive_grab_device_keycode_with_xi2_mask() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0051;
+        const KEYCODE: u32 = 116;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Spec-shaped body with mask_len=2 (two 4-byte mask words,
+        // matching what muffin emits for XI device-event masks).
+        let mut body = Vec::with_capacity(28 + 8 + 4);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes()); // grab_window
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&KEYCODE.to_le_bytes()); // detail
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid (keyboard)
+        body.extend_from_slice(&1u16.to_le_bytes()); // num_modifiers
+        body.extend_from_slice(&2u16.to_le_bytes()); // mask_len = 2
+        body.push(1); // grab_type = Keycode
+        body.push(1); // grab_mode async
+        body.push(1); // paired async
+        body.push(0); // owner_events
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad1
+        body.extend_from_slice(&[0u8; 8]); // mask (2 words)
+        body.extend_from_slice(&0u32.to_le_bytes()); // modifier 0
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 54,
+            length_units: 10,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("keycode grab with mask");
+
+        assert_eq!(
+            state.key_grabs.len(),
+            1,
+            "Keycode grab must be recorded — bug was misclassifying \
+             as grab_type=Enter due to swapped mask_len/grab_type"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_kc = KEYCODE as u8;
+        assert_eq!(state.key_grabs[0].keycode, expected_kc);
+        assert_eq!(state.key_grabs[0].modifiers, 0);
+        assert!(state.button_grabs.is_empty());
     }
 
     /// XFixes `SetCursorName(cursor, "name")` interns the name as an
