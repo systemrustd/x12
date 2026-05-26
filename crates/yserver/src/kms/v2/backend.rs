@@ -4819,6 +4819,7 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         height: u32,
     }
     let mut targets: Vec<DumpTarget> = Vec::new();
+    let mut window_manifest = String::new();
     {
         // Scoped read-borrow on the store + core. The borrow ends
         // at the `}` so the mutable borrows below are free to fire.
@@ -4871,6 +4872,34 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
                 height: d.storage.extent.height,
             });
         }
+        let mut windows: Vec<(u32, WindowGeometryV2)> = backend
+            .windows_v2
+            .iter()
+            .map(|(&xid, geom)| (xid, *geom))
+            .collect();
+        windows.sort_by_key(|(xid, _)| *xid);
+        for (host_xid, geom) in windows {
+            let leaf_id = backend.store.lookup(host_xid);
+            let redirected_target = leaf_id.and_then(|id| backend.store.redirected_target(id));
+            let resolved = leaf_id.and_then(|id| backend.resolve_paint_target_inner(host_xid, id));
+            let is_top_level = backend.core.top_level_order.contains(&host_xid);
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                window_manifest,
+                "host=0x{host_xid:x} parent={} top_level={} mapped={} depth={} geom=({},{} {}x{}) \
+leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?}",
+                geom.parent
+                    .map(|p| format!("0x{p:x}"))
+                    .unwrap_or_else(|| "None".to_string()),
+                is_top_level,
+                geom.mapped,
+                geom.depth,
+                geom.x,
+                geom.y,
+                geom.width,
+                geom.height,
+            );
+        }
         // Recent COW-targeted PresentPixmap sources — the bisect
         // dump for "is marco's offscreen broken, or only the
         // copy-to-COW step?" Walk in submission order (oldest
@@ -4906,6 +4935,14 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         "v2 do_dump_drawables: run={run} target_count={}",
         targets.len(),
     );
+    if !window_manifest.is_empty() {
+        let path = format!("./yserver-v2-drawable-{run}-windows.txt");
+        if let Err(e) = std::fs::write(&path, &window_manifest) {
+            log::warn!("v2 do_dump_drawables: write {path}: {e}");
+        } else {
+            log::info!("v2 do_dump_drawables: wrote {path}");
+        }
+    }
 
     let mut wrote = 0_u32;
     let mut last_err: Option<io::Error> = None;

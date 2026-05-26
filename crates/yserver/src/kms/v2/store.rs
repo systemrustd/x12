@@ -874,6 +874,16 @@ impl DrawableStore {
         self.entries.get(&id)?.redirected_target
     }
 
+    /// True when some live window drawable currently routes paint into
+    /// `candidate` via `set_redirected_target(..., Some(candidate))`.
+    /// This captures real redirected-backing identity even when the
+    /// backing was allocated through the generic pixmap path.
+    pub(crate) fn is_active_redirect_target(&self, candidate: DrawableId) -> bool {
+        self.entries
+            .values()
+            .any(|d| d.redirected_target == Some(candidate))
+    }
+
     /// Record an in-flight ticket. Coalesces: replaces any
     /// prior ticket. The Rc inner stays alive in other
     /// holders (e.g. SceneCompositor's pending-ack list) per

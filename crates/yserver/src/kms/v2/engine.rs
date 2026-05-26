@@ -924,7 +924,167 @@ pub(crate) fn set_frame_builder_render_composite_enabled_for_tests(on: bool) {
     cell.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameBuilderTraceFilter {
+    DrawableId(u64),
+    RedirectedArgbBackings,
+}
+
 impl RenderEngine {
+    fn frame_builder_trace_filter() -> Option<FrameBuilderTraceFilter> {
+        let raw = std::env::var("YSERVER_FB_TRACE_DRAWABLE_ID").ok()?;
+        let s = raw.trim();
+        if s.eq_ignore_ascii_case("redirected-argb-backings") {
+            return Some(FrameBuilderTraceFilter::RedirectedArgbBackings);
+        }
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            return u64::from_str_radix(hex, 16)
+                .ok()
+                .map(FrameBuilderTraceFilter::DrawableId);
+        }
+        s.parse::<u64>()
+            .ok()
+            .map(FrameBuilderTraceFilter::DrawableId)
+    }
+
+    fn frame_builder_trace_matches_dst(
+        store: &DrawableStore,
+        filter: FrameBuilderTraceFilter,
+        dst_id: DrawableId,
+    ) -> bool {
+        match filter {
+            FrameBuilderTraceFilter::DrawableId(raw) => dst_id.as_u64() == raw,
+            FrameBuilderTraceFilter::RedirectedArgbBackings => store
+                .get(dst_id)
+                .is_some_and(|d| d.depth == 32 && store.is_active_redirect_target(dst_id)),
+        }
+    }
+
+    fn trace_frame_ops(
+        store: &DrawableStore,
+        frame_seq: u64,
+        ops: &[super::frame_builder::RecordedOp],
+        filter: FrameBuilderTraceFilter,
+    ) {
+        use super::frame_builder::{RecordedOp, RecordedTrapSrcKind};
+
+        let hits = ops
+            .iter()
+            .filter(|op| {
+                op.dst_id().is_some_and(|dst_id| {
+                    Self::frame_builder_trace_matches_dst(store, filter, dst_id)
+                })
+            })
+            .count();
+        if hits == 0 {
+            return;
+        }
+        log::warn!(
+            target: "yserver::kms::v2::fbtrace",
+            "fbtrace frame_seq={} filter={:?} matched_ops={} total_ops={}",
+            frame_seq,
+            filter,
+            hits,
+            ops.len(),
+        );
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                RecordedOp::RenderComposite(rc)
+                    if Self::frame_builder_trace_matches_dst(store, filter, rc.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} RenderComposite dst={} op={} dst_has_alpha={} mask_ca={} rects={} clips={} src_clear={} mask_clear={} old_layout={:?}",
+                        frame_seq, idx, rc.dst_id.as_u64(), rc.op, rc.dst_has_alpha,
+                        rc.mask_component_alpha, rc.rects.len(),
+                        rc.clip_rects.as_deref().map_or(0, |r| r.len()),
+                        rc.src_clear_color.is_some(), rc.mask_clear_color.is_some(),
+                        rc.dst_old_layout,
+                    )
+                }
+                RecordedOp::CopyArea(ca)
+                    if Self::frame_builder_trace_matches_dst(store, filter, ca.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} CopyArea dst={} src={} src_off=({}, {}) dst_off=({}, {}) extent={}x{} self_overlap={} old_layouts=({:?}->{:?})",
+                        frame_seq, idx, ca.dst_id.as_u64(), ca.src_id.as_u64(),
+                        ca.src_rect.offset.x, ca.src_rect.offset.y, ca.dst_rect.offset.x,
+                        ca.dst_rect.offset.y, ca.dst_rect.extent.width, ca.dst_rect.extent.height,
+                        ca.self_overlap_scratch.is_some(), ca.src_old_layout, ca.dst_old_layout,
+                    )
+                }
+                RecordedOp::PutImage(pi)
+                    if Self::frame_builder_trace_matches_dst(store, filter, pi.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} PutImage dst={} off=({}, {}) extent={}x{} old_layout={:?}",
+                        frame_seq, idx, pi.dst_id.as_u64(), pi.dst_rect.offset.x,
+                        pi.dst_rect.offset.y, pi.dst_rect.extent.width, pi.dst_rect.extent.height,
+                        pi.dst_old_layout,
+                    )
+                }
+                RecordedOp::FillRect(fr)
+                    if Self::frame_builder_trace_matches_dst(store, filter, fr.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} FillRect dst={} rects={} color={:?} old_layout={:?}",
+                        frame_seq, idx, fr.dst_id.as_u64(), fr.rects.len(), fr.color, fr.dst_old_layout,
+                    )
+                }
+                RecordedOp::LogicFill(lf)
+                    if Self::frame_builder_trace_matches_dst(store, filter, lf.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} LogicFill dst={} mode={:?} opaque_alpha={} rects={} color={:?} old_layout={:?}",
+                        frame_seq, idx, lf.dst_id.as_u64(), lf.logic_mode, lf.opaque_alpha,
+                        lf.rects.len(), lf.color, lf.dst_old_layout,
+                    )
+                }
+                RecordedOp::ImageText(it)
+                    if Self::frame_builder_trace_matches_dst(store, filter, it.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} ImageText dst={} glyphs={} fg={:?} old_layout={:?}",
+                        frame_seq, idx, it.dst_id.as_u64(), it.glyphs.len(), it.foreground_rgba,
+                        it.dst_old_layout,
+                    )
+                }
+                RecordedOp::CompositeGlyphs(cg)
+                    if Self::frame_builder_trace_matches_dst(store, filter, cg.dst_id) =>
+                {
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} CompositeGlyphs dst={} glyphs={} clips={} fg={:?} old_layout={:?}",
+                        frame_seq, idx, cg.dst_id.as_u64(), cg.glyphs.len(), cg.clip_scissors.len(),
+                        cg.foreground_rgba, cg.dst_old_layout,
+                    )
+                }
+                RecordedOp::RenderTrapsOrTris(rt)
+                    if Self::frame_builder_trace_matches_dst(store, filter, rt.dst_id) =>
+                {
+                    let src_kind = match &rt.src_kind {
+                        RecordedTrapSrcKind::Drawable { .. } => "drawable",
+                        RecordedTrapSrcKind::Solid(_) => "solid",
+                        RecordedTrapSrcKind::Gradient { .. } => "gradient",
+                    };
+                    log::warn!(
+                        target: "yserver::kms::v2::fbtrace",
+                        "fbtrace frame_seq={} op#{} RenderTrapsOrTris dst={} op_byte={} dst_has_alpha={} src_kind={} clips={} bbox=({},{} {}x{}) old_layout={:?}",
+                        frame_seq, idx, rt.dst_id.as_u64(), rt.op_byte, rt.dst_has_alpha,
+                        src_kind, rt.clip_scissors.len(), rt.bbox_x, rt.bbox_y,
+                        rt.bbox_w, rt.bbox_h, rt.dst_old_layout,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Production constructor. Borrows the platform's `VkContext`
     /// (cloned `Arc`); CB allocation goes through the platform's
     /// shared `OpsCommandPool` on each op.
@@ -1244,6 +1404,9 @@ impl RenderEngine {
             (*open_frame_box, inner.frame_seq)
         };
         let frame_ticket = open_frame.ticket.clone();
+        if let Some(filter) = Self::frame_builder_trace_filter() {
+            Self::trace_frame_ops(store, frame_seq, &open_frame.ops, filter);
+        }
 
         // Phase B.2 Task 14: count RenderComposite ops once for the
         // telemetry close-event. `open_frame.ops` is not mutated

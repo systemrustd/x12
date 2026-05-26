@@ -779,13 +779,13 @@ yserver-mate-hw-release-trace log="warn":
 # rollups. RUST_LOG defaults to `info` so the telemetry lines come
 # through; pass `log=warn` if you need quieter output, but you'll
 # lose the rollup lines (they're info!-level).
-yserver-mate-hw-telemetry log="info":
+yserver-mate-hw-telemetry log="info,yserver::kms::v2::fbtrace=warn" drawable_id="redirected-argb-backings":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     rm -f yserver-mate.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-mate.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_FB_TRACE_DRAWABLE_ID="{{drawable_id}}" \
             target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
