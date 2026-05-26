@@ -831,10 +831,18 @@ rendercheck-ynest display="99" geometry="1024x768" timeout="600" tests="fill,dco
 # virtio-gpu KMS), polls for the X socket on :7, then runs the same
 # xts harness ynest uses. Result tree lands in xts/results/ on the
 # host because vng mounts the host rootfs --rw.
-xts-yserver scenario="Xproto" timeout="600":
+# NOTE: uses the Venus GPU-passthrough display config (same as
+# rendercheck), NOT `-device virtio-gpu-pci -display none`. The
+# headless-no-display config leaves yserver's KMS pageflips with no
+# completion event, which stalls the compose path and wedges clients
+# drawing to windows — the draw-heavy scenarios (Xlib9) hung there.
+# egl-headless gives a working display+flip path so the tests
+# complete. Timeout is generous because GetImage-heavy verification
+# runs slow under the guest's software/Venus Vulkan.
+xts-yserver scenario="Xproto" timeout="1200":
     cargo build --release --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-device virtio-gpu-pci -display none" \
+        --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh xts {{scenario}} {{timeout}}
 
 # Run rendercheck against yserver (KMS) inside virtme-ng.

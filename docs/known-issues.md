@@ -679,6 +679,28 @@ that the host hides for us.
 
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.
+- [ ] **yserver stalls under a headless virtio-gpu with no display
+      (`-display none`).** Surfaced 2026-05-26 while bringing up xts
+      `Xlib9` in vng: the `xts-yserver` recipe used
+      `-device virtio-gpu-pci -display none`, under which KMS atomic
+      pageflips never get a completion event. yserver's compose path
+      gates on flip-pending state (Stage 2f per-output gate), so with
+      no flip-done the scene loop intermittently wedges — clients
+      drawing to windows hang mid-test. Symptom in xts was a
+      deterministic stall a few test-cases in, then `Could not open
+      display :7` ABORTs for every later case (the wedged compose
+      starves new-client setup). Switching the recipe to the Venus
+      `egl-headless,gl=on` display config (a working flip path)
+      removed it: full `Xlib9` went from 4 cases + 1375 ABORT to 18
+      cases + 0 ABORT in the same time budget. The recipe is fixed;
+      the underlying robustness gap remains — yserver should not
+      livelock when pageflip completions never arrive. A
+      pageflip-timeout / degraded-present path in the compose loop
+      would harden the headless / broken-KMS case. Was repeatedly
+      misread as a "depth-4 GetImage hang" because the depth-4
+      `UnsupportedDepth` warnings were the last thing logged before
+      each stall; the depth-4 path itself is fast (verified offscreen
+      under lavapipe) and unrelated.
 
 ## Archived: ynest-era (pre-rendering-rework, KMS-direct supersedes)
 

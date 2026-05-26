@@ -63,7 +63,8 @@ draw-primitives-completeness program of work.
 
 | Date       | PASS | FAIL | UNRES | UNIN | UNTST | NOTIU | UNSUP | ABORT | Notes |
 |------------|-----:|-----:|------:|-----:|------:|------:|------:|------:|-------|
-| 2026-05-26 |   14 |   61 |     0 |   17 |     0 |     3 |     1 |  1375 | First yserver Xlib9 run. Test cases 0-3 (XClearArea, XClearWindow, XCopyArea, XCopyPlane) ran to completion; XDrawArc (case 4) and all subsequent 42 cases ABORT — yserver stops responding after XCopyPlane's depth-4 GetImage spam (`UnsupportedDepth(4)` repeats ~120 times). Separate yserver hang to investigate. No baseline yet for our actual targets (XDrawArc, XDrawLine, XFillArc, XFillPolygon, XPutImage, etc.). |
+| 2026-05-26 |   14 |   61 |     0 |   17 |     0 |     3 |     1 |  1375 | First yserver Xlib9 run, **old `-display none` recipe**. Cases 0-3 ran; XDrawArc (case 4) onward all ABORT — yserver wedges (mistaken for a depth-4 hang; really the headless-no-pageflip stall, see known-issues). |
+| 2026-05-26 |  116 |  658 |    21 |    0 |    16 |   146 |    15 |     0 | **egl-headless recipe** (Venus display config). yserver no longer wedges: 18 of 46 cases ran (XClearArea … XDrawString16) before the 900s timeout, **0 ABORT** (was 1375). FAILs are pixel-exactness vs the X rasterization spec (stroke geometry + thin-line bresenham not bit-exact), tracked separately. Full 46-case run needs a longer budget — each GetImage-heavy case is slow under the guest's software/Venus Vulkan. |
 
 ### `Xlib10` baseline 2026-05-26
 
