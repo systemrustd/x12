@@ -12,50 +12,6 @@ from.
 
 ## Input, grabs, event routing
 
-- [~] **GTK wheel scroll needs another app to open first (residual
-      after XI2-valuator-scroll fix).** Largely fixed 2026-05-15 by
-      adding XIScrollClass + scroll valuators 2/3 to the master
-      pointer's XIQueryDevice reply, emitting XI_Motion events with
-      cumulative scroll-axis values on each wheel click, and
-      reporting the current counter as the axis's `value` field so
-      mid-session clients pick up the right baseline. Caja now
-      scrolls from the first click in its default view.
-      Residual: the FIRST app a yserver session opens
-      occasionally doesn't scroll on its initial scrolls. The
-      trigger to unstick is **any scroll event reaching any GTK
-      target** — scrolling on the MATE desktop (caja-managed)
-      counts even though it produces no visible scroll. After
-      that, scrolling works everywhere for the rest of the
-      session. Non-deterministic: across three test runs, two
-      needed the warm-up and one worked first try.
-      Wire is delta-correct now (Relative mode, ±1 per click,
-      NoEmulation flag, valuator 2/3 declared). The race appears
-      to be between yserver emitting XI_Motion-with-scroll-axis
-      and GDK's XI2 device-init handshake completing — if GDK
-      hasn't finished caching the device's scroll classes when
-      the first event arrives, the event is dropped. Real Xorg
-      may avoid this by sending some initial axis state with
-      XI_HierarchyChanged or by serializing XIQueryDevice replies
-      against subsequent events.
-      User workaround: scroll once on the desktop or in any
-      other GTK app to prime. Filed for follow-up; not worth
-      blocking on.
-- [x] **GTK file-manager right-click popup offset + rubber-band
-      anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
-      `ea7c186`: the XIQueryPointer reply encoder placed the BOOL
-      `same_screen` field in byte 1 (pad0) instead of byte 32 per
-      the XI2 spec, and stuffed an extra `mask` u16 where
-      `buttons_len` belongs. Every XI2 client read
-      `same_screen=false`, which routes GTK's popup-placement
-      through the "pointer on a different screen" branch — that
-      branch treats pointer-root coords as window-local input to
-      `XTranslateCoordinates`, double-adding the window's root
-      origin. Pinpointed via x11trace capture (see
-      `just yserver-xfce-hw-trace`). The earlier "X-only by 640"
-      observation from the partial 2026-05-15 diagnosis was a
-      coincidence of single-output 1920×1080 geometry where the
-      panel was at the top; in dual-output 5120×1440 both axes
-      were misplaced.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
@@ -114,31 +70,6 @@ from.
       descendants via walk-up). This is non-spec-compliant but
       practically works for xfce/mate/marco. Re-do as deepest-target
       tracking if a real client surfaces a bug here.
-- [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
-      Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
-      smoke. After fixing two prerequisite routing bugs (the
-      `PointerEvent.child` field was hard-coded to 0 → fvwm3
-      MainMenu fired on every click; XI2 events were being stolen by
-      core grabs → GTK never saw ButtonRelease) and the XI2
-      `buttons` mask post-event semantics (was always-set on Release;
-      now correctly reflects post-event button state), gtk3-demo's
-      tree expanders work for *one* click — the first expand triggers,
-      then subsequent collapse / expand clicks on triangles don't
-      register. Trace logging confirmed the failing clicks deliver
-      byte-identical XI2 events to gtk3-demo as the working click
-      (same target, same xi2_targets, same coords ±1px, same `state`,
-      reasonable time deltas, comfortably outside double-click
-      threshold). Suspect remaining issues are XI2 wire-encoding
-      details GTK is sensitive to but we don't currently emit:
-      `flags` field is hard-coded to 0 (could need `XIPointerEmulated`
-      or similar), `valuators_len` is 0 (GTK tree views may rely on
-      X+Y valuators for hit-testing inside a column), or device-
-      hierarchy / device-changed events that GTK uses to track the
-      master pointer's identity. Not a regression of the
-      single-threaded core — same-shaped event flow worked
-      immediately for xterm, xclock, xeyes, and for gtk3-demo's main
-      list-row clicks.
-
 ## Drawing / rendering artifacts
 
 - [ ] **wezterm client content briefly blank after heavy drag
@@ -319,23 +250,6 @@ from.
       RENDER-driven damage (composite, fill rectangles, glyphs) is
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
-- [x] **~~Background image colors look R↔B swapped.~~ FIXED
-      2026-05-14.** yserver advertises X.Org-standard masks
-      (`red=0x00FF0000`, `green=0x0000FF00`, `blue=0x000000FF`) and
-      echoes the client's byte_order as `image_byte_order`, so the
-      spec-correct LE wire encoding of a ZPixmap pixel is `[B,G,R,A]`
-      — already matching the mirror's `B8G8R8A8_UNORM` layout.
-      `try_vk_put_image` was reading the wire as `[r,g,b,a]` and
-      permuting to `[b,g,r,a]`, double-swapping any spec-compliant
-      client. Fix: straight `copy_nonoverlapping` for depth-32; same
-      for depth-24 with a `byte[3]:=0xFF` post-pass to keep the
-      mirror opaque for RENDER composites. Confirmed on fuji: MATE
-      wallpaper + Chrome icon now render correctly. Test fixture
-      doc + the three PutImage/CopyArea alpha_invariant inputs
-      updated to feed wire bytes in spec order.
-- [x] **Text rendering broken under xfce4 / GTK heavy workloads.**
-      Fixed by Phase 3E text-run migration + downstream rework;
-      confirmed working on fuji 2026-05-15.
 - [ ] **PictFormat tracking + ARGB picture intent (Stage 4e
       candidate).** Surfaced as residual from Stage 4 close
       (2026-05-21). v2 forces opaque on depth-24 source pictures
@@ -534,44 +448,6 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
-- [x] **v2 atomic-commit ENOMEM storm → VK_ERROR_DEVICE_LOST
-      cascade (bee, RADV, 2560×1440).** *Resolved 2026-05-16
-      via Stage 3f.9 (root-cause attribution turned out to be
-      different from the original guess).* The cascade had
-      two upstream causes, neither of which was the
-      conjectured fb_id leak:
-      1. **`FenceTicket` false-positive leak on drop.** The
-         pre-3f.9 drop path checked only `signaled_cache`,
-         which is set explicitly via `poll_signaled` /
-         `update_signaled` calls. Tickets that dropped
-         signaled-but-stale-cache logged "leaked unsignaled
-         fence" + flipped `renderer_failed = true`, freezing
-         compose. Fix: drop falls back to
-         `vk.device.get_fence_status(...)` when the cache
-         says false.
-      2. **Failed-atomic-commit BO state reset.** The
-         pre-3f.9 recovery did `bo.state =
-         BoState::default()` immediately after a failed
-         flip, but the GPU had already executed
-         `queue_submit2` writing into that BO. The next
-         `acquire_scanout_bo` could re-record into a still-
-         being-written BO; OUT_FENCE_PTR (defensively `-1`
-         but sometimes written by the kernel anyway) was
-         never closed. This accumulated sync_file fds in the
-         kernel until ENOMEM, which the prior recovery path
-         busy-looped retrying. Fix: park failed-submit BOs
-         in `OutputSceneState.failed_submit_bos` along with
-         the compose fence; `retire_failed_submit_bos` polls
-         each tick and calls
-         `platform.recycle_failed_submit_bo` once signaled.
-         Also adds a 100 ms commit-retry back-off so we
-         don't spin under driver pressure.
-      User-reported hardware smoke post-fix: cursor tracks
-      cleanly, server no longer locks up. Status.md §3f.9
-      has the full diff scope + open follow-ups (no unit
-      tests for the recovery path, back-off is hardcoded,
-      `set_container_background_pixmap` doesn't tile).
-
 - [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
       treat any arc as a full ellipse regardless of `angle1`/`angle2`.
       Fine for xeyes (full circles) but anything that draws actual
@@ -625,21 +501,6 @@ that the host hides for us.
       signal handler that explicitly calls the console restore
       before re-raising, and propagate the K_OFF restore through
       panic hooks too.
-- [x] **~~P0: KMS teardown leaves DRM state that breaks Wayland host
-      sessions.~~ FIXED via failure-path disarm (2026-05-13).**
-      Diagnosis was correct: yserver's `disable_output` left
-      framebuffers bound to CRTCs that the host Wayland compositor
-      (labwc/dms/Sway) then couldn't recover. Fix landed via the KMS
-      teardown plan
-      (`docs/superpowers/plans/2026-05-13-kms-teardown-fix.md`,
-      results at
-      `docs/superpowers/plans/2026-05-13-kms-teardown-fix-results.md`):
-      6-step shutdown sequence + per-output `disarm` paths on
-      `ScanoutBo` and `drm::buffer::Buffer` so failed atomic disables
-      no longer cascade into `destroy_framebuffer` on KMS-held FBs.
-      Hardware-validated: dms+labwc session recovers cleanly when
-      user switches back to F1 after running yserver on F3. Kernel
-      `atomic remove_fb failed with -22` WARN is gone.
 - [ ] **Atomic `disable_output` returns EINVAL on AMD Polaris
       (residual bug after the P0 fix).**
       `crates/yserver/src/drm/modeset.rs:387` builds a single atomic
@@ -737,34 +598,6 @@ that the host hides for us.
 
 ## Extension polish
 
-- [x] **~~Composite extension: xfwm4 / picom / xcompmgr can't
-      redirect (`update=1` Manual mode rejected with BadValue).~~
-      FIXED 2026-05-14.** Surfaced as the MATE notification-area
-      applet crashing on every login (Gdk error handler aborts on
-      `BadValue, request_code 144 (Composite), serial 282`).
-      Fix shape per the previous "register the record but skip
-      `activate_redirect_backing_for`" recommendation: both
-      `update=0` (Automatic) and `update=1` (Manual) now insert the
-      redirect record, but the backing-pixmap activation is dropped
-      from all three call sites (composite handler x2 + CreateWindow
-      child-of-redirected hook). NameWindowPixmap reads the record;
-      no consumer reads the backing today. `activate_redirect_backing_for`
-      kept under `#[allow(dead_code)]` for revival when the
-      backing-as-source compositor path lands. Confirmed on fuji:
-      notification-area-applet survives login.
-- [x] **~~RANDR `SetCrtcConfig` / `SetScreenConfig` return
-      `BadValue=0` instead of a Success reply.~~ STUB-FIXED
-      2026-05-15.** Surfaced once the `minor_code` threading fix
-      made RANDR error replies legible: mate-settings-daemon's
-      display-settings restore on login was failing because the
-      dispatcher hard-rejected RANDR minors 2 (SetScreenConfig)
-      and 21 (SetCrtcConfig) with BadValue. yserver runs at a
-      fixed KMS-set mode and doesn't reconfigure outputs/CRTCs
-      on demand, so the handler now stubs a Success reply with a
-      current timestamp. The screen stays at the active mode (fine
-      for the single-mode-per-session use case); the client thinks
-      its restore worked. MATE's "couldn't save/restore display
-      settings" warning is gone.
 - [ ] **Real RANDR `SetCrtcConfig` / `SetScreenConfig` (runtime
       mode change).** The stub above always replies Success
       without actually switching modes. To honour the client's
@@ -844,41 +677,8 @@ that the host hides for us.
 
 ## Dev-loop / observability
 
-- [x] **~~X11 error encoder hard-codes `minor_code = 0` for
-      extension errors.~~ FIXED 2026-05-15.** Threaded the minor
-      opcode through 76 extension-dispatcher call sites in
-      `process_request.rs` via the existing
-      `emit_x11_error_with_minor` helper. Composite, MIT-SHM (+
-      children: CreatePixmap, PutImage, GetImage, CreateSegment),
-      PRESENT, DRI3, GLX, RANDR, XI2/XKEYBOARD, RENDER all now emit
-      error replies with the real per-extension minor. Core
-      requests stay on `emit_x11_error` with `minor=0` (spec-correct
-      for non-extension errors). Future emit_x11_error log lines
-      decode the failing minor immediately.
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.
-- [x] **~~Nested-DE startup hangs ~25s on xdg-desktop-portal
-      when launched from a host with an active GNOME-Wayland
-      session.~~ FIXED 2026-05-21.** Symptom: `just yserver-mate-hw`
-      from TTY3 (or any TTY) while the user also had a logged-in
-      GNOME-Wayland session showed panels in ~3s but caja desktop
-      icons only after ~30s. Diagnosed via
-      `STRACE=1 DBUS_MONITOR=1 just yserver-mate-hw-perf`: caja's
-      `gtk_application_register` calls
-      `dbus-daemon.StartServiceByName("org.freedesktop.portal.Desktop")`
-      which blocked the full 25 s default GDBus call timeout
-      because xdg-desktop-portal couldn't fully come up — its
-      Documents sub-portal failed to claim `/run/user/1000/doc`
-      (the host portal already had it FUSE-mounted). Root cause
-      is shared `XDG_RUNTIME_DIR=/run/user/1000` between the host
-      GNOME session and the nested mate session. Fix: every
-      nested-DE recipe (mate/xfce/cinnamon hw + trace + release +
-      telemetry + the Xephyr variants) and `tools/profile-mate.sh`
-      now sets `XDG_RUNTIME_DIR=$(mktemp -d -t yserver-run.XXXXXX)`
-      with `chmod 700` and cleans up on exit. Side effect: per-user
-      services (pulseaudio, gnome-keyring, etc.) start fresh in the
-      nested session; audio doesn't carry over from the host but
-      DE startup is sub-second to icons.
 
 ## Archived: ynest-era (pre-rendering-rework, KMS-direct supersedes)
 
