@@ -3,11 +3,13 @@
 //!
 //! Motivation: adapta-nokto theme apply + mate-cc launcher fire
 //! hundreds of `CreatePixmap`/`FreePixmap` cycles per second for
-//! 16×16 / 32×32 widget pixmaps. The kernel allocator (amdgpu /
-//! i915) serializes under that burst rate. This pool recycles the
-//! Vulkan allocations so a fresh `CreatePixmap` of a recently-freed
-//! `(extent, format)` hits the pool instead of round-tripping the
-//! kernel.
+//! 16×16 / 32×32 widget pixmaps; silence's dual-output MATE drag
+//! pushes that to 6000–9000 oversize-reject pixmaps/sec dominated
+//! by `<=256` icon-theme / Cairo intermediates (2026-05-26). The
+//! kernel allocator (amdgpu / i915) serializes under that burst
+//! rate. This pool recycles the Vulkan allocations so a fresh
+//! `CreatePixmap` of a recently-freed `(extent, format)` hits the
+//! pool instead of round-tripping the kernel.
 //!
 //! Keyed by `(width, height, format)`. `usage` is the constant
 //! `COLOR_ATTACHMENT | TRANSFER_DST | TRANSFER_SRC | SAMPLED`
@@ -33,14 +35,24 @@ use ash::vk;
 
 use crate::kms::{scheduler::paint_batch::BatchResource, vk::device::VkContext};
 
-/// Per-bucket cap. 32 BGRA8 32×32 images is ~128 KB per bucket;
-/// across ~10 active buckets the worst-case pool memory is ~1.5 MB.
+/// Per-bucket cap. 32 BGRA8 256×256 images is 8 MB per bucket
+/// (post-MAX_POOLED_DIM=256 bump 2026-05-26); across ~4–8 active
+/// buckets the worst-case pool memory is ~32–64 MB — comparable to
+/// Mesa's default userspace BO cache budget.
 pub const PIXMAP_POOL_BUCKET_CAP: usize = 32;
 
 /// Pixmaps with `width > MAX_POOLED_DIM || height > MAX_POOLED_DIM`
 /// skip the pool. Above this size reuse rates drop and per-entry
 /// memory grows quadratically.
-pub const MAX_POOLED_DIM: u32 = 128;
+///
+/// Set to 256 after silence dual-output telemetry (2026-05-26)
+/// showed 99.3 % of oversize rejects landing in the `<=256` bin at
+/// peak burst (8026/s out of 8080/s rejected). The previous 128
+/// cap predated the silence workload; the new value captures the
+/// real Cairo / GTK / icon-theme intermediates that churn under
+/// MATE drag without ballooning memory into the >512 range where
+/// reuse rates collapse and per-entry cost is 4 MB+.
+pub const MAX_POOLED_DIM: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PixmapPoolKey {

@@ -139,9 +139,8 @@ pub fn run() -> io::Result<()> {
                     // Bins match `pixmap_pool::OVERSIZE_BIN_THRESHOLDS`:
                     // `<=256`, `<=512`, `<=1024`, `>1024`.
                     let d_over_bins: [u64; 4] = std::array::from_fn(|i| {
-                        cur.total_returns_rejected_oversize_by_bucket[i].wrapping_sub(
-                            prev_pool.total_returns_rejected_oversize_by_bucket[i],
-                        )
+                        cur.total_returns_rejected_oversize_by_bucket[i]
+                            .wrapping_sub(prev_pool.total_returns_rejected_oversize_by_bucket[i])
                     });
                     log::info!(
                         "pixmap pool [1s]: takes_hit={} takes_miss={} \
