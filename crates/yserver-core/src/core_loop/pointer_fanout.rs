@@ -27,6 +27,8 @@ use crate::{
 };
 
 const XI2_MAJOR_OPCODE: u8 = 137;
+const XI2_MASTER_POINTER_DEVICE_ID: u16 = 2;
+const XI2_SLAVE_POINTER_DEVICE_ID: u16 = 4;
 
 /// Fan a host pointer event out to nested clients.
 ///
@@ -34,14 +36,12 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// redirection. Pass `false` from `AllowEvents ReplayPointer` to avoid
 /// re-checking the same passive grab that was just released.
 ///
-/// `is_replay` is set when the call comes from the `AllowEvents
-/// ReplayPointer` re-delivery path. XI2 device + raw events were already
-/// fanned out on the original libinput-driven invocation (XI2 fanout is
-/// independent of core grab state), so the replay must skip them to
-/// avoid duplicate XI2 ButtonPress delivery — caja's GTK gesture
-/// controllers interpret a back-to-back XI2 press pair as a drag from
-/// (0,0), producing a phantom rubber-band selection on a single click
-/// over the desktop.
+/// `is_replay` is set when the call comes from the core
+/// `AllowEvents(ReplayPointer)` re-delivery path. That path keeps XI2
+/// fanout suppressed because the original physical event has already
+/// been delivered to XI2 listeners. XI2 replay after `XIAllowEvents`
+/// uses `is_replay=false` because synchronous XI2 passive grabs must
+/// re-deliver the device event to the natural target.
 pub fn pointer_event_fanout_to_state(
     state: &mut ServerState,
     xid_map: &HostXidMap,
@@ -72,10 +72,7 @@ pub fn pointer_event_fanout_to_state(
 
     // Resolve the actual hit window (deepest mapped child under cursor)
     // up front. We need it for both the core-event paths below (passive
-    // grab matching, normal propagation) and for the XI2 fanout, which
-    // runs unconditionally — XI2 events flow to XI2 selectees regardless
-    // of any active core grab (the two grab spaces are independent per
-    // X11 spec).
+    // grab matching, normal propagation) and for the XI2 fanout.
     let root_hit = state.root_pointer_target_at(event.root_x, event.root_y);
     let top_level_id_opt = root_hit
         .map(|(target, _, _)| state.top_level_for_target(target))
@@ -259,7 +256,7 @@ pub fn pointer_event_fanout_to_state(
         merge_dropped(&mut dropped, extras);
     }
 
-    // ── XI2 fanout (always runs, independent of any core grab) ──────
+    // ── XI2 fanout ──────────────────────────────────────────────────
     //
     // Skip on replay: XI2 was already fanned out on the original
     // libinput-driven invocation. Re-running here would deliver a second
@@ -284,8 +281,22 @@ pub fn pointer_event_fanout_to_state(
     // original (untranslated) coords relative to the hit target.
     let (event_x, event_y) = (target_x, target_y);
     let nested_id = target;
-    let (xi2_targets, xi2_raw_targets) =
+    let (mut xi2_targets, xi2_raw_targets) =
         compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype);
+
+    // Synchronous passive XI2 button grabs freeze the device event at
+    // the grab owner until XIAllowEvents(ReplayDevice) replays it.
+    // Without this filter GTK sees the press on the unfocused target
+    // before muffin finishes focus activation, then never receives the
+    // replay it expects.
+    if handle_grabs
+        && event.kind == PointerEventKind::ButtonPress
+        && state.pointer_grab_is_passive
+        && state.frozen_pointer_event.is_some()
+        && let Some((grab_owner, _)) = state.pointer_grab
+    {
+        xi2_targets.retain(|cid| *cid == grab_owner);
+    }
 
     if matches!(
         event.kind,
@@ -318,10 +329,10 @@ pub fn pointer_event_fanout_to_state(
                 seq,
                 XI2_MAJOR_OPCODE,
                 raw_evtype,
-                2, // deviceid: Master Pointer
+                XI2_MASTER_POINTER_DEVICE_ID,
                 event.time,
                 u32::from(event.detail),
-                2, // sourceid: Master Pointer
+                XI2_SLAVE_POINTER_DEVICE_ID,
                 i32::from(event.root_x),
                 i32::from(event.root_y),
             );
@@ -378,7 +389,7 @@ pub fn pointer_event_fanout_to_state(
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,
-                2,
+                XI2_MASTER_POINTER_DEVICE_ID,
                 event.time,
                 ROOT_WINDOW,
                 nested_id,
@@ -389,7 +400,7 @@ pub fn pointer_event_fanout_to_state(
                 event.state,
                 0,
                 0,
-                2,
+                XI2_SLAVE_POINTER_DEVICE_ID,
             );
         } else {
             if let Some((axis, value)) = scroll_axis_info {
@@ -398,7 +409,7 @@ pub fn pointer_event_fanout_to_state(
                     order,
                     seq,
                     XI2_MAJOR_OPCODE,
-                    2,
+                    XI2_MASTER_POINTER_DEVICE_ID,
                     event.time,
                     ROOT_WINDOW,
                     nested_id,
@@ -407,7 +418,7 @@ pub fn pointer_event_fanout_to_state(
                     event_x,
                     event_y,
                     event.state,
-                    2,
+                    XI2_SLAVE_POINTER_DEVICE_ID,
                     axis,
                     value,
                 );
@@ -418,7 +429,7 @@ pub fn pointer_event_fanout_to_state(
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,
-                2,
+                XI2_MASTER_POINTER_DEVICE_ID,
                 event.time,
                 ROOT_WINDOW,
                 nested_id,
@@ -429,7 +440,7 @@ pub fn pointer_event_fanout_to_state(
                 event_y,
                 event.state,
                 u32::from(event.detail),
-                2,
+                XI2_SLAVE_POINTER_DEVICE_ID,
             );
         }
     });
@@ -563,7 +574,17 @@ fn compute_xi2_targets(
     }
     for (cid_u32, c) in state.clients.iter() {
         let cid = ClientId(*cid_u32);
-        let mask = xi2_mask_for_client(c, target, top_level_id, &[2, 1, 0]);
+        let mask = xi2_mask_for_client(
+            c,
+            target,
+            top_level_id,
+            &[
+                XI2_SLAVE_POINTER_DEVICE_ID,
+                XI2_MASTER_POINTER_DEVICE_ID,
+                1,
+                0,
+            ],
+        );
         if mask & (1 << xi2_evtype) != 0 {
             xi2_targets.push(cid);
         }
@@ -571,7 +592,17 @@ fn compute_xi2_targets(
             if mask & (1 << raw_evtype) != 0 {
                 xi2_raw_targets.push(cid);
             }
-            let root_mask = xi2_mask_for_client(c, ROOT_WINDOW, ROOT_WINDOW, &[1, 0, 2]);
+            let root_mask = xi2_mask_for_client(
+                c,
+                ROOT_WINDOW,
+                ROOT_WINDOW,
+                &[
+                    1,
+                    0,
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    XI2_MASTER_POINTER_DEVICE_ID,
+                ],
+            );
             if root_mask & (1 << raw_evtype) != 0 && !xi2_raw_targets.contains(&cid) {
                 xi2_raw_targets.push(cid);
             }

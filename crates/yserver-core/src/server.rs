@@ -1422,7 +1422,7 @@ fn pointer_event_fanout_inner(
             let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
                 for (cid, c) in g.clients.iter() {
-                    let mask = xi2_mask_for_client(c, target, top_level_id, &[2, 1, 0]);
+                    let mask = xi2_mask_for_client(c, target, top_level_id, &[4, 2, 1, 0]);
                     trace!(
                         "  xi2 lookup: client={} target=0x{:x} top_level=0x{:x} mask=0x{:x} want_bit={}",
                         cid,
@@ -1454,7 +1454,7 @@ fn pointer_event_fanout_inner(
                             c,
                             crate::resources::ROOT_WINDOW,
                             crate::resources::ROOT_WINDOW,
-                            &[1, 0, 2],
+                            &[1, 0, 4, 2],
                         );
                         if root_mask & (1 << raw_evtype) != 0
                             // Avoid double-add if the per-target lookup

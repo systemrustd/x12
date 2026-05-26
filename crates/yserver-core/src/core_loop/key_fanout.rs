@@ -26,6 +26,8 @@ const KEY_RELEASE_MASK: u32 = 0x0000_0002;
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
+const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
+const XI2_SLAVE_KEYBOARD_DEVICE_ID: u16 = 5;
 /// Modifier bits delivered on the wire (Shift|Lock|Control|Mod1|Mod4 = 0x004d).
 const WIRE_MODIFIER_MASK: u16 = 0x004d;
 
@@ -68,7 +70,7 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
 
     // XI2 device-event fanout. Same target window, picks clients
     // selecting the matching XI2 evtype on `(target, deviceid)` for any
-    // of the fallback device candidates [3, 1, 0].
+    // of the fallback device candidates [5, 3, 1, 0].
     let xi2_evtype = if event.pressed {
         XI2_KEYPRESS_EVTYPE
     } else {
@@ -78,7 +80,17 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            let mask = xi2_mask_for_client(client, target_window, target_window, &[3, 1, 0]);
+            let mask = xi2_mask_for_client(
+                client,
+                target_window,
+                target_window,
+                &[
+                    XI2_SLAVE_KEYBOARD_DEVICE_ID,
+                    XI2_MASTER_KEYBOARD_DEVICE_ID,
+                    1,
+                    0,
+                ],
+            );
             if mask & (1 << xi2_evtype) != 0 {
                 Some(ClientId(*id))
             } else {
@@ -94,7 +106,7 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
                 seq,
                 XI2_MAJOR_OPCODE,
                 xi2_evtype,
-                3,
+                XI2_MASTER_KEYBOARD_DEVICE_ID,
                 event.time,
                 ROOT_WINDOW,
                 target_window,
@@ -105,7 +117,7 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
                 event.event_y,
                 event.state & WIRE_MODIFIER_MASK,
                 u32::from(event.keycode),
-                3,
+                XI2_SLAVE_KEYBOARD_DEVICE_ID,
             );
         });
         merge_dropped(&mut dropped, xi2_dropped);

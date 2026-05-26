@@ -179,9 +179,9 @@ where
 ///
 /// Emits an XI2 FocusIn / FocusOut on `window` to clients selecting
 /// the matching XI2 evtype on `(window, deviceid)` for any of the
-/// fallback device candidates `[3, 1, 0]` (Master Keyboard, then
-/// AllMasterDevices, then AllDevices). The encoding is byte-order
-/// agnostic, matching the pre-lift helper.
+/// fallback device candidates `[5, 3, 1, 0]` (slave keyboard, then
+/// master keyboard, then AllMasterDevices, then AllDevices). The
+/// encoding is byte-order agnostic, matching the pre-lift helper.
 ///
 /// `xi2_major_opcode` is the XI extension's runtime-assigned major
 /// opcode (137 in the current build).
@@ -190,6 +190,8 @@ pub fn emit_xi2_focus_event_to_state(
     window: ResourceId,
     evtype: u16,
     xi2_major_opcode: u8,
+    mode: u8,
+    detail: u8,
 ) -> Vec<ClientId> {
     let targets: Vec<ClientId> = state
         .clients
@@ -197,7 +199,8 @@ pub fn emit_xi2_focus_event_to_state(
         .filter_map(|(id, client)| {
             let mask = client
                 .xi2_masks
-                .get(&(window, 3))
+                .get(&(window, 5))
+                .or_else(|| client.xi2_masks.get(&(window, 3)))
                 .or_else(|| client.xi2_masks.get(&(window, 1)))
                 .or_else(|| client.xi2_masks.get(&(window, 0)))
                 .copied()
@@ -222,8 +225,8 @@ pub fn emit_xi2_focus_event_to_state(
             3,
             0,
             window,
-            0,
-            0,
+            mode,
+            detail,
         );
     })
 }
@@ -525,7 +528,7 @@ mod tests {
         // Client 2 selects nothing on root.
         let mut peer2 = install(&mut state, 2, 0);
 
-        let dropped = emit_xi2_focus_event_to_state(&mut state, window, 9, 137);
+        let dropped = emit_xi2_focus_event_to_state(&mut state, window, 9, 137, 0, 0);
         assert!(dropped.is_empty());
 
         let mut buf = [0u8; 64];

@@ -39,6 +39,7 @@ use crate::{
         },
         pointer_fanout::pointer_event_fanout_to_state,
     },
+    crossings::{CrossingKind as TreeCrossingKind, normal_mode_crossings},
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
     server::ServerState,
@@ -49,6 +50,9 @@ use crate::{
 /// away in H1 with that file.
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
+const XI2_SERVER_MAJOR_VERSION: u16 = 2;
+const XI2_SERVER_MINOR_VERSION: u16 = 4;
+const XI2_DEVICE_CHANGED_MASK: u32 = 1 << 1;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -6933,6 +6937,7 @@ fn handle_xi2_request(
         }
         46 => {
             debug!("client {} #{} XISelectEvents", client_id.0, sequence.0);
+            let mut send_device_changed_bootstrap = false;
             if body.len() >= 8 {
                 let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
@@ -6967,18 +6972,55 @@ fn handle_xi2_request(
                             client.xi2_masks.remove(&(window, deviceid));
                         } else {
                             client.xi2_masks.insert((window, deviceid), mask);
+                            if window == ROOT_WINDOW
+                                && matches!(deviceid, 0..=2)
+                                && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+                            {
+                                send_device_changed_bootstrap = true;
+                            }
                         }
                         pos += byte_len;
                     }
                 }
             }
+            if send_device_changed_bootstrap {
+                emit_xi2_device_changed_bootstrap(
+                    state, backend, origin, client_id, sequence, XI2_MAJOR_OPCODE,
+                )?;
+            }
             return Ok(RequestOutcome::Handled);
         }
         47 => {
             debug!("client {} #{} XIQueryVersion", client_id.0, sequence.0);
+            let requested_major = body
+                .get(0..2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .unwrap_or(0);
+            let requested_minor = body
+                .get(2..4)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .unwrap_or(0);
+            if requested_major < 2 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(requested_major),
+                    47,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let (reply_major, reply_minor) = if (requested_major, requested_minor)
+                < (XI2_SERVER_MAJOR_VERSION, XI2_SERVER_MINOR_VERSION)
+            {
+                (requested_major, requested_minor)
+            } else {
+                (XI2_SERVER_MAJOR_VERSION, XI2_SERVER_MINOR_VERSION)
+            };
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
+            x11::write_u16(byte_order, &mut reply, reply_major);
+            x11::write_u16(byte_order, &mut reply, reply_minor);
             reply.extend_from_slice(&[0; 20]);
             buf.extend_from_slice(&reply);
         }
@@ -6991,10 +7033,29 @@ fn handle_xi2_request(
             // length + sourceid + a class-specific u16).
             debug!("client {} #{} XIQueryDevice", client_id.0, sequence.0);
             let le = ClientByteOrder::LittleEndian;
-            let (screen_w, screen_h) = (state.randr.screen_width, state.randr.screen_height);
+            let pointer = (
+                i32::from(state.randr.screen_width) / 2,
+                i32::from(state.randr.screen_height) / 2,
+            );
+            let button_labels = [
+                state.atoms.intern("Button Left", false),
+                state.atoms.intern("Button Middle", false),
+                state.atoms.intern("Button Right", false),
+                state.atoms.intern("Button Wheel Up", false),
+                state.atoms.intern("Button Wheel Down", false),
+                state.atoms.intern("Button Horiz Wheel Left", false),
+                state.atoms.intern("Button Horiz Wheel Right", false),
+            ];
+            let axis_labels = [
+                state.atoms.intern("Rel X", false),
+                state.atoms.intern("Rel Y", false),
+                state.atoms.intern("Rel Vert Scroll", false),
+                state.atoms.intern("Rel Horiz Scroll", false),
+            ];
 
-            fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, num_buttons: u16) {
+            fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[AtomId]) {
                 let le = ClientByteOrder::LittleEndian;
+                let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
                 let state_words = num_buttons.div_ceil(32) as usize;
                 let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
                 let units = byte_len / 4;
@@ -7003,40 +7064,31 @@ fn handle_xi2_request(
                 x11::write_u16(le, buf, sourceid);
                 x11::write_u16(le, buf, num_buttons);
                 buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
-                buf.extend(std::iter::repeat_n(0u8, 4 * num_buttons as usize)); // labels: ATOM=None
+                for atom in label_atoms {
+                    x11::write_u32(le, buf, atom.0);
+                }
             }
 
             fn write_valuator_class(
                 buf: &mut Vec<u8>,
                 sourceid: u16,
                 number: u16,
+                label_atom: AtomId,
+                min_int: i32,
                 max_int: i32,
                 mode: u8,
                 value: i32,
             ) {
                 let le = ClientByteOrder::LittleEndian;
-                // Header(8) + label(4) + min(8) + max(8) + value(8) +
-                // resolution(4) + mode+pad(4) = 44 bytes = 11 units.
-                // `mode`: 0 = Relative (scroll axes), 1 = Absolute
-                // (pointer X/Y). `value`: the axis's current value,
-                // used by GDK as the baseline for computing per-event
-                // deltas. For pointer X/Y this is 0 at startup (GDK
-                // doesn't care). For scroll axes this MUST be the
-                // current cumulative counter — otherwise GDK's first
-                // scroll Motion event yields a giant delta that the
-                // scroll handler either ignores or over-applies.
                 x11::write_u16(le, buf, 2); // type = Valuator
                 x11::write_u16(le, buf, 11);
                 x11::write_u16(le, buf, sourceid);
                 x11::write_u16(le, buf, number);
-                x11::write_u32(le, buf, 0); // label ATOM = None
-                // FP3232 min = 0.0
+                x11::write_u32(le, buf, label_atom.0);
+                x11::write_u32(le, buf, min_int as u32);
                 x11::write_u32(le, buf, 0);
-                x11::write_u32(le, buf, 0);
-                // FP3232 max = (max_int, 0)
                 x11::write_u32(le, buf, max_int as u32);
                 x11::write_u32(le, buf, 0);
-                // FP3232 value = (value, 0)
                 x11::write_u32(le, buf, value as u32);
                 x11::write_u32(le, buf, 0);
                 x11::write_u32(le, buf, 0); // resolution
@@ -7140,35 +7192,33 @@ fn handle_xi2_request(
                 let deviceid: u16 = 2;
                 let name = "Virtual core pointer";
                 let mut classes = Vec::new();
-                write_button_class(&mut classes, deviceid, 7);
+                write_button_class(&mut classes, deviceid, &button_labels);
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     0,
-                    i32::from(screen_w).max(1) - 1,
-                    1,
+                    axis_labels[0],
+                    -1,
+                    -1,
                     0,
+                    pointer.0,
                 );
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     1,
-                    i32::from(screen_h).max(1) - 1,
-                    1,
+                    axis_labels[1],
+                    -1,
+                    -1,
                     0,
+                    pointer.1,
                 );
-                // Scroll axes report the current cumulative counter
-                // so GDK uses it as the per-client baseline. Without
-                // this, GDK's first XI_Motion-with-scroll-axis event
-                // for a client that connects mid-session yields
-                // delta = (current_counter - 0) ≫ 1, which the
-                // scroll handler either drops or over-applies — the
-                // visible "wheel does nothing in caja until view-
-                // switch resyncs" symptom.
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     2,
+                    axis_labels[2],
+                    -1,
                     0,
                     0,
                     state.scroll_axis_value[0],
@@ -7177,6 +7227,8 @@ fn handle_xi2_request(
                     &mut classes,
                     deviceid,
                     3,
+                    axis_labels[3],
+                    -1,
                     0,
                     0,
                     state.scroll_axis_value[1],
@@ -7195,35 +7247,42 @@ fn handle_xi2_request(
                 write_device_info(&mut infos, deviceid, 2, 2, name, &classes, 1);
             }
 
-            // Attached slave devices. GTK/GDK builds its default seat
-            // from the XI2 master/slave hierarchy; advertising only
-            // masters leaves some GTK4/libadwaita clients with no
-            // GdkSeat/GdkDevice even though core input events work.
+            // Attached slave devices. GTK/GDK builds its seat/device
+            // tables from the XI2 master/slave hierarchy and also
+            // probes the first slave pointer for libinput-ish
+            // properties. Device 4 therefore needs to look like a
+            // generic attached pointer, not like XTEST.
             {
                 let deviceid: u16 = 4;
-                let name = "Virtual core XTEST pointer";
+                let name = "Virtual core slave pointer";
                 let mut classes = Vec::new();
-                write_button_class(&mut classes, deviceid, 7);
+                write_button_class(&mut classes, deviceid, &button_labels);
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     0,
-                    i32::from(screen_w).max(1) - 1,
-                    1,
+                    axis_labels[0],
+                    -1,
+                    -1,
                     0,
+                    pointer.0,
                 );
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     1,
-                    i32::from(screen_h).max(1) - 1,
-                    1,
+                    axis_labels[1],
+                    -1,
+                    -1,
                     0,
+                    pointer.1,
                 );
                 write_valuator_class(
                     &mut classes,
                     deviceid,
                     2,
+                    axis_labels[2],
+                    -1,
                     0,
                     0,
                     state.scroll_axis_value[0],
@@ -7232,6 +7291,8 @@ fn handle_xi2_request(
                     &mut classes,
                     deviceid,
                     3,
+                    axis_labels[3],
+                    -1,
                     0,
                     0,
                     state.scroll_axis_value[1],
@@ -7243,7 +7304,7 @@ fn handle_xi2_request(
 
             {
                 let deviceid: u16 = 5;
-                let name = "Virtual core XTEST keyboard";
+                let name = "Virtual core slave keyboard";
                 let mut classes = Vec::new();
                 write_key_class(&mut classes, deviceid);
                 write_device_info(&mut infos, deviceid, 4, 3, name, &classes, 1);
@@ -7675,15 +7736,26 @@ fn handle_xi2_request(
             // sync modes leave the grab in place. Touch modes are
             // out of scope.
             let releases_grab = matches!(mode, 0 | 2 | 3 | 5);
-            if releases_grab
+            let replay_pointer = mode == 2;
+            let should_release_passive_pointer = releases_grab
                 && state
                     .pointer_grab
                     .is_some_and(|(owner, _)| owner == client_id)
-                && state.pointer_grab_is_passive
-            {
+                && state.pointer_grab_is_passive;
+            let frozen = if should_release_passive_pointer {
+                state.frozen_pointer_event.take()
+            } else {
+                None
+            };
+            if should_release_passive_pointer {
                 state.pointer_grab = None;
                 state.pointer_grab_is_passive = false;
-                state.frozen_pointer_event = None;
+            }
+            if replay_pointer
+                && let Some(event) = frozen
+            {
+                let xid_map = backend.xid_map().clone();
+                let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, false);
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -7700,8 +7772,16 @@ fn handle_xi2_request(
             // PassiveButtonGrab / KeyGrab; the other three are no-ops
             // for now (yserver doesn't synthesise core X11 Enter/
             // FocusIn passive grabs).
-            let (grab_window, detail, deviceid, num_modifiers, mask_len, grab_type) =
-                if body.len() >= 23 {
+            let (
+                grab_window,
+                detail,
+                deviceid,
+                num_modifiers,
+                mask_len,
+                grab_type,
+                grab_mode,
+                paired_device_mode,
+            ) = if body.len() >= 25 {
                     (
                         u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
                         u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
@@ -7709,9 +7789,11 @@ fn handle_xi2_request(
                         u16::from_le_bytes([body[18], body[19]]),
                         u16::from_le_bytes([body[20], body[21]]) as usize,
                         body[22],
+                        body[23],
+                        body[24],
                     )
                 } else {
-                    (0, 0, 0, 0, 0, 0xff)
+                    (0, 0, 0, 0, 0, 0xff, 1, 1)
                 };
             // Modifiers tail starts after the header (28) and the mask
             // (mask_len * 4 bytes).
@@ -7753,7 +7835,7 @@ fn handle_xi2_request(
                             button,
                             modifiers: *modifiers,
                             event_mask: 0xFFFF_FFFF,
-                            pointer_mode: 1, // async — XI2 mode byte parsed only if needed
+                            pointer_mode: grab_mode,
                         });
                     }
                 }
@@ -7773,8 +7855,8 @@ fn handle_xi2_request(
                             keycode,
                             modifiers: *modifiers,
                             owner_events: false,
-                            pointer_mode: 1,
-                            keyboard_mode: 1,
+                            pointer_mode: paired_device_mode,
+                            keyboard_mode: grab_mode,
                         });
                     }
                 }
@@ -8888,18 +8970,46 @@ fn set_focused_window_to_state(state: &mut ServerState, client_id: ClientId, win
     for c in state.clients.values_mut() {
         c.focused_window = window;
     }
-    if prev != ROOT_WINDOW {
+    let crossings = normal_mode_crossings(state, prev, window);
+    if crossings.is_empty() {
         let _dropped =
-            emit_window_event_to_state(state, prev, FOCUS_CHANGE_MASK, |buf, seq, order| {
-                x11::encode_focus_event(buf, seq, order, false, prev);
+            emit_window_event_to_state(state, window, FOCUS_CHANGE_MASK, |buf, seq, order| {
+                x11::encode_focus_event(buf, seq, order, true, window);
             });
-        let _dropped = emit_xi2_focus_event_to_state(state, prev, 10, XI2_MAJOR_OPCODE);
+        let _dropped = emit_xi2_focus_event_to_state(state, window, 9, XI2_MAJOR_OPCODE, 0, 0);
+        return;
     }
-    let _dropped =
-        emit_window_event_to_state(state, window, FOCUS_CHANGE_MASK, |buf, seq, order| {
-            x11::encode_focus_event(buf, seq, order, true, window);
-        });
-    let _dropped = emit_xi2_focus_event_to_state(state, window, 9, XI2_MAJOR_OPCODE);
+    for crossing in crossings {
+        if crossing.window == ROOT_WINDOW {
+            continue;
+        }
+        let focus_in = matches!(crossing.kind, TreeCrossingKind::Enter);
+        let evtype = if focus_in { 9 } else { 10 };
+        let _dropped = emit_window_event_to_state(
+            state,
+            crossing.window,
+            FOCUS_CHANGE_MASK,
+            |buf, seq, order| {
+                x11::encode_focus_event_with_mode_detail(
+                    buf,
+                    seq,
+                    order,
+                    focus_in,
+                    crossing.window,
+                    0,
+                    crossing.detail,
+                );
+            },
+        );
+        let _dropped = emit_xi2_focus_event_to_state(
+            state,
+            crossing.window,
+            evtype,
+            XI2_MAJOR_OPCODE,
+            0,
+            crossing.detail,
+        );
+    }
 }
 
 fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
@@ -14120,6 +14230,127 @@ fn write_to_client(
     }
 }
 
+fn emit_xi2_device_changed_bootstrap(
+    state: &mut ServerState,
+    _backend: &mut dyn Backend,
+    _origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+) -> io::Result<()> {
+    fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[AtomId]) {
+        let le = x11::ClientByteOrder::LittleEndian;
+        let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
+        let state_words = num_buttons.div_ceil(32) as usize;
+        let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
+        x11::write_u16(le, buf, 1);
+        x11::write_u16(le, buf, (byte_len / 4) as u16);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, num_buttons);
+        buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
+        for atom in label_atoms {
+            x11::write_u32(le, buf, atom.0);
+        }
+    }
+
+    fn write_valuator_class(
+        buf: &mut Vec<u8>,
+        sourceid: u16,
+        number: u16,
+        label_atom: AtomId,
+        value: i32,
+    ) {
+        let le = x11::ClientByteOrder::LittleEndian;
+        x11::write_u16(le, buf, 2);
+        x11::write_u16(le, buf, 11);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, number);
+        x11::write_u32(le, buf, label_atom.0);
+        x11::write_u32(le, buf, u32::MAX);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, u32::MAX);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, value as u32);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, 0);
+        buf.push(0);
+        buf.extend_from_slice(&[0u8; 3]);
+    }
+
+    fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
+        let le = x11::ClientByteOrder::LittleEndian;
+        x11::write_u16(le, buf, 3);
+        x11::write_u16(le, buf, 6);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, number);
+        x11::write_u16(le, buf, scroll_type);
+        x11::write_u16(le, buf, 0);
+        x11::write_u32(le, buf, 1);
+        x11::write_u32(le, buf, 1);
+        x11::write_u32(le, buf, 0);
+    }
+
+    let pointer = (
+        i32::from(state.randr.screen_width) / 2,
+        i32::from(state.randr.screen_height) / 2,
+    );
+    let button_labels = [
+        state.atoms.intern("Button Left", false),
+        state.atoms.intern("Button Middle", false),
+        state.atoms.intern("Button Right", false),
+        state.atoms.intern("Button Wheel Up", false),
+        state.atoms.intern("Button Wheel Down", false),
+        state.atoms.intern("Button Horiz Wheel Left", false),
+        state.atoms.intern("Button Horiz Wheel Right", false),
+    ];
+    let axis_labels = [
+        state.atoms.intern("Rel X", false),
+        state.atoms.intern("Rel Y", false),
+        state.atoms.intern("Rel Vert Scroll", false),
+        state.atoms.intern("Rel Horiz Scroll", false),
+    ];
+    let mut classes = Vec::new();
+    write_button_class(&mut classes, 4, &button_labels);
+    write_valuator_class(&mut classes, 4, 0, axis_labels[0], pointer.0);
+    write_valuator_class(&mut classes, 4, 1, axis_labels[1], pointer.1);
+    write_valuator_class(
+        &mut classes,
+        4,
+        2,
+        axis_labels[2],
+        state.scroll_axis_value[0],
+    );
+    write_valuator_class(
+        &mut classes,
+        4,
+        3,
+        axis_labels[3],
+        state.scroll_axis_value[1],
+    );
+    write_scroll_class(&mut classes, 4, 2, 1);
+    write_scroll_class(&mut classes, 4, 3, 2);
+    let time = state.timestamp_now();
+
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(());
+    };
+    let mut buf = Vec::new();
+    x11::encode_xi2_device_changed_event(
+        &mut buf,
+        client.byte_order,
+        sequence,
+        major_opcode,
+        2,
+        time,
+        7,
+        4,
+        1,
+        &classes,
+    );
+    let _outcome = write_to_client(client, client_id, &buf);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -14166,6 +14397,102 @@ mod tests {
             },
         );
         b
+    }
+
+    fn read_all_available(peer: &mut UnixStream) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set_nonblocking");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("read failed: {err}"),
+            }
+        }
+        peer.set_nonblocking(false).expect("unset_nonblocking");
+        out
+    }
+
+    #[test]
+    fn xi_query_version_negotiates_up_to_server_24() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 131,
+            data: 47,
+            length_units: 2,
+        };
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[2, 0, 4, 0],
+        )
+        .expect("XIQueryVersion 2.4");
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "XIQueryVersion reply size");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2);
+        assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 4);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &[2, 0, 3, 0],
+        )
+        .expect("XIQueryVersion 2.3");
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "XIQueryVersion reply size");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2);
+        assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 3);
+    }
+
+    #[test]
+    fn xi_select_events_on_root_bootstraps_device_changed() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 131,
+            data: 46,
+            length_units: 5,
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // XIAllDevices
+        body.extend_from_slice(&1u16.to_le_bytes()); // 1 mask word
+        body.extend_from_slice(&XI2_DEVICE_CHANGED_MASK.to_le_bytes());
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XISelectEvents");
+
+        let wire = read_all_available(&mut peer);
+        let event_offset = (0..wire.len().saturating_sub(32))
+            .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
+            .expect("bootstrap XI_DeviceChanged event");
+        assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
+        assert_eq!(wire[event_offset + 16], 7, "num_classes low byte");
+        assert_eq!(wire[event_offset + 18], 4, "sourceid low byte");
     }
 
     #[test]
@@ -14215,6 +14542,112 @@ mod tests {
         // Reply opcode is 1 (Reply), sequence in bytes 2..4 little-endian.
         assert_eq!(buf[0], 1);
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 3);
+    }
+
+    #[test]
+    fn focus_move_to_child_uses_inferior_detail_for_parent_focus_out() {
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 52;
+        const TOP: u32 = 0x0350_0006;
+        const CHILD: u32 = 0x0350_0007;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(TOP),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD),
+                parent: ResourceId(TOP),
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let client = state.clients.get_mut(&CLIENT).expect("client");
+        client
+            .event_masks
+            .insert(ResourceId(TOP), FOCUS_CHANGE_MASK);
+        client
+            .event_masks
+            .insert(ResourceId(CHILD), FOCUS_CHANGE_MASK);
+        client
+            .xi2_masks
+            .insert((ResourceId(TOP), 3), (1 << 9) | (1 << 10));
+        client
+            .xi2_masks
+            .insert((ResourceId(CHILD), 3), (1 << 9) | (1 << 10));
+
+        set_focused_window_to_state(&mut state, ClientId(CLIENT), ResourceId(TOP));
+        let _ = read_all_available(&mut peer);
+
+        set_focused_window_to_state(&mut state, ClientId(CLIENT), ResourceId(CHILD));
+        let bytes = read_all_available(&mut peer);
+
+        assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
+        assert_eq!(bytes[0], 10, "first event should be core FocusOut");
+        assert_eq!(bytes[1], 2, "parent FocusOut should be NotifyInferior");
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            TOP
+        );
+        assert_eq!(bytes[32], 35, "second event should be XI2 GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([bytes[40], bytes[41]]),
+            10,
+            "XI2 FocusOut evtype"
+        );
+        assert_eq!(bytes[51], 2, "XI2 parent FocusOut should be NotifyInferior");
+        assert_eq!(
+            u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]),
+            TOP
+        );
+        assert_eq!(bytes[108], 9, "third event should be core FocusIn");
+        assert_eq!(bytes[109], 0, "child FocusIn should be NotifyAncestor");
+        assert_eq!(
+            u32::from_le_bytes([bytes[112], bytes[113], bytes[114], bytes[115]]),
+            CHILD
+        );
+        assert_eq!(bytes[140], 35, "fourth event should be XI2 GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([bytes[148], bytes[149]]),
+            9,
+            "XI2 FocusIn evtype"
+        );
+        assert_eq!(bytes[159], 0, "XI2 child FocusIn should be NotifyAncestor");
+        assert_eq!(
+            u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
+            CHILD
+        );
+        let focused = state.clients.get(&CLIENT).expect("client").focused_window;
+        assert_eq!(
+            focused,
+            ResourceId(CHILD),
+            "keyboard focus should track child"
+        );
     }
 
     #[test]
@@ -17021,6 +17454,257 @@ mod tests {
             "AsyncDevice releases the passive pointer grab"
         );
         assert!(!state.pointer_grab_is_passive);
+    }
+
+    #[test]
+    fn xi_allow_events_replay_device_replays_frozen_button_press_to_target() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const TARGET_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0010_0051;
+        const TARGET_WIN: u32 = 0x0020_0052;
+        const HOST_XID: u32 = 0xCAFE_0001;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut target_peer = install_client(&mut state, TARGET_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer
+            .set_nonblocking(true)
+            .expect("grab peer nonblocking");
+        target_peer
+            .set_nonblocking(true)
+            .expect("target peer nonblocking");
+
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(TARGET_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(TARGET_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(TARGET_WIN));
+        state
+            .clients
+            .get_mut(&TARGET_CLIENT_ID)
+            .expect("target client")
+            .event_masks
+            .insert(ResourceId(TARGET_WIN), 0x0000_0004);
+
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = true;
+        state.frozen_pointer_event = Some(HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
+            .expect("register host xid");
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.push(2); // mode = ReplayDevice
+        body.push(0); // pad
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events");
+
+        assert!(state.pointer_grab.is_none());
+        assert!(!state.pointer_grab_is_passive);
+        assert!(state.frozen_pointer_event.is_none());
+
+        let mut buf = [0u8; 32];
+        let grab_read = grab_peer.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "grab owner must not receive replayed ButtonPress; got {grab_read:?}",
+        );
+        let target_read = target_peer.read(&mut buf);
+        assert!(
+            matches!(target_read, Ok(32)),
+            "target window subscriber should receive replayed ButtonPress; got {target_read:?}",
+        );
+        assert_eq!(buf[0], 4, "event type should be ButtonPress");
+        assert_eq!(&buf[12..16], &TARGET_WIN.to_le_bytes());
+    }
+
+    #[test]
+    fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::PassiveButtonGrab,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const TARGET_CLIENT_ID: u32 = 2;
+        const TARGET_WIN: u32 = 0x0020_0052;
+        const HOST_XID: u32 = 0xCAFE_0002;
+        const XI2_BUTTON_PRESS_BIT: u32 = 1 << 4;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut target_peer = install_client(&mut state, TARGET_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer
+            .set_nonblocking(true)
+            .expect("grab peer nonblocking");
+        target_peer
+            .set_nonblocking(true)
+            .expect("target peer nonblocking");
+
+        state.resources.create_window(
+            ClientId(TARGET_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(TARGET_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(TARGET_WIN));
+        state
+            .clients
+            .get_mut(&GRAB_CLIENT_ID)
+            .expect("grab client")
+            .xi2_masks
+            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+        state
+            .clients
+            .get_mut(&TARGET_CLIENT_ID)
+            .expect("target client")
+            .xi2_masks
+            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+        state.button_grabs.push(PassiveButtonGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(TARGET_WIN),
+            button: 1,
+            modifiers: 0,
+            event_mask: 0xFFFF_FFFF,
+            pointer_mode: 0,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
+            .expect("register host xid");
+
+        let event = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x1234,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, event, true, false);
+
+        assert!(state.pointer_grab_is_passive);
+        assert!(state.frozen_pointer_event.is_some());
+
+        let mut buf = [0u8; 128];
+        let target_read = target_peer.read(&mut buf);
+        assert!(
+            matches!(target_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "sync passive XI2 grab must withhold the initial XI2 press from the target; got {target_read:?}",
+        );
+        let grab_read = grab_peer.read(&mut buf);
+        assert!(
+            matches!(grab_read, Ok(n) if n > 0),
+            "grab owner should receive the grabbed press stream; got {grab_read:?}",
+        );
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0x1234u32.to_le_bytes()); // time
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.push(2); // mode = ReplayDevice
+        body.push(0); // pad
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events");
+
+        let target_read = target_peer.read(&mut buf);
+        assert!(
+            matches!(target_read, Ok(n) if n >= 32 && buf[0] == 35),
+            "ReplayDevice must redeliver the XI2 press to the natural target; got {target_read:?}",
+        );
     }
 
     /// XFixes `SetCursorName(cursor, "name")` interns the name as an

@@ -1306,11 +1306,23 @@ pub fn encode_focus_event(
     focus_in: bool,
     window: ResourceId,
 ) {
+    encode_focus_event_with_mode_detail(out, sequence, order, focus_in, window, 0, 0);
+}
+
+pub fn encode_focus_event_with_mode_detail(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    focus_in: bool,
+    window: ResourceId,
+    mode: u8,
+    detail: u8,
+) {
     out.push(if focus_in { 9 } else { 10 });
-    out.push(0); // NotifyAncestor
+    out.push(detail);
     write_u16(order, out, sequence.0);
     write_u32(order, out, window.0);
-    out.push(0); // NotifyNormal
+    out.push(mode);
     out.extend_from_slice(&[0; 23]);
 }
 
@@ -2006,6 +2018,40 @@ pub fn encode_xi2_raw_event(
     write_u32(byte_order, out, 0);
 
     debug_assert_eq!(out.len(), 68);
+}
+
+pub fn encode_xi2_device_changed_event(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    deviceid: u16,
+    time: u32,
+    num_classes: u16,
+    sourceid: u16,
+    reason: u8,
+    classes: &[u8],
+) {
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(byte_order, out, sequence.0);
+    write_u32(
+        byte_order,
+        out,
+        u32::try_from(classes.len() / 4).unwrap_or(u32::MAX),
+    );
+    write_u16(byte_order, out, 1); // XI_DeviceChanged
+    write_u16(byte_order, out, deviceid);
+    write_u32(byte_order, out, time);
+    write_u16(byte_order, out, num_classes);
+    write_u16(byte_order, out, sourceid);
+    out.push(reason);
+    out.push(0); // pad0
+    write_u16(byte_order, out, 0); // pad1
+    write_u32(byte_order, out, 0); // pad2
+    write_u32(byte_order, out, 0); // pad3
+    out.extend_from_slice(classes);
+    debug_assert_eq!(out.len(), 32 + classes.len());
 }
 
 #[allow(clippy::too_many_arguments)]

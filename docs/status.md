@@ -111,6 +111,80 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `0c08568`; merged into master 2026-05-26. Next phase is B.4
   / B.5 work to retire SubmitGroup entirely and fold scene
   compose into the frame builder.
+- **Bugfixing kicked off 2026-05-26 PM** with Cinnamon validation.
+  First live issue: clicks inside `cinnamon-settings` were not
+  taking effect even though XI2 ButtonPress/Release reached the
+  app. Final root cause was the XI2 passive-grab path as a whole:
+  `XIPassiveGrabDevice` requests were being recorded as async
+  regardless of the requested `grab_mode`, so muffin's sync
+  click-to-focus grabs never froze the ButtonPress. yserver then
+  delivered the XI2 press to `cinnamon-settings` before focus
+  activation, `XIAllowEvents(mode=ReplayDevice)` had nothing
+  meaningful to replay, and GTK never treated the click as an
+  activation inside the now-focused window. Fixed 2026-05-26 PM by
+  (1) preserving the requested XI2 passive-grab modes, (2)
+  withholding the initial XI2 ButtonPress from non-grab-owner
+  clients when the passive grab is synchronous, and (3) replaying
+  the XI2 press to the natural target on `XIAllowEvents(mode=2)`.
+  Added a regression test that models the Cinnamon sequence
+  directly. The earlier XI2 device topology cleanup (attached slave
+  ids / non-XTEST naming / slave-first XI2 mask fallback) remains
+  in-tree as Cinnamon/GTK compatibility hardening, but it was not
+  the blocker for `cinnamon-settings` activation clicks. Rust
+  validation: `cargo check` green, `cargo test -p yserver-core
+  --lib` 392/392 green. A second live trace immediately after that
+  showed why Cinnamon still looked broken: muffin focused the
+  toplevel, then `cinnamon-settings` moved focus into its internal
+  child window, and yserver encoded that transition as a generic
+  top-level `FocusOut(detail=NotifyAncestor)` plus child
+  `FocusIn(detail=NotifyAncestor)`. Cinnamon treated the top-level
+  `FocusOut` as a real deactivation and cleared
+  `_NET_ACTIVE_WINDOW`, making the window appear to lose focus under
+  the pointer while being clicked. Fixed 2026-05-26 PM by switching
+  `SetInputFocus` fanout to the real ancestor-chain crossing
+  semantics for both core and XI2 focus events, so parent-to-child
+  transitions now emit `NotifyInferior` on the parent and preserve
+  the child as the actual keyboard focus. Added a regression test
+  that models the Cinnamon top-level -> child focus move directly.
+  Rust validation after the focus fix: `cargo check` green, `cargo
+  test -p yserver-core --lib` 393/393 green. `cargo clippy
+  --all-targets --all-features -- -D warnings` is still blocked by
+  pre-existing `doc_lazy_continuation` warnings in
+  `crates/yserver/src/kms/v2/engine.rs:118`. A working Xorg
+  `x11trace` for the same `cinnamon-settings applets` repro then
+  showed the remaining live click path was much closer than
+  expected: ButtonPress / replayed ButtonPress / ButtonRelease hit
+  the same target window on both servers, muffin sends the same
+  `SetInputFocus` + `XIAllowEvents(mode=ReplayDevice)` sequence,
+  and the app performs the same immediate `_NET_WM_USER_TIME`,
+  `XIQueryPointer`, and `XIChangeCursor` follow-up. The clearest
+  remaining protocol mismatch in the traces was `XIQueryVersion`:
+  yserver was hardcoded to advertise XI 2.2 while Xorg negotiated
+  up to XI 2.4 for these clients. Fixed 2026-05-26 PM by making
+  `XIQueryVersion` negotiate like Xorg for a 2.4-capable server
+  (return `min(requested, 2.4)`, keep `BadValue` for major < 2, and
+  encode the reply in the client's byte order). Added a focused
+  regression test covering 2.4 and 2.3 negotiation. Rust validation
+  after the protocol fix: `cargo +nightly fmt` green, `cargo check`
+  green, `cargo test -p yserver-core --lib` 394/394 green.
+  Another live Cinnamon retest still failed, and the next Xorg delta
+  turned out to be device-metadata bootstrap rather than click
+  routing: GTK selects `XI_DeviceChangedMask` on the root window and
+  Xorg immediately supplies a master-pointer `XI_DeviceChanged`
+  description with labeled button/valuator classes. yserver had been
+  sending no `XI_DeviceChanged` events at all and its `XIQueryDevice`
+  pointer classes were still unlabeled. Fixed 2026-05-26 PM by
+  enriching the virtual pointer classes with Xorg-style label atoms
+  (`Button Left`, `Rel X`, `Rel Vert Scroll`, etc.) and by emitting a
+  bootstrap `XI_DeviceChanged` for the master pointer when a client
+  selects that mask on the root window. Added a regression test for
+  the bootstrap event; Rust validation after this step: `cargo
+  +nightly fmt` green, `cargo check` green, `cargo test -p
+  yserver-core --lib` 395/395 green.
+  `cargo clippy --all-targets --all-features -- -D warnings`
+  remains blocked only by the same unrelated `engine.rs`
+  doc-comment warnings. Runtime Cinnamon re-validation still
+  pending against the XI 2.4 advertisement.
 
 ---
 
