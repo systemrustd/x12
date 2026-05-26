@@ -144,14 +144,15 @@ impl RandrState {
     }
 
     /// Returns `(min_width, min_height, max_width, max_height)`.
+    ///
+    /// Permissive static bounds matching Xorg/Xwayland convention.
+    /// SetScreenSize isn't implemented, so this is informational —
+    /// the narrow `min == max == current` range we used to advertise
+    /// made mate-settings-daemon reject its own uninitialized
+    /// (1, 1) stored monitor config on first boot.
     #[must_use]
     pub fn screen_size_range(&self) -> (u16, u16, u16, u16) {
-        (
-            self.screen_width,
-            self.screen_height,
-            self.screen_width,
-            self.screen_height,
-        )
+        (1, 1, 16384, 16384)
     }
 
     /// Resize the (single) ynest output. Multi-output reconfigure is
