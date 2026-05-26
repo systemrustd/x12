@@ -7622,7 +7622,63 @@ fn handle_xi2_request(
             return Ok(RequestOutcome::Handled);
         }
         53 => {
-            debug!("client {} #{} XIAllowEvents (stub)", client_id.0, sequence.0);
+            // XIAllowEvents body (per X11/extensions/XI2proto.h
+            // `xXIAllowEventsReq`): time(4) + deviceid(2) + mode(1) +
+            // pad(1). XI 2.2 extends with touchid(4) + grab_window(4)
+            // for touch grabs; we don't implement touch, so the
+            // extension fields are ignored.
+            //
+            // Modes per XI2 spec:
+            //   0 = XIAsyncDevice — release the grab, drop any frozen
+            //       event.
+            //   1 = XISyncDevice  — process the frozen event then
+            //       refreeze; we're always-async, so no-op.
+            //   2 = XIReplayDevice — release the grab and replay the
+            //       frozen event against the natural target,
+            //       bypassing this grab.
+            //   3 = XIAsyncPairedDevice / 4 = XISyncPair —
+            //       paired-device modes (pointer/keyboard pair).
+            //   5 = XIAsyncPair / 6 = XISyncPair (XI 2.2 form).
+            //   7 = XIAcceptTouch / 8 = XIRejectTouch (XI 2.2 touch).
+            //
+            // Why this matters: mutter/muffin/cinnamon shell install
+            // click-to-focus passive button grabs on every new top
+            // level (sync pointer mode in the original spec). On each
+            // button press, the WM examines the click, performs focus
+            // management, then calls XIAllowEvents to release the
+            // grab and let the natural target receive the click.
+            // Before this handler existed, the call was a no-op:
+            // yserver hardcodes async pointer mode on passive button
+            // grabs so the press is delivered to the natural XI2
+            // target via the grab-unaware fanout regardless, but the
+            // `state.pointer_grab` record stays set until ButtonRelease,
+            // and any motion in between is redirected to the WM
+            // instead of the natural target — confusing GTK gesture
+            // controllers.
+            let (deviceid, mode) = if body.len() >= 8 {
+                (u16::from_le_bytes([body[4], body[5]]), body[6])
+            } else {
+                (0, 0)
+            };
+            debug!(
+                "client {} #{} XIAllowEvents deviceid={} mode={}",
+                client_id.0, sequence.0, deviceid, mode
+            );
+            // AsyncDevice / ReplayDevice / paired-async modes all
+            // release the grab on the requested device. The paired-
+            // sync modes leave the grab in place. Touch modes are
+            // out of scope.
+            let releases_grab = matches!(mode, 0 | 2 | 3 | 5);
+            if releases_grab
+                && state
+                    .pointer_grab
+                    .is_some_and(|(owner, _)| owner == client_id)
+                && state.pointer_grab_is_passive
+            {
+                state.pointer_grab = None;
+                state.pointer_grab_is_passive = false;
+                state.frozen_pointer_event = None;
+            }
             return Ok(RequestOutcome::Handled);
         }
         54 => {
@@ -16671,6 +16727,59 @@ mod tests {
         assert_eq!(state.key_grabs[0].keycode, expected_kc);
         assert_eq!(state.key_grabs[0].modifiers, 0);
         assert!(state.button_grabs.is_empty());
+    }
+
+    /// `XIAllowEvents` with `mode=AsyncDevice(0)` releases the
+    /// passive grab on the calling client's device, matching what
+    /// mutter/cinnamon shell call after their click-to-focus button
+    /// grab activates. Before this handler shipped, the call was a
+    /// debug-logged stub so `state.pointer_grab` stayed pinned until
+    /// the next ButtonRelease, leaking the grab across intermediate
+    /// motion events.
+    #[test]
+    fn xi_allow_events_async_device_releases_passive_pointer_grab() {
+        const CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x0010_0051;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Seed a passive grab that has activated (set by the
+        // pointer-fanout Step 3 path when a click matched).
+        state.pointer_grab = Some((ClientId(CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = true;
+
+        // Body per `xXIAllowEventsReq`: time(4) + deviceid(2) +
+        // mode(1) + pad(1). deviceid=2 (master pointer), mode=0
+        // (AsyncDevice).
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.push(0); // mode = AsyncDevice
+        body.push(0); // pad
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events");
+
+        assert!(
+            state.pointer_grab.is_none(),
+            "AsyncDevice releases the passive pointer grab"
+        );
+        assert!(!state.pointer_grab_is_passive);
     }
 
     /// XFixes `SetCursorName(cursor, "name")` interns the name as an
