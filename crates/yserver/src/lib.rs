@@ -135,15 +135,28 @@ pub fn run() -> io::Result<()> {
                     let d_over = cur
                         .total_returns_rejected_oversize
                         .wrapping_sub(prev_pool.total_returns_rejected_oversize);
+                    // Per-bin oversize-reject breakdown by max(width, height).
+                    // Bins match `pixmap_pool::OVERSIZE_BIN_THRESHOLDS`:
+                    // `<=256`, `<=512`, `<=1024`, `>1024`.
+                    let d_over_bins: [u64; 4] = std::array::from_fn(|i| {
+                        cur.total_returns_rejected_oversize_by_bucket[i].wrapping_sub(
+                            prev_pool.total_returns_rejected_oversize_by_bucket[i],
+                        )
+                    });
                     log::info!(
                         "pixmap pool [1s]: takes_hit={} takes_miss={} \
                          returns_accepted={} returns_rejected_bucket_full={} \
-                         returns_rejected_oversize={}",
+                         returns_rejected_oversize={} \
+                         returns_rejected_oversize_by_bin[<=256,<=512,<=1024,>1024]=[{},{},{},{}]",
                         d_hit,
                         d_miss,
                         d_acc,
                         d_full,
                         d_over,
+                        d_over_bins[0],
+                        d_over_bins[1],
+                        d_over_bins[2],
+                        d_over_bins[3],
                     );
                     prev_pool = cur;
                 }

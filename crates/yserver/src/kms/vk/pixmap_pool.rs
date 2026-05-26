@@ -60,6 +60,20 @@ pub struct PooledPixmapImage {
 
 /// Pool statistics for synthetic tests + telemetry. Reset on
 /// backend shutdown.
+///
+/// `total_returns_rejected_oversize_by_bucket` partitions the
+/// oversize-reject counter by `max(width, height)` into bins to
+/// guide `MAX_POOLED_DIM` tuning: silence's dual-output workload
+/// rejected 6-9K oversized returns/sec at peak with the 2026-05-26
+/// capture, but the dominant size class was unknown without a
+/// breakdown. Bin layout:
+/// - `[0]` — `max_dim ≤ 256`
+/// - `[1]` — `max_dim ≤ 512`
+/// - `[2]` — `max_dim ≤ 1024`
+/// - `[3]` — `max_dim > 1024`
+///
+/// Indices match `OVERSIZE_BIN_THRESHOLDS` below — the helper keeps
+/// the print order stable and self-documenting.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PixmapPoolStats {
     pub total_takes_hit: u64,
@@ -67,6 +81,21 @@ pub struct PixmapPoolStats {
     pub total_returns_accepted: u64,
     pub total_returns_rejected_bucket_full: u64,
     pub total_returns_rejected_oversize: u64,
+    pub total_returns_rejected_oversize_by_bucket: [u64; 4],
+}
+
+/// Upper bound of each oversize-reject bin, indexed in lockstep
+/// with `PixmapPoolStats::total_returns_rejected_oversize_by_bucket`.
+/// The last entry (`u32::MAX`) is the "everything else" catch-all.
+pub const OVERSIZE_BIN_THRESHOLDS: [u32; 4] = [256, 512, 1024, u32::MAX];
+
+/// Map `max(width, height)` to its `OVERSIZE_BIN_THRESHOLDS` index.
+#[must_use]
+pub fn oversize_bin_index(max_dim: u32) -> usize {
+    OVERSIZE_BIN_THRESHOLDS
+        .iter()
+        .position(|&threshold| max_dim <= threshold)
+        .unwrap_or(OVERSIZE_BIN_THRESHOLDS.len() - 1)
 }
 
 /// Telemetry-side handle to the latest constructed pool. Set by
@@ -162,10 +191,11 @@ impl PixmapPool {
         entry: PooledPixmapImage,
     ) -> Result<(), PooledPixmapImage> {
         if !Self::eligible(key) {
-            self.stats
-                .lock()
-                .expect("pixmap pool stats mutex poisoned")
-                .total_returns_rejected_oversize += 1;
+            let max_dim = key.width.max(key.height);
+            let bin = oversize_bin_index(max_dim);
+            let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+            stats.total_returns_rejected_oversize += 1;
+            stats.total_returns_rejected_oversize_by_bucket[bin] += 1;
             return Err(entry);
         }
         let mut buckets = self
@@ -283,6 +313,19 @@ mod tests {
             height: MAX_POOLED_DIM,
             format: vk::Format::R8_UNORM,
         }));
+    }
+
+    #[test]
+    fn oversize_bin_index_maps_to_expected_bucket() {
+        // Bins: [<=256, <=512, <=1024, >1024]
+        assert_eq!(oversize_bin_index(129), 0);
+        assert_eq!(oversize_bin_index(256), 0);
+        assert_eq!(oversize_bin_index(257), 1);
+        assert_eq!(oversize_bin_index(512), 1);
+        assert_eq!(oversize_bin_index(513), 2);
+        assert_eq!(oversize_bin_index(1024), 2);
+        assert_eq!(oversize_bin_index(1025), 3);
+        assert_eq!(oversize_bin_index(u32::MAX), 3);
     }
 
     #[test]
