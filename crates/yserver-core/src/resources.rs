@@ -408,6 +408,15 @@ impl ResourceTable {
 
     /// First colormap entry whose `visual` matches; we currently keep
     /// one colormap per visual so this is unambiguous.
+    /// Remove a colormap from the resource table. Returns `true` if it
+    /// existed, `false` otherwise. Caller is responsible for emitting
+    /// `ColormapNotify` events and removing from `ServerState::installed_colormaps`.
+    /// The default colormap (`ROOT_COLORMAP`) is not freeable per X11
+    /// spec — caller should reject before calling.
+    pub fn free_colormap(&mut self, id: ResourceId) -> bool {
+        self.colormaps.remove(&id.0).is_some()
+    }
+
     pub fn colormap_for_visual(&self, visual: ResourceId) -> Option<&Colormap> {
         self.colormaps.values().find(|c| c.visual == visual)
     }
@@ -1984,6 +1993,21 @@ impl ResourceTable {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
         host_xid.map(|h| h.as_raw())
+    }
+
+    /// Windows whose `attributes.colormap` references `cmap`. Used by
+    /// `InstallColormap` / `UninstallColormap` to enumerate
+    /// `ColormapNotify` recipients per X11 spec ("a ColormapNotify
+    /// event is generated on every window having this colormap as
+    /// an attribute").
+    pub fn windows_with_colormap(&self, cmap: ResourceId) -> Vec<ResourceId> {
+        let mut out = Vec::new();
+        for (raw_id, w) in &self.windows {
+            if w.colormap == cmap {
+                out.push(ResourceId(*raw_id));
+            }
+        }
+        out
     }
 
     /// Top-level windows owned by `client`: windows whose parent is *not*

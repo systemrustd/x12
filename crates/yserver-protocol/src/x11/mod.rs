@@ -1403,6 +1403,34 @@ pub fn encode_map_notify_event(
     out.extend_from_slice(&[0; 19]);
 }
 
+/// Encode a ColormapNotify event (type 32, 32 bytes).
+///
+/// Generated when a colormap is installed or uninstalled, or when a
+/// window's `CWColormap` attribute changes. `colormap = ResourceId(0)`
+/// indicates the attribute changed to `None`.
+///
+/// `new = true` means the event is reporting that the window's
+/// `colormap` attribute was changed (e.g. via `ChangeWindowAttributes`);
+/// `false` reports an install / uninstall on the existing attribute.
+pub fn encode_colormap_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    window: ResourceId,
+    colormap: ResourceId,
+    new: bool,
+    installed: bool,
+) {
+    out.push(32); // ColormapNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window.0);
+    write_u32(order, out, colormap.0);
+    out.push(u8::from(new));
+    out.push(u8::from(installed)); // state: 1 = Installed, 0 = Uninstalled
+    out.extend_from_slice(&[0; 18]);
+}
+
 pub fn encode_create_notify_event(
     out: &mut Vec<u8>,
     sequence: SequenceNumber,
@@ -4817,6 +4845,7 @@ pub mod error {
     pub const BAD_DRAWABLE: u8 = 9;
     pub const BAD_ACCESS: u8 = 10;
     pub const BAD_ALLOC: u8 = 11;
+    pub const BAD_COLORMAP: u8 = 12;
     pub const BAD_GC: u8 = 13;
     pub const BAD_ID_CHOICE: u8 = 14;
     pub const BAD_NAME: u8 = 15;

@@ -306,6 +306,14 @@ pub struct ServerState {
     /// reads the cumulative value off each XI_Motion-with-scroll-
     /// axis event and computes deltas from the previous sample.
     pub scroll_axis_value: [i32; 2],
+    /// Installed colormaps in install order (oldest first). Capacity
+    /// is the server's max installed minimum; we only have a single
+    /// hardware colormap (TrueColor) so the list mostly mirrors the
+    /// current focus colormap. Read by `ListInstalledColormaps` and
+    /// mutated by `InstallColormap` / `UninstallColormap`. Seeded with
+    /// `ROOT_COLORMAP` at startup per X11 spec ("the default colormap
+    /// for the screen is installed when the server first starts up").
+    pub installed_colormaps: Vec<ResourceId>,
 }
 
 /// Server-side key auto-repeat. Carries the original `HostKeyEvent`
@@ -408,6 +416,7 @@ impl ServerState {
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
             scroll_axis_value: [0; 2],
+            installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
         }
     }
 

@@ -208,10 +208,13 @@ pub fn process_request(
         // ── stub replies for opcodes that need a reply but state is trivial ──
         39 => handle_get_motion_events(state, client_id, sequence),
         52 => handle_get_font_path(state, client_id, sequence),
-        83 => handle_list_installed_colormaps(state, client_id, sequence),
+        83 => handle_list_installed_colormaps(state, client_id, sequence, body),
         // ── colormap lifecycle (BadIDChoice on duplicate ID) ──
         78 => handle_create_colormap(state, client_id, sequence, body),
+        79 => handle_free_colormap(state, client_id, sequence, body),
         80 => handle_copy_colormap_and_free(state, client_id, sequence, body),
+        81 => handle_install_colormap(state, client_id, sequence, body),
+        82 => handle_uninstall_colormap(state, client_id, sequence, body),
         // ── SetCloseDownMode: validate mode (0/1/2 valid) ──
         112 => handle_set_close_down_mode(state, client_id, sequence, header),
         // ── KillClient (AllTemporary or by resource owner) ──
@@ -9333,19 +9336,209 @@ fn handle_get_font_path(
 }
 
 /// ListInstalledColormaps (83): reply with 0 colormaps.
+/// Emit `ColormapNotify(window, cmap, new=false, installed=…)` to every
+/// window whose `attributes.colormap == cmap`, for clients subscribed
+/// with the ColormapChange event mask bit (`1 << 23`).
+fn emit_colormap_notify_for(state: &mut ServerState, cmap: ResourceId, installed: bool) {
+    let windows = state.resources.windows_with_colormap(cmap);
+    for w in windows {
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+            state,
+            w,
+            0x0080_0000,
+            |buf, seq, order| {
+                x11::encode_colormap_notify_event(buf, seq, order, w, cmap, false, installed);
+            },
+        );
+    }
+}
+
+/// Restore the default colormap to the installed list if a prior
+/// uninstall / free emptied it. X11 spec: "Initially, the default
+/// colormap for a screen is installed" plus the server may implicitly
+/// install required colormaps; ROOT_COLORMAP is the lone required
+/// entry on our TrueColor setup.
+fn ensure_default_colormap_installed(state: &mut ServerState) {
+    if !state.installed_colormaps.is_empty() {
+        return;
+    }
+    let root = crate::resources::ROOT_COLORMAP;
+    state.installed_colormaps.push(root);
+    emit_colormap_notify_for(state, root, true);
+}
+
+/// InstallColormap (81): mark a colormap as installed and emit
+/// `ColormapNotify(Installed)` on every window that uses it. On a
+/// TrueColor server this is bookkeeping only — the hardware colormap
+/// never actually changes — but clients (and xts) still observe the
+/// notify chain.
+fn handle_install_colormap(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 4 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let cmap = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    debug!(
+        "client {} #{} InstallColormap 0x{:x}",
+        client_id.0, sequence.0, cmap.0
+    );
+    if state.resources.colormap(cmap).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            cmap.0,
+            81,
+        );
+    }
+    if state.installed_colormaps.contains(&cmap) {
+        return Ok(RequestOutcome::Handled);
+    }
+    // Capacity = `max_installed_maps = 1` (matches the SETUP advertise).
+    // Evict oldest to make room — its own `ColormapNotify(Uninstalled)`
+    // fans out before the new install's notify.
+    if !state.installed_colormaps.is_empty() {
+        let evicted = state.installed_colormaps.remove(0);
+        emit_colormap_notify_for(state, evicted, false);
+    }
+    state.installed_colormaps.push(cmap);
+    emit_colormap_notify_for(state, cmap, true);
+    Ok(RequestOutcome::Handled)
+}
+
+/// FreeColormap (79): destroy the colormap resource. Uninstalls it
+/// first if installed (emitting `ColormapNotify(Uninstalled)`). The
+/// default colormap is not freeable — BadColor per spec.
+fn handle_free_colormap(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 4 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let cmap = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    debug!(
+        "client {} #{} FreeColormap 0x{:x}",
+        client_id.0, sequence.0, cmap.0
+    );
+    if cmap == crate::resources::ROOT_COLORMAP || state.resources.colormap(cmap).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            cmap.0,
+            79,
+        );
+    }
+    let was_installed = state.installed_colormaps.contains(&cmap);
+    state.installed_colormaps.retain(|c| *c != cmap);
+    if was_installed {
+        emit_colormap_notify_for(state, cmap, false);
+    }
+    state.resources.free_colormap(cmap);
+    ensure_default_colormap_installed(state);
+    Ok(RequestOutcome::Handled)
+}
+
+/// UninstallColormap (82): symmetric to `InstallColormap`. Uninstalling
+/// the default colormap is allowed but the server implicitly re-installs
+/// it later when focus changes; we model the bookkeeping faithfully.
+fn handle_uninstall_colormap(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 4 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let cmap = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    debug!(
+        "client {} #{} UninstallColormap 0x{:x}",
+        client_id.0, sequence.0, cmap.0
+    );
+    if state.resources.colormap(cmap).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            cmap.0,
+            82,
+        );
+    }
+    let before = state.installed_colormaps.len();
+    state.installed_colormaps.retain(|c| *c != cmap);
+    if state.installed_colormaps.len() == before {
+        return Ok(RequestOutcome::Handled);
+    }
+    emit_colormap_notify_for(state, cmap, false);
+    ensure_default_colormap_installed(state);
+    Ok(RequestOutcome::Handled)
+}
+
 fn handle_list_installed_colormaps(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    // Body's window xid scopes the reply to the window's screen.
+    // yserver has a single screen so the list is server-global, but
+    // we still validate the xid — xts probes BadWindow on a freed xid.
+    let window = if body.len() >= 4 {
+        ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+    } else {
+        ResourceId(0)
+    };
     debug!(
-        "client {} #{} ListInstalledColormaps",
-        client_id.0, sequence.0
+        "client {} #{} ListInstalledColormaps 0x{:x}",
+        client_id.0, sequence.0, window.0
     );
+    if state.resources.window(window).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            window.0,
+            83,
+        );
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    let byte_order = client.byte_order;
+    let installed = state.installed_colormaps.clone();
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    // Layout: reply(1) pad(1) seq(2) length=N(4) nColormaps u16(2)
+    //         pad(22)  colormaps u32[N]
+    // Length field counts u32 units past the 32-byte fixed header.
+    let length_units = u32::try_from(installed.len()).unwrap_or(0);
+    let mut buf = x11::fixed_reply(byte_order, sequence, 0, length_units);
+    let mut tmp = Vec::with_capacity(2);
+    x11::write_u16(
+        byte_order,
+        &mut tmp,
+        u16::try_from(installed.len()).unwrap_or(0),
+    );
+    buf.extend_from_slice(&tmp);
+    buf.resize(32, 0);
+    for cmap in &installed {
+        let mut entry = Vec::with_capacity(4);
+        x11::write_u32(byte_order, &mut entry, cmap.0);
+        buf.extend_from_slice(&entry);
+    }
     Ok(write_to_client(client, client_id, &buf))
 }
 
