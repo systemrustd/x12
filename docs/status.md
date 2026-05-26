@@ -89,14 +89,18 @@ Cross-cutting bugs and followups that don't fit a stage live in
   under the now-`[x]` Stage 4 sections.
 - **Next live work**: Stage 5 — make v2 fast. Plan at
   `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
-  Phase A closed 2026-05-24; Phase B sub-phase B.1 implemented +
-  bee MATE-load freeze closed on 2026-05-24
-  (`feature/frame-builder-submit-rate`, HEAD `bd628c8`). B.1 did
-  not improve drag smoothness — that's by design and tracks to
-  B.2 (port `render_composite` + `render_fill`, the ~60 % of
-  submits still on the per-op-per-`vkQueueSubmit2` path under
-  cap=1). yoga / iMac / fuji / silence-dual-output regression
-  gates still pending.
+  Phase A closed 2026-05-24; Phase B sub-phases B.1, B.2, B.3
+  all CLOSED by 2026-05-26 — bee MATE drag is lag-free across
+  the chain, silence dual-output passes, yoga and air (Apple M1
+  / Asahi) green, nvidia bootstraps. Three correctness fixes
+  during B.3 closure: trap-emit α-loss on depth-32 backings
+  (`b0b57f8`), SHAPE Input region not mirrored to backend
+  (`ae480a2` — fixed adapta-nokto menu hover + click), graceful
+  drop of X11 requests from already-disconnected clients
+  (`932c34e`). `feature/frame-builder-submit-rate` HEAD is at
+  `0c08568`; merged into master 2026-05-26. Next phase is B.4
+  / B.5 work to retire SubmitGroup entirely and fold scene
+  compose into the frame builder.
 
 ---
 
@@ -3161,7 +3165,7 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         site (engine.rs:744 in `poll_retired`); B.2 doesn't add new
         retire sites.
 
-  - **Phase B sub-phase B.3 — IMPLEMENTED 2026-05-25.** Plan
+  - **Phase B sub-phase B.3 — CLOSED 2026-05-26.** Plan
     `docs/superpowers/plans/2026-05-25-frame-builder-phase-b3.md`
     landed in commits `67ff198` … `2300db1` on
     `feature/frame-builder-submit-rate`. Spec
@@ -3391,7 +3395,47 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         `get_image` readbacks. Same shape as bee post-B.3 (an
         orthogonal next target).
 
-    **Remaining hardware-smoke gates (NOT YET — pending capture):**
-      - iMac / fuji regression checks.
-      - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
-        intel, lavapipe) — no new validation VUIDs.
+    **B.3 closure summary (2026-05-26).** Closing on the strength
+    of:
+      - bee (RDNA2 / RADV) PASS lag-free — the original B.3 target,
+        first time the MATE drag workload smooths out across the
+        Phase A→B.3 chain.
+      - yoga (Snapdragon X1 / Adreno / Turnip) PASS — frame-builder
+        flush rate in band, no aborts, no `non_ported` close
+        pressure.
+      - silence (RX580 / GCN4 / RADV, dual-output 5120×1440) PASS
+        plus pixmap-churn followup resolved via the
+        MAX_POOLED_DIM 128 → 256 bump (`faee4b8`).
+      - air (Apple M1 / Asahi / Mesa AGX-V, aarch64) — bootstrap
+        clean (cherry-picked DRM-resolver fix on master); user
+        subjective lag-free under the same MATE drag.
+      - nvidia (proprietary) — MATE bootstraps and runs.
+      - Three correctness fixes landed during the closure window:
+        trap-emit α-loss on depth-32 backings (`b0b57f8`),
+        SHAPE Input region not mirrored to backend (`ae480a2`,
+        broke adapta-nokto menu hover + click), graceful drop
+        of X11 requests from already-disconnected clients
+        (`932c34e`, crash on mate-appearance teardown).
+      - Diagnostic surfaces added: pixmap-pool oversize-reject
+        bin telemetry (`71e7542`), pointer-dispatch trace target
+        `yserver::kms::v2::pointer` (`0c08568`).
+
+    **Followups carried out of B.3 (not blockers):**
+      - iMac / fuji regression checks — pending fresh capture on
+        post-2026-05-26 master. Phase A had each green; B.3 is
+        structurally compatible (no driver-class divergence so
+        far across RADV variants + ANV + Adreno + AGX-V + NVIDIA).
+      - Cross-vendor validation-layer sanity (lavapipe with VUID
+        watch) — pending; surface is unchanged since B.2 which
+        was vkdebug-clean.
+      - silence `cpu_fence_wait_ns/s` 50-235 ms/s from MATE
+        applet `get_image` readbacks — orthogonal to frame
+        builder, candidate for a separate sync-wait close
+        reduction.
+      - bee `cpu_fence_wait_ns/s` 60-220 ms/s same shape — same
+        target.
+      - Pre-trap-α-fix nvidia capture: visual transparency
+        artifacts on depth-32 CSD chrome were present at capture
+        time; resolved by `b0b57f8`. A fresh nvidia run after the
+        fix will likely show clean rendering on the appearance
+        dialog and similar GTK CSD windows.
