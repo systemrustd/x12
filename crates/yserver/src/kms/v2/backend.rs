@@ -7315,6 +7315,7 @@ impl Backend for KmsBackendV2 {
         self.core.current_join_style = state.join_style;
         self.core.current_dashes = state.dashes.clone();
         self.core.current_dash_offset = u16::try_from(state.dash_offset).unwrap_or(0);
+        self.core.current_arc_mode = state.arc_mode;
         Ok(())
     }
 
@@ -8004,75 +8005,43 @@ impl Backend for KmsBackendV2 {
             return Ok(());
         };
         // Each arc: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
-        // Partial-angle arcs are treated as full ellipses (matches v1;
-        // angle-mask refinement is a follow-up). The outline is drawn by
-        // scanline: top/bottom rows emit the full horizontal span (caps);
-        // intermediate rows emit two side connectors bridging the
-        // previous row's left/right edges to this row's edges.
-        let mut rects: Vec<Rectangle16> = Vec::new();
+        // Walk each arc parametrically (honouring angle1/angle2 — partial
+        // arcs no longer fall back to a full ellipse) into a chord
+        // polyline, then run it through the stroke rasterizer so
+        // line_width / cap_style / dashes apply. JoinStyle is irrelevant
+        // within a single smooth arc.
+        let stroke = self.current_stroke_state(foreground);
+        let mut fg_rects: Vec<Rectangle16> = Vec::new();
+        let mut bg_rects: Vec<Rectangle16> = Vec::new();
         for chunk in arcs.chunks_exact(12) {
             let ax = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
             let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
             let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
             let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
-            if aw <= 0 || ah <= 0 {
+            let angle1 = i16::from_le_bytes([chunk[8], chunk[9]]);
+            let angle2 = i16::from_le_bytes([chunk[10], chunk[11]]);
+            if aw <= 0 || ah <= 0 || angle2 == 0 {
                 continue;
             }
             let cx = f64::from(ax) + f64::from(aw) * 0.5;
             let cy = f64::from(ay) + f64::from(ah) * 0.5;
             let rx = f64::from(aw) * 0.5;
             let ry = f64::from(ah) * 0.5;
-
-            let row_at = |py: i32| -> Option<(i32, i32)> {
-                let dy = (f64::from(py) + 0.5 - cy) / ry;
-                if dy.abs() > 1.0 {
-                    return None;
-                }
-                let dx = (1.0 - dy * dy).sqrt() * rx;
-                let x0 = (cx - dx).floor() as i32;
-                let x1 = (cx + dx).ceil() as i32;
-                Some((x0, x1))
-            };
-
-            let mut prev: Option<(i32, i32)> = None;
-            for py in ay..ay + ah {
-                let Some((x0, x1)) = row_at(py) else {
-                    prev = None;
-                    continue;
-                };
-                let next = row_at(py + 1);
-                let cap = prev.is_none() || next.is_none();
-                if cap {
-                    rects.push(Rectangle16 {
-                        x: x0 as i16,
-                        y: py as i16,
-                        width: (x1 - x0 + 1) as u16,
-                        height: 1,
-                    });
-                } else {
-                    let (px0, px1) = prev.unwrap();
-                    let l_lo = px0.min(x0);
-                    let l_hi = px0.max(x0);
-                    rects.push(Rectangle16 {
-                        x: l_lo as i16,
-                        y: py as i16,
-                        width: (l_hi - l_lo + 1) as u16,
-                        height: 1,
-                    });
-                    let r_lo = px1.min(x1);
-                    let r_hi = px1.max(x1);
-                    rects.push(Rectangle16 {
-                        x: r_lo as i16,
-                        y: py as i16,
-                        width: (r_hi - r_lo + 1) as u16,
-                        height: 1,
-                    });
-                }
-                prev = Some((x0, x1));
-            }
+            let verts = crate::kms::v2::stroke::arc_polyline(cx, cy, rx, ry, angle1, angle2);
+            let out = crate::kms::v2::stroke::stroke_path(
+                &verts,
+                crate::kms::v2::stroke::StrokeShape::Polyline,
+                &stroke,
+            );
+            fg_rects.extend(out.fg_rects);
+            bg_rects.extend(out.bg_rects);
         }
-        let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        self.emit_stroke_output(
+            target,
+            foreground,
+            stroke.background,
+            crate::kms::v2::stroke::StrokeOutput { fg_rects, bg_rects },
+        );
         Ok(())
     }
 
@@ -8151,8 +8120,10 @@ impl Backend for KmsBackendV2 {
             return Ok(());
         };
         // Each arc is 12 bytes: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
-        // Partial arcs fall back to a full-ellipse fill (matches v1; xeyes /
-        // xclock-style apps draw full circles).
+        // Build the closed fill polygon per the GC's ArcMode (Chord vs
+        // PieSlice), honouring angle1/angle2 (partial arcs no longer
+        // fill the full ellipse), then scanline-fill it.
+        let arc_mode = self.core.current_arc_mode;
         let (img_w, img_h) = self
             .drawable_dims_v2(host_xid)
             .map(|(w, h)| (w as i32, h as i32))
@@ -8163,36 +8134,22 @@ impl Backend for KmsBackendV2 {
             let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
             let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
             let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
-            if aw <= 0 || ah <= 0 {
+            let angle1 = i16::from_le_bytes([chunk[8], chunk[9]]);
+            let angle2 = i16::from_le_bytes([chunk[10], chunk[11]]);
+            if aw <= 0 || ah <= 0 || angle2 == 0 {
                 continue;
             }
             let cx = f64::from(ax) + f64::from(aw) * 0.5;
             let cy = f64::from(ay) + f64::from(ah) * 0.5;
             let rx = f64::from(aw) * 0.5;
             let ry = f64::from(ah) * 0.5;
-            let y_start = ay.max(0);
-            let y_end = (ay + ah).min(img_h);
-            for py in y_start..y_end {
-                let dy = (f64::from(py) + 0.5 - cy) / ry;
-                if dy.abs() > 1.0 {
-                    continue;
-                }
-                let dx = (1.0 - dy * dy).sqrt() * rx;
-                let x0 = (cx - dx).floor().max(0.0) as i32;
-                let x1 = (cx + dx).ceil().min(f64::from(img_w)) as i32;
-                if x1 <= x0 {
-                    continue;
-                }
-                rects.push(Rectangle16 {
-                    x: x0 as i16,
-                    y: py as i16,
-                    width: (x1 - x0) as u16,
-                    height: 1,
-                });
-            }
+            let verts =
+                crate::kms::v2::stroke::fill_arc_polygon(cx, cy, rx, ry, angle1, angle2, arc_mode);
+            crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
         }
         if !rects.is_empty() {
-            let rects = self.intersect_with_current_clip(&rects);
+            let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
+            let rects = self.intersect_with_current_clip(&clipped);
             self.fill_rects_honoring_fill_state(target, foreground, &rects);
         }
         Ok(())

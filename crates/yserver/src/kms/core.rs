@@ -28,7 +28,7 @@ use std::{
 use yserver_core::{
     backend::{
         ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode,
-        params::{CapStyle, JoinStyle, LineStyle},
+        params::{ArcMode, CapStyle, JoinStyle, LineStyle},
     },
     host_x11::{HostPointerEvent, HostXidMap},
 };
@@ -776,6 +776,7 @@ pub(crate) struct KmsCore {
     pub(crate) current_join_style: JoinStyle,
     pub(crate) current_dashes: Vec<u8>,
     pub(crate) current_dash_offset: u16,
+    pub(crate) current_arc_mode: ArcMode,
 
     // SHAPE extension: per-window shape regions keyed by host XID.
     // None entry = no shape (full rectangle). Some(vec![]) = empty region.
@@ -893,6 +894,7 @@ impl KmsCore {
             current_join_style: JoinStyle::Miter,
             current_dashes: vec![4, 4],
             current_dash_offset: 0,
+            current_arc_mode: ArcMode::PieSlice,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),
@@ -970,6 +972,7 @@ impl KmsCore {
             current_join_style: JoinStyle::Miter,
             current_dashes: vec![4, 4],
             current_dash_offset: 0,
+            current_arc_mode: ArcMode::PieSlice,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),

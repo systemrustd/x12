@@ -14,9 +14,89 @@
 //! closed stroke polygon (quad + caps + joins) and feed it through
 //! `crate::kms::backend::scanline_fill_polygon`.
 
-use yserver_core::backend::params::{CapStyle, JoinStyle, LineStyle};
+use yserver_core::backend::params::{ArcMode, CapStyle, JoinStyle, LineStyle};
 
 use crate::kms::cpu_types::Rectangle16;
+
+/// Walk an elliptical arc into a chord-approximated polyline.
+///
+/// `(cx, cy)` is the ellipse centre, `(rx, ry)` the radii.
+/// `angle1` / `angle2` are X11 arc angles in 64ths of a degree:
+/// `angle1` is the start (0 = +x / 3 o'clock), `angle2` the signed
+/// sweep (positive = counter-clockwise in the math sense; screen Y
+/// is inverted so it appears clockwise on-screen, matching Xorg).
+///
+/// The step is chosen so the chord-to-true-arc error stays ≤ 0.5 px
+/// for the larger radius — visually indistinguishable from a true
+/// ellipse at the sizes real clients use. Always includes the exact
+/// start and end points.
+pub fn arc_polyline(
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    angle1_deg64: i16,
+    angle2_deg64: i16,
+) -> Vec<(i32, i32)> {
+    use std::f64::consts::PI;
+    let deg64_to_rad = |a: f64| a / 64.0 * PI / 180.0;
+    // Canonicalize to a non-negative sweep starting from the lower
+    // endpoint. Per X11 spec, an arc drawn (a1, +ext) and the same
+    // arc drawn from the other endpoint (a1+ext, -ext) must produce
+    // identical pixels (xts XDrawArc-13). Subdividing from a fixed
+    // start in a fixed direction guarantees the same vertex set
+    // regardless of the sign the client passed.
+    let (start_deg64, sweep_deg64) = if angle2_deg64 >= 0 {
+        (f64::from(angle1_deg64), f64::from(angle2_deg64))
+    } else {
+        (
+            f64::from(angle1_deg64) + f64::from(angle2_deg64),
+            -f64::from(angle2_deg64),
+        )
+    };
+    let a1 = deg64_to_rad(start_deg64);
+    let sweep = deg64_to_rad(sweep_deg64);
+
+    // Chord error ε = r·(1 - cos(dθ/2)) ≈ r·dθ²/8 ≤ 0.5 → dθ ≤ 2/√r.
+    let r = rx.max(ry).max(1.0);
+    let dtheta = (2.0 / r.sqrt()).clamp(0.001, PI / 8.0);
+    let steps = ((sweep.abs() / dtheta).ceil() as usize).max(1);
+    let step = sweep / steps as f64;
+
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let theta = a1 + step * i as f64;
+        let x = cx + rx * theta.cos();
+        let y = cy - ry * theta.sin();
+        pts.push((x.round() as i32, y.round() as i32));
+    }
+    pts
+}
+
+/// Build the closed polygon for `PolyFillArc` honouring `ArcMode`.
+/// `Chord` closes the arc endpoints directly (the implicit
+/// close edge of `scanline_fill_polygon`); `PieSlice` routes the
+/// closing path through the centre.
+pub fn fill_arc_polygon(
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    angle1_deg64: i16,
+    angle2_deg64: i16,
+    arc_mode: ArcMode,
+) -> Vec<(i32, i32)> {
+    let mut pts = arc_polyline(cx, cy, rx, ry, angle1_deg64, angle2_deg64);
+    if matches!(arc_mode, ArcMode::PieSlice) {
+        // Closing through the centre turns the segment into a wedge.
+        // Full revolutions (|angle2| >= 360°) don't need the centre
+        // vertex — the arc already closes on itself.
+        if i32::from(angle2_deg64).abs() < 360 * 64 {
+            pts.push((cx.round() as i32, cy.round() as i32));
+        }
+    }
+    pts
+}
 
 /// Per-call snapshot of the GC stroke state. Constructed by the
 /// dispatcher from the resolved `DrawState` and threaded through
@@ -525,6 +605,97 @@ impl<'a> DashIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Max distance from any chord-polyline vertex to the true ellipse
+    /// must stay within the half-pixel budget the step size targets.
+    #[test]
+    fn arc_polyline_chord_error_within_half_pixel() {
+        for &r in &[1.0_f64, 10.0, 100.0, 1000.0] {
+            // Full circle, radius r, centred at (2000, 2000) to keep
+            // coords positive.
+            let pts = arc_polyline(2000.0, 2000.0, r, r, 0, 360 * 64);
+            for &(x, y) in &pts {
+                let dx = f64::from(x) - 2000.0;
+                let dy = f64::from(y) - 2000.0;
+                let dist = (dx * dx + dy * dy).sqrt();
+                // Each rounded vertex is within ~0.71px of the true
+                // ring (0.5px rounding on each axis) plus the chord
+                // sampling error; assert a loose 1.5px bound.
+                assert!(
+                    (dist - r).abs() <= 1.5,
+                    "r={r}: vertex ({x},{y}) dist {dist} off ring by {}",
+                    (dist - r).abs()
+                );
+            }
+        }
+    }
+
+    /// The last polyline vertex must land on the exact arc endpoint
+    /// (angle1 + angle2), not drift due to step rounding.
+    #[test]
+    fn arc_polyline_endpoint_exact() {
+        // Quarter arc: start 0°, sweep 90° (90*64 deg64). Endpoint at
+        // angle 90° → (cx, cy - ry).
+        let cx = 100.0;
+        let cy = 100.0;
+        let rx = 50.0;
+        let ry = 50.0;
+        let pts = arc_polyline(cx, cy, rx, ry, 0, 90 * 64);
+        let last = *pts.last().unwrap();
+        // angle 90°: x = cx + rx*cos(90)=cx, y = cy - ry*sin(90)=cy-ry.
+        assert!((last.0 - cx.round() as i32).abs() <= 1);
+        assert!((last.1 - (cy - ry).round() as i32).abs() <= 1);
+        // First vertex at angle 0°: (cx+rx, cy).
+        let first = pts[0];
+        assert!((first.0 - (cx + rx).round() as i32).abs() <= 1);
+        assert!((first.1 - cy.round() as i32).abs() <= 1);
+    }
+
+    /// A partial arc must NOT span the full ellipse height — the
+    /// original bug was treating every arc as a full ellipse.
+    #[test]
+    fn arc_polyline_partial_does_not_cover_full_ellipse() {
+        // Top-right quarter (0°..90°) of a circle r=50 at (100,100):
+        // y ranges from cy (100) up to cy-ry (50); never reaches the
+        // bottom (cy+ry = 150).
+        let pts = arc_polyline(100.0, 100.0, 50.0, 50.0, 0, 90 * 64);
+        let max_y = pts.iter().map(|p| p.1).max().unwrap();
+        assert!(
+            max_y <= 101,
+            "partial arc reached y={max_y}, expected <= ~100"
+        );
+    }
+
+    /// xts XDrawArc-13: an arc and its reverse-direction equivalent
+    /// must produce the same vertex set (→ same pixels).
+    #[test]
+    fn arc_polyline_direction_symmetric() {
+        // (a1=30°, +60°) vs (a1=90°, -60°) cover the same 30°..90° arc.
+        let fwd = arc_polyline(100.0, 100.0, 40.0, 40.0, 30 * 64, 60 * 64);
+        let rev = arc_polyline(100.0, 100.0, 40.0, 40.0, 90 * 64, -60 * 64);
+        let mut fwd_sorted = fwd.clone();
+        let mut rev_sorted = rev.clone();
+        fwd_sorted.sort_unstable();
+        rev_sorted.sort_unstable();
+        assert_eq!(fwd_sorted, rev_sorted, "arc must be direction-symmetric");
+    }
+
+    #[test]
+    fn fill_arc_polygon_pieslice_appends_centre() {
+        let chord = fill_arc_polygon(100.0, 100.0, 50.0, 50.0, 0, 90 * 64, ArcMode::Chord);
+        let pie = fill_arc_polygon(100.0, 100.0, 50.0, 50.0, 0, 90 * 64, ArcMode::PieSlice);
+        // PieSlice has exactly one extra vertex (the centre).
+        assert_eq!(pie.len(), chord.len() + 1);
+        assert_eq!(*pie.last().unwrap(), (100, 100));
+    }
+
+    #[test]
+    fn fill_arc_polygon_full_revolution_no_centre_vertex() {
+        let chord = fill_arc_polygon(100.0, 100.0, 50.0, 50.0, 0, 360 * 64, ArcMode::Chord);
+        let pie = fill_arc_polygon(100.0, 100.0, 50.0, 50.0, 0, 360 * 64, ArcMode::PieSlice);
+        // Full circle: PieSlice closes on itself, no centre vertex.
+        assert_eq!(pie.len(), chord.len());
+    }
 
     #[test]
     fn fast_path_matches_bresenham_for_width_zero_solid() {
