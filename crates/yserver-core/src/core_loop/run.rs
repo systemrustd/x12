@@ -258,6 +258,37 @@ fn process_request_inline(
     body: &[u8],
     attached_fd: Option<OwnedFd>,
 ) -> Option<yserver_protocol::x11::ClientId> {
+    // Half-closed-socket / post-disconnect guard. The `Message::Request`
+    // channel preserves arrival order — when a client crashes (e.g.
+    // mate-appearance-properties cratering with the keyring locked) and
+    // the client_reader thread enqueues a burst of bogus requests
+    // before/around the EOF, the main thread can still be draining those
+    // queued Requests *after* `process_disconnect` removed the client
+    // from `state.clients`. Several handlers (CreatePixmap, CreateGC,
+    // CreateWindow, etc. — eight sites at process_request.rs) read
+    // `state.clients.get(client_id).expect("client registered")` to
+    // validate the request's resource XID against the client's
+    // allocation range, and panic the whole server when the lookup misses.
+    //
+    // Without this guard we observed a session crash on 2026-05-26 in
+    // the adapta-nokto investigation: 240 BadIDChoice warnings for
+    // CreatePixmap pid=0xffffffff, then panic at process_request.rs:11686
+    // when state.clients.remove(client_51) finally won the race.
+    //
+    // Drop silently: the client is gone, no reply / error can be
+    // delivered to anyone, and the work would be a no-op. Tests that
+    // exercise individual handlers via `process_request` directly are
+    // unaffected (they don't go through this dispatcher).
+    if !state.clients.contains_key(&id.0) {
+        log::debug!(
+            "process_request_inline: dropping request from already-disconnected client {} \
+             (opcode={}, seq={})",
+            id.0,
+            header.opcode,
+            sequence.0,
+        );
+        return None;
+    }
     let outcome = match process_request(state, backend, id, sequence, header, body, attached_fd) {
         Ok(out) => out,
         Err(err) => {
