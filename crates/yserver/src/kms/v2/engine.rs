@@ -9046,36 +9046,50 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         height: render_h,
     }];
 
-    // Build a StorageCompositeTarget adapter from store (fresh current_layout).
-    let dst_current_layout = store
-        .get(rt.dst_id)
-        .expect("dst_id checked at append")
-        .storage
-        .current_layout;
-    let mut adapter = StorageCompositeTarget {
-        extent: rt.dst_extent,
+    // Phase B.3 fix: under deferred recording, the GPU dst layout may
+    // diverge from `storage.current_layout` — prior ops in the SAME
+    // frame transitioned the dst on the GPU but storage isn't committed
+    // until `commit_close_success` reads back from the frame overlay on
+    // submit success. Driving the `to_color` barrier from
+    // `storage.current_layout` here mis-declares old_layout to the
+    // implementation, producing driver-undefined dst contents — the
+    // observed symptom was partial α loss on depth-32 backings when
+    // marco's frame trapezoids followed an inner-window `render_composite`
+    // in the same frame.
+    //
+    // Match the B.2 render_composite emit path: use `RecordedCompositeTarget`
+    // (constant `COLOR_ATTACHMENT_OPTIMAL`, non-mutating storage) and
+    // `record_render_composite_open_with_old_layout` with the recorded
+    // `dst_old_layout` from the overlay-resolved append snapshot. Storage
+    // is NOT mutated here; `commit_close_success` writes the frame
+    // overlay's post-op layout back to `storage.current_layout` on
+    // successful submit. The append-time
+    // `push_op_and_set_layouts([(dst_id, SHADER_READ_ONLY_OPTIMAL)])`
+    // call records that post-op layout in the overlay.
+    let mut adapter = RecordedCompositeTarget {
         image: rt.dst_image,
-        image_view: rt.dst_view,
-        current_layout: dst_current_layout,
+        view: rt.dst_view,
+        extent: rt.dst_extent,
     };
 
-    vk_render::record_render_composite(
+    vk_render::record_render_composite_open_with_old_layout(
         &inner.vk,
         cb,
-        &mut adapter,
+        &adapter,
         pipeline,
+        rt.dst_old_layout,
+    )?;
+    vk_render::record_render_composite_draws(
+        &inner.vk,
+        cb,
         pipeline_layout,
         descriptor_set,
+        rt.dst_extent,
         &attrs,
         &rects,
         &rt.clip_scissors,
-    )?;
-
-    // Propagate the layout update back into store (mirrors legacy path).
-    {
-        let d = store.get_mut(rt.dst_id).expect("dst_id checked at append");
-        d.storage.current_layout = adapter.current_layout;
-    }
+    );
+    vk_render::record_render_composite_close(&inner.vk, cb, &mut adapter);
 
     // ── (f) Post-emit CPU writeback (N5 LOAD-BEARING, codex round-10) ──
     // The composite-close barrier (inside record_render_composite) left the

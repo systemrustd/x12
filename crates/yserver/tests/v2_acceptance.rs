@@ -5492,3 +5492,106 @@ fn v2_frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_
         "renderer_failed must remain false — gradient emit must not abort on freed picture",
     );
 }
+
+/// Phase B.3 (post-Task 12) regression: trap-emit must drive its
+/// `to_color` barrier from the recorded `dst_old_layout` (the frame
+/// overlay's in-frame layout at append time) — NOT from the dst's
+/// `storage.current_layout`. Under deferred recording, prior ops in
+/// the SAME frame transition the dst on the GPU but storage is not
+/// committed until `commit_close_success` writes the overlay back on
+/// submit success. Reading storage in trap-emit declares a stale
+/// `old_layout` to the implementation; the spec resolves this as
+/// driver-undefined dst contents.
+///
+/// Symptom observed on hardware (RDNA2/RADV bee, RX580 silence): the
+/// α channel of depth-32 redirected backings was zeroed in regions
+/// touched by marco's SSD frame trapezoids that followed an inner-window
+/// `render_composite` in the same frame — visible as "partially
+/// transparent" CSD chrome on the appearance dialog. RGB survived
+/// (LOAD_OP=LOAD preserves most paths), α did not.
+///
+/// Scenario: `fill_rect_batch` into dst (Op A — B.3 Task 8 port, follows
+/// the deferred-recording contract; updates the frame overlay's in-frame
+/// layout to `SHADER_READ_ONLY_OPTIMAL`, leaves storage at the pre-frame
+/// value), then `render_traps_or_tris` into the same dst (Op B —
+/// append-time records `dst_old_layout = SHADER_READ_ONLY_OPTIMAL` from
+/// the overlay). Emit-time MUST use the recorded value, not storage.
+///
+/// Under validation layers, the buggy version emits a barrier from a
+/// layout the GPU is no longer in and trips a VUID that routes to
+/// `platform.renderer_failed`. Without validation, the assert is
+/// behavioural-light (no panic, frame closes cleanly), but the test
+/// still documents the regression scenario and exercises the corrected
+/// `RecordedCompositeTarget` + `record_render_composite_open_with_old_layout`
+/// emit path so any future revert of the fix is structurally caught.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old_layout() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // `init_root_storage` (called by `for_tests_with_vk`) issues
+    // `fill_rect` against the root drawable, which is a B.3 Task 8
+    // ported op — so it leaves an open frame on construction. Force
+    // it closed + drain before flipping the frame-builder gate, which
+    // debug-asserts no frame is open at toggle time.
+    if be.frame_builder_is_open_for_tests() {
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("force-close init_root_storage frame");
+    }
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    // Op A: fill_rect_batch into dst. B.3 Task 8 ported op — goes
+    // through frame_builder, follows the deferred-recording contract
+    // (storage layout NOT mutated; commit_close_success writes the
+    // overlay's post-op layout back on submit success). After this
+    // call the frame overlay records dst's in-frame layout as
+    // SHADER_READ_ONLY_OPTIMAL; storage.current_layout still shows
+    // the pre-frame value.
+    let rects = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+    }];
+    be.engine_fill_rect_batch_for_tests(dst, [0.5, 0.5, 0.5, 1.0], &rects)
+        .expect("fill_rect_batch into dst");
+
+    // Op B: trap into the same dst. Append-time reads dst_old_layout
+    // from the overlay (SHADER_READ_ONLY, set by Op A above). Emit-time
+    // must emit the to_color barrier from that recorded value.
+    be.engine_render_traps_or_tris_for_tests(dst, [0.0, 0.0, 1.0, 1.0], 32, 32)
+        .expect("render_traps_or_tris into same dst as fill_rect_batch");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must remain open across fill_rect_batch + render_traps_or_tris",
+    );
+
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close must not trip validation on a stale-layout barrier");
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false — trap-emit's to_color barrier must \
+         come from the recorded dst_old_layout (frame overlay snapshot at append), \
+         not from storage.current_layout (stale during deferred recording)",
+    );
+}
