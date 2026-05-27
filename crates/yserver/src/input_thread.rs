@@ -27,44 +27,10 @@ use yserver_core::{
     host_x11::HostKeyEvent,
 };
 
-use crate::input::{InputEvent, SendContext};
-
-// Linux evdev keycodes (raw, before the X11 +8 translation). Used by
-// the Ctrl-Alt-Backspace zap detector and the Ctrl-Alt-Enter dump-
-// scanout hotkey: the Linux scancodes are the unambiguous source of
-// truth — the X side may rewrite the keymap or have a grabbing client
-// consuming modifiers.
-const LINUX_KEY_ENTER: u32 = 28;
-const LINUX_KEY_BACKSPACE: u32 = 14;
-const LINUX_KEY_LEFTCTRL: u32 = 29;
-const LINUX_KEY_LEFTALT: u32 = 56;
-const LINUX_KEY_RIGHTCTRL: u32 = 97;
-const LINUX_KEY_RIGHTALT: u32 = 100;
-/// F12. Used by the Ctrl-Alt-F12 hotkey that triggers the per-
-/// drawable storage dump (same code path as SIGUSR2). PrintScreen
-/// is the spiritual choice but doesn't reach libinput as KEY_SYSRQ
-/// on every keyboard (some BIOSes / Fn-layers eat it); F12 is the
-/// pragmatic alternative — unambiguous evdev code, universally
-/// present on PC keyboards.
-const LINUX_KEY_F12: u32 = 88;
-
-/// Server-internal hotkeys recognised on the libinput thread before
-/// events are forwarded to X dispatch. The keypress that triggers the
-/// hotkey is intentionally NOT forwarded to clients — zap drops it
-/// because we're shutting down, and the scanout dump drops it to
-/// avoid an Enter sneaking into a focused client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hotkey {
-    /// Ctrl+Alt+Backspace — emergency shutdown.
-    Zap,
-    /// Ctrl+Alt+Enter — diagnostic scanout dump (same code path as
-    /// SIGUSR1).
-    DumpScanout,
-    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump (same
-    /// code path as SIGUSR2). Mirrors `DumpScanout` for the per-
-    /// window-storage view: root, COW, every redirected backing.
-    DumpDrawables,
-}
+use crate::input::{
+    InputEvent, SendContext,
+    hotkey::{Hotkey, HotkeyDetector},
+};
 
 /// Cursor accumulator + framebuffer dimensions held on the libinput
 /// thread.
@@ -74,14 +40,11 @@ pub struct LibinputThreadState {
     cursor_y: f64,
     fb_w: u32,
     fb_h: u32,
-    /// Modifier-key state for the Ctrl+Alt+Backspace "zap" emergency
-    /// shutdown. Tracked on this thread (off the kernel evdev codes)
-    /// rather than on the X side because a grabbing client or a
-    /// remapped keymap could silently consume the modifier press —
-    /// zap needs to fire even when the X dispatch is wedged, since
-    /// that's the most likely reason the user is reaching for it.
-    ctrl_pressed: bool,
-    alt_pressed: bool,
+    /// Hotkey detector. Tracks modifier-key state off the kernel evdev
+    /// codes rather than on the X side because a grabbing client or a
+    /// remapped keymap could silently consume modifier presses —
+    /// hotkeys need to fire even when X dispatch is wedged.
+    hotkey: HotkeyDetector,
     /// Sub-click scroll accumulators in v120 units. libinput's high-
     /// resolution wheel and finger/continuous scroll arrive as small
     /// v120 deltas that may not add up to a full 120-unit click in one
@@ -101,48 +64,9 @@ impl LibinputThreadState {
             cursor_y: f64::from(fb_h) / 2.0,
             fb_w,
             fb_h,
-            ctrl_pressed: false,
-            alt_pressed: false,
+            hotkey: HotkeyDetector::new(),
             scroll_accum_x_v120: 0,
             scroll_accum_y_v120: 0,
-        }
-    }
-
-    /// Update tracked modifier state for `ev` and return the hotkey
-    /// fired by this event, if any. Ctrl+Alt+Backspace fires
-    /// [`Hotkey::Zap`]; Ctrl+Alt+Enter fires [`Hotkey::DumpScanout`].
-    ///
-    /// Modifier release events update state but never fire a hotkey;
-    /// non-key events are ignored.
-    fn check_hotkey(&mut self, ev: &InputEvent) -> Option<Hotkey> {
-        match *ev {
-            InputEvent::KeyPress { keycode } => match keycode {
-                LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => {
-                    self.ctrl_pressed = true;
-                    None
-                }
-                LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => {
-                    self.alt_pressed = true;
-                    None
-                }
-                LINUX_KEY_BACKSPACE if self.ctrl_pressed && self.alt_pressed => Some(Hotkey::Zap),
-                LINUX_KEY_F12 if self.ctrl_pressed && self.alt_pressed => {
-                    Some(Hotkey::DumpDrawables)
-                }
-                LINUX_KEY_ENTER if self.ctrl_pressed && self.alt_pressed => {
-                    Some(Hotkey::DumpScanout)
-                }
-                _ => None,
-            },
-            InputEvent::KeyRelease { keycode } => {
-                match keycode {
-                    LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => self.ctrl_pressed = false,
-                    LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => self.alt_pressed = false,
-                    _ => {}
-                }
-                None
-            }
-            _ => None,
         }
     }
 
@@ -289,7 +213,7 @@ pub fn process_batch(
 ) -> io::Result<()> {
     let mut scroll_buf: Vec<HostInputEvent> = Vec::new();
     for raw in events {
-        match state.check_hotkey(&raw) {
+        match state.hotkey.check(&raw) {
             Some(Hotkey::Zap) => {
                 // Drop any pending motion + the Backspace event itself —
                 // the server is shutting down, no client should see them.
@@ -318,6 +242,13 @@ pub fn process_batch(
                 }
                 log::info!("yserver: Ctrl-Alt-F12 pressed — dumping drawables");
                 sender.send(Message::DumpDrawables)?;
+                continue;
+            }
+            Some(Hotkey::SwitchVt(vt)) => {
+                // Direct mode (no libseat): VT switching is disabled.
+                // Log and swallow the keypress so it doesn't leak to
+                // a client.
+                log::debug!("input: Ctrl-Alt-F{vt} ignored (Direct mode, no libseat)");
                 continue;
             }
             None => {}
@@ -435,6 +366,10 @@ fn current_time_ms() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::hotkey::{
+        LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
+        LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
+    };
     use yserver_core::core_loop::channel;
 
     #[test]
