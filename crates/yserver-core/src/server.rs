@@ -496,9 +496,14 @@ pub struct SyncFence {
 pub struct SyncAlarm {
     pub owner: ClientId,
     pub counter: u32,
+    /// Absolute counter value the trigger tests against. For a Relative
+    /// alarm this is resolved at create/change time (counter + value).
     pub wait_value: i64,
     pub delta: i64,
+    /// `XSyncTestType` (PositiveTransition=0 … NegativeComparison=3).
+    pub test_type: u8,
     pub events: bool,
+    /// `XSyncAlarmState` (Active=0, Inactive=1, Destroyed=2).
     pub state: u8,
 }
 
@@ -686,6 +691,7 @@ impl Default for SyncAlarm {
             counter: 0,
             wait_value: 0,
             delta: 0,
+            test_type: 0,
             events: false,
             state: 0,
         }

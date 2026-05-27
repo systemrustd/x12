@@ -47,7 +47,7 @@ const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64
 const SHAPE_FIRST_ERROR: u8 = 155;
 
 const SYNC_MAJOR_OPCODE: u8 = 142;
-const SYNC_FIRST_EVENT: u8 = 83; // matches Xorg: Counter=83, Alarm=84
+pub(crate) const SYNC_FIRST_EVENT: u8 = 83; // matches Xorg: Counter=83, Alarm=84
 const SYNC_FIRST_ERROR: u8 = 156;
 
 const DAMAGE_MAJOR_OPCODE: u8 = 143;

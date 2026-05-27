@@ -27,6 +27,32 @@ pub const AWAIT_FENCE: u8 = 19;
 pub const SERVERTIME_COUNTER: u32 = 0x106;
 pub const IDLETIME_COUNTER: u32 = 0x107;
 
+// Alarm trigger semantics, sourced from
+// `/usr/include/X11/extensions/syncconst.h`.
+//
+// XSyncValueType.
+pub const VALUE_TYPE_ABSOLUTE: u32 = 0;
+pub const VALUE_TYPE_RELATIVE: u32 = 1;
+// XSyncTestType.
+pub const TEST_POSITIVE_TRANSITION: u32 = 0;
+pub const TEST_NEGATIVE_TRANSITION: u32 = 1;
+pub const TEST_POSITIVE_COMPARISON: u32 = 2;
+pub const TEST_NEGATIVE_COMPARISON: u32 = 3;
+// XSyncAlarmState.
+pub const ALARM_STATE_ACTIVE: u8 = 0;
+pub const ALARM_STATE_INACTIVE: u8 = 1;
+pub const ALARM_STATE_DESTROYED: u8 = 2;
+// CreateAlarm/ChangeAlarm value-mask bits (XSyncCA*).
+pub const CA_COUNTER: u32 = 1 << 0;
+pub const CA_VALUE_TYPE: u32 = 1 << 1;
+pub const CA_VALUE: u32 = 1 << 2;
+pub const CA_TEST_TYPE: u32 = 1 << 3;
+pub const CA_DELTA: u32 = 1 << 4;
+pub const CA_EVENTS: u32 = 1 << 5;
+// Event sub-codes relative to the SYNC first-event base
+// (CounterNotify=0, AlarmNotify=1).
+pub const ALARM_NOTIFY_KIND: u8 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateFenceRequest {
     pub drawable: u32,
@@ -102,6 +128,134 @@ pub fn parse_alarm_with_mask(body: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     Some((read_u32_le(body), read_u32_le(&body[4..])))
+}
+
+/// Attributes carried by a `CreateAlarm`/`ChangeAlarm` value-list.
+/// Each field is `Some` only when its value-mask bit was set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlarmAttributes {
+    pub counter: Option<u32>,
+    pub value_type: Option<u32>,
+    pub value: Option<i64>,
+    pub test_type: Option<u32>,
+    pub delta: Option<i64>,
+    pub events: Option<bool>,
+}
+
+/// Parse a `CreateAlarm`/`ChangeAlarm` body: `alarm(4) value-mask(4)
+/// value-list(var)`. Fields appear in ascending value-mask bit order;
+/// CARD32/enum/BOOL fields occupy 4 bytes, INT64 (`VALUE`, `DELTA`)
+/// occupy 8 (INT32 hi, CARD32 lo). Returns `None` on truncation.
+#[must_use]
+pub fn parse_alarm_attributes(body: &[u8]) -> Option<(u32, AlarmAttributes)> {
+    if body.len() < 8 {
+        return None;
+    }
+    let alarm = read_u32_le(body);
+    let mask = read_u32_le(&body[4..]);
+    let list = &body[8..];
+    let mut off = 0usize;
+    let mut attrs = AlarmAttributes::default();
+
+    if mask & CA_COUNTER != 0 {
+        if list.len() < off + 4 {
+            return None;
+        }
+        attrs.counter = Some(read_u32_le(&list[off..]));
+        off += 4;
+    }
+    if mask & CA_VALUE_TYPE != 0 {
+        if list.len() < off + 4 {
+            return None;
+        }
+        attrs.value_type = Some(read_u32_le(&list[off..]));
+        off += 4;
+    }
+    if mask & CA_VALUE != 0 {
+        if list.len() < off + 8 {
+            return None;
+        }
+        attrs.value = Some(read_i64(&list[off..], &list[off + 4..]));
+        off += 8;
+    }
+    if mask & CA_TEST_TYPE != 0 {
+        if list.len() < off + 4 {
+            return None;
+        }
+        attrs.test_type = Some(read_u32_le(&list[off..]));
+        off += 4;
+    }
+    if mask & CA_DELTA != 0 {
+        if list.len() < off + 8 {
+            return None;
+        }
+        attrs.delta = Some(read_i64(&list[off..], &list[off + 4..]));
+        off += 8;
+    }
+    if mask & CA_EVENTS != 0 {
+        if list.len() < off + 4 {
+            return None;
+        }
+        attrs.events = Some(list[off] != 0);
+    }
+    Some((alarm, attrs))
+}
+
+/// Does a counter transition from `old` to `new` satisfy an alarm's
+/// trigger test against `wait_value`? Transition tests require an actual
+/// crossing; comparison tests look only at the new value (see the X
+/// Synchronization Extension spec, §"Alarms").
+#[must_use]
+pub fn trigger_fires(test_type: u32, old: i64, new: i64, wait_value: i64) -> bool {
+    match test_type {
+        TEST_POSITIVE_TRANSITION => old < wait_value && new >= wait_value,
+        TEST_NEGATIVE_TRANSITION => old > wait_value && new <= wait_value,
+        TEST_POSITIVE_COMPARISON => new >= wait_value,
+        TEST_NEGATIVE_COMPARISON => new <= wait_value,
+        _ => false,
+    }
+}
+
+/// The comparison underlying a test type, used when re-arming a
+/// triggered alarm: advance `wait_value` by `delta` until this is false
+/// for the current counter value, so the alarm fires again on the next
+/// crossing rather than immediately.
+#[must_use]
+pub fn comparison_satisfied(test_type: u32, value: i64, wait_value: i64) -> bool {
+    match test_type {
+        TEST_POSITIVE_TRANSITION | TEST_POSITIVE_COMPARISON => value >= wait_value,
+        TEST_NEGATIVE_TRANSITION | TEST_NEGATIVE_COMPARISON => value <= wait_value,
+        _ => false,
+    }
+}
+
+/// Encode an `AlarmNotify` event (32 bytes). `first_event` is the SYNC
+/// extension's advertised first-event base; the event type is
+/// `first_event + ALARM_NOTIFY_KIND`. Layout matches
+/// `xSyncAlarmNotifyEvent` in `syncproto.h`.
+#[must_use]
+pub fn encode_alarm_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    alarm: u32,
+    counter_value: i64,
+    alarm_value: i64,
+    time: u32,
+    state: u8,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.push(first_event.wrapping_add(ALARM_NOTIFY_KIND));
+    out.push(ALARM_NOTIFY_KIND);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, alarm);
+    write_i64(byte_order, &mut out, counter_value);
+    write_i64(byte_order, &mut out, alarm_value);
+    write_u32(byte_order, &mut out, time);
+    out.push(state);
+    out.extend_from_slice(&[0u8; 3]);
+    debug_assert_eq!(out.len(), 32);
+    out
 }
 
 #[must_use]
@@ -307,6 +461,129 @@ mod tests {
         assert_eq!(u16::from_le_bytes(reply[68..70].try_into().unwrap()), 8);
         assert_eq!(&reply[70..78], b"IDLETIME");
         assert_eq!(&reply[78..80], &[0, 0]);
+    }
+
+    // Reconstructs the exact CreateAlarm muffin sends under Cinnamon
+    // (captured in cinnamon.xtrace): all six attributes set, Relative
+    // value 1, PositiveComparison, delta 1, events true. The body is
+    // everything after the 4-byte generic SYNC request header.
+    fn muffin_create_alarm_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x01e0_0019u32.to_le_bytes()); // alarm
+        let mask = CA_COUNTER | CA_VALUE_TYPE | CA_VALUE | CA_TEST_TYPE | CA_DELTA | CA_EVENTS;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&0x0260_0006u32.to_le_bytes()); // counter
+        body.extend_from_slice(&VALUE_TYPE_RELATIVE.to_le_bytes()); // value-type
+        body.extend_from_slice(&0i32.to_le_bytes()); // value hi
+        body.extend_from_slice(&1u32.to_le_bytes()); // value lo = 1
+        body.extend_from_slice(&TEST_POSITIVE_COMPARISON.to_le_bytes()); // test-type
+        body.extend_from_slice(&0i32.to_le_bytes()); // delta hi
+        body.extend_from_slice(&1u32.to_le_bytes()); // delta lo = 1
+        body.push(1); // events = true
+        body.extend_from_slice(&[0u8; 3]); // pad
+        body
+    }
+
+    #[test]
+    fn parse_alarm_attributes_decodes_muffin_create_alarm() {
+        let (alarm, attrs) = parse_alarm_attributes(&muffin_create_alarm_body()).unwrap();
+        assert_eq!(alarm, 0x01e0_0019);
+        assert_eq!(attrs.counter, Some(0x0260_0006));
+        assert_eq!(attrs.value_type, Some(VALUE_TYPE_RELATIVE));
+        assert_eq!(attrs.value, Some(1));
+        assert_eq!(attrs.test_type, Some(TEST_POSITIVE_COMPARISON));
+        assert_eq!(attrs.delta, Some(1));
+        assert_eq!(attrs.events, Some(true));
+    }
+
+    #[test]
+    fn parse_alarm_attributes_respects_partial_mask() {
+        // Only counter + events set: the value-list packs just those
+        // two 4-byte fields, in bit order.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x55u32.to_le_bytes()); // alarm
+        body.extend_from_slice(&(CA_COUNTER | CA_EVENTS).to_le_bytes());
+        body.extend_from_slice(&0xabcdu32.to_le_bytes()); // counter
+        body.push(0); // events = false
+        body.extend_from_slice(&[0u8; 3]);
+        let (alarm, attrs) = parse_alarm_attributes(&body).unwrap();
+        assert_eq!(alarm, 0x55);
+        assert_eq!(attrs.counter, Some(0xabcd));
+        assert_eq!(attrs.value_type, None);
+        assert_eq!(attrs.value, None);
+        assert_eq!(attrs.events, Some(false));
+    }
+
+    #[test]
+    fn parse_alarm_attributes_rejects_truncated_list() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // alarm
+        body.extend_from_slice(&CA_VALUE.to_le_bytes()); // claims an INT64 value
+        body.extend_from_slice(&[0u8; 4]); // only 4 bytes, INT64 needs 8
+        assert!(parse_alarm_attributes(&body).is_none());
+    }
+
+    #[test]
+    fn trigger_fires_semantics() {
+        // PositiveComparison: fires whenever new >= wait.
+        assert!(trigger_fires(TEST_POSITIVE_COMPARISON, 0, 5, 5));
+        assert!(trigger_fires(TEST_POSITIVE_COMPARISON, 9, 6, 5));
+        assert!(!trigger_fires(TEST_POSITIVE_COMPARISON, 0, 4, 5));
+        // PositiveTransition: only on the upward crossing.
+        assert!(trigger_fires(TEST_POSITIVE_TRANSITION, 4, 5, 5));
+        assert!(!trigger_fires(TEST_POSITIVE_TRANSITION, 5, 6, 5)); // already past
+        // NegativeComparison / NegativeTransition mirror.
+        assert!(trigger_fires(TEST_NEGATIVE_COMPARISON, 0, 3, 5));
+        assert!(trigger_fires(TEST_NEGATIVE_TRANSITION, 6, 5, 5));
+        assert!(!trigger_fires(TEST_NEGATIVE_TRANSITION, 4, 3, 5));
+    }
+
+    #[test]
+    fn alarm_notify_event_shape_matches_syncproto() {
+        let evt = encode_alarm_notify_event(
+            ClientByteOrder::LittleEndian,
+            83, // SYNC first-event base
+            SequenceNumber(0x1234),
+            0x01e0_0019,
+            2,           // counter value
+            7,           // alarm (wait) value
+            0x89ab_cdef, // time
+            ALARM_STATE_ACTIVE,
+        );
+        assert_eq!(evt.len(), 32);
+        assert_eq!(evt[0], 84, "type = SYNC first-event + AlarmNotify(1)");
+        assert_eq!(evt[1], ALARM_NOTIFY_KIND, "kind byte");
+        assert_eq!(u16::from_le_bytes(evt[2..4].try_into().unwrap()), 0x1234);
+        assert_eq!(
+            u32::from_le_bytes(evt[4..8].try_into().unwrap()),
+            0x01e0_0019
+        );
+        assert_eq!(
+            i32::from_le_bytes(evt[8..12].try_into().unwrap()),
+            0,
+            "counter hi"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[12..16].try_into().unwrap()),
+            2,
+            "counter lo"
+        );
+        assert_eq!(
+            i32::from_le_bytes(evt[16..20].try_into().unwrap()),
+            0,
+            "alarm hi"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[20..24].try_into().unwrap()),
+            7,
+            "alarm lo"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[24..28].try_into().unwrap()),
+            0x89ab_cdef
+        );
+        assert_eq!(evt[28], ALARM_STATE_ACTIVE);
+        assert_eq!(&evt[29..32], &[0, 0, 0]);
     }
 
     #[test]

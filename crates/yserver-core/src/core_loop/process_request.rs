@@ -2257,17 +2257,27 @@ fn handle_sync_request(
             }
         }
         x11sync::SET_COUNTER => {
-            if let Some((counter, value)) = x11sync::parse_counter_value(body)
-                && let Some(c) = state.sync_counters.get_mut(&counter)
-            {
-                c.value = value;
+            if let Some((counter, value)) = x11sync::parse_counter_value(body) {
+                let transition = state.sync_counters.get_mut(&counter).map(|c| {
+                    let old = c.value;
+                    c.value = value;
+                    (old, value)
+                });
+                if let Some((old, new)) = transition {
+                    evaluate_alarms_for_counter(state, counter, old, new);
+                }
             }
         }
         x11sync::CHANGE_COUNTER => {
-            if let Some((counter, delta)) = x11sync::parse_counter_value(body)
-                && let Some(c) = state.sync_counters.get_mut(&counter)
-            {
-                c.value = c.value.saturating_add(delta);
+            if let Some((counter, delta)) = x11sync::parse_counter_value(body) {
+                let transition = state.sync_counters.get_mut(&counter).map(|c| {
+                    let old = c.value;
+                    c.value = old.saturating_add(delta);
+                    (old, c.value)
+                });
+                if let Some((old, new)) = transition {
+                    evaluate_alarms_for_counter(state, counter, old, new);
+                }
             }
         }
         x11sync::QUERY_COUNTER => {
@@ -2296,21 +2306,33 @@ fn handle_sync_request(
             // Non-blocking stub.
         }
         x11sync::CREATE_ALARM => {
-            if let Some((alarm, _mask)) = x11sync::parse_alarm_with_mask(body) {
-                state.sync_alarms.insert(
-                    alarm,
-                    crate::server::SyncAlarm {
-                        owner: client_id,
-                        ..crate::server::SyncAlarm::default()
-                    },
-                );
+            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body) {
+                let mut a = crate::server::SyncAlarm {
+                    owner: client_id,
+                    state: x11sync::ALARM_STATE_ACTIVE,
+                    events: true,
+                    ..crate::server::SyncAlarm::default()
+                };
+                apply_alarm_attributes(state, &mut a, &attrs);
+                let counter = a.counter;
+                state.sync_alarms.insert(alarm, a);
+                // Per the X Synchronization Extension spec the trigger is
+                // tested at creation: a comparison alarm whose condition
+                // already holds fires immediately.
+                let now = state.sync_counters.get(&counter).map_or(0, |c| c.value);
+                evaluate_alarms_for_counter(state, counter, now, now);
             }
         }
         x11sync::CHANGE_ALARM => {
-            if let Some((alarm, _mask)) = x11sync::parse_alarm_with_mask(body)
-                && let Some(a) = state.sync_alarms.get_mut(&alarm)
+            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body)
+                && let Some(mut a) = state.sync_alarms.get(&alarm).cloned()
             {
-                a.state = 0;
+                apply_alarm_attributes(state, &mut a, &attrs);
+                a.state = x11sync::ALARM_STATE_ACTIVE;
+                let counter = a.counter;
+                state.sync_alarms.insert(alarm, a);
+                let now = state.sync_counters.get(&counter).map_or(0, |c| c.value);
+                evaluate_alarms_for_counter(state, counter, now, now);
             }
         }
         x11sync::QUERY_ALARM => {
@@ -2482,6 +2504,120 @@ fn handle_sync_request(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Merge a `CreateAlarm`/`ChangeAlarm` value-list into an alarm,
+/// resolving the `wait_value` against the watched counter's current
+/// value (Relative alarms add `value` to the counter; Absolute alarms
+/// take `value` directly). Only attributes whose mask bit was set are
+/// applied. muffin sets every attribute in a single `CreateAlarm`, so
+/// the per-field defaults below are not load-bearing for the Cinnamon
+/// path.
+fn apply_alarm_attributes(
+    state: &ServerState,
+    alarm: &mut crate::server::SyncAlarm,
+    attrs: &yserver_protocol::x11::sync::AlarmAttributes,
+) {
+    use yserver_protocol::x11::sync as x11sync;
+    if let Some(counter) = attrs.counter {
+        alarm.counter = counter;
+    }
+    if let Some(test_type) = attrs.test_type {
+        alarm.test_type = u8::try_from(test_type).unwrap_or(0);
+    }
+    if let Some(delta) = attrs.delta {
+        alarm.delta = delta;
+    }
+    if let Some(events) = attrs.events {
+        alarm.events = events;
+    }
+    if attrs.value.is_some() || attrs.value_type.is_some() {
+        let value = attrs.value.unwrap_or(0);
+        let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
+        alarm.wait_value = if relative {
+            let current = state
+                .sync_counters
+                .get(&alarm.counter)
+                .map_or(0, |c| c.value);
+            current.saturating_add(value)
+        } else {
+            value
+        };
+    }
+}
+
+/// Evaluate every active alarm watching `counter` after it moved from
+/// `old` to `new`, firing `AlarmNotify` to each alarm's owner when its
+/// trigger test crosses. A triggered alarm with non-zero delta re-arms
+/// (its `wait_value` advances past the current value so it fires again
+/// on the next crossing); with zero delta it becomes Inactive. This is
+/// the frame-timing signal mutter/muffin waits on before compositing a
+/// client frame and emitting `_NET_WM_FRAME_DRAWN`.
+fn evaluate_alarms_for_counter(state: &mut ServerState, counter: u32, old: i64, new: i64) {
+    use yserver_protocol::x11::sync as x11sync;
+    let candidates: Vec<u32> = state
+        .sync_alarms
+        .iter()
+        .filter(|(_, a)| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE)
+        .map(|(id, _)| *id)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let time = state.timestamp_now();
+    for alarm_id in candidates {
+        let Some(a) = state.sync_alarms.get(&alarm_id) else {
+            continue;
+        };
+        let test_type: u32 = a.test_type.into();
+        if !x11sync::trigger_fires(test_type, old, new, a.wait_value) {
+            continue;
+        }
+        let owner = a.owner;
+        let events = a.events;
+        let fired_wait = a.wait_value;
+        let delta = a.delta;
+
+        let (new_wait, new_state) = if delta == 0 {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else {
+            // Advance past the current value so the next crossing fires
+            // again instead of re-triggering on this same value. Bounded
+            // in case delta points away from the test direction.
+            let mut w = fired_wait;
+            let mut guard = 0u32;
+            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
+                let next = w.saturating_add(delta);
+                if next == w {
+                    break;
+                }
+                w = next;
+                guard += 1;
+            }
+            (w, x11sync::ALARM_STATE_ACTIVE)
+        };
+
+        if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+            a.wait_value = new_wait;
+            a.state = new_state;
+        }
+
+        if events {
+            let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+                let evt = x11sync::encode_alarm_notify_event(
+                    order,
+                    crate::nested::SYNC_FIRST_EVENT,
+                    seq,
+                    alarm_id,
+                    new,
+                    fired_wait,
+                    time,
+                    new_state,
+                );
+                buf.extend_from_slice(&evt);
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14520,6 +14656,149 @@ mod tests {
         }
         peer.set_nonblocking(false).expect("unset_nonblocking");
         out
+    }
+
+    fn sync_header(minor: u8) -> RequestHeader {
+        RequestHeader {
+            opcode: 142,
+            data: minor,
+            length_units: 0,
+        }
+    }
+
+    fn counter_value_body(counter: u32, value: i64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&counter.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        b.extend_from_slice(&((value >> 32) as i32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        b.extend_from_slice(&(value as u32).to_le_bytes());
+        b
+    }
+
+    // The exact CreateAlarm muffin issues under Cinnamon: Relative
+    // value 1, PositiveComparison, delta 1, events true, watching
+    // counter 0x02600006.
+    fn muffin_alarm_body() -> Vec<u8> {
+        use yserver_protocol::x11::sync as x11sync;
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x01e0_0019u32.to_le_bytes());
+        let mask = x11sync::CA_COUNTER
+            | x11sync::CA_VALUE_TYPE
+            | x11sync::CA_VALUE
+            | x11sync::CA_TEST_TYPE
+            | x11sync::CA_DELTA
+            | x11sync::CA_EVENTS;
+        b.extend_from_slice(&mask.to_le_bytes());
+        b.extend_from_slice(&0x0260_0006u32.to_le_bytes());
+        b.extend_from_slice(&x11sync::VALUE_TYPE_RELATIVE.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes()); // value hi
+        b.extend_from_slice(&1u32.to_le_bytes()); // value lo
+        b.extend_from_slice(&x11sync::TEST_POSITIVE_COMPARISON.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes()); // delta hi
+        b.extend_from_slice(&1u32.to_le_bytes()); // delta lo
+        b.push(1); // events = true
+        b.extend_from_slice(&[0u8; 3]);
+        b
+    }
+
+    // Reproduces the Cinnamon frame-sync deadlock: muffin arms a SYNC
+    // alarm on a GTK client's _NET_WM_SYNC_REQUEST_COUNTER and depends
+    // on AlarmNotify to learn the client finished a frame. Before the
+    // fix, SetCounter never evaluated alarms and no AlarmNotify was
+    // ever sent, so muffin never composited and clients froze.
+    #[test]
+    fn sync_alarm_fires_alarmnotify_on_watched_counter_crossing() {
+        let mut state = ServerState::new();
+        let mut muffin = install_client(&mut state, 1);
+        let mut gtk = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        // GTK client (2) creates its frame-sync counter at 0.
+        handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(1),
+            sync_header(2), // CREATE_COUNTER
+            &counter_value_body(0x0260_0006, 0),
+        )
+        .unwrap();
+
+        // muffin (1) arms the alarm. wait_value = counter(0) + 1 = 1,
+        // so the create-time test (0 >= 1) does not fire.
+        handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            sync_header(8), // CREATE_ALARM
+            &muffin_alarm_body(),
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut muffin).is_empty(),
+            "alarm must not fire at creation when wait_value exceeds the counter"
+        );
+
+        // GTK client finishes a frame: counter 0 -> 2, crossing 1.
+        handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(2),
+            sync_header(3), // SET_COUNTER
+            &counter_value_body(0x0260_0006, 2),
+        )
+        .unwrap();
+
+        let evt = read_all_available(&mut muffin);
+        assert_eq!(evt.len(), 32, "exactly one AlarmNotify to the alarm owner");
+        assert_eq!(evt[0], 84, "type = SYNC first-event(83) + AlarmNotify(1)");
+        assert_eq!(evt[1], 1, "kind = AlarmNotify");
+        assert_eq!(
+            u32::from_le_bytes(evt[4..8].try_into().unwrap()),
+            0x01e0_0019,
+            "alarm id"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[12..16].try_into().unwrap()),
+            2,
+            "counter value carried on the event"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt[20..24].try_into().unwrap()),
+            1,
+            "alarm (wait) value that triggered"
+        );
+        assert_eq!(evt[28], 0, "non-zero delta re-arms -> state Active");
+        assert!(
+            read_all_available(&mut gtk).is_empty(),
+            "AlarmNotify goes to the alarm owner, not the counter setter"
+        );
+
+        // Re-arm proof: the next frame (2 -> 4) must fire again. Without
+        // re-arm the muffin frame loop would stall after one frame.
+        handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(3),
+            sync_header(3),
+            &counter_value_body(0x0260_0006, 4),
+        )
+        .unwrap();
+        let evt2 = read_all_available(&mut muffin);
+        assert_eq!(
+            evt2.len(),
+            32,
+            "second crossing fires again (alarm re-armed)"
+        );
+        assert_eq!(
+            u32::from_le_bytes(evt2[12..16].try_into().unwrap()),
+            4,
+            "second event carries the new counter value"
+        );
     }
 
     #[test]
