@@ -813,6 +813,23 @@ yserver-xfce-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+yserver-cinnamon-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-cinnamon.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-cinnamon.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-cinnamon.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
 # `tests` is a comma-separated list. Default budget is 600s/test —
 # `composite` / `cacomposite` / `repeat` are intrinsically slow
