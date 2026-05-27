@@ -7585,7 +7585,22 @@ fn handle_xi2_request(
             // `same_screen=false` and routing through the "different
             // screen" branch, which made Thunar's right-click popup
             // appear at root+window_origin instead of near the click.
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 6);
+            // XI2 button state: fold the KeyButMask button bits into the
+            // XI2 button bitmask (button N -> bit N). muffin's
+            // `_NET_WM_MOVERESIZE` move grab queries the pointer to learn
+            // whether the initiating button is still held — an empty mask
+            // makes it abort the move and the window never budges.
+            let mut button_mask: u32 = 0;
+            for (keybut_bit, button) in
+                [(0x0100u16, 1u32), (0x0200, 2), (0x0400, 3), (0x0800, 4), (0x1000, 5)]
+            {
+                if mask & keybut_bit != 0 {
+                    button_mask |= 1 << button;
+                }
+            }
+            // length 7 units: 6 coord words + the same_screen/buttons_len/
+            // ModifierInfo/GroupInfo block + a 1-unit button bitmask.
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 7);
             x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
             x11::write_u32(byte_order, &mut reply, child.0);
             x11::write_u32(byte_order, &mut reply, (i32::from(root_x_int) << 16) as u32);
@@ -7594,7 +7609,7 @@ fn handle_xi2_request(
             x11::write_u32(byte_order, &mut reply, (i32::from(win_y_int) << 16) as u32);
             reply.push(same_screen); // byte 32: same_screen (BOOL)
             reply.push(0); // byte 33: pad
-            x11::write_u16(byte_order, &mut reply, 0); // bytes 34-35: buttons_len
+            x11::write_u16(byte_order, &mut reply, 1); // bytes 34-35: buttons_len (1 unit)
             // ModifierInfo: 4× CARD32 = base / latched / locked /
             // effective. `mask` carries the X11 KeyButMask snapshot
             // from the backend; place it in `effective_mods` so GDK
@@ -7604,6 +7619,13 @@ fn handle_xi2_request(
             x11::write_u32(byte_order, &mut reply, 0); // locked_mods
             x11::write_u32(byte_order, &mut reply, u32::from(mask)); // effective_mods
             reply.extend_from_slice(&[0u8; 4]); // group info
+            // XI2 button mask is a raw byte array indexed by
+            // `XIMaskIsSet(ptr, btn) = ptr[btn>>3] & (1 << (btn & 7))`
+            // (X11/extensions/XI2.h) — byte[0] holds buttons 0-7. It is
+            // NOT byte-swapped per client order (Xorg leaves the trailing
+            // mask bytes untouched in its reply swap), so emit
+            // little-endian unconditionally.
+            reply.extend_from_slice(&button_mask.to_le_bytes());
             buf.extend_from_slice(&reply);
         }
         // XI2 grab opcodes (51-55). yserver wires these into the
@@ -8751,7 +8773,17 @@ fn handle_change_window_attributes(
         }
     }
 
-    if window_wants_keyboard_focus(state, client_id, target_window) {
+    // Only a CWA that (re)selects input may promote focus — i.e. a
+    // window "advertising input later" by adding key events to its event
+    // mask. A CWA changing an unrelated attribute (cursor, background,
+    // ...) must never move the input focus; in X11 focus changes only
+    // via SetInputFocus / grabs. Without this gate, muffin setting the
+    // "fleur" move cursor on its guard window during a
+    // `_NET_WM_MOVERESIZE` drag stole focus to that window, which then
+    // turned the dragged app's own child-focus move into a
+    // `FocusOut(Nonlinear)` (GTK4 backdrop) and broke the drag.
+    if request.event_mask.is_some() && window_wants_keyboard_focus(state, client_id, target_window)
+    {
         debug!(
             "focus decision: client {} ChangeWindowAttributes focus 0x{:x}",
             client_id.0, target_window.0
@@ -17475,6 +17507,91 @@ mod tests {
         );
     }
 
+    /// A `ChangeWindowAttributes` that only changes the cursor (or any
+    /// other non-event-mask attribute) must NOT move the input focus.
+    /// In X11 focus changes only via `SetInputFocus` / grabs, never CWA.
+    ///
+    /// Regression (the evince / GTK4 titlebar-drag freeze): during a
+    /// `_NET_WM_MOVERESIZE` move, muffin sets the "fleur" move cursor on
+    /// its guard window via a cursor-only CWA. The handler promoted
+    /// keyboard focus to any "focus-wanting" (viewable + key-selecting)
+    /// window on *any* CWA, so focus was stolen to the guard window. The
+    /// app's next `SetInputFocus` to its own child was then computed from
+    /// that unrelated prev focus -> `FocusOut(detail=Nonlinear)` -> GTK4
+    /// backdrop (greyed CSD buttons) and the drag collapsed.
+    #[test]
+    fn cursor_only_cwa_does_not_steal_keyboard_focus() {
+        const CLIENT_ID: u32 = 1;
+        const GUARD_XID: u32 = 0x0010_0011; // muffin's guard window
+        const FOCUSED_XID: u32 = 0x0010_0007; // the real focus window
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        for xid in [GUARD_XID, FOCUSED_XID] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(CLIENT_ID),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(xid));
+        }
+        // Guard window is viewable and selects key events, so
+        // `window_wants_keyboard_focus` would return true for it.
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .expect("client")
+            .event_masks
+            .insert(ResourceId(GUARD_XID), 0x1); // KeyPress
+
+        // Establish the real focus on FOCUSED_XID before the CWA.
+        for c in state.clients.values_mut() {
+            c.focused_window = ResourceId(FOCUSED_XID);
+        }
+
+        // Cursor-only CWA on the guard window: CWCursor (bit 14 =
+        // 0x4000), value 0 = None. No event-mask change.
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&GUARD_XID.to_le_bytes());
+        body.extend_from_slice(&0x4000u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        handle_change_window_attributes(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_change_window_attributes");
+
+        assert_eq!(
+            state
+                .clients
+                .get(&CLIENT_ID)
+                .expect("client")
+                .focused_window,
+            ResourceId(FOCUSED_XID),
+            "a cursor-only ChangeWindowAttributes must not promote keyboard \
+             focus to the target window; focus must stay where SetInputFocus \
+             put it",
+        );
+    }
+
     /// GTK4 (gnome-text-editor, modern GTK apps) sets per-widget
     /// cursors through XInput2's `XIChangeCursor` (opcode 42), not
     /// core X11's `XDefineCursor`. Pre-fix the handler was a logging
@@ -18776,6 +18893,108 @@ mod tests {
             5,
             "the grabbed XI2 event must be a ButtonRelease (evtype 5)",
         );
+    }
+
+    /// `XIQueryPointer` must report currently-held pointer buttons in
+    /// the XI2 `buttons` bitmask, not only in the legacy KeyButMask
+    /// `effective_mods`. A GTK4 CSD window move goes through
+    /// `_NET_WM_MOVERESIZE`: the app sends the request and muffin — which
+    /// never saw the ButtonPress — queries the pointer to learn whether
+    /// the initiating button is still held. With an empty `buttons` mask
+    /// muffin concluded the button was released and aborted the move
+    /// grab immediately (the window "didn't budge"). Button N maps to
+    /// bit N (button 1 -> bit 1).
+    #[test]
+    fn xi_query_pointer_reports_held_button_in_xi2_button_mask() {
+        use crate::{backend::Backend, resources::ROOT_VISUAL};
+        use yserver_protocol::x11::ClientByteOrder;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0020_0070;
+        const HOST_XID: u32 = 0xCAFE_0007;
+
+        // Run for both client byte orders. The XI2 button mask is a raw
+        // byte array indexed by `XIMaskIsSet` (X11/extensions/XI2.h), so it
+        // must NOT be byte-swapped per client order — a big-endian client
+        // must still read button 1 in mask byte 0.
+        for order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, CLIENT_ID);
+            peer.set_nonblocking(true).unwrap();
+            state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = order;
+            let mut backend = RecordingBackend::new();
+            // Model button 1 held (KeyButMask Button1Mask = 0x0100).
+            backend.query_pointer_mask = 0x0100;
+
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(CLIENT_ID),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(WINDOW_XID),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+            Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
+                .expect("register host xid");
+
+            // XIQueryPointer body: window(4) + deviceid(2) + pad(2).
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+            body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+            body.extend_from_slice(&0u16.to_le_bytes()); // pad
+
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 40, // XIQueryPointer
+                length_units: 3,
+            };
+            handle_xi2_request(
+                &mut state,
+                &mut backend,
+                None,
+                ClientId(CLIENT_ID),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("xi query pointer");
+
+            let mut buf = [0u8; 128];
+            let n = peer.read(&mut buf).expect("reply");
+            // Reply: 8-byte header + 24 coord bytes; same_screen@32, pad@33,
+            // buttons_len@34-35, mods@36-51, group@52-55, button mask@56+.
+            assert!(
+                n >= 60,
+                "{order:?}: XIQueryPointer reply must carry a 1-unit button bitmask (got {n})",
+            );
+            let buttons_len = match order {
+                ClientByteOrder::LittleEndian => u16::from_le_bytes([buf[34], buf[35]]),
+                ClientByteOrder::BigEndian => u16::from_be_bytes([buf[34], buf[35]]),
+            };
+            assert_eq!(
+                buttons_len, 1,
+                "{order:?}: buttons_len must be 1 so clients can read button state",
+            );
+            // Byte-indexed exactly as `XIMaskIsSet(mask, 1) = mask[1>>3] &
+            // (1 << (1 & 7)) = mask[0] & 0x02` (the way muffin reads it),
+            // which is byte-order independent.
+            assert_ne!(
+                buf[56] & (1 << 1),
+                0,
+                "{order:?}: button 1 must be held in XI2 button mask byte 0 \
+                 (raw byte array, not byte-swapped); muffin's \
+                 _NET_WM_MOVERESIZE move aborts on an empty mask",
+            );
+        }
     }
 
     /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter

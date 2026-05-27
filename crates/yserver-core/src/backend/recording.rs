@@ -151,6 +151,10 @@ pub struct RecordingBackend {
     /// (gated on the trait method) actually runs. Default `false`
     /// matches the trait default — v1 / host-X11 semantics.
     pub redirect_activation_supported: bool,
+    /// KeyButMask returned by `query_pointer` (lets tests model a held
+    /// pointer button — e.g. `Button1Mask = 0x0100` — so the
+    /// XIQueryPointer reply's button state can be asserted).
+    pub query_pointer_mask: u16,
 }
 
 impl Default for RecordingBackend {
@@ -170,6 +174,7 @@ impl RecordingBackend {
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             redirect_activation_supported: false,
+            query_pointer_mask: 0,
         }
     }
 
@@ -1107,7 +1112,7 @@ impl Backend for RecordingBackend {
             same_screen: true,
             win_x: 0,
             win_y: 0,
-            mask: 0,
+            mask: self.query_pointer_mask,
         })
     }
 
