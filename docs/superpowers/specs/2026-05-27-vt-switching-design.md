@@ -222,7 +222,7 @@ Triggered by `disable_seat` callback firing on the main thread during `seat.disp
 7. Call `libseat_disable_seat()` to ack. Set `seat_state = Suspended`.
 8. Re-check `pending_enable`; if set, primes the next iteration to begin resume the moment `enable_seat` arrives.
 
-**No explicit `drmDropMaster`.** Following wlroots's pattern (`backend/drm/backend.c::handle_session_active`): wlroots does not call `drmDropMaster` itself on disable. libseat / seatd / logind revoke master at the kernel level as part of processing the `disable_seat` ack. By the time the kernel completes the VT switch, master is gone. We don't need to do it ourselves and adding a redundant explicit drop would just be one more ioctl that can fail at an awkward time.
+**No explicit `drmDropMaster`.** The safety argument has three pieces: (1) by the time we reach the ack in step 7, the `seat_state != Active` gate set in step 1 has already prevented every master-requiring ioctl (modeset, pageflip, atomic commit) from being issued; (2) `libseat_disable_seat()` is the synchronization barrier — libseat / seatd / logind perform the kernel-level master revocation as part of processing the ack, before allowing the VT switch to proceed; (3) resume re-acquires master explicitly via `drmSetMaster` in resume step 3. An explicit `drmDropMaster` on suspend would be redundant under (1) and (2), and would just be one more ioctl that can fail at an awkward time. wlroots (`backend/drm/backend.c::handle_session_active`) demonstrates this pattern in production — it does not call `drmDropMaster` either.
 
 Crossing events (Enter / Leave) are **not** synthesised at suspend.
 
@@ -338,7 +338,7 @@ A rapid-double-switch capture is added to bee's run: Ctrl-Alt-F2 then immediatel
 ### Known false-positive sources
 
 - Held-key release can dispatch to a client that disconnected mid-suspend; `core_loop::process_disconnect` already handles "send to dead client = drop", so we just need to not panic on the release write itself.
-- The "no seat manager" test must exercise the Direct path on a system without logind/seatd. The "policy bypass refused" test must exercise the hard-fail path with `LIBSEAT_BACKEND=direct` set.
+- The "no seat manager" test must exercise the legacy direct-open fallback on a system without any working libseat backend (no logind, no seatd, no usable libseat-direct). On hosts where libseat-direct does succeed (root + no IPC manager), we use it — that's covered by the regular Libseat code path, not a separate test.
 
 ## Risks
 
