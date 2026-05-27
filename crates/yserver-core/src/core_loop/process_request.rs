@@ -4280,6 +4280,28 @@ fn handle_mit_shm_put_image(
         req.src_width,
         req.src_height,
     );
+    // ShmPutImage with send_event=true obligates a ShmCompletion event
+    // once the transfer is done (shmproto.h). GTK/GDK pools SHM segments
+    // and blocks the next frame until the completion frees one — without
+    // this the render loop stalls after the pool is exhausted (the
+    // cinnamon-settings repaint freeze). MIT-SHM first-event base is 65;
+    // ShmCompletion offset is 0.
+    if req.send_event {
+        const MIT_SHM_FIRST_EVENT: u8 = 65;
+        let _dropped = fanout_event_to_clients(state, &[client_id], |buf, seq, order| {
+            x11::encode_shm_completion_event(
+                buf,
+                order,
+                seq,
+                MIT_SHM_FIRST_EVENT,
+                ResourceId(req.drawable),
+                u16::from(shm::PUT_IMAGE),
+                MIT_SHM_MAJOR_OPCODE,
+                req.shmseg,
+                req.offset,
+            );
+        });
+    }
     Ok(RequestOutcome::Handled)
 }
 
@@ -10361,8 +10383,8 @@ fn handle_map_window(
         let _dropped = emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
             x11::encode_map_notify_event(buf, seq, order, parent, window, override_redir);
         });
-        // Emit Expose on the window itself (when ExposureMask selected),
-        // then recurse through descendants. Subscribed clients want the
+        // Emit VisibilityNotify(Unobscured) then Expose on the window
+        // itself when it becomes viewable. Subscribed clients want the
         // newly-viewable window to redraw.
         let extents = state
             .resources
@@ -10370,6 +10392,21 @@ fn handle_map_window(
             .filter(|w| w.map_state == crate::resources::MapState::Viewable)
             .map(|w| (w.width, w.height));
         if let Some((w, h)) = extents {
+            // VisibilityNotify(Unobscured) for clients selecting
+            // VisibilityChangeMask (0x10000). Under yserver's compositor
+            // model every viewable top-level is effectively unobscured.
+            // Without this, GTK3 leaves the window in a non-paintable
+            // visibility state and suppresses all frame-clock paints
+            // after the first expose-driven frame — the
+            // cinnamon-settings "title changes but content never
+            // repaints" freeze. Xorg sends Unobscured on map; we mirror
+            // that. (We never send Obscured: a composited top-level is
+            // always paintable, and unmap is signalled by UnmapNotify
+            // per spec, not VisibilityNotify.)
+            let _dropped =
+                emit_window_event_to_state(state, window, 0x0001_0000, |buf, seq, order| {
+                    x11::encode_visibility_notify_event(buf, seq, order, window, 0);
+                });
             let _dropped =
                 emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
                     x11::encode_expose_event(buf, seq, order, window, 0, 0, w, h, 0);
@@ -18400,6 +18437,78 @@ mod tests {
              and never NameWindowPixmap'd the freshly-mapped window. \
              See mate.xtrace lines 4938→4940 vs mate-xorg.xtrace lines 5164→5173.",
         );
+    }
+
+    /// Mapping a viewable window emits `VisibilityNotify(Unobscured)`
+    /// (event type 15, state 0) to clients selecting
+    /// `VisibilityChangeMask` (0x10000). Without it, GTK3 suppresses
+    /// all frame-clock paints after the first expose-driven frame —
+    /// the cinnamon-settings "title updates but content never
+    /// repaints" freeze, confirmed by diffing the Xorg vs yserver
+    /// wire traces (Xorg sends Unobscured; yserver previously sent
+    /// nothing).
+    #[test]
+    fn map_window_emits_visibility_notify_unobscured() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0021;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // Client selects VisibilityChangeMask on its own window.
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(WINDOW_XID), 0x0001_0000);
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        let vis = wire.chunks_exact(32).find(|chunk| chunk[0] & 0x7f == 15);
+        let vis = vis.expect("VisibilityNotify (type 15) must be emitted on map");
+        let window = u32::from_le_bytes([vis[4], vis[5], vis[6], vis[7]]);
+        assert_eq!(window, WINDOW_XID, "VisibilityNotify targets the window");
+        assert_eq!(vis[8], 0, "state must be Unobscured (0)");
     }
 
     /// Resize rotates the redirected backing by releasing the old

@@ -1349,6 +1349,58 @@ pub fn encode_expose_event(
     out.extend_from_slice(&[0; 14]);
 }
 
+/// VisibilityNotify (event type 15). `state` is 0=Unobscured,
+/// 1=PartiallyObscured, 2=FullyObscured (X.h `VisibilityUnobscured`…).
+/// GTK3 suppresses frame-clock paints for a window it believes is
+/// `FullyObscured`; clients that select `VisibilityChangeMask` need
+/// `Unobscured` to keep repainting past the first expose-driven frame.
+pub fn encode_visibility_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    window: ResourceId,
+    state: u8,
+) {
+    out.push(15); // VisibilityNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window.0);
+    out.push(state);
+    out.extend_from_slice(&[0; 23]);
+}
+
+/// MIT-SHM `ShmCompletion` event (`xShmCompletionEvent`, shmproto.h).
+/// The server must send this after a `ShmPutImage` issued with
+/// `send_event=true`, so the client knows the shared-memory segment
+/// is free to reuse. GTK/GDK keeps a pool of SHM segments and blocks
+/// the next frame until the completion arrives — without it the
+/// render loop stalls once the pool is exhausted. `event_code` is the
+/// extension's first-event base + `ShmCompletion`(0); `minor_event`
+/// is `X_ShmPutImage`(3); `major_opcode` is the MIT-SHM major.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_shm_completion_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    sequence: SequenceNumber,
+    event_code: u8,
+    drawable: ResourceId,
+    minor_event: u16,
+    major_opcode: u8,
+    shmseg: u32,
+    offset: u32,
+) {
+    out.push(event_code);
+    out.push(0); // bpad0
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, drawable.0);
+    write_u16(order, out, minor_event);
+    out.push(major_opcode);
+    out.push(0); // bpad1
+    write_u32(order, out, shmseg);
+    write_u32(order, out, offset);
+    out.extend_from_slice(&[0; 12]); // pad0/pad1/pad2
+}
+
 /// GraphicsExpose (event type 13). Sent in response to CopyArea/CopyPlane
 /// when graphics-exposures is True for source regions that aren't
 /// guaranteed visible. We always emit a single event covering the full
@@ -3067,6 +3119,45 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_shm_completion_event_wire_layout() {
+        // Ground-truthed against `xShmCompletionEvent` (shmproto.h):
+        // type, bpad, seq, drawable, minorEvent, majorEvent, bpad,
+        // shmseg, offset, 12 pad — 32 bytes total.
+        let mut buf = Vec::new();
+        encode_shm_completion_event(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            65, // event_code = first_event + ShmCompletion(0)
+            ResourceId(0xDEAD_BEEF),
+            3,           // X_ShmPutImage
+            130,         // MIT-SHM major
+            0x00AB_CDEF, // shmseg
+            0x0001_0000, // offset
+        );
+        assert_eq!(buf.len(), 32, "ShmCompletion is 32 bytes");
+        assert_eq!(buf[0], 65, "event code");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sequence");
+        assert_eq!(
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            0xDEAD_BEEF,
+            "drawable"
+        );
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), 3, "minorEvent");
+        assert_eq!(buf[10], 130, "majorEvent");
+        assert_eq!(
+            u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            0x00AB_CDEF,
+            "shmseg"
+        );
+        assert_eq!(
+            u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            0x0001_0000,
+            "offset"
+        );
+    }
 
     #[test]
     fn encode_configure_notify_event_writes_above_sibling() {
