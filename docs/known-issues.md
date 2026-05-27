@@ -200,6 +200,47 @@ from.
       tracking if a real client surfaces a bug here.
 ## Drawing / rendering artifacts
 
+- [ ] **nemo desktop rubber-band selection renders a stepped
+      (staircase) leading edge during the drag (Cinnamon, bee,
+      2026-05-27).** Exposed once the rubber-band anchored correctly
+      (after the `XIGetClientPointer` deviceid fix, `967c09d`). While
+      dragging a marquee selection on the nemo desktop, the selection
+      rectangle's trailing/top/left edges are clean but the **leading
+      (right/bottom) edge is a diagonal staircase of translucent
+      steps** — old band edges from prior frames remain visible. **On
+      button release it briefly shows the correct, clean rectangle**
+      before the band clears.
+      Evidence (captured drawable dump
+      `yserver-v2-drawable-0-present-src-0-*.ppm`, this is the
+      composited scanout source): the staircase is in the composited
+      output itself.
+      Diagnosis: NOT geometry and NOT the client's output. nemo
+      double-buffers — it renders desktop+band into a backing pixmap
+      and `CopyArea`s the band bbox to the desktop window each frame
+      (trace shows large per-frame copies, e.g.
+      `dst=(7,0) 627x496`), so nemo's source is a clean rectangle. The
+      "correct on release" behaviour proves the backing is correct and a
+      **full** repaint renders it right; only the **incremental** repaint
+      during the drag is wrong. This points at v2's Stage 2e buffer-age
+      clipped repaint: with 2-3 scanout buffers, each buffer must repaint
+      the damage accumulated since *it* was last drawn, not just the
+      latest frame's sliver. If the moving band's window-content damage
+      is only applied for the current frame, the buffer retains band
+      pixels from ~2 frames ago in the uncovered gap — and that
+      stale edge is exactly one "step". Release issues a full-region
+      redraw, so every buffer gets clean content → correct briefly.
+      So far **nemo-specific**: caja (MATE, same nautilus rubber-band
+      code) does not show it on yserver — possibly because caja's band
+      is opaque/XOR rather than a translucent overlay, so stale pixels
+      don't read as a visible step. Worth confirming caja doesn't
+      staircase under close inspection.
+      Next step: trace the v2 damage path for a moving sub-region —
+      confirm whether window-content damage from `CopyArea` / RENDER
+      fills is accumulated across buffer generations in
+      `pick_repaint_region` / the `BufferAgeRing`, or only applied to the
+      current frame. Fix is almost certainly in that accumulation, not
+      in the input/protocol layer.
+
 - [ ] **wezterm client content briefly blank after heavy drag
       stress (yoga / Snapdragon X1 / Turnip, release build,
       observed once 2026-05-19 PM).** During a deliberate
