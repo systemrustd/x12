@@ -45,6 +45,9 @@ pub enum BackendFdKind {
     /// `Backend::drain_completed_present_events`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
     PresentCompletion,
+    /// libseat connection fd (KMS + libseat mode only). Readiness
+    /// drives `Backend::on_seat_ready` → `seat.dispatch()`.
+    Seat,
 }
 
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
@@ -285,6 +288,24 @@ pub trait Backend: Send {
     /// DRM page-flip completion fd is readable. The backend should
     /// drain completion events and submit the next composite/flip.
     fn on_page_flip_ready(&mut self, state: &mut ServerState);
+
+    /// The libseat connection fd is readable. The KMS backend dispatches
+    /// libseat (which may fire enable/disable callbacks synchronously)
+    /// and runs any resulting suspend/resume sequence. Default: no-op
+    /// (ynest, host-X11, recording have no seat).
+    fn on_seat_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The libinput fd is readable AND libinput is owned by the core
+    /// loop (libseat mode). Dispatch libinput inline. Default: no-op —
+    /// in Direct mode the dedicated input thread owns the fd and this is
+    /// never registered.
+    fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
+
+    /// Hand the backend a core-channel sender so that, when it owns
+    /// input on the core thread (libseat mode), it can emit the same
+    /// control Messages the input thread would (Shutdown, DumpScanout,
+    /// DumpDrawables). Default: no-op.
+    fn set_input_sender(&mut self, _sender: crate::core_loop::CoreSender) {}
 
     /// Tell the backend that something that could affect on-screen
     /// pixels has changed since the last composite. KMS uses this to
@@ -1552,6 +1573,10 @@ mod tests {
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::HostX11);
+        assert_ne!(BackendFdKind::Seat, BackendFdKind::Libinput);
+        assert_ne!(BackendFdKind::Seat, BackendFdKind::Drm);
+        assert_ne!(BackendFdKind::Seat, BackendFdKind::HostX11);
+        assert_ne!(BackendFdKind::Seat, BackendFdKind::PresentCompletion);
     }
 }
 

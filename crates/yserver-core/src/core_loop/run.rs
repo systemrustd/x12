@@ -25,7 +25,7 @@ use super::{
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
         ClientIdAllocator, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN, LISTENER_TOKEN, NOTIFY_TOKEN,
-        PRESENT_COMPLETION_TOKEN, client_token, token_to_client,
+        PRESENT_COMPLETION_TOKEN, SEAT_TOKEN, client_token, token_to_client,
     },
     process_request::{RequestOutcome, process_request},
     sender::{CoreReceiver, CoreSender},
@@ -362,6 +362,7 @@ pub fn run_core(
             BackendFdKind::Libinput => LIBINPUT_TOKEN,
             BackendFdKind::HostX11 => HOST_X11_TOKEN,
             BackendFdKind::PresentCompletion => PRESENT_COMPLETION_TOKEN,
+            BackendFdKind::Seat => SEAT_TOKEN,
         };
         poll.registry()
             .register(&mut SourceFd(&fd), token, Interest::READABLE)?;
@@ -465,15 +466,11 @@ pub fn run_core(
                     backend.on_page_flip_ready(state);
                 }
                 LIBINPUT_TOKEN => {
-                    // Libinput on the core poll is reserved for a
-                    // future configuration that skips the dedicated
-                    // libinput thread. In production today the
-                    // libinput thread owns the fd; if this arm fires,
-                    // poll_fds() registered the libinput fd against
-                    // a backend that doesn't define a corresponding
-                    // dispatch entry-point. Log so a regression here
-                    // is visible.
-                    warn!("core_loop::run: LIBINPUT_TOKEN ready but no on-core dispatch path");
+                    // Libseat mode: the backend owns libinput on the
+                    // core thread and dispatches it inline. Direct
+                    // mode never registers this fd (the input thread
+                    // owns it).
+                    backend.on_libinput_ready(state);
                 }
                 HOST_X11_TOKEN => {
                     // F2: host X11 connection is readable. Drain
@@ -496,6 +493,9 @@ pub fn run_core(
                 }
                 PRESENT_COMPLETION_TOKEN => {
                     drain_present_completions(state, backend);
+                }
+                SEAT_TOKEN => {
+                    backend.on_seat_ready(state);
                 }
                 tok if let Some(client_id) = token_to_client(tok) => {
                     // I3: WRITABLE-readiness on a client writer fd.
