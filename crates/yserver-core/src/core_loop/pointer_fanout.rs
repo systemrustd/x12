@@ -291,8 +291,8 @@ pub fn pointer_event_fanout_to_state(
     // For XI2 the "event window" is the hit target — XI2 doesn't
     // propagate up through the event mask the way core does. Use the
     // original (untranslated) coords relative to the hit target.
-    let (event_x, event_y) = (target_x, target_y);
-    let nested_id = target;
+    let (mut event_x, mut event_y) = (target_x, target_y);
+    let mut nested_id = target;
     let (mut xi2_targets, xi2_raw_targets) =
         compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype);
 
@@ -308,6 +308,34 @@ pub fn pointer_event_fanout_to_state(
         && let Some((grab_owner, _)) = state.pointer_grab
     {
         xi2_targets.retain(|cid| *cid == grab_owner);
+    }
+
+    // Active device-grab redirection for XI2 device events. When a client
+    // holds an active pointer grab (XIGrabDevice — or an activated passive
+    // grab), the grabbed device's XI2 button/motion events must funnel to
+    // the grab owner, reported against the grab window, even when the
+    // pointer has moved onto another client's window. This mirrors the
+    // core Step-2 redirect; without it a window-move grab (muffin) stops
+    // receiving XI_Motion / XI_ButtonRelease the moment the drag pulls the
+    // pointer off the grab window, so the move never ends and the button
+    // stays "held". Crossings keep natural delivery (same as the core
+    // path); raw events bypass grabs and are left untouched.
+    if handle_grabs
+        && !matches!(
+            event.kind,
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+        )
+        && let Some((grab_window, grab_client, gx, gy, owner_events)) = active_grab_target(state)
+    {
+        let target_is_within_grab_window =
+            target == grab_window || state.resources.is_descendant_of(target, grab_window);
+        if !owner_events || !target_is_within_grab_window {
+            xi2_targets.clear();
+            xi2_targets.push(grab_client);
+            nested_id = grab_window;
+            event_x = clamp_grab_coord(event.root_x, gx);
+            event_y = clamp_grab_coord(event.root_y, gy);
+        }
     }
 
     if matches!(

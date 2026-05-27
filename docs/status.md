@@ -235,6 +235,28 @@ were being called with nested protocol XIDs in production, while the
 stack-hint logic expects the resolved host XID. That mismatch meant
 desktop/dialog restacks could silently no-op until the caller was
 fixed to translate through `state.resources.window(...).host_xid`.
+2026-05-27 drag follow-up: window moves under Cinnamon were broken —
+dragging cinnamon-settings by its titlebar lagged, stuck after a little
+movement, and on release the button read as still-held (window glued to
+the cursor, move-cursor stuck). Root-caused from the bee hw trace
+(`yserver-hw-cinnamon.log`): muffin drives the move via an active
+`XIGrabDevice` on the master pointer, but the XI2 event fanout routed
+purely by window mask-selection and ignored the active grab. Once the
+drag pulled the pointer off muffin's grab window, `XI_Motion` /
+`XI_ButtonRelease` went to whatever client selected XI2 masks on the
+window under the cursor (nemo-desktop) instead of the grab owner — so
+muffin never saw the release and never ended its move loop. The log shows
+the release delivered to `xi2_targets=[37]` (nemo) while client 27
+(muffin) held the grab. Fixed by mirroring the core Step-2 active-grab
+redirect into the XI2 device-event path (`pointer_fanout.rs`): grabbed
+device events funnel to the grab owner, reported against the grab window,
+honoring `owner_events` (so GTK menu hover-tracking still flows naturally
+inside the grab-window subtree); raw events and crossings untouched. Same
+redirect covers motion, so the lag/stuck and the stuck-button are one fix.
+Added regression test
+`xi_active_device_grab_funnels_button_release_to_grab_owner_not_window_under_cursor`.
+Validated on bee hardware (drag now works). `cargo test -p yserver-core
+--lib` 410/410 green; nightly fmt + plain clippy clean.
 
 ---
 

@@ -18638,6 +18638,146 @@ mod tests {
         );
     }
 
+    /// During a window move, muffin holds an *active* `XIGrabDevice` on
+    /// the master pointer. Every master-pointer XI2 event — including the
+    /// final `XI_ButtonRelease` — must be funnelled to the grab owner,
+    /// even after the drag has pulled the pointer over another client's
+    /// window. Regression: the XI2 fanout routed purely by window
+    /// mask-selection and ignored the active grab, so the release was
+    /// delivered to the window under the cursor (nemo-desktop) instead of
+    /// the grab owner (muffin) — leaving muffin stuck in its move loop
+    /// with the button apparently still held.
+    #[test]
+    fn xi_active_device_grab_funnels_button_release_to_grab_owner_not_window_under_cursor() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::ActivePointerGrab,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1; // muffin
+        const OTHER_CLIENT_ID: u32 = 2; // nemo-desktop
+        const GRAB_WIN: u32 = 0x0010_0011; // muffin's grab window
+        const OTHER_WIN: u32 = 0x0025_0003; // nemo-desktop fullscreen window
+        const OTHER_HOST_XID: u32 = 0xCAFE_0006;
+        const XI2_BUTTON_RELEASE_BIT: u32 = 1 << 5;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut other_peer = install_client(&mut state, OTHER_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer.set_nonblocking(true).unwrap();
+        other_peer.set_nonblocking(true).unwrap();
+
+        // muffin's grab window — small, off in the corner. The drag pulls
+        // the pointer away from it onto the desktop.
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // nemo-desktop's window — covers where the pointer ends up.
+        state.resources.create_window(
+            ClientId(OTHER_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OTHER_WIN),
+                parent: ROOT_WINDOW,
+                x: 200,
+                y: 200,
+                width: 400,
+                height: 400,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(OTHER_WIN));
+
+        // nemo selects XI2 ButtonRelease on its own window (XIAllDevices=1).
+        state
+            .clients
+            .get_mut(&OTHER_CLIENT_ID)
+            .expect("other client")
+            .xi2_masks
+            .insert((ResourceId(OTHER_WIN), 1), XI2_BUTTON_RELEASE_BIT);
+
+        // muffin holds an active master-pointer grab (XIGrabDevice).
+        // owner_events=false → every event funnels to the grab owner.
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = false;
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+        });
+
+        Backend::register_top_level(&mut backend, None, ResourceId(OTHER_WIN), OTHER_HOST_XID)
+            .expect("register host xid");
+
+        // Pointer has dragged onto nemo-desktop (200,200..600,600); button 1
+        // still held. event_x/y are relative to OTHER_WIN's origin.
+        let release = HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            host_xid: OTHER_HOST_XID,
+            detail: 1,
+            time: 0x2000,
+            root_x: 300,
+            root_y: 300,
+            event_x: 100,
+            event_y: 100,
+            state: 0x100, // button 1 down
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, release, true, false);
+
+        let mut buf = [0u8; 256];
+
+        // The window under the cursor must NOT get the XI2 release — the
+        // active grab owns the device.
+        let other_read = other_peer.read(&mut buf);
+        assert!(
+            matches!(other_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "active device grab must withhold the XI2 ButtonRelease from the window under the cursor; got {other_read:?}",
+        );
+
+        // The grab owner must receive the XI2 ButtonRelease. The grab owner
+        // also gets the parallel core ButtonRelease (32 bytes) from the
+        // core redirect, so scan event boundaries for the XI2 GenericEvent.
+        let n = match grab_peer.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => panic!("grab owner must receive the grabbed XI2 release; got {e:?}"),
+        };
+        let off = (0..n)
+            .step_by(32)
+            .find(|&off| off + 10 <= n && buf[off] == 35)
+            .expect("grab owner must receive an XI2 GenericEvent (got core-only stream)");
+        assert_eq!(
+            u16::from_le_bytes([buf[off + 8], buf[off + 9]]),
+            5,
+            "the grabbed XI2 event must be a ButtonRelease (evtype 5)",
+        );
+    }
+
     /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter
     /// calls for a declined key) releases the passive keyboard grab and
     /// replays the frozen key to the focused window. This is the
