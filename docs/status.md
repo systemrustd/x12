@@ -184,7 +184,57 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `cargo clippy --all-targets --all-features -- -D warnings`
   remains blocked only by the same unrelated `engine.rs`
   doc-comment warnings. Runtime Cinnamon re-validation still
-  pending against the XI 2.4 advertisement.
+  pending against the XI 2.4 advertisement. 2026-05-27 PM
+  follow-up: drawable-dump instrumentation was widened for the
+  live Cinnamon menu regression. The previous dump only tracked
+  recent `PresentPixmap` sources when the destination was the
+  COW/overlay path, which meant a Muffin menu visible on screen
+  via a fullscreen stage pixmap could be absent from the dump.
+  `KmsBackendV2::note_present_pixmap` now records a general
+  recent-Present ring for any destination window and resolves
+  COW-targeted presents through the backend drawable map instead of
+  assuming the protocol overlay XID survives unchanged on KMS.
+  2026-05-27 follow-up: the overlay-registration race was closed
+  by retroactively arming COW when the first `PresentPixmap → COW`
+  lands before `GetOverlayWindow` finishes wiring the backend
+  storage. This keeps the scene authoritative once the compositor
+  is actually presenting, even if the allocation/compositor startup
+  ordering flips under Cinnamon's startup timing. 2026-05-27 PM
+  follow-up: the remaining keyring-dialog click regression was in
+  the legacy `server.rs` passive-grab path, which was still
+  redirecting owned-window clicks to the grab owner even when
+  `owner_events=true`. That wrapper now mirrors the newer
+  state-borrowing fanout logic, preserves passive-grab
+  `owner_events` from both core `GrabButton` and XI2
+  `XIPassiveGrabDevice`, and lets owned-child clicks continue
+  through normal propagation while still activating the grab.
+  2026-05-27 later follow-up: Cinnamon's keyring trace also issues
+  `XIGrabDevice` followed by `XIAllowEvents(ReplayDevice)` on the
+  pointer side. `XIAllowEvents` now releases active pointer grabs as
+  well as passive ones, so the server no longer leaves the dialog in
+  a stuck grabbed state after the client believes it has thawed the
+  device. Added a regression test for the `owner_events=true`
+  passive-grab release path on `ButtonRelease`. Follow-up: the
+  `owner_events` check now keys off the grab window's descendant
+  chain, not just client ownership, so descendant dialog widgets
+  still receive clicks even when another client owns them. The
+  legacy `server.rs` fanout now matches that descendant rule too.
+2026-05-27 final follow-up: v2 now re-evaluates
+`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, and `WM_TRANSIENT_FOR`
+when window properties change and when a window re-enters
+top-level status. Desktop windows are forced to the bottom of
+`core.top_level_order`, while dialog/menu-like toplevels are
+raised back to the top. This is the stacking fix exposed by the
+sync-timing change.
+2026-05-27 focus follow-up: viewable windows now also promote
+keyboard focus when `WM_HINTS.input` is set, even if they do not
+select key events yet. That matches the Cinnamon keyring dialog
+case where the window is mapped and then advertises input later.
+2026-05-27 stack-hint follow-up: the v2 property / top-level hooks
+were being called with nested protocol XIDs in production, while the
+stack-hint logic expects the resolved host XID. That mismatch meant
+desktop/dialog restacks could silently no-op until the caller was
+fixed to translate through `state.resources.window(...).host_xid`.
 
 ---
 

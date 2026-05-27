@@ -106,9 +106,9 @@ pub fn pointer_event_fanout_to_state(
         // crosses into the popup, at which point natural
         // Enter/Leave fire and GTK3 transitions menu state. With
         // `owner_events=false`, all events report against grab_window.
-        let target_owner = state.resources.window_owner(target);
-        let target_is_owned_by_grab_client = target_owner == Some(grab_client);
-        let redirect_to_grab = !owner_events || !target_is_owned_by_grab_client;
+        let target_is_within_grab_window =
+            target == grab_window || state.resources.is_descendant_of(target, grab_window);
+        let redirect_to_grab = !owner_events || !target_is_within_grab_window;
         if !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
@@ -140,7 +140,6 @@ pub fn pointer_event_fanout_to_state(
                 );
             });
             merge_dropped(&mut dropped, extras);
-            release_passive_grab_on_button_release(state, event.kind);
             handled_core_via_grab = true;
             // Else (owner_events=true and target owned by grab client):
             // fall through to normal propagation so the event fires on
@@ -158,46 +157,59 @@ pub fn pointer_event_fanout_to_state(
         // pointer events explicitly listed in the grab's event mask.
     }
 
+    // Passive button grabs must end on the matching release even when
+    // `owner_events=true` keeps the press/release on the owned window.
+    // Releasing here keeps the grab lifecycle aligned with Xorg and
+    // avoids pinning the dialog in a grabbed state until its own
+    // timeout path gives up.
+    release_passive_grab_on_button_release(state, event.kind);
+
     // Step 3 — passive button-grab matching for ButtonPress.
     if !handled_core_via_grab
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
-        && let Some((grab_owner, grab_window, grab_pointer_mode)) =
-            try_match_passive_grab(state, xid_map, event)
+        && let Some((grab, hit_window)) = try_match_passive_grab(state, xid_map, event)
     {
         log::trace!(
             "pointer_fanout: PASSIVE-GRAB match button={} grab_owner={:?} grab_window=0x{:x} mode={}",
             event.detail,
-            grab_owner,
-            grab_window.0,
-            grab_pointer_mode,
+            grab.owner,
+            grab.grab_window.0,
+            grab.pointer_mode,
         );
         // Activate the passive grab atomically with the dispatch.
-        if let Some(grab_target) = client_target_id(state, grab_owner) {
-            if grab_pointer_mode == 0 {
-                state.frozen_pointer_event = Some(event);
-            }
-            state.pointer_grab = Some((grab_owner, grab_window));
-            state.pointer_grab_is_passive = true;
-
-            let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
-                encode_pointer_event(
-                    buf,
-                    order,
-                    PointerEventKind::ButtonPress,
-                    seq,
-                    event.detail,
-                    event.time,
-                    grab_window,
-                    ResourceId(0), // passive grab activation: no propagation child
-                    event,
-                    event.event_x,
-                    event.event_y,
-                );
-            });
-            merge_dropped(&mut dropped, extras);
+        let target_is_within_grab_window = hit_window == grab.grab_window
+            || state
+                .resources
+                .is_descendant_of(hit_window, grab.grab_window);
+        let redirect_to_grab = !grab.owner_events || !target_is_within_grab_window;
+        if grab.pointer_mode == 0 {
+            state.frozen_pointer_event = Some(event);
         }
-        handled_core_via_grab = true;
+        state.pointer_grab = Some((grab.owner, grab.grab_window));
+        state.pointer_grab_is_passive = true;
+
+        if redirect_to_grab {
+            if let Some(grab_target) = client_target_id(state, grab.owner) {
+                let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
+                    encode_pointer_event(
+                        buf,
+                        order,
+                        PointerEventKind::ButtonPress,
+                        seq,
+                        event.detail,
+                        event.time,
+                        grab.grab_window,
+                        ResourceId(0), // passive grab activation: no propagation child
+                        event,
+                        event.event_x,
+                        event.event_y,
+                    );
+                });
+                merge_dropped(&mut dropped, extras);
+            }
+            handled_core_via_grab = true;
+        }
     }
 
     // Step 4 — normal core propagation, only when no grab took ownership.
@@ -478,13 +490,24 @@ fn active_grab_target(
     let target = client_target_id(state, client_id)?;
     let (gx, gy) = state.resources.window_absolute_position(grab_window);
     // `owner_events` from the active grab record. Passive button-grabs
-    // (activated via try_match_passive_grab) leave
-    // `state.active_pointer_grab` unset, so default to false (X11
-    // implicit grab semantics — events report against the grab window).
-    let owner_events = state
-        .active_pointer_grab
-        .filter(|g| g.owner == client_id)
-        .is_some_and(|g| g.owner_events);
+    // (activated via try_match_passive_grab) do not populate
+    // `active_pointer_grab`, so look up the matching passive grab and
+    // preserve its `owner_events` flag; otherwise default to false
+    // (X11 implicit grab semantics — events report against the grab
+    // window).
+    let owner_events = if state.pointer_grab_is_passive {
+        state
+            .button_grabs
+            .iter()
+            .rev()
+            .find(|g| g.owner == client_id && g.grab_window == grab_window)
+            .is_some_and(|g| g.owner_events)
+    } else {
+        state
+            .active_pointer_grab
+            .filter(|g| g.owner == client_id)
+            .is_some_and(|g| g.owner_events)
+    };
     Some((grab_window, target, gx, gy, owner_events))
 }
 
@@ -506,7 +529,10 @@ fn try_match_passive_grab(
     state: &ServerState,
     xid_map: &HostXidMap,
     event: HostPointerEvent,
-) -> Option<(ClientId, yserver_protocol::x11::ResourceId, u8)> {
+) -> Option<(
+    crate::server::PassiveButtonGrab,
+    yserver_protocol::x11::ResourceId,
+)> {
     let (hit_window, _, _) = state
         .root_pointer_target_at(event.root_x, event.root_y)
         .or_else(|| {
@@ -516,7 +542,7 @@ fn try_match_passive_grab(
                 .or(Some((top_level_id, event.event_x, event.event_y)))
         })?;
     let grab = state.find_passive_grab(hit_window, event.detail, event.state)?;
-    Some((grab.owner, grab.grab_window, grab.pointer_mode))
+    Some((grab, hit_window))
 }
 
 fn pointer_mask_bit(kind: PointerEventKind, state_mask: u16) -> u32 {

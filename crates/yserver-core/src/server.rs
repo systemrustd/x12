@@ -111,6 +111,11 @@ pub struct PassiveButtonGrab {
     pub button: u8,
     /// 0x8000 = AnyModifier
     pub modifiers: u16,
+    /// X11 `GrabButton` / XI2 passive-grab `owner_events` flag.
+    /// When true, events on windows owned by the grab client should
+    /// still be delivered normally instead of being redirected to
+    /// `grab_window`.
+    pub owner_events: bool,
     pub event_mask: u32,
     pub pointer_mode: u8,
 }
@@ -1234,14 +1239,25 @@ fn pointer_event_fanout_inner(
             Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
                 let target = g.client_target(client_id)?;
                 let (gx, gy) = g.resources.window_absolute_position(grab_window);
-                Some((grab_window, target, gx, gy))
+                let owner_events = if g.pointer_grab_is_passive {
+                    g.button_grabs
+                        .iter()
+                        .rev()
+                        .find(|grab| grab.owner == client_id && grab.grab_window == grab_window)
+                        .is_some_and(|grab| grab.owner_events)
+                } else {
+                    g.active_pointer_grab
+                        .filter(|grab| grab.owner == client_id)
+                        .is_some_and(|grab| grab.owner_events)
+                };
+                Some((grab_window, client_id, target, gx, gy, owner_events))
             }),
             Err(_) => return,
         }
     } else {
         None
     };
-    if let Some((grab_window, target, grab_x, grab_y)) = grab_state {
+    if let Some((grab_window, _grab_client, target, grab_x, grab_y, owner_events)) = grab_state {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
         let mut buf = Vec::with_capacity(32);
         let event_x = i32::from(event.root_x)
@@ -1250,6 +1266,23 @@ fn pointer_event_fanout_inner(
         let event_y = i32::from(event.root_y)
             .saturating_sub(grab_y)
             .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let target_within_grab_window = match state.lock() {
+            Ok(g) => {
+                let hit_window =
+                    g.root_pointer_target_at(event.root_x, event.root_y)
+                        .or_else(|| {
+                            xid_map.get(&event.host_xid).copied().and_then(|top| {
+                                g.pointer_target_at(top, event.event_x, event.event_y)
+                            })
+                        })
+                        .map(|(window, _, _)| window);
+                hit_window.is_some_and(|w| {
+                    w == grab_window || g.resources.is_descendant_of(w, grab_window)
+                })
+            }
+            Err(_) => false,
+        };
+        let redirect_to_grab = !owner_events || !target_within_grab_window;
         match event.kind {
             PointerEventKind::ButtonPress => x11::encode_button_press_event(
                 &mut buf,
@@ -1304,18 +1337,18 @@ fn pointer_event_fanout_inner(
             ),
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => return,
         }
-        if let Ok(mut w) = target.writer.lock() {
+        if redirect_to_grab && let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
         }
-        if event.kind == PointerEventKind::ButtonRelease
-            && let Ok(mut s) = state.lock()
-            && s.pointer_grab_is_passive
-        {
-            s.pointer_grab = None;
-            s.pointer_grab_is_passive = false;
-            s.frozen_pointer_event = None;
-        }
-        return;
+    }
+
+    if event.kind == PointerEventKind::ButtonRelease
+        && let Ok(mut s) = state.lock()
+        && s.pointer_grab_is_passive
+    {
+        s.pointer_grab = None;
+        s.pointer_grab_is_passive = false;
+        s.frozen_pointer_event = None;
     }
 
     // Passive button grab matching for ButtonPress events.
@@ -1328,8 +1361,18 @@ fn pointer_event_fanout_inner(
                 .or_else(|| s.pointer_target_at(top, event.event_x, event.event_y))
                 .unwrap_or((top, event.event_x, event.event_y));
             s.find_passive_grab(hit_window, event.detail, event.state)
+                .map(|grab| (grab, hit_window))
         });
         if let Some(grab) = matched {
+            let (grab, hit_window) = grab;
+            let target_within_grab_window = match state.lock() {
+                Ok(s) => {
+                    hit_window == grab.grab_window
+                        || s.resources.is_descendant_of(hit_window, grab.grab_window)
+                }
+                Err(_) => false,
+            };
+            let redirect_to_grab = !grab.owner_events || !target_within_grab_window;
             let target_opt = match state.lock() {
                 Ok(mut s) => {
                     let target = s.client_target(grab.owner);
@@ -1342,31 +1385,33 @@ fn pointer_event_fanout_inner(
                 }
                 Err(_) => return,
             };
-            if let Some(target) = target_opt {
-                let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-                let mut buf = Vec::with_capacity(32);
-                x11::encode_button_press_event(
-                    &mut buf,
-                    target.byte_order,
-                    x11::PointerEvent {
-                        sequence: seq,
-                        detail: event.detail,
-                        time: event.time,
-                        root: crate::resources::ROOT_WINDOW,
-                        event: grab.grab_window,
-                        root_x: event.root_x,
-                        root_y: event.root_y,
-                        event_x: event.event_x,
-                        event_y: event.event_y,
-                        child: ResourceId(0),
-                        state: event.state,
-                    },
-                );
-                if let Ok(mut w) = target.writer.lock() {
-                    let _ = w.write_all(&buf);
+            if redirect_to_grab {
+                if let Some(target) = target_opt {
+                    let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+                    let mut buf = Vec::with_capacity(32);
+                    x11::encode_button_press_event(
+                        &mut buf,
+                        target.byte_order,
+                        x11::PointerEvent {
+                            sequence: seq,
+                            detail: event.detail,
+                            time: event.time,
+                            root: crate::resources::ROOT_WINDOW,
+                            event: grab.grab_window,
+                            root_x: event.root_x,
+                            root_y: event.root_y,
+                            event_x: event.event_x,
+                            event_y: event.event_y,
+                            child: ResourceId(0),
+                            state: event.state,
+                        },
+                    );
+                    if let Ok(mut w) = target.writer.lock() {
+                        let _ = w.write_all(&buf);
+                    }
                 }
+                return;
             }
-            return;
         }
     }
 
@@ -2231,6 +2276,285 @@ mod tests {
         );
         assert_eq!(buf[0], 4, "event type should be ButtonPress");
         assert_eq!(&buf[12..16], &0x0020_0002u32.to_le_bytes());
+    }
+
+    #[test]
+    fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
+        use std::{
+            collections::HashMap as StdHashMap,
+            io::{ErrorKind, Read},
+            sync::Mutex as StdMutex,
+        };
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
+        grab_reader_remote.set_nonblocking(true).unwrap();
+        child_reader_remote.set_nonblocking(true).unwrap();
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            let grab_window = ResourceId(0x0010_0002);
+            let child_window = ResourceId(0x0010_0003);
+            s.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: grab_window,
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            s.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: child_window,
+                    parent: grab_window,
+                    x: 10,
+                    y: 10,
+                    width: 40,
+                    height: 40,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = s.resources.map_window(grab_window);
+            let _ = s.resources.map_window(child_window);
+            s.clients.insert(
+                1,
+                ClientState {
+                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            s.clients.insert(
+                2,
+                ClientState {
+                    writer: Arc::new(Mutex::new(child_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0020_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            s.pointer_grab = Some((ClientId(1), grab_window));
+            s.pointer_grab_is_passive = true;
+            s.button_grabs.push(PassiveButtonGrab {
+                owner: ClientId(1),
+                grab_window,
+                button: 1,
+                modifiers: 0,
+                owner_events: true,
+                event_mask: 0xFFFF_FFFF,
+                pointer_mode: 0,
+            });
+        }
+
+        let mut map = StdHashMap::new();
+        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
+        let xid_map = map;
+
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+        );
+
+        let mut buf = [0u8; 32];
+        let child_read = child_reader_remote.read(&mut buf);
+        assert!(
+            matches!(child_read, Ok(32)),
+            "owner_events=true passive grab must still deliver to the owned child; got {child_read:?}",
+        );
+        assert_eq!(buf[0], 4, "event type should be ButtonPress");
+        assert_eq!(&buf[12..16], &0x0010_0003u32.to_le_bytes());
+
+        let grab_read = grab_reader_remote.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "owner_events=true passive grab must not redirect owned-child clicks to the grab owner; got {grab_read:?}",
+        );
+    }
+
+    #[test]
+    fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_elsewhere() {
+        use std::{
+            collections::HashMap as StdHashMap,
+            io::{ErrorKind, Read},
+            sync::Mutex as StdMutex,
+        };
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
+        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
+        grab_reader_remote.set_nonblocking(true).unwrap();
+        child_reader_remote.set_nonblocking(true).unwrap();
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            let grab_window = ResourceId(0x0010_0010);
+            let child_window = ResourceId(0x0010_0011);
+            s.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: grab_window,
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            s.resources.create_window(
+                ClientId(2),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: child_window,
+                    parent: grab_window,
+                    x: 10,
+                    y: 10,
+                    width: 40,
+                    height: 40,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = s.resources.map_window(grab_window);
+            let _ = s.resources.map_window(child_window);
+            s.clients.insert(
+                1,
+                ClientState {
+                    writer: Arc::new(Mutex::new(grab_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            s.clients.insert(
+                2,
+                ClientState {
+                    writer: Arc::new(Mutex::new(child_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0020_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
+                },
+            );
+            s.pointer_grab = Some((ClientId(1), grab_window));
+            s.pointer_grab_is_passive = true;
+            s.button_grabs.push(PassiveButtonGrab {
+                owner: ClientId(1),
+                grab_window,
+                button: 1,
+                modifiers: 0,
+                owner_events: true,
+                event_mask: 0xFFFF_FFFF,
+                pointer_mode: 0,
+            });
+        }
+
+        let mut map = StdHashMap::new();
+        map.insert(0xCAFE_u32, ResourceId(0x0010_0010));
+        let xid_map = map;
+
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+        );
+
+        let mut buf = [0u8; 32];
+        let child_read = child_reader_remote.read(&mut buf);
+        assert!(
+            matches!(child_read, Ok(32)),
+            "owner_events=true passive grab must still deliver to the descendant child even when another client owns it; got {child_read:?}",
+        );
+        let grab_read = grab_reader_remote.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "owner_events=true passive grab must not redirect descendant clicks to the grab owner; got {grab_read:?}",
+        );
     }
 
     #[test]

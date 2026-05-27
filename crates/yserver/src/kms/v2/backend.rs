@@ -33,12 +33,13 @@ use yserver_core::{
         HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
         PointerEventKind, PointerPosition,
     },
+    properties::PropertyValue,
     resources::{ARGB_COLORMAP, ARGB_VISUAL},
     server::ServerState,
 };
 use yserver_protocol::x11::{
-    ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, ResourceId,
-    xfixes,
+    AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
+    ResourceId, xfixes,
 };
 
 use crate::{
@@ -110,6 +111,12 @@ pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 pub(crate) struct PaintTarget {
     pub(crate) id: crate::kms::v2::store::DrawableId,
     pub(crate) offset: (i32, i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopLevelStackHint {
+    Bottom,
+    Top,
 }
 
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
@@ -212,6 +219,15 @@ pub struct KmsBackendV2 {
     /// covering marco's typical double-buffered front/back pair
     /// plus head-room for short flips of additional sources.
     pub(crate) present_to_cow_sources: std::collections::VecDeque<u32>,
+    /// Diagnostic ring of recent `PRESENT::Pixmap` submissions to
+    /// any destination window. Cinnamon's shell menus paint into a
+    /// fullscreen Muffin stage pixmap rather than a normal window
+    /// backing, so a drawable dump taken while the menu is visible
+    /// needs the recent Present sources even when the destination is
+    /// not COW. `(src_pixmap_xid, dst_window_xid)` pairs are stored
+    /// in submission order, deduplicated only against the immediately
+    /// previous pair.
+    pub(crate) recent_present_pixmaps: std::collections::VecDeque<(u32, u32)>,
 
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
@@ -489,6 +505,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
+            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
@@ -949,6 +966,29 @@ impl KmsBackendV2 {
         self.scene.is_cow_registered()
     }
 
+    /// If the compositor presented to the overlay before COW was
+    /// fully wired, arm scene authority as soon as allocation
+    /// completes. This closes the startup race where the first
+    /// overlay frame can arrive before `GetOverlayWindow` finishes,
+    /// leaving the scene in non-authoritative mode even though the
+    /// compositor is already active.
+    fn arm_cow_from_recent_present_if_needed(&mut self) {
+        let Some(cow_id) = self.cow_id else {
+            return;
+        };
+        if self.scene.is_cow_registered() {
+            return;
+        }
+        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        if self
+            .recent_present_pixmaps
+            .iter()
+            .any(|&(_, dst_xid)| dst_xid == cow_xid)
+        {
+            self.scene.register_cow(cow_id);
+        }
+    }
+
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -1014,6 +1054,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
+            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
@@ -3723,6 +3764,139 @@ impl KmsBackendV2 {
             },
             _ => stack.push(host_xid),
         }
+        log::trace!(
+            "v2 restack_top_level host=0x{host_xid:x} mode={stack_mode} sibling={sibling:?} order={:?}",
+            self.core.top_level_order
+        );
+        self.scene.mark_scene_structure_dirty();
+    }
+
+    fn property_value_by_name<'a>(
+        state: &'a yserver_core::server::ServerState,
+        window: &'a yserver_core::resources::Window,
+        name: &str,
+    ) -> Option<&'a PropertyValue> {
+        window.properties.iter().find_map(|(atom, value)| {
+            state
+                .atoms
+                .name(*atom)
+                .is_some_and(|n| n == name)
+                .then_some(value)
+        })
+    }
+
+    fn atom_list_from_property(value: &PropertyValue) -> Option<Vec<AtomId>> {
+        if !matches!(value.format, yserver_core::properties::PropertyFormat::F32)
+            || !value.data.len().is_multiple_of(4)
+        {
+            return None;
+        }
+        Some(
+            value
+                .data
+                .chunks_exact(4)
+                .map(|chunk| AtomId(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+                .collect(),
+        )
+    }
+
+    fn window_stack_hint(
+        state: &yserver_core::server::ServerState,
+        window: &yserver_core::resources::Window,
+    ) -> Option<TopLevelStackHint> {
+        let mut bottom = false;
+        let mut top = false;
+
+        if let Some(value) = Self::property_value_by_name(state, window, "_NET_WM_WINDOW_TYPE")
+            && let Some(atoms) = Self::atom_list_from_property(value)
+        {
+            for atom in atoms {
+                match state.atoms.name(atom) {
+                    Some("_NET_WM_WINDOW_TYPE_DESKTOP") => bottom = true,
+                    Some("_NET_WM_WINDOW_TYPE_DOCK")
+                    | Some("_NET_WM_WINDOW_TYPE_TOOLBAR")
+                    | Some("_NET_WM_WINDOW_TYPE_MENU")
+                    | Some("_NET_WM_WINDOW_TYPE_DROPDOWN_MENU")
+                    | Some("_NET_WM_WINDOW_TYPE_POPUP_MENU")
+                    | Some("_NET_WM_WINDOW_TYPE_TOOLTIP")
+                    | Some("_NET_WM_WINDOW_TYPE_UTILITY")
+                    | Some("_NET_WM_WINDOW_TYPE_COMBO")
+                    | Some("_NET_WM_WINDOW_TYPE_DND")
+                    | Some("_NET_WM_WINDOW_TYPE_DIALOG")
+                    | Some("_NET_WM_WINDOW_TYPE_SPLASH")
+                    | Some("_NET_WM_WINDOW_TYPE_NOTIFICATION") => top = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(value) = Self::property_value_by_name(state, window, "_NET_WM_STATE")
+            && let Some(atoms) = Self::atom_list_from_property(value)
+        {
+            for atom in atoms {
+                match state.atoms.name(atom) {
+                    Some("_NET_WM_STATE_BELOW") => bottom = true,
+                    Some("_NET_WM_STATE_ABOVE")
+                    | Some("_NET_WM_STATE_MODAL")
+                    | Some("_NET_WM_STATE_FULLSCREEN")
+                    | Some("_NET_WM_STATE_DEMANDS_ATTENTION")
+                    | Some("_NET_WM_STATE_FOCUSED") => top = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(value) = Self::property_value_by_name(state, window, "WM_TRANSIENT_FOR")
+            && value.format == yserver_core::properties::PropertyFormat::F32
+            && value.data.len() >= 4
+        {
+            let target =
+                u32::from_ne_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]);
+            if target != 0 {
+                top = true;
+            }
+        }
+
+        match (bottom, top) {
+            (true, _) => Some(TopLevelStackHint::Bottom),
+            (false, true) => Some(TopLevelStackHint::Top),
+            _ => None,
+        }
+    }
+
+    fn apply_top_level_stack_hint(
+        &mut self,
+        state: &yserver_core::server::ServerState,
+        host_xid: u32,
+    ) {
+        if !self.core.top_level_order.contains(&host_xid) {
+            return;
+        }
+        let Some(window_id) = state
+            .resources
+            .children(yserver_core::resources::ROOT_WINDOW)
+            .iter()
+            .copied()
+            .find(|id| {
+                state
+                    .resources
+                    .window(*id)
+                    .and_then(|w| w.host_xid)
+                    .is_some_and(|h| h.as_raw() == host_xid)
+            })
+        else {
+            return;
+        };
+        let Some(window) = state.resources.window(window_id) else {
+            return;
+        };
+        let Some(hint) = Self::window_stack_hint(state, window) else {
+            return;
+        };
+        match hint {
+            TopLevelStackHint::Bottom => self.restack_top_level(host_xid, 1, None),
+            TopLevelStackHint::Top => self.restack_top_level(host_xid, 0, None),
+        }
     }
 
     /// Stage 4a — shift each rect by `(dx, dy)` (saturating to
@@ -5015,6 +5189,30 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 height: d.storage.extent.height,
             });
         }
+        // Recent non-COW PresentPixmap sources. This captures
+        // compositor-stage pixmaps too, which matter for Cinnamon:
+        // the menu can be visible on screen while living only in a
+        // fullscreen stage pixmap that never becomes a normal window
+        // backing. Keep the source keyed by both src and dst so the
+        // filename names which stage/window it was presented into.
+        for (idx, &(src_xid, dst_xid)) in backend.recent_present_pixmaps.iter().enumerate() {
+            let Some(src_id) = backend.store.lookup(src_xid) else {
+                continue;
+            };
+            if already.contains(&src_id) {
+                continue;
+            }
+            let Some(d) = backend.store.get(src_id) else {
+                continue;
+            };
+            targets.push(DumpTarget {
+                label: format!("present-src-{idx}-0x{src_xid:x}-to-0x{dst_xid:x}"),
+                id: src_id,
+                depth: d.depth,
+                width: d.storage.extent.width,
+                height: d.storage.extent.height,
+            });
+        }
     }
 
     if targets.is_empty() {
@@ -5502,6 +5700,19 @@ impl Backend for KmsBackendV2 {
 
     // ── Single-threaded core hooks ──────────────────────────────
 
+    fn on_window_property_changed(
+        &mut self,
+        state: &ServerState,
+        host_xid: u32,
+        _property: AtomId,
+    ) {
+        self.apply_top_level_stack_hint(state, host_xid);
+    }
+
+    fn on_window_became_top_level(&mut self, state: &ServerState, host_xid: u32) {
+        self.apply_top_level_stack_hint(state, host_xid);
+    }
+
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
         // Stage 3f.7 port of v1's on_host_input. Key events go
         // through the cook → key fanout path; pointer events flow
@@ -5764,18 +5975,35 @@ impl Backend for KmsBackendV2 {
         // shape (cow_id set, recent sources non-empty) without
         // having to grep for the per-target log lines.
         log::info!(
-            "v2 dump_drawables: cow_id={:?} present_to_cow_sources_len={}",
+            "v2 dump_drawables: cow_id={:?} present_to_cow_sources_len={} \
+             recent_present_pixmaps_len={}",
             self.cow_id,
             self.present_to_cow_sources.len(),
+            self.recent_present_pixmaps.len(),
         );
     }
 
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
-        // Capture COW-targeted presents only — that's the bisect
-        // point of interest for the Stage 4d "shadow only" bug.
-        // Other present targets (toplevel windows in DRI3 / GL
-        // composite flows) aren't useful for the dump set.
-        if dst_window_xid != yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0 {
+        const COW_CAP: usize = 16;
+        const PRESENT_CAP: usize = 32;
+
+        if self.recent_present_pixmaps.back() != Some(&(src_pixmap_xid, dst_window_xid)) {
+            if self.recent_present_pixmaps.len() == PRESENT_CAP {
+                self.recent_present_pixmaps.pop_front();
+            }
+            self.recent_present_pixmaps
+                .push_back((src_pixmap_xid, dst_window_xid));
+        }
+
+        // Capture COW-targeted presents too — that's the original
+        // Stage 4d shadow/COW bisect point. On KMS the destination
+        // xid passed here is the backend's drawable xid, not
+        // necessarily the protocol's literal overlay xid, so resolve
+        // it through the store and compare the resulting DrawableId.
+        let is_cow_dst = self
+            .cow_id
+            .is_some_and(|cow_id| self.store.lookup(dst_window_xid) == Some(cow_id));
+        if !is_cow_dst {
             return;
         }
         if !self.scene.is_cow_registered()
@@ -5783,7 +6011,6 @@ impl Backend for KmsBackendV2 {
         {
             self.scene.register_cow(cow_id);
         }
-        const CAP: usize = 16;
         // Deduplicate consecutive same-xid presents (marco
         // double-buffers two offscreens so the ring otherwise
         // alternates between two values; keeping only fresh xids
@@ -5792,7 +6019,7 @@ impl Backend for KmsBackendV2 {
         if self.present_to_cow_sources.back() == Some(&src_pixmap_xid) {
             return;
         }
-        if self.present_to_cow_sources.len() == CAP {
+        if self.present_to_cow_sources.len() == COW_CAP {
             self.present_to_cow_sources.pop_front();
         }
         self.present_to_cow_sources.push_back(src_pixmap_xid);
@@ -6652,6 +6879,7 @@ impl Backend for KmsBackendV2 {
         }
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
+        self.arm_cow_from_recent_present_if_needed();
         Ok(())
     }
 
@@ -11090,9 +11318,16 @@ mod tests {
         KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, compute_render_composite_clip,
         intersect_rect_with_clip, resolve_picture_for_render,
     };
-    use crate::kms::cpu_types::{Rectangle16, Repeat};
+    use crate::kms::{
+        cpu_types::{Rectangle16, Repeat},
+        v2::{platform::PlatformBackend, store::Storage},
+    };
     use std::collections::HashMap;
-    use yserver_core::backend::Backend;
+    use yserver_core::{
+        backend::Backend,
+        properties::{PropertyFormat, PropertyValue},
+        server::ServerState,
+    };
 
     /// Stage 1b acceptance gate (synthetic): v2 constructs through
     /// `for_tests` and answers the capability accessors with the
@@ -13856,6 +14091,82 @@ mod tests {
         assert_eq!(b.core.top_level_order, vec![0x2000, 0x3000, 0x1000]);
     }
 
+    /// `_NET_WM_WINDOW_TYPE_DESKTOP` must force a top-level to the
+    /// bottom of `core.top_level_order`, regardless of when the
+    /// property arrives.
+    #[test]
+    fn desktop_window_type_moves_to_bottom() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+        let window = ResourceId(0x4000);
+        seed_v2_window(&mut state, &mut b, window, ROOT_WINDOW, 0, 0, 100, 100);
+        let host_xid = synth_host_xid(window);
+        b.core.top_level_order = vec![0x1111, host_xid];
+
+        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
+        let atom_desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
+        let atom_atom = state.atoms.intern("ATOM", false);
+        state
+            .resources
+            .window_mut(window)
+            .unwrap()
+            .properties
+            .insert(
+                atom_window_type,
+                PropertyValue {
+                    r#type: atom_atom,
+                    format: PropertyFormat::F32,
+                    data: atom_desktop.0.to_ne_bytes().to_vec(),
+                },
+            );
+
+        b.on_window_property_changed(&state, host_xid, atom_window_type);
+        assert_eq!(b.core.top_level_order, vec![host_xid, 0x1111]);
+    }
+
+    /// Dialog-like windows should rise when they become top-level,
+    /// even if the hint was already present before the reparent /
+    /// register_top_level transition.
+    #[test]
+    fn dialog_hint_raises_when_window_becomes_top_level() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+        let window = ResourceId(0x5000);
+        seed_v2_window(&mut state, &mut b, window, ROOT_WINDOW, 0, 0, 100, 100);
+        let host_xid = synth_host_xid(window);
+        b.core.top_level_order = vec![host_xid, 0x1111];
+
+        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
+        let atom_dialog = state.atoms.intern("_NET_WM_WINDOW_TYPE_DIALOG", false);
+        let atom_atom = state.atoms.intern("ATOM", false);
+        state
+            .resources
+            .window_mut(window)
+            .unwrap()
+            .properties
+            .insert(
+                atom_window_type,
+                PropertyValue {
+                    r#type: atom_atom,
+                    format: PropertyFormat::F32,
+                    data: atom_dialog.0.to_ne_bytes().to_vec(),
+                },
+            );
+
+        assert_eq!(
+            KmsBackendV2::window_stack_hint(&state, state.resources.window(window).unwrap()),
+            Some(super::TopLevelStackHint::Top)
+        );
+        b.on_window_became_top_level(&state, host_xid);
+        assert_eq!(b.core.top_level_order, vec![0x1111, host_xid]);
+    }
+
     /// Stage 3f.11 follow-up: subwindow restack updates sibling order
     /// within a shared parent instead of relying on HashMap iteration.
     #[test]
@@ -14777,6 +15088,77 @@ mod tests {
         assert!(
             b.test_scene_cow_registered(),
             "overlay PresentPixmap must arm cow-authoritative mode",
+        );
+    }
+
+    #[test]
+    fn cow_registers_retroactively_when_present_precedes_get_overlay_window() {
+        let mut b = KmsBackendV2::for_tests();
+
+        b.note_present_pixmap(
+            0x4000_1234,
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
+        );
+        assert!(
+            !b.test_scene_cow_registered(),
+            "without a COW allocation, PresentPixmap cannot arm scene authority yet",
+        );
+
+        b.get_overlay_window(None).expect("get_overlay_window");
+
+        assert!(
+            b.test_scene_cow_registered(),
+            "a prior PresentPixmap to the overlay must arm COW as soon as allocation completes",
+        );
+    }
+
+    #[test]
+    fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
+        let mut b = KmsBackendV2::for_tests();
+        let stage = b
+            .store
+            .allocate(
+                0x4000_2000,
+                super::super::store::DrawableKind::Window,
+                32,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 800,
+                        height: 600,
+                    },
+                    PlatformBackend::format_for_depth(32),
+                ),
+            )
+            .expect("allocate stage");
+        let _src = b
+            .store
+            .allocate(
+                0x4000_3000,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 800,
+                        height: 600,
+                    },
+                    PlatformBackend::format_for_depth(32),
+                ),
+            )
+            .expect("allocate src pixmap");
+        assert!(b.store.get(stage).is_some(), "stage must exist");
+
+        b.note_present_pixmap(0x4000_3000, 0x4000_2000);
+
+        assert_eq!(
+            b.recent_present_pixmaps.back(),
+            Some(&(0x4000_3000, 0x4000_2000)),
+            "non-COW PresentPixmap must still land in the general diagnostic ring",
+        );
+        assert!(
+            b.present_to_cow_sources.is_empty(),
+            "non-COW PresentPixmap must not pollute the COW-only ring",
         );
     }
 

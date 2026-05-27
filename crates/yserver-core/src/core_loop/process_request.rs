@@ -22,7 +22,9 @@
 use std::{io, os::fd::OwnedFd};
 
 use log::{debug, trace};
-use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
+use yserver_protocol::x11::{
+    self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
+};
 
 use crate::{
     backend::{Backend, OriginContext, params::FillState},
@@ -240,7 +242,7 @@ pub fn process_request(
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
         26 => handle_grab_pointer(state, backend, origin, client_id, sequence, header, body),
         27 => handle_ungrab_pointer(state, backend, origin, client_id, sequence),
-        28 => handle_grab_button(state, client_id, sequence, body),
+        28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
         31 => handle_grab_keyboard(state, backend, origin, client_id, sequence, body),
@@ -252,9 +254,9 @@ pub fn process_request(
         48 => handle_query_text_extents(state, client_id, sequence, header, body),
         97 => handle_query_best_size(state, client_id, sequence, body),
         // ── properties (state mutation + PropertyNotify fanout) ──
-        18 => handle_change_property(state, client_id, sequence, header, body),
-        19 => handle_delete_property(state, client_id, sequence, body),
-        20 => handle_get_property(state, client_id, sequence, header, body),
+        18 => handle_change_property(state, backend, client_id, sequence, header, body),
+        19 => handle_delete_property(state, backend, client_id, sequence, body),
+        20 => handle_get_property(state, backend, client_id, sequence, header, body),
         // ── backend-proxy replies (state-light, host-RPC) ──
         17 => handle_get_atom_name(state, backend, origin, client_id, sequence, body),
         38 => handle_query_pointer(state, backend, origin, client_id, sequence, body),
@@ -7908,11 +7910,11 @@ fn handle_xi2_request(
                 && state
                     .pointer_grab
                     .is_some_and(|(owner, _)| owner == client_id)
-                && state.pointer_grab_is_passive
             {
                 let frozen = state.frozen_pointer_event.take();
                 state.pointer_grab = None;
                 state.pointer_grab_is_passive = false;
+                state.active_pointer_grab = None;
                 if replay
                     && let Some(event) = frozen
                 {
@@ -7966,6 +7968,7 @@ fn handle_xi2_request(
                 grab_type,
                 grab_mode,
                 paired_device_mode,
+                owner_events,
             ) = if body.len() >= 25 {
                     (
                         u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
@@ -7976,9 +7979,10 @@ fn handle_xi2_request(
                         body[22],
                         body[23],
                         body[24],
+                        body.get(25).copied().unwrap_or(0) != 0,
                     )
                 } else {
-                    (0, 0, 0, 0, 0, 0xff, 1, 1)
+                    (0, 0, 0, 0, 0, 0xff, 1, 1, false)
                 };
             // Modifiers tail starts after the header (28) and the mask
             // (mask_len * 4 bytes).
@@ -8019,6 +8023,7 @@ fn handle_xi2_request(
                             grab_window: ResourceId(grab_window),
                             button,
                             modifiers: *modifiers,
+                            owner_events,
                             event_mask: 0xFFFF_FFFF,
                             pointer_mode: grab_mode,
                         });
@@ -8335,6 +8340,8 @@ fn handle_reparent_window(
                     client_id.0,
                     result.window.0
                 );
+            } else {
+                backend.on_window_became_top_level(state, xid.as_raw());
             }
         }
     }
@@ -8628,6 +8635,8 @@ fn handle_create_window(
                     client_id.0,
                     new_id
                 );
+            } else if parent == ROOT_WINDOW {
+                backend.on_window_became_top_level(state, host_xid);
             }
             // L2 plan B.6b future-child hook: under spec, a freshly
             // created child of a REDIRECT_SUBWINDOWS parent inherits
@@ -8637,19 +8646,11 @@ fn handle_create_window(
             // until the backing-pixmap path lands.
         }
     }
-    let wants_focus = {
-        let mask = state
-            .clients
-            .get(&client_id.0)
-            .and_then(|c| c.event_masks.get(&window_id).copied())
-            .unwrap_or(0);
-        let viewable = state
-            .resources
-            .window(window_id)
-            .is_some_and(|w| w.map_state == MapState::Viewable);
-        viewable && (mask & 0x3) != 0
-    };
-    if wants_focus {
+    if window_wants_keyboard_focus(state, client_id, window_id) {
+        debug!(
+            "focus decision: client {} CreateWindow focus 0x{:x}",
+            client_id.0, window_id.0
+        );
         set_focused_window_to_state(state, client_id, window_id);
     }
     // CreateNotify on parent (SubstructureNotify subscribers).
@@ -8732,16 +8733,6 @@ fn handle_change_window_attributes(
         let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
     }
 
-    let want_focus_check = state
-        .clients
-        .get(&client_id.0)
-        .and_then(|c| c.event_masks.get(&target_window).copied())
-        .unwrap_or(0);
-    let viewable = state
-        .resources
-        .window(target_window)
-        .is_some_and(|w| w.map_state == MapState::Viewable);
-
     if target_window == ROOT_WINDOW {
         let root_bg = state.resources.window_resolved_background(ROOT_WINDOW);
         let root_bg_host_xid = root_bg.and_then(|bg| bg.background_pixmap_host_xid);
@@ -8760,7 +8751,11 @@ fn handle_change_window_attributes(
         }
     }
 
-    if viewable && want_focus_check & 0x3 != 0 {
+    if window_wants_keyboard_focus(state, client_id, target_window) {
+        debug!(
+            "focus decision: client {} ChangeWindowAttributes focus 0x{:x}",
+            client_id.0, target_window.0
+        );
         set_focused_window_to_state(state, client_id, target_window);
     }
 
@@ -8828,6 +8823,75 @@ fn handle_change_window_attributes(
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+fn window_is_desktop_window_type(state: &mut ServerState, window_id: ResourceId) -> bool {
+    let window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
+    let desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
+    let Some(property) = state.resources.window_property(window_id, window_type) else {
+        return false;
+    };
+    if property.format != properties::PropertyFormat::F32 || !property.data.len().is_multiple_of(4)
+    {
+        return false;
+    }
+    property
+        .data
+        .chunks_exact(4)
+        .map(|chunk| AtomId(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+        .any(|atom| atom == desktop)
+}
+
+fn window_wants_input_focus_hint(state: &mut ServerState, window_id: ResourceId) -> bool {
+    let wm_hints = AtomId(35);
+    let Some(property) = state.resources.window_property(window_id, wm_hints) else {
+        return false;
+    };
+    if property.format != properties::PropertyFormat::F32 || property.data.len() < 8 {
+        return false;
+    }
+
+    // `WM_HINTS` is a client-supplied 32-bit property. We do not
+    // persist its byte order, so accept either endianness here.
+    for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+        let flags = x11::read_u32(byte_order, &property.data[0..4]);
+        let input = x11::read_u32(byte_order, &property.data[4..8]);
+        // Xlib's XWMHints uses `flags & InputHint` to mark `input`
+        // as meaningful; the field itself is a boolean.
+        if flags & 0x0000_0001 != 0 && input != 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn window_wants_keyboard_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    window_id: ResourceId,
+) -> bool {
+    let mask = state
+        .clients
+        .get(&client_id.0)
+        .and_then(|c| c.event_masks.get(&window_id).copied())
+        .unwrap_or(0);
+    let viewable = state
+        .resources
+        .window(window_id)
+        .is_some_and(|w| w.map_state == MapState::Viewable);
+    viewable
+        && !window_is_desktop_window_type(state, window_id)
+        && ((mask & 0x3) != 0 || window_wants_input_focus_hint(state, window_id))
+}
+
+fn window_host_xid(state: &ServerState, window: ResourceId) -> u32 {
+    state
+        .resources
+        .window(window)
+        .and_then(|w| w.host_xid)
+        .map(|h| h.as_raw())
+        .unwrap_or(window.0)
 }
 
 fn handle_configure_window(
@@ -10625,20 +10689,11 @@ fn handle_map_subwindows(
             // children-on-show) also notify subscribed compositors.
             let _dropped = accumulate_damage_full_to_state(state, child);
         }
-        let wants_focus = {
-            let mask = state
-                .clients
-                .get(&client_id.0)
-                .and_then(|c| c.event_masks.get(&child).copied())
-                .unwrap_or(0);
-            let viewable = state
-                .resources
-                .window(child)
-                .is_some_and(|w| w.map_state == MapState::Viewable);
-            viewable && (mask & 0x3) != 0
-        };
-        if wants_focus {
-            debug!("focus key window 0x{:x}", child.0);
+        if window_wants_keyboard_focus(state, client_id, child) {
+            debug!(
+                "focus decision: client {} MapSubwindows focus 0x{:x}",
+                client_id.0, child.0
+            );
             set_focused_window_to_state(state, client_id, child);
         }
         if was_unmapped {
@@ -11213,6 +11268,10 @@ fn handle_set_input_focus(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::input_focus_window(body) {
+        debug!(
+            "focus decision: client {} SetInputFocus 0x{:x}",
+            client_id.0, window.0
+        );
         set_focused_window_to_state(state, client_id, window);
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
@@ -13517,6 +13576,7 @@ fn handle_get_modifier_mapping(
 
 fn handle_change_property(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -13690,6 +13750,7 @@ fn handle_change_property(
     state
         .resources
         .set_window_property(req.window, req.property, new_value);
+    backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
     let timestamp = state.timestamp_now();
     let window = req.window;
     let property = req.property;
@@ -13701,12 +13762,25 @@ fn handle_change_property(
             x11::encode_property_notify_event(buf, seq, order, window, property, timestamp, false);
         },
     );
+    if state
+        .atoms
+        .name(req.property)
+        .is_some_and(|name| name == "WM_HINTS")
+        && window_wants_keyboard_focus(state, client_id, req.window)
+    {
+        debug!(
+            "focus decision: client {} WM_HINTS focus 0x{:x}",
+            client_id.0, req.window.0
+        );
+        set_focused_window_to_state(state, client_id, req.window);
+    }
     debug!("client {} #{} ChangeProperty", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
 
 fn handle_get_property(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -13814,6 +13888,7 @@ fn handle_get_property(
         let _ = state
             .resources
             .delete_window_property(req.window, req.property);
+        backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
         let timestamp = state.timestamp_now();
         let window = req.window;
         let property = req.property;
@@ -13827,6 +13902,7 @@ fn handle_get_property(
 
 fn handle_delete_property(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -13848,6 +13924,7 @@ fn handle_delete_property(
         .resources
         .delete_window_property(req.window, req.property);
     if removed.is_some() {
+        backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
         let timestamp = state.timestamp_now();
         let window = req.window;
         let property = req.property;
@@ -14149,6 +14226,7 @@ fn handle_grab_button(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
@@ -14156,6 +14234,7 @@ fn handle_grab_button(
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let event_mask = u32::from(u16::from_le_bytes([body[4], body[5]]));
         let pointer_mode = body[6];
+        let owner_events = header.data != 0;
         let modifiers = u16::from_le_bytes([body[18], body[19]]);
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
@@ -14168,6 +14247,7 @@ fn handle_grab_button(
             grab_window,
             button,
             modifiers,
+            owner_events,
             event_mask,
             pointer_mode,
         });
@@ -15034,6 +15114,218 @@ mod tests {
             ResourceId(CHILD),
             "keyboard focus should track child"
         );
+    }
+
+    #[test]
+    fn wm_hints_input_focuses_viewable_window_on_property_change() {
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 53;
+        const WIN: u32 = 0x0360_0006;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT);
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 120,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            &WIN.to_le_bytes(),
+        )
+        .expect("MapWindow");
+        let _ = read_all_available(&mut peer);
+
+        assert_eq!(
+            state.clients.get(&CLIENT).unwrap().focused_window,
+            ROOT_WINDOW,
+            "window should not be focused before WM_HINTS arrives"
+        );
+
+        let wm_hints = state.atoms.intern("WM_HINTS", false);
+        let mut body = Vec::new();
+        body.extend_from_slice(&WIN.to_le_bytes());
+        body.extend_from_slice(&wm_hints.0.to_le_bytes());
+        body.extend_from_slice(&wm_hints.0.to_le_bytes());
+        body.push(32);
+        body.extend_from_slice(&[0u8; 3]);
+        body.extend_from_slice(&9u32.to_le_bytes());
+        let mut hints = vec![0u8; 36];
+        hints[0..4].copy_from_slice(&1u32.to_le_bytes());
+        hints[4..8].copy_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&hints);
+
+        handle_change_property(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 18,
+                data: 0,
+                length_units: 0,
+            },
+            &body,
+        )
+        .expect("ChangeProperty");
+
+        assert_eq!(
+            state.clients.get(&CLIENT).unwrap().focused_window,
+            ResourceId(WIN),
+            "WM_HINTS.input should promote focus when the window is viewable"
+        );
+    }
+
+    #[test]
+    fn wm_hints_input_does_not_focus_desktop_window() {
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 54;
+        const WIN: u32 = 0x0360_0007;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT);
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 120,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            &WIN.to_le_bytes(),
+        )
+        .expect("MapWindow");
+        let _ = read_all_available(&mut peer);
+
+        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
+        let atom_desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
+
+        let mut set_type_body = Vec::new();
+        set_type_body.extend_from_slice(&WIN.to_le_bytes());
+        set_type_body.extend_from_slice(&atom_window_type.0.to_le_bytes());
+        set_type_body.extend_from_slice(&atom_window_type.0.to_le_bytes());
+        set_type_body.push(32);
+        set_type_body.extend_from_slice(&[0u8; 3]);
+        set_type_body.extend_from_slice(&1u32.to_le_bytes());
+        set_type_body.extend_from_slice(&atom_desktop.0.to_le_bytes());
+        set_type_body.extend_from_slice(&[0u8; 4]);
+        handle_change_property(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 18,
+                data: 0,
+                length_units: 0,
+            },
+            &set_type_body,
+        )
+        .expect("ChangeProperty desktop type");
+
+        let wm_hints = state.atoms.intern("WM_HINTS", false);
+        let mut hints_body = Vec::new();
+        hints_body.extend_from_slice(&WIN.to_le_bytes());
+        hints_body.extend_from_slice(&wm_hints.0.to_le_bytes());
+        hints_body.extend_from_slice(&wm_hints.0.to_le_bytes());
+        hints_body.push(32);
+        hints_body.extend_from_slice(&[0u8; 3]);
+        hints_body.extend_from_slice(&9u32.to_le_bytes());
+        let mut hints = vec![0u8; 36];
+        hints[0..4].copy_from_slice(&1u32.to_le_bytes());
+        hints[4..8].copy_from_slice(&1u32.to_le_bytes());
+        hints_body.extend_from_slice(&hints);
+        handle_change_property(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 18,
+                data: 0,
+                length_units: 0,
+            },
+            &hints_body,
+        )
+        .expect("ChangeProperty WM_HINTS");
+
+        assert_eq!(
+            state.clients.get(&CLIENT).unwrap().focused_window,
+            ROOT_WINDOW,
+            "desktop windows should not take focus from WM_HINTS.input"
+        );
+    }
+
+    #[test]
+    fn window_host_xid_prefers_resolved_host_mapping() {
+        use crate::backend::WindowHandle;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 55;
+        const WIN: u32 = 0x0360_0008;
+        const HOST: u32 = 0x0400_1234;
+
+        let mut state = ServerState::new();
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(WIN))
+            .unwrap()
+            .host_xid = WindowHandle::from_raw(HOST);
+
+        assert_eq!(window_host_xid(&state, ResourceId(WIN)), HOST);
     }
 
     #[test]
@@ -17968,6 +18260,75 @@ mod tests {
     }
 
     #[test]
+    fn xi_allow_events_replay_device_releases_active_pointer_grab() {
+        use crate::{backend::Backend, resources::ROOT_VISUAL, server::ActivePointerGrab};
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const TARGET_WIN: u32 = 0x0020_0052;
+        const HOST_XID: u32 = 0xCAFE_0003;
+
+        let mut state = ServerState::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(TARGET_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(TARGET_WIN));
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(TARGET_WIN)));
+        state.pointer_grab_is_passive = false;
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(TARGET_WIN),
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
+            .expect("register host xid");
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.push(2); // mode = ReplayDevice
+        body.push(0); // pad
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events replay pointer");
+
+        assert!(state.pointer_grab.is_none());
+        assert!(!state.pointer_grab_is_passive);
+        assert!(state.active_pointer_grab.is_none());
+    }
+
+    #[test]
     fn xi_sync_passive_grab_replays_xi2_press_to_target_only_after_allow_events() {
         use crate::{
             backend::Backend,
@@ -18027,6 +18388,7 @@ mod tests {
             grab_window: ResourceId(TARGET_WIN),
             button: 1,
             modifiers: 0,
+            owner_events: false,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
         });
@@ -18090,6 +18452,189 @@ mod tests {
         assert!(
             matches!(target_read, Ok(n) if n >= 32 && buf[0] == 35),
             "ReplayDevice must redeliver the XI2 press to the natural target; got {target_read:?}",
+        );
+    }
+
+    #[test]
+    fn xi_passive_grab_owner_events_releases_on_button_release() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::PassiveButtonGrab,
+        };
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0020_0053;
+        const HOST_XID: u32 = 0xCAFE_0004;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        state.button_grabs.push(PassiveButtonGrab {
+            owner: ClientId(CLIENT_ID),
+            grab_window: ResourceId(WINDOW_XID),
+            button: 1,
+            modifiers: 0,
+            owner_events: true,
+            event_mask: 0xFFFF_FFFF,
+            pointer_mode: 0,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
+            .expect("register host xid");
+
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x1234,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, press, true, false);
+        assert!(state.pointer_grab_is_passive);
+        assert!(state.frozen_pointer_event.is_some());
+
+        let release = HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            ..press
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, release, true, false);
+
+        assert!(state.pointer_grab.is_none());
+        assert!(!state.pointer_grab_is_passive);
+        assert!(state.frozen_pointer_event.is_none());
+    }
+
+    #[test]
+    fn xi_passive_grab_owner_events_delivers_descendant_window_regardless_of_owner() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::PassiveButtonGrab,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const CHILD_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0020_0062;
+        const CHILD_WIN: u32 = 0x0020_0063;
+        const HOST_XID: u32 = 0xCAFE_0005;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut child_peer = install_client(&mut state, CHILD_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer
+            .set_nonblocking(true)
+            .expect("grab peer nonblocking");
+        child_peer
+            .set_nonblocking(true)
+            .expect("child peer nonblocking");
+
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(CHILD_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_WIN),
+                parent: ResourceId(GRAB_WIN),
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(CHILD_WIN));
+        state
+            .clients
+            .get_mut(&CHILD_CLIENT_ID)
+            .expect("child client")
+            .event_masks
+            .insert(ResourceId(CHILD_WIN), 0x0000_0004);
+        state.button_grabs.push(PassiveButtonGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            button: 1,
+            modifiers: 0,
+            owner_events: true,
+            event_mask: 0xFFFF_FFFF,
+            pointer_mode: 0,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
+            .expect("register host xid");
+
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x1234,
+            root_x: 20,
+            root_y: 20,
+            event_x: 20,
+            event_y: 20,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, press, true, false);
+
+        let mut buf = [0u8; 128];
+        let child_read = child_peer.read(&mut buf);
+        assert!(
+            matches!(child_read, Ok(n) if n >= 32),
+            "owner_events=true passive grab must deliver descendant clicks to the descendant window even when a different client owns it; got {child_read:?}",
+        );
+        let grab_read = grab_peer.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "owner_events=true passive grab must not redirect descendant clicks to the grab owner; got {grab_read:?}",
         );
     }
 

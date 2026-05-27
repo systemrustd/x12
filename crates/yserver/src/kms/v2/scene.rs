@@ -1687,16 +1687,18 @@ fn build_scene(
     if cow.is_some() {
         log::trace!(
             "v2 scene_walk begin output={output_idx} cow_authoritative=true \
-             top_levels_skipped={n} \
+             top_levels_skipped={n} order={order:?} \
              layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
             n = core.top_level_order.len(),
+            order = core.top_level_order,
         );
     } else {
         log::trace!(
             "v2 scene_walk begin output={output_idx} cow_authoritative=false \
-             top_levels={n} \
+             top_levels={n} order={order:?} \
              layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
             n = core.top_level_order.len(),
+            order = core.top_level_order,
         );
         for &top_xid in &core.top_level_order {
             emit_window_subtree(

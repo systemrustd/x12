@@ -12,7 +12,7 @@
 
 use std::{any::Any, io};
 
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, xfixes};
+use yserver_protocol::x11::{AtomId, ClipRectangles, FontMetrics, xfixes};
 
 use crate::{
     backend::{
@@ -328,6 +328,24 @@ pub trait Backend: Send {
     /// own per-drawable storage (v1 KmsBackend, ynest's
     /// HostX11Backend, RecordingBackend).
     fn dump_drawables(&mut self) {}
+
+    /// Notify the backend that a window property changed or was
+    /// deleted. KMS uses this to re-evaluate EWMH stack hints
+    /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).
+    /// Default no-op.
+    fn on_window_property_changed(
+        &mut self,
+        _state: &ServerState,
+        _host_xid: u32,
+        _property: AtomId,
+    ) {
+    }
+
+    /// Notify the backend that a window has become top-level under
+    /// root. This lets backends re-apply stack hints that were set
+    /// before the window re-entered `core.top_level_order`.
+    /// Default no-op.
+    fn on_window_became_top_level(&mut self, _state: &ServerState, _host_xid: u32) {}
 
     /// Observer hook fired on every PRESENT::Pixmap request, with
     /// the source pixmap xid and destination window xid the
