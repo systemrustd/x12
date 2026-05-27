@@ -26,6 +26,7 @@ fontconfig = "0.10.1"
 ash.workspace = true
 gpu-allocator.workspace = true
 thiserror.workspace = true
+libseat = "0.2.4"
 
 [[bin]]
 name = "ynest"
