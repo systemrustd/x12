@@ -257,6 +257,24 @@ Added regression test
 `xi_active_device_grab_funnels_button_release_to_grab_owner_not_window_under_cursor`.
 Validated on bee hardware (drag now works). `cargo test -p yserver-core
 --lib` 410/410 green; nightly fmt + plain clippy clean.
+2026-05-27 first Cinnamon telemetry run (bee, release build,
+`RUST_LOG=warn YSERVER_LOOP_TELEMETRY=1`, ~30 s while dragging a window
+fast across the whole screen): clean across every correctness gate.
+`vk_queue_wait_idle/s=0`, `missed_pageflips/s=0`,
+`full_redraw_fallback/s=0` (steady state; 2 at cold boot),
+`submit_group_aborts/s=0`, frame-builder `aborts=0` every window — no
+EBUSY / atomic-commit-failed / BO-invalidated / panic (only WARNs are
+the Ctrl-Alt-Backspace zap shutdown). Throughput: `composite_submits/s`
+≈ 55–61 with `frame_present_count/s` matching 1:1 → vsync-locked
+~58–60 fps held under a full Cinnamon desktop. Cost: avg compose-CB
+record ≈ 200–250 µs steady (1.29 ms cold-start spike), ~1.5% of a
+16.6 ms frame budget. `damage_fraction` rode at ~1.000 for the back half
+— honest full-screen damage from the fast drag (worst-case compositing
+workload), not a fallback, and compose cost stayed flat through it.
+Frame-builder close reasons still split `legacy_sc` ≈ `present_completion`
+(~half each), i.e. the legacy scene-compose path is still in use as
+expected pre-B.4. Net: Cinnamon runs vsync-locked at 60 fps with zero
+stalls/misses/aborts on bee, even under a screen-spanning drag.
 
 ---
 
