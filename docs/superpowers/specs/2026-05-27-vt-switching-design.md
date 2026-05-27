@@ -1,6 +1,6 @@
 # VT switching design
 
-**Status:** Draft, 2026-05-27 (revision 3 — simplified per wlroots + codex re-review).
+**Status:** Draft, 2026-05-27 (revision 9 — final cleanup after seven codex review rounds).
 **Branch (planned):** `feature/vt-switch`.
 **Related:** `crates/yserver/src/kms/console.rs` (existing TTY takeover, explicitly defers VT switching), `xserver/hw/xfree86/os-support/linux/lnx_init.c` + `systemd-logind.c` (upstream reference), `wlroots/backend/session/session.c` (the authoritative production reference for libseat-driven session management).
 
@@ -100,8 +100,8 @@ struct LibseatBackend {
 
 #[derive(Default)]
 struct SeatPending {
-    enable_fired: bool,
-    disable_fired: bool,
+    pending_enable: bool,
+    pending_disable: bool,
 }
 
 enum DeviceKind { Drm { is_kms: bool }, Input }
@@ -135,8 +135,8 @@ There is **no per-device pause callback** surfaced to client code. Per-device re
 
 | libseat event   | Where it goes                            | Triggers                                           |
 |-----------------|------------------------------------------|----------------------------------------------------|
-| `enable_seat`   | Sets `pending.enable_fired = true`       | Resume sequence (reopen devices, modeset, repaint) |
-| `disable_seat`  | Sets `pending.disable_fired = true`      | Suspend sequence                                   |
+| `enable_seat`   | Sets `pending.pending_enable = true`     | Resume sequence (reopen devices, modeset, repaint) |
+| `disable_seat`  | Sets `pending.pending_disable = true`    | Suspend sequence                                   |
 
 Practically: on `disable_seat`, we **close every input fd** and **stop submitting GPU work / committing modesets** before calling `libseat_disable_seat()` to ack. We do **not** call `drmDropMaster` ourselves — wlroots doesn't, and libseat / seatd / logind revoke master at the kernel level as part of disable processing. DRM fds stay open; see "Device fd lifetime contract" below. On `enable_seat`, we reopen each device via `seat.open_device(path)`, which returns a fresh `(device_id, fd)` pair — we treat the fd as opaque and replace the old one unconditionally.
 
