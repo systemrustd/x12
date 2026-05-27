@@ -49,7 +49,10 @@ use yserver_core::backend::BackendFdKind;
 use crate::{
     drm,
     kms::{
-        backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
+        backend::{
+            OutputLayout, PlatformInit, platform_init as core_platform_init,
+            platform_init_with_fd as core_platform_init_with_fd,
+        },
         v2::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
@@ -526,18 +529,35 @@ pub(crate) struct PlatformBackend {
 }
 
 impl PlatformBackend {
-    /// Production constructor. Opens DRM, initialises Vk,
-    /// allocates per-output scanout pools, builds the fence
-    /// pool. All-or-nothing: any failure tears down already-
-    /// allocated resources and returns Err.
+    /// Libseat-mode constructor. Accepts a seat-provided card fd via
+    /// [`core_platform_init_with_fd`]; all other bring-up is identical to
+    /// [`open_with_commit`]. In libseat mode `input_ctx` is always `None`
+    /// here — the caller builds `crate::input::Context` on the core thread
+    /// via `Context::new_libseat` and stores it on `KmsBackendV2` directly.
+    pub(crate) fn open_with_commit_fd(
+        device_path: &str,
+        card_fd: std::os::fd::OwnedFd,
+        commit: fn(
+            &drm::Device,
+            &drm::modeset::Output,
+            ::drm::control::framebuffer::Handle,
+        ) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let platform_init = core_platform_init_with_fd(device_path, card_fd, commit)?;
+        Self::from_platform_init(platform_init)
+    }
+
+    /// Direct-mode (no libseat) constructor. Opens DRM, initialises Vk,
+    /// allocates per-output scanout pools, builds the fence pool.
+    /// All-or-nothing: any failure tears down already-allocated resources
+    /// and returns `Err`.
     ///
     /// # Errors
     ///
     /// Propagates platform-init failures from `core_platform_init`,
-    /// Vk init failures from `VkContext::new`, command-pool
-    /// allocation failures from `OpsCommandPool::new`. ScanoutBoPool
-    /// failures per-output are non-fatal — that output is marked
-    /// `None` and skipped.
+    /// Vk init failures from `VkContext::new`, command-pool allocation
+    /// failures from `OpsCommandPool::new`. `ScanoutBoPool` failures
+    /// per-output are non-fatal — that output is marked `None` and skipped.
     pub(crate) fn open_with_commit(
         device_path: &str,
         commit: fn(
@@ -546,6 +566,15 @@ impl PlatformBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
+        let platform_init = core_platform_init(device_path, commit)?;
+        Self::from_platform_init(platform_init)
+    }
+
+    /// Shared bring-up body: Vk + pools + epoll + cursor plane init
+    /// from a pre-built [`PlatformInit`]. Used by both
+    /// [`open_with_commit`] (Direct mode) and
+    /// [`open_with_commit_fd`] (libseat mode).
+    fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
             device,
             render_node_fd,
@@ -554,7 +583,7 @@ impl PlatformBackend {
             fb_w,
             fb_h,
             input_ctx,
-        } = core_platform_init(device_path, commit)?;
+        } = platform_init;
 
         let vk = match VkContext::new() {
             Ok(v) => v,

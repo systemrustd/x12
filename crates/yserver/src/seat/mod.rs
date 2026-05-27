@@ -196,4 +196,13 @@ impl Seat {
     pub fn is_libseat(&self) -> bool {
         matches!(self, Seat::Libseat { .. })
     }
+
+    /// Return a clone of the `LibseatInner` `Rc` if in libseat mode.
+    #[must_use]
+    pub fn libseat_inner(&self) -> Option<Rc<RefCell<LibseatInner>>> {
+        match self {
+            Seat::Libseat { inner, .. } => Some(Rc::clone(inner)),
+            Seat::Direct => None,
+        }
+    }
 }

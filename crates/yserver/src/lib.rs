@@ -20,6 +20,7 @@ use nix::sys::{
 };
 
 use yserver_core::{
+    backend::Backend,
     core_loop::{self, Message, poll_tokens::ClientIdAllocator},
     server::ServerState,
 };
@@ -177,11 +178,15 @@ pub fn run() -> io::Result<()> {
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
-    // v1 retired 2026-05-26; v2 is the only rendering backend now.
-    // Previously this went through `KmsBackendKind::open_from_env` which
-    // routed on `YSERVER_RENDER_MODEL`. With v1 gone, the env knob is
-    // gone too — instantiate v2 directly.
-    let mut backend = crate::kms::v2::KmsBackendV2::open(&device_path)?;
+    // Open the seat first so DRM + input device opens can route through
+    // it in libseat mode. Falls back to `Seat::Direct` silently when
+    // libseat is unavailable (no seat manager / not on a real VT).
+    let seat = crate::seat::Seat::open();
+
+    // Build the backend in seat-aware fashion. In libseat mode the DRM
+    // card is opened through the seat and libinput lives on the core
+    // thread. In Direct mode today's behaviour is preserved exactly.
+    let mut backend = build_kms_backend_v2(seat, &device_path)?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -232,13 +237,20 @@ pub fn run() -> io::Result<()> {
     // a clone, run_core needs the receiver.
     let (poll, sender, rx) = core_loop::channel()?;
 
-    // Hand the libinput context off to the dedicated input thread. After
-    // this `take_input_ctx`, the backend's `poll_fds()` returns only
-    // the DRM fd, so run_core's E3 registration step won't double-poll
-    // libinput.
-    if let Some(input_ctx) = backend.take_input_ctx() {
+    // Libseat mode: the backend owns libinput on the core thread.
+    // Hand it the sender for Shutdown/Dump messages from the on-core
+    // hotkey path. No input thread in this mode.
+    //
+    // Direct mode: spawn the dedicated libinput sender thread exactly
+    // as before. After `take_input_ctx`, the backend's `poll_fds()`
+    // returns only the DRM fd, so run_core's E3 registration step
+    // won't double-poll libinput.
+    if backend.is_libseat_mode() {
+        backend.set_input_sender(sender.clone_handle());
+        log::info!("yserver: libseat mode — libinput on core thread, no input thread spawned");
+    } else if let Some(input_ctx) = backend.take_input_ctx() {
         let input_sender = sender.clone_handle();
-        log::info!("yserver: spawning libinput sender thread");
+        log::info!("yserver: Direct mode — spawning libinput sender thread");
         thread::Builder::new()
             .name("yserver-libinput".into())
             .spawn(move || {
@@ -325,6 +337,53 @@ pub fn run() -> io::Result<()> {
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");
     result
+}
+
+/// Build a `KmsBackendV2` in either libseat or Direct mode depending on
+/// `seat`. This is the single decision point for the mode branch.
+///
+/// **Libseat mode** (`seat == Seat::Libseat`):
+/// - Opens the DRM card through the seat (FATAL on failure — once libseat
+///   has the session, direct device opens won't get DRM master).
+/// - Builds a `crate::input::Context` on the core thread via
+///   `Context::new_libseat` (FATAL on failure for the same reason).
+/// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
+///
+/// **Direct mode** (`seat == Seat::Direct`):
+/// - Calls `KmsBackendV2::open(device_path)` — today's code path.
+/// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
+fn build_kms_backend_v2(
+    seat: crate::seat::Seat,
+    device_path: &str,
+) -> io::Result<crate::kms::v2::KmsBackendV2> {
+    match seat {
+        crate::seat::Seat::Libseat { ref inner, .. } => {
+            // Build on-core libinput first (before DRM open) so any failure
+            // is reported clearly. If libinput fails here it is FATAL —
+            // we're committed to libseat mode.
+            let core_libinput = crate::input::Context::new_libseat(std::rc::Rc::clone(inner))
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "libseat mode: building on-core libinput context failed: {e}"
+                    ))
+                })?;
+            let core_libinput_fd = core_libinput.fd();
+            let seat_fd = inner.borrow_mut().fd().map_err(|e| {
+                io::Error::other(format!("libseat mode: getting seat fd failed: {e}"))
+            })?;
+            crate::kms::v2::KmsBackendV2::open_libseat(
+                seat,
+                device_path,
+                core_libinput,
+                seat_fd,
+                core_libinput_fd,
+            )
+        }
+        crate::seat::Seat::Direct => {
+            // Today's path: open DRM + libinput directly.
+            crate::kms::v2::KmsBackendV2::open(device_path)
+        }
+    }
 }
 
 fn resolve_drm_device() -> io::Result<String> {

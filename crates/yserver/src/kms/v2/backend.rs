@@ -292,7 +292,58 @@ pub struct KmsBackendV2 {
     /// drain helper emit one `record_frame_builder_open` per new open
     /// without requiring a separate event queue.
     last_drained_fb_opens: u64,
+
+    // ── VT switching (Task 8 — libseat mode). `Direct`/`None`/`-1` in
+    //    Direct mode; populated during `open_libseat` construction.
+    //
+    //    `seat_fd` and `core_libinput_fd` are STABLE for the process
+    //    lifetime (the DRM fd is opened once, Deviation #5 of the plan),
+    //    so caching them once and never re-registering with the poller is
+    //    correct.
+    //
+    //    Tasks 9/12 (`on_libinput_ready` / `on_seat_ready`) will consume
+    //    the fields below; they have no callers yet, so we suppress
+    //    dead_code until those tasks land.
+    /// Seat mode (owns libseat in Libseat mode; marker in Direct mode).
+    seat: crate::seat::Seat,
+    /// State machine for the suspend/resume cycle.
+    #[allow(dead_code)]
+    seat_state: crate::seat::state::SeatState,
+    /// Coalesced counter-events for the state machine.
+    #[allow(dead_code)]
+    seat_pending: crate::seat::state::SeatPending,
+    /// On-core libinput context (libseat mode only). `None` in Direct mode
+    /// (the dedicated input thread owns libinput there).
+    #[allow(dead_code)]
+    core_libinput: Option<crate::input::Context>,
+    /// Cursor/scroll accumulator for on-core libinput event mapping
+    /// (libseat mode). `None` in Direct mode.
+    #[allow(dead_code)]
+    core_input_state: Option<crate::input_thread::LibinputThreadState>,
+    /// Cached libseat connection fd for `poll_fds` (`&self`). `-1` in
+    /// Direct mode (never registered with the poller).
+    seat_fd: std::os::fd::RawFd,
+    /// Cached on-core libinput fd for `poll_fds` (`&self`). `-1` in
+    /// Direct mode (the input thread owns the fd there).
+    core_libinput_fd: std::os::fd::RawFd,
+    /// Core-channel sender for emitting Shutdown/Dump messages from the
+    /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
+    /// after the channel is created in `lib.rs`.
+    input_sender: Option<yserver_core::core_loop::CoreSender>,
+    /// Hotkey detector — used on the core thread in libseat mode.
+    /// Pre-allocated here so Tasks 9/12 (`on_libinput_ready`) find it.
+    #[allow(dead_code)]
+    hotkey: crate::input::hotkey::HotkeyDetector,
 }
+
+// SAFETY: `KmsBackendV2` lives entirely on the core-loop thread. The
+// `!Send` fields (`crate::seat::Seat` with `Rc<RefCell<...>>`, and
+// `crate::input::Context` with `*mut libinput`) are only accessed from
+// that single thread. `run_core` requires `Backend: Send` because it is
+// generic over `dyn Backend`, but the backend is never actually moved
+// between threads after construction — the same pattern used by the
+// existing `!Send` KMS fields (`XkbContext`, `XkbState`, etc.).
+unsafe impl Send for KmsBackendV2 {}
 
 impl KmsBackendV2 {
     /// Test-only entry point: drives the production `get_image` path
@@ -516,11 +567,138 @@ impl KmsBackendV2 {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             last_drained_fb_opens: 0,
+            // Direct mode: seat is a marker, fds are -1 (never polled),
+            // no on-core libinput, no core sender.
+            seat: crate::seat::Seat::Direct,
+            seat_state: crate::seat::state::SeatState::Active,
+            seat_pending: crate::seat::state::SeatPending::default(),
+            core_libinput: None,
+            core_input_state: None,
+            seat_fd: -1,
+            core_libinput_fd: -1,
+            input_sender: None,
+            hotkey: crate::input::hotkey::HotkeyDetector::new(),
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
         // Best-effort — a failure logs + leaves the cursor invisible
         // (matches pre-3f.8 behaviour, no regression).
+        if let Err(e) = b.init_cursor_sprite() {
+            log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
+        }
+        Ok(b)
+    }
+
+    /// Libseat-mode constructor. The seat has already been opened and
+    /// the initial Enable received; the DRM card fd came from
+    /// `seat.open_device`, and libinput was built on the core thread via
+    /// `Context::new_libseat`. This is called by `lib.rs` after
+    /// `build_kms_backend_v2` branches on the seat mode.
+    ///
+    /// # Errors
+    ///
+    /// Propagates Vk / libinput init failures from
+    /// `PlatformBackend::open_with_commit_fd`.
+    pub fn open_libseat(
+        seat: crate::seat::Seat,
+        device_path: &str,
+        core_libinput: crate::input::Context,
+        seat_fd: std::os::fd::RawFd,
+        core_libinput_fd: std::os::fd::RawFd,
+    ) -> io::Result<Self> {
+        Self::open_libseat_with_commit(
+            seat,
+            device_path,
+            core_libinput,
+            seat_fd,
+            core_libinput_fd,
+            drm::modeset::commit_modeset,
+        )
+    }
+
+    fn open_libseat_with_commit(
+        seat: crate::seat::Seat,
+        device_path: &str,
+        core_libinput: crate::input::Context,
+        seat_fd: std::os::fd::RawFd,
+        core_libinput_fd: std::os::fd::RawFd,
+        commit: fn(
+            &crate::drm::Device,
+            &crate::drm::modeset::Output,
+            ::drm::control::framebuffer::Handle,
+        ) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        // Get the card fd from the seat.
+        let card_fd = {
+            let inner = seat.libseat_inner().ok_or_else(|| {
+                io::Error::other("open_libseat_with_commit: seat is not in libseat mode")
+            })?;
+            inner
+                .borrow_mut()
+                .open_device(
+                    std::path::Path::new(device_path),
+                    crate::seat::DeviceKind::Drm { is_kms: true },
+                )
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "libseat mode: opening DRM card {device_path} via seat failed: {e}"
+                    ))
+                })?
+        };
+        let platform = PlatformBackend::open_with_commit_fd(device_path, card_fd, commit)?;
+        let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
+        let core = KmsCore::new(fb_w, fb_h)?;
+        let engine = RenderEngine::new(&platform)
+            .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
+        let scene = SceneCompositor::new(&platform)
+            .map_err(|e| io::Error::other(format!("v2 SceneCompositor::new failed: {e:?}")))?;
+        log::info!(
+            "yserver(v2): KmsBackendV2 boot (libseat mode) — {} output(s), {fb_w}x{fb_h} \
+             virtual screen; VT switching enabled",
+            platform.outputs.len(),
+        );
+        let mut b = Self {
+            core,
+            platform,
+            logged_gaps: RefCell::new(HashSet::new()),
+            store: DrawableStore::new(),
+            engine,
+            scene,
+            windows_v2: WindowsV2Map::new(),
+            next_window_stack_rank: 1,
+            telemetry: Telemetry::new(),
+            last_observed_pool_creates: 0,
+            last_observed_pool_resets: 0,
+            cow_id: None,
+            clip_mask_cache: None,
+            clear_window_area_calls: 0,
+            engine_copy_area_calls: 0,
+            present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
+            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
+            dri3_xshmfences: HashMap::new(),
+            dri3_sync_resources: HashMap::new(),
+            pending_present_batches: std::collections::VecDeque::new(),
+            pending_completed_events_on_shutdown: Vec::new(),
+            cursor_records: HashMap::new(),
+            cursor_pixmaps: HashMap::new(),
+            next_cursor_version: 1,
+            default_cursor_xid: None,
+            effective_cursor_xid: None,
+            last_drained_fb_opens: 0,
+            seat,
+            seat_state: crate::seat::state::SeatState::Active,
+            seat_pending: crate::seat::state::SeatPending::default(),
+            core_libinput: Some(core_libinput),
+            core_input_state: Some(crate::input_thread::LibinputThreadState::new(
+                u32::from(fb_w),
+                u32::from(fb_h),
+            )),
+            seat_fd,
+            core_libinput_fd,
+            input_sender: None,
+            hotkey: crate::input::hotkey::HotkeyDetector::new(),
+        };
+        b.init_root_storage();
         if let Err(e) = b.init_cursor_sprite() {
             log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
         }
@@ -1065,6 +1243,16 @@ impl KmsBackendV2 {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             last_drained_fb_opens: 0,
+            // Test fixtures always run in Direct mode.
+            seat: crate::seat::Seat::Direct,
+            seat_state: crate::seat::state::SeatState::Active,
+            seat_pending: crate::seat::state::SeatPending::default(),
+            core_libinput: None,
+            core_input_state: None,
+            seat_fd: -1,
+            core_libinput_fd: -1,
+            input_sender: None,
+            hotkey: crate::input::hotkey::HotkeyDetector::new(),
         }
     }
 
@@ -2983,6 +3171,13 @@ impl KmsBackendV2 {
     #[must_use]
     pub fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.platform.take_input_ctx()
+    }
+
+    /// Returns `true` when the backend is in libseat mode (VT switching
+    /// enabled). `false` in Direct mode (no libseat, today's behaviour).
+    #[must_use]
+    pub fn is_libseat_mode(&self) -> bool {
+        self.seat.is_libseat()
     }
 
     /// Initial composite + flip. v2's SceneCompositor records
@@ -6026,10 +6221,27 @@ impl Backend for KmsBackendV2 {
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
-        // DRM fd for page-flip events; libinput fd if the input
-        // context is still owned by us. Delegates to
-        // PlatformBackend.
-        self.platform.poll_fds()
+        // DRM fd + present-completion epfd (always); in libseat mode also
+        // the seat connection fd and the on-core libinput fd.
+        // The fds are stable for the process lifetime (Deviation #5), so
+        // caching them once and never re-registering is correct.
+        let mut fds = self.platform.poll_fds();
+        if self.seat.is_libseat() {
+            // seat_fd < 0 only when the libseat init path was skipped, which
+            // cannot happen here (the seat being Libseat implies it was opened
+            // successfully and the fd was cached).
+            if self.seat_fd >= 0 {
+                fds.push((self.seat_fd, BackendFdKind::Seat));
+            }
+            if self.core_libinput_fd >= 0 {
+                fds.push((self.core_libinput_fd, BackendFdKind::Libinput));
+            }
+        }
+        fds
+    }
+
+    fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
+        self.input_sender = Some(sender);
     }
 
     // ── Subwindow lifecycle ─────────────────────────────────────

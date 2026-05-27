@@ -544,6 +544,133 @@ pub(crate) fn platform_init(
     })
 }
 
+/// Seat-aware variant of [`platform_init`]. Uses a seat-provided DRM card fd
+/// (from `libseat::Seat::open_device`) instead of opening the path directly.
+///
+/// The only difference from `platform_init` is how `device` is constructed:
+/// we call `drm::Device::from_owned_fd` (which does NOT call `drmSetMaster`
+/// because libseat/logind already owns master — Deviation #5 from the plan)
+/// instead of `drm::Device::open`. Everything else — render-node discovery,
+/// output enumeration, swapchain init, libinput setup — is identical.
+///
+/// In libseat mode libinput is created on the core thread via
+/// `Context::new_libseat` rather than `SendContext::new`, so this function
+/// returns `input_ctx: None` — the caller builds the `Context` separately.
+///
+/// # Errors
+///
+/// Returns the same errors as [`platform_init`] except that the first device
+/// open is replaced by an ioctl on the already-open fd. A failure here is
+/// FATAL when in libseat mode (see plan §"Startup policy").
+pub(crate) fn platform_init_with_fd(
+    device_path: &str,
+    card_fd: std::os::fd::OwnedFd,
+    commit: fn(
+        &crate::drm::Device,
+        &crate::drm::modeset::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<PlatformInit> {
+    // Wrap the seat-provided fd. No path open, no drmSetMaster.
+    let device = Arc::new(drm::Device::from_owned_fd(card_fd, device_path)?);
+    let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
+    {
+        Ok((fd, path)) => {
+            use std::os::fd::AsRawFd;
+            let raw = fd.as_raw_fd();
+            let stat_minor = std::fs::metadata(&path)
+                .ok()
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    let rdev = m.rdev();
+                    ((rdev >> 8) & 0xff, rdev & 0xff)
+                })
+                .map(|(maj, min)| format!("{maj}:{min}"))
+                .unwrap_or_else(|| "?".into());
+            log::info!(
+                "DRI3 render node ready (sibling of {device_path}): fd={raw} \
+                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
+            );
+            (Some(fd), Some(path))
+        }
+        Err(err) => {
+            log::warn!(
+                "DRI3 render node unavailable: {err}; DRI3 import path will be \
+                     unavailable but the rest of yserver continues"
+            );
+            (None, None)
+        }
+    };
+    let outputs = drm::modeset::discover_outputs(&device)?;
+
+    let mut layouts: Vec<OutputLayout> = Vec::with_capacity(outputs.len());
+    let mut next_x: i32 = 0;
+    let mut bring_up_err: Option<io::Error> = None;
+    for output in outputs {
+        let w = output.picked.width;
+        let h = output.picked.height;
+        let mut buffers = Vec::with_capacity(2);
+        let mut buffer_err: Option<io::Error> = None;
+        for _ in 0..2 {
+            match drm::Buffer::new(Arc::clone(&device), w, h) {
+                Ok(b) => buffers.push(b),
+                Err(e) => {
+                    buffer_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = buffer_err {
+            bring_up_err = Some(e);
+            break;
+        }
+        let initial_fb = buffers[0].fb_id();
+        if let Err(e) = commit(&device, &output, initial_fb) {
+            bring_up_err = Some(e);
+            break;
+        }
+        let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
+        layouts.push(OutputLayout {
+            output,
+            swapchain,
+            x: next_x,
+            y: 0,
+            width: w,
+            height: h,
+        });
+        next_x = next_x.saturating_add(i32::from(w));
+    }
+    if let Some(err) = bring_up_err {
+        for done in layouts.iter().rev() {
+            let _ = drm::modeset::disable_output(&device, &done.output);
+        }
+        return Err(err);
+    }
+
+    let fb_w: u16 = layouts
+        .iter()
+        .map(|l| u16::try_from(l.x.saturating_add(i32::from(l.width))).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    let fb_h: u16 = layouts
+        .iter()
+        .map(|l| u16::try_from(l.y.saturating_add(i32::from(l.height))).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+
+    // In libseat mode, libinput is built on the core thread via
+    // Context::new_libseat (caller's responsibility). No SendContext here.
+    Ok(PlatformInit {
+        device,
+        render_node_fd,
+        render_node_path,
+        layouts,
+        fb_w,
+        fb_h,
+        input_ctx: None,
+    })
+}
+
 /// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.
 /// `body_tail` is everything after the 4-byte glyphset XID.
 pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
