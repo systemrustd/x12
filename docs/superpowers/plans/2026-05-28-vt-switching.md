@@ -479,12 +479,10 @@ pub enum DeviceKind {
     Input,
 }
 
-/// Map libseat's error (`errno::Errno`, a newtype over `i32`) to
-/// `io::Error`. VERIFY at impl time: the field is `.0`; the type may be
-/// re-exported as `libseat::Errno` or reachable as `errno::Errno`.
-fn errno_to_io(e: libseat::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e.0)
-}
+// libseat returns `errno::Errno` on failure. `errno` (0.3) provides
+// `impl From<Errno> for io::Error`, so map with `.map_err(io::Error::from)`
+// — no need to name the type or add `errno` as a direct dep (the trait
+// impl is in scope globally; the closure infers `e: errno::Errno`).
 
 /// A device opened through libseat. We OWN the libseat `Device` — it has
 /// NO `Drop` impl, so the only way to release it is `Seat::close_device`,
@@ -514,7 +512,7 @@ impl LibseatInner {
     /// the same description (see `ManagedDevice`). Mirrors wlroots'
     /// `wlr_session_open_file` (`backend/session/session.c`).
     pub fn open_device(&mut self, path: &Path, kind: DeviceKind) -> io::Result<OwnedFd> {
-        let device = self.seat.open_device(&path).map_err(errno_to_io)?;
+        let device = self.seat.open_device(&path).map_err(io::Error::from)?;
         let owned = device.as_fd().try_clone_to_owned()?; // dup(2)
         let handed_fd = owned.as_raw_fd();
         self.devices.push(ManagedDevice {
@@ -542,23 +540,23 @@ impl LibseatInner {
     /// switch will occur, and any state transition arrives later via the
     /// disable callback.
     pub fn switch_session(&mut self, vt: u32) -> io::Result<()> {
-        self.seat.switch_session(vt as i32).map_err(errno_to_io)
+        self.seat.switch_session(vt as i32).map_err(io::Error::from)
     }
 
     /// Ack a disable: tell libseat we've quiesced. Only after this does
     /// the kernel allow the VT switch to proceed.
     pub fn disable(&mut self) -> io::Result<()> {
-        self.seat.disable().map_err(errno_to_io)
+        self.seat.disable().map_err(io::Error::from)
     }
 
     pub fn fd(&mut self) -> io::Result<RawFd> {
-        self.seat.get_fd().map(|b| b.as_raw_fd()).map_err(errno_to_io)
+        self.seat.get_fd().map(|b| b.as_raw_fd()).map_err(io::Error::from)
     }
 
     /// Non-blocking dispatch. The enable/disable callback closure runs
     /// inside this call and pushes into the shared `pending_events` queue.
     pub fn dispatch(&mut self) -> io::Result<()> {
-        self.seat.dispatch(0).map(|_| ()).map_err(errno_to_io)
+        self.seat.dispatch(0).map(|_| ()).map_err(io::Error::from)
     }
 }
 
@@ -654,7 +652,7 @@ impl Seat {
 > - `get_fd(&mut self) -> Result<BorrowedFd<'_>, Errno>`, `dispatch(&mut self, timeout: i32) -> Result<i32, Errno>`
 > - `Device` impls **`AsFd`** + `Debug`. It has **no `Drop`, no `Clone`, no `AsRawFd`, no `device_id()`** — it is an opaque owned handle you hand back to `close_device`. Get the fd via `device.as_fd()`.
 >
-> **Still to verify at impl time (Task 1, once the crate is fetched):** (a) the `SeatEvent` enum variants are exactly `Enable`/`Disable`; (b) the error type path (`libseat::Errno` re-export vs `errno::Errno`) and that the inner i32 is field `.0`. These are the only two unconfirmed points; the wrappers above are the single place the API surface is touched, so adapt there if either differs.
+> **VERIFIED against the downloaded crate source (libseat 0.2.4, errno 0.3.14):** `SeatEvent` variants are exactly `Enable`/`Disable` (`libseat/src/lib.rs:24-26`). The error type is `errno::Errno` (NOT re-exported as `libseat::Errno`); `errno` provides `impl From<Errno> for io::Error` (`errno/src/lib.rs:87`), so use `.map_err(io::Error::from)` as shown — do not name the type. `libseat::Device` is `{ id: i32, fd: RawFd }`, impls only `AsFd` (no `Drop`/`Clone`/`device_id()`), confirming the dup-via-`as_fd().try_clone_to_owned()` ownership model.
 
 - [ ] **Step 2: Build**
 
