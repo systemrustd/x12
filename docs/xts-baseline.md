@@ -89,18 +89,24 @@ for the draw-primitives work:
 | `XSetLineAttributes`  |    3 |    2 |     1 |     0 | line_width / line_style / cap_style / join_style stored but not honoured in rasterizer. |
 | Xlib8 totals          |   53 |   67 |    22 |    12 | UNSUP=10. |
 
-### `Xlib9draw` baseline 2026-05-26
+### `Xlib9draw` baseline 2026-05-26 — superseded
 
-Custom scenario: `Xlib9draw` is a local addition to
+> **Resolved.** The "hang" described below was the `-display none`
+> recipe leaving KMS pageflips with no completion event, not a
+> depth-4 GetImage bug. Fixed by switching the recipe to the
+> egl-headless/Venus display config; the full `Xlib9` now runs (see
+> the *Full scenario sweep* section). This custom scenario + its
+> finding are kept for history; the temp `Xlib9draw`/`Xlib9line`
+> entries have been removed from `xts/xts5/tet_scen`.
+
+Custom scenario: `Xlib9draw` was a local addition to
 `xts/xts5/tet_scen` listing only the `Xlib9/X(Draw|Fill|Put)*` tests,
-since the full `Xlib9` scenario triggers a yserver hang after
-`XCopyPlane` (depth-4 GetImage spam). With the custom scenario we
-get signal on the draw primitives directly without waiting on the
-`XCopyPlane` fix.
+since the full `Xlib9` scenario appeared to hang after
+`XCopyPlane` (depth-4 GetImage spam was the last log line). With the
+custom scenario we got signal on the draw primitives directly.
 
-The hang still recurs ~31 subtests into `XDrawArcs` (same depth-4
-get_image path), so we only get partial signal on the draw cases.
-Tracked as a separate known issue.
+The apparent hang recurred ~31 subtests into `XDrawArcs`; root cause
+turned out to be the pageflip-completion stall, not depth-4.
 
 | Date       | PASS | FAIL | UNRES | UNIN | UNTST | NOTIU | UNSUP | ABORT | Notes |
 |------------|-----:|-----:|------:|-----:|------:|------:|------:|------:|-------|
@@ -118,13 +124,13 @@ rasterizers (acceptable) or unimplemented esoterica.
 | Scenario  | CASES | TESTS | PASS | FAIL | UNRES | UNTST | UNSUP | NOTIU | ABORT |
 |-----------|------:|------:|-----:|-----:|------:|------:|------:|------:|------:|
 | Xproto    |   122 |   389 |  344 |    8 |    16 |    19 |     2 |     0 |     0 |
-| Xlib3     |   109 |     - |    - |    - |     - |     - |     - |     - |     0 |
+| Xlib3     |   109 |   162 |  100 |   23 |     5 |    21 |     6 |     1 |     0 |
 | Xlib4     |    29 |   324 |  110 |  174 |     7 |    17 |    11 |     5 |     0 |
 | Xlib5     |    15 |    84 |   56 |   21 |     0 |     5 |     2 |     0 |     0 |
 | Xlib6     |     8 |    50 |    4 |   17 |     0 |    29 |     0 |     0 |     0 |
 | Xlib7     |    58 |   172 |   83 |   31 |     0 |    13 |    45 |     0 |     0 |
-| Xlib8     |    29 |   165 |   60 |   62 |    10 |    22 |    10 |     0 |     0 |
-| Xlib9     |    46 |     - |  157 |  893 |    62 |    21 |    22 |   159 |     0 |
+| Xlib8     |    29 |   165 |   60 |   63 |    10 |    22 |    10 |     0 |     0 |
+| Xlib9 †   |    31 |  1316 |  157 |  893 |    62 |    21 |    22 |   159 |     0 |
 | Xlib10    |    23 |    95 |   23 |   31 |     5 |    35 |     1 |     0 |     0 |
 | Xlib11    |    33 |   195 |   24 |   98 |     2 |     4 |    24 |    43 |     0 |
 | Xlib12    |    27 |   138 |   89 |   15 |     4 |    16 |     2 |    12 |     0 |
@@ -154,15 +160,26 @@ rasterizers (acceptable) or unimplemented esoterica.
 | XtE       |     1 |     1 |    1 |    0 |     0 |     0 |     0 |     0 |     0 |
 
 Notes:
+- **† `Xlib9` is throughput-limited, not hung.** 31 of 46 cases
+  completed within a 90-min budget; the remaining ~15 (GetImage-heavy
+  font/image cases) are just slow under the guest's software/Venus
+  Vulkan readback — 0 ABORT on everything that ran, no hang. A real
+  GPU (hardware run) makes GetImage fast and the scenario should
+  finish in full. Numbers shown are the 31 completed cases.
 - **`XI` / `XIproto` are almost entirely UNTESTED**, not failing —
   the XInput test framework skips when it can't enumerate the
-  expected device set; worth a look but not a survival concern.
+  expected device set. XInput device handling is incomplete; WIP
+  lives on `origin/cinnamon` (the "Cinnamon click-activation chain"
+  XI2 work — ~810 lines in `process_request.rs` + pointer/key
+  fanout, unfinished). Revisit XI/XIproto once that lands. Not a
+  survival concern (0 ABORT).
 - `Xt*` (toolkit) all complete; FAIL counts are small.
 - `Xlib16` is clean (82 PASS / 0 FAIL).
-- **`Xlib3`**: ran to completion (case-level: 109 cases, 11 failed,
-  16 not run, 0 ABORT) but `xts-report` produced an empty summary
-  for this run's journal — a tooling quirk, not a yserver failure;
-  per-purpose PASS/FAIL not captured. Re-run to get the breakdown.
+- **`Xlib8`** XSetArcMode: ArcMode is now honoured (Chord/PieSlice),
+  but the filled-arc spans aren't bit-exact to Xorg `mifillarc`, so
+  the pixel-check is a definite FAIL (was NORESULT) — hence 63 FAIL
+  vs the pre-arc 62. Acceptable pixel-exactness diff, not a
+  regression.
 
 (Total tests: 122 cases / 389 purposes throughout.)
 
