@@ -3576,10 +3576,25 @@ impl KmsBackendV2 {
         // 4. Resume libinput. MUST NOT hold a LibseatInner borrow across
         //    this call — `resume()` re-enters `open_restricted` which
         //    `borrow_mut`s `LibseatInner`. No borrow is held here.
-        if let Some(ctx) = self.core_libinput.as_mut()
-            && let Err(e) = ctx.resume()
-        {
-            log::warn!("kms: libinput resume failed: {e}");
+        //    A resume failure means the session is active but the input
+        //    devices were not reopened — the user would have a display
+        //    with no keyboard/mouse (and no way to zap). Treat it as
+        //    fatal, exactly like the modeset-failure path above (Risk #4):
+        //    exit cleanly rather than wedge with no input.
+        let resume_failed = match self.core_libinput.as_mut() {
+            Some(ctx) => match ctx.resume() {
+                Ok(()) => false,
+                Err(e) => {
+                    log::error!("kms: libinput resume failed: {e}; exiting (no input on resume)");
+                    true
+                }
+            },
+            None => false,
+        };
+        if resume_failed {
+            // Nothing further to do here; the queued Shutdown will tear
+            // the server down on the next loop iteration.
+            self.request_exit();
         }
 
         // 5. Full-damage repaint deferred to `drive_seat_event` after
@@ -3616,36 +3631,56 @@ impl KmsBackendV2 {
     /// `on_seat_ready` and the test injection entry point
     /// (`inject_seat_event_for_test`) share the same logic.
     fn drive_seat_event(&mut self, state: &mut ServerState, ev: crate::seat::state::SeatEventKind) {
-        use crate::seat::state::SeatAction;
+        use crate::seat::state::{SeatAction, SeatEventKind};
 
-        match self.seat_state.on_event(&mut self.seat_pending, ev) {
-            SeatAction::BeginSuspend => {
-                self.run_suspend(state);
-                self.seat_state.suspend_complete(&self.seat_pending);
-            }
-            SeatAction::BeginResume => {
-                self.run_resume(state);
-                match self.seat_state.resume_complete(&mut self.seat_pending) {
-                    SeatAction::BeginSuspend => {
-                        // A disable arrived during the resume sequence
-                        // (no-blink boundary): go straight back into
-                        // suspend without ever becoming Active.
-                        self.run_suspend(state);
-                        self.seat_state.suspend_complete(&self.seat_pending);
+        // Drive the state machine to a stable state. The loop consumes
+        // any counter-event coalesced into the pending flags so a fast VT
+        // flip can't strand us: after a suspend, a coalesced `pending_enable`
+        // resumes; after a resume, a coalesced `pending_disable` re-suspends
+        // (the no-blink boundary, via `resume_complete`). A pending flag is
+        // only ever set by a real libseat callback, so the session has
+        // genuinely toggled and DRM master is in the expected state when we
+        // act on it.
+        let mut action = self.seat_state.on_event(&mut self.seat_pending, ev);
+        loop {
+            match action {
+                SeatAction::BeginSuspend => {
+                    self.run_suspend(state);
+                    self.seat_state.suspend_complete(&self.seat_pending);
+                    if self.seat_pending.pending_enable {
+                        self.seat_pending.pending_enable = false;
+                        // Re-drive through the state machine so it
+                        // transitions Suspended → Resuming (and returns
+                        // BeginResume) — resume_complete asserts Resuming.
+                        action = self
+                            .seat_state
+                            .on_event(&mut self.seat_pending, SeatEventKind::Enable);
+                        continue;
                     }
-                    _ => {
-                        // Committed Active: scanout gate is open —
-                        // post a full-damage repaint on all outputs.
-                        self.scene.wake_for_damage();
-                    }
+                    break;
                 }
-            }
-            SeatAction::Nothing => {
-                log::debug!(
-                    "kms: seat event {:?} ignored in state {:?}",
-                    ev,
-                    self.seat_state
-                );
+                SeatAction::BeginResume => {
+                    self.run_resume(state);
+                    // `resume_complete` returns `BeginSuspend` (consuming
+                    // `pending_disable`) for the no-blink boundary, else
+                    // commits `Active`.
+                    action = self.seat_state.resume_complete(&mut self.seat_pending);
+                    if matches!(action, SeatAction::BeginSuspend) {
+                        continue;
+                    }
+                    // Committed Active: scanout gate is open — post a
+                    // full-damage repaint on all outputs.
+                    self.scene.wake_for_damage();
+                    break;
+                }
+                SeatAction::Nothing => {
+                    log::debug!(
+                        "kms: seat event {:?} ignored in state {:?}",
+                        ev,
+                        self.seat_state
+                    );
+                    break;
+                }
             }
         }
     }
@@ -17384,6 +17419,38 @@ mod tests {
         assert!(
             !b.seat_pending.pending_disable,
             "pending_disable must be cleared after resume_complete consumed it"
+        );
+    }
+
+    /// A coalesced `pending_enable` (an Enable that arrived during the
+    /// suspend sequence) must be consumed by the drive loop and resume the
+    /// session, not strand it in `Suspended`. Regression test for the
+    /// final-review finding that `pending_enable` was set but never acted
+    /// on. We pre-seed `pending_enable` (the synchronous stub can't
+    /// interleave a real Enable mid-suspend) and drive a Disable; the loop
+    /// must run suspend, then consume the flag and resume to `Active`.
+    #[test]
+    fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended() {
+        use crate::seat::state::{SeatPending, SeatState};
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        b.seat_pending = SeatPending {
+            pending_enable: true,
+            pending_disable: false,
+        };
+
+        b.inject_seat_event_for_test(&mut state, false);
+
+        assert_eq!(
+            b.seat_state,
+            SeatState::Active,
+            "a coalesced pending_enable must drive a resume after suspend, not strand in Suspended"
+        );
+        assert!(
+            !b.seat_pending.pending_enable,
+            "pending_enable must be cleared once the consume-loop acts on it"
         );
     }
 
