@@ -4354,6 +4354,12 @@ fn handle_mit_shm_put_image(
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     use yserver_protocol::x11::mit_shm as shm;
+    // MIT-SHM PutImage perf-cliff diagnostic (2026-05-28 cinnamon
+    // telemetry: single op130 calls at 100-128ms blocking the core
+    // loop for ~6-8 vsync intervals). Section-time so we can pin
+    // which step dominates. Threshold-gated at exit; steady-state
+    // healthy calls (sub-100µs) stay silent.
+    let t_entry = std::time::Instant::now();
     debug!(
         "client {} #{} MIT-SHM::PutImage drawable=0x{:x} {}x{} d{}",
         client_id.0, sequence.0, req.drawable, req.src_width, req.src_height, req.depth
@@ -4364,42 +4370,43 @@ fn handle_mit_shm_put_image(
     let Some(target) = target else {
         return Ok(RequestOutcome::Handled);
     };
-    let snapshot: Vec<u8> = {
-        let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                req.shmseg,
-                u16::from(shm::PUT_IMAGE),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        };
-        let Some(extracted) = extract_shm_zpixmap_region(
-            segment.as_slice(),
-            req.offset,
-            req.total_width,
-            req.total_height,
-            req.src_x,
-            req.src_y,
-            req.src_width,
-            req.src_height,
-            req.depth,
-        ) else {
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_VALUE,
-                req.offset,
-                u16::from(shm::PUT_IMAGE),
-                MIT_SHM_MAJOR_OPCODE,
-            );
-        };
-        extracted
+    let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.shmseg,
+            u16::from(shm::PUT_IMAGE),
+            MIT_SHM_MAJOR_OPCODE,
+        );
     };
+    let Some(snapshot) = extract_shm_zpixmap_region(
+        segment.as_slice(),
+        req.offset,
+        req.total_width,
+        req.total_height,
+        req.src_x,
+        req.src_y,
+        req.src_width,
+        req.src_height,
+        req.depth,
+    ) else {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.offset,
+            u16::from(shm::PUT_IMAGE),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    };
+    let t_after_extract = t_entry.elapsed();
+    let snapshot_borrowed = matches!(snapshot, std::borrow::Cow::Borrowed(_));
+    let snapshot_bytes = snapshot.len();
     backend.clear_clip_rectangles(origin)?;
+    let t_after_clear_clip = t_entry.elapsed();
     backend.put_image(
         origin,
         target.host_xid(),
@@ -4410,6 +4417,7 @@ fn handle_mit_shm_put_image(
         req.dst_y,
         &snapshot,
     )?;
+    let t_after_put_image = t_entry.elapsed();
     let _dropped = accumulate_damage_to_state(
         state,
         ResourceId(req.drawable),
@@ -4439,6 +4447,32 @@ fn handle_mit_shm_put_image(
                 req.offset,
             );
         });
+    }
+    let total = t_entry.elapsed();
+    // 5ms threshold matches the suspected cliff territory; healthy
+    // PutImage steady-state is sub-100µs per call so threshold-
+    // gating keeps the log quiet.
+    if total >= std::time::Duration::from_millis(5) {
+        log::info!(
+            "MIT-SHM PutImage perf: total={total_us}us \
+             [extract={ext_us}us clear_clip+={cc_us}us put_image+={pi_us}us] \
+             {w}x{h} depth={depth} bytes={bytes} borrowed={borrowed} \
+             drawable=0x{drawable:x}",
+            total_us = total.as_micros(),
+            ext_us = t_after_extract.as_micros(),
+            cc_us = t_after_clear_clip
+                .saturating_sub(t_after_extract)
+                .as_micros(),
+            pi_us = t_after_put_image
+                .saturating_sub(t_after_clear_clip)
+                .as_micros(),
+            w = req.src_width,
+            h = req.src_height,
+            depth = req.depth,
+            bytes = snapshot_bytes,
+            borrowed = snapshot_borrowed,
+            drawable = req.drawable,
+        );
     }
     Ok(RequestOutcome::Handled)
 }
@@ -10388,7 +10422,7 @@ fn extract_shm_zpixmap_region(
     src_width: u16,
     src_height: u16,
     depth: u8,
-) -> Option<Vec<u8>> {
+) -> Option<std::borrow::Cow<'_, [u8]>> {
     if src_x < 0 || src_y < 0 {
         return None;
     }
@@ -10436,6 +10470,29 @@ fn extract_shm_zpixmap_region(
         return None;
     }
 
+    // Fast path: full-frame extract (src origin = (0,0), src dims = total
+    // dims) AND no trailing per-row pad gap (`row_bytes == src_stride ==
+    // total_stride`). The wanted bytes are contiguous in the SHM segment
+    // starting at `offset` — borrow directly instead of per-row memcpy
+    // into a fresh Vec. 2026-05-28 cinnamon telemetry showed 28MB full-
+    // frame extracts at ~8-10ms each; this fast path drops them to a
+    // bounds-check + slice. The slow per-row path stays for partial
+    // regions (src offset != 0 or src dims != total dims) and for depths
+    // where `row_bytes < src_stride` (padding fills required).
+    if src_x == 0
+        && src_y == 0
+        && src_width == total_width
+        && src_height == total_height
+        && row_bytes == src_stride
+    {
+        let total_bytes = src_stride.checked_mul(usize::from(src_height))?;
+        let end = base.checked_add(total_bytes)?;
+        if end > bytes.len() {
+            return None;
+        }
+        return Some(std::borrow::Cow::Borrowed(&bytes[base..end]));
+    }
+
     let mut out = Vec::with_capacity(src_stride.checked_mul(usize::from(src_height))?);
     for r in 0..usize::from(src_height) {
         let row_y = (src_y as usize).checked_add(r)?;
@@ -10455,7 +10512,7 @@ fn extract_shm_zpixmap_region(
             out.resize(out.len() + (src_stride - row_bytes), 0);
         }
     }
-    Some(out)
+    Some(std::borrow::Cow::Owned(out))
 }
 
 fn handle_image_text8(
@@ -16239,6 +16296,83 @@ mod tests {
         let out = extract_shm_zpixmap_region(&bytes, 0, 4, 4, 0, 0, 4, 4, 32)
             .expect("tight extraction succeeds");
         assert_eq!(out, bytes);
+    }
+
+    /// 2026-05-28 perf-cliff fix: full-frame extracts MUST return
+    /// `Cow::Borrowed` (no allocation, no memcpy). On cinnamon the
+    /// hot-path PutImage of the 28MB compositor stage was spending
+    /// 8-10ms in the legacy per-row Vec::extend_from_slice loop.
+    /// Borrowing the SHM slice directly drops it to a bounds-check.
+    /// Tested both depth=24 and depth=32 at the boundary (full frame,
+    /// no offset, row_bytes == src_stride) and against a partial /
+    /// padded case that MUST still allocate.
+    #[test]
+    fn extract_full_frame_d32_returns_borrowed_slice() {
+        // 8×4 full-frame extract, depth 32 → row_bytes == src_stride.
+        let mut bytes = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..8u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, x ^ y, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 8, 4, 0, 0, 8, 4, 32)
+            .expect("full-frame d32 extraction succeeds");
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "full-frame extract must zero-copy (Cow::Borrowed)",
+        );
+        assert_eq!(out.as_ref(), bytes.as_slice());
+    }
+
+    #[test]
+    fn extract_full_frame_d24_returns_borrowed_slice() {
+        // 8×4 full-frame, depth 24 (4 bytes per pixel — same as d32).
+        let mut bytes = Vec::new();
+        for y in 0..4u8 {
+            for x in 0..8u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, x ^ y, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 8, 4, 0, 0, 8, 4, 24)
+            .expect("full-frame d24 extraction succeeds");
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "full-frame d24 extract must zero-copy (Cow::Borrowed)",
+        );
+        assert_eq!(out.as_ref(), bytes.as_slice());
+    }
+
+    #[test]
+    fn extract_partial_region_returns_owned_vec() {
+        // Same data but ask for a sub-region — the borrow fast path
+        // MUST NOT trigger.
+        let mut bytes = Vec::new();
+        for y in 0..8u8 {
+            for x in 0..8u8 {
+                bytes.extend_from_slice(&d32_pixel(x, y, 0, 0xFF));
+            }
+        }
+        let out = extract_shm_zpixmap_region(&bytes, 0, 8, 8, 2, 2, 4, 4, 32)
+            .expect("partial extraction succeeds");
+        assert!(
+            matches!(out, std::borrow::Cow::Owned(_)),
+            "partial extract must allocate (Cow::Owned)",
+        );
+    }
+
+    #[test]
+    fn extract_d8_padded_full_frame_does_not_borrow() {
+        // Depth-8 with src_width=5 → src_stride=8 (pad-to-32-bit).
+        // row_bytes (5) < src_stride (8) — the borrow fast path's
+        // `row_bytes == src_stride` precondition excludes this so
+        // the slow padding path runs.
+        let bytes: Vec<u8> = (0..16).map(|i| i as u8).collect();
+        let out = extract_shm_zpixmap_region(&bytes, 0, 5, 2, 0, 0, 5, 2, 8)
+            .expect("padded d8 extraction succeeds");
+        assert!(
+            matches!(out, std::borrow::Cow::Owned(_)),
+            "padded full-frame d8 must NOT borrow (per-row padding required)",
+        );
     }
 
     #[test]
