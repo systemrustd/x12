@@ -59,6 +59,40 @@ pub fn pointer_event_fanout_to_state(
     // the sprite position in device state.
     state.pointer_root = (event.root_x, event.root_y);
 
+    // Sync-passive-grab freeze queue (Xorg `dix/events.c:1320`
+    // ComputeFreezes + PlayReleasedEvents). While a sync passive
+    // grab is frozen — between the activating press and
+    // AllowEvents — subsequent pointer events MUST NOT leak to
+    // the natural target. Marco does ~10 round-trips of focus and
+    // property work between the press and AllowEvents(ReplayPointer);
+    // a fast user release in that window would otherwise reach the
+    // app before the replayed press, malforming the gesture
+    // (menus + titlebar drags break). Queue them here for replay.
+    //
+    // Crossings (Enter/Leave) and the replay path itself bypass —
+    // crossings are pointer-tracking notifications Xorg doesn't
+    // queue, and the replay re-entry mustn't recursively re-queue.
+    if !is_replay
+        && handle_grabs
+        && state.pointer_grab_is_passive
+        && state.frozen_pointer_event.is_some()
+        && !matches!(
+            event.kind,
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify,
+        )
+    {
+        log::trace!(
+            "pointer_fanout: QUEUE-WHILE-FROZEN kind={:?} button={} root=({},{}) queue_len={}",
+            event.kind,
+            event.detail,
+            event.root_x,
+            event.root_y,
+            state.frozen_pointer_queue.len() + 1,
+        );
+        state.frozen_pointer_queue.push_back(event);
+        return dropped;
+    }
+
     if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
@@ -111,9 +145,23 @@ pub fn pointer_event_fanout_to_state(
         // crosses into the popup, at which point natural
         // Enter/Leave fire and GTK3 transitions menu state. With
         // `owner_events=false`, all events report against grab_window.
-        let target_is_within_grab_window =
-            target == grab_window || state.resources.is_descendant_of(target, grab_window);
-        let redirect_to_grab = !owner_events || !target_is_within_grab_window;
+        // Step-2 active-grab redirect — `owner_events=true` semantics
+        // per X11 spec: deliver normally if the natural target's
+        // window is OWNED BY the grab client, in addition to the
+        // topological "within grab subtree" case. The earlier check
+        // used pure topology, which worked for Cinnamon's muffin
+        // (grab window = the same window the menu sub-widgets are
+        // descendants of) but failed on MATE's mate-panel pattern
+        // where menu items are SEPARATE TOP-LEVEL override-redirect
+        // windows OWNED BY mate-panel — siblings of the panel main
+        // window, not descendants. Pre-fix this redirected hover
+        // motion to the panel main window with grab-relative coords,
+        // GTK couldn't localise the hover, submenus stopped opening.
+        // No-op when owner_events=false (Cinnamon's pattern).
+        let target_qualifies_for_natural = target == grab_window
+            || state.resources.is_descendant_of(target, grab_window)
+            || state.resources.window_owner(target) == Some(grab_client);
+        let redirect_to_grab = !owner_events || !target_qualifies_for_natural;
         if !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
@@ -183,11 +231,16 @@ pub fn pointer_event_fanout_to_state(
             grab.pointer_mode,
         );
         // Activate the passive grab atomically with the dispatch.
-        let target_is_within_grab_window = hit_window == grab.grab_window
+        // `owner_events=true` qualifies for natural delivery when hit
+        // is the grab window, a descendant of it, OR owned by the
+        // grab client — see the Step-2 active-grab comment for the
+        // mate-panel regression that drove this ownership-aware check.
+        let target_qualifies_for_natural = hit_window == grab.grab_window
             || state
                 .resources
-                .is_descendant_of(hit_window, grab.grab_window);
-        let redirect_to_grab = !grab.owner_events || !target_is_within_grab_window;
+                .is_descendant_of(hit_window, grab.grab_window)
+            || state.resources.window_owner(hit_window) == Some(grab.owner);
+        let redirect_to_grab = !grab.owner_events || !target_qualifies_for_natural;
         if grab.pointer_mode == 0 {
             state.frozen_pointer_event = Some(event);
         }
@@ -332,9 +385,16 @@ pub fn pointer_event_fanout_to_state(
         )
         && let Some((grab_window, grab_client, gx, gy, owner_events)) = active_grab_target(state)
     {
-        let target_is_within_grab_window =
-            target == grab_window || state.resources.is_descendant_of(target, grab_window);
-        if !owner_events || !target_is_within_grab_window {
+        // Same ownership-aware natural-delivery test as the Step-2
+        // core path: `owner_events=true` keeps motion on whichever
+        // GTK sub-window the cursor is over when that sub-window is
+        // OWNED BY the grab client, even if it's a sibling top-level
+        // (mate-panel menu items) rather than a descendant of the
+        // grab window. No-op when owner_events=false.
+        let target_qualifies_for_natural = target == grab_window
+            || state.resources.is_descendant_of(target, grab_window)
+            || state.resources.window_owner(target) == Some(grab_client);
+        if !owner_events || !target_qualifies_for_natural {
             xi2_targets.clear();
             xi2_targets.push(grab_client);
             nested_id = grab_window;

@@ -230,8 +230,24 @@ pub struct ServerState {
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// True when `pointer_grab` was activated by a passive button grab.
     pub pointer_grab_is_passive: bool,
-    /// Frozen pointer event held by a sync passive grab.
+    /// Frozen pointer event held by a sync passive grab. This is the
+    /// *activating* press that triggered the grab; replayed on
+    /// `AllowEvents(ReplayPointer)` / `XIAllowEvents(ReplayDevice)`.
     pub frozen_pointer_event: Option<crate::host_x11::HostPointerEvent>,
+    /// Pointer events that arrived while a sync passive grab was frozen
+    /// (between the activating press and `AllowEvents`). Mirrors
+    /// Xorg's `syncEvents.pending` (`dix/events.c:1320` —
+    /// `ComputeFreezes` then `PlayReleasedEvents`). Drained in arrival
+    /// order on replay AllowEvents; cleared without delivery on
+    /// async/disconnect.
+    /// Holding these in a queue (instead of delivering through to the
+    /// natural target) is load-bearing for slow-WM cases like MATE's
+    /// marco, which does ~10 round-trips of focus/property work
+    /// between the press and `AllowEvents(ReplayPointer)` — without
+    /// the queue, a fast user release races marco's AllowEvents and
+    /// the app sees Release before the replayed Press, malforming the
+    /// gesture and breaking menus and titlebar drags.
+    pub frozen_pointer_queue: std::collections::VecDeque<crate::host_x11::HostPointerEvent>,
     /// Registered passive key grabs.
     pub key_grabs: Vec<KeyGrab>,
     /// Active keyboard grab (explicit or passive-induced).
@@ -408,6 +424,7 @@ impl ServerState {
             active_pointer_grab: None,
             button_grabs: Vec::new(),
             pointer_grab_is_passive: false,
+            frozen_pointer_queue: std::collections::VecDeque::new(),
             frozen_pointer_event: None,
             key_grabs: Vec::new(),
             active_keyboard_grab: None,
@@ -1356,6 +1373,7 @@ fn pointer_event_fanout_inner(
         s.pointer_grab = None;
         s.pointer_grab_is_passive = false;
         s.frozen_pointer_event = None;
+        s.frozen_pointer_queue.clear();
     }
 
     // Passive button grab matching for ButtonPress events.

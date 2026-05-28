@@ -250,6 +250,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
+        state.frozen_pointer_queue.clear();
     }
     state
         .selections

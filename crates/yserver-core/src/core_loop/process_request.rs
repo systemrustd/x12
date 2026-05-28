@@ -7829,6 +7829,7 @@ fn handle_xi2_request(
                 state.pointer_grab_is_passive = false;
                 state.active_pointer_grab = None;
                 state.frozen_pointer_event = None;
+                state.frozen_pointer_queue.clear();
             }
             if let Some(grab_window) = grab_window_for_event {
                 let pointer_xy = backend
@@ -7937,6 +7938,13 @@ fn handle_xi2_request(
                     .is_some_and(|(owner, _)| owner == client_id)
             {
                 let frozen = state.frozen_pointer_event.take();
+                // Drain freeze queue alongside the activating press —
+                // see core AllowEvents handler for rationale. On
+                // ReplayDevice the queued events get re-delivered to
+                // natural targets; on AsyncDevice / paired-async the
+                // grab unfreezes without replay and queued events are
+                // dropped (would be stale).
+                let frozen_queue = std::mem::take(&mut state.frozen_pointer_queue);
                 state.pointer_grab = None;
                 state.pointer_grab_is_passive = false;
                 state.active_pointer_grab = None;
@@ -7946,6 +7954,10 @@ fn handle_xi2_request(
                     let xid_map = backend.xid_map().clone();
                     let _dropped =
                         pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+                    for queued in frozen_queue {
+                        let _dropped =
+                            pointer_event_fanout_to_state(state, &xid_map, queued, false, false);
+                    }
                 }
             }
 
@@ -11260,6 +11272,19 @@ fn handle_allow_events(
     } else {
         None
     };
+    // Drain the queued events that arrived during the freeze. On
+    // replay they get re-delivered to natural targets in arrival
+    // order (matching Xorg PlayReleasedEvents); on non-replay
+    // releases (AsyncPointer / SyncPointer) we drop them — the grab
+    // owner already consumed the activating press, and per-event
+    // delivery semantics for "the events you held while frozen"
+    // diverge once the grab unfreezes asynchronously. Holding them
+    // until next press would be worse: stale events accumulate.
+    let frozen_pointer_queue = if pointer_release {
+        std::mem::take(&mut state.frozen_pointer_queue)
+    } else {
+        std::collections::VecDeque::new()
+    };
     if pointer_release && state.pointer_grab_is_passive {
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
@@ -11292,7 +11317,28 @@ fn handle_allow_events(
         // and AllowEvents-replay is rare, so the clone is cheap
         // compared to the wire writes the fanout produces.
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, true);
+        // is_replay=false: deliver BOTH core AND XI2 to the natural
+        // target on replay. Prior to 2026-05-28 this passed
+        // is_replay=true under the comment "XI2 was already
+        // delivered to listeners" — that was wrong. The XI2
+        // freeze-filter at pointer_fanout.rs:309-316 (cinnamon
+        // aea9b0f) restricts XI2 press to the grab owner ONLY
+        // during sync-passive-grab freeze; the natural target
+        // never received XI2 during the freeze. Trace evidence
+        // from MATE on silence (2026-05-28): marco activates
+        // passive grab on the panel, AllowEvents fires, mate-panel
+        // (only XI2 mask, no core mask) saw the queued release
+        // but no press → menu clicks dead. Replay needs is_replay=
+        // false so XI2 fanout actually runs.
+        let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+        // Drain freeze queue in arrival order. Same is_replay=false
+        // rationale: queued events were never delivered to anyone
+        // (my queue check at the top of pointer_event_fanout_to_state
+        // intercepts them before any delivery), so they need full
+        // core + XI2 fanout on replay.
+        for queued in frozen_pointer_queue {
+            let _dropped = pointer_event_fanout_to_state(state, &xid_map, queued, false, false);
+        }
     }
     if keyboard_replay && let Some(event) = frozen_keyboard {
         let _dropped = replay_frozen_key_to_focus(state, event);
@@ -14196,6 +14242,7 @@ fn handle_ungrab_pointer(
     state.pointer_grab_is_passive = false;
     state.active_pointer_grab = None;
     state.frozen_pointer_event = None;
+    state.frozen_pointer_queue.clear();
     if let Some(prev) = prev_grab_window {
         emit_core_grab_deactivation_crossing(
             state,
@@ -18383,6 +18430,348 @@ mod tests {
         assert_eq!(&buf[12..16], &TARGET_WIN.to_le_bytes());
     }
 
+    /// Regression for the MATE submenu-hover bug. mate-panel holds an
+    /// active XI2 grab on its main panel window with `owner_events=true`;
+    /// menu items it pops up are top-level override-redirect windows
+    /// OWNED BY mate-panel (siblings of the grab window, not
+    /// descendants). Pre-fix the active-grab-redirect check used pure
+    /// topology (`target == grab_window || is_descendant_of`),
+    /// which redirected motion on the menu items to the grab window
+    /// with grab-relative coords — GTK couldn't track which menu item
+    /// the cursor was over, hover-delay never fired the submenu.
+    /// The fix adds an ownership-aware path: window owned by the grab
+    /// client qualifies for natural delivery alongside descendants.
+    /// Note: this is a heuristic — the fully spec-correct rule is "the
+    /// event would normally be reported to the grab client" (a mask-
+    /// subscription check). Ownership is a close proxy: clients almost
+    /// always select events on windows they own.
+    #[test]
+    fn active_grab_owner_events_natural_delivery_to_sibling_window_owned_by_grab_client() {
+        use crate::{
+            backend::Backend,
+            core_loop::pointer_fanout::pointer_event_fanout_to_state,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::ActivePointerGrab,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x0010_0070;
+        const SIBLING_WIN: u32 = 0x0010_0071; // top-level, owned by same client, not descendant of grab window
+        const HOST_GRAB_XID: u32 = 0xCAFE_0070;
+        const HOST_SIBLING_XID: u32 = 0xCAFE_0071;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        peer.set_nonblocking(true).expect("nonblocking");
+
+        // Create two top-level windows under root, both owned by the
+        // grab client. They are siblings (both children of root), not
+        // in an ancestor relationship — the exact topology for
+        // mate-panel + popup-menu.
+        for (xid, host_xid) in [(GRAB_WIN, HOST_GRAB_XID), (SIBLING_WIN, HOST_SIBLING_XID)] {
+            state.resources.create_window(
+                ClientId(GRAB_CLIENT_ID),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(xid));
+            Backend::register_top_level(&mut backend, None, ResourceId(xid), host_xid)
+                .expect("register host xid");
+        }
+        // XI2 mask selecting motion on the sibling window (the menu
+        // item the cursor will move over). XI_Motion evtype = 6 →
+        // mask bit 1<<6 = 0x40.
+        state
+            .clients
+            .get_mut(&GRAB_CLIENT_ID)
+            .expect("client")
+            .xi2_masks
+            .insert((ResourceId(SIBLING_WIN), 2), 0x40);
+
+        // Install active grab on GRAB_WIN with owner_events=true.
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: 0,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+        });
+        // Sanity: sibling is NOT a descendant of grab window.
+        assert!(
+            !state
+                .resources
+                .is_descendant_of(ResourceId(SIBLING_WIN), ResourceId(GRAB_WIN))
+        );
+        // And IS owned by the grab client.
+        assert_eq!(
+            state.resources.window_owner(ResourceId(SIBLING_WIN)),
+            Some(ClientId(GRAB_CLIENT_ID)),
+        );
+
+        // Cursor at root_x=50, root_y=50 — landing on SIBLING_WIN.
+        // host_xid = SIBLING's host xid so the v2-style hit-test lands
+        // on the sibling window naturally.
+        let motion = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: HOST_SIBLING_XID,
+            detail: 0,
+            time: 0x1000,
+            root_x: 50,
+            root_y: 50,
+            event_x: 50,
+            event_y: 50,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _ = pointer_event_fanout_to_state(&mut state, &xid_map, motion, true, false);
+
+        // Read whatever landed on the wire. With the ownership-aware
+        // natural-delivery check, the XI2 motion must report against
+        // the sibling window (event=SIBLING_WIN) with sensible coords
+        // (event_x ≈ 50), NOT redirected to the grab window with
+        // grab-relative coords. Pre-fix the event would be on
+        // GRAB_WIN with grab-clamped coords — for this layout
+        // (sibling at the same root origin) the difference might be
+        // subtle in coords but the `event` window XID is the
+        // smoking-gun: GRAB vs SIBLING.
+        let mut buf = [0u8; 256];
+        let n = peer.read(&mut buf).expect("client got at least one event");
+        assert!(n >= 32, "expected at least one event, got {n} bytes");
+        // Scan for a Generic XI2 event (type=35, second byte=major opcode of XInputExtension).
+        // We just need to find the `event` window XID in the body.
+        let mut found_sibling = false;
+        let mut found_grab = false;
+        let mut i = 0;
+        while i + 32 <= n {
+            // Generic event byte 0 is type. XI2 Motion event window
+            // sits at a known offset; rather than parsing the full
+            // event structure, scan for either window XID in the
+            // first 64 bytes of the body. Cheap+robust.
+            let slice = &buf[i..(i + 64).min(n)];
+            if slice.windows(4).any(|w| w == SIBLING_WIN.to_le_bytes()) {
+                found_sibling = true;
+            }
+            if slice.windows(4).any(|w| w == GRAB_WIN.to_le_bytes()) {
+                found_grab = true;
+            }
+            i += 32;
+        }
+        assert!(
+            found_sibling,
+            "XI2 motion must address the sibling window (owner=grab client) under owner_events=true; got buf bytes {:?}",
+            &buf[..n.min(64)],
+        );
+        // The grab window XID may also appear (e.g., in root/sourceid
+        // fields by coincidence) so we don't assert !found_grab — the
+        // load-bearing assertion is that the natural target window
+        // shows up in the body.
+        let _ = found_grab;
+    }
+
+    /// Regression for the MATE menu-click bug: when a release was
+    /// queued during a sync passive grab freeze (because the WM hadn't
+    /// yet called AllowEvents), the replay path MUST drain both the
+    /// frozen press AND the queued release to the natural target — in
+    /// that order. Pre-fix the release leaked through during freeze
+    /// and the press was never replayed (frozen state cleared by the
+    /// rogue release path), so the app saw release-then-nothing.
+    #[test]
+    fn xi_allow_events_replay_device_drains_queued_release_after_press() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const TARGET_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0010_0061;
+        const TARGET_WIN: u32 = 0x0020_0062;
+        const HOST_XID: u32 = 0xCAFE_0010;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut target_peer = install_client(&mut state, TARGET_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer
+            .set_nonblocking(true)
+            .expect("grab peer nonblocking");
+        target_peer
+            .set_nonblocking(true)
+            .expect("target peer nonblocking");
+
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(TARGET_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(TARGET_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(TARGET_WIN));
+        // Target client selects ButtonPress | ButtonRelease.
+        state
+            .clients
+            .get_mut(&TARGET_CLIENT_ID)
+            .expect("target client")
+            .event_masks
+            .insert(ResourceId(TARGET_WIN), 0x0000_000c);
+
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = true;
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x1c33,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        state.frozen_pointer_event = Some(press);
+        // Queue a release that arrived while frozen.
+        let release = HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            time: 0x1c89,
+            ..press
+        };
+        state.frozen_pointer_queue.push_back(release);
+        Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
+            .expect("register host xid");
+
+        // XIAllowEvents ReplayDevice on master pointer (deviceid=2).
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.push(2); // mode = ReplayDevice
+        body.push(0); // pad
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events");
+
+        // Both frozen slots cleared after drain.
+        assert!(state.frozen_pointer_event.is_none());
+        assert!(state.frozen_pointer_queue.is_empty());
+        assert!(state.pointer_grab.is_none());
+
+        // Grab owner must not receive the replayed events (they go to
+        // the natural target).
+        let mut buf = [0u8; 32];
+        let grab_read = grab_peer.read(&mut buf);
+        assert!(
+            matches!(grab_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "grab owner must not receive replay; got {grab_read:?}",
+        );
+
+        // Target must receive BOTH events in order. Read a sequence of
+        // 32-byte core events, expecting Press(type=4) then
+        // Release(type=5). The XI2 fanout would also fire (each event
+        // shipping a GenericEvent), so we read until we've seen one
+        // press and one release.
+        let mut saw_press = false;
+        let mut saw_release = false;
+        let mut press_offset = usize::MAX;
+        let mut release_offset = usize::MAX;
+        let mut total_read = 0usize;
+        // Slurp whatever the wire has — bound the read loop to avoid
+        // hanging if something goes wrong.
+        for iter in 0..8 {
+            let mut chunk = [0u8; 256];
+            match target_peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // Scan 32-byte boundaries for core ButtonPress(4)
+                    // / ButtonRelease(5). GenericEvents (XI2) are
+                    // type=35 and longer; their first byte still
+                    // shows up at a 32-byte offset.
+                    let mut i = 0;
+                    while i + 32 <= n {
+                        let evt_type = chunk[i] & 0x7F;
+                        if evt_type == 4 && !saw_press {
+                            saw_press = true;
+                            press_offset = total_read + i;
+                        } else if evt_type == 5 && !saw_release {
+                            saw_release = true;
+                            release_offset = total_read + i;
+                        }
+                        // GenericEvent is variable-length; advance by 32 conservatively.
+                        i += 32;
+                    }
+                    total_read += n;
+                    if saw_press && saw_release {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("target read failed at iter {iter}: {e}"),
+            }
+        }
+        assert!(saw_press, "target must receive replayed ButtonPress");
+        assert!(saw_release, "target must receive queued ButtonRelease");
+        assert!(
+            press_offset < release_offset,
+            "Press must arrive BEFORE Release at the target (got press@{press_offset}, release@{release_offset})",
+        );
+    }
+
     #[test]
     fn xi_allow_events_replay_device_releases_active_pointer_grab() {
         use crate::{backend::Backend, resources::ROOT_VISUAL, server::ActivePointerGrab};
@@ -18580,7 +18969,16 @@ mod tests {
     }
 
     #[test]
-    fn xi_passive_grab_owner_events_releases_on_button_release() {
+    fn xi_sync_passive_grab_release_during_freeze_queues_for_replay() {
+        // Regression: in a sync passive grab, a ButtonRelease arriving
+        // BEFORE the grab owner sends AllowEvents must NOT clear the
+        // grab nor leak to the natural target — it must queue alongside
+        // the activating press for replay. Pre-fix, the release cleared
+        // `frozen_pointer_event` + `pointer_grab_is_passive`, so when
+        // AllowEvents(ReplayPointer/ReplayDevice) finally arrived there
+        // was nothing to replay. Visible symptom on MATE: marco's slow
+        // ~10 round-trip grab handler vs a fast click → app never sees
+        // the press → menu/titlebar clicks dead.
         use crate::{
             backend::Backend,
             host_x11::{HostPointerEvent, PointerEventKind},
@@ -18620,7 +19018,7 @@ mod tests {
             modifiers: 0,
             owner_events: true,
             event_mask: 0xFFFF_FFFF,
-            pointer_mode: 0,
+            pointer_mode: 0, // Synchronous → triggers freeze
         });
         Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
             .expect("register host xid");
@@ -18642,17 +19040,38 @@ mod tests {
         let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, press, true, false);
         assert!(state.pointer_grab_is_passive);
         assert!(state.frozen_pointer_event.is_some());
+        assert!(state.frozen_pointer_queue.is_empty());
 
+        // Release arrives BEFORE AllowEvents (the load-bearing case).
         let release = HostPointerEvent {
             kind: PointerEventKind::ButtonRelease,
+            time: 0x1280,
             ..press
         };
         let xid_map = backend.xid_map().clone();
         let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, release, true, false);
 
-        assert!(state.pointer_grab.is_none());
-        assert!(!state.pointer_grab_is_passive);
-        assert!(state.frozen_pointer_event.is_none());
+        // Grab MUST still be active (waiting for AllowEvents). Press
+        // is still frozen. Release is in the queue.
+        assert!(
+            state.pointer_grab.is_some(),
+            "grab must remain active while frozen — release waits for AllowEvents",
+        );
+        assert!(state.pointer_grab_is_passive);
+        assert!(state.frozen_pointer_event.is_some());
+        assert_eq!(
+            state.frozen_pointer_queue.len(),
+            1,
+            "release must be queued for replay, not delivered to natural target",
+        );
+        assert_eq!(
+            state
+                .frozen_pointer_queue
+                .front()
+                .map(|e| e.kind)
+                .expect("queued event present"),
+            PointerEventKind::ButtonRelease,
+        );
     }
 
     #[test]
