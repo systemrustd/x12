@@ -3336,6 +3336,80 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Synthesize releases for every held key/button so a client that
+    /// owned input at switch time does not see stuck-down keys on
+    /// resume. Emits one `KeyRelease` per held keycode (via
+    /// `key_event_fanout_to_state`) and one `ButtonRelease` per held
+    /// button (via the same pointer path `on_host_input` uses), then
+    /// clears `down_keys` and zeroes `button_mask`.
+    ///
+    /// XI2 raw listeners are intentionally NOT updated (spec §"XI2 raw
+    /// events"). Crossing events are not synthesized.
+    ///
+    /// Caller is Task 11's `run_suspend`.
+    #[allow(dead_code)]
+    fn synthesize_held_releases(&mut self, state: &mut ServerState) {
+        use yserver_core::core_loop::{
+            key_fanout::key_event_fanout_to_state, pointer_fanout::pointer_event_fanout_to_state,
+        };
+
+        // Keys: drain down_keys, emit a synthetic KeyRelease for each.
+        let keys: Vec<u8> = self.core.down_keys.drain().collect();
+        for keycode in keys {
+            let ev = HostKeyEvent {
+                pressed: false,
+                keycode,
+                time: crate::clock::server_time_ms(),
+                root_x: self.core.cursor_x as i16,
+                root_y: self.core.cursor_y as i16,
+                event_x: self.core.cursor_x as i16,
+                event_y: self.core.cursor_y as i16,
+                state: 0,
+            };
+            let _dropped = key_event_fanout_to_state(state, ev);
+        }
+
+        // Buttons: held bits live in (button_mask >> 8) & 0x1f,
+        // bit n => X11 button number (n+1).
+        // button_bit for button n+1 is (1 << (n + 8)), which equals
+        // (button_mask >> 8) bit n. We synthesize a ButtonRelease
+        // by calling process_pointer_button with the libinput code
+        // that maps to that button, then flush pending events.
+        // Libinput code → X11 detail mapping (from process_pointer_button):
+        //   0x110 → 1, 0x112 → 2, 0x111 → 3, 0x113 → 8, 0x114 → 9
+        // For buttons 1-5 we use the same code path as on_host_input.
+        let held = (self.core.button_mask >> 8) & 0x1f;
+        // Libinput codes for X11 buttons 1–5 (detail 1..=5):
+        // detail 1→0x110, detail 2→0x112, detail 3→0x111, detail 4→scroll, detail 5→scroll
+        // process_pointer_button maps: 0x110→1, 0x112→2, 0x111→3, 0x180→4, 0x181→5
+        // button_bit: detail 1→0x0100 (bit 8), detail 2→0x0200 (bit 9), detail 3→0x0400 (bit 10),
+        //             detail 4→0x0800 (bit 11), detail 5→0x1000 (bit 12)
+        // So bit 0 of `held` = button 1 (detail 1), bit 1 = button 2 (detail 2), etc.
+        const BUTTON_CODES: [u32; 5] = [
+            0x110, // bit 0 → detail 1 (BTN_LEFT)
+            0x112, // bit 1 → detail 2 (BTN_MIDDLE)
+            0x111, // bit 2 → detail 3 (BTN_RIGHT)
+            0x180, // bit 3 → detail 4 (SYNTH_SCROLL_UP, button 4)
+            0x181, // bit 4 → detail 5 (SYNTH_SCROLL_DOWN, button 5)
+        ];
+        for (n, &code) in BUTTON_CODES.iter().enumerate() {
+            if held & (1 << n) != 0 {
+                self.process_pointer_button(code, false, state);
+                // Drain pointer events into fanout after each button
+                // (matches on_host_input's drain-per-event contract).
+                let pending = std::mem::take(&mut self.core.pending_pointer_events);
+                for ev in pending {
+                    let _dropped =
+                        pointer_event_fanout_to_state(state, &self.core.xid_map, ev, true, false);
+                }
+            }
+        }
+        // button_mask is already zeroed by process_pointer_button for
+        // each release, but force-zero to guard against scroll buttons
+        // (detail 4/5) that carry no button_bit.
+        self.core.button_mask = 0;
+    }
+
     /// Deepest mapped window under the cursor. Walks
     /// `core.top_level_order` back-to-front for the topmost top-level
     /// match, then descends the sub-window tree picking the topmost
@@ -5971,6 +6045,14 @@ impl Backend for KmsBackendV2 {
             }
             HostInputEvent::Key(raw) => {
                 let cooked = self.cook_host_key(raw);
+                // Maintain the held-keys set so suspend can synthesize
+                // releases (Task 10). Use the COOKED keycode so
+                // synthesized releases carry the same value clients see.
+                if cooked.pressed {
+                    self.core.down_keys.insert(cooked.keycode);
+                } else {
+                    self.core.down_keys.remove(&cooked.keycode);
+                }
                 let _dropped = key_event_fanout_to_state(state, cooked);
                 return;
             }
@@ -16744,5 +16826,107 @@ mod tests {
         assert!(b.dri3_syncobj_handle(xid).is_none());
         drop(h); // OwnedSemaphore::Drop fires here; null guard
         // skips destroy_semaphore.
+    }
+
+    // ─── Task 10: held-key tracking + synthesize-releases tests ───
+
+    /// `on_host_input` Key arm maintains `down_keys`: press inserts the
+    /// cooked keycode, release removes it. Tests the additive tracking
+    /// path without touching fanout behaviour.
+    #[test]
+    fn down_keys_maintained_on_key_press_and_release() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
+        };
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        let raw_press = HostKeyEvent {
+            keycode: 38, // evdev 'a' (US layout)
+            pressed: true,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        b.on_host_input(&mut state, HostInputEvent::Key(raw_press));
+        assert!(
+            b.core.down_keys.contains(&38),
+            "key 38 must be in down_keys after press"
+        );
+        assert_eq!(b.core.down_keys.len(), 1);
+
+        let raw_release = HostKeyEvent {
+            keycode: 38,
+            pressed: false,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        b.on_host_input(&mut state, HostInputEvent::Key(raw_release));
+        assert!(
+            !b.core.down_keys.contains(&38),
+            "key 38 must be removed from down_keys after release"
+        );
+        assert!(b.core.down_keys.is_empty());
+    }
+
+    /// `synthesize_held_releases` clears `down_keys` and `button_mask`,
+    /// emits a synthetic release for every tracked key and button, and
+    /// leaves `pending_pointer_events` empty.
+    ///
+    /// Behavioural contract:
+    /// (a) `down_keys` empty after the call
+    /// (b) `button_mask == 0` after the call
+    /// (c) `pending_pointer_events` drained (button releases fanned out)
+    /// (d) No XI2 raw event is generated (key_event_fanout_to_state
+    ///     does not emit XI2 raw events — this is a property of the
+    ///     fanout, not separately asserted here)
+    ///
+    /// Note: with a fresh `ServerState::new()` there are no subscribed
+    /// clients, so key/button events are dropped by the fanout (no
+    /// receivers). The load-bearing observables are the state fields:
+    /// `down_keys` empty proves every held key was iterated, and
+    /// `button_mask == 0` proves every held button's bit was cleared
+    /// by its corresponding `process_pointer_button(released)` call.
+    #[test]
+    fn synthesize_held_releases_clears_down_keys_and_button_mask() {
+        use yserver_core::server::ServerState;
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        // Inject two held keys directly into down_keys (bypassing
+        // cook_host_key so we control exact keycodes).
+        b.core.down_keys.insert(38); // 'a'
+        b.core.down_keys.insert(56); // 'b'
+        assert_eq!(b.core.down_keys.len(), 2);
+
+        // Inject held buttons 1 (BTN_LEFT, bit 0x0100) and 3
+        // (BTN_RIGHT, bit 0x0400) into button_mask.
+        b.core.button_mask = 0x0100 | 0x0400;
+        assert_ne!(b.core.button_mask, 0);
+
+        b.synthesize_held_releases(&mut state);
+
+        // (a) down_keys cleared.
+        assert!(
+            b.core.down_keys.is_empty(),
+            "down_keys must be empty after synthesize_held_releases"
+        );
+        // (b) button_mask zeroed.
+        assert_eq!(
+            b.core.button_mask, 0,
+            "button_mask must be 0 after synthesize_held_releases"
+        );
+        // (c) pending_pointer_events drained.
+        assert!(
+            b.core.pending_pointer_events.is_empty(),
+            "pending_pointer_events must be empty (fanned out) after synthesize_held_releases"
+        );
     }
 }

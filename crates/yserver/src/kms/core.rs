@@ -731,6 +731,10 @@ pub(crate) struct KmsCore {
     pub(crate) xkb_context: XkbContext,
     pub(crate) xkb_keymap: XkbKeymap,
     pub(crate) xkb_state: XkbState,
+    /// Cooked X11 keycodes currently pressed. Maintained in the key path
+    /// so suspend can synthesize a release for each (xkbcommon::State
+    /// cannot enumerate down keys).
+    pub(crate) down_keys: HashSet<u8>,
 
     // Font protocol state
     pub(crate) font_loader: FontLoader,
@@ -871,6 +875,7 @@ impl KmsCore {
             xkb_context,
             xkb_keymap,
             xkb_state,
+            down_keys: HashSet::new(),
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
             bg_pixel: None,
@@ -949,6 +954,7 @@ impl KmsCore {
             xkb_context,
             xkb_keymap,
             xkb_state,
+            down_keys: HashSet::new(),
             font_loader: FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
             bg_pixel: None,
