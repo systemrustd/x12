@@ -373,6 +373,79 @@ device.
   logic deterministically).
 - No real-libseat container CI yet (CI is unit + lint).
 
+## HW cursor drag-lag fix (master, 2026-05-29)
+
+After the VT-switch series landed, `55924b1 feat(kms/v2): flip HW cursor
+strategy to default ON` (2026-05-28) made the HW cursor plane the default.
+Symptom on bee/MATE drag: cursor smooth, window content trails badly;
+`yserver-hw-mate.log` showed ~280 EBUSY errors in 4.7s, `frame_present_count/s`
+collapsing to 0 during sustained drag, and `iter_wall_max` 80-93ms (5-6 vsync
+periods per blocked iter).
+
+**Diagnosis** (verified across two machines): cursor-plane atomic commits
+and scanout-plane atomic pageflips on the same CRTC serialize in the
+kernel atomic state machine, and during drag they collide repeatedly.
+The kernel rejects the second with `EBUSY`; the second commit retries on
+the next iter; meanwhile damage accumulates so `damage_fraction → 1.0`
+and compose work grows, widening the contention window — feedback spiral
+that ends with `frame_present_count/s → 0`.
+
+**Failed architectural fix** (`bundle-cursor-atomic` branch, not merged):
+bundle cursor properties into the scanout pageflip atomic so they ride
+the same commit. Worked for drag (verified on yoga: drag → smooth, zero
+EBUSY) but left idle cursor stranded — `scene.tick` is gated on
+`scene_structure_dirty`, so on idle desktop the bundle absorb path
+never fires, cursor only updates at ~5-9 Hz. A per-iter cursor flush in
+`maybe_composite` was tried; produced a fresh EBUSY storm
+(~200 cursor-EBUSYs/sec) because kernel cursor commits are vblank-paced
+and we were spamming them.
+
+The plan went through 4 codex review rounds (`docs/superpowers/plans/2026-05-28-cursor-bundled-atomic.md`)
+and converged on a clean atomic-bundle design — but the design was wrong
+for an X server, regardless of correctness of the implementation.
+
+**The fix that landed** (`0b3fd0c fix(kms/cursor): use legacy ioctls for HW cursor`):
+match Xorg's modesetting driver exactly
+(`hw/xfree86/drivers/modesetting/drmmode_display.c:1797` →
+`drmModeMoveCursor`; `:1812` → `drmModeSetCursor2`). The legacy cursor
+ioctls don't EBUSY-collide with atomic scanout commits on the same CRTC
+because the kernel routes them through a separate path from the atomic
+state machine. Legacy is also **immediate** (not vblank-paced) — perfect
+for cursor responsiveness. ~283 LOC deleted from `cursor_plane.rs`
+(`PerCrtcAtomicState`, `discover_cursor_planes`, `fb` framebuffer,
+imports); `show`/`hide`/`move_to` now have only the legacy path.
+
+Verified on yoga (2026-05-29):
+
+| Metric                       | Original master | bundle (drag fix) | cursor-legacy-ioctl |
+|------------------------------|---|---|---|
+| EBUSY (over ~30s)            | 284 | 362 | **0** |
+| frame_present_count/s        | 0–37 (collapses) | 7–26 | **43–60 sustained** |
+| missed_pageflips/s           | 5–10 | 4–9 | **0** |
+| iter_wall_max                | 80–93ms | 26–99ms | 15–22ms |
+| Log WARN lines               | 280+ | 90+ | **3** |
+
+Bundle work preserved as the `bundle-cursor-atomic` branch on origin —
+documents the architectural exploration we abandoned, retained as
+reference for any future pure-atomic context (e.g. kernel/driver that
+deprecates legacy cursor).
+
+**Process lesson — when designing a new KMS architecture change,
+check Xorg's modesetting driver first.** Memory rule "Xorg is the de
+facto spec" applies at the *design* stage, not just at the diagnosis
+stage. The codex plan-review loop verified correctness against the spec
+but never asked "is the whole architectural approach right for an X
+server?" — that question belongs upstream of plan-writing.
+
+**Open follow-up — MATE drag still slightly choppy on yoga.** MATE/Marco
+fires ~7000 RENDER (op133) calls/sec totaling ~18.8s of CPU over a 40s
+run, with at least one 27.86ms single-call outlier (a dropped frame).
+This is a separate problem from cursor — Marco's compositor + Caja
+RENDER traffic. Not addressed by this work. A diagnostic perf-log
+attribution inside the RENDER dispatcher (mirroring `c4093fa`'s
+MIT-SHM perf log) would identify the heavy subop before any
+optimization attempt.
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
