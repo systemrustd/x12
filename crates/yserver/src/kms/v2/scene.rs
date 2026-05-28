@@ -204,6 +204,40 @@ pub(crate) enum CursorPlaneMode {
     Sw,
 }
 
+/// Pure classifier driving the steady-state cursor-mode decision —
+/// extracted from `SceneCompositor::cursor_mode` so the dual-output
+/// case (and any future N-output topology) can be unit-tested with
+/// synthetic mode arrays. Callers MUST short-circuit Mixed for
+/// pending transitions BEFORE invoking this helper; this fn only
+/// looks at last-frame modes.
+///
+/// Classification rules (load-bearing — see scene.rs:686 docstring):
+/// - `Hidden` outputs are NEUTRAL (cursor isn't on them, the
+///   per-CRTC visible check in `cursor_plane_move` skips them).
+/// - `Hw` outputs vote for the fast path.
+/// - `Sw` outputs need scene-compose updates for cursor position
+///   (the sprite is part of the compose draw list).
+/// - Any mix of `Hw` and `Sw` is `Mixed` so the SW cursor doesn't
+///   desync from the eventual plane bind during a transition.
+fn classify_cursor_mode_from_per_output(
+    modes: impl IntoIterator<Item = OutputCursorMode>,
+) -> CursorPlaneMode {
+    let mut any_hw = false;
+    let mut any_sw_like = false;
+    for m in modes {
+        match m {
+            OutputCursorMode::Hw => any_hw = true,
+            OutputCursorMode::Sw { .. } => any_sw_like = true,
+            OutputCursorMode::Hidden => {}
+        }
+    }
+    match (any_hw, any_sw_like) {
+        (true, false) => CursorPlaneMode::Hw,
+        (false, _) => CursorPlaneMode::Sw,
+        (true, true) => CursorPlaneMode::Mixed,
+    }
+}
+
 struct FailedSubmitBo {
     bo_idx: usize,
     pool_slot: usize,
@@ -687,8 +721,6 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };
-        let mut any_hw = false;
-        let mut any_sw_like = false;
         for output in &inner.outputs {
             // Any pending transition on any output forces Mixed —
             // the fast path must not move the plane until every
@@ -700,16 +732,8 @@ impl SceneCompositor {
             {
                 return CursorPlaneMode::Mixed;
             }
-            match output.last_frame_cursor_mode {
-                OutputCursorMode::Hw => any_hw = true,
-                OutputCursorMode::Sw { .. } | OutputCursorMode::Hidden => any_sw_like = true,
-            }
         }
-        match (any_hw, any_sw_like) {
-            (true, false) => CursorPlaneMode::Hw,
-            (false, _) => CursorPlaneMode::Sw,
-            (true, true) => CursorPlaneMode::Mixed,
-        }
+        classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
     }
 
     /// Stage 5 Phase D — steady-state HW sprite-change path. Called
@@ -2811,6 +2835,69 @@ mod tests {
         // Sw → Sw with HW NOT active — no transition.
         let (trans, _, _) = derive_cursor_transition(prev, CursorAssignment::Sw { pos: (10, 10) });
         assert!(trans.is_none());
+    }
+
+    /// Dual-output regression: cursor on monitor 1 only (output 0 =
+    /// Hw, output 1 = Hidden) MUST classify as `Hw`, not `Mixed`.
+    /// Pre-fix this returned Mixed and routed every motion event
+    /// through scene.wake_for_damage — the HW cursor never moved on
+    /// silence.
+    #[test]
+    fn classify_cursor_mode_dual_output_cursor_on_one_monitor_is_hw() {
+        let modes = [OutputCursorMode::Hw, OutputCursorMode::Hidden];
+        assert_eq!(
+            classify_cursor_mode_from_per_output(modes),
+            CursorPlaneMode::Hw,
+        );
+        // Order shouldn't matter.
+        let modes = [OutputCursorMode::Hidden, OutputCursorMode::Hw];
+        assert_eq!(
+            classify_cursor_mode_from_per_output(modes),
+            CursorPlaneMode::Hw,
+        );
+    }
+
+    /// Single-output Hw is Hw; single-output Hidden is Sw (degenerate
+    /// — no Hw plane active, scene wake is what'd update a future SW
+    /// cursor draw).
+    #[test]
+    fn classify_cursor_mode_single_output_cases() {
+        assert_eq!(
+            classify_cursor_mode_from_per_output([OutputCursorMode::Hw]),
+            CursorPlaneMode::Hw,
+        );
+        assert_eq!(
+            classify_cursor_mode_from_per_output([OutputCursorMode::Hidden]),
+            CursorPlaneMode::Sw,
+        );
+        assert_eq!(
+            classify_cursor_mode_from_per_output([OutputCursorMode::Sw { prev: None }]),
+            CursorPlaneMode::Sw,
+        );
+    }
+
+    /// Hw + Sw on different outputs IS Mixed (one output's SW sprite
+    /// is in the compose draw list; the other's plane is bound). The
+    /// fast path must defer until the SW output transitions out, or
+    /// the plane could desync from the SW sprite position.
+    #[test]
+    fn classify_cursor_mode_hw_and_sw_is_mixed() {
+        let modes = [OutputCursorMode::Hw, OutputCursorMode::Sw { prev: None }];
+        assert_eq!(
+            classify_cursor_mode_from_per_output(modes),
+            CursorPlaneMode::Mixed,
+        );
+    }
+
+    /// Empty input degenerates to Sw (no outputs = no Hw plane to
+    /// drive; the fast path has nothing to optimise anyway).
+    #[test]
+    fn classify_cursor_mode_no_outputs_is_sw() {
+        let empty: [OutputCursorMode; 0] = [];
+        assert_eq!(
+            classify_cursor_mode_from_per_output(empty),
+            CursorPlaneMode::Sw,
+        );
     }
 
     /// `cursor_mode()` returns `Mixed` while any output's PendingAck

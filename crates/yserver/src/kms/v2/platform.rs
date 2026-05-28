@@ -526,6 +526,14 @@ pub(crate) struct PlatformBackend {
     /// fixture. The shared dumb buffer + per-CRTC visibility map
     /// live inside `CursorPlane` itself.
     pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
+    /// Latest root-space cursor position that the kernel rejected with
+    /// `EBUSY` on at least one CRTC. Re-issued at the next page-flip
+    /// completion (`cursor_plane_drain_pending_move`). Single slot,
+    /// latest-wins — new motion events overwrite stale pending entries
+    /// since X11 motion semantics are "where the cursor IS", not "by
+    /// how much it moved". Cleared on full commit success or on
+    /// `cursor_plane_hide_all` (VT-leave).
+    cursor_pending_move: Option<(i32, i32)>,
 }
 
 impl PlatformBackend {
@@ -725,6 +733,7 @@ impl PlatformBackend {
             renderer_failed: false,
             shutting_down: false,
             cursor_plane,
+            cursor_pending_move: None,
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
@@ -802,6 +811,7 @@ impl PlatformBackend {
             renderer_failed: false,
             shutting_down: false,
             cursor_plane: None,
+            cursor_pending_move: None,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
@@ -947,14 +957,66 @@ impl PlatformBackend {
         Ok(())
     }
 
-    /// `drmModeMoveCursor` per visible CRTC. Hidden CRTCs are
+    /// Atomic cursor move per visible CRTC. Hidden CRTCs are
     /// skipped — the kernel naturally clips off-output coords on
     /// the visible ones, so no per-output geometry test is needed
     /// beyond the visibility filter.
     ///
+    /// Returns the number of per-CRTC commits that the kernel
+    /// rejected with `EBUSY` (cursor commit lost to a pending
+    /// primary-plane commit on the same CRTC — the move's effect
+    /// is dropped, the caller's telemetry counts it). Other
+    /// errors are logged per-CRTC and not counted.
+    ///
     /// # Errors
-    /// Logged per-CRTC; `Err` only when the plane is unavailable.
-    pub(crate) fn cursor_plane_move(&mut self, x: i32, y: i32) -> io::Result<()> {
+    /// `Err` only when the plane is unavailable; per-CRTC ioctl
+    /// failures are logged + counted (EBUSY) or logged (other).
+    pub(crate) fn cursor_plane_move(&mut self, x: i32, y: i32) -> io::Result<u32> {
+        let ebusy_count = self.try_cursor_plane_move_inner(x, y)?;
+        // Latest-wins pending slot: if any CRTC EBUSY'd, queue THIS
+        // position for retry on the next page-flip-complete. Drop any
+        // stale pending — a fresh motion event invalidates older
+        // positions (X11 motion is about "where you are", not "what
+        // path you took"). On full success, clear pending so we don't
+        // re-issue a position the kernel already accepted.
+        if ebusy_count > 0 {
+            self.cursor_pending_move = Some((x, y));
+        } else {
+            self.cursor_pending_move = None;
+        }
+        Ok(ebusy_count)
+    }
+
+    /// Retry the most recent pending cursor move, if any. Called from
+    /// the backend's page-flip-complete handler — the just-retired
+    /// flip means the primary atomic-commit queue freed up for this
+    /// CRTC, so the cursor commit that lost the race a few ms ago has
+    /// a fresh window to land. Latest-wins: only the most recent
+    /// position is retried, intermediate motions are discarded.
+    ///
+    /// Returns the EBUSY count from this retry (typically 0 if the
+    /// commit landed; >0 means the cursor commit raced another
+    /// pending primary commit and stays queued for the next page-flip
+    /// retire).
+    ///
+    /// # Errors
+    /// `Err` only when the plane is unavailable.
+    pub(crate) fn cursor_plane_drain_pending_move(&mut self) -> io::Result<u32> {
+        let Some((x, y)) = self.cursor_pending_move else {
+            return Ok(0);
+        };
+        let ebusy_count = self.try_cursor_plane_move_inner(x, y)?;
+        if ebusy_count == 0 {
+            self.cursor_pending_move = None;
+        }
+        Ok(ebusy_count)
+    }
+
+    /// Internal helper: per-CRTC `move_to` iteration that returns the
+    /// number of CRTCs whose atomic commit returned `EBUSY`. Shared by
+    /// `cursor_plane_move` (first-attempt path) and
+    /// `cursor_plane_drain_pending_move` (retry path).
+    fn try_cursor_plane_move_inner(&mut self, x: i32, y: i32) -> io::Result<u32> {
         // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
@@ -964,6 +1026,7 @@ impl PlatformBackend {
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
         };
+        let mut ebusy_count: u32 = 0;
         for (crtc, layout_x, layout_y) in layouts {
             if !plane.is_visible_on(crtc) {
                 continue;
@@ -971,10 +1034,14 @@ impl PlatformBackend {
             let cx = x - layout_x;
             let cy = y - layout_y;
             if let Err(e) = plane.move_to(crtc, cx, cy) {
-                log::warn!("v2 cursor move on {crtc:?} failed: {e}");
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    ebusy_count = ebusy_count.saturating_add(1);
+                } else {
+                    log::warn!("v2 cursor move on {crtc:?} failed: {e}");
+                }
             }
         }
-        Ok(())
+        Ok(ebusy_count)
     }
 
     /// Detach the plane on a single CRTC. Output-local recovery
@@ -1005,6 +1072,11 @@ impl PlatformBackend {
     /// Per-CRTC failures are logged; this never returns `Err`
     /// unless the plane is unavailable.
     pub(crate) fn cursor_plane_hide_all(&mut self) -> io::Result<()> {
+        // VT-leave / shutdown / DRM-master-loss: any pending retry is
+        // pointless once the plane is hidden everywhere (we don't own
+        // the device anymore). Clearing before the per-CRTC hide so a
+        // hide-failure mid-loop still leaves no stale pending.
+        self.cursor_pending_move = None;
         // Union of currently-tracked CRTCs and current output CRTCs.
         // Output disable could have removed a CRTC from `outputs`
         // while a stale visibility entry survives; iterate both.
@@ -2131,6 +2203,55 @@ mod tests {
     fn for_tests_scanout_acquire_returns_none() {
         let mut p = PlatformBackend::for_tests();
         assert!(p.acquire_scanout_bo(0).is_none());
+    }
+
+    /// Pending-move slot is None on a fresh backend and stays None
+    /// when the cursor plane is unavailable (the for_tests fixture
+    /// has no real DRM device, so `cursor_plane_move` returns Err
+    /// and never touches the slot).
+    #[test]
+    fn cursor_pending_move_starts_empty_and_unavailable_path_does_not_set_it() {
+        let mut p = PlatformBackend::for_tests();
+        assert_eq!(p.cursor_pending_move, None);
+        // Unavailable plane → Err return → pending stays None.
+        assert!(p.cursor_plane_move(100, 200).is_err());
+        assert_eq!(p.cursor_pending_move, None);
+        // Drain on empty slot is Ok(0) (early-exit before any
+        // plane access). The path that returns Err is only the
+        // populated-slot retry that hits the unavailable plane —
+        // tested separately in `cursor_pending_move_is_latest_wins`.
+        assert_eq!(p.cursor_plane_drain_pending_move().ok(), Some(0));
+        assert_eq!(p.cursor_pending_move, None);
+    }
+
+    /// Hide-all clears any pending move (VT-leave invariant).
+    #[test]
+    fn cursor_plane_hide_all_clears_pending_move() {
+        let mut p = PlatformBackend::for_tests();
+        p.cursor_pending_move = Some((123, 456));
+        // hide_all returns Err on the unavailable fixture, but the
+        // pending-clear MUST happen before the early-return so a
+        // hide-failure mid-recovery leaves no stale pending.
+        let _ = p.cursor_plane_hide_all();
+        assert_eq!(p.cursor_pending_move, None);
+    }
+
+    /// Latest-wins: explicitly setting pending then overwriting
+    /// reflects the latest position. This is the same in-place mutation
+    /// that `cursor_plane_move` does internally on EBUSY — by exercising
+    /// it directly (since we can't drive a real EBUSY without a kernel),
+    /// we lock in the "old pending is discarded" invariant.
+    #[test]
+    fn cursor_pending_move_is_latest_wins() {
+        let mut p = PlatformBackend::for_tests();
+        p.cursor_pending_move = Some((100, 100));
+        p.cursor_pending_move = Some((200, 250));
+        assert_eq!(p.cursor_pending_move, Some((200, 250)));
+        // Drain consumes; on the unavailable fixture this errors but
+        // the test's invariant is the slot mechanics, not the drain.
+        let _ = p.cursor_plane_drain_pending_move();
+        // Slot still holds because drain Err'd before clearing.
+        assert_eq!(p.cursor_pending_move, Some((200, 250)));
     }
 
     /// `invalidate_bo` on a missing entry is a no-op (doesn't

@@ -159,6 +159,16 @@ pub struct Bucket {
     /// High-water mark of active scratch image bytes across
     /// submitted + parked ops, sampled each tick.
     pub(crate) active_scratch_bytes_high_water: u64,
+    /// Number of per-CRTC `cursor_plane.move_to` atomic commits
+    /// that returned `EBUSY` (kernel rejected the cursor move
+    /// because a primary-plane commit is pending on the same
+    /// CRTC). Bumped once per per-CRTC EBUSY, so a single
+    /// motion event on a dual-output system can contribute 2.
+    /// Lifetime tells the cumulative count; the per-second
+    /// bucket value (printed in the summary line) tells the
+    /// current contention rate. Hypothesised to be the cause of
+    /// HW-cursor jerkiness on AMD under heavy compositing.
+    pub cursor_move_ebusy: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
@@ -308,7 +318,8 @@ impl Telemetry {
              submit_group_flush_reason_frame_builder/s={} \
              active_descriptor_pool_count_high_water={} \
              active_staging_bytes_high_water={} \
-             active_scratch_bytes_high_water={}",
+             active_scratch_bytes_high_water={} \
+             cursor_move_ebusy/s={} cursor_move_ebusy(lifetime)={}",
             b.paint_submits,
             b.composite_submits,
             b.one_shot_submits,
@@ -347,6 +358,8 @@ impl Telemetry {
             self.lifetime.active_descriptor_pool_count_high_water,
             self.lifetime.active_staging_bytes_high_water,
             self.lifetime.active_scratch_bytes_high_water,
+            b.cursor_move_ebusy,
+            self.lifetime.cursor_move_ebusy,
         );
         #[allow(clippy::cast_precision_loss)]
         let fb_ops_avg =
@@ -807,6 +820,17 @@ impl Telemetry {
         }
     }
 
+    /// Per-CRTC cursor-plane atomic move that returned `EBUSY`
+    /// (kernel rejected the cursor commit because a primary-plane
+    /// commit is pending on the same CRTC). `n` is the number of
+    /// CRTCs that EBUSY'd in this one `cursor_plane_move` call —
+    /// 0 means everything committed cleanly, >0 means the cursor
+    /// position was lost on that many CRTCs.
+    pub(crate) fn record_cursor_move_ebusy(&mut self, n: u64) {
+        self.bucket.cursor_move_ebusy = self.bucket.cursor_move_ebusy.saturating_add(n);
+        self.lifetime.cursor_move_ebusy = self.lifetime.cursor_move_ebusy.saturating_add(n);
+    }
+
     /// Stage 5 Task 3 (render-composite generalization): one
     /// render batch flushed. Bumps `paint_submits` + `queue_submit2`
     /// since each flush is one real `vkQueueSubmit2`.
@@ -963,6 +987,22 @@ mod tests {
         assert_eq!(t.bucket.frame_builder_renders_per_frame_total, 11);
         assert_eq!(t.lifetime.frame_builder_renders_per_frame_max_in_window, 7);
         assert_eq!(t.bucket.frame_builder_renders_per_frame_max_in_window, 7);
+    }
+
+    #[test]
+    fn cursor_move_ebusy_accumulates_in_bucket_and_lifetime() {
+        let mut t = Telemetry::new();
+        // Single-CRTC EBUSY.
+        t.record_cursor_move_ebusy(1);
+        // Multi-CRTC EBUSY in one motion event (e.g., dual-output).
+        t.record_cursor_move_ebusy(2);
+        assert_eq!(t.bucket.cursor_move_ebusy, 3);
+        assert_eq!(t.lifetime.cursor_move_ebusy, 3);
+        // Zero call (caller invariant: only called with n > 0, but
+        // saturating add still has to do the right thing).
+        t.record_cursor_move_ebusy(0);
+        assert_eq!(t.bucket.cursor_move_ebusy, 3);
+        assert_eq!(t.lifetime.cursor_move_ebusy, 3);
     }
 
     #[test]

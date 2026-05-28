@@ -4063,8 +4063,10 @@ impl KmsBackendV2 {
                 let cx = new_x as i32;
                 #[allow(clippy::cast_possible_truncation)]
                 let cy = new_y as i32;
-                if let Err(e) = self.platform.cursor_plane_move(cx, cy) {
-                    log::debug!("v2 cursor fast path: move failed: {e}");
+                match self.platform.cursor_plane_move(cx, cy) {
+                    Ok(0) => {}
+                    Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                    Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
                 }
             } else {
                 self.scene.wake_for_damage();
@@ -6425,6 +6427,18 @@ impl Backend for KmsBackendV2 {
             {
                 self.telemetry.record_frame_present();
             }
+        }
+        // The just-retired flip(s) freed up the primary atomic-commit
+        // queue on at least one CRTC; retry any cursor move that lost
+        // to a pending primary commit since its fresh motion event.
+        // Latest-wins: only the most recent pending position is
+        // re-issued. If the retry itself EBUSY's against another
+        // primary commit that landed in the meantime, the slot stays
+        // populated for the next page-flip retire.
+        match self.platform.cursor_plane_drain_pending_move() {
+            Ok(0) => {}
+            Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+            Err(e) => log::debug!("v2 cursor drain on page-flip retire: {e}"),
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
