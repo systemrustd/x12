@@ -186,6 +186,27 @@ impl Context {
         })?;
         Ok(Self { libinput })
     }
+
+    /// Suspend libinput: closes all open input device fds and calls
+    /// `close_restricted` for each, releasing them through libseat.
+    /// The context remains valid and can be resumed with [`Context::resume`].
+    /// Task 11 `run_suspend` calls this.
+    pub fn suspend(&mut self) {
+        self.libinput.suspend();
+    }
+
+    /// Resume a suspended libinput context. Re-enables device monitoring
+    /// and re-opens devices via `open_restricted` (→ `seat.open_device`).
+    /// Task 12 `run_resume` calls this.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `libinput_resume` returns -1.
+    pub fn resume(&mut self) -> io::Result<()> {
+        self.libinput
+            .resume()
+            .map_err(|()| io::Error::other("libinput resume failed"))
+    }
 }
 
 /// Best-effort `/dev/input/` enumeration logged at startup. Lets us

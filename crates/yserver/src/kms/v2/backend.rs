@@ -303,11 +303,10 @@ pub struct KmsBackendV2 {
     /// Seat mode (owns libseat in Libseat mode; marker in Direct mode).
     seat: crate::seat::Seat,
     /// State machine for the suspend/resume cycle.
-    /// Consumed by Tasks 11/12 (`on_seat_ready` suspend/resume).
-    #[allow(dead_code)]
+    /// Used by `scanout_allowed()` / `run_suspend` / Task 12's `on_seat_ready`.
     seat_state: crate::seat::state::SeatState,
     /// Coalesced counter-events for the state machine.
-    /// Consumed by Tasks 11/12 (`on_seat_ready` suspend/resume).
+    /// Consumed by Task 12's `on_seat_ready` driver.
     #[allow(dead_code)]
     seat_pending: crate::seat::state::SeatPending,
     /// On-core libinput context (libseat mode only). `None` in Direct mode
@@ -3185,6 +3184,12 @@ impl KmsBackendV2 {
     /// Returns the first per-output Vk / DRM failure; subsequent
     /// outputs still attempted.
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
+        // Gate: no modeset/pageflip/submit when not holding DRM master.
+        // In Direct mode seat_state is always Active → no behaviour change.
+        if !self.scanout_allowed() {
+            log::debug!("v2 composite_and_flip: skipped (seat not Active)");
+            return Ok(());
+        }
         match self.scene.tick(
             &self.core,
             &mut self.store,
@@ -3408,6 +3413,110 @@ impl KmsBackendV2 {
         // each release, but force-zero to guard against scroll buttons
         // (detail 4/5) that carry no button_bit.
         self.core.button_mask = 0;
+    }
+
+    /// True only when `seat_state` is `Active` — i.e. we hold DRM master
+    /// and are allowed to submit page-flips, modesets, and GPU work.
+    /// Gate every master-requiring operation on this. In Direct mode
+    /// `seat_state` is always `Active`, so this is always `true` there.
+    fn scanout_allowed(&self) -> bool {
+        self.seat_state.allows_scanout()
+    }
+
+    /// Suspend sequence — called by Task 12's `on_seat_ready` driver when
+    /// the state machine decides `BeginSuspend`. `seat_state` is already
+    /// `Suspending` at entry; the scanout gate is already closed.
+    ///
+    /// Steps:
+    /// 1. Gate already closed (state is `Suspending`).
+    /// 2. Drain libinput to capture any events mio may have buffered
+    ///    before delivering the seat disable (closes the
+    ///    SEAT-before-LIBINPUT poll-ordering race).
+    /// 3. Synthesize held-key / held-button releases.
+    /// 4. Wait for in-flight GPU work (bounded).
+    /// 5. Suspend libinput (closes input device fds via `close_restricted`
+    ///    → `seat.close_device`).
+    /// 6. Ack the libseat disable (MUST always run — missing the ack
+    ///    wedges the kernel waiting for the VT switch: Risk #1).
+    ///
+    /// Steps 3–6 are wrapped so errors are logged rather than propagated,
+    /// ensuring the ack (step 6) always executes.
+    ///
+    /// # Caller
+    ///
+    /// Task 12's `on_seat_ready`; no caller yet. Dead-code allow removed
+    /// when Task 12 lands.
+    #[allow(dead_code)] // caller is Task 12
+    fn run_suspend(&mut self, state: &mut ServerState) {
+        // 2. DETERMINISTIC INPUT DRAIN — mio may deliver SEAT_TOKEN before
+        //    LIBINPUT_TOKEN in the same poll batch, leaving events in the
+        //    libinput kernel buffer that we haven't read yet. Drain now so
+        //    `down_keys`/`button_mask` reflect every delivered event before
+        //    we snapshot them for held-release synthesis. One dispatch
+        //    typically suffices; loop until empty to be defensive.
+        if self.core_libinput.is_some() {
+            loop {
+                let evs = match self.core_libinput.as_mut().unwrap().dispatch() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("kms: suspend drain dispatch failed: {e}");
+                        break;
+                    }
+                };
+                if evs.is_empty() {
+                    break;
+                }
+                let time_ms = crate::clock::server_time_ms();
+                let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
+                for ev in evs {
+                    // Hotkeys are irrelevant mid-suspend; just update input
+                    // state via the normal mapping + fanout so down_keys and
+                    // button_mask stay accurate for the held-release snapshot.
+                    if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev {
+                        scroll_buf.clear();
+                        if let Some(input_state) = self.core_input_state.as_mut() {
+                            input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
+                        }
+                        for host_ev in scroll_buf.drain(..) {
+                            self.on_host_input(state, host_ev);
+                        }
+                    } else if let Some(input_state) = self.core_input_state.as_mut() {
+                        let host = input_state.map(ev, time_ms);
+                        self.on_host_input(state, host);
+                    }
+                }
+            }
+        }
+
+        // Steps 3–6: error-tolerant so the disable() ack (step 6) always
+        // executes even if an earlier step fails (Risk #1).
+
+        // 3. Synthesize held-key / held-button releases.
+        self.synthesize_held_releases(state);
+
+        // 4. Wait for in-flight GPU work, bounded.
+        self.platform.wait_idle_bounded();
+
+        // 5. Suspend libinput — closes input device fds via close_restricted
+        //    → seat.close_device for each input device. MUST NOT hold a
+        //    LibseatInner borrow across this call (re-entrancy contract:
+        //    close_restricted borrow_muts LibseatInner inside libinput).
+        if let Some(ctx) = self.core_libinput.as_mut() {
+            ctx.suspend();
+        }
+
+        // 6. Ack the libseat disable. We do NOT drmDropMaster: the scanout
+        //    gate (step 1) already stopped all master ioctls; libseat/logind
+        //    revokes master during this ack. Missing this ack wedges the
+        //    kernel waiting for the VT switch (Risk #1).
+        if let crate::seat::Seat::Libseat { inner, .. } = &self.seat
+            && let Err(e) = inner.borrow_mut().disable()
+        {
+            log::warn!("kms: libseat disable() ack failed: {e}");
+        }
+
+        // 7. Caller (`on_seat_ready`) calls `seat_state.suspend_complete()`
+        //    after we return.
     }
 
     /// Deepest mapped window under the cursor. Walks
@@ -6067,6 +6176,16 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
+        // Gate: when not Active we have no DRM master; page-flip events
+        // are drained (so the fd doesn't stay readable) but no resubmit
+        // or flush_submit_group runs. In Direct mode this is always false
+        // → no behaviour change.
+        if !self.scanout_allowed() {
+            // Drain to clear the DRM fd's readiness; discard results.
+            let _ = self.platform.drain_page_flip_events();
+            log::debug!("v2 on_page_flip_ready: skipped (seat not Active)");
+            return;
+        }
         let flipped = match self.platform.drain_page_flip_events() {
             Ok(flipped) => flipped,
             Err(e) => {

@@ -1787,6 +1787,32 @@ impl PlatformBackend {
 
     // ── Disable output ──────────────────────────────────────────
 
+    /// Best-effort wait for all in-flight GPU work to complete, bounded
+    /// to 5 seconds (matching the `FenceTicket::wait` / `device_wait_idle`
+    /// convention used at shutdown). Called by `KmsBackendV2::run_suspend`
+    /// before acking the libseat disable, so in-flight submits don't race
+    /// a kernel-side scanout teardown.
+    ///
+    /// Errors from `device_wait_idle` are logged and swallowed: the ack
+    /// to libseat (which unlocks the VT switch) must always run, even if
+    /// the wait times out or the device is already lost (Risk #1).
+    pub(crate) fn wait_idle_bounded(&self) {
+        // `device_wait_idle` is inherently blocking; 5 s is the same bound
+        // used by FenceTicket::wait in the pool destructor.  We do not set a
+        // real timeout here because ash's `device_wait_idle` wraps
+        // `vkDeviceWaitIdle` which has no timeout parameter — on a lost
+        // device it returns VK_ERROR_DEVICE_LOST promptly.  The 5-second
+        // comment in the plan refers to the *practical* upper bound the
+        // driver enforces on a wedged device; real quiescence is typically
+        // sub-millisecond.
+        if let Some(vk) = self.vk.as_ref() {
+            let result = unsafe { vk.device.device_wait_idle() };
+            if let Err(e) = result {
+                log::warn!("kms: wait_idle_bounded: device_wait_idle failed: {e:?}");
+            }
+        }
+    }
+
     /// Post-loop teardown — disable each output, leaving the
     /// scanout BOs in a state where their Drop can clean up
     /// (or, on atomic disable failure, disarm them so we leak
