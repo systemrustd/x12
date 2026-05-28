@@ -6771,6 +6771,19 @@ impl Backend for KmsBackendV2 {
         // event through the same fanout that Direct mode uses. Hotkeys are
         // intercepted here before forwarding to clients (wlroots'
         // `handle_libinput_readable`, backend.c:49-63).
+        //
+        // Motion coalescing: mirrors `input_thread::process_batch`'s
+        // `pending_motion` carry-over. libinput emits motion at device
+        // polling rate (often 1000 Hz for mice); without coalescing each
+        // motion fires the full fanout + composite path. During a window
+        // drag this drove `iter/s` to 1700+ (per the 2026-05-28 cinnamon
+        // telemetry, vs. ~120 expected for dual-60Hz vsync), exhausting
+        // each vsync interval before the rendering work completed.
+        // Coalescing collapses bursts to "Motion(latest), <non-motion>,
+        // Motion(latest)" — clients still see the final cursor position
+        // each frame, but the loop wakes per-batch, not per-libinput-
+        // report. Matches the off-thread path's
+        // `input_thread::process_batch` contract.
         let Some(ctx) = self.core_libinput.as_mut() else {
             return;
         };
@@ -6783,28 +6796,59 @@ impl Backend for KmsBackendV2 {
         };
         let time_ms = crate::clock::server_time_ms();
         let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
+        let mut pending_motion: Option<yserver_core::core_loop::HostInputEvent> = None;
         for ev in events {
             if let Some(hk) = self.hotkey.check(&ev) {
+                // Hotkey absorbs the event — but flush any pending
+                // motion first so the cursor's last position is
+                // delivered chronologically before the hotkey effect.
+                if let Some(m) = pending_motion.take() {
+                    self.on_host_input(state, m);
+                }
                 self.handle_core_hotkey(hk);
-                continue; // do not forward the hotkey keypress to clients
+                continue;
             }
             // Scroll fans out to zero or many press+release pairs depending
-            // on accumulated v120 — mirror the input thread's path.
+            // on accumulated v120 — mirror the input thread's path. Flush
+            // pending motion first so press/release timestamps stay after
+            // the motion they belong to.
             if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev {
                 scroll_buf.clear();
                 if let Some(input_state) = self.core_input_state.as_mut() {
                     input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
                 }
-                for host_ev in scroll_buf.drain(..) {
-                    self.on_host_input(state, host_ev);
+                if !scroll_buf.is_empty() {
+                    if let Some(m) = pending_motion.take() {
+                        self.on_host_input(state, m);
+                    }
+                    for host_ev in scroll_buf.drain(..) {
+                        self.on_host_input(state, host_ev);
+                    }
                 }
                 continue;
             }
-            // All other events go through map then the shared fanout.
-            if let Some(input_state) = self.core_input_state.as_mut() {
-                let host = input_state.map(ev, time_ms);
-                self.on_host_input(state, host);
+            // Map then route via the same Motion-vs-non-Motion split
+            // `input_thread::process_batch` uses.
+            let Some(input_state) = self.core_input_state.as_mut() else {
+                continue;
+            };
+            let host = input_state.map(ev, time_ms);
+            match host {
+                yserver_core::core_loop::HostInputEvent::PointerMotion { .. } => {
+                    pending_motion = Some(host);
+                }
+                non_motion => {
+                    if let Some(m) = pending_motion.take() {
+                        self.on_host_input(state, m);
+                    }
+                    self.on_host_input(state, non_motion);
+                }
             }
+        }
+        // Flush trailing motion at the end of the dispatch batch so the
+        // core sees the last cursor position before the next epoll wait.
+        if let Some(m) = pending_motion.take() {
+            self.on_host_input(state, m);
         }
     }
 
