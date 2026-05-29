@@ -463,7 +463,7 @@ yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
 
-yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
+yserver-mate-hw log="info":
     cargo build --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
