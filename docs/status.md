@@ -446,6 +446,100 @@ attribution inside the RENDER dispatcher (mirroring `c4093fa`'s
 MIT-SHM perf log) would identify the heavy subop before any
 optimization attempt.
 
+## Dogfood bring-up: Firefox + Chrome + YouTube on bee (master, 2026-05-29)
+
+A single-day investigation that took yserver from "Firefox profile chooser
+empty-shadow" to "playing YouTube in Firefox" to "Chrome scroll works
+everywhere" — five concrete fixes, all driven by visible-smoke evidence
+and Xorg-vs-yserver xtrace diffs.
+
+### Fixes that landed (all on master)
+
+1. **`85ff1e7 diag(present): PRESENT-INSTR per-Pixmap info log`** — INFO-level
+   log line per `Present::Pixmap` request (src kind+size, target window,
+   wait_fence triggered bit, idle_fence). Cherry-picked from the now-
+   discarded dma-buf-sync branch because it was the diagnostic that
+   cracked the Firefox bug below ("`src=pixmap 1x1` over an 800×800 window"
+   was the smoking gun).
+
+2. **`25af7fa fix(x11): gate ConfigureWindow grow-Expose on Viewable`** —
+   `handle_configure_window` unconditionally emitted `Expose` on every
+   grow-configure, including on Unmapped windows. Under marco-style
+   reparenting WMs that puts a phantom Expose ~50 requests before
+   MapNotify; FF would service it, paint background to transparent
+   black, mark the window clean, and the real content never reached
+   the compositor. Spec-correctness gate mirroring MapWindow's existing
+   Viewable filter. Not the FF root cause but a real protocol fix.
+
+3. **`df500df fix(x11): emit VisibilityNotify(Unobscured) to viewable
+   descendants on Map`** — MapWindow only emitted `VisibilityNotify` for
+   the directly-mapped window. Xorg emits it for every previously-
+   mapped descendant that transitions Unviewable→Viewable when an
+   ancestor maps (FF profile-chooser child `0x02400010`). GTK3's
+   frame clock keys content paints off `VisibilityNotify`; missing
+   notification left the child stuck non-paintable. New
+   `emit_visibility_unobscured_subtree_to_state` helper in `fanout.rs`.
+
+4. **`e9b7802 fix(present): emit Present::ConfigureNotify on window resize`** —
+   *The actual Firefox empty-shadow root cause.* Mesa's `loader_dri3_helper`
+   keys swap-buffer reallocation on `Present::ConfigureNotify`. yserver
+   never emitted it. Race-determined: when Mesa's first
+   `DRI3::PixmapFromBuffers` happened to land AFTER the GTK
+   ConfigureWindow to 800×800, FF rendered; when it landed before
+   (window still 1×1), Mesa stayed at 1×1 forever — every Present
+   landed a 1×1 pixmap over an 800×800 window → blank.
+   `mate.xtrace` fail-vs-pass on the same binary showed
+   `src=pixmap 1x1` vs `src=pixmap 800x800` PRESENT-INSTRs — pure
+   timing race that the missing event closed.
+
+5. **`53542c9 fix(xi2): match Xorg byte-for-byte wire format on pointer events`** —
+   *Chrome scroll-crash, then Caja scroll-stuck.* Release Chrome (Ozone X11)
+   stack-smashed on every wheel-scroll into a yserver window. Three earlier
+   hypotheses (implicit dma-buf sync; XI_POINTER_EMULATED flag alone;
+   NoEmulation-on-scroll-class alone) didn't move the symptom. The
+   `mate-xorg.xtrace` vs `mate.xtrace` byte diff on the same scroll event
+   revealed four cumulative wire-format gaps + one latent valuator-encoding bug:
+   - `flags=0` vs Xorg's `0x00010000` (XIPointerEmulated)
+   - `buttons_len=1` vs Xorg's 8 (32-byte button mask)
+   - `valuators_len=0` (on button events) vs Xorg's 2
+   - scroll-class declared `NoEmulation` but still emitted buttons (contradiction)
+   - scroll axisvalue was `delta` (±1) instead of cumulative
+
+   Width + flag fixes were needed for Chrome's pre-sized event-struct
+   reader. The cumulative-vs-delta fix was a pre-existing GDK bug
+   masked by the missing XIPointerEmulated flag — once GDK correctly
+   skipped the emulated buttons, the broken Motion-axis path became
+   the only scroll source and Caja got "1 tick then stuck." All five
+   fixed together; verified on Chrome, Caja, Firefox, video playback.
+
+### What didn't land
+
+- `fix/dri3-implicit-dmabuf-sync` branch (commits `4011764`, `d965c89`,
+  `39bf239` of the original plan docs) — the implicit dma-buf
+  sync read-side fence bridge based on a refuted hypothesis. Branch
+  preserved as historical record; PRESENT-INSTR diagnostic salvaged
+  into the standalone `85ff1e7` commit above. Plan docs
+  (`docs/plans/2026-05-29-dri3-implicit-dmabuf-sync.md` and
+  `docs/plans/2026-05-29-present-wait-fence.md`) dropped — both
+  proposed fixes for what turned out to be a different bug.
+- `fix/xi2` first attempt (`7b5461d`, reset from history) — XI_POINTER_EMULATED
+  flag alone with a false-verification commit message. Re-landed combined
+  with the width and cumulative fixes in `53542c9`.
+
+### Methodology takeaway
+
+For race-y intermittent bugs, **same-binary fail-vs-pass xtrace diff** is
+far more informative than Xorg-vs-yserver. The cross-server diff
+conflates "different code path" with "different timing"; same-server
+isolates timing alone. Saved to memory
+([`feedback_same_binary_fail_vs_pass_diff`](../../../.claude/projects/-home-jos-Projects-yserver/memory/feedback_same_binary_fail_vs_pass_diff.md)).
+
+When that's not enough — and for client-specific crashes — **byte-for-byte
+Xorg vs yserver event diff** is the second line of attack. Each spec-
+allowed-but-different field is a candidate; cumulative pressure on a
+strictly-parsing client (Chrome's Ozone X11 layer) needs all of them
+matched, not just the ones spec-language calls "MUST."
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
