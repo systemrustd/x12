@@ -5238,6 +5238,34 @@ fn handle_present_request(
                 const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
                 req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
             };
+            // Diagnostic: the copy below is gated on the source resolving to
+            // a usable host pixmap and the window resolving to a host target.
+            // The pixmap/window resource-existence checks already ran above
+            // (BadDrawable/BadWindow), so reaching here unresolved means the
+            // resource exists but has no backend host xid — the classic
+            // failed-DRI3-dmabuf-import shape (e.g. PixmapFromBuffers rejected
+            // a multi-plane/modifier buffer). Without this warn the present is
+            // silently dropped and the window shows stale content.
+            if !matches!(
+                src,
+                Some(crate::resources::HostDrawableTarget::Pixmap { .. })
+            ) || dst.is_none()
+            {
+                log::warn!(
+                    "client {} #{} Present::Pixmap pixmap=0x{:x} window=0x{:x}: dropping present \
+                     copy — src_resolved_as_host_pixmap={} dst_resolved={} (window keeps stale \
+                     content; a preceding DRI3 dmabuf import likely failed)",
+                    client_id.0,
+                    sequence.0,
+                    req.pixmap,
+                    req.window,
+                    matches!(
+                        src,
+                        Some(crate::resources::HostDrawableTarget::Pixmap { .. })
+                    ),
+                    dst.is_some(),
+                );
+            }
             if let (
                 Some(crate::resources::HostDrawableTarget::Pixmap {
                     host_xid,
@@ -5485,6 +5513,30 @@ fn handle_present_request(
                     req.pixmap,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
+                );
+            }
+            // Same silent-drop diagnostic as the Present::Pixmap path: if the
+            // source pixmap didn't resolve to a backend host pixmap (failed
+            // DRI3 dmabuf import) or the window didn't resolve, the copy below
+            // is skipped and the window keeps stale content.
+            if !matches!(
+                src,
+                Some(crate::resources::HostDrawableTarget::Pixmap { .. })
+            ) || dst.is_none()
+            {
+                log::warn!(
+                    "client {} #{} Present::PixmapSynced pixmap=0x{:x} window=0x{:x}: dropping \
+                     present copy — src_resolved_as_host_pixmap={} dst_resolved={} (window keeps \
+                     stale content; a preceding DRI3 dmabuf import likely failed)",
+                    client_id.0,
+                    sequence.0,
+                    req.pixmap,
+                    req.window,
+                    matches!(
+                        src,
+                        Some(crate::resources::HostDrawableTarget::Pixmap { .. })
+                    ),
+                    dst.is_some(),
                 );
             }
             let copied_to_dst = if let (
