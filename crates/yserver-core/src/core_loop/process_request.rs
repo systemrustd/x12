@@ -10247,7 +10247,17 @@ fn handle_query_tree(
             15,
         );
     };
-    let parent = window_state.parent;
+    // X11 spec: the root window's parent is None. Internally we store
+    // root.parent = root (self) and other code relies on that invariant, so
+    // translate the self-parent to None only here on the QueryTree wire reply.
+    // Reporting the root as its own parent makes Chromium/Ozone's GeometryCache
+    // recurse forever (infinite QueryTree(root)+GetGeometry(root)), so Electron
+    // apps (VS Code) spin and never map their window.
+    let parent = if window_state.parent == window {
+        ResourceId(0)
+    } else {
+        window_state.parent
+    };
     let children = window_state.children.clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
