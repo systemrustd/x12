@@ -810,6 +810,57 @@ that the host hides for us.
       that drawing path doesn't reach the host (same family as the
       old wmaker chrome bugs).
 
+## Window lifecycle
+
+- [ ] **Top-level window vanishes mid-session while the X client
+      process stays alive.** First observed 2026-05-30 ~00:00 local on
+      bee/yserver-hw under MATE: an alacritty terminal disappeared
+      from screen while `ps auxf` still showed the alacritty
+      process, and a `DumpDrawables` dump confirmed the window was
+      gone from yserver's tree (not just unmapped — absent
+      entirely). Marco kept compositing fine (the cat wallpaper +
+      a newly-spawned terminal rendered to the scanout), so this
+      is a per-window teardown, not a compositor stall. The bug
+      was not triggered by deliberate user action — happened
+      spontaneously during a long-running `cargo build`.
+      Root cause **unknown** — the active log was `RUST_LOG=warn`
+      (`Justfile:469` at the time) and produced no warn-level
+      trace: no `BadWindow`, no `BadDrawable`, no destroy/
+      disconnect lines. The only client-level warn in the window
+      was 9× `client 14 CreatePixmap BadIDChoice pid=0xffffffff
+      (out-of-range)` at 22:06:31 UTC, but the timing analysis put
+      alacritty's vanish before the first warn line (21:56:47, a
+      VT-switch-recovery EACCES burst), so client 14 is almost
+      certainly the debug terminal spawned after the bug — not
+      alacritty.
+      Captured artefacts (saved 2026-05-30 ~00:09 local):
+      `yserver-hw-mate.log`, `yserver-v2-drawable-0-windows.txt`,
+      `yserver-v2-scanout-0-out0.ppm`, the 32 `present-src-*.ppm`
+      ring dumps, and `scanout-0.png`.
+      Next-time setup: `Justfile:466` now defaults the
+      `yserver-mate-hw` recipe's `RUST_LOG` to include
+      `yserver_core::core_loop::pointer_fanout=trace,
+      yserver_core::core_loop::process_request=debug` — useful but
+      doesn't cover client lifecycle. For the next repro also
+      raise `yserver_core::core_loop::process_disconnect=debug`
+      (currently logs `process_disconnect: client X close_mode=Y`
+      at debug level — `process_disconnect.rs:92`) and the
+      `client_reader` module so the EOF / I/O-error path that
+      drops a client's fd is visible. Cheapest follow-up if a
+      grep-level trace is enough: promote
+      `process_disconnect::process_disconnect`'s entry log
+      from `debug!` to `warn!` so future warn-only captures pin
+      the disconnect timing.
+      Open hypothesis space (none yet refuted):
+      a) alacritty's X connection broke (e.g. EPIPE on a write)
+         → yserver fired `Message::ClientDisconnected` →
+         `process_disconnect` destroyed its windows; alacritty
+         survived because its main loop doesn't exit on X EOF.
+      b) marco issued `KillClient` or `DestroyWindow` against
+         alacritty for reasons unknown.
+      c) alacritty itself sent `DestroyWindow` from a recovery
+         path triggered by an earlier (silent) error.
+
 ## Extension polish
 
 - [ ] **Real RANDR `SetCrtcConfig` / `SetScreenConfig` (runtime
