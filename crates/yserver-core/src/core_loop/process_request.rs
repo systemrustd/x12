@@ -5117,15 +5117,24 @@ pub(crate) fn apply_dpms_transition(
     new_level: u8,
 ) {
     let old = state.dpms.power_level;
+    if new_level == old {
+        // No-op transition. Don't spam logs on these (we hit the same-
+        // binary-state branch frequently on the wake path while idle is
+        // small).
+        return;
+    }
+    log::info!(
+        "dpms: apply_dpms_transition {old} → {new_level} (enabled={}, kms_capable={})",
+        state.dpms.enabled,
+        state.dpms.kms_capable,
+    );
     state.dpms.power_level = new_level;
     if let Err(e) = backend.set_dpms_power(new_level) {
         log::error!("set_dpms_power({new_level}) failed: {e}");
         // Intentionally swallowed: state still advances. See spec
         // "Backend hook / Error contract".
     }
-    if new_level != old {
-        emit_dpms_notify(state);
-    }
+    emit_dpms_notify(state);
 }
 
 /// Fan a `DPMSInfoNotify` GenericEvent out to every client

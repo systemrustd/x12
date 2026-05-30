@@ -11897,24 +11897,73 @@ impl Backend for KmsBackendV2 {
         // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
         let want_active = level == 0;
         if want_active == self.kms_outputs_active {
+            log::info!(
+                "kms: set_dpms_power(level={level}) — same binary state \
+                 (kms_outputs_active={}), no-op",
+                self.kms_outputs_active,
+            );
             return Ok(()); // same binary state (e.g. Standby → Suspend)
         }
-        let res = self.platform.dpms_set_outputs_active(want_active);
-        // Only flip the cache on success. On Err, leave it where it was
-        // so the next set_dpms_power call retries the commit rather than
-        // no-opping through the same-binary-state guard above. (The
-        // protocol-level state.dpms.power_level still advances per the
-        // apply_dpms_transition error contract — the cache here is
-        // backend-internal bookkeeping.)
-        if res.is_ok() {
-            self.kms_outputs_active = want_active;
-            if want_active {
-                // Compositor next tick must paint a fresh frame; outputs
-                // were dark, so any incremental damage tracking is stale.
+        log::info!(
+            "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",
+            self.kms_outputs_active,
+        );
+
+        if want_active {
+            // ── Wake side. Mirrors KmsBackendV2::run_resume around the
+            //    modeset commit: commit_modeset, then re-arm the cursor
+            //    plane via legacy ioctl. Without rearm_cursor the cursor
+            //    plane stays bound to a CRTC that was disabled — the
+            //    first subsequent atomic page-flip then EINVALs because
+            //    the kernel sees a stale plane→CRTC reference. See
+            //    project_einval_atomic_commit_storm_wedge memory entry.
+            let res = self.platform.dpms_set_outputs_active(true);
+            if res.is_ok() {
+                self.kms_outputs_active = true;
+                let (hot_x, hot_y) = self
+                    .effective_cursor_xid
+                    .and_then(|xid| self.cursor_records.get(&xid))
+                    .map(|rec| (rec.hot_x, rec.hot_y))
+                    .unwrap_or((0, 0));
+                #[allow(clippy::cast_possible_truncation)]
+                let cx = self.core.cursor_x as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let cy = self.core.cursor_y as i32;
+                log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
+                self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+                // Outputs were dark; any incremental damage tracking is
+                // stale. Force a fresh full frame on the next composite tick.
                 self.scene.wake_for_damage();
             }
+            res
+        } else {
+            // ── Sleep side. Mirrors KmsBackendV2::run_suspend steps 4 →
+            //    4b → 4c around `disable_output`:
+            //      (1) wait for GPU idle so disable_output isn't racing
+            //          in-flight compose CBs.
+            //      (2) drain in-flight page-flip acks + reset per-output
+            //          cursor plane state. Without this, the cursor plane
+            //          stays bound across disable_output and the kernel
+            //          rejects the next page-flip after wake with EINVAL.
+            //      (3) reset platform's scanout BO state machine so
+            //          orphaned Pending/OnScreen entries don't leak.
+            //      (4) actually disable_output per output.
+            log::info!("kms: dpms sleep — wait_idle_bounded");
+            self.platform.wait_idle_bounded();
+            log::info!("kms: dpms sleep — scene.drain_all");
+            self.scene.drain_all(&mut self.platform);
+            log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
+            self.platform.reset_scanout_bos_for_suspend();
+            log::info!("kms: dpms sleep — disable_output per output");
+            let res = self.platform.dpms_set_outputs_active(false);
+            // Only flip the cache on success. On Err, leave it where it was
+            // so the next set_dpms_power call retries rather than no-opping
+            // through the same-binary-state guard above.
+            if res.is_ok() {
+                self.kms_outputs_active = false;
+            }
+            res
         }
-        res
     }
 }
 
