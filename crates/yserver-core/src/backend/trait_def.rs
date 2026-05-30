@@ -612,6 +612,29 @@ pub trait Backend: Send {
         false
     }
 
+    /// Whether this backend can actually power-cycle a display.
+    /// `yserver-hw` returns `true`; ynest and recording backends
+    /// return `false`. `ServerState` snapshots this at init so the
+    /// idle timer never fires on a backend that can't act on it.
+    fn dpms_capable(&self) -> bool {
+        false
+    }
+
+    /// Drive the display to a DPMS power level (`0=On, 1=Standby,
+    /// `2=Suspend, 3=Off`). `yserver-hw` collapses non-On levels to a
+    /// single "outputs disabled" KMS state. Default is a no-op so
+    /// ynest, host-X11, and recording backends remain protocol-
+    /// compliant without touching the host display.
+    ///
+    /// # Errors
+    ///
+    /// May return DRM atomic-commit errors; the caller (the
+    /// `apply_dpms_transition` helper) logs and advances the
+    /// in-memory state regardless of the result.
+    fn set_dpms_power(&mut self, _level: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Stage 4b — flip a window's scene-participation under
     /// COMPOSITE redirect. Manual mode: `participating = false`
     /// removes the window from the scene walk so the external
