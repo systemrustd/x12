@@ -192,6 +192,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_force_level_rejects_short_body() {
+        assert!(parse_force_level_request(&[0; 2]).is_none());
+    }
+
+    #[test]
+    fn parse_select_input_rejects_short_body() {
+        assert!(parse_select_input_request(&[0; 2]).is_none());
+    }
+
+    #[test]
     fn get_version_reply_shape() {
         let buf = encode_get_version_reply(LittleEndian, SequenceNumber(0x1234), 1, 2);
         assert_eq!(buf.len(), 32);
