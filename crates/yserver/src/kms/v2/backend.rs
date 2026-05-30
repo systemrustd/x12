@@ -3519,6 +3519,17 @@ impl KmsBackendV2 {
         // 3. Synthesize held-key / held-button releases.
         self.synthesize_held_releases(state);
 
+        // 3b. DPMS: post-resume the user expects "On from their
+        //     perspective". No backend call here — we already gave up
+        //     DRM master (or are about to in the libseat disable() ack
+        //     below), and the resume path's commit_modeset will re-light
+        //     the CRTC. No notify either — clients aren't receiving
+        //     events during the suspend window; Xorg matches (clients
+        //     don't see a forced transition on VT switch). Mirrors
+        //     Xorg hw/xfree86/common/xf86Events.c:358-360.
+        state.dpms.power_level = 0;
+        state.dpms.last_activity = std::time::Instant::now();
+
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
@@ -3633,6 +3644,14 @@ impl KmsBackendV2 {
                 return;
             }
         }
+
+        // 2b. DPMS: requery_outputs_and_modeset just re-lit every
+        //     output, so reconcile the backend cache. state.dpms.power_level
+        //     was reset to On in run_suspend; this brings the binary
+        //     cache into agreement so a later DPMS Off request actually
+        //     fires the modeset commit instead of no-opping through the
+        //     same-binary-state guard.
+        self.kms_outputs_active = true;
 
         // 3. Re-arm the hardware cursor plane. Use the current cursor
         //    position + effective cursor hotspot.
