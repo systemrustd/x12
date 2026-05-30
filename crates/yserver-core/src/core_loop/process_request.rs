@@ -10852,11 +10852,11 @@ fn handle_set_screen_saver(
 
     state.screensaver.timeout_ms = match timeout {
         -1 => 600_000,
-        n => u32::from(n as u16) * 1000, // n is already ≥ 0
+        n => u32::from(n as u16) * 1000, // n is already ≥ 0 (validated above)
     };
     state.screensaver.interval_ms = match interval {
         -1 => 600_000,
-        n => u32::from(n as u16) * 1000,
+        n => u32::from(n as u16) * 1000, // n is already ≥ 0 (validated above)
     };
     state.screensaver.prefer_blanking = match prefer_blanking {
         0 => false,
@@ -25518,6 +25518,32 @@ mod tests {
     }
 
     #[test]
+    fn force_screen_saver_activate_via_handler_transitions_to_on() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 115,
+            data: 1,
+            length_units: 1,
+        }; // mode=1 (Activate)
+
+        let _ = handle_force_screen_saver(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+        );
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::On);
+        assert!(
+            state.screensaver.forced,
+            "Activate is the FORCER path → forced=true"
+        );
+    }
+
+    #[test]
     fn force_screen_saver_reset_via_handler_advances_last_activity() {
         // Reset is the FORCER+Reset path Xorg runs NoticeTime on
         // (window.c:3187-3193) — the handler must bump last_activity.
@@ -25617,7 +25643,7 @@ mod tests {
     }
 
     #[test]
-    fn get_screen_saver_round_trips_set_screen_saver() {
+    fn get_screen_saver_reflects_current_state() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         state.screensaver.timeout_ms = 120_000;
