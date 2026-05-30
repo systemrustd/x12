@@ -2335,9 +2335,26 @@ fn handle_sync_request(
                 state.sync_alarms.insert(alarm, a);
                 // Per the X Synchronization Extension spec the trigger is
                 // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately.
-                let now = state.sync_counters.get(&counter).map_or(0, |c| c.value);
-                evaluate_alarms_for_counter(state, counter, now, now);
+                // already holds fires immediately. For IDLETIME-family
+                // counters the value is derived from last_activity rather
+                // than `sync_counters`.
+                let now_value = if matches!(
+                    counter,
+                    x11sync::IDLETIME_COUNTER
+                        | x11sync::IDLETIME_DEVICE_VCP
+                        | x11sync::IDLETIME_DEVICE_VCK
+                ) {
+                    let baseline = state.idletime_baseline(counter);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let v = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as i64;
+                    v
+                } else {
+                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
+                };
+                evaluate_alarms_for_counter(state, counter, now_value, now_value);
             }
         }
         x11sync::CHANGE_ALARM => {
@@ -2348,8 +2365,28 @@ fn handle_sync_request(
                 a.state = x11sync::ALARM_STATE_ACTIVE;
                 let counter = a.counter;
                 state.sync_alarms.insert(alarm, a);
-                let now = state.sync_counters.get(&counter).map_or(0, |c| c.value);
-                evaluate_alarms_for_counter(state, counter, now, now);
+                // Per the X Synchronization Extension spec the trigger is
+                // tested at creation: a comparison alarm whose condition
+                // already holds fires immediately. For IDLETIME-family
+                // counters the value is derived from last_activity rather
+                // than `sync_counters`.
+                let now_value = if matches!(
+                    counter,
+                    x11sync::IDLETIME_COUNTER
+                        | x11sync::IDLETIME_DEVICE_VCP
+                        | x11sync::IDLETIME_DEVICE_VCK
+                ) {
+                    let baseline = state.idletime_baseline(counter);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let v = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as i64;
+                    v
+                } else {
+                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
+                };
+                evaluate_alarms_for_counter(state, counter, now_value, now_value);
             }
         }
         x11sync::QUERY_ALARM => {
@@ -2552,10 +2589,23 @@ fn apply_alarm_attributes(
         let value = attrs.value.unwrap_or(0);
         let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
         alarm.wait_value = if relative {
-            let current = state
-                .sync_counters
-                .get(&alarm.counter)
-                .map_or(0, |c| c.value);
+            let current = match alarm.counter {
+                x11sync::IDLETIME_COUNTER
+                | x11sync::IDLETIME_DEVICE_VCP
+                | x11sync::IDLETIME_DEVICE_VCK => {
+                    let baseline = state.idletime_baseline(alarm.counter);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let v = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as i64;
+                    v
+                }
+                _ => state
+                    .sync_counters
+                    .get(&alarm.counter)
+                    .map_or(0, |c| c.value),
+            };
             current.saturating_add(value)
         } else {
             value
@@ -26573,6 +26623,188 @@ mod tests {
         assert_eq!(
             after.wait_value, near_max,
             "wait_value unchanged on overflow (Xorg sync.c:589-597)"
+        );
+    }
+
+    /// Encode an INT64 value in XSync wire format: hi(INT32 LE) || lo(CARD32 LE).
+    /// This is NOT the same as `i64::to_le_bytes()` (which is lo-first).
+    fn xsync_i64(v: i64) -> [u8; 8] {
+        #[allow(clippy::cast_possible_truncation)]
+        let hi = (v >> 32) as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lo = v as u32;
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&hi.to_le_bytes());
+        out[4..].copy_from_slice(&lo.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn relative_alarm_value_on_idletime_resolves_against_current_idle() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-condition: already idle 5s.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(5);
+
+        // CreateAlarm relative-value=10_000 → wait_value should resolve
+        // to current_idle (~5_000) + 10_000 = ~15_000.
+        let alarm_id: u32 = 0x2000_0002;
+        let mut body = Vec::new();
+        body.extend_from_slice(&alarm_id.to_le_bytes());
+        let mask: u32 = x11sync::CA_COUNTER
+            | x11sync::CA_VALUE_TYPE
+            | x11sync::CA_VALUE
+            | x11sync::CA_TEST_TYPE
+            | x11sync::CA_DELTA
+            | x11sync::CA_EVENTS;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&x11sync::VALUE_TYPE_RELATIVE.to_le_bytes()); // u32
+        body.extend_from_slice(&xsync_i64(10_000)); // value = 10_000 relative
+        body.extend_from_slice(&(x11sync::TEST_POSITIVE_TRANSITION as u32).to_le_bytes());
+        body.extend_from_slice(&xsync_i64(0)); // delta = 0
+        body.push(1); // events = true
+        body.extend_from_slice(&[0u8; 3]);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::CREATE_ALARM,
+            length_units: u32::try_from(2 + body.len() / 4).unwrap(),
+        };
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let alarm = state.sync_alarms.get(&alarm_id).expect("alarm exists");
+        assert!(
+            alarm.wait_value >= 14_500 && alarm.wait_value <= 16_000,
+            "wait_value ≈ current_idle(5000) + 10000 = 15000; got {}",
+            alarm.wait_value
+        );
+    }
+
+    #[test]
+    fn create_alarm_on_idletime_with_comparison_already_true_fires_immediately() {
+        // Xorg sync.c:1772-1775 — create-time trigger eval passes
+        // (old=current, new=current). PositiveTransition requires
+        // `old < wait <= new` so it cannot fire on a same-value pair;
+        // only Comparison test types can fire at create time.
+        // PositiveComparison fires when `new >= wait`, which is
+        // exactly the "client opens an alarm while user is already
+        // idle past the threshold" smoke we want to verify.
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-condition: already idle past the alarm threshold.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+
+        let alarm_id: u32 = 0x2000_0001;
+        let mut body = Vec::new();
+        body.extend_from_slice(&alarm_id.to_le_bytes());
+        let mask: u32 = x11sync::CA_COUNTER
+            | x11sync::CA_VALUE_TYPE
+            | x11sync::CA_VALUE
+            | x11sync::CA_TEST_TYPE
+            | x11sync::CA_DELTA
+            | x11sync::CA_EVENTS;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // value_type = Absolute
+        body.extend_from_slice(&xsync_i64(60_000)); // value = 60_000
+        body.extend_from_slice(&(x11sync::TEST_POSITIVE_COMPARISON as u32).to_le_bytes());
+        body.extend_from_slice(&xsync_i64(0)); // delta = 0 → goes Inactive on fire
+        body.push(1); // events = true
+        body.extend_from_slice(&[0u8; 3]);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::CREATE_ALARM,
+            length_units: u32::try_from(2 + body.len() / 4).unwrap(),
+        };
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        // AlarmNotify event: type = SYNC_FIRST_EVENT(83) + ALARM_NOTIFY_KIND(1) = 84
+        assert!(
+            bytes.iter().any(|&b| b == 84),
+            "AlarmNotify must fire at create-time for an already-idle PositiveComparison alarm; got {:?}",
+            bytes
+        );
+        // Comparison + delta=0 transitions to Inactive on fire.
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_INACTIVE
+        );
+    }
+
+    #[test]
+    fn create_alarm_on_idletime_with_pos_transition_does_not_fire_at_create() {
+        // Companion test: PositiveTransition cannot fire at create-time
+        // (Xorg sync.c:1772-1775 — old==new). The alarm sits Active
+        // waiting for the post-poll evaluator or input wake to drive
+        // the (old, new) pair across the threshold.
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+
+        let alarm_id: u32 = 0x2000_0003;
+        let mut body = Vec::new();
+        body.extend_from_slice(&alarm_id.to_le_bytes());
+        let mask: u32 = x11sync::CA_COUNTER
+            | x11sync::CA_VALUE_TYPE
+            | x11sync::CA_VALUE
+            | x11sync::CA_TEST_TYPE
+            | x11sync::CA_DELTA
+            | x11sync::CA_EVENTS;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&xsync_i64(60_000));
+        body.extend_from_slice(&(x11sync::TEST_POSITIVE_TRANSITION as u32).to_le_bytes());
+        body.extend_from_slice(&xsync_i64(0));
+        body.push(1);
+        body.extend_from_slice(&[0u8; 3]);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::CREATE_ALARM,
+            length_units: u32::try_from(2 + body.len() / 4).unwrap(),
+        };
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            !bytes.iter().any(|&b| b == 84),
+            "PositiveTransition with old==new at create-time must not fire"
+        );
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE,
+            "alarm stays Active, waiting for evaluator/input to drive the transition"
         );
     }
 }

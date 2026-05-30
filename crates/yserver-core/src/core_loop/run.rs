@@ -688,6 +688,7 @@ pub fn run_core(
 
         // SS: evaluate idle activation and Cycle re-fire.
         evaluate_screen_saver_post_poll(state, backend);
+        evaluate_idletime_alarms_post_poll(state, backend);
 
         // F2: if a `wait_for_reply` (called by `process_request`
         // mid-handler) saw the host close, propagate it as a clean
@@ -1139,6 +1140,64 @@ pub(crate) fn evaluate_screen_saver_post_poll(state: &mut ServerState, backend: 
     }
 }
 
+/// Post-poll IDLETIME alarm evaluator. For each IDLETIME counter,
+/// compute the current idle, walk Active alarms referencing the
+/// counter, run the test-type check against the cached
+/// `(last_evaluated, current)` pair, and fire via
+/// `evaluate_alarms_for_counter` (which handles re-arm + emission).
+/// Mirrors Xorg's `IdleTimeBlockHandler` + `IdleTimeWakeupHandler`
+/// (sync.c:2647, :2750).
+pub(crate) fn evaluate_idletime_alarms_post_poll(
+    state: &mut ServerState,
+    _backend: &mut dyn crate::backend::Backend,
+) {
+    use yserver_protocol::x11::sync as x11sync;
+    // Suspend gate (Xorg WaitFor.c:519 unified-timer rule) — mirrors
+    // `idletime_alarm_deadline`. Skip the whole evaluator when any
+    // client holds XScreenSaverSuspend; otherwise an unrelated wake
+    // could still fire Positive alarms mid-fullscreen-video.
+    if !state.screensaver.suspend_counts.is_empty() {
+        return;
+    }
+    const IDLETIME_COUNTERS: &[u32] = &[
+        x11sync::IDLETIME_COUNTER,
+        x11sync::IDLETIME_DEVICE_VCP,
+        x11sync::IDLETIME_DEVICE_VCK,
+    ];
+    let now = Instant::now();
+    for &counter in IDLETIME_COUNTERS {
+        // Skip if no alarms reference this counter.
+        let has_alarm = state
+            .sync_alarms
+            .values()
+            .any(|a| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE);
+        if !has_alarm {
+            continue;
+        }
+        let baseline = state.idletime_baseline(counter);
+        #[allow(clippy::cast_possible_truncation)]
+        let current_idle = now
+            .duration_since(baseline)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as i64;
+        let old_idle = state
+            .idletime_last_evaluated
+            .get(&counter)
+            .copied()
+            .unwrap_or(0);
+        // Run the existing evaluator helper — it walks Active alarms,
+        // calls trigger_fires, applies the Task 2 state-transition fix,
+        // emits AlarmNotify, and updates wait_value.
+        crate::core_loop::process_request::evaluate_alarms_for_counter(
+            state,
+            counter,
+            old_idle,
+            current_idle,
+        );
+        state.idletime_last_evaluated.insert(counter, current_idle);
+    }
+}
+
 /// Wire a freshly-completed setup handshake into the core's bookkeeping:
 ///   - try_clone the stream for the writer (set non-blocking on the
 ///     core's clone)
@@ -1531,5 +1590,53 @@ mod tests {
             ScreenSaverActive::Off,
             "evaluator must not fire SS when DPMS is blanked"
         );
+    }
+
+    #[test]
+    fn idletime_evaluator_fires_pos_transition_when_deadline_elapsed() {
+        use std::time::Duration;
+        use yserver_protocol::x11::{ClientId, sync as x11sync};
+        let mut state = ServerState::new();
+        // Pre-arm: a PositiveTransition alarm at 60_000ms, last_activity 61s ago.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: false, // skip wire delivery; assert state mutation only
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        let mut backend = RecordingBackend::default();
+
+        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+
+        // PositiveTransition + delta=0 stays Active (Task 2 fix).
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(after.state, x11sync::ALARM_STATE_ACTIVE);
+        // last_evaluated cache updated for global IDLETIME.
+        assert!(
+            state
+                .idletime_last_evaluated
+                .get(&x11sync::IDLETIME_COUNTER)
+                .copied()
+                .unwrap_or(0)
+                >= 60_000,
+            "last_evaluated cache should advance past the trigger value"
+        );
+    }
+
+    #[test]
+    fn idletime_evaluator_skips_when_no_idletime_alarms() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        // No alarms at all — must not panic, must not insert spurious cache entries.
+        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+        assert!(state.idletime_last_evaluated.is_empty());
     }
 }
