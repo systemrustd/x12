@@ -53,6 +53,20 @@ pub fn pointer_event_fanout_to_state(
     state.dpms.last_activity = std::time::Instant::now();
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+        // DPMS coupling tail already flipped SS Off if it was On.
+    }
+    if matches!(
+        state.screensaver.active,
+        crate::server::ScreenSaverActive::On
+    ) {
+        // Standalone SS activation (DPMS was On already; SS came up
+        // via idle timer or ForceScreenSaver) — input wakes it.
+        crate::core_loop::process_request::apply_screen_saver_transition(
+            state,
+            backend,
+            crate::server::ScreenSaverActive::Off,
+            /*forced=*/ false,
+        );
     }
 
     let mut dropped = Vec::new();
@@ -855,7 +869,8 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::ServerState;
+    use crate::server::{ScreenSaverActive, ServerState};
+    use yserver_protocol::x11::ClientId;
 
     fn motion_event() -> HostPointerEvent {
         HostPointerEvent {
@@ -954,5 +969,31 @@ mod tests {
             state.dpms.power_level, 0,
             "state must advance on backend error"
         );
+    }
+
+    #[test]
+    fn pointer_event_during_screen_saver_on_flips_off_via_independent_path() {
+        // Standalone SS-On (DPMS still On). Motion event must flip
+        // SS Off with forced=0.
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        // dpms.power_level already 0 from new()
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.selected_by.insert(ClientId(1), 0x01);
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
+        assert!(!state.screensaver.forced, "input-driven Off is non-forced");
     }
 }

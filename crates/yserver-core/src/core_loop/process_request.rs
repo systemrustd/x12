@@ -46,7 +46,7 @@ use crate::{
     crossings::{CrossingKind as TreeCrossingKind, normal_mode_crossings},
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
-    server::ServerState,
+    server::{ScreenSaverActive, ServerState},
 };
 
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
@@ -5138,6 +5138,24 @@ pub(crate) fn apply_dpms_transition(
         );
     }
     state.dpms.power_level = new_level;
+
+    // SS coupling — fires BEFORE backend hook and BEFORE DPMS notify
+    // (Xorg dpms.c:262-279 ordering).
+    //   non-On + SS Off → SCREEN_SAVER_FORCER + Active → forced=true
+    //   On     + SS On  → SCREEN_SAVER_OFF    + Reset  → forced=false
+    // Neither path resets last_activity (Xorg's NoticeTime only runs
+    // for the FORCER+Reset combination, window.c:3187-3193).
+    let dpms_on = new_level == 0;
+    match (dpms_on, state.screensaver.active) {
+        (false, ScreenSaverActive::Off) => {
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::On, true);
+        }
+        (true, ScreenSaverActive::On) => {
+            apply_screen_saver_transition(state, backend, ScreenSaverActive::Off, false);
+        }
+        _ => {}
+    }
+
     if let Err(e) = backend.set_dpms_power(new_level) {
         log::error!("set_dpms_power({new_level}) failed: {e}");
         // Intentionally swallowed: state still advances. See spec
@@ -5183,6 +5201,100 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     // CPU on every subsequent notify until that finishes.
     for cid in dropped {
         state.dpms.selected_by.remove(&cid);
+    }
+}
+
+/// Transition the screensaver to `new` (must be `Off` or `On`).
+/// `Cycle` is an event-only value — it never appears in
+/// `screensaver.active`. Passing it here is a programmer error; the
+/// helper debug-asserts and no-ops in release builds. Idempotent on
+/// same-state. On every Off↔On transition updates
+/// `screensaver.active`, `screensaver.forced`, and
+/// `screensaver.next_cycle`, then fires `ScreenSaverNotify` to
+/// `SCREEN_SAVER_NOTIFY_MASK` subscribers. The `backend` parameter
+/// is reserved for signature parity with `apply_dpms_transition`
+/// and is currently unused (SS is purely server-side bookkeeping).
+pub(crate) fn apply_screen_saver_transition(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    new: ScreenSaverActive,
+    forced: bool,
+) {
+    debug_assert!(
+        !matches!(new, ScreenSaverActive::Cycle),
+        "Cycle is event-only and must never be written into screensaver.active — \
+         route it through emit_screen_saver_notify instead"
+    );
+    if matches!(new, ScreenSaverActive::Cycle) {
+        return; // release-build safety net
+    }
+    if state.screensaver.active == new {
+        return;
+    }
+    let _ = backend; // reserved for future coupling
+    state.screensaver.active = new;
+    state.screensaver.forced = forced;
+    state.screensaver.next_cycle = match new {
+        ScreenSaverActive::On if state.screensaver.interval_ms > 0 => Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(u64::from(state.screensaver.interval_ms)),
+        ),
+        _ => None,
+    };
+    emit_screen_saver_notify(state, new, forced);
+}
+
+/// Fan a `ScreenSaverNotify` event out to subscribers. `notify_state`
+/// and `forced` are passed explicitly so the cycle-timer path can
+/// fire `Cycle` events without mutating `screensaver.active`. Cycle
+/// events deliver to `CYCLE_MASK` subscribers; Off/On events deliver
+/// to `NOTIFY_MASK` subscribers (Xorg `saver.c:389-391`).
+pub(crate) fn emit_screen_saver_notify(
+    state: &mut ServerState,
+    notify_state: ScreenSaverActive,
+    forced: bool,
+) {
+    use yserver_protocol::x11::screensaver as x11ss;
+    const SCREEN_SAVER_FIRST_EVENT: u8 = 162;
+    let (active_state, deliver_mask) = match notify_state {
+        ScreenSaverActive::Off => (x11ss::SCREEN_SAVER_OFF, x11ss::SCREEN_SAVER_NOTIFY_MASK),
+        ScreenSaverActive::On => (x11ss::SCREEN_SAVER_ON, x11ss::SCREEN_SAVER_NOTIFY_MASK),
+        ScreenSaverActive::Cycle => (x11ss::SCREEN_SAVER_CYCLE, x11ss::SCREEN_SAVER_CYCLE_MASK),
+    };
+    let subs: Vec<ClientId> = state
+        .screensaver
+        .selected_by
+        .iter()
+        .filter(|(_, mask)| **mask & deliver_mask != 0)
+        .map(|(c, _)| *c)
+        .collect();
+    if subs.is_empty() {
+        return;
+    }
+    let ts = state.timestamp_now();
+    let root = crate::resources::ROOT_WINDOW.0;
+    let kind = if state.screensaver.prefer_blanking {
+        x11ss::SCREEN_SAVER_BLANKED
+    } else {
+        x11ss::SCREEN_SAVER_INTERNAL
+    };
+    let dropped =
+        crate::core_loop::fanout::fanout_event_to_clients(state, &subs, |buf, seq, order| {
+            x11ss::encode_screen_saver_notify_event(
+                buf,
+                order,
+                seq,
+                SCREEN_SAVER_FIRST_EVENT,
+                active_state,
+                ts,
+                root,
+                0, // window — always 0 (no SetAttributes path)
+                kind,
+                forced,
+            );
+        });
+    for cid in dropped {
+        state.screensaver.selected_by.remove(&cid);
     }
 }
 
@@ -15395,13 +15507,15 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
 
-    use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+    use yserver_protocol::x11::{
+        ClientByteOrder, ClientId, RequestHeader, SequenceNumber, screensaver as x11screensaver,
+    };
 
     use super::*;
     use crate::{
         backend::recording::{RecordedCall, RecordingBackend},
         resources::ROOT_WINDOW,
-        server::{ClientState, ServerState},
+        server::{ClientState, ScreenSaverActive, ServerState},
     };
 
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
@@ -25089,6 +25203,147 @@ mod tests {
         assert!(
             !state.dpms.selected_by.contains(&ClientId(1)),
             "mask=0 must remove the client from selected_by"
+        );
+    }
+
+    #[test]
+    fn dpms_off_drives_screensaver_on_with_forced_true() {
+        // Xorg dpms.c:269-279 — DPMS Non-On + SS Off →
+        // dixSaveScreens(SCREEN_SAVER_FORCER, ScreenSaverActive)
+        // → SendScreenSaverNotify(... forced=true).
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let mut peer = install_client(&mut state, 1);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        let mut backend = RecordingBackend::new();
+
+        apply_dpms_transition(&mut state, &mut backend, 3); // Off
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::On);
+        assert!(state.screensaver.forced);
+
+        let bytes = read_all_available(&mut peer);
+        // Sequential event tag is first_event + 0 = 162.
+        let idx = bytes
+            .iter()
+            .position(|&b| b == 162)
+            .expect("ScreenSaverNotify must be present");
+        assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_ON, "state=On");
+        assert_eq!(bytes[idx + 17], 1, "forced byte = 1");
+    }
+
+    #[test]
+    fn dpms_on_drives_screensaver_off_with_forced_false_and_no_activity_reset() {
+        // Xorg dpms.c:275-278 + window.c:3187-3193 — DPMS On + SS On
+        // takes the SCREEN_SAVER_OFF (not FORCER) path, so forced=0.
+        // NoticeTime only fires on the FORCER+Reset combination, so
+        // last_activity must NOT be touched by the coupling itself.
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3;
+        state.screensaver.active = ScreenSaverActive::On;
+        let prior = state.dpms.last_activity;
+
+        let mut peer = install_client(&mut state, 1);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        let mut backend = RecordingBackend::new();
+
+        apply_dpms_transition(&mut state, &mut backend, 0);
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
+        assert!(
+            !state.screensaver.forced,
+            "DPMS-On→SS-Off is non-FORCER path"
+        );
+        assert_eq!(state.dpms.last_activity, prior, "coupling must NOT reset");
+
+        let bytes = read_all_available(&mut peer);
+        let idx = bytes.iter().position(|&b| b == 162).unwrap();
+        assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_OFF);
+        assert_eq!(bytes[idx + 17], 0, "forced byte = 0");
+    }
+
+    #[test]
+    fn dpms_coupling_emits_screensaver_notify_before_dpms_notify() {
+        // SS notify (sequential event tag 162) must appear at a lower
+        // wire offset than the DPMS XGE notify (GenericEvent tag 35)
+        // — matches Xorg ordering in DPMSSet (dpms.c:262-293).
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let mut peer = install_client(&mut state, 1);
+        state.dpms.selected_by.insert(ClientId(1));
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        let mut backend = RecordingBackend::new();
+
+        apply_dpms_transition(&mut state, &mut backend, 3);
+
+        let bytes = read_all_available(&mut peer);
+        let ss_pos = bytes.iter().position(|&b| b == 162).unwrap();
+        let dpms_pos = bytes.iter().position(|&b| b == 35).unwrap();
+        assert!(
+            ss_pos < dpms_pos,
+            "SS notify (offset {ss_pos}) must precede DPMS notify (offset {dpms_pos})"
+        );
+    }
+
+    #[test]
+    fn force_screen_saver_activate_emits_notify_with_forced_true() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        let mut backend = RecordingBackend::new();
+
+        apply_screen_saver_transition(
+            &mut state,
+            &mut backend,
+            ScreenSaverActive::On,
+            /*forced=*/ true,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        let idx = bytes.iter().position(|&b| b == 162).unwrap();
+        assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_ON);
+        assert_eq!(bytes[idx + 17], 1, "forced=1");
+    }
+
+    #[test]
+    fn apply_screen_saver_transition_does_not_touch_last_activity() {
+        // last_activity update is the *handler's* responsibility
+        // (FORCER+Reset path runs Xorg's NoticeTime, window.c:3187-3193).
+        // The pure helper must NOT touch last_activity — otherwise the
+        // input-fanout SS-only sibling check (Task 3 step 5) would
+        // double-bump it, and the DPMS coupling would too.
+        let mut state = ServerState::new();
+        state.screensaver.active = ScreenSaverActive::On;
+        let prior = state.dpms.last_activity;
+        let mut backend = RecordingBackend::new();
+
+        apply_screen_saver_transition(
+            &mut state,
+            &mut backend,
+            ScreenSaverActive::Off,
+            /*forced=*/ true,
+        );
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
+        assert_eq!(
+            state.dpms.last_activity, prior,
+            "helper alone must not touch last_activity"
         );
     }
 }

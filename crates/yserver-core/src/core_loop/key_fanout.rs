@@ -47,6 +47,20 @@ pub fn key_event_fanout_to_state(
     state.dpms.last_activity = std::time::Instant::now();
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+        // DPMS coupling tail already flipped SS Off if it was On.
+    }
+    if matches!(
+        state.screensaver.active,
+        crate::server::ScreenSaverActive::On
+    ) {
+        // Standalone SS activation (DPMS was On already; SS came up
+        // via idle timer or ForceScreenSaver) — input wakes it.
+        crate::core_loop::process_request::apply_screen_saver_transition(
+            state,
+            backend,
+            crate::server::ScreenSaverActive::Off,
+            /*forced=*/ false,
+        );
     }
 
     match key_route(state, &event) {
@@ -314,7 +328,9 @@ fn current_focus(state: &ServerState) -> ResourceId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ServerState};
+    use crate::server::{
+        ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ScreenSaverActive, ServerState,
+    };
     use yserver_protocol::x11::ClientId;
 
     use crate::server::ClientState;
@@ -586,5 +602,24 @@ mod tests {
             state.dpms.power_level, 0,
             "state must advance on backend error"
         );
+    }
+
+    #[test]
+    fn key_event_during_screen_saver_on_flips_off_via_independent_path() {
+        // Pre-state: DPMS On (so the existing DPMS-wake prologue
+        // doesn't fire), SS On (activated standalone via idle timer
+        // or ForceScreenSaver). Input must flip SS Off with forced=0.
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        // dpms.power_level already 0 from new()
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.selected_by.insert(ClientId(1), 0x01);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
+        assert!(!state.screensaver.forced, "input-driven Off is non-forced");
     }
 }
