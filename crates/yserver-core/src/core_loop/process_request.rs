@@ -5183,8 +5183,8 @@ pub(crate) fn apply_dpms_transition(
 /// Uses the existing `fanout_event_to_clients` helper for sequence
 /// + byte-order + per-client write_or_buffer handling.
 pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
+    use crate::nested::DPMS_MAJOR_OPCODE;
     use yserver_protocol::x11::dpms as x11dpms;
-    const DPMS_MAJOR_OPCODE: u8 = 134;
     if state.dpms.selected_by.is_empty() {
         return;
     }
@@ -5317,8 +5317,8 @@ fn handle_dpms_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::nested::DPMS_MAJOR_OPCODE;
     use yserver_protocol::x11::{ClientByteOrder, dpms as x11dpms};
-    const DPMS_MAJOR_OPCODE: u8 = 134;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -5523,8 +5523,8 @@ fn handle_screen_saver_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    use crate::nested::MIT_SCREEN_SAVER_MAJOR_OPCODE;
     use yserver_protocol::x11::{ClientByteOrder, screensaver as x11ss};
-    const MAJOR: u8 = 150;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -5561,9 +5561,15 @@ fn handle_screen_saver_request(
                     x11::error::BAD_LENGTH,
                     0,
                     minor_u16,
-                    MAJOR,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             }
+            debug_assert!(
+                !matches!(state.screensaver.active, ScreenSaverActive::Cycle),
+                "Cycle must never appear in screensaver.active — \
+                 see apply_screen_saver_transition guard"
+            );
+            // X11 timestamps are 32-bit ms; wraps at ~49 days per X11 spec.
             #[allow(clippy::cast_possible_truncation)]
             let last_input = state.dpms.last_activity.elapsed().as_millis() as u32;
             let timeout = state.screensaver.timeout_ms;
@@ -5617,7 +5623,7 @@ fn handle_screen_saver_request(
                     x11::error::BAD_LENGTH,
                     0,
                     minor_u16,
-                    MAJOR,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             };
             if mask == 0 {
@@ -5634,7 +5640,7 @@ fn handle_screen_saver_request(
                 x11::error::BAD_ACCESS,
                 0,
                 minor_u16,
-                MAJOR,
+                MIT_SCREEN_SAVER_MAJOR_OPCODE,
             );
         }
         x11ss::UNSET_ATTRIBUTES => {
@@ -5646,7 +5652,7 @@ fn handle_screen_saver_request(
                     x11::error::BAD_LENGTH,
                     0,
                     minor_u16,
-                    MAJOR,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             }
         }
@@ -5659,7 +5665,7 @@ fn handle_screen_saver_request(
                     x11::error::BAD_LENGTH,
                     0,
                     minor_u16,
-                    MAJOR,
+                    MIT_SCREEN_SAVER_MAJOR_OPCODE,
                 );
             };
             if suspend {
@@ -5699,7 +5705,7 @@ fn handle_screen_saver_request(
                 x11::error::BAD_REQUEST,
                 0,
                 minor_u16,
-                MAJOR,
+                MIT_SCREEN_SAVER_MAJOR_OPCODE,
             );
         }
     }
@@ -26184,7 +26190,7 @@ mod tests {
         );
 
         let bytes = read_all_available(&mut peer);
-        assert!(!bytes.iter().any(|&b| b == 0), "no error reply");
+        assert!(bytes.is_empty(), "SelectInput has no reply on success");
         assert_eq!(
             state.screensaver.selected_by.get(&ClientId(1)).copied(),
             Some(0x04)

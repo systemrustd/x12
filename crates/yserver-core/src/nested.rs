@@ -65,9 +65,9 @@ const PRESENT_MAJOR_OPCODE: u8 = 145;
 const PRESENT_FIRST_EVENT: u8 = 0; // Present uses XGE, no sequential event codes
 const PRESENT_FIRST_ERROR: u8 = 159;
 
-const DPMS_MAJOR_OPCODE: u8 = 134;
+pub(crate) const DPMS_MAJOR_OPCODE: u8 = 134;
 
-const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
+pub(crate) const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
 pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 162;
 
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;

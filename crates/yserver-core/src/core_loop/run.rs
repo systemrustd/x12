@@ -1105,20 +1105,22 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
 ///
 /// Mirrors the DPMS cascade evaluator above it in the loop:
 /// compute the deadline, check `now >= deadline`, drive the helper.
+// nested-if matches the DPMS evaluator's shape for readability symmetry
+#[allow(clippy::collapsible_if)]
 pub(crate) fn evaluate_screen_saver_post_poll(state: &mut ServerState, backend: &mut dyn Backend) {
     // SS: idle activation. Mirrors Xorg WaitFor.c:441 timing.
     // `screensaver_idle_deadline` returns None when DPMS is blanked
     // (power_level != 0), so this branch is already suppressed under
     // DPMS blanking — Xorg WaitFor.c:457 parity.
-    if let Some(deadline) = state.screensaver_idle_deadline()
-        && Instant::now() >= deadline
-    {
-        crate::core_loop::process_request::apply_screen_saver_transition(
-            state,
-            backend,
-            crate::server::ScreenSaverActive::On,
-            /*forced=*/ false,
-        );
+    if let Some(deadline) = state.screensaver_idle_deadline() {
+        if Instant::now() >= deadline {
+            crate::core_loop::process_request::apply_screen_saver_transition(
+                state,
+                backend,
+                crate::server::ScreenSaverActive::On,
+                /*forced=*/ false,
+            );
+        }
     }
     // SS: cycle re-fire. Mirrors Xorg WaitFor.c:470-476.
     if let Some(deadline) = state.screensaver_cycle_deadline() {
@@ -1476,10 +1478,9 @@ mod tests {
 
     #[test]
     fn evaluator_fires_idle_activation_when_deadline_elapsed() {
-        use std::time::Duration;
         let mut state = ServerState::new();
         state.screensaver.timeout_ms = 60_000;
-        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
+        state.dpms.last_activity = Instant::now() - Duration::from_secs(61);
         // No client installed — emit_screen_saver_notify short-circuits
         // on empty selected_by; we're asserting state transition only.
         let mut backend = RecordingBackend::default();
@@ -1495,7 +1496,6 @@ mod tests {
 
     #[test]
     fn evaluator_fires_cycle_and_advances_next_cycle() {
-        use std::time::{Duration, Instant};
         let mut state = ServerState::new();
         state.screensaver.active = ScreenSaverActive::On;
         state.screensaver.interval_ms = 60_000;
@@ -1516,10 +1516,9 @@ mod tests {
     fn evaluator_idle_path_skipped_while_dpms_blanked() {
         // Xorg WaitFor.c:457 — when DPMS is non-On the SS idle timer
         // is suppressed; the DPMS→SS coupling already handled it.
-        use std::time::Duration;
         let mut state = ServerState::new();
         state.screensaver.timeout_ms = 60_000;
-        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+        state.dpms.last_activity = Instant::now() - Duration::from_secs(120);
         state.dpms.power_level = 3; // Off
         let mut backend = RecordingBackend::default();
 
