@@ -6567,6 +6567,18 @@ impl Backend for KmsBackendV2 {
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
+        // DPMS gate: outputs are inactive (every CRTC has ACTIVE=0 +
+        // MODE_ID=0 from disable_output). Submitting an atomic page-flip
+        // commit against a disabled CRTC returns EINVAL. Without this
+        // gate the core loop's per-iteration `backend.maybe_composite()`
+        // call would loop a tight EINVAL storm while DPMS is Off (and
+        // the `composite_and_flip` gate at :3196 wouldn't catch it —
+        // maybe_composite is a separate scene.tick caller). Same kind
+        // of gate `scanout_allowed()` provides for the VT-master case.
+        // See project_einval_atomic_commit_storm_wedge memory entry.
+        if !self.kms_outputs_active {
+            return Ok(());
+        }
         // Phase B.1 close trigger 4: if a frame has been open past the
         // timeout (16 ms default), force a close to release pinned
         // resources. No-op if no frame open or below threshold.
