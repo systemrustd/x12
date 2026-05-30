@@ -396,12 +396,14 @@ pub fn run_core(
             let dpms_deadline = state.dpms_transition_deadline();
             let ss_idle_deadline = state.screensaver_idle_deadline();
             let ss_cycle_deadline = state.screensaver_cycle_deadline();
+            let idletime_alarm_deadline = state.idletime_alarm_deadline();
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
                 .chain(dpms_deadline)
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
+                .chain(idletime_alarm_deadline)
                 .min()
                 .map(|deadline| {
                     deadline

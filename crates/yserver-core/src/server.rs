@@ -660,6 +660,78 @@ impl ServerState {
         }
     }
 
+    /// Earliest instant any Active IDLETIME alarm could fire from idle
+    /// progression alone. Negative-* alarms fire on input wake (handled
+    /// by the fanouts), so they don't contribute to this deadline.
+    /// Returns `None` when no eligible alarm exists, or when
+    /// `XScreenSaverSuspend` has gated the unified timer (Xorg
+    /// WaitFor.c:519).
+    ///
+    /// **Quiescent-state handling.** A `PositiveTransition + delta=0`
+    /// alarm that has already fired stays Active but is *quiescent*
+    /// until the counter drops below `wait_value` and crosses up again
+    /// (which requires an input event resetting `last_activity`). For
+    /// such alarms, the deadline only contributes when current idle is
+    /// strictly below `wait_value`. Without this check the poll-min
+    /// would lock at a past `Instant` forever and spin with
+    /// `Duration::ZERO`. `PositiveComparison` is level-triggered: a
+    /// `delta=0` Comparison transitions to Inactive on fire (Xorg
+    /// `sync.c:548-555`) so it never re-enters this path; a
+    /// `delta != 0` Comparison re-arms `wait_value` past the current
+    /// value, so by construction `current_idle < wait_value` and the
+    /// deadline is in the future.
+    #[must_use]
+    pub fn idletime_alarm_deadline(&self) -> Option<std::time::Instant> {
+        use yserver_protocol::x11::sync as x11sync;
+        if !self.screensaver.suspend_counts.is_empty() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let mut earliest: Option<std::time::Instant> = None;
+        for alarm in self.sync_alarms.values() {
+            if alarm.state != x11sync::ALARM_STATE_ACTIVE {
+                continue;
+            }
+            if !matches!(
+                alarm.counter,
+                x11sync::IDLETIME_COUNTER
+                    | x11sync::IDLETIME_DEVICE_VCP
+                    | x11sync::IDLETIME_DEVICE_VCK
+            ) {
+                continue;
+            }
+            let test_type = u32::from(alarm.test_type);
+            if !matches!(
+                test_type,
+                x11sync::TEST_POSITIVE_TRANSITION | x11sync::TEST_POSITIVE_COMPARISON
+            ) {
+                continue;
+            }
+            if alarm.wait_value < 0 {
+                continue; // negative wait_value can't be reached by idle (unsigned ms)
+            }
+            let baseline = self.idletime_baseline(alarm.counter);
+            // Quiescent-state skip: drop alarms whose threshold is already
+            // at-or-below current idle. They've already fired (Transition)
+            // or would re-fire every poll (Comparison) — neither shape
+            // contributes a future-instant deadline. They re-enter the
+            // deadline only after an input event resets `baseline`, at
+            // which point `current_idle < wait_value` again.
+            #[allow(clippy::cast_sign_loss)]
+            let current_idle_ms = now
+                .duration_since(baseline)
+                .as_millis()
+                .min(u128::from(u32::MAX)) as i64;
+            if current_idle_ms >= alarm.wait_value {
+                continue;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let fire_at = baseline + std::time::Duration::from_millis(alarm.wait_value as u64);
+            earliest = Some(earliest.map_or(fire_at, |e| e.min(fire_at)));
+        }
+        earliest
+    }
+
     /// Earliest instant a DPMS transition could fire. Picks the
     /// smallest non-zero timeout strictly above the current level.
     /// Returns `None` when DPMS is off (either `!enabled` or
@@ -3770,5 +3842,113 @@ mod tests {
         let state = ServerState::new();
         let baseline = state.dpms.last_activity;
         assert_eq!(state.idletime_baseline(0xdead_beef), baseline);
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_none_when_no_alarms() {
+        let state = ServerState::new();
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_picks_smallest_active_pos_alarm() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let baseline = std::time::Instant::now();
+        state.dpms.last_activity = baseline;
+
+        for (id, wait) in &[(1u32, 60_000i64), (2, 30_000), (3, 90_000)] {
+            state.sync_alarms.insert(
+                *id,
+                crate::server::SyncAlarm {
+                    owner: ClientId(1),
+                    counter: x11sync::IDLETIME_COUNTER,
+                    wait_value: *wait,
+                    delta: 0,
+                    test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                    events: true,
+                    state: x11sync::ALARM_STATE_ACTIVE,
+                },
+            );
+        }
+
+        let deadline = state.idletime_alarm_deadline().expect("Some");
+        let expected = baseline + Duration::from_millis(30_000);
+        // Allow ±1ms for monotonic-clock resolution.
+        let diff = if deadline > expected {
+            deadline - expected
+        } else {
+            expected - deadline
+        };
+        assert!(
+            diff < Duration::from_millis(2),
+            "deadline ~ baseline + 30_000ms; got diff {diff:?}"
+        );
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_ignores_negative_alarms() {
+        // Negative-* alarms only fire on input wake, not on a positive
+        // deadline. They must not be considered when computing the
+        // poll-deadline `.min()`.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.sync_alarms.insert(
+            1,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_ignores_inactive_alarms() {
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.sync_alarms.insert(
+            1,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_INACTIVE,
+            },
+        );
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_none_when_screensaver_suspended() {
+        // Mirrors the dpms_transition_deadline suspend gate. XScreen-
+        // SaverSuspend inhibits both the DPMS cascade AND IDLETIME
+        // alarms so fullscreen video (Firefox / mpv / vlc) doesn't
+        // blank the screen.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.screensaver.suspend_counts.insert(ClientId(99), 1);
+        state.sync_alarms.insert(
+            1,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        assert!(state.idletime_alarm_deadline().is_none());
     }
 }
