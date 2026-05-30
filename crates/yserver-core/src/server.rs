@@ -199,7 +199,7 @@ pub struct DpmsState {
     pub off_ms: u32,
     pub last_activity: Instant,
     /// Client IDs that issued `DPMSSelectInput(DPMS_INFO_NOTIFY_MASK)`.
-    pub selected_by: std::collections::HashSet<ClientId>,
+    pub selected_by: HashSet<ClientId>,
 }
 
 impl DpmsState {
@@ -216,7 +216,7 @@ impl DpmsState {
             suspend_ms: 600_000,
             off_ms: 600_000,
             last_activity: Instant::now(),
-            selected_by: std::collections::HashSet::new(),
+            selected_by: HashSet::new(),
         }
     }
 }
@@ -3468,5 +3468,7 @@ mod tests {
         state.dpms.off_ms = 900_000;
         assert_eq!(next_dpms_level(0, 0, &state.dpms), 0);
         assert_eq!(next_dpms_level(1, 100_000, &state.dpms), 1);
+        // Already at Off (max level): cascade has nowhere to go.
+        assert_eq!(next_dpms_level(3, 999_999_999, &state.dpms), 3);
     }
 }
