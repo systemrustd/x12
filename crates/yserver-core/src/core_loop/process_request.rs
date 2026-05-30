@@ -26250,4 +26250,42 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert!(bytes.is_empty(), "UnsetAttributes must be a silent no-op");
     }
+
+    #[test]
+    fn cycle_event_delivered_only_to_cycle_mask_subscribers() {
+        // Two clients: A subscribed with NOTIFY_MASK, B with CYCLE_MASK.
+        // After SS goes Active and we fire a Cycle event, only B sees it.
+        let mut state = ServerState::new();
+        let mut peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(2), x11screensaver::SCREEN_SAVER_CYCLE_MASK);
+        let mut backend = RecordingBackend::new();
+
+        apply_screen_saver_transition(
+            &mut state,
+            &mut backend,
+            ScreenSaverActive::On,
+            /*forced=*/ false,
+        );
+        // A received the activation Notify; drain so the next read is clean.
+        let _ = read_all_available(&mut peer_a);
+        // B was NOT a NOTIFY subscriber; it should have received nothing yet.
+        assert!(read_all_available(&mut peer_b).is_empty());
+
+        emit_screen_saver_notify(&mut state, ScreenSaverActive::Cycle, /*forced=*/ false);
+        assert!(
+            read_all_available(&mut peer_a).is_empty(),
+            "Cycle must NOT deliver to NOTIFY_MASK subscriber"
+        );
+        let b = read_all_available(&mut peer_b);
+        let idx = b.iter().position(|&x| x == 162).expect("B receives Cycle");
+        assert_eq!(b[idx + 1], x11screensaver::SCREEN_SAVER_CYCLE);
+    }
 }

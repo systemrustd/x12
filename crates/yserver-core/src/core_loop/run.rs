@@ -394,10 +394,14 @@ pub fn run_core(
             let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
             let backend_deadline = backend.next_wakeup();
             let dpms_deadline = state.dpms_transition_deadline();
+            let ss_idle_deadline = state.screensaver_idle_deadline();
+            let ss_cycle_deadline = state.screensaver_cycle_deadline();
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
                 .chain(dpms_deadline)
+                .chain(ss_idle_deadline)
+                .chain(ss_cycle_deadline)
                 .min()
                 .map(|deadline| {
                     deadline
@@ -679,6 +683,9 @@ pub fn run_core(
                 }
             }
         }
+
+        // SS: evaluate idle activation and Cycle re-fire.
+        evaluate_screen_saver_post_poll(state, backend);
 
         // F2: if a `wait_for_reply` (called by `process_request`
         // mid-handler) saw the host close, propagate it as a clean
@@ -1092,6 +1099,42 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
     backend.on_host_input(state, HostInputEvent::Key(press));
 }
 
+/// Post-poll screen-saver evaluator. Drives idle activation and the
+/// periodic Cycle event re-fire. Extracted from the outer loop body
+/// so unit tests can drive it directly with pre-armed state.
+///
+/// Mirrors the DPMS cascade evaluator above it in the loop:
+/// compute the deadline, check `now >= deadline`, drive the helper.
+pub(crate) fn evaluate_screen_saver_post_poll(state: &mut ServerState, backend: &mut dyn Backend) {
+    // SS: idle activation. Mirrors Xorg WaitFor.c:441 timing.
+    // `screensaver_idle_deadline` returns None when DPMS is blanked
+    // (power_level != 0), so this branch is already suppressed under
+    // DPMS blanking — Xorg WaitFor.c:457 parity.
+    if let Some(deadline) = state.screensaver_idle_deadline()
+        && Instant::now() >= deadline
+    {
+        crate::core_loop::process_request::apply_screen_saver_transition(
+            state,
+            backend,
+            crate::server::ScreenSaverActive::On,
+            /*forced=*/ false,
+        );
+    }
+    // SS: cycle re-fire. Mirrors Xorg WaitFor.c:470-476.
+    if let Some(deadline) = state.screensaver_cycle_deadline() {
+        let now = Instant::now();
+        if now >= deadline {
+            crate::core_loop::process_request::emit_screen_saver_notify(
+                state,
+                crate::server::ScreenSaverActive::Cycle,
+                /*forced=*/ false,
+            );
+            state.screensaver.next_cycle =
+                Some(now + Duration::from_millis(u64::from(state.screensaver.interval_ms)));
+        }
+    }
+}
+
 /// Wire a freshly-completed setup handshake into the core's bookkeeping:
 ///   - try_clone the stream for the writer (set non-blocking on the
 ///     core's clone)
@@ -1205,7 +1248,11 @@ fn _hint(_: UnixStream) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_loop::sender::channel;
+    use crate::{
+        backend::recording::RecordingBackend,
+        core_loop::sender::channel,
+        server::{ScreenSaverActive, ServerState},
+    };
     use std::time::Duration;
 
     /// I5 test: `reconcile_client_writable_interest` toggles a client's
@@ -1425,5 +1472,63 @@ mod tests {
         }
         assert!(handle.is_finished(), "run_core did not return on Shutdown");
         handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn evaluator_fires_idle_activation_when_deadline_elapsed() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
+        // No client installed — emit_screen_saver_notify short-circuits
+        // on empty selected_by; we're asserting state transition only.
+        let mut backend = RecordingBackend::default();
+
+        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+        assert_eq!(
+            state.screensaver.active,
+            ScreenSaverActive::On,
+            "elapsed idle deadline must drive SS On"
+        );
+    }
+
+    #[test]
+    fn evaluator_fires_cycle_and_advances_next_cycle() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.interval_ms = 60_000;
+        let past = Instant::now() - Duration::from_millis(10);
+        state.screensaver.next_cycle = Some(past);
+        let mut backend = RecordingBackend::default();
+
+        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+        let next = state.screensaver.next_cycle.expect("re-armed by evaluator");
+        assert!(
+            next > past,
+            "next_cycle must advance past the prior deadline"
+        );
+    }
+
+    #[test]
+    fn evaluator_idle_path_skipped_while_dpms_blanked() {
+        // Xorg WaitFor.c:457 — when DPMS is non-On the SS idle timer
+        // is suppressed; the DPMS→SS coupling already handled it.
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+        state.dpms.power_level = 3; // Off
+        let mut backend = RecordingBackend::default();
+
+        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+        assert_eq!(
+            state.screensaver.active,
+            ScreenSaverActive::Off,
+            "evaluator must not fire SS when DPMS is blanked"
+        );
     }
 }
