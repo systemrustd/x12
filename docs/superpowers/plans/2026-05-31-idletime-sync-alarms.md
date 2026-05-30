@@ -1335,7 +1335,9 @@ If `CA_*` constants are not all in `x11sync`, check the existing `parse_alarm_at
 - [ ] **Step 7: Run all Task 4 tests + workspace test**
 
 ```bash
-cargo test -p yserver-core idletime_evaluator create_alarm_on_idletime
+cargo test -p yserver-core idletime_evaluator
+cargo test -p yserver-core create_alarm_on_idletime
+cargo test -p yserver-core relative_alarm_value_on_idletime
 cargo test -p yserver-core
 ```
 
@@ -1423,6 +1425,53 @@ In `key_fanout.rs`'s `#[cfg(test)] mod tests`, append:
 
 In `pointer_fanout.rs`'s test module, append the pointer analogue (use the file's existing pointer-event fixture; key device id is 3 → swap to 2 for VCP).
 
+Append one more test in `key_fanout.rs`'s test module covering per-device IDLETIME (the bug-fix above's regression target):
+
+```rust
+    #[test]
+    fn key_event_fires_neg_transition_alarm_on_per_device_idletime_vck() {
+        // Regression for the prior `unwrap_or(0)` bug: a NegativeTransition
+        // alarm on IDLETIME_DEVICE_VCK must fire on the very first input
+        // even if `per_device_last_activity[3]` has no entry yet (the
+        // first-input case). Without the fallback-to-global fix, the
+        // computed `prior_device` would be 0 and the trigger
+        // `old > wait_value && new <= wait_value` would not hold.
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        // Deliberately do NOT insert into per_device_last_activity[3] —
+        // simulate the first-input-for-this-device case.
+        assert!(state.per_device_last_activity.get(&3).is_none());
+
+        let alarm_id = 0x3000;
+        state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_DEVICE_VCK,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+            events: false,
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        // Alarm stays Active (Transition + delta=0 — Task 2 fix), and the
+        // per-device last_evaluated cache should reflect post-wake idle = 0.
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE
+        );
+        assert_eq!(
+            state.idletime_last_evaluated
+                .get(&x11sync::IDLETIME_DEVICE_VCK).copied(),
+            Some(0)
+        );
+    }
+```
+
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
@@ -1508,11 +1557,17 @@ Insert the IDLETIME wake handler RIGHT AFTER the `state.per_device_last_activity
     // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
     let prior_global = now.duration_since(state.dpms.last_activity)
         .as_millis().min(u128::from(u32::MAX)) as i64;
+    // Per-device prior: fall back to global if no per-device entry yet.
+    // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
+    // this, the very first input event for a device whose baseline isn't
+    // recorded would compute prior_device=0 and a per-device Negative
+    // alarm (whose wait_value > 0) would not see the `old > wait` half of
+    // its trigger.
     let prior_device = state.per_device_last_activity
         .get(&(XI2_MASTER_KEYBOARD_DEVICE_ID as u8))
         .copied()
         .map(|t| now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64)
-        .unwrap_or(0);
+        .unwrap_or(prior_global);
 
     state.dpms.last_activity = now;
     state.per_device_last_activity.insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
@@ -1542,16 +1597,137 @@ Insert the IDLETIME wake handler RIGHT AFTER the `state.per_device_last_activity
 
 Apply the same shape, with `XI2_MASTER_POINTER_DEVICE_ID` (value 2) instead of `XI2_MASTER_KEYBOARD_DEVICE_ID`.
 
-- [ ] **Step 6: Run tests + workspace test**
+- [ ] **Step 6: Suspend-release reset for IDLETIME state**
+
+When `XScreenSaverSuspend` drains to empty, existing MIT-SS code (in TWO places — `process_request.rs:5696` SUSPEND handler and `process_disconnect.rs:263`) bumps `state.dpms.last_activity = now`. That's enough for DPMS and the global IDLETIME *value* to behave correctly, BUT:
+
+- `idletime_last_evaluated` may hold stale-high values from before suspend. Next post-poll evaluator pass sees `(old=stale, new=fresh)` and the `old < wait <= new` half of a `PositiveTransition` test never holds — the crossing is missed forever.
+- `per_device_last_activity` entries are also stale. A fresh device baseline matters for per-device alarms post-resume.
+
+Add a small helper in `process_request.rs` (alongside `evaluate_idletime_negative_alarms_on_input_wake`):
+
+```rust
+/// Reset IDLETIME bookkeeping when the suspend-counts table drains to
+/// empty. Must be called at the SAME spot the existing MIT-SCREEN-SAVER
+/// code resets `state.dpms.last_activity` (process_request.rs:5696
+/// SUSPEND handler + process_disconnect.rs:263 last-suspender cleanup).
+///
+/// Without this, IDLETIME alarms can be skipped post-suspend because
+/// `idletime_last_evaluated` holds stale-high values from before the
+/// suspend, causing `evaluate_alarms_for_counter`'s
+/// `old < wait <= new` Transition check to never hold.
+pub(crate) fn reset_idletime_state_after_suspend_release(state: &mut ServerState) {
+    let now = std::time::Instant::now();
+    // dpms.last_activity is already reset by the caller (preserve
+    // existing behaviour). Reset the per-device baselines so post-resume
+    // per-device IDLETIME computation is consistent.
+    for entry in state.per_device_last_activity.values_mut() {
+        *entry = now;
+    }
+    // Clear the evaluator's last-seen cache so the next post-poll pass
+    // computes `(old=0, new=current)` from a clean slate, preserving
+    // the Transition `old < wait <= new` invariant.
+    state.idletime_last_evaluated.clear();
+}
+```
+
+Wire into the SS SUSPEND handler. In `process_request.rs` at `:5690-5697` (the existing `drained && suspend_counts.is_empty() && Off && On` guard), the current code reads:
+
+```rust
+                if drained
+                    && state.screensaver.suspend_counts.is_empty()
+                    && matches!(state.screensaver.active, ScreenSaverActive::Off)
+                    && state.dpms.power_level == 0
+                {
+                    // Mirrors ScreenSaverFreeSuspend (saver.c:343-378):
+                    // restart the idle clock from now. No notify fires.
+                    state.dpms.last_activity = std::time::Instant::now();
+                }
+```
+
+Change to:
+
+```rust
+                if drained
+                    && state.screensaver.suspend_counts.is_empty()
+                    && matches!(state.screensaver.active, ScreenSaverActive::Off)
+                    && state.dpms.power_level == 0
+                {
+                    // Mirrors ScreenSaverFreeSuspend (saver.c:343-378):
+                    // restart the idle clock from now. No notify fires.
+                    state.dpms.last_activity = std::time::Instant::now();
+                    reset_idletime_state_after_suspend_release(state);
+                }
+```
+
+Same edit in `process_disconnect.rs:263`:
+
+```rust
+    if was_suspending
+        && state.screensaver.suspend_counts.is_empty()
+        && matches!(state.screensaver.active, crate::server::ScreenSaverActive::Off)
+        && state.dpms.power_level == 0
+    {
+        // Mirrors ScreenSaverFreeSuspend (saver.c:343-378): on the last
+        // suspender going away, restart the idle clock so the saver
+        // doesn't immediately fire from a stale baseline.
+        state.dpms.last_activity = std::time::Instant::now();
+        crate::core_loop::process_request::reset_idletime_state_after_suspend_release(state);
+    }
+```
+
+Add a regression test in `process_request.rs::tests`:
+
+```rust
+    #[test]
+    fn suspend_release_resets_idletime_last_evaluated_and_per_device_baselines() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Pre-seed: stale idletime cache from before suspend.
+        state.idletime_last_evaluated.insert(x11sync::IDLETIME_COUNTER, 999_999);
+        state.per_device_last_activity.insert(
+            3,
+            std::time::Instant::now() - Duration::from_secs(120),
+        );
+
+        // Insert a suspending client, then drain via Suspend(false).
+        state.screensaver.suspend_counts.insert(ClientId(1), 1);
+        let header = RequestHeader { opcode: 150, data: x11screensaver::SUSPEND, length_units: 2 };
+        let _ = handle_screen_saver_request(&mut state, &mut backend, ClientId(1),
+                                            SequenceNumber(1), header, &[0u8, 0, 0, 0]);
+
+        // The drain hit the (drained && empty && SS=Off && DPMS=On) guard
+        // and must have reset both IDLETIME bookkeeping fields.
+        assert!(
+            state.idletime_last_evaluated.is_empty(),
+            "idletime_last_evaluated must be cleared on suspend release"
+        );
+        let vck_baseline = state.per_device_last_activity.get(&3).copied()
+            .expect("per_device_last_activity[3] still present");
+        let elapsed = std::time::Instant::now().duration_since(vck_baseline);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "per_device_last_activity[3] must be reset to ~now; got elapsed {elapsed:?}"
+        );
+    }
+```
+
+- [ ] **Step 7: Run tests + workspace test**
 
 ```bash
-cargo test -p yserver-core key_event_fires_neg_transition pointer_event_fires_neg_transition
+cargo test -p yserver-core key_event_fires_neg_transition
+cargo test -p yserver-core pointer_event_fires_neg_transition
+cargo test -p yserver-core suspend_release_resets_idletime
 cargo test -p yserver-core
 ```
 
-Expected: both new tests pass; full crate green.
+Expected: all new tests pass; full crate green.
 
-- [ ] **Step 7: Smoke-test on `just startx` (user-driven)**
+- [ ] **Step 8: Smoke-test on `just startx` (user-driven)**
 
 Per [[feedback_hw_recipes_user_only]] the user drives this. Restart yserver to pick up the fix, then:
 
@@ -1567,12 +1743,12 @@ gsettings set org.mate.session idle-delay 1
 
 If the smoke doesn't trip, capture xtrace and look for `AlarmNotify` events at type 84 — if absent, the fanout-prologue path didn't fire.
 
-- [ ] **Step 8: Format, lint, commit**
+- [ ] **Step 9: Format, lint, commit**
 
 ```bash
 cargo +nightly fmt
 cargo clippy -p yserver-core
-git add crates/yserver-core/src/core_loop/process_request.rs crates/yserver-core/src/core_loop/key_fanout.rs crates/yserver-core/src/core_loop/pointer_fanout.rs
+git add crates/yserver-core/src/core_loop/process_request.rs crates/yserver-core/src/core_loop/key_fanout.rs crates/yserver-core/src/core_loop/pointer_fanout.rs crates/yserver-core/src/core_loop/process_disconnect.rs
 git commit -m "feat(sync): IDLETIME NegativeTransition firing on input wake
 
 Key + pointer fanouts now capture the prior idle BEFORE mutating
