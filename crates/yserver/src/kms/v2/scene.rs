@@ -58,11 +58,12 @@
 )]
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, OnceLock},
 };
 
 use ash::vk;
+use yserver_protocol::x11::xfixes;
 
 use super::{
     platform::{FenceTicket, PlatformBackend},
@@ -1837,6 +1838,7 @@ fn build_scene(
                 0,
                 store,
                 windows_v2,
+                &core.shape_bounding,
                 layout_x0,
                 layout_y0,
                 layout_w,
@@ -2037,6 +2039,12 @@ fn emit_window_subtree(
     parent_abs_y: i32,
     store: &mut DrawableStore,
     windows_v2: &super::backend::WindowsV2Map,
+    // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
+    // When a host xid has an entry the window's scene draw is
+    // clipped to those rects — marco's rounded-corner frame masks
+    // depend on this. Empty / missing entry → unshaped, single
+    // full-window draw.
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
     layout_x0: i32,
     layout_y0: i32,
     layout_w: u32,
@@ -2324,36 +2332,89 @@ fn emit_window_subtree(
                 // matched the post-4d.7 mate-with-compositing
                 // and xfce-with-compositing hardware-smoke
                 // failure shape.
+                //
+                // SHAPE bounding handling: when the window has a
+                // bounding region (marco's rounded-corner mask,
+                // panel-applet transparency cutouts, etc.) emit
+                // one clipped draw per rect intersected with the
+                // window's storage extent. Without bounding (the
+                // common case), emit a single full-window draw —
+                // preserving the alpha-passthrough invariants
+                // documented above for the depth-32 / depth-24
+                // distinction. Pixels outside the bounding region
+                // are intentionally NOT drawn so the layer below
+                // (parent / wallpaper / root) shows through.
                 let image_view = source.storage.sample_view;
-                draws.push(CompositeDraw {
-                    image_view,
-                    #[allow(clippy::cast_precision_loss)]
-                    dst_origin: [dx as f32, dy as f32],
-                    #[allow(clippy::cast_precision_loss)]
-                    dst_size: [win_w as f32, win_h as f32],
-                    src_origin: [0.0, 0.0],
-                    src_size: [1.0, 1.0],
-                    // Depth-32 ARGB windows initialize their storage to
-                    // (0,0,0,0) per `default_window_init_color(32)`, so any
-                    // unpainted region is transparent and must alpha-blend
-                    // onto the layers below — matching X11 / Composite
-                    // semantics where the root window is the opaque
-                    // bottom layer and ARGB windows stack with blending.
-                    // Forcing alpha to 1.0 here (the old `false` setting)
-                    // turned transparent areas into opaque black, hiding
-                    // mate-panel applets, control-center sidebar text,
-                    // system-tray icons, and tooltips. Depth-24 sources
-                    // pass through `sample_view`'s α=ONE swizzle so the
-                    // shader sees α=1 from them regardless of the BGRA8
-                    // padding byte — that's the scene-α fix above.
-                    alpha_passthrough: true,
-                });
-                sampled_ids.push(source_id);
-                if let Some(snap) = store.peek_presentation_damage(source_id) {
-                    for r in snap.region.rects() {
-                        add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
+                #[allow(clippy::cast_precision_loss)]
+                let win_w_f = win_w as f32;
+                #[allow(clippy::cast_precision_loss)]
+                let win_h_f = win_h as f32;
+                let mut emitted_any = false;
+                if let Some(rects) = shape_bounding.get(&host_xid) {
+                    for rect in rects {
+                        let rx = i32::from(rect.x);
+                        let ry = i32::from(rect.y);
+                        let rw = i32::from(rect.width);
+                        let rh = i32::from(rect.height);
+                        let cx = rx.max(0);
+                        let cy = ry.max(0);
+                        let cw = (rx + rw).min(win_w) - cx;
+                        let ch = (ry + rh).min(win_h) - cy;
+                        if cw <= 0 || ch <= 0 {
+                            continue;
+                        }
+                        #[allow(clippy::cast_precision_loss)]
+                        let cw_f = cw as f32;
+                        #[allow(clippy::cast_precision_loss)]
+                        let ch_f = ch as f32;
+                        #[allow(clippy::cast_precision_loss)]
+                        let cx_f = cx as f32;
+                        #[allow(clippy::cast_precision_loss)]
+                        let cy_f = cy as f32;
+                        draws.push(CompositeDraw {
+                            image_view,
+                            #[allow(clippy::cast_precision_loss)]
+                            dst_origin: [(dx + cx) as f32, (dy + cy) as f32],
+                            dst_size: [cw_f, ch_f],
+                            src_origin: [cx_f / win_w_f, cy_f / win_h_f],
+                            src_size: [cw_f / win_w_f, ch_f / win_h_f],
+                            alpha_passthrough: true,
+                        });
+                        emitted_any = true;
                     }
-                    snapshots.push(snap);
+                } else {
+                    draws.push(CompositeDraw {
+                        image_view,
+                        #[allow(clippy::cast_precision_loss)]
+                        dst_origin: [dx as f32, dy as f32],
+                        dst_size: [win_w_f, win_h_f],
+                        src_origin: [0.0, 0.0],
+                        src_size: [1.0, 1.0],
+                        // Depth-32 ARGB windows initialize their storage to
+                        // (0,0,0,0) per `default_window_init_color(32)`, so any
+                        // unpainted region is transparent and must alpha-blend
+                        // onto the layers below — matching X11 / Composite
+                        // semantics where the root window is the opaque
+                        // bottom layer and ARGB windows stack with blending.
+                        // Forcing alpha to 1.0 here (the old `false` setting)
+                        // turned transparent areas into opaque black, hiding
+                        // mate-panel applets, control-center sidebar text,
+                        // system-tray icons, and tooltips. Depth-24 sources
+                        // pass through `sample_view`'s α=ONE swizzle so the
+                        // shader sees α=1 from them regardless of the BGRA8
+                        // padding byte — that's the scene-α fix above.
+                        alpha_passthrough: true,
+                    });
+                    emitted_any = true;
+                }
+                if emitted_any {
+                    sampled_ids.push(source_id);
+                    if let Some(snap) = store.peek_presentation_damage(source_id) {
+                        for r in snap.region.rects() {
+                            add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
+                        }
+                        snapshots.push(snap);
+                    }
                 }
             }
         } else {
@@ -2414,6 +2475,7 @@ fn emit_window_subtree(
             abs_y,
             store,
             windows_v2,
+            shape_bounding,
             layout_x0,
             layout_y0,
             layout_w,
@@ -3429,6 +3491,94 @@ mod tests {
             .find(|d| d.dst_size[0] == 40.0 && d.dst_size[1] == 30.0)
             .expect("child draw present");
         assert_eq!(child.dst_origin, [60.0, 80.0]);
+    }
+
+    /// SHAPE bounding region clips the window's scene draw. Marco
+    /// uses `SHAPE-Request: Rectangles destination=Bounding` to set
+    /// a rounded-corner mask on frame windows; without honouring it
+    /// the scene paints the full rectangle and shows the scanout
+    /// clear colour (black) in the corners instead of the layer
+    /// below — diagnosed 2026-05-30 on non-composited MATE.
+    #[test]
+    fn build_scene_clips_window_to_shape_bounding() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Top-level @ (50, 60), 200×100.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Bounding mask: a single sub-rect inset (10, 14) from the
+        // window's top-left, 180×80 — analogous to one of marco's
+        // rounded-corner approximation strips.
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 10,
+                y: 14,
+                width: 180,
+                height: 80,
+            }],
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+        );
+        let scene = built.scene;
+
+        // Exactly one draw for this window, clipped to the bounding
+        // rect — NOT a full-window 200×100 draw.
+        let window_draws: Vec<_> = scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size != [200.0, 100.0])
+            .collect();
+        assert_eq!(
+            window_draws.len(),
+            1,
+            "expected one draw per bounding rect, got {}: {:?}",
+            scene.draws.len(),
+            scene.draws,
+        );
+        let d = window_draws[0];
+        // dst: window absolute origin + bounding-rect offset.
+        assert_eq!(d.dst_origin, [60.0, 74.0], "dst_origin = (50+10, 60+14)");
+        assert_eq!(d.dst_size, [180.0, 80.0], "dst_size = bounding rect");
+        // src UV: the sub-region of the window's texture that
+        // corresponds to the bounding rect.
+        assert!(
+            (d.src_origin[0] - 10.0 / 200.0).abs() < 1e-5
+                && (d.src_origin[1] - 14.0 / 100.0).abs() < 1e-5,
+            "src_origin = (10/200, 14/100), got {:?}",
+            d.src_origin,
+        );
+        assert!(
+            (d.src_size[0] - 180.0 / 200.0).abs() < 1e-5
+                && (d.src_size[1] - 80.0 / 100.0).abs() < 1e-5,
+            "src_size = (180/200, 80/100), got {:?}",
+            d.src_size,
+        );
     }
 
     /// Stage 3f.6 — unmapped parent hides the entire subtree per
