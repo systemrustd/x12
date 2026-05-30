@@ -5117,24 +5117,35 @@ pub(crate) fn apply_dpms_transition(
     new_level: u8,
 ) {
     let old = state.dpms.power_level;
-    if new_level == old {
-        // No-op transition. Don't spam logs on these (we hit the same-
-        // binary-state branch frequently on the wake path while idle is
-        // small).
-        return;
+    // ALWAYS call the backend, even when new_level == old. Matches Xorg
+    // DPMSSet (dpms.c:262-293), which gates only the notify on level
+    // change but always runs the per-screen DPMS hook. Two reasons this
+    // matters:
+    //   (1) Recovery via reissue. If a previous transition advanced
+    //       state.dpms.power_level but the backend errored (per the
+    //       error contract, state advances anyway), a client can send
+    //       DPMSForceLevel(same_level) to retry. The KMS backend's
+    //       kms_outputs_active guard short-circuits idempotently when
+    //       state IS consistent, and re-attempts when desynced.
+    //   (2) Spam suppression is already handled at the backend level:
+    //       KmsBackendV2::set_dpms_power early-returns when want_active
+    //       equals self.kms_outputs_active.
+    if new_level != old {
+        log::info!(
+            "dpms: apply_dpms_transition {old} → {new_level} (enabled={}, kms_capable={})",
+            state.dpms.enabled,
+            state.dpms.kms_capable,
+        );
     }
-    log::info!(
-        "dpms: apply_dpms_transition {old} → {new_level} (enabled={}, kms_capable={})",
-        state.dpms.enabled,
-        state.dpms.kms_capable,
-    );
     state.dpms.power_level = new_level;
     if let Err(e) = backend.set_dpms_power(new_level) {
         log::error!("set_dpms_power({new_level}) failed: {e}");
         // Intentionally swallowed: state still advances. See spec
         // "Backend hook / Error contract".
     }
-    emit_dpms_notify(state);
+    if new_level != old {
+        emit_dpms_notify(state);
+    }
 }
 
 /// Fan a `DPMSInfoNotify` GenericEvent out to every client

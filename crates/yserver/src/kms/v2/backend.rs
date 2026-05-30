@@ -11917,23 +11917,35 @@ impl Backend for KmsBackendV2 {
             //    first subsequent atomic page-flip then EINVALs because
             //    the kernel sees a stale plane→CRTC reference. See
             //    project_einval_atomic_commit_storm_wedge memory entry.
+            //
+            // ALWAYS run rearm_cursor + wake_for_damage regardless of
+            // dpms_set_outputs_active's result. That helper is best-
+            // effort: it returns the FIRST per-output failure but keeps
+            // attempting the rest, so a partial-success scenario (one
+            // output came up, another didn't) returns Err — but the
+            // outputs that DID come up still need their cursor plane
+            // rebound and damage queued. Cache flip is conservative —
+            // only mark fully-on if every output succeeded; on partial
+            // failure, the next set_dpms_power(On) retry sees
+            // kms_outputs_active=false and re-attempts (idempotent on
+            // the outputs that already came up).
             let res = self.platform.dpms_set_outputs_active(true);
+            let (hot_x, hot_y) = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid))
+                .map(|rec| (rec.hot_x, rec.hot_y))
+                .unwrap_or((0, 0));
+            #[allow(clippy::cast_possible_truncation)]
+            let cx = self.core.cursor_x as i32;
+            #[allow(clippy::cast_possible_truncation)]
+            let cy = self.core.cursor_y as i32;
+            log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
+            self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            // Outputs were dark; any incremental damage tracking is
+            // stale. Force a fresh full frame on the next composite tick.
+            self.scene.wake_for_damage();
             if res.is_ok() {
                 self.kms_outputs_active = true;
-                let (hot_x, hot_y) = self
-                    .effective_cursor_xid
-                    .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| (rec.hot_x, rec.hot_y))
-                    .unwrap_or((0, 0));
-                #[allow(clippy::cast_possible_truncation)]
-                let cx = self.core.cursor_x as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let cy = self.core.cursor_y as i32;
-                log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
-                self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
-                // Outputs were dark; any incremental damage tracking is
-                // stale. Force a fresh full frame on the next composite tick.
-                self.scene.wake_for_damage();
             }
             res
         } else {
