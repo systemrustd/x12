@@ -221,6 +221,94 @@ impl DpmsState {
     }
 }
 
+/// Activation state of the screensaver. `Cycle` is used only as the
+/// `notify_state` argument to `emit_screen_saver_notify` from the
+/// periodic cycle path; it never appears in
+/// `ScreenSaverState.active`, which only holds `Off` or `On`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ScreenSaverActive {
+    Off,
+    On,
+    Cycle,
+}
+
+/// Global MIT-SCREEN-SAVER state. Mirrors Xorg's per-server (not
+/// per-screen) saver data model. The idle clock lives on `DpmsState`
+/// (`last_activity`) — both extensions read the same "time of last
+/// input" baseline.
+#[derive(Debug, Clone)]
+pub struct ScreenSaverState {
+    /// `SetScreenSaver` `timeout` field, in milliseconds. 0 = idle
+    /// timer disabled.
+    pub timeout_ms: u32,
+    /// `SetScreenSaver` `interval` field. We don't implement Internal
+    /// saver tiling, but `GetScreenSaver` echoes the stored value and
+    /// `interval_ms` drives the `ScreenSaverNotify(state=Cycle)` re-fire
+    /// while active.
+    pub interval_ms: u32,
+    /// Echo-only — `GetScreenSaver` round-trip. No behavioural effect.
+    pub prefer_blanking: bool,
+    /// Echo-only — `GetScreenSaver` round-trip.
+    pub allow_exposures: bool,
+
+    /// Current activation. Holds only `Off` / `On`; never `Cycle`.
+    pub active: ScreenSaverActive,
+    /// True when the most recent transition came from
+    /// `ForceScreenSaver` or from DPMS→SS coupling. Mirrors the
+    /// `forced` byte on `ScreenSaverNotify` wire events.
+    pub forced: bool,
+
+    /// Per-client `SelectInput` mask. OR of `SCREEN_SAVER_NOTIFY_MASK`
+    /// (0x01) and `SCREEN_SAVER_CYCLE_MASK` (0x02). Xorg's
+    /// `ProcScreenSaverSelectInput` (`saver.c:695-713`) does NOT
+    /// validate bits — any value is stored verbatim; only the two
+    /// mask bits gate delivery. `mask == 0` removes the entry.
+    /// QueryInfo's `event_mask` reply field is the CALLING client's
+    /// mask (`saver.c:220-231`), not the union.
+    pub selected_by: HashMap<ClientId, u32>,
+
+    /// Per-client outstanding `Suspend(true)` count. Effective
+    /// "suspended" = `!suspend_counts.is_empty()`. `Suspend(false)`
+    /// decrements saturating to 0 (matches Xorg's silent
+    /// `FreeResource` on spurious free); on hitting 0 the entry is
+    /// dropped. `process_disconnect` drops the entry entirely.
+    pub suspend_counts: HashMap<ClientId, u32>,
+
+    /// Instant the next `ScreenSaverNotify(state=Cycle)` should fire.
+    /// Set to `Some(now + interval_ms)` whenever `active` transitions
+    /// to `On` (when `interval_ms > 0`); advanced each cycle fire;
+    /// cleared when `active` returns to `Off`. Mirrors Xorg
+    /// `WaitFor.c:473-476`.
+    pub next_cycle: Option<Instant>,
+}
+
+impl ScreenSaverState {
+    /// Defaults match Xorg `dix/globals.c:96-99`:
+    /// `defaultScreenSaverTime` = `defaultScreenSaverInterval` = 600s,
+    /// `defaultScreenSaverBlanking = PreferBlanking`,
+    /// `defaultScreenSaverAllowExposures = AllowExposures`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            timeout_ms: 600_000,
+            interval_ms: 600_000,
+            prefer_blanking: true,
+            allow_exposures: true,
+            active: ScreenSaverActive::Off,
+            forced: false,
+            selected_by: HashMap::new(),
+            suspend_counts: HashMap::new(),
+            next_cycle: None,
+        }
+    }
+}
+
+impl Default for ScreenSaverState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-window XComposite redirect record stored in
 /// [`ServerState::composite_redirects`]. The `owner` is the client
 /// that issued the `RedirectWindow` / `RedirectSubwindows` — used
@@ -352,6 +440,8 @@ pub struct ServerState {
     pub repeat_state: Option<KeyRepeatState>,
     /// Global DPMS extension state (power management).
     pub dpms: DpmsState,
+    /// MIT-SCREEN-SAVER extension state.
+    pub screensaver: ScreenSaverState,
     /// Per-client close-down mode set by `SetCloseDownMode` (opcode 112).
     /// Absent / 0 = Destroy (default); 1 = RetainPermanent; 2 = RetainTemporary.
     /// Only non-zero entries are stored. Read at disconnect time to decide
@@ -496,6 +586,7 @@ impl ServerState {
             sync_pending_awaits: Vec::new(),
             repeat_state: None,
             dpms: DpmsState::new(false),
+            screensaver: ScreenSaverState::new(),
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
             scroll_axis_value: [0; 2],
@@ -536,11 +627,20 @@ impl ServerState {
     /// Earliest instant a DPMS transition could fire. Picks the
     /// smallest non-zero timeout strictly above the current level.
     /// Returns `None` when DPMS is off (either `!enabled` or
-    /// `!kms_capable`), when there is no higher level to reach, or
-    /// when every higher level's timeout is zero (disabled).
+    /// `!kms_capable`), when a client has suspended via
+    /// `XScreenSaverSuspend` (Xorg `WaitFor.c:519` unified-timer rule),
+    /// when there is no higher level to reach, or when every higher
+    /// level's timeout is zero (disabled).
     #[must_use]
     pub fn dpms_transition_deadline(&self) -> Option<std::time::Instant> {
         if !self.dpms.enabled || !self.dpms.kms_capable {
+            return None;
+        }
+        // Xorg WaitFor.c:519 — single timer drives both SS and DPMS,
+        // not armed when screenSaverSuspended. XScreenSaverSuspend
+        // inhibits BOTH the SS timer and the DPMS cascade (mpv /
+        // Firefox / vlc rely on this for fullscreen-video-inhibit).
+        if !self.screensaver.suspend_counts.is_empty() {
             return None;
         }
         let mut next: Option<u32> = None;
@@ -560,6 +660,43 @@ impl ServerState {
             push(self.dpms.off_ms);
         }
         Some(self.dpms.last_activity + std::time::Duration::from_millis(u64::from(next?)))
+    }
+
+    /// Instant the SS idle timer should fire next. None when:
+    /// - the timer is disabled (`timeout_ms == 0`),
+    /// - a client has suspended via `XScreenSaverSuspend`,
+    /// - SS is already active, or
+    /// - DPMS has already blanked the panel (Xorg `WaitFor.c:457` —
+    ///   the DPMS→SS coupling already handled it; firing the idle
+    ///   timer now would be a redundant no-op transition).
+    #[must_use]
+    pub fn screensaver_idle_deadline(&self) -> Option<std::time::Instant> {
+        if self.screensaver.timeout_ms == 0
+            || !self.screensaver.suspend_counts.is_empty()
+            || matches!(self.screensaver.active, ScreenSaverActive::On)
+            || self.dpms.power_level != 0
+        {
+            return None;
+        }
+        Some(
+            self.dpms.last_activity
+                + std::time::Duration::from_millis(u64::from(self.screensaver.timeout_ms)),
+        )
+    }
+
+    /// Instant the next `ScreenSaverNotify(state=Cycle)` should fire.
+    /// None when SS is Off, when a client has suspended, when DPMS
+    /// has blanked, or when `next_cycle` is `None` (no cycle
+    /// scheduled — `interval_ms == 0` at the activation transition).
+    #[must_use]
+    pub fn screensaver_cycle_deadline(&self) -> Option<std::time::Instant> {
+        if !matches!(self.screensaver.active, ScreenSaverActive::On)
+            || !self.screensaver.suspend_counts.is_empty()
+            || self.dpms.power_level != 0
+        {
+            return None;
+        }
+        self.screensaver.next_cycle
     }
 }
 
@@ -3470,5 +3607,94 @@ mod tests {
         assert_eq!(next_dpms_level(1, 100_000, &state.dpms), 1);
         // Already at Off (max level): cascade has nowhere to go.
         assert_eq!(next_dpms_level(3, 999_999_999, &state.dpms), 3);
+    }
+
+    #[test]
+    fn screensaver_idle_deadline_none_when_timeout_zero() {
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 0;
+        assert!(state.screensaver_idle_deadline().is_none());
+    }
+
+    #[test]
+    fn screensaver_idle_deadline_none_when_suspended() {
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 60_000;
+        state.screensaver.suspend_counts.insert(ClientId(7), 1);
+        assert!(state.screensaver_idle_deadline().is_none());
+    }
+
+    #[test]
+    fn dpms_transition_deadline_none_when_screensaver_suspended() {
+        // Xorg WaitFor.c:519 — one timer drives BOTH SS and DPMS, and
+        // it isn't armed when screenSaverSuspended. XScreenSaverSuspend
+        // therefore inhibits DPMS firing, which mpv/Firefox rely on.
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.standby_ms = 300_000;
+        state.screensaver.suspend_counts.insert(ClientId(99), 1);
+        assert!(state.dpms_transition_deadline().is_none());
+    }
+
+    #[test]
+    fn screensaver_idle_deadline_none_when_active() {
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 60_000;
+        state.screensaver.active = ScreenSaverActive::On;
+        assert!(state.screensaver_idle_deadline().is_none());
+    }
+
+    #[test]
+    fn screensaver_idle_deadline_none_when_dpms_blanked() {
+        // Xorg WaitFor.c:457 — when DPMS already blanked the panel
+        // the SS idle timer is suppressed (DPMS→SS coupling will
+        // have already activated SS on the DPMS transition).
+        let mut state = ServerState::new();
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.power_level = 1;
+        assert!(state.screensaver_idle_deadline().is_none());
+    }
+
+    #[test]
+    fn screensaver_idle_deadline_returns_last_activity_plus_timeout() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        let baseline = Instant::now();
+        state.dpms.last_activity = baseline;
+        state.screensaver.timeout_ms = 60_000;
+        assert_eq!(
+            state.screensaver_idle_deadline(),
+            Some(baseline + Duration::from_millis(60_000))
+        );
+    }
+
+    #[test]
+    fn screensaver_cycle_deadline_none_when_off() {
+        let state = ServerState::new();
+        assert!(state.screensaver_cycle_deadline().is_none());
+    }
+
+    #[test]
+    fn screensaver_cycle_deadline_some_when_on() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.interval_ms = 600_000;
+        let fire_at = Instant::now() + Duration::from_millis(600_000);
+        state.screensaver.next_cycle = Some(fire_at);
+        assert_eq!(state.screensaver_cycle_deadline(), Some(fire_at));
+    }
+
+    #[test]
+    fn screensaver_cycle_deadline_propagates_next_cycle_none() {
+        // The invariant "interval_ms == 0 ⇒ next_cycle is None" lives
+        // in the activation transition (Task 3); here we only verify
+        // the deadline helper propagates a None `next_cycle` through.
+        let mut state = ServerState::new();
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.interval_ms = 0;
+        state.screensaver.next_cycle = None;
+        assert!(state.screensaver_cycle_deadline().is_none());
     }
 }
