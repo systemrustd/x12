@@ -1435,14 +1435,20 @@ Append one more test in `key_fanout.rs`'s test module covering per-device IDLETI
         // even if `per_device_last_activity[3]` has no entry yet (the
         // first-input case). Without the fallback-to-global fix, the
         // computed `prior_device` would be 0 and the trigger
-        // `old > wait_value && new <= wait_value` would not hold.
+        // `old > wait_value && new <= wait_value` would not hold —
+        // no AlarmNotify would land on the wire.
+        //
+        // Primary assertion is AlarmNotify (type=84) on the client's
+        // outbound stream; cache + state are secondary checks.
         use std::time::Duration;
         use yserver_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
-        // Deliberately do NOT insert into per_device_last_activity[3] —
-        // simulate the first-input-for-this-device case.
-        assert!(state.per_device_last_activity.get(&3).is_none());
+        assert!(
+            state.per_device_last_activity.get(&3).is_none(),
+            "test precondition: no per-device entry"
+        );
 
         let alarm_id = 0x3000;
         state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
@@ -1451,15 +1457,26 @@ Append one more test in `key_fanout.rs`'s test module covering per-device IDLETI
             wait_value: 60_000,
             delta: 0,
             test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
-            events: false,
+            events: true, // load-bearing: only events=true reaches the wire
             state: x11sync::ALARM_STATE_ACTIVE,
         });
         let mut backend = crate::backend::recording::RecordingBackend::default();
 
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
 
-        // Alarm stays Active (Transition + delta=0 — Task 2 fix), and the
-        // per-device last_evaluated cache should reflect post-wake idle = 0.
+        // PRIMARY: AlarmNotify event type = SYNC_FIRST_EVENT(83) +
+        // ALARM_NOTIFY_KIND(1) = 84 must appear in the client stream.
+        // Without the fallback-to-global fix, the prior unwrap_or(0)
+        // computed prior_device=0 → no Negative transition fired → no
+        // AlarmNotify on the wire.
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.iter().any(|&b| b == 84),
+            "AlarmNotify (type=84) must reach client; got {:?}",
+            bytes
+        );
+        // SECONDARY: alarm stays Active (Transition + delta=0 — Task 2),
+        // cache reflects post-wake idle = 0.
         assert_eq!(
             state.sync_alarms[&alarm_id].state,
             x11sync::ALARM_STATE_ACTIVE
