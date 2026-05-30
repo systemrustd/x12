@@ -717,7 +717,7 @@ impl ServerState {
             // contributes a future-instant deadline. They re-enter the
             // deadline only after an input event resets `baseline`, at
             // which point `current_idle < wait_value` again.
-            #[allow(clippy::cast_sign_loss)]
+            #[allow(clippy::cast_possible_truncation)]
             let current_idle_ms = now
                 .duration_since(baseline)
                 .as_millis()
@@ -3926,6 +3926,37 @@ mod tests {
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_ignores_quiescent_alarm_whose_threshold_already_passed() {
+        // Regression for the quiescent-state skip: a PositiveTransition +
+        // delta=0 alarm that has already fired stays Active but is
+        // quiescent — it doesn't re-fire until the counter drops below
+        // wait_value and crosses back up (which requires input). Such an
+        // alarm must NOT contribute a past-instant to the poll-deadline
+        // (which would spin the poll loop with Duration::ZERO).
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        // Already idle for 90s; alarm threshold is 60s — quiescent.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        state.sync_alarms.insert(
+            1,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        assert!(
+            state.idletime_alarm_deadline().is_none(),
+            "quiescent alarm (current_idle >= wait_value) must not contribute a deadline"
+        );
     }
 
     #[test]
