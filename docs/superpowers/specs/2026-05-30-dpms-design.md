@@ -206,22 +206,51 @@ Defaults are the ynest behaviour. yserver-hw overrides both:
   → outputs active; `Standby`/`Suspend`/`Off` → outputs inactive — and
   only act when the binary state changes. Track a cached
   `kms_outputs_active: bool` on the backend.
-  - **inactive transition** (any non-On from active): call
-    `drm::modeset::disable_output(device, output)` for every output. This
-    is the existing helper at
-    `crates/yserver/src/drm/modeset.rs:516-535` and already does the
-    right atomic commit (plane `FB_ID=0`, plane `CRTC_ID=0`, CRTC
-    `ACTIVE=0`, CRTC `MODE_ID=0`, connector `CRTC_ID=0`) under
-    `ALLOW_MODESET`.
-  - **active transition** (On from inactive): call
-    `drm::modeset::commit_modeset(device, output, fb_id)` for every
-    output (`crates/yserver/src/drm/modeset.rs:537-602`), re-establishing
-    `MODE_ID`, plane `FB_ID`/`CRTC_ID`, `ACTIVE=1`, plane SRC/CRTC
-    rects. After all outputs are back up, mark the scene fully dirty so
-    the next compositing tick produces a fresh frame, and resume normal
-    page-flipping.
+
+  **Critical: must mirror `KmsBackendV2::run_suspend` and
+  `run_resume`'s drain/rearm sequence around the actual
+  disable/commit. The minimal "just call disable_output / commit_modeset"
+  shape originally specified is INSUFFICIENT — it leaves the cursor
+  plane bound to a now-disabled CRTC and orphans in-flight page-flips,
+  producing an EINVAL storm on the first page-flip after wake
+  ([[project_einval_atomic_commit_storm_wedge]]). The DPMS off/on
+  sequence is effectively a "soft suspend/resume" that doesn't touch
+  libseat but otherwise needs the same care.**
+
+  - **inactive transition** (any non-On from active), in order:
+    1. `self.platform.wait_idle_bounded()` — let in-flight GPU work
+       finish before the kernel disables the CRTC.
+    2. `self.scene.drain_all(&mut self.platform)` — drain pending
+       page-flip acks, release pool slots, **reset per-output cursor
+       state** (this is the cursor-plane-hide step that prevents EINVAL
+       on the next wake). Mirrors `run_suspend:3551`.
+    3. `self.platform.reset_scanout_bos_for_suspend()` — force every BO
+       back to Free; otherwise the orphaned Pending/OnScreen entries
+       leak each cycle. Mirrors `run_suspend:3563`.
+    4. `drm::modeset::disable_output(device, output)` for each output
+       (`crates/yserver/src/drm/modeset.rs:516-535`).
+  - **active transition** (On from inactive), in order:
+    1. `drm::modeset::commit_modeset(device, output, fb_id)` for each
+       output (`crates/yserver/src/drm/modeset.rs:537-602`),
+       re-establishing `MODE_ID`, plane `FB_ID`/`CRTC_ID`, `ACTIVE=1`,
+       plane SRC/CRTC rects.
+    2. `self.platform.rearm_cursor(hot_x, hot_y, cx, cy)` — re-bind the
+       cursor plane to each visible CRTC via the legacy ioctl. Mirrors
+       `run_resume:3661-3667`. Use the same hotspot+position fetch as
+       `run_resume`: `self.effective_cursor_xid →
+       self.cursor_records.get(&xid).map(|r| (r.hot_x, r.hot_y))` plus
+       `self.core.cursor_x/y as i32`.
+    3. `self.scene.wake_for_damage()` so the next composite tick paints
+       a fresh full frame.
   - **same binary state** (e.g. Standby → Suspend, both inactive): no
-    KMS commit; only the in-memory `power_level` and notify advance.
+    KMS work; only the in-memory `power_level` and notify advance.
+
+  **Borrow-check consequence:** the orchestration accesses `platform`,
+  `scene`, AND `core` (for cursor pos) on the same `&mut self`. The
+  cleanest restructure is to keep this in `KmsBackendV2::set_dpms_power`
+  itself (not buried in `PlatformBackend`). The PlatformBackend can
+  still own the per-output disable_output / commit_modeset loops; the
+  backend method orchestrates around them.
 
 **Why not the connector `"DPMS"` property?** Xorg modesetting's atomic
 path explicitly does *not* set the connector DPMS property — it
