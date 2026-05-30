@@ -22,6 +22,7 @@ pub mod present;
 pub mod randr;
 pub mod request_lengths;
 pub mod request_swap;
+pub mod screensaver;
 pub mod shape;
 pub mod sync;
 pub mod wire_swap;
