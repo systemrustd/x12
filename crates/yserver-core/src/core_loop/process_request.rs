@@ -5236,13 +5236,26 @@ fn handle_dpms_request(
             // Zero = "this level disabled". Among non-zero values
             // require off >= suspend >= standby. Xorg `:370-376`.
             let nonzero_violates = |a: u16, b: u16| a != 0 && b != 0 && a > b;
-            if nonzero_violates(suspend, off) || nonzero_violates(standby, suspend) {
+            // Report the value being compared against (the one that
+            // "should have been bigger"), matching Xorg dpms.c:373.
+            if nonzero_violates(suspend, off) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
-                    0,
+                    u32::from(off),
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            }
+            if nonzero_violates(standby, suspend) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(suspend),
                     u16::from(header.data),
                     DPMS_MAJOR_OPCODE,
                 );
@@ -5295,7 +5308,7 @@ fn handle_dpms_request(
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
-                    0,
+                    u32::from(level),
                     u16::from(header.data),
                     DPMS_MAJOR_OPCODE,
                 );
@@ -5333,7 +5346,7 @@ fn handle_dpms_request(
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
-                    0,
+                    mask,
                     u16::from(header.data),
                     DPMS_MAJOR_OPCODE,
                 );
@@ -24925,6 +24938,20 @@ mod tests {
         assert_eq!(notifies, 2, "Disable from Off must emit two XGE notifies");
         assert!(!state.dpms.enabled);
         assert_eq!(state.dpms.power_level, 0);
+        // Verify ordering: byte 18 of each event is the `state`
+        // (enabled) field. The first event fires from
+        // apply_dpms_transition before `enabled` is cleared, so it
+        // should show enabled=1; the second event fires after the
+        // enable flip, so it should show enabled=0.
+        assert_eq!(
+            bytes[18], 1,
+            "first notify is the level-change notify; enabled still true"
+        );
+        assert_eq!(
+            bytes[32 + 18],
+            0,
+            "second notify is the enable-change notify; enabled now false"
+        );
     }
 
     #[test]
@@ -24982,6 +25009,66 @@ mod tests {
         assert!(
             !bytes.iter().any(|b| *b == 35),
             "no notify when state didn't change"
+        );
+    }
+
+    #[test]
+    fn dpms_set_timeouts_rejects_inverted_ordering() {
+        // off=10 but suspend=20 violates the non-zero
+        // off >= suspend ordering — must produce BadValue.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 134,
+            data: 3,
+            length_units: 2,
+        }; // SetTimeouts
+        // Body: standby=30, suspend=20, off=10, pad=0 — clearly out of order.
+        let body = [30u8, 0, 20, 0, 10, 0, 0, 0];
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "reply is an X11 error");
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        // Timeouts must NOT have been stored.
+        assert_eq!(state.dpms.standby_ms, 600_000);
+        assert_eq!(state.dpms.suspend_ms, 600_000);
+        assert_eq!(state.dpms.off_ms, 600_000);
+    }
+
+    #[test]
+    fn dpms_select_input_zero_removes_subscriber() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-seed: client is already subscribed.
+        state.dpms.selected_by.insert(ClientId(1));
+        assert!(state.dpms.selected_by.contains(&ClientId(1)));
+
+        let header = RequestHeader {
+            opcode: 134,
+            data: 8,
+            length_units: 2,
+        }; // SelectInput
+        let body = [0u8, 0, 0, 0]; // mask = 0 → unsubscribe
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        assert!(
+            !state.dpms.selected_by.contains(&ClientId(1)),
+            "mask=0 must remove the client from selected_by"
         );
     }
 }
