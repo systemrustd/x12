@@ -78,9 +78,10 @@ No errors of its own; reuses core `BadAccess` / `BadValue`.
 20-31 pad (12 bytes)
 ```
 
-Event fires whenever `screensaver.active` changes. We never emit `Cycle`
-(no Internal saver) and never emit `Disabled` as an event (`Disabled` is
-a QueryInfo-state-only report — Xorg matches).
+Event fires whenever `screensaver.active` changes (state=Off or On)
+AND every `interval_ms` while active (state=Cycle, see "Cycle" in §4).
+`Disabled` is never sent as a notify event — it is a QueryInfo-only
+state report (Xorg `saver.c:381-414`).
 
 ### State model
 
@@ -826,7 +827,7 @@ Client disconnect:
 10b. `screensaver_cycle_deadline_some_when_on` — after `apply_screen_saver_transition(On)` with interval_ms > 0, `next_cycle` is set and deadline returns it.
 10c. `screensaver_cycle_deadline_none_when_interval_zero` — even with `active=On`, deadline is None when `interval_ms=0` (no Cycle events).
 
-**`crates/yserver-core/src/core_loop/process_request.rs::tests`** (8 tests):
+**`crates/yserver-core/src/core_loop/process_request.rs::tests`** (16 tests, covering DPMS↔SS coupling, ForceScreenSaver, Suspend, the SetAttributes/UnsetAttributes BadAccess/Success split, SelectInput-accepts-unknown-bits, and Cycle event delivery):
 
 11. `dpms_off_drives_screensaver_on_with_forced_true` — subscribed client gets ScreenSaverNotify with state=On, forced=1 after `apply_dpms_transition(state, backend, OFF)`.
 12. `dpms_on_drives_screensaver_off_with_forced_false_and_no_activity_reset` — reverse direction: `apply_dpms_transition(state, backend, ON)` with SS=On fires SS notify state=Off, **forced=0** (non-FORCER path, Xorg `dpms.c:275-278` + `window.c:3187-3193`). `last_activity` is NOT reset by the coupling itself.
