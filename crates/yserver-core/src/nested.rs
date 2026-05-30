@@ -15,7 +15,10 @@ use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
 use crate::{
-    backend::WindowHandle, host_x11::HostX11Backend, resources::ROOT_WINDOW, server::ServerState,
+    backend::{Backend, WindowHandle},
+    host_x11::HostX11Backend,
+    resources::ROOT_WINDOW,
+    server::ServerState,
 };
 
 const RANDR_MAJOR_OPCODE: u8 = 128;
