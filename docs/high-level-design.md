@@ -177,9 +177,9 @@ pixmaps, cursors, graphics contexts, drawables, atoms,
 properties, selections, hierarchy, mapping, focus, grabs,
 pointer/keyboard events, crossings, event masks.
 
-Extensions implemented: BIG-REQUESTS, COMPOSITE, DAMAGE, DRI3,
-Generic Event Extension, GLX (modern direct-rendering only via
-DRI3/Present), MIT-SHM, PRESENT, RANDR, RENDER, SHAPE, SYNC,
+Extensions implemented: BIG-REQUESTS, COMPOSITE, DAMAGE, DPMS,
+DRI3, Generic Event Extension, GLX (modern direct-rendering only
+via DRI3/Present), MIT-SHM, PRESENT, RANDR, RENDER, SHAPE, SYNC,
 X-Resource, XFIXES, XInput2, XKB (XKEYBOARD), XTEST. Coverage
 is what real clients actually drive — extension versions and
 capability sets are conservative where the implementation isn't

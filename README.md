@@ -21,6 +21,7 @@ We support the following extensions:
 - BIG-REQUESTS
 - Composite
 - DAMAGE
+- DPMS
 - DRI3
 - GLX
 - Generic Event Extension
