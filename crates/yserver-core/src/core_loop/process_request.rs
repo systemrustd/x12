@@ -379,6 +379,8 @@ pub fn process_request(
         128 => handle_randr_request(state, client_id, sequence, header, body),
         // ── RENDER extension dispatcher ──
         133 => handle_render_request(state, backend, origin, client_id, sequence, header, body),
+        // ── DPMS extension dispatcher ──
+        134 => handle_dpms_request(state, backend, client_id, sequence, header, body),
         // ── XTEST extension dispatcher ──
         146 => handle_xtest_request(state, backend, client_id, sequence, header, body),
         // ── DRI3 extension dispatcher ──
@@ -5162,6 +5164,199 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     for cid in dropped {
         state.dpms.selected_by.remove(&cid);
     }
+}
+
+fn handle_dpms_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, dpms as x11dpms};
+    const DPMS_MAJOR_OPCODE: u8 = 134;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    debug!(
+        "client {} #{} DPMS::minor={} body_len={}",
+        client_id.0,
+        sequence.0,
+        minor,
+        body.len()
+    );
+    match minor {
+        x11dpms::GET_VERSION => {
+            let reply = x11dpms::encode_get_version_reply(
+                byte_order,
+                sequence,
+                x11dpms::MAJOR_VERSION,
+                x11dpms::MINOR_VERSION,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dpms::CAPABLE => {
+            let reply = x11dpms::encode_capable_reply(byte_order, sequence, state.dpms.kms_capable);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dpms::GET_TIMEOUTS => {
+            #[allow(clippy::cast_possible_truncation)]
+            let s = (state.dpms.standby_ms / 1000) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let su = (state.dpms.suspend_ms / 1000) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let o = (state.dpms.off_ms / 1000) as u16;
+            let reply = x11dpms::encode_get_timeouts_reply(byte_order, sequence, s, su, o);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dpms::SET_TIMEOUTS => {
+            let Some((standby, suspend, off)) = x11dpms::parse_set_timeouts_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            };
+            // Zero = "this level disabled". Among non-zero values
+            // require off >= suspend >= standby. Xorg `:370-376`.
+            let nonzero_violates = |a: u16, b: u16| a != 0 && b != 0 && a > b;
+            if nonzero_violates(suspend, off) || nonzero_violates(standby, suspend) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            }
+            state.dpms.standby_ms = u32::from(standby) * 1000;
+            state.dpms.suspend_ms = u32::from(suspend) * 1000;
+            state.dpms.off_ms = u32::from(off) * 1000;
+        }
+        x11dpms::ENABLE => {
+            if !state.dpms.enabled {
+                state.dpms.enabled = true;
+                emit_dpms_notify(state);
+            }
+        }
+        x11dpms::DISABLE => {
+            let was_enabled = state.dpms.enabled;
+            // Force level back to On (calls notify iff level changed).
+            apply_dpms_transition(state, backend, 0);
+            if was_enabled {
+                state.dpms.enabled = false;
+                emit_dpms_notify(state);
+            }
+        }
+        x11dpms::FORCE_LEVEL => {
+            if !state.dpms.enabled {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            }
+            let Some(level) = x11dpms::parse_force_level_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            };
+            if level > 3 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            apply_dpms_transition(state, backend, level as u8);
+        }
+        x11dpms::INFO => {
+            let reply = x11dpms::encode_info_reply(
+                byte_order,
+                sequence,
+                u16::from(state.dpms.power_level),
+                state.dpms.enabled,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dpms::SELECT_INPUT => {
+            let Some(mask) = x11dpms::parse_select_input_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            };
+            if mask & !x11dpms::DPMS_INFO_NOTIFY_MASK != 0 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    DPMS_MAJOR_OPCODE,
+                );
+            }
+            if mask & x11dpms::DPMS_INFO_NOTIFY_MASK != 0 {
+                state.dpms.selected_by.insert(client_id);
+            } else {
+                state.dpms.selected_by.remove(&client_id);
+            }
+        }
+        _ => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(header.data),
+                DPMS_MAJOR_OPCODE,
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15171,7 +15366,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        backend::recording::RecordingBackend,
+        backend::recording::{RecordedCall, RecordingBackend},
         resources::ROOT_WINDOW,
         server::{ClientState, ServerState},
     };
@@ -24629,6 +24824,164 @@ mod tests {
             "expected SetWindowSceneParticipation(_, true) after Manual → Automatic flip; \
              got {:?}",
             *calls,
+        );
+    }
+
+    #[test]
+    fn dpms_force_level_rejects_when_disabled() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = false;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 134,
+            data: 6,
+            length_units: 2,
+        };
+        let body = [3u8, 0, 0, 0]; // level=Off
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        let calls = backend.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::SetDpmsPower(_))),
+            "ForceLevel must not call backend when !enabled"
+        );
+        assert_eq!(state.dpms.power_level, 0, "state unchanged on BadMatch");
+        // Error reply: byte 0 == 0 (Error), byte 1 == x11::error::BAD_MATCH.
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "reply is an X11 error");
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    }
+
+    #[test]
+    fn dpms_force_level_changes_state_and_notifies() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.selected_by.insert(ClientId(1));
+        let header = RequestHeader {
+            opcode: 134,
+            data: 6,
+            length_units: 2,
+        };
+        let body = [3u8, 0, 0, 0]; // level=Off
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        assert_eq!(state.dpms.power_level, 3);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::SetDpmsPower(3)))
+        );
+        // GenericEvent tag = 35 should appear exactly once in this client's stream.
+        let bytes = read_all_available(&mut peer);
+        let notifies = bytes.iter().filter(|&&b| b == 35).count();
+        assert_eq!(notifies, 1, "ForceLevel(Off) from On: exactly one notify");
+    }
+
+    #[test]
+    fn dpms_disable_from_off_emits_two_notifies() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3; // Off
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.selected_by.insert(ClientId(1));
+        let header = RequestHeader {
+            opcode: 134,
+            data: 5,
+            length_units: 1,
+        }; // Disable
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        );
+        // First notify: Off→On (level change). Second: enabled true→false.
+        let bytes = read_all_available(&mut peer);
+        let notifies = bytes.iter().filter(|&&b| b == 35).count();
+        assert_eq!(notifies, 2, "Disable from Off must emit two XGE notifies");
+        assert!(!state.dpms.enabled);
+        assert_eq!(state.dpms.power_level, 0);
+    }
+
+    #[test]
+    fn dpms_disable_from_on_emits_one_notify() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.selected_by.insert(ClientId(1));
+        let header = RequestHeader {
+            opcode: 134,
+            data: 5,
+            length_units: 1,
+        };
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        );
+        let bytes = read_all_available(&mut peer);
+        let notifies = bytes.iter().filter(|&&b| b == 35).count();
+        assert_eq!(
+            notifies, 1,
+            "Disable from On: only the enable-change notify fires"
+        );
+        assert!(!state.dpms.enabled);
+    }
+
+    #[test]
+    fn dpms_enable_when_already_enabled_emits_no_notify() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.selected_by.insert(ClientId(1));
+        let header = RequestHeader {
+            opcode: 134,
+            data: 4,
+            length_units: 1,
+        }; // Enable
+        let _ = handle_dpms_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        );
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            !bytes.iter().any(|b| *b == 35),
+            "no notify when state didn't change"
         );
     }
 }

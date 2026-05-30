@@ -65,6 +65,8 @@ const PRESENT_MAJOR_OPCODE: u8 = 145;
 const PRESENT_FIRST_EVENT: u8 = 0; // Present uses XGE, no sequential event codes
 const PRESENT_FIRST_ERROR: u8 = 159;
 
+const DPMS_MAJOR_OPCODE: u8 = 134;
+
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65
 const MIT_SHM_FIRST_ERROR: u8 = 160;
@@ -216,6 +218,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: PRESENT_FIRST_EVENT,
         event_count: 0, // Present uses XGE, not sequential event codes
         first_error: PRESENT_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "DPMS",
+        major_opcode: DPMS_MAJOR_OPCODE,
+        first_event: 0, // XGE — no sequential event codes
+        event_count: 0,
+        first_error: 0, // uses core BadValue / BadMatch
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },

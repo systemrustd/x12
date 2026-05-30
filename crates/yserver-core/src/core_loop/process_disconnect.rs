@@ -242,6 +242,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state
         .xkb_select_event_masks
         .retain(|(owner, _), _| *owner != client_id.0);
+    state.dpms.selected_by.remove(&client_id);
     state.button_grabs.retain(|g| g.owner != client_id);
     if state
         .pointer_grab
@@ -601,6 +602,22 @@ mod tests {
         assert_eq!(
             state.resources.resource_owner(ResourceId(0x0210_0001)),
             Some(ClientId(33)),
+        );
+    }
+
+    #[test]
+    fn disconnect_removes_client_from_dpms_selected_by() {
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        state.dpms.selected_by.insert(ClientId(7));
+        assert!(state.dpms.selected_by.contains(&ClientId(7)));
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(
+            !state.dpms.selected_by.contains(&ClientId(7)),
+            "process_disconnect must remove the client from selected_by"
         );
     }
 
