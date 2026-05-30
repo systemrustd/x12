@@ -7186,72 +7186,32 @@ impl Backend for KmsBackendV2 {
         let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
             return Ok(());
         };
-        let mut repaint_bg = false;
         let mut idx = 0;
         if value_mask & 0x01 != 0 && idx < values.len() {
             // CWBackPixmap. 0 = None / inherit-from-parent.
             let v = values[idx];
             geom.bg_pixmap = if v == 0 { None } else { Some(v) };
             idx += 1;
-            repaint_bg = true;
         }
         if value_mask & 0x02 != 0 && idx < values.len() {
             // CWBackPixel — opaque ARGB-or-XRGB pixel value.
             geom.bg_pixel = Some(values[idx]);
-            repaint_bg = true;
         }
-        if repaint_bg {
-            let _ = geom;
-            let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
-                return Ok(());
-            };
-            // Stage 4d fix — skip the eager CWA-time clear when W
-            // is under COMPOSITE redirect, EITHER directly (W has
-            // its own backing) OR via ancestor inheritance (W has
-            // no own backing but its paints resolve up the chain
-            // to a redirected ancestor's backing). The backing's
-            // content belongs to the redirected client / external
-            // compositor, not the server; routing a fill through
-            // `resolve_paint_target` here would land on that
-            // backing and wipe pixels we don't own. Two live
-            // triggers covered:
-            //
-            // - marco-with-compositing "CC turns opaque black on
-            //   drag": marco re-asserts bg_pixmap=None on every
-            //   drag-induced configure of CC, which has its own
-            //   backing. (The original Stage 4d case.)
-            // - mate-panel tray applets visible-then-disappear:
-            //   applets reparent away from root into mate-panel
-            //   sockets; they have no own backing but resolve to
-            //   mate-panel's backing via the ancestor walk. marco
-            //   churns their CWA per configure, which pre-fix wiped
-            //   the icon area on mate-panel's backing.
-            //
-            // Real X11 doesn't redraw on CWA either — the bg
-            // attribute only affects future ClearArea / Expose
-            // handling. v2's eager clear was a Stage 3f.6 over-
-            // reach; this guard is what survives of it.
-            let routes_via_redirect = self
-                .store
-                .lookup(host_xid)
-                .and_then(|leaf| {
-                    self.resolve_paint_target(host_xid)
-                        .map(|target| target.id != leaf)
-                })
-                .unwrap_or(false);
-            if !routes_via_redirect {
-                let bg_pixel = geom.bg_pixel.unwrap_or(0);
-                self.clear_window_area_with_background(
-                    host_xid,
-                    bg_pixel,
-                    geom.bg_pixmap,
-                    0,
-                    0,
-                    geom.width.max(1),
-                    geom.height.max(1),
-                )?;
-            }
-        }
+        // X11 spec: CWA's background attribute change does NOT
+        // repaint the window. The bg setting only affects future
+        // `ClearArea` / Expose handling. v2's pre-2026-05-30 eager
+        // clear here was a Stage 3f.6 over-reach: the Stage 4d
+        // guard (`routes_via_redirect`) skipped the clear for
+        // windows under COMPOSITE redirect (avoiding the
+        // "CC opaque black on drag with compositing" and
+        // "tray applets disappear" symptoms), but the
+        // non-redirected path still cleared — visible as
+        // non-composited MATE's CC sidebar going black when caja
+        // took focus over it (marco re-asserts CWA per configure;
+        // yserver wiped CC's pixmap to bg=0; GTK got no Expose so
+        // bg never repainted; widgets came back only on
+        // per-widget hover redraw). Removing the clear matches
+        // X11 in both modes.
         Ok(())
     }
 
@@ -13963,6 +13923,89 @@ mod tests {
 
         // Sanity: bg state IS stored (CWA still records the
         // values; only the eager paint is skipped).
+        let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
+        assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
+        assert_eq!(geom.bg_pixmap, None);
+    }
+
+    /// X11 spec generalisation: CWA's background attribute change
+    /// MUST NOT repaint, regardless of whether the window is under
+    /// composite redirect. The bg attribute only affects future
+    /// `ClearArea` / Expose handling. The earlier
+    /// `cwa_on_redirected_window_does_not_clear_backing` guard only
+    /// caught the redirect case; the non-redirect case still wiped
+    /// the client's storage. Live trigger (2026-05-30): non-
+    /// composited mate-control-center sidebar going black when
+    /// caja takes focus over CC — marco re-asserts CWA on CC's
+    /// client window, yserver clears its 975×600 storage to bg=0
+    /// (black), and GTK gets no Expose so the bg never repaints.
+    /// Widgets come back on hover (per-widget redraw), bg stays
+    /// black.
+    #[test]
+    fn cwa_on_non_redirected_window_does_not_clear_storage() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        let w_xid: u32 = 0x200_0001;
+        let stack_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            w_xid,
+            super::WindowGeometryV2 {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank,
+                cursor: None,
+            },
+        );
+        let w_storage = Storage::for_tests_null(
+            ash::vk::Extent2D {
+                width: 300,
+                height: 200,
+            },
+            ash::vk::Format::B8G8R8A8_UNORM,
+        );
+        let _w_id = b
+            .store
+            .allocate(w_xid, DrawableKind::Window, 24, true, w_storage)
+            .expect("alloc W");
+        // Sanity: not under redirect — paint target is the leaf
+        // itself, which is the path the existing guard fails to
+        // catch.
+        let leaf = b.store.lookup(w_xid).expect("W leaf");
+        assert!(b.store.redirected_target(leaf).is_none(), "fixture sanity");
+        let resolved = b.resolve_paint_target(w_xid).expect("resolve");
+        assert_eq!(resolved.id, leaf, "fixture sanity: paint stays at leaf");
+
+        let calls_before = b.clear_window_area_calls;
+
+        // CWBackPixmap = None (marco's per-configure churn).
+        b.change_subwindow_attributes(None, w_xid, 0x01, &[0])
+            .expect("CWA");
+        assert_eq!(
+            b.clear_window_area_calls, calls_before,
+            "CWA on a non-redirected window must not clear storage \
+             (pre-fix this fired and wiped the client's pixmap to bg=0, \
+             producing the 'CC sidebar black on focus-uncover' symptom)",
+        );
+
+        // CWBackPixel — second clear-trigger pre-fix.
+        b.change_subwindow_attributes(None, w_xid, 0x02, &[0x00FF_FFFF])
+            .expect("CWA bg_pixel");
+        assert_eq!(
+            b.clear_window_area_calls, calls_before,
+            "CWBackPixel on a non-redirected window must also skip the eager clear",
+        );
+
+        // Sanity: bg state IS still stored.
         let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
         assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
         assert_eq!(geom.bg_pixmap, None);
