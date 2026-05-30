@@ -621,7 +621,7 @@ pub trait Backend: Send {
     }
 
     /// Drive the display to a DPMS power level (`0=On, 1=Standby,
-    /// `2=Suspend, 3=Off`). `yserver-hw` collapses non-On levels to a
+    /// 2=Suspend, 3=Off`). `yserver-hw` collapses non-On levels to a
     /// single "outputs disabled" KMS state. Default is a no-op so
     /// ynest, host-X11, and recording backends remain protocol-
     /// compliant without touching the host display.
