@@ -34,10 +34,7 @@ added here is reusable when SCREEN-SAVER lands" — this spec lands it.
   `os/WaitFor.c:457`. ScreenSaver activation does NOT call `DPMSSet`.
   This is the consequential gotcha for "`xset s 60` alone won't power
   off the panel" — see "Smoke matrix" below. Matches Xorg.
-- `Cycle` events (`ScreenSaverCycleMask`). Cycle is the Internal
-  saver's per-tick periodic event; we don't have an Internal saver,
-  so we don't fire Cycle. `SelectInput(mask=CycleMask)` is accepted
-  (no `BadValue`) but no event is ever delivered.
+(none beyond the SetAttributes deviation above).
 
 **Spec reference:** `/usr/include/X11/extensions/saver.h` for constants,
 `/usr/include/X11/extensions/saverproto.h` for wire layouts.
@@ -114,16 +111,31 @@ pub struct ScreenSaverState {
     /// Xorg's per-client resource records, simpler bookkeeping). Effective
     /// "suspended" = `!suspend_counts.is_empty()`.
     pub suspend_counts: HashMap<ClientId, u32>,
+
+    /// Next time a `ScreenSaverNotify(state=Cycle)` event should fire.
+    /// Set to `Some(now + interval_ms)` whenever `active` transitions to
+    /// `On` (when `interval_ms > 0`); advanced each time the cycle event
+    /// fires. Cleared when `active` returns to `Off`. Mirrors Xorg's
+    /// `WaitFor.c:473-476` re-scheduling logic.
+    pub next_cycle: Option<Instant>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum ScreenSaverActive { Off, On }
+pub enum ScreenSaverActive {
+    Off,
+    On,
+    /// Periodic event-only variant; never stored in
+    /// `ScreenSaverState.active` (which only holds Off/On). Used as the
+    /// `notify_state` argument to `emit_screen_saver_notify` from the
+    /// cycle-timer path.
+    Cycle,
+}
 ```
 
 Defaults at init: `timeout_ms = 600_000`, `interval_ms = 600_000`,
 `prefer_blanking = true`, `allow_exposures = true`, `active = Off`,
-`forced = false`, both `HashMap`s empty. Matches Xorg
-`dix/globals.c:96-99` (`PreferBlanking`, `AllowExposures`).
+`forced = false`, `next_cycle = None`, both `HashMap`s empty. Matches
+Xorg `dix/globals.c:96-99` (`PreferBlanking`, `AllowExposures`).
 
 `last_activity` continues to live on `DpmsState` — both extensions
 read the same "time of last input" clock. Existing fanout-prologue
@@ -181,13 +193,15 @@ any `ScreenSaverNotify(state=On)`.
 
 ### State machine
 
-Five event sources can change `active`:
+Six event sources affect screen-saver state:
 
 1. **Idle timer** (post-poll cascade evaluator in `run.rs`):
    transitions Off→On with `forced=false`. Guarded by
-   `screensaver_idle_deadline()` returning `Some`.
+   `screensaver_idle_deadline()` returning `Some`. On the transition,
+   `next_cycle = Some(now + interval_ms)` if `interval_ms > 0`.
 2. **Input event** (fanout prologue): transitions On→Off with
-   `forced=false`. No-op when active is already Off.
+   `forced=false`. No-op when active is already Off. Clears
+   `next_cycle = None`.
 3. **DPMS coupling via `apply_dpms_transition`** (mirrors
    `Xext/dpms.c:269-279`):
    - DPMS non-On AND SS=Off → flip SS On with `forced=true` (Xorg uses
@@ -206,10 +220,23 @@ Five event sources can change `active`:
    `forced=true`. No-op when already On.
 5. **`ForceScreenSaver(Reset)`**: transitions On→Off with `forced=true`
    AND `last_activity = Instant::now()`. No-op when already Off.
+   Clears `next_cycle = None`.
+6. **Cycle timer** (post-poll evaluator, fires only while `active==On`):
+   when `now >= next_cycle`, emit `ScreenSaverNotify(state=Cycle,
+   forced=false)` to subscribers whose mask has `CycleMask` set, then
+   advance `next_cycle = Some(now + interval_ms)`. Mirrors Xorg's
+   `WaitFor.c:470-476` (the same timer that drives idle activation re-
+   fires every `interval_ms` while `screenIsSaved==SCREEN_SAVER_ON`, and
+   `dixSaveScreens` promotes the type to `SCREEN_SAVER_CYCLE` because
+   `what==screenIsSaved` at `window.c:3107-3111`).
 
 Each transition fires `ScreenSaverNotify` via the
 `fanout_event_to_clients` helper. Sequence + byte-order handled
-per-client by the helper.
+per-client by the helper. **Subscriber filtering depends on event
+type**: Off/On transitions go to subscribers with `NotifyMask` set
+(bit 0); Cycle events go to subscribers with `CycleMask` set (bit 1).
+Matches Xorg `saver.c:389-391` (`mask = ScreenSaverNotifyMask; if
+(state == ScreenSaverCycle) mask = ScreenSaverCycleMask;`).
 
 ### Idle timer
 
@@ -233,10 +260,46 @@ The `dpms.power_level != 0` clause matches Xorg: when DPMS has already
 blanked the panel, the SS idle timer is suppressed — the DPMS→SS
 coupling has already handled it.
 
-Add this deadline to the `.min()` chain in `run.rs:386` alongside
+**Cycle deadline** is separate. While `active==On`, `next_cycle` is
+the moment we should fire the next `Cycle` event:
+
+```rust
+pub fn screensaver_cycle_deadline(&self) -> Option<Instant> {
+    if !matches!(self.screensaver.active, ScreenSaverActive::On)
+        || !self.screensaver.suspend_counts.is_empty()
+        || self.dpms.power_level != 0
+    {
+        return None;
+    }
+    self.screensaver.next_cycle
+}
+```
+
+Add both deadlines to the `.min()` chain in `run.rs:386` alongside
 `dpms_transition_deadline()`. Post-poll, after the DPMS cascade
-evaluator, add a sibling block: if the deadline has passed, run
-`apply_screen_saver_transition(state, backend, On, /*forced=*/false)`.
+evaluator, run two sibling blocks:
+
+```rust
+// Idle activation
+if let Some(deadline) = state.screensaver_idle_deadline() {
+    if Instant::now() >= deadline {
+        apply_screen_saver_transition(state, backend, On, /*forced=*/false);
+    }
+}
+// Cycle re-fire (only fires when active==On per the deadline gate)
+if let Some(deadline) = state.screensaver_cycle_deadline() {
+    let now = Instant::now();
+    if now >= deadline {
+        emit_screen_saver_notify(state, ScreenSaverActive::Cycle, /*forced=*/false);
+        state.screensaver.next_cycle =
+            Some(now + Duration::from_millis(u64::from(state.screensaver.interval_ms)));
+    }
+}
+```
+
+(Note: `emit_screen_saver_notify` is generalized to take an explicit
+state value — see the helper definition below — so the cycle path can
+pass `Cycle` without flipping `state.screensaver.active`.)
 
 ### Suspend
 
@@ -334,40 +397,56 @@ Lives in `process_request.rs` alongside `apply_dpms_transition`:
 ```rust
 pub(crate) fn apply_screen_saver_transition(
     state: &mut ServerState,
-    _backend: &mut dyn Backend,  // unused; signature parity
+    backend: &mut dyn Backend,
     new: ScreenSaverActive,
     forced: bool,
 ) {
     if state.screensaver.active == new { return; }
+    let was_off = matches!(state.screensaver.active, ScreenSaverActive::Off);
     state.screensaver.active = new;
     state.screensaver.forced = forced;
-    emit_screen_saver_notify(state);
+    // Manage the cycle deadline alongside the activation transition.
+    state.screensaver.next_cycle = match new {
+        ScreenSaverActive::On if state.screensaver.interval_ms > 0 => {
+            Some(Instant::now() + Duration::from_millis(u64::from(state.screensaver.interval_ms)))
+        }
+        _ => None,
+    };
+    let _ = (backend, was_off);  // backend reserved for future coupling; was_off unused but documents intent
+    emit_screen_saver_notify(state, new, forced);
 }
 
-pub(crate) fn emit_screen_saver_notify(state: &mut ServerState) {
+/// `notify_state` and `forced` are passed explicitly so the cycle-timer
+/// path can fire `Cycle` events without mutating `state.screensaver.active`.
+/// `Cycle` events go to `CycleMask` subscribers; `Off`/`On` events go to
+/// `NotifyMask` subscribers (Xorg `saver.c:389-391`).
+pub(crate) fn emit_screen_saver_notify(
+    state: &mut ServerState,
+    notify_state: ScreenSaverActive,
+    forced: bool,
+) {
     const SCREEN_SAVER_FIRST_EVENT: u8 = 162;
+    // Notify events carry On/Off/Cycle. Disabled is QueryInfo-only per
+    // `saver.c:381-414` — SendScreenSaverNotify never sees ScreenSaverDisabled.
+    let (active_state, deliver_mask): (u8, u32) = match notify_state {
+        ScreenSaverActive::Off   => (SCREEN_SAVER_OFF,   SCREEN_SAVER_NOTIFY_MASK),
+        ScreenSaverActive::On    => (SCREEN_SAVER_ON,    SCREEN_SAVER_NOTIFY_MASK),
+        ScreenSaverActive::Cycle => (SCREEN_SAVER_CYCLE, SCREEN_SAVER_CYCLE_MASK),
+    };
     let subs: Vec<ClientId> = state
         .screensaver
         .selected_by
         .iter()
-        .filter(|(_, mask)| *mask & SCREEN_SAVER_NOTIFY_MASK != 0)
+        .filter(|(_, mask)| *mask & deliver_mask != 0)
         .map(|(c, _)| *c)
         .collect();
     if subs.is_empty() { return; }
     let ts = state.timestamp_now();
-    // Notify events only carry On/Off (and Cycle, which we never emit).
-    // `Disabled` is a QueryInfo-only state per Xorg `saver.c:381-414` —
-    // SendScreenSaverNotify is only called with ScreenSaverOn/Off/Cycle.
-    let active_state: u8 = match state.screensaver.active {
-        ScreenSaverActive::Off => SCREEN_SAVER_OFF,  // 0
-        ScreenSaverActive::On  => SCREEN_SAVER_ON,   // 1
-    };
     let kind: u8 = if state.screensaver.prefer_blanking {
         SCREEN_SAVER_BLANKED  // 0
     } else {
         SCREEN_SAVER_INTERNAL // 1
     };
-    let forced = state.screensaver.forced;
     let dropped = fanout_event_to_clients(state, &subs, |buf, seq, order| {
         encode_screen_saver_notify_event(
             buf, order, seq,
@@ -381,8 +460,12 @@ pub(crate) fn emit_screen_saver_notify(state: &mut ServerState) {
 }
 ```
 
-Filtering by `NotifyMask` bit before fanout matches Xorg behaviour:
-subscribers with mask=`CycleMask` alone don't receive On/Off events.
+Note: `ScreenSaverActive::Cycle` is a value used only as the
+`notify_state` argument — it never appears in
+`state.screensaver.active` (which only holds `Off`/`On`). Cycle is a
+periodic event, not a persistent state. The enum gets a `Cycle`
+variant solely so the same `emit_screen_saver_notify` helper covers
+all three notify-event types.
 
 ### DPMS coupling
 
@@ -537,8 +620,9 @@ pub screensaver: ScreenSaverState,
 
 Initialize in `with_geometry` with the defaults above.
 
-Add `screensaver_idle_deadline(&self) -> Option<Instant>` method on
-the existing `impl ServerState` block.
+Add `screensaver_idle_deadline(&self) -> Option<Instant>` and
+`screensaver_cycle_deadline(&self) -> Option<Instant>` methods on the
+existing `impl ServerState` block.
 
 ### `crates/yserver-core/src/core_loop/process_request.rs`
 
@@ -561,13 +645,24 @@ above).
 
 ### `crates/yserver-core/src/core_loop/run.rs`
 
-Chain `state.screensaver_idle_deadline()` into the `.min()` at `:386`.
-After the DPMS cascade evaluator block, add a sibling block:
+Chain both `state.screensaver_idle_deadline()` and
+`state.screensaver_cycle_deadline()` into the `.min()` at `:386`.
+After the DPMS cascade evaluator block, add two sibling blocks:
 
 ```rust
+// Idle activation
 if let Some(deadline) = state.screensaver_idle_deadline() {
     if Instant::now() >= deadline {
-        apply_screen_saver_transition(state, backend, On, /*forced=*/false);
+        apply_screen_saver_transition(state, backend, ScreenSaverActive::On, /*forced=*/false);
+    }
+}
+// Cycle re-fire
+if let Some(deadline) = state.screensaver_cycle_deadline() {
+    let now = Instant::now();
+    if now >= deadline {
+        emit_screen_saver_notify(state, ScreenSaverActive::Cycle, /*forced=*/false);
+        state.screensaver.next_cycle =
+            Some(now + Duration::from_millis(u64::from(state.screensaver.interval_ms)));
     }
 }
 ```
@@ -720,13 +815,16 @@ Client disconnect:
 4. `encode_query_info_reply_shape` — assert byte offsets per saverproto.h: state at 1, window at 8, til_or_since at 12, idle at 16, event_mask at 20, kind at 24, pad to 32.
 5. `encode_screen_saver_notify_event_shape` — assert byte offsets per saverproto.h: type at 0, state at 1, sequence at 2-3, timestamp at 4-7, root at 8-11, window at 12-15, kind at 16, forced at 17, pads to 32.
 
-**`crates/yserver-core/src/server.rs::tests`** (5 tests):
+**`crates/yserver-core/src/server.rs::tests`** (8 tests):
 
 6. `screensaver_idle_deadline_none_when_timeout_zero`.
 7. `screensaver_idle_deadline_none_when_suspended` — insert a fake client into `suspend_counts`; deadline → None.
 8. `screensaver_idle_deadline_none_when_active`.
 9. `screensaver_idle_deadline_none_when_dpms_blanked` — `dpms.power_level = 1` → None (Xorg `WaitFor.c:457`).
 10. `screensaver_idle_deadline_returns_last_activity_plus_timeout` — basic Some-path.
+10a. `screensaver_cycle_deadline_none_when_off`.
+10b. `screensaver_cycle_deadline_some_when_on` — after `apply_screen_saver_transition(On)` with interval_ms > 0, `next_cycle` is set and deadline returns it.
+10c. `screensaver_cycle_deadline_none_when_interval_zero` — even with `active=On`, deadline is None when `interval_ms=0` (no Cycle events).
 
 **`crates/yserver-core/src/core_loop/process_request.rs::tests`** (8 tests):
 
@@ -759,6 +857,8 @@ Client disconnect:
 25. `screen_saver_select_input_accepts_unknown_mask_bits` — mask=0x04 → Success; client added to `selected_by` with mask=0x04; subsequent Off→On transition does NOT deliver an event to this client (NotifyMask bit not set). Matches Xorg `saver.c:695-713`.
 26. `screen_saver_set_attributes_returns_bad_access` — opcode dispatch returns BadAccess; no state side-effects.
 27. `screen_saver_unset_attributes_returns_success_noop` — opcode dispatch returns Success with no error reply; no state side-effects. Matches Xorg `saver.c:1057-1073`.
+28. `cycle_event_delivered_only_to_cycle_mask_subscribers` — two subscribers: client A with `mask=NotifyMask`, client B with `mask=CycleMask`. Force SS active, then advance time past `interval_ms`. Run the cycle evaluator. Client A receives nothing (already got the On notify from the activation); client B receives a ScreenSaverNotify with `state=Cycle` and `forced=0`. Matches Xorg `saver.c:389-391`.
+29. `cycle_event_advances_next_cycle_deadline` — after firing a cycle event, `state.screensaver.next_cycle` advances by exactly `interval_ms`.
 
 ### Integration (smoke) tests
 
@@ -780,7 +880,7 @@ lockscreen actually appears.
 
 | Crate              | Before | After |
 |--------------------|--------|-------|
-| `yserver-core`     | +13 from DPMS | +22 |
+| `yserver-core`     | +13 from DPMS | +27 |
 | `yserver-protocol` | +11 from DPMS | +5  |
 
 ---
@@ -809,9 +909,10 @@ plain clippy only.
    `handle_screen_saver_request` with the six minor-opcode arms,
    opcode-150 dispatch in `process_request`. Tests #17, #18, #19,
    #23–#27.
-6. **Core-loop idle cascade.** Add `screensaver_idle_deadline()` to the
-   `.min()` chain in `run.rs`, add the post-poll SS evaluator block.
-   No new unit tests (coverage from #6–#10 and the smoke matrix).
+6. **Core-loop idle cascade + cycle fire.** Add both
+   `screensaver_idle_deadline()` and `screensaver_cycle_deadline()` to
+   the `.min()` chain in `run.rs`, add the post-poll evaluator blocks
+   for activation and cycle re-fire. Tests #28, #29.
 7. **Disconnect cleanup.** Add the SS lines to `process_disconnect`,
    plus the conditional timer-restart guard. Test #20.
 
