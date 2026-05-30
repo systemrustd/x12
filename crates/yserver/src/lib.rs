@@ -190,6 +190,7 @@ pub fn run(display: u16) -> io::Result<()> {
 
     let randr_outputs = backend.randr_outputs();
     let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
+    state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -227,7 +228,7 @@ pub fn run(display: u16) -> io::Result<()> {
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
-    if let Err(e) = backend.composite_and_flip() {
+    if let Err(e) = backend.composite_and_flip(&state) {
         log::warn!("yserver: initial composite_and_flip failed: {e}");
     }
 

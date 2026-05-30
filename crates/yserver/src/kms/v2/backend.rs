@@ -190,6 +190,12 @@ pub struct KmsBackendV2 {
     /// `current_clip` transitions away from `ClipState::Pixmap`.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
 
+    /// Cached binary KMS power state. `true` at startup (outputs
+    /// come up active); mutated only by `set_dpms_power`. Lets
+    /// `set_dpms_power` no-op when called for Standby→Suspend /
+    /// Suspend→Off (same binary state, different protocol level).
+    pub(crate) kms_outputs_active: bool,
+
     /// Test-only counter: bumps every time
     /// `clear_window_area_with_background` is entered. Used by the
     /// `cwa_on_redirected_window_does_not_clear_backing` regression
@@ -546,6 +552,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
@@ -664,6 +671,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
@@ -1222,6 +1230,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
@@ -3182,7 +3191,11 @@ impl KmsBackendV2 {
     ///
     /// Returns the first per-output Vk / DRM failure; subsequent
     /// outputs still attempted.
-    pub fn composite_and_flip(&mut self) -> io::Result<()> {
+    pub fn composite_and_flip(&mut self, state: &ServerState) -> io::Result<()> {
+        // DPMS gate: outputs are inactive, page-flip would EBUSY.
+        if state.dpms.power_level != 0 {
+            return Ok(());
+        }
         // Gate: no modeset/pageflip/submit when not holding DRM master.
         // In Direct mode seat_state is always Active → no behaviour change.
         if !self.scanout_allowed() {
@@ -11849,6 +11862,34 @@ impl Backend for KmsBackendV2 {
         Ok(crate::kms::xkb::modifier_mapping_from_keymap(
             &self.core.xkb_keymap.0,
         ))
+    }
+
+    fn dpms_capable(&self) -> bool {
+        true
+    }
+
+    fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
+        // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
+        let want_active = level == 0;
+        if want_active == self.kms_outputs_active {
+            return Ok(()); // same binary state (e.g. Standby → Suspend)
+        }
+        let res = self.platform.dpms_set_outputs_active(want_active);
+        // Only flip the cache on success. On Err, leave it where it was
+        // so the next set_dpms_power call retries the commit rather than
+        // no-opping through the same-binary-state guard above. (The
+        // protocol-level state.dpms.power_level still advances per the
+        // apply_dpms_transition error contract — the cache here is
+        // backend-internal bookkeeping.)
+        if res.is_ok() {
+            self.kms_outputs_active = want_active;
+            if want_active {
+                // Compositor next tick must paint a fresh frame; outputs
+                // were dark, so any incremental damage tracking is stale.
+                self.scene.wake_for_damage();
+            }
+        }
+        res
     }
 }
 

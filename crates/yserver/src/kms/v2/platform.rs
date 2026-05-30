@@ -1971,6 +1971,76 @@ impl PlatformBackend {
         }
     }
 
+    /// Drive every output to a binary KMS power state. Used by
+    /// DPMS — collapses Standby/Suspend/Off to "outputs inactive"
+    /// and On to "outputs active". Unlike the post-loop
+    /// `disable_output` it does NOT set `shutting_down`, NOT call
+    /// `device_wait_idle`, and NOT disarm scanout pools — DPMS is
+    /// reversible.
+    ///
+    /// # Errors
+    ///
+    /// Collects the first per-output failure, continues with the
+    /// rest, then returns it. The caller (KmsBackendV2::set_dpms_power)
+    /// logs and advances the in-memory DPMS state regardless.
+    pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+        if active {
+            // Re-commit modeset. Pick the OnScreen BO (last frame
+            // before blank) or any registered fb — same selection
+            // logic as `requery_outputs_and_modeset` at :2030.
+            for (i, layout) in self.outputs.iter().enumerate() {
+                let fb = self
+                    .scanout_pools
+                    .get(i)
+                    .and_then(|p| p.as_ref())
+                    .and_then(|pool| {
+                        use crate::kms::vk::scanout::BoPhase;
+                        pool.bos
+                            .iter()
+                            .find(|bo| bo.state.phase == BoPhase::OnScreen)
+                            .and_then(|bo| bo.fb_handle)
+                            .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
+                    });
+                let Some(fb_id) = fb else {
+                    log::warn!(
+                        "dpms_set_outputs_active(true): no fb for output {} — skipping; \
+                         next composite tick will set it",
+                        layout.output.connector_name,
+                    );
+                    continue;
+                };
+                if let Err(e) =
+                    crate::drm::modeset::commit_modeset(&self.device, &layout.output, fb_id)
+                {
+                    log::error!(
+                        "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
+                        layout.output.connector_name,
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        } else {
+            for layout in &self.outputs {
+                if let Err(e) = crate::drm::modeset::disable_output(&self.device, &layout.output) {
+                    log::error!(
+                        "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
+                        layout.output.connector_name,
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     // ── VT-switch resume helpers (Task 12) ─────────────────────────
     //
     // Called from `KmsBackendV2::run_resume` after libseat/logind has
