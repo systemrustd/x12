@@ -411,6 +411,44 @@ fullscreen + `xset dpms 60 60 60` no-blank, etc.). Test coverage is
 40 new unit tests across protocol/server/process_request/run/
 disconnect modules — invariants only; the smoke is in the spec.
 
+**IDLETIME counter + SYNC alarm firing (2026-05-31):** smoke testing
+the MIT-SCREEN-SAVER landing revealed that MATE doesn't actually use
+the X SS/DPMS timers — it uses XSync IDLETIME counter alarms for
+idle detection, then calls `DPMSForceLevel` from its own logic. The
+xtrace showed `mate-power-manager` calling `SetTimeouts(0,0,0)`
+(explicit disable) and creating IDLETIME alarms at value=59999.
+yserver's IDLETIME counter was stubbed to return SERVERTIME (server
+uptime), AND `evaluate_alarms_for_counter` had a pre-existing bug
+where `delta=0` alarms went Inactive regardless of test type
+(Xorg `sync.c:548-555` only does this for Comparison types).
+
+The IDLETIME fix landed across 5 implementation commits (plus 1
+follow-up review-fix) on `feat/mit-screen-saver`:
+
+- Real `IDLETIME` counter values (`now - last_activity` instead of
+  server uptime); per-master-device IDLETIME counters (VCP=0x108,
+  VCK=0x109) advertised in `ListSystemCounters`.
+- Fixed `delta=0+Transition→Inactive` bug; switched re-arm to
+  `checked_add` with overflow→Inactive.
+- `ServerState::idletime_alarm_deadline()` chained into poll-min,
+  with quiescent-state skip and unified-timer suspend gate.
+- `evaluate_idletime_alarms_post_poll()` evaluator + create-time fire
+  + Relative-value resolution for IDLETIME counters.
+- Fanout-prologue `evaluate_idletime_negative_alarms_on_input_wake`
+  for input-driven Negative-* alarm firing; per-device prior idle
+  falls back to global when no per-device entry exists.
+- `reset_idletime_state_after_suspend_release` at both SS suspend-
+  drain sites to prevent stale-high cache values from missing
+  post-resume crossings.
+
+Spec: [`2026-05-31-idletime-sync-alarms-design.md`](superpowers/specs/2026-05-31-idletime-sync-alarms-design.md).
+Plan: [`2026-05-31-idletime-sync-alarms.md`](superpowers/plans/2026-05-31-idletime-sync-alarms.md)
+(converged after 4 codex rounds). +20 new unit tests. After this
+the visible-smoke matrix that DPMS + MIT-SCREEN-SAVER alone could
+not deliver (`mate-screensaver` lockscreen at N min; `mate-power-
+manager` blanks display via `DPMSForceLevel` at N min) actually
+works.
+
 ## HW cursor drag-lag fix (master, 2026-05-29)
 
 After the VT-switch series landed, `55924b1 feat(kms/v2): flip HW cursor
