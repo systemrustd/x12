@@ -2331,9 +2331,15 @@ fn handle_sync_request(
                 };
                 apply_alarm_attributes(state, &mut a, &attrs);
                 let counter = a.counter;
+                let class = state
+                    .client_wm_class
+                    .get(&client_id.0)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
                 log::info!(
-                    "sync: client {} CreateAlarm 0x{alarm:x} counter={cname}(0x{counter:x}) \
-                     test={test} wait_value={wait} delta={delta} events={events}",
+                    "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
+                     counter={cname}(0x{counter:x}) test={test} \
+                     wait_value={wait} delta={delta} events={events}",
                     client_id.0,
                     cname = sync_counter_name(counter),
                     test = sync_test_type_name(u32::from(a.test_type)),
@@ -2367,9 +2373,15 @@ fn handle_sync_request(
                 apply_alarm_attributes(state, &mut a, &attrs);
                 a.state = x11sync::ALARM_STATE_ACTIVE;
                 let counter = a.counter;
+                let class = state
+                    .client_wm_class
+                    .get(&client_id.0)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
                 log::info!(
-                    "sync: client {} ChangeAlarm 0x{alarm:x} counter={cname}(0x{counter:x}) \
-                     test={test} wait_value={wait} delta={delta} events={events}",
+                    "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
+                     counter={cname}(0x{counter:x}) test={test} \
+                     wait_value={wait} delta={delta} events={events}",
                     client_id.0,
                     cname = sync_counter_name(counter),
                     test = sync_test_type_name(u32::from(a.test_type)),
@@ -2743,10 +2755,17 @@ pub(crate) fn evaluate_alarms_for_counter(
             a.state = new_state;
         }
 
+        let owner_class = state
+            .client_wm_class
+            .get(&owner.0)
+            .map(String::as_str)
+            .unwrap_or("<unknown>");
         log::debug!(
-            "sync: alarm 0x{alarm_id:x} fired counter={counter_name}(0x{counter:x}) \
-             test={test} old={old} new={new} wait={fired_wait} \
+            "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
+             counter={counter_name}(0x{counter:x}) test={test} \
+             old={old} new={new} wait={fired_wait} \
              → state={state_name} (events={events})",
+            owner_id = owner.0,
             counter_name = sync_counter_name(counter),
             test = sync_test_type_name(test_type),
             state_name = sync_alarm_state_name(new_state),
