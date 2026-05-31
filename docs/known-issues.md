@@ -795,6 +795,40 @@ that the host hides for us.
       Cross-vendor reproduction (Intel-fuji OK, AMD-bee residual,
       AMD-silence catastrophic) suggests hardware/driver factors
       compound on top of an absolute-rate problem.
+- [ ] **Vulkan validation error: `shaderDemoteToHelperInvocation`
+      SPIR-V capability declared but device feature not enabled.**
+      Surfaced 2026-05-31 during the MIT-SCREEN-SAVER smoke run on
+      bee (AMD RDNA2): `vkCreateShaderModule()` validation reports
+      `SPIR-V Capability DemoteToHelperInvocation was declared, but
+      one of [...] VkPhysicalDeviceVulkan13Features::
+      shaderDemoteToHelperInvocation [...] is required`. yserver
+      passes Vulkan-1.3 features but does not query and enable
+      `shader_demote_to_helper_invocation`, while at least one
+      shader (saver-overlay-related path triggers it; possibly any
+      with `discard;`) declares the SPIR-V capability. Validation-
+      only on bee's driver (RADV happily creates the module),
+      but a stricter ICD would reject the module. Fix in
+      `crates/yserver/src/kms/vk/device.rs` — query
+      `PhysicalDeviceVulkan13Features::shader_demote_to_helper_invocation`,
+      enable it on the logical-device create when supported, and
+      log a warning + fall back to a non-demoting shader variant
+      when not. User has a WIP stash with this work already in
+      progress on `feature/frame-builder-submit-rate`.
+- [ ] **1471 leaked Vulkan objects on yserver shutdown.**
+      Observed 2026-05-31 at recipe teardown on bee:
+      `vk: vkDestroyDevice(): VkDevice 0x... has 1471 leaked objects
+      that have not been destroyed.` Triggered when yserver is
+      SIGTERM'd at the end of `yserver-mate-hw-trace` (mate-session
+      exits → recipe kills yserver). The exact object mix is in
+      the validation log; likely candidates are pixmap-pool images
+      / image views, descriptor sets, command buffers, and frame-
+      builder retire-pin slots that the shutdown path doesn't
+      walk. Functionally invisible (process is about to exit), but
+      the count is high enough that an embedded long-running
+      use-case would accumulate. Fix shape: explicit destroy on
+      `KmsBackend::drop` for each pool/cache, OR rely on
+      `vkDeviceWaitIdle` + driver cleanup. Probably worth doing
+      both for graceful release on signal-driven exit.
 
 ## WM-specific behaviour
 
@@ -860,6 +894,28 @@ that the host hides for us.
          alacritty for reasons unknown.
       c) alacritty itself sent `DestroyWindow` from a recovery
          path triggered by an earlier (silent) error.
+- [ ] **BadWindow storm on screensaver/dialog teardown.** Observed
+      2026-05-31 on bee/MATE during a clean screensaver
+      activate → blank → wake → unlock cycle: ~10–15 `BadWindow
+      (code=3)` errors land on marco (client 11) and a secondary
+      MATE component (client 14) within ~2s of each saver-window
+      DestroyWindow. The bad xids (`0x3f00004`, `0x1000129`,
+      `0x10000e`) are the just-destroyed saver/dialog windows;
+      the failing requests are GetProperty (opcode 20),
+      GetGeometry (14), GetWindowAttributes (3), ChangeProperty
+      (18), ReparentWindow (7), CirculateWindow (19). marco/MATE
+      have requests queued against the window between yserver's
+      DestroyNotify dispatch and the clients draining their
+      stream. Cosmetic in logs and functionally invisible (the
+      X spec requires the server to error in this case and the
+      client to handle the error), but the volume is high
+      enough to suggest yserver could either delay DestroyNotify
+      until clients ACK their queues (Xorg doesn't), or recognise
+      the racey pattern and demote to a single rollup line.
+      Lower priority: real Xorg has the same race, just with
+      different timing characteristics that hide it most of the
+      time. No fix required unless a future investigation finds
+      a downstream effect.
 
 ## Extension polish
 

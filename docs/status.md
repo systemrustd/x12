@@ -449,6 +449,39 @@ not deliver (`mate-screensaver` lockscreen at N min; `mate-power-
 manager` blanks display via `DPMSForceLevel` at N min) actually
 works.
 
+**MapWindow(root) phantom MapRequest fix (2026-05-31):** first hardware
+smoke of the IDLETIME branch on bee/MATE blanked the screen but left it
+with a moving cursor and no visible saver — the dialog never appeared
+and the session was unrecoverable. Root cause was a latent v1 bug
+unmasked by IDLETIME finally making mate-screensaver activate for the
+first time: yserver's `handle_map_window` had the spec-required
+"already mapped → no-op" guard positioned AFTER the SubstructureRedirect-
+on-parent MapRequest dispatch, and yserver's root window has
+`parent == self` (`resources.rs:194`). When mate-screensaver activates
+it calls `MapWindow(root)`; that combination fanned a phantom
+`MapRequest(parent=root, window=root)` to marco. Marco panic-
+responded by GrabServer + ChangeWindowAttributes(root) DROPPING
+SubstructureNotify+SubstructureRedirect from its event mask (visible
+on the wire at xtrace seq `0x35e5a`), then UngrabServer. After that
+marco no longer received MapNotify for new top-levels → no
+`COMPOSITE::NameWindowPixmap` → the saver overlay and dialog were
+invisible. Fix matches Xorg `dix/window.c:2661` exactly: hoist
+`if (pWin->mapped) return Success;` above the MapRequest emission;
+root (permanently `Viewable`) is naturally covered. Subsumes the
+prior brisk-menu redundant-map guard. Regression test
+`map_window_on_root_does_not_emit_phantom_map_request` asserts zero
+MapRequest events from a non-WM client's `MapWindow(root)` against
+a marco-like WM peer (pre-fix: 1; post-fix: 0). Commit `e4ef3f4`
+on `feat/mit-screen-saver`. End-to-end visible smoke verified on
+bee/MATE: saver appears → screen blanks → key press → DPMS wakes →
+unlock dialog appears → password unlock → desktop restored. Three
+loose ends surfaced during the smoke run filed in
+[`known-issues.md`](known-issues.md): Vulkan
+`shaderDemoteToHelperInvocation` validation error (latent, user
+WIP), BadWindow teardown storm on saver/dialog destroy
+(cosmetic), and 1471 leaked Vulkan objects at yserver shutdown
+(pre-existing cleanup gap).
+
 ## HW cursor drag-lag fix (master, 2026-05-29)
 
 After the VT-switch series landed, `55924b1 feat(kms/v2): flip HW cursor
