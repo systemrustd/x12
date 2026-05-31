@@ -669,6 +669,112 @@ allowed-but-different field is a candidate; cumulative pressure on a
 strictly-parsing client (Chrome's Ozone X11 layer) needs all of them
 matched, not just the ones spec-language calls "MUST."
 
+## Systray applet loop — parked branch `fix/applet` (2026-05-31, 2026-06-01)
+
+Long-standing mate-panel notification-area-applet bug:
+mate `mate-bee.xtrace` baseline (2026-05-31) — applet receives ~61
+DAMAGE-Notify/s vs Xorg's 0.76/s on bee, plus tray icons render
+invisible. The original codex-assisted diagnosis identified an
+asymmetry: v2's `resolve_dst_picture_for_render` walks through
+`KmsBackendV2::resolve_paint_target` for redirect routing, but the
+SOURCE counterpart `resolve_picture_for_render` did `store.lookup`
+directly and never walked the redirect chain. Hypothesis: source
+pictures wrapping a redirected window sample the leaf storage
+(empty under Manual redirect) instead of the backing → composite
+produces empty output (icons invisible) → applet's FillRect Clear
+on the same picture damages the backing → DAMAGE-Notify → applet
+wakes → 60 Hz loop. One defect, two symptoms.
+
+Plan executed (`docs/superpowers/plans/2026-05-31-render-source-picture-redirect.md`
+on the parked branch): 10 commits on `fix/applet` landing
+`KmsBackendV2::resolve_source_picture` + Phase 2 wire-up in
+`render_composite` + Phase 3 in `render_trapezoids` /
+`render_triangles_op` (engine signature gained `src_offset: (i32, i32)`)
++ Phase 4 tray-shape integration test. All 13 added tests pass.
+Each commit is atomic + bisectable.
+
+**hw smoke outcome (yoga, X1E / Turnip, 2026-06-01):**
+
+- Tray icons remained invisible.
+- Total systray request rate: pre-fix 1338 req/s → post-fix
+  1270 req/s. ~5% delta, well within trace-duration noise.
+- Xorg-on-yoga reference (same workload, same 4 tray icons):
+  7.5 req/s. **yserver is ~170× the Xorg rate** for the same
+  systray workload — yoga is NOT an intrinsically hot workload;
+  it's a real yserver bug.
+
+**Subsequent code-backed diagnosis (codex, 2026-06-01):**
+
+The actual loop driver is `crates/yserver-core/src/core_loop/process_request.rs:1622`
+— RENDER FillRectangles' unconditional
+`accumulate_damage_full_to_state(dst_drawable)`. When the applet's
+`FillRectangles op=Clear` on `picture(proxy)` lands, yserver damages
+the full proxy drawable. The applet has `DamageCreate` on those
+proxy/socket drawables (the XEMBED-host pattern for noticing icon
+redraws). The applet receives its own DamageNotify → Subtract +
+Compose + Clear → repeat at vsync.
+
+In Xorg, the same `Clear` on `picture(proxy)` is a true no-op:
+default `subwindow-mode = ClipByChildren`
+(`xserver/render/picture.c:719`) plus `miValidatePicture`'s
+window-clip-list intersection (`xserver/render/mipict.c:112-118`)
+make `pCompositeClip` empty when children fully cover the proxy.
+`damagePolyFillRect`'s `TRIM_BOX` reduces the damage box to empty,
+and the actual write is also gated by the GC clip — no damage
+emitted, icon pixels in the backing preserved across cycles.
+
+The source-picture redirect fix that landed on `fix/applet` IS a
+real asymmetry per the Xorg spec, but it's NOT the load-bearing
+driver of either symptom on yoga. The Risk Register on the
+original plan named this exact outcome as "outcome 2" and called
+out ClipByChildren as the likely follow-up. We landed there.
+
+**Process notes worth carrying forward:**
+
+- Multi-symptom diagnoses that elegantly explain everything with
+  one defect deserve MORE skepticism, not less. The
+  source-picture-fixes-both shape was clean but wrong about
+  load-bearing-ness.
+- yoga-Claude's mid-investigation pivot ("damage_fanout descends
+  into children") was wrong about mechanism — codex's code read
+  confirmed `damage_fanout` only ascends; the
+  `level_drawable=0x2600011 match_ids=1` lines come from a
+  separate `accumulate_damage` call at `process_request.rs:1622`,
+  not from descent. The symptom observation was right, the
+  mechanism interpretation was wrong.
+- Branch parked at `origin/fix/applet` (tip `b76a537`), not
+  merged. Source-picture fix is preserved for future workloads
+  that surface it; the loop fix is a follow-up plan.
+- yserver-core working-tree diagnostic block
+  (`YSERVER_DAMAGE_BACKTRACE=1` gate in `damage_fanout.rs`)
+  preserved on the WIP commit (`b76a537`). Re-add to working
+  tree on the next branch — it's load-bearing for verifying
+  the ClipByChildren fix.
+
+**Findings doc:** `docs/superpowers/findings/2026-05-31-render-source-picture-redirect.md`
+(post-mortem on the parked branch).
+
+**Next direction (to be planned next session, probably on
+silence):** ClipByChildren-aware FillRectangles in v2's
+RENDER paint paths. Specifically:
+
+1. At `process_request.rs:1622` (and the matching sites for
+   `render_composite`, `render_trapezoids`, etc.): the actual
+   paint AND the damage emit need to be gated by the picture's
+   effective clip-by-children region. Damage-only gating stops
+   the loop but leaves icons flickering (Clear still wipes the
+   backing every cycle). Paint-gating preserves the icon
+   pixels — both halves are needed.
+2. The existing CopyArea "skip ClipByChildren subtraction for
+   manually-redirected children" workaround at
+   `process_request.rs:13462` is a tray-specific patch that
+   probably reflects the same underlying gap. Worth reviewing
+   for consistency once the proper ClipByChildren machinery
+   lands.
+3. Re-test on bee (the platform where the original ~80×
+   divergence was measured) as the load-bearing validation.
+   yoga remains the rate-canary post-fix.
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
