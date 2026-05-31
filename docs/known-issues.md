@@ -814,21 +814,89 @@ that the host hides for us.
       log a warning + fall back to a non-demoting shader variant
       when not. User has a WIP stash with this work already in
       progress on `feature/frame-builder-submit-rate`.
-- [ ] **1471 leaked Vulkan objects on yserver shutdown.**
-      Observed 2026-05-31 at recipe teardown on bee:
-      `vk: vkDestroyDevice(): VkDevice 0x... has 1471 leaked objects
-      that have not been destroyed.` Triggered when yserver is
-      SIGTERM'd at the end of `yserver-mate-hw-trace` (mate-session
-      exits → recipe kills yserver). The exact object mix is in
-      the validation log; likely candidates are pixmap-pool images
-      / image views, descriptor sets, command buffers, and frame-
-      builder retire-pin slots that the shutdown path doesn't
-      walk. Functionally invisible (process is about to exit), but
-      the count is high enough that an embedded long-running
-      use-case would accumulate. Fix shape: explicit destroy on
-      `KmsBackend::drop` for each pool/cache, OR rely on
-      `vkDeviceWaitIdle` + driver cleanup. Probably worth doing
-      both for graceful release on signal-driven exit.
+- [x] **~~1471 leaked Vulkan objects on yserver shutdown.~~ FIXED
+      2026-05-31 across three commits on `master`.** Bee/MATE
+      vkDestroyDevice warning went from 1471 → 0 across the chain:
+      `6464ef7` retained `Arc<VkContext>` on `FenceTicketInner` so
+      its fallback Drop destroys the fence handle directly when
+      the pool is already gone (root cause: `KmsBackendV2`'s field
+      declaration ran `platform`'s `fence_pool` drop before
+      `store` / `engine` / `scene` released their tickets, so the
+      `Weak::upgrade() == None` branch leaked every fence — 523
+      VkFence leaks); `288a6aa` added `DrawableStore::
+      shutdown_destroy_all` called from lib.rs's explicit shutdown
+      block so resident drawables' VkImage / VkImageView /
+      VkDeviceMemory are destroyed via `Storage::destroy` (58 more
+      leaks gone); `a517c0e` drained `RenderEngine::drawable_view_cache`
+      in `Drop` (890 leaks gone — the bulk). Verified across four
+      vkdebug recipe runs: 1471 → 948 (after fence) → 890 (after
+      store) → 0 (after engine cache).
+- [ ] **`vkCmdBeginRendering()` READ_AFTER_WRITE hazard on
+      `pColorAttachments[0]` with `LOAD_OP_LOAD`.** Validation
+      reports the LoadOp read of the attachment view races a
+      preceding `vkCmdPipelineBarrier2` layout transition: the
+      barrier's `dst_stage_mask`/`dst_access_mask` doesn't cover
+      `COLOR_ATTACHMENT_OUTPUT` + `COLOR_ATTACHMENT_READ`, so the
+      LoadOp read happens before the layout transition's write is
+      visible. Observed 2026-05-31 on bee/MATE in 6 distinct
+      image views during the saver-smoke run. No visible
+      rendering glitches reported, but synchronisation-layer
+      validation flags it; under a stricter driver the load
+      could return undefined data. Fix shape: at any
+      `vkCmdBeginRendering` that uses `LOAD_OP_LOAD`, ensure the
+      preceding barrier into the colour-attachment-optimal layout
+      includes `dst_stage_mask=COLOR_ATTACHMENT_OUTPUT` and
+      `dst_access_mask=COLOR_ATTACHMENT_READ|COLOR_ATTACHMENT_WRITE`
+      (currently it's likely WRITE-only). Investigate
+      `crates/yserver/src/kms/v2/store.rs::transition_layout_for_dynamic_rendering`
+      and the LoadOp-emitting sites in `engine.rs` /
+      `scene.rs`.
+- [ ] **`vkQueueSubmit2()` reads VkImage in `UNDEFINED` layout
+      where shader expects `SHADER_READ_ONLY_OPTIMAL`.** Observed
+      2026-05-31 on bee/MATE: `command buffer ... expects VkImage
+      ... (aspectMask = COLOR, mip = 0, layer = 0) to be in layout
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL — instead, current
+      layout is VK_IMAGE_LAYOUT_UNDEFINED`. First-use-before-
+      transition: a fresh allocation (likely from a pool-take or
+      freshly-allocated drawable) is bound as a sampler input
+      before any barrier transitions it from the initial
+      UNDEFINED. Possibly related to the
+      READ_AFTER_WRITE hazard above (same code path).
+      Fix shape: walk the sampler-binding sites in `engine.rs`
+      / `scene.rs`; ensure every sampler bind is preceded by a
+      layout-transition barrier to `SHADER_READ_ONLY_OPTIMAL`
+      from `current_layout` (tracked on `Storage`).
+- [ ] **`vkGetImageSubresourceLayout()` uses wrong aspect mask
+      for DRM-format-modifier images.** Validation: `pSubresource
+      ->aspectMask (VK_IMAGE_ASPECT_COLOR_BIT) must be
+      VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT.` Observed
+      2026-05-31. Per the Vulkan DRM-format-modifier ext spec,
+      queries against an image created with a DRM format modifier
+      must use the per-memory-plane aspect masks
+      (`MEMORY_PLANE_{0,1,2,3}_BIT_EXT`), not the generic colour
+      aspect. yserver's call site (likely the DRI3-import /
+      scanout-BO query path in `kms/vk/target.rs` or `kms/vk/
+      scanout.rs`) needs to detect the modifier and switch aspect
+      mask. Functionally probably fine on RADV (returns plausible
+      layout for COLOR aspect on single-plane modifiers) but
+      formally non-conforming and could break on other ICDs or
+      multi-plane formats.
+- [ ] **`RenderEngine::notify_drawable_retired` is defined but
+      never called.** `engine.rs:2507` exposes a per-drawable
+      cache-invalidation hook for `drawable_view_cache`, but a
+      tree-wide grep shows zero callers. The shutdown leak
+      (`a517c0e` above) only drained the cache at SIGTERM; at
+      runtime every `DestroyPixmap` / `DestroyWindow` leaves the
+      drawable's cached views (one per `(SamplerConfig,
+      SwizzleClass)` triple) in the cache, referencing the
+      destroyed image. Long sessions accumulate dead entries
+      until process exit. Not a kernel leak (cleanup at exit),
+      but unbounded growth and the cached views point at freed
+      images. Fix shape: call `engine.notify_drawable_retired(id)`
+      from `DrawableStore::destroy_now` (which already owns the
+      destroy moment), threaded through `KmsBackendV2`'s
+      destroy-window / destroy-pixmap entry points. Touches the
+      runtime path so worth small TDD coverage.
 
 ## WM-specific behaviour
 
