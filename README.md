@@ -25,6 +25,7 @@ We support the following extensions:
 - DRI3
 - GLX
 - Generic Event Extension
+- MIT-SCREEN-SAVER
 - MIT-SHM
 - Present
 - RANDR
