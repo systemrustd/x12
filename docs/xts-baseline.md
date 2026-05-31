@@ -188,6 +188,68 @@ ynest stays up through the entire battery** — no panics, no hangs,
 no socket disconnects beyond what the tests themselves induced. From
 a "does the server survive xts" angle, that's the win.
 
+### Bare-metal baseline — yserver KMS on bee, 2026-05-31
+
+First full bare-metal `just xts-yserver-hw all` run on bee (Ryzen 9
+6900HX / RDNA2 / RADV, KMS direct via DRM master + libseat). The
+2026-05-27 sweep above used the egl-headless / Venus QEMU recipe;
+this is the same suite driven against real hardware. **0 ABORT, no
+panic, no hang** through the scenarios that ran. Run started 11:37:38,
+yserver torn down 11:57:38 = **~20 minutes**; the user logged out
+before scenarios past Xlib9 ran (so Xlib10–17 / Xt* / XI / Xopen /
+ShapeExt / XtC / XtE not in this snapshot — rerun with a longer
+session for a full sweep).
+
+| Scenario | CASES | TESTS | PASS | FAIL | UNRES | UNTST | UNSUP | Δ vs 2026-05-27 |
+|----------|------:|------:|-----:|-----:|------:|------:|------:|-----------------|
+| Xproto   |   122 |   389 |  358 |    6 |     4 |    19 |     2 | **+14 PASS / -2 FAIL / -12 UNRES** (grab event-mask fix `8f6305e`) |
+| Xlib3    |       |       |  108 |   15 |     5 |       |       | +8 PASS / -8 FAIL |
+| Xlib4    |       |       |  108 |  176 |     7 |       |       | -2 PASS / +2 FAIL (noise) |
+| Xlib5    |       |       |   56 |   21 |     0 |       |       | unchanged |
+| Xlib6    |       |       |    4 |   17 |     0 |       |       | unchanged |
+| Xlib7    |       |       |   83 |   31 |     0 |       |       | unchanged |
+| Xlib8    |       |       |   60 |   63 |    10 |       |       | unchanged |
+| Xlib9    |       |       |  158 |  892 |    62 |       |       | +1 / -1 (noise) |
+| **Total**|       |  2489 |  935 | 1221 |    88 |   147 |    98 |   |
+
+**Headline movement:** the only material change is `Xproto`'s grab
+family closing — `GrabPointer` / `GrabKeyboard` / `AllowEvents` /
+`ChangeActivePointerGrab` / `UngrabPointer` all flipped UNRES → PASS
+after `8f6305e` filtered grab-activation/deactivation synthesised
+crossings by the grabber's per-window event-mask selection (matching
+Xorg `dix/enterleave.c` semantics). xts opens fresh connections that
+don't select `EnterWindowMask`, expects the reply on the wire first;
+pre-fix yserver fanned `EnterNotify`/`LeaveNotify` unconditionally
+and the test framework couldn't recover the reply ordering.
+
+The other scenarios are largely unchanged — the remaining bulk
+(Xlib9's 892, Xlib4's 176, Xlib3-8's combined 415) is dominated by:
+
+- **Pixel-content rendering** (~6500 lines): pixel-check vs Xorg's
+  `mi*` rasterizers, GX{op} Boolean alu modes unimplemented
+  (GXxor/GXnor/GXequiv/GXorReverse/GXcopyInverted/…), arc-mode
+  ArcChord rasterization, line cap/join, dashed line — the
+  drawing-completeness program of work.
+- **Colormap fidelity** (~510 XQueryColors fails): yserver synthesises
+  RGB from pixel via bit-replication; xts wants the exact RGB stored
+  by `XAllocColor`. Needs real per-colormap entry tracking.
+- **`GravityNotify` not emitted** (~250 lines): child windows don't
+  reposition per `win_gravity` on parent resize.
+- **Scattered argument validation** (`Bad{Match,Value,Window,GC,
+  Font,Pixmap}` missing): per-handler arg-relation checks (~285
+  test reports).
+- **`Closedown mode RetainPermanent`** (~24): close-mode state
+  machine doesn't preserve windows past disconnect.
+- **`BadLength`** on variable-length opcodes (PolyText8/16, SetFontPath)
+  + **"too big a reply"** on ListFonts/ListFontsWithInfo/GetImage
+  (~6 Xproto FAILs): exact-length content validation for the
+  TextItem-style encoding + BIG-REQUESTS reply-side path.
+
+None of the above are "quick simple wins" — each is its own
+medium-scope program. Pick by impact (XQueryColors clears ~510;
+GravityNotify ~250; everything else <100 each).
+
+
 The sole PASS is `OpenDisplay 2`. The remaining outcome is masked by
 the structural bugs below. The first row was the baseline cause;
 struck-through rows are fixed but their tests still UNRES because of
