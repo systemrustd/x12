@@ -333,6 +333,15 @@ pub fn run(display: u16) -> io::Result<()> {
         );
     }
 
+    // 2026-05-31: destroy every drawable's Vk handles before
+    // `backend` drops, so `vkDestroyDevice` doesn't warn about
+    // leaked `VkImage` / `VkImageView` / `VkDeviceMemory`.
+    // `DrawableStore` has no `Drop` (`Storage::destroy` needs
+    // `&PlatformBackend` for pool-return + DRI3-import handling
+    // and Drop has no access to disjoint sibling fields), so
+    // bridge them explicitly here.
+    backend.shutdown_destroy_drawables();
+
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");
     result

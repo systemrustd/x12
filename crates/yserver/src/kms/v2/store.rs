@@ -647,6 +647,28 @@ impl DrawableStore {
         self.by_xid.get(&xid).copied()
     }
 
+    /// Shutdown-only: destroy every remaining drawable's Vk
+    /// storage. The runtime release path (`destroy_now`) walks
+    /// from `decref` → `poll_pending_retire`, so any drawable
+    /// still in `entries` at shutdown was alive at SIGTERM (e.g.
+    /// MATE's resident pixmaps when the session quit). Without
+    /// this call the entries are dropped silently and their
+    /// `VkImage` / `VkImageView` / `VkDeviceMemory` handles leak
+    /// to `vkDestroyDevice`'s `has N leaked objects` warning
+    /// (948 VkDeviceMemory observed on bee/MATE 2026-05-31 after
+    /// the FenceTicket fix). Idempotent: `Storage::destroy`
+    /// nulls handles after pool-return and the direct-destroy
+    /// path is null-guarded throughout, so re-calling is safe.
+    /// Caller is `KmsBackendV2::shutdown_destroy_drawables` from
+    /// `lib.rs`'s explicit shutdown block.
+    pub(crate) fn shutdown_destroy_all(&mut self, platform: &PlatformBackend) {
+        self.by_xid.clear();
+        self.pending_retire.clear();
+        for (_, mut drawable) in self.entries.drain() {
+            drawable.storage.destroy(platform);
+        }
+    }
+
     pub(crate) fn get(&self, id: DrawableId) -> Option<&Drawable> {
         self.entries.get(&id)
     }
@@ -1338,5 +1360,53 @@ mod tests {
             ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         );
         assert!(!s.is_test_stub);
+    }
+
+    /// `shutdown_destroy_all` on an empty store is a clean no-op:
+    /// no entries, no by_xid lookups, no pending retires.
+    #[test]
+    fn shutdown_destroy_all_on_empty_store_is_noop() {
+        let mut s = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        s.shutdown_destroy_all(&platform);
+        assert!(s.entries.is_empty());
+        assert!(s.by_xid.is_empty());
+        assert!(s.pending_retire.is_empty());
+    }
+
+    /// Regression: pre-fix `DrawableStore` had no `Drop`, so
+    /// stub drawables still in `entries` at SIGTERM had their
+    /// `Storage` dropped silently — production drawables would
+    /// leak their real Vk handles. Verify `shutdown_destroy_all`
+    /// drains every entry and clears the xid lookup. Stub
+    /// storage's `destroy` is a no-op (early-returns on
+    /// `is_test_stub`), so this only proves the iteration +
+    /// drain logic; live-Vk leak verification is via the smoke
+    /// recipe with `VK_LAYER_KHRONOS_validation`.
+    #[test]
+    fn shutdown_destroy_all_drains_every_entry() {
+        let mut s = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let id1 = s
+            .allocate(0x100_0001, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate 1");
+        let id2 = s
+            .allocate(0x100_0002, DrawableKind::Window, 24, true, stub_storage())
+            .expect("allocate 2");
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.by_xid.len(), 2);
+        // Park one in pending_retire to verify it's cleared too
+        // (would otherwise hold a stale DrawableId past the drain).
+        s.pending_retire.push(id1);
+        s.pending_retire.push(id2);
+
+        s.shutdown_destroy_all(&platform);
+
+        assert!(s.entries.is_empty(), "shutdown must drain entries");
+        assert!(s.by_xid.is_empty(), "shutdown must clear xid lookup");
+        assert!(
+            s.pending_retire.is_empty(),
+            "shutdown must clear pending_retire so a redrop attempt finds no DrawableId",
+        );
     }
 }

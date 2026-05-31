@@ -2941,6 +2941,21 @@ impl KmsBackendV2 {
         std::mem::take(&mut self.pending_completed_events_on_shutdown)
     }
 
+    /// Shutdown-only: walk every drawable still in `store` and
+    /// destroy its Vk handles (`VkImage` / `VkImageView` /
+    /// `VkDeviceMemory`). `DrawableStore` has no `Drop` impl
+    /// because `Storage::destroy` needs `&PlatformBackend` for
+    /// pool-return + DRI3-import handling — both fields are
+    /// owned by `KmsBackendV2`, so this method bridges them.
+    /// Without this, MATE's resident pixmaps at SIGTERM leak
+    /// (948 VkDeviceMemory observed on bee/MATE 2026-05-31
+    /// post-FenceTicket fix). Caller is `lib.rs`'s explicit
+    /// shutdown block, after PRESENT completions are drained
+    /// and before `backend` drops.
+    pub fn shutdown_destroy_drawables(&mut self) {
+        self.store.shutdown_destroy_all(&self.platform);
+    }
+
     fn fire_pending_present_entry(
         &mut self,
         entry: crate::kms::v2::present_completion::PendingPresentEntry,
