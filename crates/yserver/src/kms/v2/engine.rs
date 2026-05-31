@@ -7726,6 +7726,18 @@ impl Drop for RenderEngine {
             // BatchResources without borrow conflicts against the
             // submitted/pending_frames iteration below.
             let vk = Arc::clone(&inner.vk);
+            // Drain cached drawable views. `notify_drawable_retired`
+            // is the runtime per-drawable-destroy invalidation hook
+            // but currently nobody calls it (filed as a separate
+            // known-issue), so at shutdown the entire cache is
+            // resident and every cached `VkImageView` would leak.
+            // VkImageView is destroyable independently of its image
+            // (Vulkan spec), so even cache entries whose underlying
+            // image has already been destroyed via the runtime path
+            // are safe to destroy here.
+            for (_, cached) in inner.drawable_view_cache.drain() {
+                unsafe { vk.device.destroy_image_view(cached.view, None) };
+            }
             for mut op in inner.submitted.drain(..) {
                 let _ = op.ticket.wait(&vk);
                 // Phase B.2 Mechanism 3: explicit release of any
