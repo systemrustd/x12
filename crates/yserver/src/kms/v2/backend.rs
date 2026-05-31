@@ -6629,14 +6629,26 @@ impl Backend for KmsBackendV2 {
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
+        // VT-master gate: when libseat has revoked DRM master (VT
+        // switch in progress / handed to another session), every
+        // atomic_commit returns `EACCES`. `composite_and_flip` has
+        // the same gate at :3263; `maybe_composite` was missing it
+        // and emitted a burst of "atomic commit failed for output …
+        // Permission denied" WARNs across the VT-suspend window
+        // (observed 2026-05-31 — 77 WARNs in 3 seconds on
+        // `just startx` + VT switch under MATE). In Direct mode
+        // `scanout_allowed()` is always true so this is a no-op
+        // there.
+        if !self.scanout_allowed() {
+            return Ok(());
+        }
         // DPMS gate: outputs are inactive (every CRTC has ACTIVE=0 +
         // MODE_ID=0 from disable_output). Submitting an atomic page-flip
         // commit against a disabled CRTC returns EINVAL. Without this
         // gate the core loop's per-iteration `backend.maybe_composite()`
         // call would loop a tight EINVAL storm while DPMS is Off (and
         // the `composite_and_flip` gate at :3196 wouldn't catch it —
-        // maybe_composite is a separate scene.tick caller). Same kind
-        // of gate `scanout_allowed()` provides for the VT-master case.
+        // maybe_composite is a separate scene.tick caller).
         // See project_einval_atomic_commit_storm_wedge memory entry.
         if !self.kms_outputs_active {
             return Ok(());
