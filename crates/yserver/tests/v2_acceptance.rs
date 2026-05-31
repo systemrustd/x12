@@ -5595,3 +5595,118 @@ fn v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old
          not from storage.current_layout (stale during deferred recording)",
     );
 }
+
+/// Regression for the runtime `notify_drawable_retired` wiring
+/// (2026-05-31). Pre-fix the engine's `drawable_view_cache`
+/// accumulated entries forever — every `DestroyPixmap` /
+/// `DestroyWindow` orphaned the per-drawable cached `VkImageView`s
+/// because `notify_drawable_retired` was defined but had zero
+/// callers, and only `RenderEngine::drop` ever swept the cache (at
+/// process exit). Long-running sessions grew unboundedly.
+///
+/// Post-fix `store_decref_with_invalidate` /
+/// `poll_pending_retire_with_invalidate` bridge `DrawableStore`
+/// destruction to `RenderEngine::notify_drawable_retired` via an
+/// `on_destroyed` closure that fires BEFORE `Storage::destroy`,
+/// so views are cleaned synchronously when the drawable retires.
+///
+/// The cache is populated by `ensure_drawable_view` from RENDER
+/// composite paths (NOT plain `copy_area`), so this test drives
+/// `render_composite(src_pic, dst_pic)` to seed the cache, then
+/// releases the picture + pixmap to exercise the runtime destroy
+/// chain and asserts the cache drops accordingly.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_free_pixmap_invalidates_engine_view_cache() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let src_pix = b.create_pixmap(None, 32, 4, 4).expect("src pixmap");
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    let src_xid = src_pix.as_raw();
+
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 4, 4)
+        .expect("fill src");
+    b.fill_rectangle(None, dst_pix.as_raw(), 0xFF0000FF, 0, 0, 4, 4)
+        .expect("fill dst");
+
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(src_pix), 0, 0, &[])
+        .expect("render_create_picture src")
+        .expect("Some(src PictureHandle)");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(dst PictureHandle)");
+
+    let baseline_cache_len = b.drawable_view_cache_len();
+
+    // OP_SRC composite from src pixmap to dst pixmap — invokes
+    // `ensure_drawable_view` for src (and possibly mask=white
+    // alias), populating drawable_view_cache.
+    b.render_composite(
+        None,
+        1, // OP_SRC
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        4,
+    )
+    .expect("render_composite");
+
+    let after_composite_cache_len = b.drawable_view_cache_len();
+    assert!(
+        after_composite_cache_len > baseline_cache_len,
+        "render_composite should populate the engine view cache \
+         (baseline={baseline_cache_len}, after_composite={after_composite_cache_len})",
+    );
+
+    // render_composite records into the deferred frame builder;
+    // close + flush so the GPU actually submits before we test
+    // retirement. (Otherwise the FenceTicket is unsignaled →
+    // decref parks in pending_retire and never destroys.)
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+    }
+    b.engine_flush_submit_group_for_tests()
+        .expect("flush submit group");
+
+    // Free the picture FIRST so it drops its refcount on src;
+    // otherwise free_pixmap's decref returns StillReferenced.
+    b.render_free_picture(None, src_pic.as_raw())
+        .expect("free src picture");
+    // free_pixmap routes through `backend.rs::free_pixmap` →
+    // `store_decref_with_invalidate` → engine.notify_drawable_retired
+    // → cache entry destroyed (VkImageView destroyed before
+    // Storage::destroy releases the underlying VkImage).
+    b.free_pixmap(None, src_xid).expect("free src pixmap");
+    // free_pixmap likely parks in pending_retire (in-flight composite
+    // fence not yet signaled). Wait on all submitted work, then drive
+    // the retirement loop — poll_pending_retire_with_invalidate
+    // sweeps and fires the invalidate closure for each retired id.
+    b.engine_drain_all_for_tests();
+    b.for_tests_poll_retired();
+
+    let after_free_cache_len = b.drawable_view_cache_len();
+    assert!(
+        after_free_cache_len < after_composite_cache_len,
+        "free_pixmap + for_tests_poll_retired must drop cached views \
+         for the freed drawable (after_composite={after_composite_cache_len}, \
+         after_free={after_free_cache_len}). Pre-fix this was equal — \
+         cached views accumulated until engine Drop (process exit), so \
+         long sessions grew unboundedly.",
+    );
+}

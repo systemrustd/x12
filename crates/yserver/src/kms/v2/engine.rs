@@ -2322,8 +2322,10 @@ impl RenderEngine {
 
     /// Stage 3c: how many cached drawable views the engine
     /// currently holds. Test-only — used to assert eviction on
-    /// drawable retire.
-    #[cfg(test)]
+    /// drawable retire. Also exposed to integration tests via
+    /// `KmsBackendV2::drawable_view_cache_len` — not gated on
+    /// `cfg(test)` because `tests/` integration crates compile
+    /// against the regular lib build, not the `--cfg test` one.
     pub(crate) fn drawable_view_cache_len(&self) -> usize {
         self.inner
             .as_ref()
@@ -10872,7 +10874,7 @@ mod tests {
         // The hostile FreePixmap. Pre-fix this returns Destroyed
         // because src.last_render_ticket is the (signaled) fill_rect
         // ticket, never bumped to the batch ticket.
-        let decision = store.decref(&mut platform, src_id);
+        let decision = store.decref(&mut platform, src_id, |_| {});
         assert_eq!(
             decision,
             super::super::store::RetireDecision::PendingFence,

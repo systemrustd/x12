@@ -827,7 +827,7 @@ impl KmsBackendV2 {
             log::warn!("v2 cursor sprite alloc: put_image failed: {e:?}");
             // Drop the freshly-allocated storage cleanly so it
             // doesn't leak.
-            self.store.decref(&mut self.platform, id);
+            self.store_decref_with_invalidate(id);
             return None;
         }
         Some(id)
@@ -1866,6 +1866,18 @@ impl KmsBackendV2 {
         self.engine.descriptor_pool_ring_pool_count()
     }
 
+    /// Test-only accessor for the engine's per-drawable view cache
+    /// size. Used by the live-Vk integration test that gates the
+    /// `notify_drawable_retired` runtime-wiring fix: pre-fix a
+    /// destroyed drawable's cached views accumulated until engine
+    /// `Drop`; post-fix they're invalidated synchronously via
+    /// `store_decref_with_invalidate` / `poll_pending_retire_with_invalidate`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn drawable_view_cache_len(&self) -> usize {
+        self.engine.drawable_view_cache_len()
+    }
+
     /// Stage 5 Task 4 layer 1: test-side retirement driver. In
     /// production, retirement runs from `on_page_flip_ready` and
     /// invokes `engine.poll_retired` + `store.poll_pending_retire`.
@@ -1878,8 +1890,43 @@ impl KmsBackendV2 {
     #[doc(hidden)]
     pub fn for_tests_poll_retired(&mut self) {
         self.engine.poll_retired(&self.platform);
-        self.store.poll_pending_retire(&mut self.platform);
+        self.poll_pending_retire_with_invalidate();
         self.sync_descriptor_pool_telemetry();
+    }
+
+    /// Bridge `store.decref` to `engine.notify_drawable_retired`.
+    /// When `decref` decides the drawable is destroyable, the
+    /// closure fires BEFORE `Storage::destroy`, so any
+    /// `VkImageView` cached in `RenderEngine::drawable_view_cache`
+    /// for that `DrawableId` is destroyed while its underlying
+    /// `VkImage` is still alive. Without this hook the cache
+    /// accumulates entries pointing at freed images for the
+    /// lifetime of the session (only swept at engine `Drop`).
+    /// `DrawableId`s are monotonically allocated so stale entries
+    /// can never alias a fresh drawable — the leak is memory-only,
+    /// not use-after-free — but unbounded growth still matters.
+    pub(crate) fn store_decref_with_invalidate(
+        &mut self,
+        id: crate::kms::v2::store::DrawableId,
+    ) -> crate::kms::v2::store::RetireDecision {
+        let engine = &mut self.engine;
+        self.store.decref(&mut self.platform, id, |dropped| {
+            engine.notify_drawable_retired(dropped);
+        })
+    }
+
+    /// Bridge `store.poll_pending_retire` to
+    /// `engine.notify_drawable_retired`. Per the rationale on
+    /// `store_decref_with_invalidate`, drawables that were
+    /// parked in `pending_retire` (waiting for their fence to
+    /// signal) get their engine-side view caches dropped before
+    /// `Storage::destroy` runs.
+    pub(crate) fn poll_pending_retire_with_invalidate(&mut self) {
+        let engine = &mut self.engine;
+        self.store
+            .poll_pending_retire(&mut self.platform, |dropped| {
+                engine.notify_drawable_retired(dropped);
+            });
     }
 
     /// Stage 5 Task 6.1 — test-only: number of entries currently in
@@ -6525,7 +6572,7 @@ impl Backend for KmsBackendV2 {
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
         self.engine.poll_retired(&self.platform);
-        self.store.poll_pending_retire(&mut self.platform);
+        self.poll_pending_retire_with_invalidate();
         self.sync_descriptor_pool_telemetry();
         // Phase A T7: pageflip retire is a frame boundary — close
         // any open render batch FIRST so its CBs land in the group
@@ -7005,7 +7052,7 @@ impl Backend for KmsBackendV2 {
         host_xid: u32,
     ) -> io::Result<()> {
         if let Some(id) = self.store.lookup(host_xid) {
-            self.store.decref(&mut self.platform, id);
+            self.store_decref_with_invalidate(id);
         }
         self.windows_v2.remove(&host_xid);
         // Stage 3f.11: also drop from top_level_order so build_scene
@@ -7098,7 +7145,7 @@ impl Backend for KmsBackendV2 {
             // semantics (a Picture on a window references the
             // window's *current* storage).
             self.store.detach_xid(host_xid);
-            self.store.decref(&mut self.platform, old_id);
+            self.store_decref_with_invalidate(old_id);
             match self.platform.allocate_drawable_storage(new_w, new_h, depth) {
                 Ok(storage) => {
                     if let Err(e) = self.store.allocate(
@@ -7801,7 +7848,7 @@ impl Backend for KmsBackendV2 {
             // stop referencing COW from this point regardless.
             self.scene.unregister_cow();
             if let Some(id) = self.cow_id.take() {
-                self.store.decref(&mut self.platform, id);
+                self.store_decref_with_invalidate(id);
             }
             Ok(true)
         } else {
@@ -7922,12 +7969,12 @@ impl Backend for KmsBackendV2 {
             if self.core.alias_registry.decref(handle)
                 && let Some(id) = self.store.lookup(host_xid)
             {
-                self.store.decref(&mut self.platform, id);
+                self.store_decref_with_invalidate(id);
             }
             return Ok(());
         }
         if let Some(id) = self.store.lookup(host_xid) {
-            self.store.decref(&mut self.platform, id);
+            self.store_decref_with_invalidate(id);
         }
         Ok(())
     }
@@ -9712,7 +9759,7 @@ impl Backend for KmsBackendV2 {
             && let Some(drawable_xid) = record.drawable_host_xid()
             && let Some(id) = self.store.lookup(drawable_xid)
         {
-            self.store.decref(&mut self.platform, id);
+            self.store_decref_with_invalidate(id);
         }
         // Drop any GPU-side state cached for this picture. Stage
         // 3b never populates the map (no gradient LUT built yet),
@@ -15764,7 +15811,7 @@ mod tests {
         // Tear it back down so the DrawableId no longer resolves.
         // `decref` with no Vk treats the ticket as signaled and
         // calls `destroy_now`, removing the id from `entries`.
-        let _ = b.store.decref(&mut b.platform, w_id);
+        let _ = b.store.decref(&mut b.platform, w_id, |_| {});
         // Also clear the windows_v2 entry — otherwise the helper
         // would early-return on the xid lookup, not the id lookup
         // we want to exercise.

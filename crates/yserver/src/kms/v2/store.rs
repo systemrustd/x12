@@ -722,11 +722,15 @@ impl DrawableStore {
     /// the caller would silently keep the old (now-orphaned) storage.
     /// Id-based access stays valid (any in-flight op captured the id
     /// before this point), so this only affects xid-based lookups.
-    pub(crate) fn decref(
+    pub(crate) fn decref<F>(
         &mut self,
         platform: &mut PlatformBackend,
         id: DrawableId,
-    ) -> RetireDecision {
+        on_destroyed: F,
+    ) -> RetireDecision
+    where
+        F: FnOnce(DrawableId),
+    {
         let Some(drawable) = self.entries.get_mut(&id) else {
             return RetireDecision::Destroyed;
         };
@@ -743,6 +747,17 @@ impl DrawableStore {
             },
         };
         if ticket_ready {
+            // Engine-cache invalidation must fire BEFORE
+            // `destroy_now` so cached `VkImageView`s are
+            // destroyed while their underlying `VkImage` is still
+            // alive (the Vulkan-spec-clean ordering — view
+            // destruction is technically independent of the image
+            // but VUID-best-practice + most validation layers
+            // expect view-first). Caller threads the closure
+            // through to bridge `&mut DrawableStore` with
+            // `&mut RenderEngine` (disjoint sibling fields on
+            // `KmsBackendV2`).
+            on_destroyed(id);
             self.destroy_now(platform, id);
             RetireDecision::Destroyed
         } else {
@@ -918,7 +933,18 @@ impl DrawableStore {
 
     /// Sweep `pending_retire`. Drawables whose ticket has
     /// signaled (or never had one) get destroyed and removed.
-    pub(crate) fn poll_pending_retire(&mut self, platform: &mut PlatformBackend) {
+    /// `on_destroyed` is invoked per drawable BEFORE its storage
+    /// is destroyed, so engine-side caches keyed on `DrawableId`
+    /// (e.g. `RenderEngine::drawable_view_cache`) can drop their
+    /// `VkImageView`s while the underlying `VkImage` is still
+    /// alive.
+    pub(crate) fn poll_pending_retire<F>(
+        &mut self,
+        platform: &mut PlatformBackend,
+        mut on_destroyed: F,
+    ) where
+        F: FnMut(DrawableId),
+    {
         let mut survivors = Vec::with_capacity(self.pending_retire.len());
         let mut to_destroy = Vec::new();
         for id in std::mem::take(&mut self.pending_retire) {
@@ -939,6 +965,7 @@ impl DrawableStore {
             }
         }
         for id in to_destroy {
+            on_destroyed(id);
             self.destroy_now(platform, id);
         }
         self.pending_retire = survivors;
@@ -1023,7 +1050,10 @@ mod tests {
         let id = s
             .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
             .unwrap();
-        assert_eq!(s.decref(&mut platform, id), RetireDecision::Destroyed);
+        assert_eq!(
+            s.decref(&mut platform, id, |_| {}),
+            RetireDecision::Destroyed
+        );
         assert!(s.lookup(0x1).is_none());
         assert_eq!(s.len(), 0);
     }
@@ -1036,9 +1066,15 @@ mod tests {
             .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
             .unwrap();
         s.incref(id);
-        assert_eq!(s.decref(&mut platform, id), RetireDecision::StillReferenced);
+        assert_eq!(
+            s.decref(&mut platform, id, |_| {}),
+            RetireDecision::StillReferenced
+        );
         assert!(s.lookup(0x1).is_some());
-        assert_eq!(s.decref(&mut platform, id), RetireDecision::Destroyed);
+        assert_eq!(
+            s.decref(&mut platform, id, |_| {}),
+            RetireDecision::Destroyed
+        );
         assert!(s.lookup(0x1).is_none());
     }
 
@@ -1143,7 +1179,7 @@ mod tests {
         // we can't easily construct a FenceTicket in tests).
         s.entries.get_mut(&id).unwrap().refcount = 0;
         s.pending_retire.push(id);
-        s.poll_pending_retire(&mut platform);
+        s.poll_pending_retire(&mut platform, |_| {});
         // No ticket attached → treated as signaled → destroyed.
         assert!(s.lookup(0x1).is_none());
         assert_eq!(s.pending_retire_count(), 0);
@@ -1181,7 +1217,7 @@ mod tests {
         );
         // Now retire the old drawable. No real ticket attached, so
         // poll_pending_retire treats it as signaled → destroy_now.
-        s.poll_pending_retire(&mut platform);
+        s.poll_pending_retire(&mut platform, |_| {});
         // The new drawable's xid mapping MUST survive.
         assert_eq!(
             s.lookup(0x42),
@@ -1215,7 +1251,7 @@ mod tests {
         assert_eq!(s.get(id).unwrap().refcount, 2);
         // Simulate configure_subwindow resize sequence:
         s.detach_xid(0x42);
-        let r = s.decref(&mut platform, id);
+        let r = s.decref(&mut platform, id, |_| {});
         assert_eq!(
             r,
             RetireDecision::StillReferenced,
@@ -1408,5 +1444,88 @@ mod tests {
             s.pending_retire.is_empty(),
             "shutdown must clear pending_retire so a redrop attempt finds no DrawableId",
         );
+    }
+
+    /// `decref` invokes `on_destroyed` exactly when it actually
+    /// destroys the drawable's storage (refcount→0 + ticket
+    /// signaled). The callback is the bridge that lets
+    /// `KmsBackendV2` invalidate `RenderEngine::drawable_view_cache`
+    /// entries keyed on the destroyed `DrawableId` before
+    /// `Storage::destroy` runs. Pre-fix the callback parameter
+    /// didn't exist; the engine's cached views accumulated for
+    /// every `DestroyPixmap` / `DestroyWindow` across the session
+    /// and only got swept at engine `Drop`.
+    #[test]
+    fn decref_invokes_invalidation_callback_on_destroy() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        let id = s
+            .allocate(0x100_0001, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        let mut invalidated = Vec::new();
+        let decision = s.decref(&mut platform, id, |dropped| invalidated.push(dropped));
+        assert_eq!(decision, RetireDecision::Destroyed);
+        assert_eq!(
+            invalidated,
+            vec![id],
+            "decref must invoke `on_destroyed(id)` BEFORE Storage::destroy \
+             so engine view cache invalidates while the underlying VkImage \
+             is still alive (the Vulkan view-before-image idiom)",
+        );
+    }
+
+    /// Companion to the test above: when `decref` parks the
+    /// drawable in `pending_retire` (ticket not yet signaled),
+    /// the invalidation callback must NOT fire — the drawable's
+    /// storage is still alive and its cached views are still
+    /// valid. The callback fires later, when `poll_pending_retire`
+    /// finally destroys it. Pre-fix this distinction was moot
+    /// (no callback); post-fix it's load-bearing because firing
+    /// early would invalidate views the engine may still be
+    /// sampling from in-flight ops.
+    #[test]
+    fn decref_does_not_invalidate_when_still_referenced() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        let id = s
+            .allocate(0x100_0002, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        s.incref(id);
+        let mut invalidated = Vec::new();
+        let decision = s.decref(&mut platform, id, |dropped| invalidated.push(dropped));
+        assert_eq!(decision, RetireDecision::StillReferenced);
+        assert!(
+            invalidated.is_empty(),
+            "decref with refcount > 1 must NOT invalidate — drawable storage \
+             is still alive and engine cache entries are still valid",
+        );
+    }
+
+    /// `poll_pending_retire` invokes `on_destroyed` per drawable
+    /// that gets destroyed during the sweep (one callback per
+    /// id, BEFORE `Storage::destroy`).
+    #[test]
+    fn poll_pending_retire_invokes_invalidation_callback_per_destroyed_id() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        // Stash two drawables in pending_retire by setting
+        // refcount=1 + a (stub) ticket and decref'ing. Stub
+        // storage has no real ticket so decref goes synchronous;
+        // park them directly via the internal list.
+        let id_a = s
+            .allocate(0x100_0003, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate a");
+        let id_b = s
+            .allocate(0x100_0004, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate b");
+        s.pending_retire.push(id_a);
+        s.pending_retire.push(id_b);
+        let mut invalidated = Vec::new();
+        s.poll_pending_retire(&mut platform, |dropped| invalidated.push(dropped));
+        assert_eq!(invalidated.len(), 2);
+        assert!(invalidated.contains(&id_a));
+        assert!(invalidated.contains(&id_b));
+        assert!(s.entries.is_empty(), "both entries destroyed");
+        assert!(s.pending_retire.is_empty(), "pending_retire drained");
     }
 }
