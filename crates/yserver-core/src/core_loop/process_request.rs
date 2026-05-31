@@ -5404,6 +5404,72 @@ pub(crate) fn emit_screen_saver_notify(
     }
 }
 
+/// Evaluate Negative-* alarms on IDLETIME-family counters after input
+/// wake. Called from the key + pointer fanout prologues immediately
+/// after `last_activity` is updated to "now". The semantic is:
+/// `old_idle = (now - prior_last_activity)`, `new_idle = 0`. Fires any
+/// alarms whose trigger crosses on this transition.
+///
+/// `device_id` identifies which per-device counter to evaluate; pass
+/// 2 for pointer events (drives IDLETIME_DEVICE_VCP), 3 for key events
+/// (drives IDLETIME_DEVICE_VCK). The global IDLETIME counter is
+/// evaluated unconditionally because any input resets the global
+/// last_activity.
+pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
+    state: &mut ServerState,
+    device_id: u8,
+    prior_global_idle_ms: i64,
+    prior_device_idle_ms: i64,
+) {
+    use yserver_protocol::x11::sync as x11sync;
+    // Suspend gate (Xorg WaitFor.c:519). When XScreenSaverSuspend is
+    // held, the unified timer is not armed in either direction —
+    // including the input-wake firing of Negative-* alarms. Without
+    // this gate, an input event during fullscreen video would still
+    // fire MATE's wake alarms and could prompt mate-power-manager to
+    // re-arm screen-blanking too aggressively.
+    if !state.screensaver.suspend_counts.is_empty() {
+        return;
+    }
+    // Global IDLETIME: always reset on any input.
+    evaluate_alarms_for_counter(state, x11sync::IDLETIME_COUNTER, prior_global_idle_ms, 0);
+    state
+        .idletime_last_evaluated
+        .insert(x11sync::IDLETIME_COUNTER, 0);
+
+    // Per-device IDLETIME: only the affected device resets.
+    let device_counter = match device_id {
+        2 => x11sync::IDLETIME_DEVICE_VCP,
+        3 => x11sync::IDLETIME_DEVICE_VCK,
+        _ => return,
+    };
+    evaluate_alarms_for_counter(state, device_counter, prior_device_idle_ms, 0);
+    state.idletime_last_evaluated.insert(device_counter, 0);
+}
+
+/// Reset IDLETIME bookkeeping when the suspend-counts table drains to
+/// empty. Must be called at the SAME spot the existing MIT-SCREEN-SAVER
+/// code resets `state.dpms.last_activity` (SS Suspend handler +
+/// process_disconnect's last-suspender cleanup).
+///
+/// Without this, IDLETIME alarms can be skipped post-suspend because
+/// `idletime_last_evaluated` holds stale-high values from before the
+/// suspend, causing `evaluate_alarms_for_counter`'s
+/// `old < wait <= new` Transition check to never hold.
+pub(crate) fn reset_idletime_state_after_suspend_release(state: &mut ServerState) {
+    let now = std::time::Instant::now();
+    // dpms.last_activity is already reset by the caller. Reset the
+    // per-device baselines so post-resume per-device IDLETIME
+    // computation is consistent.
+    for entry in state.per_device_last_activity.values_mut() {
+        *entry = now;
+    }
+    // Clear the evaluator's last-seen cache so the next post-poll pass
+    // computes `(old=0, new=current)` from a clean slate, preserving
+    // the Transition `old < wait <= new` invariant.
+    state.idletime_last_evaluated.clear();
+}
+
 fn handle_dpms_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -5789,6 +5855,7 @@ fn handle_screen_saver_request(
                     // Mirrors ScreenSaverFreeSuspend (saver.c:343-378):
                     // restart the idle clock from now. No notify fires.
                     state.dpms.last_activity = std::time::Instant::now();
+                    reset_idletime_state_after_suspend_release(state);
                 }
             }
         }
@@ -26805,6 +26872,55 @@ mod tests {
             state.sync_alarms[&alarm_id].state,
             x11sync::ALARM_STATE_ACTIVE,
             "alarm stays Active, waiting for evaluator/input to drive the transition"
+        );
+    }
+
+    #[test]
+    fn suspend_release_resets_idletime_last_evaluated_and_per_device_baselines() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Pre-seed: stale idletime cache from before suspend.
+        state
+            .idletime_last_evaluated
+            .insert(x11sync::IDLETIME_COUNTER, 999_999);
+        state
+            .per_device_last_activity
+            .insert(3, std::time::Instant::now() - Duration::from_secs(120));
+
+        // Insert a suspending client, then drain via Suspend(false).
+        state.screensaver.suspend_counts.insert(ClientId(1), 1);
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::SUSPEND,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8, 0, 0, 0],
+        );
+
+        // The drain hit the (drained && empty && SS=Off && DPMS=On) guard
+        // and must have reset both IDLETIME bookkeeping fields.
+        assert!(
+            state.idletime_last_evaluated.is_empty(),
+            "idletime_last_evaluated must be cleared on suspend release"
+        );
+        let vck_baseline = state
+            .per_device_last_activity
+            .get(&3)
+            .copied()
+            .expect("per_device_last_activity[3] still present");
+        let elapsed = std::time::Instant::now().duration_since(vck_baseline);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "per_device_last_activity[3] must be reset to ~now; got elapsed {elapsed:?}"
         );
     }
 }

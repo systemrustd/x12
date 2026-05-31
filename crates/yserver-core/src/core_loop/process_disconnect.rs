@@ -261,6 +261,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         // last suspender going away, restart the idle clock so the
         // saver doesn't immediately fire from a stale baseline.
         state.dpms.last_activity = std::time::Instant::now();
+        crate::core_loop::process_request::reset_idletime_state_after_suspend_release(state);
     }
     state.button_grabs.retain(|g| g.owner != client_id);
     if state

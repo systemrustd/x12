@@ -45,10 +45,43 @@ pub fn key_event_fanout_to_state(
     // we wake the screen *before* fanning out, so the first event
     // of the resumed session lands on a visible scanout.
     let now = std::time::Instant::now();
+    // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
+    #[allow(clippy::cast_possible_truncation)]
+    let prior_global = now
+        .duration_since(state.dpms.last_activity)
+        .as_millis()
+        .min(u128::from(u32::MAX)) as i64;
+    // Per-device prior: fall back to global if no per-device entry yet.
+    // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
+    // this, the very first input event for a device whose baseline isn't
+    // recorded would compute prior_device=0 and a per-device Negative
+    // alarm (whose wait_value > 0) would not see the `old > wait` half of
+    // its trigger.
+    let prior_device = state
+        .per_device_last_activity
+        .get(&(XI2_MASTER_KEYBOARD_DEVICE_ID as u8))
+        .copied()
+        .map(|t| {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
+            v
+        })
+        .unwrap_or(prior_global);
+
     state.dpms.last_activity = now;
     state
         .per_device_last_activity
         .insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
+
+    // IDLETIME wake: fires Negative-* alarms before the input event itself
+    // reaches clients (predictable ordering).
+    crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
+        state,
+        XI2_MASTER_KEYBOARD_DEVICE_ID as u8,
+        prior_global,
+        prior_device,
+    );
+
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
         // DPMS coupling tail already flipped SS Off if it was On.
@@ -345,6 +378,46 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
     use yserver_protocol::x11::ClientByteOrder;
+
+    fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
+        use crate::resources::ROOT_WINDOW;
+        let (a, b) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        b
+    }
+
+    fn read_all_available(peer: &mut UnixStream) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set_nonblocking");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("read failed: {err}"),
+            }
+        }
+        peer.set_nonblocking(false).expect("unset_nonblocking");
+        out
+    }
 
     fn key_event(pressed: bool, keycode: u8) -> HostKeyEvent {
         HostKeyEvent {
@@ -647,5 +720,105 @@ mod tests {
             .copied()
             .expect("VCK per-device entry inserted");
         assert!(vck > stale, "VCK per-device last_activity advanced");
+    }
+
+    #[test]
+    fn key_event_fires_neg_transition_alarm_when_prior_idle_crosses_threshold() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        // User idle for 90s, NegativeTransition alarm at 60s.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        state
+            .per_device_last_activity
+            .insert(3, std::time::Instant::now() - Duration::from_secs(90));
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                events: false,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        // Alarm stays Active (Transition + delta=0 — Task 2 fix); cache reflects post-wake idle=0.
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE
+        );
+        assert_eq!(
+            state
+                .idletime_last_evaluated
+                .get(&x11sync::IDLETIME_COUNTER)
+                .copied(),
+            Some(0),
+            "post-wake last_evaluated should be 0"
+        );
+    }
+
+    #[test]
+    fn key_event_fires_neg_transition_alarm_on_per_device_idletime_vck() {
+        // Regression for the per-device fallback bug: a NegativeTransition
+        // alarm on IDLETIME_DEVICE_VCK must fire on the very first input
+        // even if `per_device_last_activity[3]` has no entry yet.
+        // Without the fallback-to-global fix in the prologue, the computed
+        // prior_device would be 0 and the trigger `old > wait && new <= wait`
+        // would not hold — no AlarmNotify would reach the wire.
+        //
+        // PRIMARY assertion is AlarmNotify (type=84) on the client's
+        // outbound stream; cache + state are secondary checks.
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        assert!(
+            state.per_device_last_activity.get(&3).is_none(),
+            "test precondition: no per-device entry"
+        );
+
+        let alarm_id = 0x3000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_DEVICE_VCK,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                events: true, // load-bearing
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        // PRIMARY: AlarmNotify event type 84.
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.iter().any(|&b| b == 84),
+            "AlarmNotify (type=84) must reach client; got {:?}",
+            bytes
+        );
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE
+        );
+        assert_eq!(
+            state
+                .idletime_last_evaluated
+                .get(&x11sync::IDLETIME_DEVICE_VCK)
+                .copied(),
+            Some(0)
+        );
     }
 }

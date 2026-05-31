@@ -51,10 +51,43 @@ pub fn pointer_event_fanout_to_state(
     is_replay: bool,
 ) -> Vec<ClientId> {
     let now = std::time::Instant::now();
+    // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
+    #[allow(clippy::cast_possible_truncation)]
+    let prior_global = now
+        .duration_since(state.dpms.last_activity)
+        .as_millis()
+        .min(u128::from(u32::MAX)) as i64;
+    // Per-device prior: fall back to global if no per-device entry yet.
+    // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
+    // this, the very first input event for a device whose baseline isn't
+    // recorded would compute prior_device=0 and a per-device Negative
+    // alarm (whose wait_value > 0) would not see the `old > wait` half of
+    // its trigger.
+    let prior_device = state
+        .per_device_last_activity
+        .get(&(XI2_MASTER_POINTER_DEVICE_ID as u8))
+        .copied()
+        .map(|t| {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
+            v
+        })
+        .unwrap_or(prior_global);
+
     state.dpms.last_activity = now;
     state
         .per_device_last_activity
         .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
+
+    // IDLETIME wake: fires Negative-* alarms before the input event itself
+    // reaches clients (predictable ordering).
+    crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
+        state,
+        XI2_MASTER_POINTER_DEVICE_ID as u8,
+        prior_global,
+        prior_device,
+    );
+
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
         // DPMS coupling tail already flipped SS Off if it was On.
@@ -1029,5 +1062,55 @@ mod tests {
             .copied()
             .expect("VCP per-device entry inserted");
         assert!(vcp > stale, "VCP per-device last_activity advanced");
+    }
+
+    #[test]
+    fn pointer_event_fires_neg_transition_alarm_when_prior_idle_crosses_threshold() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        // User idle for 90s, NegativeTransition alarm at 60s.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        state
+            .per_device_last_activity
+            .insert(2, std::time::Instant::now() - Duration::from_secs(90));
+        let alarm_id = 0x4000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_DEVICE_VCP,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                events: false,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        // Alarm stays Active (Transition + delta=0 — Task 2 fix); cache reflects post-wake idle=0.
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE
+        );
+        assert_eq!(
+            state
+                .idletime_last_evaluated
+                .get(&x11sync::IDLETIME_DEVICE_VCP)
+                .copied(),
+            Some(0),
+            "post-wake last_evaluated should be 0"
+        );
     }
 }
