@@ -2331,6 +2331,16 @@ fn handle_sync_request(
                 };
                 apply_alarm_attributes(state, &mut a, &attrs);
                 let counter = a.counter;
+                log::info!(
+                    "sync: client {} CreateAlarm 0x{alarm:x} counter={cname}(0x{counter:x}) \
+                     test={test} wait_value={wait} delta={delta} events={events}",
+                    client_id.0,
+                    cname = sync_counter_name(counter),
+                    test = sync_test_type_name(u32::from(a.test_type)),
+                    wait = a.wait_value,
+                    delta = a.delta,
+                    events = a.events,
+                );
                 state.sync_alarms.insert(alarm, a);
                 // Per the X Synchronization Extension spec the trigger is
                 // tested at creation: a comparison alarm whose condition
@@ -2357,6 +2367,16 @@ fn handle_sync_request(
                 apply_alarm_attributes(state, &mut a, &attrs);
                 a.state = x11sync::ALARM_STATE_ACTIVE;
                 let counter = a.counter;
+                log::info!(
+                    "sync: client {} ChangeAlarm 0x{alarm:x} counter={cname}(0x{counter:x}) \
+                     test={test} wait_value={wait} delta={delta} events={events}",
+                    client_id.0,
+                    cname = sync_counter_name(counter),
+                    test = sync_test_type_name(u32::from(a.test_type)),
+                    wait = a.wait_value,
+                    delta = a.delta,
+                    events = a.events,
+                );
                 state.sync_alarms.insert(alarm, a);
                 // Per the X Synchronization Extension spec the trigger is
                 // tested at creation: a comparison alarm whose condition
@@ -2607,6 +2627,42 @@ fn apply_alarm_attributes(
 /// - `delta == 0` + Transition test type: stay Active with `wait_value`
 ///   unchanged — the alarm quiesces until the next edge crossing.
 ///
+/// Human-friendly name for a SYNC counter id (system counters land
+/// here; client-allocated counters fall through to `<client>`).
+fn sync_counter_name(counter: u32) -> &'static str {
+    use yserver_protocol::x11::sync as x11sync;
+    match counter {
+        x11sync::SERVERTIME_COUNTER => "SERVERTIME",
+        x11sync::IDLETIME_COUNTER => "IDLETIME",
+        x11sync::IDLETIME_DEVICE_VCP => "IDLETIME-VCP",
+        x11sync::IDLETIME_DEVICE_VCK => "IDLETIME-VCK",
+        _ => "<client>",
+    }
+}
+
+/// Human-friendly name for a SYNC alarm test type.
+fn sync_test_type_name(test_type: u32) -> &'static str {
+    use yserver_protocol::x11::sync as x11sync;
+    match test_type {
+        x11sync::TEST_POSITIVE_TRANSITION => "PosTransition",
+        x11sync::TEST_NEGATIVE_TRANSITION => "NegTransition",
+        x11sync::TEST_POSITIVE_COMPARISON => "PosComparison",
+        x11sync::TEST_NEGATIVE_COMPARISON => "NegComparison",
+        _ => "?",
+    }
+}
+
+/// Human-friendly name for a SYNC alarm state.
+fn sync_alarm_state_name(state: u8) -> &'static str {
+    use yserver_protocol::x11::sync as x11sync;
+    match state {
+        x11sync::ALARM_STATE_ACTIVE => "Active",
+        x11sync::ALARM_STATE_INACTIVE => "Inactive",
+        x11sync::ALARM_STATE_DESTROYED => "Destroyed",
+        _ => "?",
+    }
+}
+
 /// This is the frame-timing signal mutter/muffin waits on before
 /// compositing a client frame and emitting `_NET_WM_FRAME_DRAWN`, and
 /// also the idle/wake pair used by mate-power-manager.
@@ -2686,6 +2742,15 @@ pub(crate) fn evaluate_alarms_for_counter(
             a.wait_value = new_wait;
             a.state = new_state;
         }
+
+        log::debug!(
+            "sync: alarm 0x{alarm_id:x} fired counter={counter_name}(0x{counter:x}) \
+             test={test} old={old} new={new} wait={fired_wait} \
+             → state={state_name} (events={events})",
+            counter_name = sync_counter_name(counter),
+            test = sync_test_type_name(test_type),
+            state_name = sync_alarm_state_name(new_state),
+        );
 
         if events {
             let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
