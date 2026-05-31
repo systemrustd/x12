@@ -6032,7 +6032,7 @@ fn handle_present_request(
                         None => "unknown-fence".to_string(),
                     }
                 };
-                log::info!(
+                log::debug!(
                     "PRESENT-INSTR client {} #{} Pixmap serial={} src={} {}x{} \
                      window=0x{:x} wait_fence=0x{:x} wait_triggered={} idle_fence=0x{:x}",
                     client_id.0,
@@ -6337,7 +6337,7 @@ fn handle_present_request(
                     Some(_) => ("non-pixmap", 0, 0),
                     None => ("unresolved", 0, 0),
                 };
-                log::info!(
+                log::debug!(
                     "PRESENT-INSTR client {} #{} PixmapSynced serial={} src={} {}x{} \
                      window=0x{:x} acquire_syncobj=0x{:x} acquire_value={} \
                      release_syncobj=0x{:x} release_value={}",
