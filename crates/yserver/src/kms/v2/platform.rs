@@ -1135,7 +1135,17 @@ impl PlatformBackend {
         }
         for crtc in crtcs {
             if let Err(e) = plane.hide(crtc) {
-                log::warn!("v2 cursor hide_all on {crtc:?} failed: {e}");
+                // `cursor_plane_hide_all` is designed to be called on
+                // VT-leave / shutdown / DRM-master-loss (see top-of-fn
+                // comment). `EACCES` there is the kernel correctly
+                // telling us we no longer own the device — expected,
+                // not a real warning. Other errnos are still worth
+                // surfacing.
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    log::debug!("v2 cursor hide_all on {crtc:?} (no master): {e}");
+                } else {
+                    log::warn!("v2 cursor hide_all on {crtc:?} failed: {e}");
+                }
             }
         }
         plane.invalidate_uploaded_version();
