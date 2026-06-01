@@ -707,7 +707,17 @@ Roughly half the session's protocol traffic was this one dead loop;
 killing it also recovers idle CPU and lowers latency (the
 single-threaded core was being woken ~per vsync to service a no-op).
 
-**Open follow-ups (not blocking; the tray is fixed):**
+**Open follow-ups (not blocking; the storm is fixed):**
+
+0. **Tray icons intermittently blank / bottom-sliver** — a SECOND,
+   distinct tray bug surfaced after the storm fix: COMPOSITE
+   manual-redirect paint-routing race (routing set lazily in the scene
+   walk, not at `RedirectWindow` time, so a plug that paints before the
+   scene walk loses its content). Code-grounded; confirming probe +
+   fix direction in `known-issues.md` ("Tray icons intermittently
+   blank / bottom-sliver") and the `project_systray_icon_redirect_race`
+   memory.
+
 
 1. The other RENDER paint sites — Composite (~`1592`), CompositeGlyphs
    (~`1414`/`1488`), Trapezoids/Triangles (~`1764`) — still
