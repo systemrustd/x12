@@ -42,7 +42,7 @@ pub struct ClientId(pub u32);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ResourceId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AtomId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2145,11 +2145,26 @@ pub fn encode_xi2_raw_event(
 /// Constants from `XI.h`: `use` codes IsXPointer=0, IsXKeyboard=1,
 /// IsXExtensionKeyboard=3, IsXExtensionPointer=4; class ids KeyClass=0,
 /// ButtonClass=1, ValuatorClass=2; valuator mode Relative=0, Absolute=1.
+/// `names` supplies the device names for ids `[2, 3, 4, 5]` (master
+/// pointer, master keyboard, slave pointer, slave keyboard) in that
+/// order. They MUST come from the same source the XI2 `XIQueryDevice`
+/// handler reads (the `ServerState::xi_devices` registry) so the two
+/// enumerations report identical names — clients cross-check them and
+/// fatal-`CHECK` on a mismatch.
+///
+/// `types` supplies the XI 1.x device-type `Atom` value for each of the
+/// same four devices in the same order (`[2, 3, 4, 5]`).  Pass the atom
+/// ids interned at server startup: `MOUSE` for pointer devices,
+/// `KEYBOARD` for keyboard devices, and `TOUCHPAD` for the slave pointer
+/// when a touchpad is active.  The atom ids are looked up from
+/// `ServerState::atoms` by name at the call site.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn encode_list_input_devices_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    names: [&str; 4],
+    types: [u32; 4],
 ) -> Vec<u8> {
     // Pointer button/axis shape mirrors the XIQueryDevice handler:
     // 7 buttons (left/middle/right + 4 wheel directions), 4 relative
@@ -2167,10 +2182,10 @@ pub fn encode_list_input_devices_reply(
     const NUM_KEYS: u16 = 248;
 
     // Device descriptor: id, XI-1.x `use` code, name, and class count.
-    struct Dev {
+    struct Dev<'a> {
         id: u8,
         use_code: u8,
-        name: &'static str,
+        name: &'a str,
         num_classes: u8,
     }
 
@@ -2210,32 +2225,37 @@ pub fn encode_list_input_devices_reply(
         }
     }
 
+    // Names are threaded in from the XI2 registry (ids 2, 3, 4, 5 in
+    // order) so XI1 and XI2 never disagree on a device name.
+    let [name2, name3, name4, name5] = names;
+    let [type2, type3, type4, type5] = types;
     let devices = [
         Dev {
             id: 2,
             use_code: 0,
-            name: "Virtual core pointer",
+            name: name2,
             num_classes: 2,
         },
         Dev {
             id: 3,
             use_code: 1,
-            name: "Virtual core keyboard",
+            name: name3,
             num_classes: 1,
         },
         Dev {
             id: 4,
             use_code: 4,
-            name: "Virtual core slave pointer",
+            name: name4,
             num_classes: 2,
         },
         Dev {
             id: 5,
             use_code: 3,
-            name: "Virtual core slave keyboard",
+            name: name5,
             num_classes: 1,
         },
     ];
+    let type_atoms = [type2, type3, type4, type5];
 
     // Class-info block for a given device id (matches num_classes above).
     let push_classes = |out: &mut Vec<u8>, id: u8| match id {
@@ -2248,8 +2268,8 @@ pub fn encode_list_input_devices_reply(
 
     // 1. Device-info array.
     let mut data = Vec::new();
-    for d in &devices {
-        write_u32(byte_order, &mut data, 0); // type ATOM = None
+    for (d, &type_atom) in devices.iter().zip(type_atoms.iter()) {
+        write_u32(byte_order, &mut data, type_atom); // type ATOM (XI device-type)
         data.push(d.id);
         data.push(d.num_classes);
         data.push(d.use_code);
@@ -2265,8 +2285,14 @@ pub fn encode_list_input_devices_reply(
     //    following length byte); match that for byte-for-byte parity
     //    before the 4-byte pad.
     for d in &devices {
-        data.push(u8::try_from(d.name.len()).unwrap_or(u8::MAX));
-        data.extend_from_slice(d.name.as_bytes());
+        // XI1's STR length is a single byte; clamp the emitted bytes to it
+        // so the length and the payload always agree on the wire (a real
+        // libinput device name is far below 255 bytes, but a name longer
+        // than that must not desync the reply).
+        let bytes = d.name.as_bytes();
+        let len = bytes.len().min(usize::from(u8::MAX));
+        data.push(u8::try_from(len).unwrap_or(u8::MAX));
+        data.extend_from_slice(&bytes[..len]);
     }
     data.push(0); // trailing NUL after the names blob (Xorg parity)
     pad_vec4(&mut data);
@@ -4769,7 +4795,22 @@ mod tests {
         #[test]
         fn list_input_devices_reply_decodes_to_four_devices() {
             let le = ClientByteOrder::LittleEndian;
-            let buf = encode_list_input_devices_reply(le, SequenceNumber(0x1234));
+            // Simulated type atoms: MOUSE=69, KEYBOARD=70, TOUCHPAD=71
+            // (the exact values are allocated at ServerState::with_geometry;
+            // here we pass them explicitly to keep the test self-contained).
+            const MOUSE: u32 = 69;
+            const KEYBOARD: u32 = 70;
+            let buf = encode_list_input_devices_reply(
+                le,
+                SequenceNumber(0x1234),
+                [
+                    "Virtual core pointer",
+                    "Virtual core keyboard",
+                    "Virtual core slave pointer",
+                    "Virtual core slave keyboard",
+                ],
+                [MOUSE, KEYBOARD, MOUSE, KEYBOARD],
+            );
 
             // Header. Per XIproto.h, ndevices is at byte 8 — NOT the
             // standard reply "data" byte (byte 1). Byte 1 is RepType,
@@ -4785,13 +4826,17 @@ mod tests {
             // Device-info array (8B each), immediately after the 32B header.
             let mut off = 32;
             let mut dev = Vec::new();
-            for _ in 0..ndevices {
+            let expected_types = [MOUSE, KEYBOARD, MOUSE, KEYBOARD];
+            for &expected_type in &expected_types {
                 let type_atom =
                     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
                 let id = buf[off + 4];
                 let num_classes = buf[off + 5];
                 let use_code = buf[off + 6];
-                assert_eq!(type_atom, 0, "type ATOM = None");
+                assert_eq!(
+                    type_atom, expected_type,
+                    "type ATOM for device {id} must match passed value"
+                );
                 assert_eq!(buf[off + 7], 0, "device-info pad");
                 dev.push((id, num_classes, use_code));
                 off += 8;
@@ -4865,6 +4910,52 @@ mod tests {
                 buf[off..].iter().all(|&b| b == 0),
                 "trailing bytes are zero"
             );
+        }
+
+        /// A seeded touchpad renames the slave pointer (device 4); the
+        /// XI1 reply must carry that name in the STR list (and the
+        /// length byte must match), proving names thread through from
+        /// the registry rather than being hardcoded.
+        #[test]
+        fn list_input_devices_reply_reflects_seeded_slave_pointer_name() {
+            let le = ClientByteOrder::LittleEndian;
+            let touchpad = "SynPS/2 Synaptics TouchPad";
+            let buf = encode_list_input_devices_reply(
+                le,
+                SequenceNumber(1),
+                [
+                    "Virtual core pointer",
+                    "Virtual core keyboard",
+                    touchpad,
+                    "Virtual core slave keyboard",
+                ],
+                [69, 70, 71, 70], // MOUSE=69, KBD=70, TOUCHPAD=71
+            );
+            let ndevices = buf[8] as usize;
+            assert_eq!(ndevices, 4);
+
+            // Skip the device-info array.
+            let mut off = 32 + 8 * ndevices;
+            // Skip the class-info blocks (walk by byte length).
+            for &num_classes in &[2u8, 1, 2, 1] {
+                for _ in 0..num_classes {
+                    let len = buf[off + 1] as usize;
+                    off += len;
+                }
+            }
+            // Name STR list, device order: the 3rd name is the touchpad.
+            let expected = [
+                "Virtual core pointer",
+                "Virtual core keyboard",
+                touchpad,
+                "Virtual core slave keyboard",
+            ];
+            for name in expected {
+                let n = buf[off] as usize;
+                assert_eq!(n, name.len(), "name length byte for {name}");
+                assert_eq!(&buf[off + 1..off + 1 + n], name.as_bytes());
+                off += 1 + n;
+            }
         }
     }
 }

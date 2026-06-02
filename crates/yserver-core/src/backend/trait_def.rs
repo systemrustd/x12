@@ -301,6 +301,53 @@ pub trait Backend: Send {
     /// never registered.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
+    /// Drain libinput's INITIAL device enumeration and seed the XI2
+    /// device registry (`state.xi_devices`) BEFORE the core serves any
+    /// client — the Xorg model of probing input at startup.
+    ///
+    /// Without this, the registry carries only the static {2,3,4,5}
+    /// model until libinput's first `DeviceAdded` burst is dispatched
+    /// from the main loop. On real hardware the desktop's clients can
+    /// enumerate devices (`XIQueryDevice` / `XListInputDevices`) seconds
+    /// before that burst lands, so they cache a plain pointer and never
+    /// recognise the touchpad (observed on M2/Asahi MATE: all four
+    /// libinput devices first processed ~2s AFTER the clients queried
+    /// device 4).
+    ///
+    /// Implementations MUST be bounded and non-blocking: if libinput has
+    /// nothing yet, return immediately rather than waiting. Only backends
+    /// that own a libinput context on the core thread (libseat mode) do
+    /// any work; every other backend (Direct mode — the context was moved
+    /// to the input thread; host-X11/nested — no libinput) is a clean
+    /// no-op via this default.
+    ///
+    /// Returns the number of devices seeded so the caller can log that
+    /// the probe ran before clients connected.
+    fn probe_input_devices(&mut self, _state: &mut ServerState) -> usize {
+        0
+    }
+
+    /// Apply a decoded touchpad config change to the live input device
+    /// identified by `device_node`. `Ok` = applied (or nothing to apply
+    /// on this backend). `Err(Unsupported)` → BadMatch, `Err(Invalid)`
+    /// → BadValue.
+    ///
+    /// Default: no-op success — only backends that own a live libinput
+    /// context write through to a device.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DeviceConfigError::Unsupported` when the setting isn't
+    /// available on the addressed device, or `Invalid` when the value
+    /// is out of range / not a legal one-hot.
+    fn apply_device_config(
+        &mut self,
+        _device_node: &str,
+        _change: crate::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
+        Ok(())
+    }
+
     /// Hand the backend a core-channel sender so that, when it owns
     /// input on the core thread (libseat mode), it can emit the same
     /// control Messages the input thread would (Shutdown, DumpScanout,

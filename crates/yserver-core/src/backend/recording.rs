@@ -162,6 +162,18 @@ pub struct RecordingBackend {
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
+    /// Startup input-probe model. Each inner `Vec` is one "dispatch
+    /// round" the fake libinput would yield; `probe_input_devices`
+    /// consumes the front round per iteration and seeds the registry,
+    /// mirroring the KMS backend's bounded drain (stop after two
+    /// consecutive empty rounds or `PROBE_MAX_ROUNDS`). Empty by
+    /// default → the override is a no-op returning 0, matching the
+    /// trait default for backends with no on-core libinput.
+    pub probe_rounds: std::collections::VecDeque<Vec<crate::core_loop::DeviceInfo>>,
+    /// Number of dispatch rounds `probe_input_devices` actually ran —
+    /// lets tests assert the bounded loop terminated rather than
+    /// spinning to the ceiling.
+    pub probe_rounds_run: std::cell::Cell<usize>,
 }
 
 impl Default for RecordingBackend {
@@ -184,6 +196,8 @@ impl RecordingBackend {
             query_pointer_mask: 0,
             dpms_capable: true,
             dpms_set_returns_err: false,
+            probe_rounds: std::collections::VecDeque::new(),
+            probe_rounds_run: std::cell::Cell::new(0),
         }
     }
 
@@ -273,6 +287,37 @@ impl Backend for RecordingBackend {
     fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
         self.page_flip_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn probe_input_devices(&mut self, state: &mut crate::server::ServerState) -> usize {
+        // Mirror the KMS backend's bounded-drain contract over the
+        // test-configured `probe_rounds`: at most `PROBE_MAX_ROUNDS`
+        // iterations, stop after two consecutive empty rounds, never
+        // block. With no rounds configured this returns 0 immediately,
+        // matching the trait default for a backend with no on-core
+        // libinput.
+        const PROBE_MAX_ROUNDS: usize = 8;
+        let mut seeded = 0usize;
+        let mut empty_rounds = 0usize;
+        let mut rounds_run = 0usize;
+        for _ in 0..PROBE_MAX_ROUNDS {
+            rounds_run += 1;
+            let batch = self.probe_rounds.pop_front().unwrap_or_default();
+            if batch.is_empty() {
+                empty_rounds += 1;
+                if empty_rounds >= 2 {
+                    break;
+                }
+                continue;
+            }
+            empty_rounds = 0;
+            for info in batch {
+                seeded += 1;
+                state.xi_seed_touchpad(&info);
+            }
+        }
+        self.probe_rounds_run.set(rounds_run);
+        seeded
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {

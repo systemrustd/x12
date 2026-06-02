@@ -145,6 +145,9 @@ impl Backend for HostX11Backend {
                     child: 0,
                 }));
             }
+            // Device add/remove are plumbing-only in the host-X11 backend;
+            // the nested backend has no XI2 device registry of its own.
+            HostInputEvent::DeviceAdded(_) | HostInputEvent::DeviceRemoved { .. } => {}
         }
     }
 

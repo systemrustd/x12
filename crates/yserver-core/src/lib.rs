@@ -10,3 +10,4 @@ pub mod randr;
 pub mod resources;
 pub mod server;
 mod unix_fd;
+pub mod xinput;

@@ -20,7 +20,7 @@ pub mod sender;
 pub mod setup_thread;
 
 pub use message::{
-    HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
+    DeviceInfo, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
     SYNTH_SCROLL_UP, SetupAllocateResponse,
 };
 pub use run::{handle_host_input, run_core};

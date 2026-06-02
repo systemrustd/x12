@@ -22,6 +22,7 @@ use crate::{
     host_x11::{HostExposeEvent, HostXidMap},
     resources::{MapState, ROOT_WINDOW},
     server::ServerState,
+    xinput::XI2_DEVICE_CHANGED_MASK,
 };
 
 /// Build a deduped client-id list of every client that selected at
@@ -242,6 +243,230 @@ pub fn emit_xi2_focus_event_to_state(
     })
 }
 
+/// `XIDeviceChange` reason (XI2.h:108) — the device's own classes/name
+/// changed (as opposed to `XISlaveSwitch`, which reports a master's
+/// active slave swap).
+const XI_REASON_DEVICE_CHANGE: u8 = 2;
+
+/// Emit an XI2 `XI_DeviceChanged` for the slave pointer (device 4) to
+/// every client that selected `XI_DeviceChanged` on it.
+///
+/// Called after `xi_seed_touchpad` / `xi_clear_touchpad` so a running
+/// desktop re-reads device 4 (picking up the new name + libinput
+/// properties when a touchpad appears, or the reverted defaults when it
+/// disappears). The carried class set mirrors the device-4 classes the
+/// XIQueryDevice handler reports (button + 4 valuators + 2 scroll), so a
+/// client re-querying after the event sees a consistent device.
+///
+/// Selection matches device 4 explicitly, plus the `XIAllDevices` (0)
+/// and `XIAllMasterDevices` (1) wildcards a client may have used. If no
+/// client selected, this is a no-op. Returns clients whose outbound
+/// buffer overflowed (for `ClientDisconnected` reporting).
+///
+/// `xi2_major_opcode` is the XI extension's runtime-assigned major
+/// opcode (137 in the current build).
+pub fn emit_xi2_device_changed_slave_pointer(
+    state: &mut ServerState,
+    xi2_major_opcode: u8,
+) -> Vec<ClientId> {
+    const SLAVE_POINTER: u16 = 4;
+
+    // Clients select on (window, deviceid). DeviceChanged is a
+    // hierarchy-wide event clients select on the ROOT window (the same
+    // window `process_request`'s XISelectEvents bootstrap requires before
+    // it sends the initial DeviceChanged). Match the root window only —
+    // matching any window would spuriously deliver to a client that
+    // selected DeviceChanged on some unrelated child. Device-id match
+    // covers device 4 plus the AllDevices(0)/AllMasterDevices(1)
+    // wildcards.
+    let targets: Vec<ClientId> = state
+        .clients
+        .iter()
+        .filter_map(|(id, client)| {
+            let selected = client.xi2_masks.iter().any(|(&(window, dev), &mask)| {
+                window == ROOT_WINDOW
+                    // NOTE: XIAllMasterDevices(1) technically covers
+                    // masters only; device 4 is a slave. Kept for
+                    // delivery breadth; real clients select via
+                    // XIAllDevices(0).
+                    && matches!(dev, SLAVE_POINTER | 0 | 1)
+                    && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+            });
+            selected.then_some(ClientId(*id))
+        })
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let (classes, num_classes) = build_slave_pointer_class_block(state);
+    let time = state.timestamp_now();
+    fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        x11::encode_xi2_device_changed_event(
+            buf,
+            order,
+            seq,
+            xi2_major_opcode,
+            SLAVE_POINTER,
+            time,
+            num_classes,
+            SLAVE_POINTER, // sourceid = the device itself
+            XI_REASON_DEVICE_CHANGE,
+            &classes,
+        );
+    })
+}
+
+/// Build the XI2 device-class block for the slave pointer (device 4),
+/// returning `(class_bytes, num_classes)`.
+///
+/// This is the SINGLE source of truth for device 4's class shape:
+/// Button(7) + Valuator×4 (X, Y, vert-scroll, horiz-scroll) + Scroll×2
+/// (vert, horiz). Both XIQueryDevice's device-4 path (opcode 48) and the
+/// touchpad-add/remove `XI_DeviceChanged` fanout call it, so the bytes can
+/// never drift apart (asserted byte-identical by
+/// `query_device_4_matches_device_changed_block`). `num_classes` is
+/// derived from the writes below, not hardcoded at the call sites.
+///
+/// The scroll valuators MUST stay declared — dropping them fires a
+/// Gdk-CRITICAL (`_gdk_x11_device_xi2_add_scroll_valuator` asserts the
+/// scroll axis index is within the valuator count).
+pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u8>, u16) {
+    const DEVICEID: u16 = 4;
+
+    fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[x11::AtomId]) {
+        let le = ClientByteOrder::LittleEndian;
+        let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
+        let state_words = num_buttons.div_ceil(32) as usize;
+        let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
+        x11::write_u16(le, buf, 1); // type = Button
+        x11::write_u16(le, buf, (byte_len / 4) as u16);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, num_buttons);
+        buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
+        for atom in label_atoms {
+            x11::write_u32(le, buf, atom.0);
+        }
+    }
+
+    fn write_valuator_class(
+        buf: &mut Vec<u8>,
+        sourceid: u16,
+        number: u16,
+        label_atom: x11::AtomId,
+        min_int: i32,
+        max_int: i32,
+        mode: u8,
+        value: i32,
+    ) {
+        let le = ClientByteOrder::LittleEndian;
+        x11::write_u16(le, buf, 2); // type = Valuator
+        x11::write_u16(le, buf, 11);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, number);
+        x11::write_u32(le, buf, label_atom.0);
+        x11::write_u32(le, buf, min_int as u32);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, max_int as u32);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, value as u32);
+        x11::write_u32(le, buf, 0);
+        x11::write_u32(le, buf, 0); // resolution
+        buf.push(mode);
+        buf.extend_from_slice(&[0u8; 3]);
+    }
+
+    fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
+        let le = ClientByteOrder::LittleEndian;
+        x11::write_u16(le, buf, 3); // type = Scroll
+        x11::write_u16(le, buf, 6);
+        x11::write_u16(le, buf, sourceid);
+        x11::write_u16(le, buf, number);
+        x11::write_u16(le, buf, scroll_type);
+        x11::write_u16(le, buf, 0); // pad
+        x11::write_u32(le, buf, 0); // flags
+        x11::write_u32(le, buf, 1); // increment = 1.0
+        x11::write_u32(le, buf, 0);
+    }
+
+    let pointer = (
+        i32::from(state.randr.screen_width) / 2,
+        i32::from(state.randr.screen_height) / 2,
+    );
+    let button_labels = [
+        state.atoms.intern("Button Left", false),
+        state.atoms.intern("Button Middle", false),
+        state.atoms.intern("Button Right", false),
+        state.atoms.intern("Button Wheel Up", false),
+        state.atoms.intern("Button Wheel Down", false),
+        state.atoms.intern("Button Horiz Wheel Left", false),
+        state.atoms.intern("Button Horiz Wheel Right", false),
+    ];
+    let axis_labels = [
+        state.atoms.intern("Rel X", false),
+        state.atoms.intern("Rel Y", false),
+        state.atoms.intern("Rel Vert Scroll", false),
+        state.atoms.intern("Rel Horiz Scroll", false),
+    ];
+    let scroll = state.scroll_axis_value;
+
+    // `num_classes` is incremented per class written below so the count
+    // can never drift from the actual byte content.
+    let mut classes = Vec::new();
+    let mut num_classes = 0u16;
+    write_button_class(&mut classes, DEVICEID, &button_labels);
+    num_classes += 1;
+    write_valuator_class(
+        &mut classes,
+        DEVICEID,
+        0,
+        axis_labels[0],
+        -1,
+        -1,
+        0,
+        pointer.0,
+    );
+    num_classes += 1;
+    write_valuator_class(
+        &mut classes,
+        DEVICEID,
+        1,
+        axis_labels[1],
+        -1,
+        -1,
+        0,
+        pointer.1,
+    );
+    num_classes += 1;
+    write_valuator_class(
+        &mut classes,
+        DEVICEID,
+        2,
+        axis_labels[2],
+        -1,
+        0,
+        0,
+        scroll[0],
+    );
+    num_classes += 1;
+    write_valuator_class(
+        &mut classes,
+        DEVICEID,
+        3,
+        axis_labels[3],
+        -1,
+        0,
+        0,
+        scroll[1],
+    );
+    num_classes += 1;
+    write_scroll_class(&mut classes, DEVICEID, 2, 1); // vertical
+    num_classes += 1;
+    write_scroll_class(&mut classes, DEVICEID, 3, 2); // horizontal
+    num_classes += 1;
+    (classes, num_classes)
+}
+
 /// State-borrowing replacement for `nested::expose_event_fanout`.
 ///
 /// Translates the host xid via `xid_map`, emits an Expose event to
@@ -454,6 +679,7 @@ mod tests {
             save_set: HashSet::new(),
             big_requests_enabled: false,
             xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
             focused_window: ROOT_WINDOW,

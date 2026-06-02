@@ -19,7 +19,7 @@
 //! state-borrowing implementation here. The `nested::handle_request`
 //! path is dead-code from D4 forward and gets retired in H1.
 
-use std::{io, os::fd::OwnedFd};
+use std::{collections::HashSet, io, os::fd::OwnedFd};
 
 use log::{debug, trace};
 use yserver_protocol::x11::{
@@ -46,17 +46,20 @@ use crate::{
     crossings::{CrossingKind as TreeCrossingKind, normal_mode_crossings},
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
-    server::{ScreenSaverActive, ServerState},
+    server::{ScreenSaverActive, ServerState, XI_FIRST_EVENT},
+    xinput::{XI_DEVICE_PROPERTY_NOTIFY_OFFSET, XI2_DEVICE_CHANGED_MASK, XI2_PROPERTY_EVENT_MASK},
 };
 
 /// XI2 major opcode assigned by `extension_metadata("XInputExtension")`.
 /// This matches the `XI2_MAJOR_OPCODE` constant in nested.rs and goes
 /// away in H1 with that file.
 const XI2_MAJOR_OPCODE: u8 = 137;
+/// XInput extension first-error base (matches `nested.rs::XI2_FIRST_ERROR`).
+/// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
+const XI2_FIRST_ERROR: u8 = 153;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 const XI2_SERVER_MAJOR_VERSION: u16 = 2;
 const XI2_SERVER_MINOR_VERSION: u16 = 4;
-const XI2_DEVICE_CHANGED_MASK: u32 = 1 << 1;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -3340,7 +3343,7 @@ fn handle_xfixes_request(
                 }
                 // BadWindow on unknown window xid
                 // (`xfixes/region.c:158-163`) — Xorg sets
-                // `client->errorValue = stuff->window`.
+                // `client->error_value = stuff->window`.
                 if state.resources.window(ResourceId(window)).is_none() {
                     return emit_x11_error(
                         state,
@@ -8382,6 +8385,21 @@ fn handle_xi2_request(
                 state.atoms.intern("Rel Horiz Scroll", false),
             ];
 
+            // Device names come from the XI2 registry (`state.xi_devices`)
+            // so a seeded touchpad's real name is reported, and so the XI1
+            // `XListInputDevices` reply (which reads the SAME registry)
+            // can never disagree (the ListInputDevices fatal-CHECK class).
+            // Snapshot to owned Strings up front: the registry borrow must
+            // end before `infos`/`classes` are populated below.
+            let name_master_pointer =
+                crate::xinput::device_name(&state.xi_devices, 2).to_owned();
+            let name_master_keyboard =
+                crate::xinput::device_name(&state.xi_devices, 3).to_owned();
+            let name_slave_pointer =
+                crate::xinput::device_name(&state.xi_devices, 4).to_owned();
+            let name_slave_keyboard =
+                crate::xinput::device_name(&state.xi_devices, 5).to_owned();
+
             fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[AtomId]) {
                 let le = ClientByteOrder::LittleEndian;
                 let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
@@ -8528,7 +8546,7 @@ fn handle_xi2_request(
             // settings ignoring the wheel until a view-switch).
             {
                 let deviceid: u16 = 2;
-                let name = "Virtual core pointer";
+                let name = name_master_pointer.as_str();
                 let mut classes = Vec::new();
                 write_button_class(&mut classes, deviceid, &button_labels);
                 write_valuator_class(
@@ -8579,7 +8597,7 @@ fn handle_xi2_request(
             // Master Keyboard (deviceid=3): Key with keycodes 8..=255.
             {
                 let deviceid: u16 = 3;
-                let name = "Virtual core keyboard";
+                let name = name_master_keyboard.as_str();
                 let mut classes = Vec::new();
                 write_key_class(&mut classes, deviceid);
                 write_device_info(&mut infos, deviceid, 2, 2, name, &classes, 1);
@@ -8592,57 +8610,25 @@ fn handle_xi2_request(
             // generic attached pointer, not like XTEST.
             {
                 let deviceid: u16 = 4;
-                let name = "Virtual core slave pointer";
-                let mut classes = Vec::new();
-                write_button_class(&mut classes, deviceid, &button_labels);
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    0,
-                    axis_labels[0],
-                    -1,
-                    -1,
-                    0,
-                    pointer.0,
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    1,
-                    axis_labels[1],
-                    -1,
-                    -1,
-                    0,
-                    pointer.1,
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    2,
-                    axis_labels[2],
-                    -1,
-                    0,
-                    0,
-                    state.scroll_axis_value[0],
-                );
-                write_valuator_class(
-                    &mut classes,
-                    deviceid,
-                    3,
-                    axis_labels[3],
-                    -1,
-                    0,
-                    0,
-                    state.scroll_axis_value[1],
-                );
-                write_scroll_class(&mut classes, deviceid, 2, 1);
-                write_scroll_class(&mut classes, deviceid, 3, 2);
-                write_device_info(&mut infos, deviceid, 3, 2, name, &classes, 7);
+                // Name from the XI2 registry: a seeded touchpad reports its
+                // real libinput name here; the XI1 ListInputDevices encoder
+                // reads the same source so the two enumerations agree.
+                let name = name_slave_pointer.as_str();
+                // Device 4's class block is built by the SINGLE shared
+                // builder in `fanout` so this reply and the touchpad
+                // add/remove XI_DeviceChanged event can never drift
+                // (asserted byte-identical by
+                // `query_device_4_matches_device_changed_block`). The
+                // local `write_*_class` helpers above are still used by
+                // devices 2/3/5, which have different shapes.
+                let (classes, num_classes) =
+                    crate::core_loop::fanout::build_slave_pointer_class_block(state);
+                write_device_info(&mut infos, deviceid, 3, 2, name, &classes, num_classes);
             }
 
             {
                 let deviceid: u16 = 5;
-                let name = "Virtual core slave keyboard";
+                let name = name_slave_keyboard.as_str();
                 let mut classes = Vec::new();
                 write_key_class(&mut classes, deviceid);
                 write_device_info(&mut infos, deviceid, 4, 3, name, &classes, 1);
@@ -8659,14 +8645,285 @@ fn handle_xi2_request(
             reply.extend_from_slice(&infos);
             buf.extend_from_slice(&reply);
         }
-        59 => {
+        56 => {
+            // XIListProperties (xXIListPropertiesReq, XI2proto.h:742-749).
+            // body[0..2] = deviceid, body[2..4] = pad.
+            if body.len() < 2 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let deviceid = u16::from_le_bytes([body[0], body[1]]);
             debug!(
-                "client {} #{} XIGetProperty -> not found",
-                client_id.0, sequence.0
+                "client {} #{} XIListProperties deviceid={}",
+                client_id.0, sequence.0, deviceid
             );
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            reply.extend_from_slice(&[0u8; 24]);
-            buf.extend_from_slice(&reply);
+            let Some(device) = crate::xinput::find_device(&state.xi_devices, deviceid) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    56,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            buf.extend_from_slice(&crate::xinput::encode_list_properties_reply(
+                byte_order, sequence, device,
+            ));
+        }
+        57 => {
+            // XIChangeProperty (xXIChangePropertyReq, XI2proto.h:769-780).
+            // Header struct: deviceid(2), mode(1), format(1), property(4),
+            // type(4), num_items(4); after stripping the 4-byte generic
+            // header `body` begins at deviceid:
+            //   body[0..2] deviceid, body[2] mode, body[3] format,
+            //   body[4..8] property, body[8..12] type,
+            //   body[12..16] num_items, body[16..] value bytes.
+            if body.len() < 16 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let deviceid = u16::from_le_bytes([body[0], body[1]]);
+            let mode = body[2];
+            let format = body[3];
+            let property = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let type_atom = AtomId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+            let num_items =
+                u32::from_le_bytes([body[12], body[13], body[14], body[15]]) as usize;
+            debug!(
+                "client {} #{} XIChangeProperty deviceid={} mode={} format={} property={} type={} num_items={}",
+                client_id.0, sequence.0, deviceid, mode, format, property.0, type_atom.0, num_items
+            );
+            // Device lookup FIRST (xserver ProcXIChangeProperty,
+            // xiproperty.c:1137-1141, does dixLookupDevice before the
+            // format/mode checks), so an unknown device yields BadDevice
+            // even when the format is also invalid.
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    57,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            // Validate mode (xiproperty.c check_change_property:325-329).
+            if mode != crate::xinput::XI_PROP_MODE_REPLACE
+                && mode != crate::xinput::XI_PROP_MODE_PREPEND
+                && mode != crate::xinput::XI_PROP_MODE_APPEND
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(mode),
+                    57,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            // Format must be 8/16/32 before we compute the value length.
+            if format != 8 && format != 16 && format != 32 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(format),
+                    57,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let value_len = num_items.saturating_mul(usize::from(format / 8));
+            let Some(data) = body.get(16..16 + value_len) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    16, // BadLength
+                    0,
+                    57,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            let data = data.to_vec();
+            // T3 spec §D order is implemented by `dispatch_change_property`;
+            // both write arms (XI2 minor 57 + XI1 minor 37) share the same
+            // pipeline so T5/T6 only has to wire event emission in one place.
+            match dispatch_change_property(
+                state, backend, deviceid, mode, format, property, type_atom, &data,
+            ) {
+                Ok(what) => {
+                    let _ = emit_property_change(state, deviceid, property, what);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(err) => {
+                    return emit_property_dispatch_error(state, client_id, sequence, err, 57);
+                }
+            }
+        }
+        58 => {
+            // XIDeleteProperty (xXIDeletePropertyReq, XI2proto.h:785-793).
+            //   body[0..2] deviceid, body[2..4] pad0, body[4..8] property.
+            if body.len() < 8 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let deviceid = u16::from_le_bytes([body[0], body[1]]);
+            let property = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            debug!(
+                "client {} #{} XIDeleteProperty deviceid={} property={}",
+                client_id.0, sequence.0, deviceid, property.0
+            );
+            // T3: BadAtom guard (xserver ProcXIDeleteProperty,
+            // xiproperty.c). We intentionally do NOT BadAccess on
+            // attempting to delete a libinput descriptor — the driver
+            // re-seeds those on every device add, so a delete is a no-op
+            // race the client recovers from on its own.
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    5, // BadAtom
+                    property.0,
+                    58,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let Some(device) = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    58,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            if let Some(what) = crate::xinput::apply_delete_property(device, property) {
+                // Notify on a real removal only; a redundant delete of
+                // an absent property must stay silent — xiproperty.c
+                // does not call `send_property_event` in that case.
+                let _ = emit_property_change(state, deviceid, property, what);
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        59 => {
+            // XIGetProperty (xXIGetPropertyReq, XI2proto.h:798-814).
+            // Struct: deviceid(2), delete(1), pad0(1), property(4),
+            // type(4), offset(4), len(4). After the 4-byte generic header
+            // `body` begins at deviceid:
+            //   body[0..2] deviceid, body[2] delete, body[3] pad0,
+            //   body[4..8] property, body[8..12] type,
+            //   body[12..16] offset, body[16..20] len.
+            if body.len() < 20 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let deviceid = u16::from_le_bytes([body[0], body[1]]);
+            let delete_raw = body[2];
+            let property = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let req_type = AtomId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+            let offset = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+            let len = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+            debug!(
+                "client {} #{} XIGetProperty deviceid={} property={} type={} offset={} len={} delete={}",
+                client_id.0, sequence.0, deviceid, property.0, req_type.0, offset, len, delete_raw
+            );
+            // T3: BadAtom guard before the device lookup so a bogus atom
+            // surfaces as BadAtom (xserver ProcXIGetProperty does it the
+            // same way via ValidAtom() before dixLookupDevice's payload
+            // path; the relative precedence vs. BadDevice never matters
+            // because clients always pair a valid atom with the deviceid
+            // they just learned from XIListProperties).
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    5, // BadAtom
+                    property.0,
+                    59,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            // Device lookup first (xserver dixLookupDevice precedes
+            // get_property, so BadDevice outranks the BadValue below).
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    59,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            // `delete` must be exactly 0 or 1; xserver's get_property
+            // (xiproperty.c:252-255) rejects anything else with BadValue.
+            if delete_raw > 1 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(delete_raw),
+                    59,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let delete = delete_raw != 0;
+            // Re-acquire mutably now that both validations passed.
+            let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+                .expect("device existence verified above");
+            // Snapshot pre-existence so we can detect an inline delete
+            // and emit `XI_PropertyEvent(Deleted)` after the reply is
+            // queued. `encode_get_property_reply` removes the property
+            // iff `delete && bytes_after == 0` — re-checking
+            // `contains_key` post-call is the simplest oracle.
+            let pre_existed = delete && device.properties.contains_key(&property);
+            match crate::xinput::encode_get_property_reply(
+                byte_order, sequence, device, property, req_type, offset, len, delete,
+            ) {
+                Ok(reply) => buf.extend_from_slice(&reply),
+                Err(crate::xinput::XiPropError::BadValue) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        2, // BadValue
+                        offset,
+                        59,
+                        XI2_MAJOR_OPCODE,
+                    );
+                }
+                Err(_) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        2,
+                        offset,
+                        59,
+                        XI2_MAJOR_OPCODE,
+                    );
+                }
+            }
+            if pre_existed {
+                let device = crate::xinput::find_device(&state.xi_devices, deviceid)
+                    .expect("device existence verified above");
+                if !device.properties.contains_key(&property) {
+                    let _ = emit_property_change(
+                        state,
+                        deviceid,
+                        property,
+                        crate::xinput::PropWhat::Deleted,
+                    );
+                }
+            }
         }
         60 => {
             debug!("client {} #{} XIGetSelectedEvents", client_id.0, sequence.0);
@@ -9361,10 +9618,473 @@ fn handle_xi2_request(
         // when XI2 has a master pointer but XI1 reports zero devices.
         2 => {
             debug!("client {} #{} XListInputDevices", client_id.0, sequence.0);
-            buf.extend_from_slice(&x11::encode_list_input_devices_reply(byte_order, sequence));
+            // Names come from the SAME source as XIQueryDevice (the
+            // `xi_devices` registry, ids 2/3/4/5) so the XI1 and XI2
+            // enumerations report identical device names — clients
+            // cross-check and fatal-CHECK on a mismatch.
+            let names = [
+                crate::xinput::device_name(&state.xi_devices, 2),
+                crate::xinput::device_name(&state.xi_devices, 3),
+                crate::xinput::device_name(&state.xi_devices, 4),
+                crate::xinput::device_name(&state.xi_devices, 5),
+            ];
+            // Device-type atoms (MOUSE / KEYBOARD / TOUCHPAD) were
+            // interned at ServerState construction, so these lookups are
+            // infallible (only_if_exists=true still finds them).
+            let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true).0;
+            let kbd_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true).0;
+            let touchpad_atom = state
+                .atoms
+                .intern(crate::xinput::XI_ATOM_TOUCHPAD, true)
+                .0;
+            // id 4 (slave pointer) is TOUCHPAD when active, otherwise MOUSE.
+            let slave_ptr_type = if crate::xinput::device_is_touchpad(&state.xi_devices, 4) {
+                touchpad_atom
+            } else {
+                mouse_atom
+            };
+            let types = [mouse_atom, kbd_atom, slave_ptr_type, kbd_atom];
+            buf.extend_from_slice(&x11::encode_list_input_devices_reply(
+                byte_order, sequence, names, types,
+            ));
         }
-        // XI 1.x reply-required minors. xts opens a probe XOpenDevice on
-        // every test, so without these stubs the XI / XIproto suites
+        // XI 1.x SelectExtensionEvent (minor 6; xSelectExtensionEventReq,
+        // XIproto.h). Body after the 4-byte generic header:
+        //   body[0..4] window (Window = CARD32),
+        //   body[4..6] count  (CARD16, number of XEventClass values),
+        //   body[6..8] pad00  (CARD16),
+        //   body[8..]  count × XEventClass (CARD32).
+        //
+        // An XEventClass packs `(deviceid << 8) | event_code`. We only
+        // implement XI1 `DevicePropertyNotify` (event code 16 within
+        // the XInput block, i.e. low byte = `XI_FIRST_EVENT + 16` = 82
+        // — yserver assigns XInput the contiguous block 66..=82), so
+        // classes for other XI1 events (motion / button / key / etc.)
+        // are accepted but ignored. We do NOT error on unknown classes:
+        // a single SelectExtensionEvent often selects multiple classes
+        // and Xorg silently drops the ones it can't service.
+        //
+        // The `window` argument is intentionally ignored: the events we
+        // deliver here (`DevicePropertyNotify`) are device-scoped on
+        // the wire (no event-window field), so the selection is
+        // effectively "this client wants notifications for device X".
+        //
+        // Replace semantics: for every deviceid mentioned in the
+        // supplied class list, this client's prior
+        // `DevicePropertyNotify` selections for that deviceid are
+        // dropped before the new set is installed. A client
+        // unsubscribes a given deviceid by passing at least one class
+        // for it whose low byte is not `DevicePropertyNotify` — the
+        // deviceid lands in `touched_devices` and its prior entries
+        // are cleared; the unsupported class itself is silently
+        // dropped. `count == 0` is a no-op (the existing selection
+        // survives unchanged), matching Xorg's behaviour.
+        6 => {
+            if body.len() < 8 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    16, // BadLength
+                    0,
+                    6,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let count = usize::from(u16::from_le_bytes([body[4], body[5]]));
+            let expected_len = 8usize.saturating_add(count.saturating_mul(4));
+            if body.len() < expected_len {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    16, // BadLength
+                    0,
+                    6,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            // Decode the requested class list and collect the set of
+            // deviceids that appear (so we can drop the client's stale
+            // entries for *those* devices — Xorg's "replace per device"
+            // semantics, see Xi/selectev.c::ProcXSelectExtensionEvent).
+            let mut classes: Vec<u32> = Vec::with_capacity(count);
+            let mut touched_devices: HashSet<u8> = HashSet::new();
+            for i in 0..count {
+                let off = 8 + i * 4;
+                let class = u32::from_le_bytes([
+                    body[off],
+                    body[off + 1],
+                    body[off + 2],
+                    body[off + 3],
+                ]);
+                #[allow(clippy::cast_possible_truncation)]
+                let class_low = class as u8; // event code in the XInput block
+                #[allow(clippy::cast_possible_truncation)]
+                let dev_byte = (class >> 8) as u8;
+                touched_devices.insert(dev_byte);
+                // Keep only classes for XI1 `DevicePropertyNotify`; the
+                // other XI1 events aren't yet wired here. Discarding
+                // unknown classes (rather than erroring) matches Xorg:
+                // it walks `xi_all_events` and silently skips entries
+                // it cannot service.
+                if class_low == XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET {
+                    classes.push(class);
+                }
+            }
+            debug!(
+                "client {} #{} XSelectExtensionEvent window=0x{:x} count={} accepted={}",
+                client_id.0,
+                sequence.0,
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+                count,
+                classes.len(),
+            );
+            if let Some(client) = state.clients.get_mut(&client_id.0) {
+                // Drop stale entries for the deviceids named in this
+                // request (Xorg replacement semantics).
+                if !touched_devices.is_empty() {
+                    client.xi1_event_classes.retain(|c| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let dev_byte = (c >> 8) as u8;
+                        !touched_devices.contains(&dev_byte)
+                    });
+                }
+                for class in classes {
+                    client.xi1_event_classes.insert(class);
+                }
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        // XI 1.x ListDeviceProperties (minor 36; xListDevicePropertiesReq,
+        // XIproto.h:1433-1440). Body after the 4-byte generic header:
+        //   body[0] deviceid (CARD8), body[1] pad0, body[2..4] pad1.
+        // MATE's settings daemon enumerates a touchpad's libinput
+        // properties through this XI1 path (not the XI2 XIListProperties),
+        // so a real reply backed by `xi_devices` is required.
+        36 => {
+            if body.is_empty() {
+                return Ok(RequestOutcome::Handled);
+            }
+            let deviceid = u16::from(body[0]);
+            debug!(
+                "client {} #{} XListDeviceProperties deviceid={}",
+                client_id.0, sequence.0, deviceid
+            );
+            let Some(device) = crate::xinput::find_device(&state.xi_devices, deviceid) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    36,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            buf.extend_from_slice(&crate::xinput::encode_xi1_list_properties_reply(
+                byte_order, sequence, device,
+            ));
+        }
+        // XI 1.x ChangeDeviceProperty (minor 37; xChangeDevicePropertyReq,
+        // XIproto.h:1462-1473). Body after the 4-byte generic header:
+        //   body[0..4] property (Atom), body[4..8] type (Atom),
+        //   body[8] deviceid (CARD8), body[9] format, body[10] mode,
+        //   body[11] pad, body[12..16] nUnits (CARD32), body[16..] value.
+        37 => {
+            if body.len() < 16 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let property = AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let type_atom = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let deviceid = u16::from(body[8]);
+            let format = body[9];
+            let mode = body[10];
+            let num_items =
+                u32::from_le_bytes([body[12], body[13], body[14], body[15]]) as usize;
+            debug!(
+                "client {} #{} XChangeDeviceProperty deviceid={} mode={} format={} property={} type={} num_items={}",
+                client_id.0, sequence.0, deviceid, mode, format, property.0, type_atom.0, num_items
+            );
+            // Device lookup first, mirroring the XI2 path (xserver does
+            // dixLookupDevice before the mode/format checks).
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    37,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if mode != crate::xinput::XI_PROP_MODE_REPLACE
+                && mode != crate::xinput::XI_PROP_MODE_PREPEND
+                && mode != crate::xinput::XI_PROP_MODE_APPEND
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(mode),
+                    37,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if format != 8 && format != 16 && format != 32 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(format),
+                    37,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let value_len = num_items.saturating_mul(usize::from(format / 8));
+            let Some(data) = body.get(16..16 + value_len) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    16, // BadLength
+                    0,
+                    37,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            let data = data.to_vec();
+            // The T3 spec §D pipeline is shared with the XI2 arm
+            // (minor 57) via `dispatch_change_property`; the same
+            // `emit_property_change` helper fans out
+            // `XI_PropertyEvent` here too — xserver's
+            // `send_property_event` fires from both XI1 and XI2 paths.
+            match dispatch_change_property(
+                state, backend, deviceid, mode, format, property, type_atom, &data,
+            ) {
+                Ok(what) => {
+                    let _ = emit_property_change(state, deviceid, property, what);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(err) => {
+                    return emit_property_dispatch_error(state, client_id, sequence, err, 37);
+                }
+            }
+        }
+        // XI 1.x DeleteDeviceProperty (minor 38; xDeleteDevicePropertyReq,
+        // XIproto.h:1481-1489). Body after the 4-byte generic header:
+        //   body[0..4] property (Atom), body[4] deviceid (CARD8),
+        //   body[5] pad0, body[6..8] pad1.
+        38 => {
+            if body.len() < 5 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let property = AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let deviceid = u16::from(body[4]);
+            debug!(
+                "client {} #{} XDeleteDeviceProperty deviceid={} property={}",
+                client_id.0, sequence.0, deviceid, property.0
+            );
+            // T3: BadAtom guard (mirror of XI2 minor 58). Same policy:
+            // libinput descriptor deletes are tolerated as no-ops; the
+            // driver re-seeds on the next device add.
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    5, // BadAtom
+                    property.0,
+                    38,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let Some(device) = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    38,
+                    XI2_MAJOR_OPCODE,
+                );
+            };
+            if let Some(what) = crate::xinput::apply_delete_property(device, property) {
+                // Same XI2 fan-out the minor-58 arm runs.
+                let _ = emit_property_change(state, deviceid, property, what);
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        // XI 1.x GetDeviceProperty (minor 39; xGetDevicePropertyReq,
+        // XIproto.h:1497-1512). Body after the 4-byte generic header:
+        //   body[0..4] property (Atom), body[4..8] type (Atom),
+        //   body[8..12] longOffset (CARD32), body[12..16] longLength
+        //   (CARD32), body[16] deviceid (CARD8), body[17] delete (BOOL),
+        //   body[18..20] pad.
+        // This is the request MATE's settings daemon uses to read
+        // "libinput Tapping Enabled" etc. The reply echoes the requested
+        // deviceid (byte 21), unlike the XI2 reply (Task brief: the old
+        // zero-stub returned device=0 and MATE rejected the touchpad).
+        39 => {
+            if body.len() < 18 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let property = AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let req_type = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let offset = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            let len = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+            let deviceid = u16::from(body[16]);
+            let delete_raw = body[17];
+            debug!(
+                "client {} #{} XGetDeviceProperty deviceid={} property={} type={} offset={} len={} delete={}",
+                client_id.0, sequence.0, deviceid, property.0, req_type.0, offset, len, delete_raw
+            );
+            // T3: BadAtom guard (mirror of XI2 minor 59).
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    5, // BadAtom
+                    property.0,
+                    39,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if crate::xinput::find_device(&state.xi_devices, deviceid).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    XI2_FIRST_ERROR, // XI_BadDevice
+                    u32::from(deviceid),
+                    39,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            if delete_raw > 1 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    2, // BadValue
+                    u32::from(delete_raw),
+                    39,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let delete = delete_raw != 0;
+            let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+                .expect("device existence verified above");
+            // Same delete-detection oracle as the XI2 minor-59 arm:
+            // snapshot pre-existence and emit when the encoder removed it.
+            let pre_existed = delete && device.properties.contains_key(&property);
+            match crate::xinput::encode_xi1_get_property_reply(
+                byte_order, sequence, device, property, req_type, offset, len, delete,
+            ) {
+                Ok(reply) => buf.extend_from_slice(&reply),
+                Err(_) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        2, // BadValue
+                        offset,
+                        39,
+                        XI2_MAJOR_OPCODE,
+                    );
+                }
+            }
+            if pre_existed {
+                let device = crate::xinput::find_device(&state.xi_devices, deviceid)
+                    .expect("device existence verified above");
+                if !device.properties.contains_key(&property) {
+                    let _ = emit_property_change(
+                        state,
+                        deviceid,
+                        property,
+                        crate::xinput::PropWhat::Deleted,
+                    );
+                }
+            }
+        }
+        // XI1 OpenDevice (minor 3). Xlib's `DevicePropertyNotify(dev, type,
+        // _class)` macro walks `XDevice->classes` (populated from this
+        // reply) for an `OtherClass(6)` entry, then computes
+        //   type  = entry.event_type_base + _propertyNotify(=6)
+        //   _class = (deviceid << 8) | type
+        // and passes _class to `XSelectExtensionEvent`. An empty class
+        // list (our pre-fix stub) leaves _class = 0, and `xinput
+        // watch-props` silently subscribes to nothing.
+        //
+        // Verified against `mate-asahi-xorg.xtrace`: Xorg returns four
+        // entries — Button(1)/Valuator(2)/Feedback(3)/Other(6) with
+        // `event_type_base = 0x4c = 76` — and xinput's subsequent
+        // `SelectExtensionEvent` carries class `(deviceid<<8)|82`.
+        // We return the minimum compatible reply (one OtherClass entry)
+        // so watch-props gets DevicePropertyNotify events; the other
+        // three classes carry trailing per-class data (button count,
+        // valuator axes, feedback) we don't emit yet, so they stay out
+        // until a client is found to need them.
+        3 => {
+            // Mirror Xorg's OpenDevice reply layout (verified in
+            // mate-asahi-xorg.xtrace line 142667): four XInputClassInfo
+            // entries in the order Button(1), Valuator(2), Feedback(3),
+            // Other(6) with `event_type_base` values that line up the
+            // XI1 wire event codes against `XI_FIRST_EVENT`.
+            //
+            // The Other entry is the load-bearing one for property
+            // notification: xinput's Xlib `DevicePropertyNotify(dev,
+            // type, _class)` macro walks `XDevice->classes`, finds the
+            // OtherClass entry, and computes
+            //   type   = entry.event_type_base + _propertyNotify(=6)
+            //   _class = (deviceid << 8) | type
+            // and passes _class to `XSelectExtensionEvent`. An empty
+            // class list (our pre-fix stub) leaves _class = 0 and
+            // `xinput watch-props` silently subscribes to nothing.
+            //
+            // The Button/Valuator/Feedback entries carry only their
+            // (class, event_type_base) tags here — the OpenDevice
+            // reply itself never includes per-class trailing data
+            // (buttons / axes / feedback descriptors live in separate
+            // requests). Including them empty-shaped matches Xorg's
+            // wire byte-for-byte, which Xlib appears to need for the
+            // `XDevice` to register as fully usable even though only
+            // the OtherClass entry is consumed for property events.
+            const BUTTON_CLASS: u8 = 1;
+            const VALUATOR_CLASS: u8 = 2;
+            const FEEDBACK_CLASS: u8 = 3;
+            const OTHER_CLASS: u8 = 6;
+            // event_type_base offsets relative to `XI_FIRST_EVENT`:
+            //   DeviceButtonPress (0)     at base + 3 = 69 (0x45)
+            //   DeviceMotionNotify (0)    at base + 5 = 71 (0x47)
+            //   FeedbackClass has no event (base = 0 like Xorg)
+            //   DevicePropertyNotify (6)  at base + 10 = 76 (0x4c)
+            // Matches Xorg's `Xi/extinit.c::FixExtensionEvents` numbering.
+            let button_base = XI_FIRST_EVENT + 3;
+            let valuator_base = XI_FIRST_EVENT + 5;
+            let feedback_base = 0;
+            let other_base = XI_FIRST_EVENT + 10;
+            // num_classes=4 in the reply's data byte; length=2 (two
+            // extra 4-byte units = 8 bytes for the four entries).
+            let mut reply = x11::fixed_reply(byte_order, sequence, 4, 2);
+            reply.extend_from_slice(&[0u8; 24]);
+            reply.extend_from_slice(&[
+                BUTTON_CLASS, button_base,
+                VALUATOR_CLASS, valuator_base,
+                FEEDBACK_CLASS, feedback_base,
+                OTHER_CLASS, other_base,
+            ]);
+            debug!("client {} #{} XI1 OpenDevice", client_id.0, sequence.0);
+            buf.extend_from_slice(&reply);
+        }
+        // XI 1.x reply-required minors. xts opens probe XInput requests
+        // on every test, so without these stubs the XI / XIproto suites
         // hang on _XReply. Each reply is exactly 32 bytes (the standard
         // reply header + 24 zero bytes); all count/status fields default
         // to 0 which means "empty list" / "Success" in their respective
@@ -9372,9 +10092,9 @@ fn handle_xi2_request(
         //
         // TODO(no-stub): these remain zero-stubs. They satisfy xts but
         // may mislead real clients (see the ListInputDevices crash that
-        // motivated minor 2's real implementation). Implement against
+        // motivated minor 2's real implementation, and the OpenDevice
+        // bug for `xinput watch-props` fixed above). Implement against
         // real device state as clients are found to need them.
-        3 |  // OpenDevice: num_classes = 0
         5 |  // SetDeviceMode: status = Success
         7 |  // GetSelectedExtensionEvents: counts = 0
         9 |  // GetDeviceDontPropagateList: count = 0
@@ -9392,9 +10112,7 @@ fn handle_xi2_request(
         30 | // QueryDeviceState: num_classes = 0
         33 | // SetDeviceValuators: status = Success
         34 | // GetDeviceControl: status = Success
-        35 | // ChangeDeviceControl: status = Success
-        36 | // ListDeviceProperties: nAtoms = 0
-        39   // GetDeviceProperty: propertyType = None
+        35   // ChangeDeviceControl: status = Success
         => {
             debug!("client {} #{} XI 1.x stub minor={}", client_id.0, sequence.0, minor);
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
@@ -10598,6 +11316,281 @@ fn render_picture_damage_drawable(state: &ServerState, drawable: ResourceId) -> 
         .resources
         .composite_named_pixmap_owner_window(drawable)
         .unwrap_or(drawable)
+}
+
+/// Why the shared property-change dispatch helper rejected a request.
+///
+/// Each variant maps 1:1 to a wire X error: the caller turns it into an
+/// `emit_x11_error_with_minor` call with the variant-specific code and
+/// error_value. Kept inside `process_request.rs` so the field types
+/// don't leak ServerState into `xinput::libinput_props`. Variants
+/// share the `Bad` prefix on purpose — they mirror the X11 error code
+/// constants (BadAtom = 5, BadAccess = 10, BadValue = 2, BadMatch = 8).
+#[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
+enum PropertyDispatchError {
+    /// Atom is not interned → X error code 5 (BadAtom). Echoes the atom.
+    BadAtom { atom: u32 },
+    /// Write targets a ReadOnly descriptor → X error code 10 (BadAccess).
+    /// Echoes the atom.
+    BadAccess { atom: u32 },
+    /// Value failed `validate_value` / `decode_change` / backend
+    /// rejected it as `Invalid` → X error code 2 (BadValue). Echoes the
+    /// wire `format` for spec parity with the other BadValue sites in
+    /// the property arms.
+    BadValue { error_value: u32 },
+    /// Backend rejected the setting as `Unsupported` → X error code 8
+    /// (BadMatch). error_value is always 0 here (matches xserver).
+    BadMatch,
+}
+
+/// Run the T3 spec §D validate-before-commit pipeline shared by XI2
+/// XIChangeProperty (minor 57) and XI1 XChangeDeviceProperty (minor 37).
+///
+/// Order: BadAtom → descriptor lookup → ReadOnly→BadAccess →
+/// validate_value→BadValue → decode_change→BadValue →
+/// `backend.apply_device_config`→Unsupported/Invalid → commit via
+/// `apply_change_property`.
+///
+/// Preconditions (already enforced by both arms before calling):
+///   * `find_device(deviceid)` returned Some.
+///   * `mode` is one of REPLACE/PREPEND/APPEND.
+///   * `format` is one of 8/16/32.
+///   * `data.len() == num_items * (format / 8)`.
+///
+/// On `Ok`, the per-device property registry has been mutated. The
+/// returned [`PropWhat`] is either `Created` (the property did not
+/// exist before this write) or `Modified` (it did) — the caller feeds
+/// it straight into the `XI_PropertyEvent` / `DevicePropertyNotify`
+/// `what` byte.
+fn dispatch_change_property(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    deviceid: u16,
+    mode: u8,
+    format: u8,
+    property: AtomId,
+    type_atom: AtomId,
+    data: &[u8],
+) -> Result<crate::xinput::PropWhat, PropertyDispatchError> {
+    // 1. BadAtom.
+    if !state.atoms.exists(property) {
+        return Err(PropertyDispatchError::BadAtom { atom: property.0 });
+    }
+    // 2. Descriptor lookup. Borrow the name as `&str` from the atom
+    //    table, copy it out before any `find_device_mut` reborrow.
+    let dev_node =
+        crate::xinput::find_device(&state.xi_devices, deviceid).and_then(|d| d.device_node.clone());
+    let prop_name = state.atoms.name(property).map(str::to_owned);
+    if let Some(name) = prop_name.as_deref()
+        && let Some(desc) = crate::xinput::libinput_props::descriptor_by_name(name)
+    {
+        // 3. ReadOnly → BadAccess.
+        if desc.access == crate::xinput::libinput_props::Access::ReadOnly {
+            return Err(PropertyDispatchError::BadAccess { atom: property.0 });
+        }
+        // 4. validate_value → BadValue.
+        if crate::xinput::libinput_props::validate_value(desc.kind, format, data).is_err() {
+            return Err(PropertyDispatchError::BadValue {
+                error_value: u32::from(format),
+            });
+        }
+        // 5. decode_change → BadValue (covers AccelProfile-custom).
+        if let Some(binding) = desc.binding {
+            let change =
+                crate::xinput::libinput_props::decode_change(binding, data).map_err(|_| {
+                    PropertyDispatchError::BadValue {
+                        error_value: u32::from(format),
+                    }
+                })?;
+            // 6. Backend apply → Unsupported/Invalid.
+            if let Some(node) = dev_node.as_deref() {
+                match backend.apply_device_config(node, change) {
+                    Ok(()) => {}
+                    Err(crate::xinput::libinput_props::DeviceConfigError::Unsupported) => {
+                        return Err(PropertyDispatchError::BadMatch);
+                    }
+                    Err(crate::xinput::libinput_props::DeviceConfigError::Invalid) => {
+                        return Err(PropertyDispatchError::BadValue {
+                            error_value: u32::from(format),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // 7. Commit. `apply_change_property` itself reports whether the
+    //    property pre-existed (Modified vs Created), so the dispatch
+    //    layer can fan-out the matching `XI_PropertyEvent.what` byte
+    //    without re-querying the registry.
+    let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
+        .expect("caller verified device exists");
+    match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
+        Ok(what) => Ok(what),
+        Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
+            error_value: u32::from(format),
+        }),
+        Err(crate::xinput::XiPropError::BadMatch) => Err(PropertyDispatchError::BadMatch),
+        // `apply_change_property` only returns BadValue / BadMatch;
+        // BadDevice is handled by the caller's lookup, so no BadDevice
+        // arm is reachable here.
+        Err(crate::xinput::XiPropError::BadDevice) => {
+            unreachable!("apply_change_property never returns BadDevice; lookup handled above")
+        }
+    }
+}
+
+/// Map a [`PropertyDispatchError`] onto the XI minor-opcode error-emit
+/// path. Pure plumbing — the variant carries the error code + value.
+fn emit_property_dispatch_error(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    err: PropertyDispatchError,
+    minor_opcode: u16,
+) -> io::Result<RequestOutcome> {
+    let (code, bad_value) = match err {
+        PropertyDispatchError::BadAtom { atom } => (5u8, atom),
+        PropertyDispatchError::BadAccess { atom } => (10u8, atom),
+        PropertyDispatchError::BadValue { error_value } => (2u8, error_value),
+        PropertyDispatchError::BadMatch => (8u8, 0u32),
+    };
+    emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        code,
+        bad_value,
+        minor_opcode,
+        XI2_MAJOR_OPCODE,
+    )
+}
+
+/// Emit the property-change notification(s) to every client that
+/// selected for them on this device. Single fan-out for both XI2
+/// (`XI_PropertyEvent`, evtype 12) and XI1 (`DevicePropertyNotify`,
+/// XI1 event code 16 within the XInput event block, delivered as wire
+/// type `XI_FIRST_EVENT + 16 = 82`), keyed by the same
+/// `(deviceid, property, what)` tuple so the two notifications can
+/// never diverge.
+///
+/// Delivery follows xserver's `send_property_event`
+/// (`Xi/xiproperty.c:189-208`) via `SendEventToAllWindows`: every
+/// client that has selected `XI_PropertyEventMask` (XI2) or a matching
+/// `XEventClass` via `SelectExtensionEvent` (XI1) for the affected
+/// device on **any** window receives one copy of the event. Because
+/// neither `xXIPropertyEvent` nor `devicePropertyNotify` carries an
+/// event-window field, per-window distinctions only affect *which
+/// clients* receive — the wire bytes are identical for every
+/// recipient. Deduplication by client id is handled inside
+/// `fanout_event_to_clients`.
+///
+/// `deviceid` is the literal device id the change applied to (e.g. 4
+/// for the slave pointer). The XISelectEvents storage keys masks by
+/// the deviceid the client *requested*, which may be `XIAllDevices(0)`
+/// (a client that wants events from every device) or
+/// `XIAllMasterDevices(1)` (every master). xserver's delivery walks
+/// `dix/events.c::EventMaskForClient` and OR's the masks stored under
+/// the specific id AND the wildcard ids — we must mirror that here, or
+/// a client that called `xinput watch-props` (which selects with
+/// `deviceid=0`) silently receives nothing. The XI2 and XI1 emits are
+/// independent: a client may have selected via either (or both) paths
+/// and receives one copy per path.
+fn emit_property_change(
+    state: &mut ServerState,
+    deviceid: u16,
+    property: AtomId,
+    what: crate::xinput::PropWhat,
+) -> Vec<ClientId> {
+    // XI2 emit: clients select XI_PropertyEvent via
+    // `xi2_masks[(window, deviceid)]` keyed by the deviceid they asked
+    // for. A client targeting `XIAllDevices(0)` or — when the event
+    // device is a master — `XIAllMasterDevices(1)` selects with that
+    // wildcard id, so a property event on slave id 4 reaches both
+    // `dev == 4` selectors AND `dev == 0` selectors. xinput's
+    // `watch-props` uses `dev == 0`; without the wildcard match it
+    // sees nothing.
+    // XI device-id wildcards from `XI2.h`: XIAllDevices=0 selects any
+    // device; XIAllMasterDevices=1 selects any master. Property events
+    // are sourced from a slave (id 4 for the touchpad), so the slave
+    // never matches the master-only wildcard — but a future emit from
+    // a master device would. The OR keeps both well-defined.
+    const XI_ALL_DEVICES: u16 = 0;
+    let xi2_targets: Vec<ClientId> = state
+        .clients
+        .iter()
+        .filter_map(|(id, client)| {
+            let selected = client.xi2_masks.iter().any(|(&(_, dev), &mask)| {
+                let device_matches = dev == deviceid || dev == XI_ALL_DEVICES;
+                device_matches && (mask & XI2_PROPERTY_EVENT_MASK) != 0
+            });
+            selected.then_some(ClientId(*id))
+        })
+        .collect();
+    let time = state.timestamp_now();
+    let mut dropped = Vec::new();
+    if !xi2_targets.is_empty() {
+        dropped.extend(fanout_event_to_clients(
+            state,
+            &xi2_targets,
+            |buf, seq, order| {
+                let event = crate::xinput::encode_xi2_property_event(
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    deviceid,
+                    time,
+                    property,
+                    what,
+                );
+                buf.extend_from_slice(&event);
+            },
+        ));
+    }
+    // XI1 `DevicePropertyNotify` fan-out, keyed off
+    // `ClientState::xi1_event_classes`. A client selects via
+    // `SelectExtensionEvent` (minor 6) and the recorded class is
+    // `(deviceid << 8) | (XI_FIRST_EVENT + 16)` — a property delivery
+    // matches only when the client has that exact class. The XI2 and
+    // XI1 emits are independent: a client may have selected via either
+    // (or both) paths and receives one copy per path.
+    //
+    // XI1 deviceids are CARD8 on the wire, so the high byte of
+    // `xi1_class` is always zero — `as u8` truncations in the
+    // SelectExtensionEvent handler (minor 6) rely on this invariant.
+    debug_assert!(deviceid <= 0xFF, "XI1 deviceid must fit in CARD8");
+    let xi1_class =
+        (u32::from(deviceid) << 8) | u32::from(XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+    let xi1_targets: Vec<ClientId> = state
+        .clients
+        .iter()
+        .filter_map(|(id, client)| {
+            client
+                .xi1_event_classes
+                .contains(&xi1_class)
+                .then_some(ClientId(*id))
+        })
+        .collect();
+    if !xi1_targets.is_empty() {
+        let deleted = matches!(what, crate::xinput::PropWhat::Deleted);
+        dropped.extend(fanout_event_to_clients(
+            state,
+            &xi1_targets,
+            |buf, seq, order| {
+                let event = crate::xinput::encode_xi1_device_property_notify(
+                    order,
+                    seq,
+                    XI_FIRST_EVENT,
+                    deviceid,
+                    time,
+                    property,
+                    deleted,
+                );
+                buf.extend_from_slice(&event);
+            },
+        ));
+    }
+    dropped
 }
 
 fn emit_x11_error_with_minor(
@@ -16170,7 +17163,16 @@ fn emit_xi2_device_changed_bootstrap(
         x11::write_u16(le, buf, number);
         x11::write_u16(le, buf, scroll_type);
         x11::write_u16(le, buf, 0);
-        x11::write_u32(le, buf, 1);
+        // Flags = 0 to match the XIQueryDevice encoder's `write_scroll_class`
+        // (the canonical comment lives there). XIScrollFlagNoEmulation would
+        // be a contract violation while we still emit emulated XI_ButtonPress
+        // 4..7 — release Chrome crashes on it (2026-05-29). xserver's
+        // XIQueryDevice and DeviceChanged paths populate this field from a
+        // single `axis->scroll.flags` source
+        // (`Xi/xiquerydevice.c:ListScrollInfo` and
+        // `dix/eventconvert.c:appendScrollInfo`), so the two encoders here
+        // must agree.
+        x11::write_u32(le, buf, 0);
         x11::write_u32(le, buf, 1);
         x11::write_u32(le, buf, 0);
     }
@@ -16278,6 +17280,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
@@ -16520,6 +17523,2573 @@ mod tests {
         assert_eq!(wire[event_offset + 10], 2, "deviceid low byte");
         assert_eq!(wire[event_offset + 16], 7, "num_classes low byte");
         assert_eq!(wire[event_offset + 18], 4, "sourceid low byte");
+    }
+
+    // -----------------------------------------------------------------
+    // Tier 2 Task 4: device naming from the registry + XI1/XI2 sync
+    // -----------------------------------------------------------------
+
+    /// Drive XIQueryDevice (opcode 48) and parse out `(id, name)` for
+    /// each device in the reply (little-endian fixture clients).
+    fn query_device_ids_and_names(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+    ) -> Vec<(u16, String)> {
+        let mut backend = RecordingBackend::new();
+        handle_xi2_request(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(48),
+            &[],
+        )
+        .expect("XIQueryDevice");
+        let wire = read_all_available(peer);
+        let num_devices = u16::from_le_bytes([wire[8], wire[9]]) as usize;
+        let mut off = 32;
+        let mut out = Vec::new();
+        for _ in 0..num_devices {
+            let id = u16::from_le_bytes([wire[off], wire[off + 1]]);
+            let num_classes = u16::from_le_bytes([wire[off + 6], wire[off + 7]]) as usize;
+            let name_len = u16::from_le_bytes([wire[off + 8], wire[off + 9]]) as usize;
+            let name_start = off + 12;
+            let name = String::from_utf8(wire[name_start..name_start + name_len].to_vec()).unwrap();
+            // Advance: 12-byte info header + name (padded to 4) + classes.
+            let mut pos = name_start + name_len;
+            while pos % 4 != 0 {
+                pos += 1;
+            }
+            // Walk class blocks by their 4-byte-unit length field (u16 at
+            // offset +2 of each class header).
+            for _ in 0..num_classes {
+                let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
+                pos += units * 4;
+            }
+            out.push((id, name));
+            off = pos;
+        }
+        out
+    }
+
+    /// Drive XListInputDevices (XI 1.x, major 131 minor 2) and parse out
+    /// `(id, name)` for each device.
+    fn list_input_devices_ids_and_names(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+    ) -> Vec<(u16, String)> {
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 131,
+            data: 2,
+            length_units: 0,
+        };
+        handle_xi2_request(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        )
+        .expect("XListInputDevices");
+        let wire = read_all_available(peer);
+        let ndevices = wire[8] as usize;
+        // Device-info array: 8 bytes each (type ATOM, id, num_classes,
+        // use, pad). Track ids and per-device class counts.
+        let mut ids = Vec::new();
+        let mut class_counts = Vec::new();
+        let mut off = 32;
+        for _ in 0..ndevices {
+            ids.push(u16::from(wire[off + 4]));
+            class_counts.push(wire[off + 5] as usize);
+            off += 8;
+        }
+        // Class-info blocks: walk by the BYTE length field (offset +1).
+        for &nc in &class_counts {
+            for _ in 0..nc {
+                let len = wire[off + 1] as usize;
+                off += len;
+            }
+        }
+        // STR name list: 1 length byte + bytes, in device order.
+        let mut out = Vec::new();
+        for &id in &ids {
+            let n = wire[off] as usize;
+            let name = String::from_utf8(wire[off + 1..off + 1 + n].to_vec()).unwrap();
+            out.push((id, name));
+            off += 1 + n;
+        }
+        out
+    }
+
+    #[test]
+    fn xiquerydevice_reports_slave_pointer_registry_name_after_rename() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // Rename device 4 in the registry (simulating a seeded touchpad).
+        state
+            .xi_devices
+            .iter_mut()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .name = "SynPS/2 Synaptics TouchPad".to_owned();
+
+        let devs = query_device_ids_and_names(&mut state, &mut peer);
+        let slave = devs.iter().find(|(id, _)| *id == 4).expect("device 4");
+        assert_eq!(
+            slave.1, "SynPS/2 Synaptics TouchPad",
+            "XIQueryDevice must report device 4's registry name"
+        );
+    }
+
+    #[test]
+    fn xi1_and_xi2_report_same_device_ids_and_names() {
+        // Default (no touchpad): both enumerations must agree.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let xi2 = query_device_ids_and_names(&mut state, &mut peer);
+        let xi1 = list_input_devices_ids_and_names(&mut state, &mut peer);
+        assert_eq!(xi2, xi1, "XI1 and XI2 must agree on (id, name) by default");
+
+        // After a touchpad rename, both must STILL agree — this is the
+        // ListInputDevices fatal-CHECK guard: Chromium/Electron compare
+        // the two enumerations and crash on any divergence.
+        state
+            .xi_devices
+            .iter_mut()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .name = "ETPS/2 Elantech Touchpad".to_owned();
+        let xi2 = query_device_ids_and_names(&mut state, &mut peer);
+        let xi1 = list_input_devices_ids_and_names(&mut state, &mut peer);
+        assert_eq!(
+            xi2, xi1,
+            "XI1 and XI2 must agree on (id, name) after a touchpad rename"
+        );
+        assert_eq!(
+            xi2.iter().find(|(id, _)| *id == 4).unwrap().1,
+            "ETPS/2 Elantech Touchpad",
+            "both enumerations carry the renamed slave pointer"
+        );
+    }
+
+    /// Drive `XListInputDevices` (XI 1.x, major 131 minor 2) and return
+    /// the type-atom `u32` for each device in order `[2, 3, 4, 5]`.
+    /// The atom sits at bytes 0-3 of each 8-byte device-info descriptor
+    /// immediately after the 32-byte reply header.
+    fn list_input_devices_type_atoms(state: &mut ServerState, peer: &mut UnixStream) -> [u32; 4] {
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 131,
+            data: 2,
+            length_units: 0,
+        };
+        handle_xi2_request(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        )
+        .expect("XListInputDevices");
+        let wire = read_all_available(peer);
+        let ndevices = wire[8] as usize;
+        assert_eq!(ndevices, 4, "expected 4 devices");
+        let mut result = [0u32; 4];
+        let mut off = 32;
+        for r in result.iter_mut().take(ndevices) {
+            *r = u32::from_le_bytes([wire[off], wire[off + 1], wire[off + 2], wire[off + 3]]);
+            off += 8;
+        }
+        result
+    }
+
+    /// `XListInputDevices` device-type atoms: before seeding, device 4
+    /// (slave pointer) must carry the MOUSE atom; after `xi_seed_touchpad`
+    /// it must carry the TOUCHPAD atom; after `xi_clear_touchpad` it must
+    /// revert to MOUSE.  Devices 2 (master ptr) and 3/5 (keyboards) are
+    /// always MOUSE/KEYBOARD respectively.
+    #[test]
+    fn list_input_devices_device4_type_atom_matches_touchpad_state() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        // Look up the pre-interned type atoms from the server's atom table.
+        let mouse_atom = state.atoms.intern(crate::xinput::XI_ATOM_MOUSE, true).0;
+        let kbd_atom = state.atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, true).0;
+        let touchpad_atom = state.atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, true).0;
+        assert_ne!(mouse_atom, 0, "MOUSE pre-interned");
+        assert_ne!(kbd_atom, 0, "KEYBOARD pre-interned");
+        assert_ne!(touchpad_atom, 0, "TOUCHPAD pre-interned");
+
+        // Before seeding: device 4 should be MOUSE.
+        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+        assert_eq!(types[0], mouse_atom, "device 2 = MOUSE");
+        assert_eq!(types[1], kbd_atom, "device 3 = KEYBOARD");
+        assert_eq!(
+            types[2], mouse_atom,
+            "device 4 = MOUSE before touchpad seed"
+        );
+        assert_eq!(types[3], kbd_atom, "device 5 = KEYBOARD");
+
+        // Seed a touchpad onto device 4: type must become TOUCHPAD.
+        let touchpad_info = crate::core_loop::DeviceInfo {
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event4".into(),
+            sysname: "event4".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                tap: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                dwt: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: true,
+                },
+                ..Default::default()
+            },
+        };
+        state.xi_seed_touchpad(&touchpad_info);
+        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+        assert_eq!(types[2], touchpad_atom, "device 4 = TOUCHPAD after seed");
+
+        // Clear it: device 4 must revert to MOUSE.
+        state.xi_clear_touchpad("/dev/input/event4");
+        let types = list_input_devices_type_atoms(&mut state, &mut peer);
+        assert_eq!(types[2], mouse_atom, "device 4 = MOUSE after clear");
+    }
+
+    /// Drive XIQueryDevice (opcode 48) and return the RAW class-block
+    /// bytes (and `num_classes`) for device 4 only — the slave pointer.
+    /// Walks the device-info array exactly like
+    /// `query_device_ids_and_names` but, for the device whose id is 4,
+    /// slices out the trailing class bytes rather than just the name.
+    fn query_device_4_class_block(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+    ) -> (Vec<u8>, u16) {
+        let mut backend = RecordingBackend::new();
+        handle_xi2_request(
+            state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(48),
+            &[],
+        )
+        .expect("XIQueryDevice");
+        let wire = read_all_available(peer);
+        let num_devices = u16::from_le_bytes([wire[8], wire[9]]) as usize;
+        let mut off = 32;
+        for _ in 0..num_devices {
+            let id = u16::from_le_bytes([wire[off], wire[off + 1]]);
+            let num_classes = u16::from_le_bytes([wire[off + 6], wire[off + 7]]);
+            let name_len = u16::from_le_bytes([wire[off + 8], wire[off + 9]]) as usize;
+            let mut pos = off + 12 + name_len;
+            while pos % 4 != 0 {
+                pos += 1;
+            }
+            let classes_start = pos;
+            for _ in 0..num_classes {
+                let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
+                pos += units * 4;
+            }
+            if id == 4 {
+                return (wire[classes_start..pos].to_vec(), num_classes);
+            }
+            off = pos;
+        }
+        panic!("device 4 not present in XIQueryDevice reply");
+    }
+
+    /// Regression guard: the device-4 class block XIQueryDevice (opcode
+    /// 48) emits MUST be byte-identical to the block carried by the
+    /// touchpad-add/remove `XI_DeviceChanged` fanout. Both callers now go
+    /// through `fanout::build_slave_pointer_class_block`, so they cannot
+    /// drift; this test parses the real XIQueryDevice wire bytes and
+    /// compares them against the shared builder's output (the path the
+    /// fanout uses) to keep that guarantee under test.
+    #[test]
+    fn query_device_4_matches_device_changed_block() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let (wire_classes, wire_num) = query_device_4_class_block(&mut state, &mut peer);
+        let (builder_classes, builder_num) =
+            crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
+
+        assert_eq!(
+            wire_num, builder_num,
+            "XIQueryDevice device-4 num_classes must match the shared builder"
+        );
+        assert_eq!(
+            wire_classes, builder_classes,
+            "XIQueryDevice device-4 class bytes must be byte-identical to the \
+             XI_DeviceChanged fanout block (both call build_slave_pointer_class_block)"
+        );
+
+        // Also hold under a seeded-touchpad rename: the class shape is
+        // name-independent, so the two must STILL match byte-for-byte.
+        state
+            .xi_devices
+            .iter_mut()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .name = "SynPS/2 Synaptics TouchPad".to_owned();
+        let (wire_classes, _) = query_device_4_class_block(&mut state, &mut peer);
+        let (builder_classes, _) =
+            crate::core_loop::fanout::build_slave_pointer_class_block(&mut state);
+        assert_eq!(
+            wire_classes, builder_classes,
+            "device-4 class blocks must stay byte-identical after a touchpad rename"
+        );
+    }
+
+    /// Tier 2b T7 regression: the `XI_DeviceChanged` event emitted by
+    /// `emit_xi2_device_changed_bootstrap` (driven from XISelectEvents at
+    /// connect time) must advertise the SAME scroll-class `flags` u32 as
+    /// XIQueryDevice does, namely `0`. xserver populates both paths from a
+    /// single `axis->scroll.flags` source (`Xi/xiquerydevice.c:ListScrollInfo`
+    /// and `dix/eventconvert.c:appendScrollInfo`), so they cannot legitimately
+    /// differ. yserver's XIQueryDevice site emits `0`; a stale `flags = 1` in
+    /// the bootstrap path would re-arm the 2026-05-29 Chrome crash-class
+    /// (NoEmulation declared while still emitting emulated XI_ButtonPress
+    /// 4..7).
+    #[test]
+    fn t7_xi2_device_changed_bootstrap_scroll_flags_match_xiquerydevice() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        emit_xi2_device_changed_bootstrap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(7),
+            XI2_MAJOR_OPCODE,
+        )
+        .expect("emit_xi2_device_changed_bootstrap");
+
+        let wire = read_all_available(&mut peer);
+        // Locate the XI_DeviceChanged event (opcode 35, evtype 1).
+        let off = (0..wire.len().saturating_sub(32))
+            .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
+            .expect("XI_DeviceChanged event in wire");
+        assert_eq!(wire[off + 1], XI2_MAJOR_OPCODE, "major opcode = XI2 ext");
+        // Header layout (see encode_xi2_device_changed_event):
+        //   0       u8   35 (GenericEvent)
+        //   1       u8   major_opcode
+        //   2..4    u16  sequence
+        //   4..8    u32  length (classes.len() / 4)
+        //   8..10   u16  evtype = 1
+        //   10..12  u16  deviceid
+        //   12..16  u32  time
+        //   16..18  u16  num_classes
+        //   18..20  u16  sourceid
+        //   20      u8   reason
+        //   21..32  pad
+        //   32..    classes
+        let num_classes = u16::from_le_bytes([wire[off + 16], wire[off + 17]]);
+        assert_eq!(num_classes, 7, "Button + 4 Valuators + 2 Scrolls");
+
+        // Walk past the 32-byte event header and the non-scroll classes.
+        // Layout matches what `emit_xi2_device_changed_bootstrap` writes:
+        //   - 32 bytes header
+        //   - Button(7): 8 (header) + 4 (state words for 7 buttons) + 4*7
+        //     = 40 bytes
+        //   - Valuator x4: 11 units * 4 = 44 bytes each, 176 total
+        //   - Scroll x2: 6 units * 4 = 24 bytes each
+        let classes_start = off + 32;
+        let mut pos = classes_start;
+        let mut scroll_offsets = Vec::new();
+        for _ in 0..num_classes {
+            let cls_type = u16::from_le_bytes([wire[pos], wire[pos + 1]]);
+            let units = u16::from_le_bytes([wire[pos + 2], wire[pos + 3]]) as usize;
+            if cls_type == 3 {
+                // Scroll class — `flags` is a u32 at offset 12 within the
+                // 24-byte class body (after type/length/sourceid/number/
+                // scroll_type/pad).
+                scroll_offsets.push(pos);
+            }
+            pos += units * 4;
+        }
+        assert_eq!(scroll_offsets.len(), 2, "two scroll classes (V + H)");
+        for s_off in scroll_offsets {
+            let flags = u32::from_le_bytes([
+                wire[s_off + 12],
+                wire[s_off + 13],
+                wire[s_off + 14],
+                wire[s_off + 15],
+            ]);
+            assert_eq!(
+                flags, 0,
+                "XI_DeviceChanged scroll flags must match XIQueryDevice (0); see the \
+                 XIQueryDevice `write_scroll_class` comment for the 2026-05-29 \
+                 Chrome crash-class rationale"
+            );
+        }
+    }
+
+    #[test]
+    fn device_changed_emitted_to_selecting_client_on_touchpad_add_and_remove() {
+        use crate::{
+            core_loop::fanout::emit_xi2_device_changed_slave_pointer,
+            xinput::DEVICEID_SLAVE_POINTER,
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // Client selects XI_DeviceChanged on the slave pointer (device 4)
+        // at the root window — the way GDK/Chromium subscribe.
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ROOT_WINDOW, DEVICEID_SLAVE_POINTER),
+            XI2_DEVICE_CHANGED_MASK,
+        );
+
+        // Touchpad add → DeviceChanged for device 4.
+        let info = crate::core_loop::DeviceInfo {
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event4".into(),
+            sysname: "event4".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                tap: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                dwt: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: true,
+                },
+                ..Default::default()
+            },
+        };
+        state.xi_seed_touchpad(&info);
+        let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
+        assert!(dropped.is_empty());
+        let wire = read_all_available(&mut peer);
+        let off = (0..wire.len().saturating_sub(32))
+            .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
+            .expect("XI_DeviceChanged on add");
+        assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
+        assert_eq!(wire[off + 18], 4, "sourceid = the device itself");
+        assert_eq!(wire[off + 20], 2, "reason = XIDeviceChange");
+        assert_eq!(wire[off + 16], 7, "num_classes low byte");
+
+        // Touchpad remove → DeviceChanged again.
+        state.xi_clear_touchpad(&info.device_node);
+        let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
+        assert!(dropped.is_empty());
+        let wire = read_all_available(&mut peer);
+        let off = (0..wire.len().saturating_sub(32))
+            .find(|&i| wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 1)
+            .expect("XI_DeviceChanged on remove");
+        assert_eq!(wire[off + 10], 4, "deviceid = slave pointer");
+    }
+
+    #[test]
+    fn device_changed_is_noop_when_no_client_selected() {
+        use crate::core_loop::fanout::emit_xi2_device_changed_slave_pointer;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // No xi2_masks selection → no event.
+        let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
+        assert!(dropped.is_empty());
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no DeviceChanged when nothing selected"
+        );
+    }
+
+    #[test]
+    fn device_changed_not_sent_for_selection_on_non_root_window() {
+        // DeviceChanged is a root-window hierarchy event. A client that
+        // selected it on some unrelated (non-root) window must NOT get it
+        // — otherwise the fanout spuriously delivers to the wrong window.
+        use crate::{
+            core_loop::fanout::emit_xi2_device_changed_slave_pointer,
+            xinput::DEVICEID_SLAVE_POINTER,
+        };
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let non_root = ResourceId(0x4000_0001);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((non_root, DEVICEID_SLAVE_POINTER), XI2_DEVICE_CHANGED_MASK);
+        let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
+        assert!(dropped.is_empty());
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "selection on a non-root window must not receive DeviceChanged"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Tier 2 Task 3: XI2 device-property requests (dispatch-level, wire bytes)
+    // -----------------------------------------------------------------
+
+    /// Header for an XI2 (major 131) request with the given minor opcode.
+    fn xi2_header(minor: u8) -> RequestHeader {
+        RequestHeader {
+            opcode: 131,
+            data: minor,
+            length_units: 1,
+        }
+    }
+
+    /// Seed the slave-pointer device (id 4) with one INTEGER/8 property
+    /// keyed by a synthetic atom whose numeric id is supplied by the
+    /// caller. The atom is registered into `state.atoms` so it passes
+    /// the T3 BadAtom guard in the property dispatch arms — historical
+    /// test fixtures pass 100/200, which sit outside the well-known
+    /// range and would otherwise look "uninterned" to the dispatcher.
+    fn seed_one_prop(state: &mut ServerState, atom: u32, format: u8, data: Vec<u8>) {
+        state
+            .atoms
+            .register_for_test(AtomId(atom), &format!("test-prop-{atom}"));
+        let dev = state
+            .xi_devices
+            .iter_mut()
+            .find(|d| d.id == 4)
+            .expect("slave pointer");
+        dev.properties.insert(
+            AtomId(atom),
+            crate::xinput::XiProperty {
+                type_atom: crate::xinput::XA_INTEGER,
+                format,
+                data,
+            },
+        );
+    }
+
+    #[test]
+    fn xi_list_properties_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        seed_one_prop(&mut state, 200, 8, vec![2]);
+
+        // body: deviceid=4 (u16) + pad(u16).
+        let body = [4u8, 0, 0, 0];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(56),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32 + 8, "32 header + 2 atoms");
+        assert_eq!(wire[0], 1, "X_Reply");
+        assert_eq!(
+            u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+            2,
+            "length"
+        );
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "num_properties");
+        assert_eq!(u32::from_le_bytes(wire[32..36].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(wire[36..40].try_into().unwrap()), 200);
+    }
+
+    #[test]
+    fn xi_list_properties_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = [99u8, 0, 0, 0]; // deviceid 99 — not present
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(7),
+            xi2_header(56),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error is 32 bytes");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice = 153");
+        // sequence at bytes 2-3.
+        assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 7);
+    }
+
+    #[test]
+    fn xi_get_property_full_read_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![0xAB]);
+
+        // body: deviceid(2)=4, delete(1)=0, pad(1), property(4)=100,
+        //       type(4)=0(Any), offset(4)=0, len(4)=100.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(0); // delete
+        body.push(0); // pad
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(59),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32 + 4, "header + 1 byte padded to 4");
+        assert_eq!(
+            u32::from_le_bytes(wire[8..12].try_into().unwrap()),
+            19,
+            "type=INTEGER"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+            0,
+            "bytes_after"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[16..20].try_into().unwrap()),
+            1,
+            "num_items"
+        );
+        assert_eq!(wire[20], 8, "format");
+        assert_eq!(wire[32], 0xAB, "value byte");
+    }
+
+    #[test]
+    fn xi_get_property_bad_delete_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // device 4 exists; delete = 2 (illegal) → BadValue.
+        // Pre-register atom 100 so the BadAtom guard (T3) doesn't fire
+        // before the bad-delete check we're actually exercising.
+        state.atoms.register_for_test(AtomId(100), "test-prop-100");
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(2); // delete = 2 (illegal)
+        body.push(0);
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            xi2_header(59),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], 2, "BadValue");
+    }
+
+    #[test]
+    fn xi_change_then_get_roundtrip_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-register atom 100 so the T3 BadAtom guard accepts it.
+        state.atoms.register_for_test(AtomId(100), "test-prop-100");
+
+        // XIChangeProperty: deviceid(2)=4, mode(1)=Replace, format(1)=8,
+        // property(4)=100, type(4)=INTEGER(19), num_items(4)=3, data=[7,8,9]+pad.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(0); // mode Replace
+        body.push(8); // format
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&19u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&[7, 8, 9, 0]); // 3 data bytes + 1 pad
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        // ChangeProperty has no reply.
+        assert!(read_all_available(&mut peer).is_empty());
+
+        // GetProperty back.
+        let mut gbody = Vec::new();
+        gbody.extend_from_slice(&4u16.to_le_bytes());
+        gbody.push(0);
+        gbody.push(0);
+        gbody.extend_from_slice(&100u32.to_le_bytes());
+        gbody.extend_from_slice(&0u32.to_le_bytes());
+        gbody.extend_from_slice(&0u32.to_le_bytes());
+        gbody.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(59),
+            &gbody,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            u32::from_le_bytes(wire[16..20].try_into().unwrap()),
+            3,
+            "num_items"
+        );
+        assert_eq!(&wire[32..35], &[7, 8, 9], "value round-trips");
+    }
+
+    #[test]
+    fn xi_change_property_bad_format_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(0); // mode
+        body.push(7); // format = 7 (illegal)
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&19u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(4),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], 2, "BadValue");
+    }
+
+    #[test]
+    fn xi_change_property_unknown_device_outranks_bad_format() {
+        // Error-precedence: xserver ProcXIChangeProperty (xiproperty.c:1137)
+        // does the device lookup before validating mode/format, so an
+        // unknown device + illegal format must yield BadDevice, not BadValue.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(&99u16.to_le_bytes()); // deviceid 99 — absent
+        body.push(0); // mode
+        body.push(7); // format = 7 (illegal)
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&19u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(5),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice outranks BadValue");
+        assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 5, "sequence");
+    }
+
+    #[test]
+    fn xi_delete_property_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+
+        // body: deviceid(2)=4, pad(2), property(4)=100.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(58),
+            &body,
+        )
+        .unwrap();
+        // No reply for DeleteProperty.
+        assert!(read_all_available(&mut peer).is_empty());
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        assert!(
+            !dev.properties.contains_key(&AtomId(100)),
+            "property removed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // XI 1.x device-property dispatch (minors 36/37/38/39) — byte-level.
+    // These are the path MATE's settings daemon actually uses
+    // (OpenDevice + GetDeviceProperty), distinct from the XI2 path above.
+    // -----------------------------------------------------------------
+
+    /// Build an `xGetDevicePropertyReq` body (bytes after the 4-byte
+    /// generic header): property(4), type(4), longOffset(4), longLength(4),
+    /// deviceid(1, CARD8), delete(1), pad(2).
+    fn xi1_get_property_body(
+        property: u32,
+        type_atom: u32,
+        offset: u32,
+        len: u32,
+        deviceid: u8,
+        delete: u8,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        body.extend_from_slice(&offset.to_le_bytes());
+        body.extend_from_slice(&len.to_le_bytes());
+        body.push(deviceid);
+        body.push(delete);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn xi1_get_device_property_tapping_enabled_wire() {
+        // Mirrors MATE's read of "libinput Tapping Enabled" on the
+        // seeded touchpad (device 4): INTEGER/8/[1], deviceid echoed.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.xi_seed_touchpad(&crate::core_loop::DeviceInfo {
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event4".into(),
+            sysname: "event4".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                tap: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                dwt: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: true,
+                },
+                ..Default::default()
+            },
+        });
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi1_get_property_body(tap_atom, 0 /* AnyPropertyType */, 0, 100, 4, 0);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(0x1234),
+            xi2_header(39),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        // 32-byte header + 1 data byte padded to 4 → 36.
+        assert_eq!(wire.len(), 36);
+        assert_eq!(wire[0], 1, "X_Reply");
+        assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 0x1234, "sequence");
+        assert_eq!(
+            u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+            1,
+            "length = ceil(1/4)"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[8..12].try_into().unwrap()),
+            integer_atom,
+            "type = INTEGER"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+            0,
+            "bytes_after = 0"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[16..20].try_into().unwrap()),
+            1,
+            "num_items = 1"
+        );
+        assert_eq!(wire[20], 8, "format = 8");
+        assert_eq!(wire[21], 4, "deviceid echoed (XI1-specific byte)");
+        assert!(wire[22..32].iter().all(|&b| b == 0), "pad1..pad3 zero");
+        assert_eq!(wire[32], 1, "value = tap enabled");
+        assert_eq!(&wire[33..36], &[0, 0, 0], "value padding");
+    }
+
+    #[test]
+    fn xi1_get_device_property_absent_returns_none() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // device 4 exists but has no property at atom 999. The atom
+        // ITSELF must be valid (T3 BadAtom guard); the test checks the
+        // distinct case where the atom is interned but the device has
+        // no value for it.
+        state.atoms.register_for_test(AtomId(999), "test-prop-999");
+        let body = xi1_get_property_body(999, 0, 0, 100, 4, 0);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            xi2_header(39),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "no data for absent property");
+        assert_eq!(wire[0], 1, "X_Reply (not error)");
+        assert_eq!(
+            u32::from_le_bytes(wire[8..12].try_into().unwrap()),
+            0,
+            "type = None"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+            0,
+            "bytes_after = 0"
+        );
+        assert_eq!(wire[20], 0, "format = 0");
+        assert_eq!(wire[21], 4, "deviceid still echoed");
+    }
+
+    #[test]
+    fn xi1_get_device_property_type_mismatch_metadata_only() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Seed an INTEGER/8 prop at atom 100, then ask for STRING.
+        seed_one_prop(&mut state, 100, 8, vec![0xAB]);
+        let string_atom = crate::xinput::XA_STRING.0;
+        let body = xi1_get_property_body(100, string_atom, 0, 100, 4, 0);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(4),
+            xi2_header(39),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "no value bytes on mismatch");
+        assert_eq!(
+            u32::from_le_bytes(wire[8..12].try_into().unwrap()),
+            crate::xinput::XA_INTEGER.0,
+            "type = stored INTEGER"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+            1,
+            "bytes_after = stored item count"
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[16..20].try_into().unwrap()),
+            0,
+            "num_items = 0"
+        );
+        assert_eq!(wire[20], 8, "format = stored");
+        assert_eq!(wire[21], 4, "deviceid echoed");
+    }
+
+    #[test]
+    fn xi1_get_device_property_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-register atom 100 so the BadAtom guard doesn't fire before
+        // the bad-device check the test is exercising.
+        state.atoms.register_for_test(AtomId(100), "test-prop-100");
+        let body = xi1_get_property_body(100, 0, 0, 100, 99, 0); // device 99 absent
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(9),
+            xi2_header(39),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error is 32 bytes");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice = 153");
+        assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 9, "sequence");
+    }
+
+    #[test]
+    fn xi1_get_device_property_bad_delete_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.atoms.register_for_test(AtomId(100), "test-prop-100");
+        let body = xi1_get_property_body(100, 0, 0, 1, 4, 2); // delete = 2 (illegal)
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(11),
+            xi2_header(39),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], 2, "BadValue");
+    }
+
+    #[test]
+    fn xi1_list_device_properties_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        seed_one_prop(&mut state, 200, 8, vec![2]);
+
+        // xListDevicePropertiesReq body: deviceid(1), pad0(1), pad1(2).
+        let body = [4u8, 0, 0, 0];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(36),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32 + 8, "32 header + 2 atoms");
+        assert_eq!(wire[0], 1, "X_Reply");
+        assert_eq!(
+            u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+            2,
+            "length = nAtoms"
+        );
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "nAtoms");
+        assert!(wire[10..32].iter().all(|&b| b == 0), "pad zero");
+        assert_eq!(u32::from_le_bytes(wire[32..36].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(wire[36..40].try_into().unwrap()), 200);
+    }
+
+    #[test]
+    fn xi1_list_device_properties_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = [99u8, 0, 0, 0]; // device 99 absent
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(36),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice");
+    }
+
+    #[test]
+    fn xi1_change_then_get_roundtrip_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-register atom 100 (T3 BadAtom guard).
+        state.atoms.register_for_test(AtomId(100), "test-prop-100");
+
+        // xChangeDevicePropertyReq body: property(4)=100, type(4)=INTEGER,
+        // deviceid(1)=4, format(1)=8, mode(1)=Replace, pad(1),
+        // nUnits(4)=3, value=[7,8,9]+pad.
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::XA_INTEGER.0.to_le_bytes());
+        body.push(4); // deviceid (CARD8)
+        body.push(8); // format
+        body.push(crate::xinput::XI_PROP_MODE_REPLACE); // mode
+        body.push(0); // pad
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&[7, 8, 9, 0]); // 3 data bytes + 1 pad
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        // ChangeDeviceProperty has no reply.
+        assert!(read_all_available(&mut peer).is_empty());
+
+        // Read it back via XI1 GetDeviceProperty.
+        let gbody = xi1_get_property_body(100, 0, 0, 100, 4, 0);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(39),
+            &gbody,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            u32::from_le_bytes(wire[16..20].try_into().unwrap()),
+            3,
+            "num_items"
+        );
+        assert_eq!(wire[21], 4, "deviceid echoed");
+        assert_eq!(&wire[32..35], &[7, 8, 9], "value round-trips");
+    }
+
+    #[test]
+    fn xi1_change_device_property_bad_device_outranks_format() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&crate::xinput::XA_INTEGER.0.to_le_bytes());
+        body.push(99); // deviceid (CARD8) absent
+        body.push(7); // format 7 (illegal)
+        body.push(0); // mode
+        body.push(0); // pad
+        body.extend_from_slice(&0u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(5),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice outranks BadValue");
+    }
+
+    #[test]
+    fn xi1_delete_device_property_wire() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+
+        // xDeleteDevicePropertyReq body: property(4)=100, deviceid(1)=4,
+        // pad0(1), pad1(2).
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.push(4); // deviceid (CARD8)
+        body.push(0);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(38),
+            &body,
+        )
+        .unwrap();
+        assert!(read_all_available(&mut peer).is_empty(), "no reply");
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        assert!(
+            !dev.properties.contains_key(&AtomId(100)),
+            "property removed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T3 dispatch: validate→apply→commit + BadAtom/BadAccess/BadValue.
+    // These exercise the new descriptor-aware path against a seeded
+    // touchpad; the recording backend's default `apply_device_config`
+    // returns `Ok(())`, so successful writes commit to the registry.
+    // -----------------------------------------------------------------
+
+    /// Build an `xXIChangePropertyReq` body (after the 4-byte generic
+    /// header): deviceid(2), mode(1), format(1), property(4), type(4),
+    /// num_items(4), value(num_items * format/8). The caller is
+    /// responsible for any 4-byte pad on the wire — the body slice we
+    /// hand to `handle_xi2_request` doesn't need it because each test
+    /// passes the raw data block directly.
+    fn xi2_change_property_body(
+        deviceid: u16,
+        mode: u8,
+        format: u8,
+        property: u32,
+        type_atom: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&deviceid.to_le_bytes());
+        body.push(mode);
+        body.push(format);
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        let num_items = data.len() / usize::from(format / 8);
+        body.extend_from_slice(&(num_items as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        // 4-byte pad on the value tail.
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        body
+    }
+
+    /// Seed a touchpad onto device 4 with tap available+current+default.
+    /// Mirrors the MATE test fixture used elsewhere in this module.
+    fn seed_touchpad_for_t3(state: &mut ServerState) {
+        state.xi_seed_touchpad(&crate::core_loop::DeviceInfo {
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event4".into(),
+            sysname: "event4".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: crate::core_loop::message::LibinputConfigSnapshot {
+                tap: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                dwt: crate::core_loop::message::BoolSetting {
+                    available: true,
+                    current: true,
+                    default: true,
+                },
+                scroll_method: crate::core_loop::message::OneHot3 {
+                    available_mask: 0b111,
+                    current: Some(0),
+                    default: Some(0),
+                },
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn t3_xi2_change_property_writable_descriptor_commits_to_registry() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        // Write `[0]` (disable tap) to a writable Bool descriptor.
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "successful XIChangeProperty has no reply"
+        );
+        // Registry now holds the new value.
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let prop = dev.properties.get(&AtomId(tap_atom)).expect("tap stored");
+        assert_eq!(prop.format, 8);
+        assert_eq!(prop.data, vec![0], "tap toggled off");
+    }
+
+    // -----------------------------------------------------------------
+    // XI2 XI_PropertyEvent fan-out on change / delete / get(delete=1).
+    // The dispatch arm must wire `emit_property_change` into all six
+    // property-write sites so every client that selected
+    // `XI_PropertyEventMask` on the affected device receives a
+    // 32-byte XI2 GenericEvent (evtype 12) with the right `what` byte.
+    // -----------------------------------------------------------------
+
+    /// Scan a wire buffer for the first XI2 GenericEvent (`type == 35`)
+    /// of evtype 12 (XI_PropertyEvent) and return the 32-byte slice
+    /// pointing at the event header. Used by the T5 tests below; we
+    /// can't anchor at offset 0 because some arms emit a reply (e.g.
+    /// `XIGetProperty(delete=1)`) before the event.
+    ///
+    /// Window: `0..=wire.len()-32` (inclusive) so a 32-byte buffer
+    /// matches at offset 0.
+    fn find_xi2_property_event(wire: &[u8]) -> Option<&[u8]> {
+        let end = wire.len().checked_sub(32)?;
+        (0..=end).find_map(|i| {
+            (wire[i] == 35 && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 12)
+                .then(|| &wire[i..i + 32])
+        })
+    }
+
+    /// Subscribe `client_id` to `XI_PropertyEventMask` on the slave
+    /// pointer (device 4) at the root window — the selection MATE /
+    /// GDK make once they have learned the device id.
+    fn select_xi2_property_event_on_root(state: &mut ServerState, client_id: u32, deviceid: u16) {
+        state
+            .clients
+            .get_mut(&client_id)
+            .expect("client installed")
+            .xi2_masks
+            .insert((ROOT_WINDOW, deviceid), XI2_PROPERTY_EVENT_MASK);
+    }
+
+    #[test]
+    fn t5_xi2_change_property_emits_property_event_modified_to_selecting_client() {
+        // Selecting client receives an XI2 XI_PropertyEvent with
+        // what=Modified after a successful XIChangeProperty against an
+        // already-seeded libinput property ("libinput Tapping Enabled"
+        // is set by `seed_touchpad`, so the write is a Modify).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        // No reply for XIChangeProperty; the only bytes on the wire
+        // must be the 32-byte XI_PropertyEvent.
+        assert_eq!(wire.len(), 32, "exactly one 32-byte event, no reply");
+        let ev = find_xi2_property_event(&wire).expect("XI_PropertyEvent present");
+        assert_eq!(ev[0], 35, "GenericEvent");
+        assert_eq!(ev[1], 137, "extension = XInputExtension major");
+        assert_eq!(u16::from_le_bytes([ev[8], ev[9]]), 12, "evtype");
+        assert_eq!(u16::from_le_bytes([ev[10], ev[11]]), 4, "deviceid");
+        assert_eq!(
+            u32::from_le_bytes([ev[16], ev[17], ev[18], ev[19]]),
+            tap_atom,
+            "property atom"
+        );
+        assert_eq!(ev[20], 2, "what = Modified (property already seeded)");
+    }
+
+    #[test]
+    fn t5_xi2_change_property_emits_property_event_created_for_new_atom() {
+        // Writing a property the device has never carried before
+        // (atom 0x4242 — a synthetic test atom, no descriptor table
+        // entry, so the dispatch falls through to the bare commit step)
+        // reports `Created`.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // No touchpad → the descriptor path is bypassed and any atom
+        // commits straight into the registry.
+        state.atoms.register_for_test(AtomId(0x4242), "T5 created");
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            0x4242,
+            crate::xinput::XA_INTEGER.0,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        let ev = find_xi2_property_event(&wire).expect("XI_PropertyEvent present");
+        assert_eq!(ev[20], 1, "what = Created");
+        assert_eq!(
+            u32::from_le_bytes([ev[16], ev[17], ev[18], ev[19]]),
+            0x4242,
+            "property atom"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_delete_property_emits_property_event_deleted() {
+        // XIDeleteProperty against a seeded property fans out
+        // what=Deleted.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(58),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "exactly one 32-byte event, no reply");
+        let ev = find_xi2_property_event(&wire).expect("XI_PropertyEvent present");
+        assert_eq!(ev[20], 0, "what = Deleted");
+        assert_eq!(
+            u32::from_le_bytes([ev[16], ev[17], ev[18], ev[19]]),
+            100,
+            "property atom"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_delete_property_absent_is_silent() {
+        // Redundant delete of an absent property must NOT emit an
+        // event (mirror of xiproperty.c, which only calls
+        // `send_property_event` when the registry actually shrank).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Atom must exist for the BadAtom guard, but the property is
+        // not seeded onto device 4.
+        state.atoms.register_for_test(AtomId(100), "T5 absent prop");
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(58),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no event for a no-op delete"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_get_property_delete_emits_property_event_deleted() {
+        // `XIGetProperty(delete=1)` removes the property after a full
+        // read and the dispatch arm fans out what=Deleted to selecting
+        // clients. Both the GetProperty reply (36 bytes: 32 header +
+        // 1 data byte padded to 4) and the 32-byte XI_PropertyEvent
+        // end up on the same socket — the X protocol leaves the order
+        // unspecified (clients reorder by sequence), so the test
+        // searches for the event payload rather than anchoring on its
+        // wire position.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+
+        // body: deviceid(2)=4, delete(1)=1, pad(1), property(4)=100,
+        // type(4)=0, offset(4)=0, len(4)=100.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(1); // delete = true
+        body.push(0); // pad
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(59),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 36 + 32, "GetProperty reply + PropertyEvent");
+        let ev = find_xi2_property_event(&wire).expect("XI_PropertyEvent present");
+        assert_eq!(ev[20], 0, "what = Deleted");
+        // Independently confirm the reply is somewhere in the buffer.
+        // The reply starts with X_Reply = 1, which the 32-byte event
+        // (starts with GenericEvent = 35) can't impersonate.
+        assert!(wire.contains(&1), "GetProperty reply is on the wire");
+        // The registry must have actually shrunk.
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        assert!(
+            !dev.properties.contains_key(&AtomId(100)),
+            "delete=1 consumed the property"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_get_property_no_delete_does_not_emit() {
+        // The non-deleting read path must not emit anything.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(0); // delete = false
+        body.push(0); // pad
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(59),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert!(
+            find_xi2_property_event(&wire).is_none(),
+            "no XI_PropertyEvent on a non-deleting read"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_change_property_not_selected_client_gets_nothing() {
+        // A client that did NOT select `XI_PropertyEventMask` for
+        // device 4 must not receive the event, even if it has other
+        // XI2 selections on the same window.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Selecting `XI_DeviceChanged` only — the
+        // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
+        // must be skipped.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 4), crate::xinput::XI2_DEVICE_CHANGED_MASK);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "client without the property-event bit gets nothing"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_change_property_other_device_does_not_match() {
+        // Selecting `XI_PropertyEvent` for device 3 (master keyboard)
+        // must NOT route a device-4 property change to that client.
+        // The wildcards `XIAllDevices(0)` / `XIAllMasterDevices(1)` are
+        // followed by `xi2mask_isset` (xserver dix/inpututils.c:1153),
+        // but device 3 is neither, so this client stays unselected.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Client subscribes to property events on device 3, not 4.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 3), XI2_PROPERTY_EVENT_MASK);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "device-3 selection must not see device-4 events"
+        );
+    }
+
+    #[test]
+    fn t5_xi2_change_property_xi_all_devices_wildcard_matches() {
+        // Regression for the bug `xinput watch-props 4` exposed on
+        // M1/Asahi: every realworld client (xinput, MATE, etc.) calls
+        // XISelectEvents with `deviceid = XIAllDevices = 0`, not the
+        // specific slave id. xserver's `xi2mask_isset`
+        // (dix/inpututils.c:1153) ORs the wildcard mask with the
+        // specific mask; without that OR the client silently received
+        // nothing.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Select on the wildcard, NOT on device 4 directly.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), XI2_PROPERTY_EVENT_MASK);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        let ev = find_xi2_property_event(&wire)
+            .expect("XIAllDevices selection must receive the property event");
+        assert_eq!(ev[20], 2, "what byte = Modified");
+    }
+
+    #[test]
+    fn t5_xi1_change_device_property_also_emits_xi2_property_event() {
+        // The XI1 write path (minor 37) must trigger the same XI2
+        // fan-out — xserver's `send_property_event` fires from both
+        // protocol paths so an XI2-listening client sees its tap
+        // toggle even when an XI1 caller (e.g. an older xset variant)
+        // wrote the property.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        // xChangeDevicePropertyReq body layout (XIproto.h:1467-1479):
+        // property(4), type(4), deviceid(1), format(1), mode(1), pad(1),
+        // num_items(4), value(num_items * format/8 padded to 4).
+        let mut body = Vec::new();
+        body.extend_from_slice(&tap_atom.to_le_bytes());
+        body.extend_from_slice(&integer_atom.to_le_bytes());
+        body.push(4); // deviceid
+        body.push(8); // format
+        body.push(crate::xinput::XI_PROP_MODE_REPLACE);
+        body.push(0); // pad
+        body.extend_from_slice(&1u32.to_le_bytes()); // num_items = 1
+        body.extend_from_slice(&[0u8, 0, 0, 0]); // value=[0] + 3 pad
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        let ev =
+            find_xi2_property_event(&wire).expect("XI1 write must also fan-out XI_PropertyEvent");
+        assert_eq!(ev[20], 2, "what = Modified");
+    }
+
+    #[test]
+    fn t5_property_event_selected_on_any_window_still_delivers() {
+        // SendEventToAllWindows: a client that selected
+        // `XI_PropertyEvent` for the device on ANY window (here a
+        // synthetic non-root xid) must still receive the event. The
+        // event has no event-window field, so per-window distinctions
+        // only affect delivery.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Subscribe via a non-root window — anything keyed by the
+        // device id wins.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ResourceId(0xdead_beef), 4), XI2_PROPERTY_EVENT_MASK);
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert!(
+            find_xi2_property_event(&wire).is_some(),
+            "non-root selection must still deliver"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // XI 1.x `SelectExtensionEvent` + `DevicePropertyNotify` fan-out.
+    // -----------------------------------------------------------------
+
+    /// XI1 device-property event code is 16; with `XI_FIRST_EVENT = 66`
+    /// the wire type byte is 82. The XEventClass packs
+    /// `(deviceid << 8) | event_code`, so for the slave pointer
+    /// (deviceid 4) the class is `(4 << 8) | 82 = 0x0452`.
+    const XI1_DEV_PROP_CLASS_DEV4: u32 = (4 << 8) | 82;
+
+    /// Build an `xSelectExtensionEventReq` body (the bytes after the
+    /// 4-byte X request header) for a single XEventClass list.
+    fn xi1_select_extension_event_body(window: u32, classes: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8 + classes.len() * 4);
+        body.extend_from_slice(&window.to_le_bytes()); // window
+        #[allow(clippy::cast_possible_truncation)]
+        let count = classes.len() as u16;
+        body.extend_from_slice(&count.to_le_bytes()); // count
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        for c in classes {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        body
+    }
+
+    /// Scan a wire buffer for the first XI1 `DevicePropertyNotify`
+    /// (type byte == 82) and return the 32-byte slice. T5's
+    /// `find_xi2_property_event` keyed off GenericEvent + evtype 12;
+    /// XI1 is a sequential event code so a single-byte type match is
+    /// enough — and it explicitly cannot collide with the XI2
+    /// `GenericEvent` (35) or other extension events in our range.
+    fn find_xi1_device_property_notify(wire: &[u8]) -> Option<&[u8]> {
+        let end = wire.len().checked_sub(32)?;
+        (0..=end).find_map(|i| (wire[i] == 82).then(|| &wire[i..i + 32]))
+    }
+
+    #[test]
+    fn t6_xi1_select_extension_event_populates_client_class_set() {
+        // Selecting a DevicePropertyNotify class for device 4 stores
+        // the exact wire-form class in `xi1_event_classes`. Classes the
+        // server does not yet implement (e.g. a hypothetical XI1
+        // motion-event class 0x04XX with the wrong low byte) are
+        // silently dropped — Xorg's behaviour.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Body: window=ROOT, count=2, [DevicePropertyNotify(dev4),
+        // motion-event(dev4)]. The motion-event class has low byte
+        // != 82 so must be dropped.
+        let unknown_class: u32 = (4 << 8) | 70; // bogus event code 4 → DeviceMotion
+        let body = xi1_select_extension_event_body(
+            ROOT_WINDOW.0,
+            &[XI1_DEV_PROP_CLASS_DEV4, unknown_class],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        let client = state.clients.get(&1).expect("client installed");
+        assert!(
+            client.xi1_event_classes.contains(&XI1_DEV_PROP_CLASS_DEV4),
+            "DevicePropertyNotify class stored verbatim"
+        );
+        assert!(
+            !client.xi1_event_classes.contains(&unknown_class),
+            "unsupported XI1 event classes dropped"
+        );
+        assert_eq!(
+            client.xi1_event_classes.len(),
+            1,
+            "exactly one class accepted"
+        );
+    }
+
+    #[test]
+    fn t6_xi1_select_extension_event_replaces_classes_for_device() {
+        // Xorg's SelectExtensionEvent REPLACES the prior selection for
+        // every deviceid mentioned in the request. So a follow-up call
+        // with an empty class list for the same device drops the entry.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Step 1: select DevicePropertyNotify for device 4.
+        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            state
+                .clients
+                .get(&1)
+                .unwrap()
+                .xi1_event_classes
+                .contains(&XI1_DEV_PROP_CLASS_DEV4)
+        );
+        // Step 2: re-select with a class list that names device 4 but
+        // requests a class we don't handle. The replacement must clear
+        // the prior device-4 entry.
+        let unknown_class_dev4: u32 = (4 << 8) | 70;
+        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[unknown_class_dev4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        let client = state.clients.get(&1).unwrap();
+        assert!(
+            client.xi1_event_classes.is_empty(),
+            "replacement with no supported classes clears device-4 selection"
+        );
+    }
+
+    #[test]
+    fn t6_xi1_select_extension_event_other_device_preserved() {
+        // Replacement is scoped to the deviceids mentioned in the new
+        // request. Pre-select dev4 + dev5; re-select only dev4. The
+        // dev5 entry must survive (Xorg's per-device replace).
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let class_dev5: u32 = (5 << 8) | 82;
+        // Seed via the dispatch — two classes, two devices.
+        let body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4, class_dev5]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        // Re-select only dev4 (with the supported class). The dev5
+        // entry must remain — its deviceid wasn't named in this call.
+        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        let client = state.clients.get(&1).unwrap();
+        assert!(
+            client.xi1_event_classes.contains(&XI1_DEV_PROP_CLASS_DEV4),
+            "device-4 selection re-installed"
+        );
+        assert!(
+            client.xi1_event_classes.contains(&class_dev5),
+            "device-5 selection untouched"
+        );
+    }
+
+    #[test]
+    fn t6_xi1_change_property_delivers_device_property_notify() {
+        // End-to-end: a client SelectExtensionEvent(DevicePropertyNotify
+        // for dev4), then someone (here, the same client via XI2
+        // XIChangeProperty minor 57) writes a property. The 32-byte
+        // XI1 event must land on the selecting client with the right
+        // type byte, atom, and deviceid.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Subscribe via SelectExtensionEvent only (no XI2 mask), so the
+        // ONLY event on the wire is the XI1 one.
+        let select_body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &select_body,
+        )
+        .unwrap();
+        // Drain anything the select produced (must be empty — minor 6
+        // is event-only, no reply).
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "SelectExtensionEvent emits no reply"
+        );
+
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "exactly one 32-byte XI1 event");
+        let ev = find_xi1_device_property_notify(&wire).expect("XI1 event present");
+        assert_eq!(ev[0], 82, "type = XI_FIRST_EVENT(66) + 16");
+        assert_eq!(ev[1], 0, "state = PropertyNewValue");
+        assert_eq!(
+            u32::from_le_bytes([ev[8], ev[9], ev[10], ev[11]]),
+            tap_atom,
+            "atom"
+        );
+        assert_eq!(ev[31], 4, "deviceid (last byte)");
+    }
+
+    #[test]
+    fn t6_xi1_delete_property_delivers_event_with_state_one() {
+        // The delete path (XI2 minor 58) must also fan out an XI1
+        // event, with `state = 1` (PropertyDelete).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_one_prop(&mut state, 100, 8, vec![1]);
+        let select_body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &select_body,
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(58),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "exactly one 32-byte XI1 event");
+        let ev = find_xi1_device_property_notify(&wire).expect("XI1 event present");
+        assert_eq!(ev[1], 1, "state = PropertyDelete");
+        assert_eq!(
+            u32::from_le_bytes([ev[8], ev[9], ev[10], ev[11]]),
+            100,
+            "atom"
+        );
+        assert_eq!(ev[31], 4, "deviceid");
+    }
+
+    #[test]
+    fn t6_xi1_unselected_client_gets_nothing() {
+        // A client that did NOT call SelectExtensionEvent must not
+        // receive an XI1 DevicePropertyNotify — even if the property
+        // change happens on the device it cares about.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // No SelectExtensionEvent, no XI2 mask.
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "unselected client receives nothing"
+        );
+    }
+
+    #[test]
+    fn t6_xi1_wrong_device_class_does_not_match() {
+        // Selecting DevicePropertyNotify for device 5 must NOT route a
+        // device-4 property change to that client (parallel to the
+        // XI2 same-property-different-device test in T5).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let class_dev5: u32 = (5 << 8) | 82;
+        let select_body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[class_dev5]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &select_body,
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "device-5 selection must not see device-4 events"
+        );
+    }
+
+    #[test]
+    fn t6_xi1_select_extension_event_short_body_bad_length() {
+        // A body shorter than the 8-byte fixed header must yield
+        // BadLength. The error reply uses minor=6 and major=137.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Only 4 bytes — missing the count/pad portion.
+        let body = vec![0u8; 4];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "single 32-byte X error reply");
+        assert_eq!(wire[0], 0, "X error opcode");
+        assert_eq!(wire[1], 16, "BadLength code");
+    }
+
+    #[test]
+    fn t6_xi1_select_extension_event_truncated_class_list_bad_length() {
+        // count = 2 but only one class on the wire → BadLength.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = Vec::new();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes()); // count = 2
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&XI1_DEV_PROP_CLASS_DEV4.to_le_bytes()); // only one class
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire[0], 0, "X error opcode");
+        assert_eq!(wire[1], 16, "BadLength");
+    }
+
+    #[test]
+    fn t6_xi1_and_xi2_dual_selection_delivers_one_event_per_path() {
+        // A client that selected `XI_PropertyEvent` via XI2's
+        // `xi2_masks` AND a `DevicePropertyNotify` class via XI1's
+        // `SelectExtensionEvent` receives TWO independent events from
+        // a single property write — one per protocol path. The fan-outs
+        // do not deduplicate across paths because a client may be
+        // running adapter code that bridges both (e.g. a GTK app that
+        // uses XI2 directly plus a legacy libXi consumer in the same
+        // process). Pins the no-cross-path-dedup invariant.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // XI2 selection.
+        select_xi2_property_event_on_root(&mut state, 1, 4);
+        // XI1 selection.
+        let select_body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(6),
+            &select_body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "SelectExtensionEvent emits no reply"
+        );
+
+        let tap_atom = state
+            .atoms
+            .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            tap_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 64, "two 32-byte events (XI2 + XI1)");
+        // Both events must be present — anchor by type byte.
+        let xi2 = find_xi2_property_event(&wire).expect("XI2 GenericEvent present");
+        assert_eq!(xi2[0], 35, "GenericEvent");
+        assert_eq!(u16::from_le_bytes([xi2[8], xi2[9]]), 12, "evtype = 12");
+        assert_eq!(u16::from_le_bytes([xi2[10], xi2[11]]), 4, "deviceid");
+        let xi1 = find_xi1_device_property_notify(&wire).expect("XI1 event present");
+        assert_eq!(xi1[0], 82, "XI_FIRST_EVENT + 16");
+        assert_eq!(xi1[31], 4, "XI1 deviceid (last byte)");
+    }
+
+    #[test]
+    fn t3_xi2_change_property_readonly_descriptor_yields_bad_access() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // `…Enabled Default` is the ReadOnly companion (Access::ReadOnly).
+        let default_atom = state
+            .atoms
+            .intern("libinput Tapping Enabled Default", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        // Capture the seeded value so we can confirm the write was
+        // rejected and the registry was not mutated.
+        let before = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .properties
+            .get(&AtomId(default_atom))
+            .cloned()
+            .expect("default seeded");
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            default_atom,
+            integer_atom,
+            &[0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "X_Error");
+        assert_eq!(wire[1], 10, "BadAccess");
+
+        let after = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .properties
+            .get(&AtomId(default_atom))
+            .cloned()
+            .expect("default still present");
+        assert_eq!(before.data, after.data, "read-only value unchanged");
+    }
+
+    #[test]
+    fn t3_xi2_get_property_uninterned_atom_yields_bad_atom() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Atom 0xdeadbeef has never been interned → BadAtom.
+        let bogus_atom = 0xdead_beefu32;
+        assert!(!state.atoms.exists(AtomId(bogus_atom)), "precondition");
+        // XIGetProperty body: deviceid(2)=4, delete(1)=0, pad(1),
+        // property(4), type(4)=0, offset(4)=0, len(4)=100.
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.push(0); // delete
+        body.push(0); // pad
+        body.extend_from_slice(&bogus_atom.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&100u32.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            xi2_header(59),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "X_Error");
+        assert_eq!(wire[1], 5, "BadAtom");
+        // The error's bad-value field should echo the offending atom.
+        assert_eq!(
+            u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+            bogus_atom,
+            "BadAtom echoes property"
+        );
+    }
+
+    #[test]
+    fn t3_xi2_change_property_invalid_value_yields_bad_value_without_mutation() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        // Scroll Method Enabled is `OneHotOrNone { n: 3 }` — two bits set is illegal.
+        let scroll_atom = state
+            .atoms
+            .intern("libinput Scroll Method Enabled", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+        let before = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .properties
+            .get(&AtomId(scroll_atom))
+            .cloned()
+            .expect("scroll method seeded");
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            scroll_atom,
+            integer_atom,
+            &[1, 1, 0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(4),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "X_Error");
+        assert_eq!(wire[1], 2, "BadValue");
+
+        let after = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == 4)
+            .unwrap()
+            .properties
+            .get(&AtomId(scroll_atom))
+            .cloned()
+            .expect("scroll method still present");
+        assert_eq!(
+            before.data, after.data,
+            "registry untouched when validation rejects the value"
+        );
     }
 
     #[test]
@@ -23664,7 +27234,7 @@ mod tests {
     /// Audit #7 (code-review follow-up): Xorg's
     /// `ProcXFixesCreateRegionFromWindow` (`xfixes/region.c:158-163`)
     /// returns BadWindow when `dixLookupResourceByType` on the
-    /// window xid fails, with `client->errorValue = stuff->window`.
+    /// window xid fails, with `client->error_value = stuff->window`.
     /// Pre-fix yserver passed any xid (including 0) through to
     /// `shape_rects_for` and silently inserted a default/empty
     /// region.
@@ -23726,7 +27296,7 @@ mod tests {
     /// `ProcXFixesCreateRegionFromWindow` (`xfixes/region.c:164-181`)
     /// accepts only `WindowRegionBounding` (0) and `WindowRegionClip`
     /// (1); any other `kind` returns BadValue with
-    /// `client->errorValue = stuff->kind`. The SHAPE-shaped value 2
+    /// `client->error_value = stuff->kind`. The SHAPE-shaped value 2
     /// (Input) is rejected per X11 XFIXES spec.
     #[test]
     fn create_region_from_window_with_invalid_kind_returns_bad_value() {

@@ -3,7 +3,9 @@
 //! Deliberately minimal: keycodes, pointer deltas, button + state.
 //! No keysym translation — that's xkbcommon's job and lives in C.
 
-#[derive(Debug, Clone, Copy)]
+use yserver_core::core_loop::DeviceInfo;
+
+#[derive(Debug, Clone)]
 pub enum InputEvent {
     KeyPress {
         keycode: u32,
@@ -33,5 +35,14 @@ pub enum InputEvent {
     PointerScroll {
         dx_v120: i32,
         dy_v120: i32,
+    },
+    /// A new input device has been enumerated by libinput.  Carries a
+    /// snapshot of its identity and configuration; forwarded to the core for
+    /// Task 2's XI2 device-property registry.
+    DeviceAdded(DeviceInfo),
+    /// An input device has been removed; matched by the evdev device node
+    /// that was reported at add time.
+    DeviceRemoved {
+        device_node: String,
     },
 }

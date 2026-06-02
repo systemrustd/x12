@@ -38,7 +38,15 @@ const BIG_REQUESTS_FIRST_ERROR: u8 = 0;
 const XKB_MAJOR_OPCODE: u8 = 136;
 
 const XI2_MAJOR_OPCODE: u8 = 137;
-const XI2_FIRST_EVENT: u8 = 66; // matches Xorg: XI1 legacy events 66-82
+/// First event code reserved for the XInput extension. Despite the name,
+/// this is the same base for XI1 *and* XI2 — Xorg assigns one contiguous
+/// `first_event..first_event+16` block to XInput. XI1 event codes 0..16
+/// live at `first_event..first_event+16` (e.g. `DevicePropertyNotify=16`
+/// at byte type `first_event + 16 = 82`); XI2 uses `GenericEvent` (35)
+/// with `evtype` discrimination. Shared by the XI1 selection plumbing
+/// (re-exported as [`crate::server::XI_FIRST_EVENT`]) and the XI2 event
+/// fan-outs.
+pub(crate) const XI2_FIRST_EVENT: u8 = 66;
 const XI2_FIRST_ERROR: u8 = 153;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
@@ -1308,6 +1316,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,

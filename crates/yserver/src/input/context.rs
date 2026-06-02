@@ -9,6 +9,7 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fs::{File, OpenOptions},
     io,
     os::{
@@ -22,7 +23,7 @@ use std::{
 use crate::seat::{DeviceKind, LibseatInner};
 
 use input::{
-    Event, Libinput, LibinputInterface,
+    Device, Event, Libinput, LibinputInterface,
     event::{
         EventTrait,
         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
@@ -30,8 +31,15 @@ use input::{
     },
 };
 use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
+use yserver_core::{
+    core_loop::{
+        DeviceInfo,
+        message::{LibinputConfigSnapshot, device_node_from_sysname},
+    },
+    xinput::libinput_props::{DeviceConfigChange, DeviceConfigError},
+};
 
-use crate::input::event::InputEvent;
+use crate::input::{event::InputEvent, libinput_config};
 
 struct Interface;
 
@@ -64,6 +72,19 @@ impl LibinputInterface for Interface {
 
 pub struct Context {
     libinput: Libinput,
+    /// Live libinput device handles keyed by evdev devnode (e.g.
+    /// `/dev/input/event4`). Populated at `DeviceAdded` for touchpads
+    /// (`is_touchpad == true`); cleared at `DeviceRemoved`. Consumed
+    /// by [`Context::apply_device_config`] so the libseat-mode backend
+    /// can route a decoded `xinput set-prop` write through to the
+    /// matching `config_*_set_*` setter on the live device.
+    ///
+    /// `input::Device` is refcounted at the C level (`libinput_device_ref`)
+    /// and the Rust wrapper exposes that via `Clone` — stashing the handle
+    /// here keeps the device alive even after libinput's own iterator
+    /// drops its borrow, and the entry's eventual `remove(...)` drops
+    /// the last ref.
+    touchpad_devices: HashMap<String, Device>,
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
@@ -102,7 +123,10 @@ impl Context {
                  seat reachable from this process?",
             )
         })?;
-        Ok(Self { libinput })
+        Ok(Self {
+            libinput,
+            touchpad_devices: HashMap::new(),
+        })
     }
 
     pub fn fd(&self) -> RawFd {
@@ -118,10 +142,79 @@ impl Context {
             // No devices ever logged → seat permission / udev issue.
             match &event {
                 Event::Device(input::event::DeviceEvent::Added(d)) => {
-                    log::info!("libinput: device added: {:?}", d.device().name());
+                    let mut dev = d.device();
+                    let name = dev.name().into_owned();
+                    let tap_finger_count = dev.config_tap_finger_count();
+                    let is_tp = is_touchpad(tap_finger_count);
+                    if is_tp {
+                        configure_touchpad(&mut dev, &name);
+                        log::info!(
+                            "libinput: device added: {name:?} (touchpad — tap-to-click + \
+                             disable-while-typing enabled)"
+                        );
+                    } else {
+                        log::info!("libinput: device added: {name:?}");
+                    }
+                    let sysname = dev.sysname().to_owned();
+                    // Prefer the real udev devnode; fall back to the
+                    // derived path (libinput sysname == `eventN`, so
+                    // the node is always `/dev/input/eventN`).
+                    let device_node = {
+                        // SAFETY: libinput holds the udev device alive
+                        // for the duration of this event; we only read
+                        // the devnode string and drop the handle.
+                        let node = unsafe { dev.udev_device() }
+                            .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
+                        node.unwrap_or_else(|| device_node_from_sysname(&sysname))
+                    };
+                    // T4: gather the live config snapshot for touchpads so the
+                    // XI2 property registry exposes which libinput knobs are
+                    // available / current / default on this device. Non-
+                    // touchpads still get a default snapshot — the property
+                    // descriptors gate creation off `is_touchpad`, so the
+                    // contents are unused there.
+                    let config = if is_tp {
+                        libinput_config::gather(&dev)
+                    } else {
+                        LibinputConfigSnapshot::default()
+                    };
+                    // T4: stash the live device handle keyed by devnode so
+                    // `apply_device_config` (the `xinput set-prop` write path)
+                    // can later route to the matching `config_*_set_*` setter.
+                    // `Device: Clone` is libinput's C-level refcount bump
+                    // (`libinput_device_ref`), so the handle survives even
+                    // after this event's borrow drops. Only stored for
+                    // touchpads — the writable property table only targets
+                    // touchpads at T4 scope.
+                    if is_tp {
+                        self.touchpad_devices
+                            .insert(device_node.clone(), dev.clone());
+                    }
+                    let info = DeviceInfo {
+                        name,
+                        device_node,
+                        sysname,
+                        vendor_id: dev.id_vendor(),
+                        product_id: dev.id_product(),
+                        is_touchpad: is_tp,
+                        config,
+                    };
+                    out.push(InputEvent::DeviceAdded(info));
                 }
                 Event::Device(input::event::DeviceEvent::Removed(d)) => {
-                    log::info!("libinput: device removed: {:?}", d.device().name());
+                    let dev = d.device();
+                    let name = dev.name();
+                    log::info!("libinput: device removed: {name:?}");
+                    let sysname = dev.sysname().to_owned();
+                    let device_node = {
+                        let node = unsafe { dev.udev_device() }
+                            .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
+                        node.unwrap_or_else(|| device_node_from_sysname(&sysname))
+                    };
+                    // T4: drop the stashed handle (libinput unref via Drop).
+                    // No-op if the device wasn't a touchpad (never inserted).
+                    self.touchpad_devices.remove(&device_node);
+                    out.push(InputEvent::DeviceRemoved { device_node });
                 }
                 _ => {}
             }
@@ -131,11 +224,66 @@ impl Context {
         }
         Ok(out)
     }
+
+    /// Route a decoded `xinput set-prop` write through to the live
+    /// libinput device. Called from the libseat-mode KMS v2 backend's
+    /// `apply_device_config` override. Returns `Ok(())` when no
+    /// matching device is stashed for `device_node` (a property write
+    /// on a non-touchpad / unplugged device is a no-op from the user's
+    /// perspective; the property registry stays writable and the X11
+    /// reply path doesn't surface a "device gone" error to clients).
+    ///
+    /// Errors map libinput's [`input::DeviceConfigError`] onto the
+    /// X-layer's [`DeviceConfigError`]: `Unsupported` → BadMatch,
+    /// `Invalid` → BadValue (the mapping is performed by the
+    /// `dispatch_change_property` helper that calls us).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceConfigError::Unsupported`] when libinput
+    /// reports the setting isn't available on this device, or
+    /// [`DeviceConfigError::Invalid`] when the value is out of range.
+    pub fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: DeviceConfigChange,
+    ) -> Result<(), DeviceConfigError> {
+        self.touchpad_devices
+            .get_mut(device_node)
+            .map_or(Ok(()), |dev| libinput_config::apply(dev, change))
+    }
 }
 
 impl AsFd for Context {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.libinput.as_fd()
+    }
+}
+
+/// A libinput device is a touchpad iff it reports a tap finger count.
+/// libinput/wlroots classify touchpads this way: pointers that are not
+/// touchpads (mice, trackpoints) report a finger count of 0, while
+/// clickpads/touchpads report >= 1. We use this to decide whether to
+/// apply touchpad-friendly defaults at device-add time.
+fn is_touchpad(tap_finger_count: u32) -> bool {
+    tap_finger_count > 0
+}
+
+/// Apply touchpad-friendly defaults at device-add so the laptop is
+/// usable without a settings daemon. libinput defaults tapping OFF, so
+/// without this "tap to click" does nothing on a fresh yserver session
+/// (the reported yoga symptom). We also enable disable-while-typing to
+/// suppress accidental cursor jumps while typing. Scroll direction is
+/// left at the libinput default to avoid surprising the user by
+/// reversing it. Errors are logged, not fatal — a touchpad that rejects
+/// a config still works, just without that nicety.
+fn configure_touchpad(dev: &mut Device, name: &str) {
+    if let Err(e) = dev.config_tap_set_enabled(true) {
+        log::warn!("libinput: enable tap-to-click on {name:?} failed: {e:?}");
+    }
+    if let Err(e) = dev.config_dwt_set_enabled(true) {
+        // Many touchpads don't support DWT; that's expected, so debug.
+        log::debug!("libinput: disable-while-typing on {name:?} unavailable: {e:?}");
     }
 }
 
@@ -184,13 +332,24 @@ impl Context {
         libinput.udev_assign_seat("seat0").map_err(|()| {
             io::Error::other("libinput: udev_assign_seat(\"seat0\") failed under libseat")
         })?;
-        Ok(Self { libinput })
+        Ok(Self {
+            libinput,
+            touchpad_devices: HashMap::new(),
+        })
     }
 
     /// Suspend libinput: closes all open input device fds and calls
     /// `close_restricted` for each, releasing them through libseat.
     /// The context remains valid and can be resumed with [`Context::resume`].
     /// Task 11 `run_suspend` calls this.
+    ///
+    /// `touchpad_devices` is intentionally left as-is — the stashed
+    /// handles point at devices whose fds are now closed, but
+    /// libinput's own `DeviceRemoved` (or a fresh `DeviceAdded` after
+    /// `resume`) will replace each entry the next time `dispatch()`
+    /// runs. Any `apply_device_config` write that races against an
+    /// open suspend window targets a closed device and returns
+    /// libinput's UNSUPPORTED — caller-visible as BadMatch.
     pub fn suspend(&mut self) {
         self.libinput.suspend();
     }
@@ -320,5 +479,21 @@ fn translate(event: &Event) -> Option<InputEvent> {
         Event::Pointer(PointerEvent::ScrollFinger(ev)) => finger_or_continuous_to_event(ev),
         Event::Pointer(PointerEvent::ScrollContinuous(ev)) => finger_or_continuous_to_event(ev),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_touchpad;
+
+    /// Touchpad classification keys off libinput's tap finger count:
+    /// mice / trackpoints / keyboards report 0; clickpads/touchpads
+    /// report >= 1. (The config application itself is libinput FFI,
+    /// verified on hardware — only the decision is unit-testable.)
+    #[test]
+    fn touchpad_classified_by_tap_finger_count() {
+        assert!(!is_touchpad(0), "0 fingers = not a touchpad");
+        assert!(is_touchpad(1), "1 finger = touchpad");
+        assert!(is_touchpad(3), "3 fingers = touchpad");
     }
 }

@@ -3559,7 +3559,20 @@ impl KmsBackendV2 {
                     // Hotkeys are irrelevant mid-suspend; just update input
                     // state via the normal mapping + fanout so down_keys and
                     // button_mask stay accurate for the held-release snapshot.
-                    if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev {
+                    // Device add/remove during suspend are forwarded so the
+                    // core's device registry stays accurate.
+                    if let crate::input::InputEvent::DeviceAdded(info) = ev {
+                        self.on_host_input(
+                            state,
+                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                        );
+                    } else if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
+                        self.on_host_input(
+                            state,
+                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                        );
+                    } else if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev
+                    {
                         scroll_buf.clear();
                         if let Some(input_state) = self.core_input_state.as_mut() {
                             input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
@@ -6521,6 +6534,34 @@ impl Backend for KmsBackendV2 {
                 let _dropped = key_event_fanout_to_state(state, self, cooked);
                 return;
             }
+            HostInputEvent::DeviceAdded(info) => {
+                log::info!(
+                    "xi-device: added {:?} node={} touchpad={}",
+                    info.name,
+                    info.device_node,
+                    info.is_touchpad,
+                );
+                state.xi_seed_touchpad(&info);
+                // Notify clients selecting XI_DeviceChanged on the slave
+                // pointer (device 4) so a running desktop re-reads the
+                // device's new name + properties. No-op if none selected.
+                // 137 = the XI extension's runtime major opcode (mirrors
+                // nested.rs / process_request.rs XI2_MAJOR_OPCODE).
+                let _dropped =
+                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                        state, 137,
+                    );
+                return;
+            }
+            HostInputEvent::DeviceRemoved { device_node } => {
+                log::info!("xi-device: removed node={device_node}");
+                state.xi_clear_touchpad(&device_node);
+                let _dropped =
+                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                        state, 137,
+                    );
+                return;
+            }
         }
 
         // Drain pointer events queued by the process_pointer_* call.
@@ -6967,6 +7008,30 @@ impl Backend for KmsBackendV2 {
                 self.handle_core_hotkey(hk);
                 continue;
             }
+            // Device add/remove — forward directly, flushing pending
+            // motion first to preserve chronological order.
+            if let crate::input::InputEvent::DeviceAdded(info) = ev {
+                if let Some(m) = pending_motion.take() {
+                    yserver_core::core_loop::handle_host_input(state, self, m);
+                }
+                yserver_core::core_loop::handle_host_input(
+                    state,
+                    self,
+                    yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                );
+                continue;
+            }
+            if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
+                if let Some(m) = pending_motion.take() {
+                    yserver_core::core_loop::handle_host_input(state, self, m);
+                }
+                yserver_core::core_loop::handle_host_input(
+                    state,
+                    self,
+                    yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                );
+                continue;
+            }
             // Scroll fans out to zero or many press+release pairs depending
             // on accumulated v120 — mirror the input thread's path. Flush
             // pending motion first so press/release timestamps stay after
@@ -7009,6 +7074,92 @@ impl Backend for KmsBackendV2 {
         if let Some(m) = pending_motion.take() {
             yserver_core::core_loop::handle_host_input(state, self, m);
         }
+    }
+
+    fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: yserver_core::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), yserver_core::xinput::libinput_props::DeviceConfigError> {
+        // Libseat mode: route through the on-core libinput context's
+        // device map, where `DeviceAdded` stashed the live handle. Direct
+        // mode doesn't reach this backend variant (KmsBackendV1 path); if
+        // `core_libinput` is None we have nowhere to write, so silently
+        // succeed — the trait's default contract.
+        let Some(ctx) = self.core_libinput.as_mut() else {
+            return Ok(());
+        };
+        ctx.apply_device_config(device_node, change)
+    }
+
+    fn probe_input_devices(&mut self, state: &mut ServerState) -> usize {
+        // Libseat mode only: drain libinput's initial device enumeration
+        // and seed the XI2 registry before the core serves clients. No
+        // on-core context (Direct mode moved it to the input thread,
+        // ynest/host-X11 have none) → clean no-op.
+        if self.core_libinput.is_none() {
+            return 0;
+        }
+        // libinput may surface the initial enumeration across several
+        // dispatches as udev settles, so iterate — but BOUNDED and
+        // non-blocking. `dispatch()` returns whatever is queued right now
+        // (it never waits), so when libinput has nothing more the round
+        // comes back empty. Stop after two consecutive empty rounds (the
+        // enumeration has settled) or MAX_ROUNDS (hard ceiling against a
+        // pathological device that re-announces forever). We do NOT block
+        // waiting for devices — if the seat has no input hardware yet the
+        // first round is empty and we return immediately.
+        const MAX_ROUNDS: usize = 8;
+        let mut seeded = 0usize;
+        let mut empty_rounds = 0usize;
+        for _ in 0..MAX_ROUNDS {
+            let Some(ctx) = self.core_libinput.as_mut() else {
+                break;
+            };
+            let events = match ctx.dispatch() {
+                Ok(evs) => evs,
+                Err(e) => {
+                    log::warn!("kms: startup libinput probe dispatch failed: {e}");
+                    break;
+                }
+            };
+            if events.is_empty() {
+                empty_rounds += 1;
+                if empty_rounds >= 2 {
+                    break;
+                }
+                continue;
+            }
+            empty_rounds = 0;
+            // Route device add/remove through the same fanout the live
+            // `on_libinput_ready` path uses so `xi_seed_touchpad` runs;
+            // count adds for the caller's log. Non-device events (motion,
+            // keys, scroll) are intentionally ignored here: this runs
+            // before any client has connected, so there is nowhere to
+            // deliver them, and the live `on_libinput_ready` path takes
+            // over for all real input once the serve loop starts.
+            for ev in events {
+                match ev {
+                    crate::input::InputEvent::DeviceAdded(info) => {
+                        seeded += 1;
+                        yserver_core::core_loop::handle_host_input(
+                            state,
+                            self,
+                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                        );
+                    }
+                    crate::input::InputEvent::DeviceRemoved { device_node } => {
+                        yserver_core::core_loop::handle_host_input(
+                            state,
+                            self,
+                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        seeded
     }
 
     // ── Subwindow lifecycle ─────────────────────────────────────
@@ -17315,6 +17466,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,

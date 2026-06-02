@@ -135,6 +135,11 @@ impl LibinputThreadState {
                 pressed: false,
                 time: time_ms,
             },
+            // DeviceAdded/Removed are forwarded by process_batch before
+            // reaching map(); reaching here is a routing bug, so fail loud.
+            InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. } => {
+                unreachable!("device events are forwarded before map(); must not reach map()")
+            }
         }
     }
 
@@ -252,6 +257,25 @@ pub fn process_batch(
                 continue;
             }
             None => {}
+        }
+        // Device add/remove are forwarded directly — they carry their
+        // own data and bypass the motion/scroll mapping entirely.
+        // Flush any pending motion first to preserve chronological order.
+        if let InputEvent::DeviceAdded(info) = raw {
+            if let Some(m) = pending_motion.take() {
+                sender.send(Message::HostInput(m))?;
+            }
+            sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
+            continue;
+        }
+        if let InputEvent::DeviceRemoved { device_node } = raw {
+            if let Some(m) = pending_motion.take() {
+                sender.send(Message::HostInput(m))?;
+            }
+            sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
+                device_node,
+            }))?;
+            continue;
         }
         // Scroll fans out separately because one InputEvent may map to
         // zero or many press+release pairs depending on accumulated v120.

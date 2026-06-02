@@ -22,6 +22,18 @@ use crate::{
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
 pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
 
+/// First event code reserved for the XInput extension (XI1 + XI2 share
+/// one contiguous block; the constant has an `XI2_` prefix in
+/// [`crate::nested`] for historical reasons). Re-exported here under an
+/// XI-version-neutral name so the XI1 `SelectExtensionEvent` plumbing in
+/// `process_request.rs` can derive `XEventClass` low bytes
+/// (`first_event + event_code`) without naming the misleading `XI2_*`
+/// symbol.
+///
+/// `DevicePropertyNotify` (XI1 event code 16) therefore lives at
+/// `XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET = 82`.
+pub(crate) const XI_FIRST_EVENT: u8 = crate::nested::XI2_FIRST_EVENT;
+
 #[derive(Debug)]
 pub struct IdAllocator {
     next_base: u32,
@@ -100,6 +112,19 @@ impl AtomTable {
     pub fn exists(&self, atom: AtomId) -> bool {
         atom.0 != 0
             && (x11::well_known_atom_name(atom).is_some() || self.names.contains_key(&atom.0))
+    }
+
+    /// Register a synthetic name-atom pair at a caller-chosen id. Used
+    /// only by tests that need a specific numeric atom (e.g. 100/200
+    /// fixtures predating the T3 BadAtom guard); production code goes
+    /// through [`Self::intern`] which assigns ids sequentially.
+    #[cfg(test)]
+    pub(crate) fn register_for_test(&mut self, atom: AtomId, name: &str) {
+        self.by_name.insert(name.to_owned(), atom);
+        self.names.insert(atom.0, name.to_owned());
+        if atom.0 >= self.next_id {
+            self.next_id = atom.0 + 1;
+        }
     }
 }
 
@@ -494,6 +519,19 @@ pub struct ServerState {
     /// `ROOT_COLORMAP` at startup per X11 spec ("the default colormap
     /// for the screen is installed when the server first starts up").
     pub installed_colormaps: Vec<ResourceId>,
+    /// XI2 device and property registry.  One entry per static XI2
+    /// device (ids 2–5, mirroring the XIQueryDevice reply).  The slave-
+    /// pointer entry (id 4) is updated by `xi_seed_touchpad` /
+    /// `xi_clear_touchpad` when libinput reports a touchpad device.
+    /// Read by the XIListProperties / XIGetProperty handlers.
+    pub xi_devices: Vec<crate::xinput::XiDevice>,
+    /// Pre-interned atom for the property-type literal `"FLOAT"`.
+    ///
+    /// `FLOAT` is **not** a predefined X atom, so the libinput
+    /// `Accel Speed` family of properties — which Xorg types
+    /// `FLOAT/32` — needs us to intern the name at startup so the
+    /// type-atom on the wire never resolves to id 0.
+    pub float_atom: AtomId,
 }
 
 /// Server-side key auto-repeat. Carries the original `HostKeyEvent`
@@ -557,8 +595,21 @@ impl ServerState {
             overlay.width = width;
             overlay.height = height;
         }
+        let mut atoms = AtomTable::new();
+        // Intern the XI 1.x device-type atoms at server startup so that
+        // clients calling InternAtom(only_if_exists=true) at session init
+        // (e.g. MATE's settings daemon checking for "TOUCHPAD") find them
+        // before calling XListInputDevices.
+        atoms.intern(crate::xinput::XI_ATOM_MOUSE, false);
+        atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, false);
+        atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, false);
+        // FLOAT is not a predefined X atom; intern it now so the
+        // libinput accel-speed property family can stamp
+        // type=float_atom on its wire replies without a per-request
+        // intern dance.
+        let float_atom = atoms.intern("FLOAT", false);
         Self {
-            atoms: AtomTable::new(),
+            atoms,
             resources,
             clients: HashMap::new(),
             id_allocator: IdAllocator::new(),
@@ -605,6 +656,8 @@ impl ServerState {
             zombie_clients: HashMap::new(),
             scroll_axis_value: [0; 2],
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
+            xi_devices: crate::xinput::initial_xi_devices(),
+            float_atom,
         }
     }
 
@@ -627,6 +680,32 @@ impl ServerState {
             overlay.height = s.randr.screen_height;
         }
         s
+    }
+
+    /// Seed the XI2 device-property registry from a libinput touchpad
+    /// device-add event.
+    ///
+    /// When `info.is_touchpad` is true, the slave-pointer entry (id 4)
+    /// receives the real device name and a set of libinput-style
+    /// properties.  Non-touchpad devices are silently ignored.
+    ///
+    /// Property-name atoms are interned via `self.atoms` so they share
+    /// the same atom namespace as all other server atoms.
+    pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
+        if !info.is_touchpad {
+            return;
+        }
+        crate::xinput::seed_touchpad(&mut self.xi_devices, &mut self.atoms, self.float_atom, info);
+    }
+
+    /// Revert the slave-pointer XI2 device entry to its generic defaults
+    /// and clear all touchpad properties.
+    ///
+    /// Called from `on_host_input(DeviceRemoved)`.  `device_node` is
+    /// used for logging; no node→device mapping is maintained today
+    /// (one touchpad assumed).
+    pub fn xi_clear_touchpad(&mut self, device_node: &str) {
+        crate::xinput::clear_touchpad(&mut self.xi_devices, device_node);
     }
 
     #[must_use]
@@ -1085,6 +1164,14 @@ pub struct ClientState {
     pub big_requests_enabled: bool,
     /// XI2 event masks: (window_id, device_id) -> mask
     pub xi2_masks: HashMap<(ResourceId, u16), u32>,
+    /// XI1 `XEventClass` values the client has selected via
+    /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
+    /// `(deviceid << 8) | event_code` where `event_code` is one of the
+    /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
+    /// Classes are stored verbatim — the XI1 events we deliver
+    /// (currently only `DevicePropertyNotify`) are device-scoped, not
+    /// window-scoped, so the request's `window` argument is ignored.
+    pub xi1_event_classes: HashSet<u32>,
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
     pub outbound: std::collections::VecDeque<u8>,
@@ -2099,6 +2186,16 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn float_atom_is_pre_interned_at_server_init() {
+        let state = ServerState::new();
+        assert_ne!(state.float_atom.0, 0, "FLOAT must be interned at startup");
+        // Re-interning must hit the cache and return the same id.
+        let mut state = state;
+        let again = state.atoms.intern("FLOAT", true);
+        assert_eq!(again, state.float_atom);
+    }
+
+    #[test]
     fn first_client_base_is_above_root_resources() {
         let mut a = IdAllocator::new();
         let (base, mask) = a.allocate().expect("first allocate");
@@ -2194,6 +2291,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2212,6 +2310,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2238,6 +2337,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2261,6 +2361,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 4)]),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2287,6 +2388,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 2)]),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2315,6 +2417,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2341,6 +2444,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2359,6 +2463,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2400,6 +2505,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2438,6 +2544,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2456,6 +2563,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2501,6 +2609,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2581,6 +2690,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2599,6 +2709,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2724,6 +2835,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2742,6 +2854,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2865,6 +2978,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2883,6 +2997,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2965,6 +3080,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2983,6 +3099,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3001,6 +3118,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3096,6 +3214,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3114,6 +3233,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3207,6 +3327,7 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3320,6 +3441,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,

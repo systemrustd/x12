@@ -479,6 +479,25 @@ pub(crate) struct FlushOutcome {
 /// token instead, distinguishing them from the wakeup_eventfd.
 pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 
+/// True iff a cursor-plane ioctl error means the driver does not
+/// implement the (legacy) cursor ioctls at all — a permanent,
+/// per-driver condition that warrants latching the HW cursor strategy
+/// off and falling back to the SW composite path.
+///
+/// Apple's DCP display driver (Asahi) returns `ENXIO` from
+/// `DRM_IOCTL_MODE_CURSOR2`; other atomic-only drivers may return
+/// `ENODEV` / `EOPNOTSUPP`. Recoverable / ambiguous errors (`EBUSY`,
+/// `EINVAL`, non-OS errors) must NOT latch — `EBUSY` is transient and
+/// latching it would needlessly kill the HW cursor on drivers that do
+/// support the ioctl (e.g. amdgpu). This mirrors Xorg's modesetting
+/// driver, which clears `use_hw_cursor` when the cursor ioctl fails.
+fn cursor_err_disables_hw(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENXIO | libc::ENODEV | libc::EOPNOTSUPP)
+    )
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackendV2` carried.
 pub(crate) struct PlatformBackend {
@@ -577,6 +596,15 @@ pub(crate) struct PlatformBackend {
     /// how much it moved". Cleared on full commit success or on
     /// `cursor_plane_hide_all` (VT-leave).
     cursor_pending_move: Option<(i32, i32)>,
+    /// Auto-fallback latch: set when a cursor-plane bind ioctl fails
+    /// with an errno that means the driver doesn't implement the
+    /// (legacy) cursor ioctls at all (Apple DCP / Asahi returns
+    /// `ENXIO`). Once set, `cursor_plane_available` reports `false`
+    /// so `tick_one_output`'s `hw_can_run` gate closes and the scene
+    /// composites the SW cursor instead. One-way / sticky: a driver
+    /// that rejects the cursor ioctl on the first bind will reject it
+    /// forever, so there's no point re-probing every frame.
+    hw_cursor_disabled: bool,
 }
 
 impl PlatformBackend {
@@ -777,6 +805,7 @@ impl PlatformBackend {
             shutting_down: false,
             cursor_plane,
             cursor_pending_move: None,
+            hw_cursor_disabled: false,
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
@@ -855,6 +884,7 @@ impl PlatformBackend {
             shutting_down: false,
             cursor_plane: None,
             cursor_pending_move: None,
+            hw_cursor_disabled: false,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
@@ -895,11 +925,37 @@ impl PlatformBackend {
     //   serve Phase D' output-local / global recovery respectively.
 
     /// True iff the cursor plane was successfully initialised at
-    /// boot. The scene strategy decision (`CursorAssignment`) gates
-    /// on this without holding a `PlatformBackend` borrow.
+    /// boot AND hasn't been disabled by an auto-fallback latch. The
+    /// scene strategy decision (`CursorAssignment`) gates on this
+    /// without holding a `PlatformBackend` borrow.
     #[must_use]
     pub(crate) fn cursor_plane_available(&self) -> bool {
-        self.cursor_plane.is_some()
+        self.cursor_plane.is_some() && !self.hw_cursor_disabled
+    }
+
+    /// True iff the HW cursor strategy has been latched off because a
+    /// bind ioctl failed with a "driver doesn't support cursor ioctls"
+    /// errno (see [`cursor_err_disables_hw`]). Diagnostic / test hook.
+    #[must_use]
+    pub(crate) fn hw_cursor_disabled(&self) -> bool {
+        self.hw_cursor_disabled
+    }
+
+    /// Record a cursor-plane bind failure. If `e` indicates the driver
+    /// doesn't implement the cursor ioctls (Apple DCP / Asahi: `ENXIO`),
+    /// latch the HW cursor strategy off so the scene falls back to the
+    /// SW composite path. Transient errors are logged but don't latch.
+    pub(crate) fn note_cursor_plane_failure(&mut self, e: &io::Error) {
+        if self.hw_cursor_disabled {
+            return;
+        }
+        if cursor_err_disables_hw(e) {
+            log::warn!(
+                "v2 cursor: HW cursor plane unsupported on this driver ({e}); \
+                 disabling HW cursor, falling back to SW composite path"
+            );
+            self.hw_cursor_disabled = true;
+        }
     }
 
     /// Memcpy `bgra_bytes` into the shared dumb buffer iff
@@ -953,12 +1009,21 @@ impl PlatformBackend {
         let crtc = layout.output.crtc;
         let layout_x = layout.x;
         let layout_y = layout.y;
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
         let cx = x - layout_x - i32::from(hot_x);
         let cy = y - layout_y - i32::from(hot_y);
-        plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
+        let result = {
+            let Some(plane) = self.cursor_plane.as_mut() else {
+                return Err(io::Error::other("cursor plane unavailable"));
+            };
+            plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
+        };
+        // Auto-fallback: a driver that rejects the legacy cursor bind
+        // (Asahi/Apple DCP: ENXIO) latches the HW cursor off so the
+        // scene composites the SW cursor from the next tick onward.
+        if let Err(e) = &result {
+            self.note_cursor_plane_failure(e);
+        }
+        result
     }
 
     /// Steady-state sprite-swap path. Re-issues `set_cursor2(Some,
@@ -2324,6 +2389,55 @@ impl PlatformBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HW-cursor auto-fallback policy: an ioctl error that means the
+    /// driver doesn't implement the (legacy) cursor ioctls must latch
+    /// the strategy off so the scene falls back to the SW cursor.
+    /// Apple's DCP driver (Asahi) returns `ENXIO`; some drivers return
+    /// `ENODEV` / `EOPNOTSUPP`. Recoverable errors (`EBUSY`) must NOT
+    /// latch — those are transient and latching would needlessly kill
+    /// the HW cursor on drivers that DO support it (e.g. amdgpu).
+    #[test]
+    fn cursor_err_disables_hw_only_for_unsupported_errnos() {
+        use std::io::Error;
+        // Asahi / Apple DCP: legacy cursor ioctl unimplemented.
+        assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::ENXIO
+        )));
+        assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::ENODEV
+        )));
+        assert!(cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        // Transient / recoverable: must keep the HW path alive.
+        assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::EBUSY
+        )));
+        // Generic / ambiguous: don't latch on these either.
+        assert!(!cursor_err_disables_hw(&Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+        assert!(!cursor_err_disables_hw(&Error::other("not an os error")));
+    }
+
+    /// Once a show/bind fails with an unsupported errno, the plane is
+    /// no longer reported available, so `tick_one_output`'s `hw_can_run`
+    /// gate closes and `build_scene` collapses every assignment to SW.
+    /// The latch is sticky across subsequent queries.
+    #[test]
+    fn unsupported_cursor_failure_latches_plane_unavailable() {
+        let mut p = PlatformBackend::for_tests();
+        // Fixture has no real plane, but the latch is the thing under
+        // test: it must flip independently and stay flipped.
+        assert!(!p.hw_cursor_disabled());
+        p.note_cursor_plane_failure(&std::io::Error::from_raw_os_error(libc::ENXIO));
+        assert!(p.hw_cursor_disabled());
+        assert!(!p.cursor_plane_available());
+        // Sticky: a later transient error doesn't un-latch it.
+        p.note_cursor_plane_failure(&std::io::Error::from_raw_os_error(libc::EBUSY));
+        assert!(p.hw_cursor_disabled());
+    }
 
     /// Test fixture works at all: open `for_tests`, query
     /// dimensions, query poll_fds, no Vk required.

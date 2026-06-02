@@ -368,6 +368,29 @@ pub fn run_core(
             .register(&mut SourceFd(&fd), token, Interest::READABLE)?;
     }
 
+    // Probe input devices at startup, Xorg-style: drain libinput's
+    // initial device enumeration and seed `state.xi_devices` BEFORE the
+    // serve loop begins, so the first client to connect sees the real
+    // device model (e.g. device 4 = touchpad) immediately. Without this
+    // the registry carries only the static {2,3,4,5} model until
+    // libinput's first `DeviceAdded` burst is dispatched from the loop,
+    // which on real hardware can land seconds after the desktop's
+    // clients have already enumerated devices and cached a plain
+    // pointer. No-op for backends without an on-core libinput context
+    // (Direct mode, host-X11/nested) — see `Backend::probe_input_devices`.
+    let seeded = backend.probe_input_devices(state);
+    log::info!("xi: startup input probe — {seeded} devices seeded");
+    // TODO(direct-mode startup probe): in Direct mode the libinput
+    // Context lives on the dedicated input thread, so the hook above is
+    // a no-op here. The input thread already dispatches the initial
+    // enumeration and sends the `DeviceAdded` burst on the channel as
+    // its very first action (input_thread::run, before its epoll loop),
+    // which shrinks the race versus the old libseat gap. Fully closing
+    // it would mean draining already-queued `Message::HostInput` device
+    // events from `rx` here before the serve loop — left out for now to
+    // avoid reordering/duplicating the loop's own message handling for a
+    // path that isn't the primary (M2/Asahi) target.
+
     let mut events = Events::with_capacity(64);
     let mut telemetry = LoopTelemetry::new();
     if telemetry.enabled {
@@ -1240,6 +1263,7 @@ fn handle_client_setup_complete(
             save_set: std::collections::HashSet::new(),
             big_requests_enabled: false,
             xi2_masks: std::collections::HashMap::new(),
+            xi1_event_classes: std::collections::HashSet::new(),
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
@@ -1358,6 +1382,7 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -1500,6 +1525,135 @@ mod tests {
         // Release B → clears.
         handle_host_input(&mut state, &mut backend, key(39, false));
         assert!(state.repeat_state.is_none());
+    }
+
+    /// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration
+    /// of a Synaptics pad (matches xinput.rs's `touchpad_info`).
+    #[cfg(test)]
+    fn probe_touchpad_info() -> crate::core_loop::DeviceInfo {
+        use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
+        crate::core_loop::DeviceInfo {
+            name: "SynPS/2 Synaptics TouchPad".into(),
+            device_node: "/dev/input/event4".into(),
+            sysname: "event4".into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: LibinputConfigSnapshot {
+                tap: BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                dwt: BoolSetting {
+                    available: true,
+                    current: true,
+                    default: true,
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn slave_pointer_name(state: &ServerState) -> String {
+        state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
+            .expect("slave pointer (id 4) always present")
+            .name
+            .clone()
+    }
+
+    /// A backend with no on-core libinput (the trait default, and what
+    /// Direct-mode / host-X11 / ynest present) is a clean no-op probe:
+    /// returns 0 and leaves the static device model untouched.
+    #[test]
+    fn probe_input_devices_default_is_noop() {
+        use crate::backend::recording::RecordingBackend;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new(); // no probe_rounds configured
+        let before = slave_pointer_name(&state);
+
+        let seeded = backend.probe_input_devices(&mut state);
+
+        assert_eq!(seeded, 0, "no-op probe seeds nothing");
+        assert_eq!(
+            slave_pointer_name(&state),
+            before,
+            "device 4 unchanged when nothing to probe",
+        );
+    }
+
+    /// A backend whose startup probe enumerates a touchpad seeds the
+    /// XI2 registry: device 4 becomes the real touchpad BEFORE the
+    /// serve loop — the whole point of the Xorg-style startup probe.
+    #[test]
+    fn probe_input_devices_seeds_touchpad_before_loop() {
+        use crate::backend::recording::RecordingBackend;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // One non-empty round (the touchpad), then libinput goes quiet.
+        backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
+
+        assert_ne!(
+            slave_pointer_name(&state),
+            "SynPS/2 Synaptics TouchPad",
+            "precondition: device 4 starts as the generic slave pointer",
+        );
+
+        let seeded = backend.probe_input_devices(&mut state);
+
+        assert_eq!(seeded, 1, "exactly one device seeded");
+        assert_eq!(
+            slave_pointer_name(&state),
+            "SynPS/2 Synaptics TouchPad",
+            "device 4 is the touchpad after the startup probe",
+        );
+    }
+
+    /// The bounded drain TERMINATES: with libinput perpetually empty it
+    /// stops after two consecutive empty rounds (not the MAX_ROUNDS
+    /// ceiling), and even an adversarial always-non-empty source is
+    /// capped at the ceiling rather than spinning forever.
+    #[test]
+    fn probe_input_devices_bounded_drain_terminates() {
+        use crate::backend::recording::RecordingBackend;
+
+        // Empty source → stops after the 2 empty rounds, well under the
+        // 8-round ceiling.
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let seeded = backend.probe_input_devices(&mut state);
+        assert_eq!(seeded, 0);
+        assert_eq!(
+            backend.probe_rounds_run.get(),
+            2,
+            "two consecutive empty rounds end the drain",
+        );
+
+        // Adversarial source that never goes empty → capped at the
+        // MAX_ROUNDS ceiling, never unbounded.
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        for _ in 0..100 {
+            backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
+        }
+        let seeded = backend.probe_input_devices(&mut state);
+        assert_eq!(
+            backend.probe_rounds_run.get(),
+            8,
+            "drain is capped at the MAX_ROUNDS ceiling",
+        );
+        assert_eq!(seeded, 8, "one device seeded per capped round");
     }
 
     #[test]

@@ -154,6 +154,7 @@ mod tests {
             save_set: HashSet::new(),
             big_requests_enabled: false,
             xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
             focused_window: ResourceId(0),
