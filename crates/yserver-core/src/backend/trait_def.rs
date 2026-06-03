@@ -427,6 +427,20 @@ pub trait Backend: Send {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
+    /// CONFIRMATION hook (wezterm/Firefox transparent-content
+    /// investigation 2026-06-03): before a `PresentPixmap` copy reads
+    /// `src_pixmap_host_xid`, wait for the producing client's
+    /// outstanding GPU writes to that buffer to complete. Only
+    /// meaningful for DRI3-imported dma-buf sources where the present
+    /// carried `wait_fence=0` and relied on implicit dma-buf sync that
+    /// some GPU stacks (Turnip/Adreno, Apple) don't honour for
+    /// yserver's read queue — yielding a partly-rendered (transparent)
+    /// copy. Default no-op; the v2 backend bounds the wait with a
+    /// timeout (never a hang) and falls back to a no-op for
+    /// server-owned sources. The production fix replaces this CPU wait
+    /// with a GPU acquire-semaphore on the frame-builder submit.
+    fn wait_present_source_ready(&mut self, _src_pixmap_host_xid: u32) {}
+
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived
     /// from `BackendFdKind`.

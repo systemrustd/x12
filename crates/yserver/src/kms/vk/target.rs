@@ -568,6 +568,20 @@ impl DrawableImage {
         }
     }
 
+    /// Borrow the client-supplied dma-buf fd for a DRI3-imported image,
+    /// or `None` for server-owned storage. Used to synchronize a read
+    /// (e.g. a PresentPixmap copy) against the producing client's
+    /// outstanding GPU writes via the buffer's implicit fence —
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`. Server-owned images are
+    /// ordered by yserver's own queue barriers and need no such wait.
+    pub fn imported_dma_buf_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        match &self.backing {
+            ImageBacking::Imported { dma_buf_fd, .. } => Some(dma_buf_fd.as_fd()),
+            ImageBacking::ServerOwned { .. } => None,
+        }
+    }
+
     /// Image view to bind when this BGRA mirror is sampled as a
     /// *source* for a picture format with no alpha mask (depth-24
     /// r8g8b8 / x8r8g8b8 pictures). The X RENDER spec says missing

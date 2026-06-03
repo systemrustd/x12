@@ -220,6 +220,93 @@ pub fn import_dmabuf(
     )
 }
 
+/// Outcome of [`wait_dmabuf_read_ready`], for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmabufReadWait {
+    /// No fence attached (buffer already idle) — nothing to wait on.
+    Idle,
+    /// Producer writes completed before the deadline.
+    Ready,
+    /// Deadline elapsed with the fence still pending — caller proceeds
+    /// anyway (a possibly-incomplete frame, never a hang).
+    TimedOut,
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` unsupported / errored — caller
+    /// falls back to the prior (no-wait) behaviour.
+    Unsupported,
+}
+
+// `struct dma_buf_export_sync_file { __u32 flags; __s32 fd; }`
+#[repr(C)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+// `_IOWR(DMA_BUF_BASE='b', 2, struct dma_buf_export_sync_file)` →
+// dir=READ|WRITE(3) size=8 type='b'(0x62) nr=2.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+
+/// CPU-wait for a DRI3-imported dma-buf's outstanding producer writes
+/// to complete before yserver reads it (e.g. a `PresentPixmap` copy).
+///
+/// `PresentPixmap` with `wait_fence=0` relies on implicit dma-buf sync;
+/// some GPU stacks (Turnip/Adreno, Apple) don't make yserver's read
+/// queue honour it, so the copy can race the client's still-pending GPU
+/// render and capture a partly-rendered (transparent) frame. This
+/// exports the buffer's read fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+/// `DMA_BUF_SYNC_READ` → the *write* fence a reader must wait on) and
+/// `poll()`s it.
+///
+/// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
+/// [`DmabufReadWait::TimedOut`] and the caller proceeds — worst case a
+/// stale frame, never a stall. This is the CONFIRMATION path; the
+/// production fix replaces the CPU poll with a GPU wait-semaphore on the
+/// copy submit.
+pub fn wait_dmabuf_read_ready(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    timeout_ms: i32,
+) -> DmabufReadWait {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut export = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: ioctl on a valid borrowed dma-buf fd with a correctly
+    // sized request struct. Returns 0 on success and fills `export.fd`.
+    let rc = unsafe {
+        libc::ioctl(
+            dma_buf_fd.as_raw_fd(),
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+            std::ptr::addr_of_mut!(export),
+        )
+    };
+    if rc != 0 {
+        return DmabufReadWait::Unsupported;
+    }
+    if export.fd < 0 {
+        // No fences in the reservation object → buffer is idle.
+        return DmabufReadWait::Idle;
+    }
+    // Own the returned sync_file fd so it is always closed.
+    // SAFETY: the kernel just handed us an owned fd via the ioctl.
+    let sync_fd = unsafe { OwnedFd::from_raw_fd(export.fd) };
+    let mut pfd = libc::pollfd {
+        fd: sync_fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: single valid pollfd; bounded timeout.
+    let pr = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, timeout_ms) };
+    // `sync_fd` drops (closes) here regardless of outcome.
+    if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        DmabufReadWait::Ready
+    } else {
+        DmabufReadWait::TimedOut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

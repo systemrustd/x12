@@ -6268,6 +6268,15 @@ fn handle_present_request(
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
+                // The copy below runs immediately and `wait_fence` only
+                // gates completion, not the read. For a DRI3-imported
+                // source presented with implicit sync (wait_fence=0),
+                // wait for the client's outstanding GPU writes first so
+                // we don't copy a partly-rendered (transparent) frame —
+                // the wezterm/Firefox transparent-content bug on GPU
+                // stacks that don't honour implicit sync for our read
+                // queue. Bounded + no-op for server-owned sources.
+                backend.wait_present_source_ready(host_xid.as_raw());
                 if req.update != 0 {
                     if let Some(region) = state.xfixes_regions.get(&req.update) {
                         for rect in &region.rects {

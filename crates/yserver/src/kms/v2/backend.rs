@@ -6893,6 +6893,50 @@ impl Backend for KmsBackendV2 {
         self.present_to_cow_sources.push_back(src_pixmap_xid);
     }
 
+    fn wait_present_source_ready(&mut self, src_pixmap_host_xid: u32) {
+        use crate::kms::vk::dri3::{DmabufReadWait, wait_dmabuf_read_ready};
+        // Bounded so an absent/stuck producer fence can never hang the
+        // single-threaded core. 50 ms (~3 vsync @ 60 Hz) is generous
+        // for a finished-but-not-flushed GPU frame, short enough that a
+        // pathological miss only yields one stale frame.
+        //
+        // This is a CPU wait — correct and safe, but it stalls the core
+        // for the (usually sub-frame) duration of the producer's
+        // outstanding render. The non-stalling form — a GPU
+        // acquire-semaphore imported from the same dma-buf fence and
+        // waited on the present copy's submit — is filed as a follow-up
+        // to land with the composite-into-frame-builder work (see
+        // docs/known-issues.md), where there is one well-defined submit
+        // per frame to attach the wait to.
+        const TIMEOUT_MS: i32 = 50;
+        let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
+            return;
+        };
+        // Only DRI3-imported (client-produced) sources carry a producer
+        // fence to wait on; server-owned storage is ordered by our own
+        // queue barriers, so `imported_dma_buf_fd()` → None → no wait
+        // (also why this never blocks the lavapipe/server-owned paths).
+        let Some(fd) = self
+            .store
+            .get(src_id)
+            .and_then(|d| d.storage.imported_drawable.as_ref())
+            .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+        else {
+            return;
+        };
+        // Ready / Idle are the common, healthy outcomes — silent. Only
+        // surface the anomalies: TimedOut (we proceeded on a still-
+        // pending render → possible stale frame) and Unsupported (the
+        // ioctl is unavailable → we fell back to the old no-wait read).
+        match wait_dmabuf_read_ready(fd, TIMEOUT_MS) {
+            DmabufReadWait::Ready | DmabufReadWait::Idle => {}
+            other => log::debug!(
+                target: "yserver::kms::v2::present",
+                "present source 0x{src_pixmap_host_xid:x} dma-buf read-wait → {other:?}",
+            ),
+        }
+    }
+
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // DRM fd + present-completion epfd (always); in libseat mode also
         // the seat connection fd and the on-core libinput fd.

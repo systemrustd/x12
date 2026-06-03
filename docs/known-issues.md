@@ -241,30 +241,43 @@ from.
       current frame. Fix is almost certainly in that accumulation, not
       in the input/protocol layer.
 
-- [ ] **wezterm client content briefly blank after heavy drag
-      stress (yoga / Snapdragon X1 / Turnip, release build,
-      observed once 2026-05-19 PM).** During a deliberate
-      window-drag stress test (purpose: check whether v2 spikes
-      CPU under marco-comp drag — it doesn't), wezterm's client
-      area went blank/white for a few seconds while marco's frame
-      decoration kept rendering normally. Resolved on its own.
-      Not reproducible on a debug build (timing-sensitive). No
-      telemetry capture at the moment of the symptom.
-      Two working hypotheses:
-      1. Buffer-age history loss during the drag-induced
-         ConfigureNotify storm + Stage 2e failed-flip recovery
-         momentarily presenting a stale/uninit BO for wezterm's
-         backing.
-      2. Marco briefly dropping its `NameWindowPixmap` alias on
-         wezterm mid-drag, so its compositor reads nothing for a
-         few frames and the COW shows marco's frame-fill (white)
-         through where wezterm content should be.
-      Reproduction hint: heavy drag of any window while wezterm is
-      running with btop or similar continuously-painting workload.
-      Capture `yserver-mate-hw-telemetry` log during a repro
-      attempt — diff per-second counters across the symptom
-      window for clues (especially `composite_submit`,
-      `frame_present`, scene-structure damage path).
+- [x] **wezterm/Firefox transparent (see-through) client content —
+      FIXED (2026-06-03).** On the no-AMD laptops (eiger/air/yoga;
+      Turnip/Adreno + Apple) wezterm rendered only partway, with large
+      regions transparent and the desktop showing through; the holes
+      shifted on typing/hover. Same family as the older "wezterm blank
+      after heavy drag" note. **Root cause:** GPU clients
+      (`PresentPixmap` of a DRI3-imported dma-buf, `wait_fence=0`)
+      rely on *implicit* dma-buf sync. yserver's present copy runs
+      immediately at request-parse time (`wait_fence` only gates
+      completion, not the read), so on GPU stacks that don't honour
+      implicit sync for our read queue (Turnip/Adreno, Apple — AMD does)
+      the copy raced the client's still-pending render and captured a
+      partly-rendered (α=0) frame. Confirmed: the copy itself is full +
+      unclipped (`present_dbg` instrumentation); the source was simply
+      not ready. **Fix:** before the present copy, wait for the source's
+      producer writes via the buffer's read fence
+      (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` → `poll()`,
+      `dri3::wait_dmabuf_read_ready`, bounded 50 ms → never a hang;
+      no-op for server-owned sources). HW-verified on the laptops
+      (wezterm + Firefox/YouTube). The clip-by-children commit
+      (`e7a1ba0`) was NOT involved — wezterm issues zero RENDER/fills.
+
+- [ ] **Follow-up: replace the present-source CPU wait with a GPU
+      acquire-semaphore (perf).** `wait_present_source_ready`
+      (backend.rs) CPU-`poll()`s the source dma-buf's read fence before
+      the present copy — correct and bounded, but it stalls the
+      single-threaded core for the producer's outstanding render
+      (usually sub-frame; can add up under many concurrent GPU clients).
+      The non-stalling form imports that same fence as a `VkSemaphore`
+      (machinery already exists: `vk::sync::import_sync_file` +
+      `external_semaphore_fd`) and waits on it on the present copy's
+      **submit**. Land it with the composite-into-frame-builder work
+      (Stage 5 / Phase B): that gives one well-defined submit per frame
+      to carry the acquire list, with the semaphore's lifetime tied to
+      the frame's fence ticket. NB Vulkan queue waits have no timeout —
+      only ever wait when `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` returns a real
+      fd, else no-op, to avoid a never-signalled-wait hang.
 
 - [ ] **Stage 4c follow-up: multi-output coord-space for
       scene-structure damage rects.** `SceneCompositor::
