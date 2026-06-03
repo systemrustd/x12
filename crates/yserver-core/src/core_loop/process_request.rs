@@ -7843,7 +7843,7 @@ fn handle_glx_request(
             let s = match name {
                 x11glx::STRING_VENDOR => "yserver",
                 x11glx::STRING_VERSION => "1.4",
-                x11glx::STRING_EXTENSIONS => "",
+                x11glx::STRING_EXTENSIONS => x11glx::SERVER_EXTENSIONS,
                 _ => "",
             };
             let reply = x11glx::encode_string_reply(byte_order, sequence, s);
@@ -7854,11 +7854,10 @@ fn handle_glx_request(
         }
         x11glx::QUERY_EXTENSIONS_STRING => {
             // Per design §3.5 — list of GLX extensions Mesa probes for.
-            let exts = "GLX_ARB_create_context GLX_ARB_create_context_profile \
-                GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
-                GLX_INTEL_swap_event GLX_ARB_fbconfig_float GLX_EXT_visual_info \
-                GLX_EXT_visual_rating GLX_EXT_import_context";
-            let reply = x11glx::encode_string_reply(byte_order, sequence, exts);
+            // Same list as the server string (opcode 19) — see
+            // `x11glx::SERVER_EXTENSIONS`.
+            let reply =
+                x11glx::encode_string_reply(byte_order, sequence, x11glx::SERVER_EXTENSIONS);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

@@ -95,6 +95,18 @@ pub const STRING_VENDOR: u32 = 1;
 pub const STRING_VERSION: u32 = 2;
 pub const STRING_EXTENSIONS: u32 = 3;
 
+/// The GLX extensions yserver advertises. Returned for BOTH
+/// `glXQueryServerString(GLX_EXTENSIONS)` (opcode 19, `QUERY_SERVER_STRING`,
+/// `STRING_EXTENSIONS`) and `glXQueryExtensionsString` (opcode 18,
+/// `QUERY_EXTENSIONS_STRING`). They must stay identical: ANGLE/Chromium
+/// queries the *server* string (opcode 19) and refuses to create a GLES
+/// context if `GLX_ARB_create_context` is absent — an empty server string
+/// there breaks Chromium even though opcode 18 carried the list.
+pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
+    GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
+    GLX_INTEL_swap_event GLX_ARB_fbconfig_float GLX_EXT_visual_info \
+    GLX_EXT_visual_rating GLX_EXT_import_context";
+
 #[must_use]
 pub fn parse_query_server_string(body: &[u8]) -> Option<QueryServerStringRequest> {
     if body.len() < 8 {
@@ -529,6 +541,24 @@ mod tests {
         // BadCurrentDrawable.
         assert_eq!(ERROR_GLX_BAD_RENDER_REQUEST, 6);
         assert_eq!(ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST, 8);
+    }
+
+    #[test]
+    fn server_extensions_advertise_create_context() {
+        // ANGLE/Chromium calls glXQueryServerString(GLX_EXTENSIONS)
+        // (opcode 19) and refuses a GLES context if GLX_ARB_create_context
+        // is missing. The server string must be non-empty and advertise it
+        // (regression: STRING_EXTENSIONS used to return "").
+        assert!(!SERVER_EXTENSIONS.is_empty());
+        assert!(SERVER_EXTENSIONS.contains("GLX_ARB_create_context"));
+        // The string reply for STRING_EXTENSIONS must carry the same list.
+        let reply = encode_string_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            SERVER_EXTENSIONS,
+        );
+        let body = String::from_utf8_lossy(&reply);
+        assert!(body.contains("GLX_ARB_create_context"));
     }
 
     #[test]
