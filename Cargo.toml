@@ -1,10 +1,51 @@
 [workspace]
-members = [
-    "crates/yserver",
-    "crates/yserver-core",
-    "crates/yserver-protocol",
-]
 resolver = "3"
+members = [
+  "crates/yserver",
+  "crates/yserver-core",
+  "crates/yserver-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = ""
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+ash = "0.38"
+crossbeam-channel = "0.5"
+drm = "0.15"
+env_logger = "0.11"
+freetype-rs = "0.38"
+gpu-allocator = { version = "0.28", default-features = false, features = [
+  "std",
+  "vulkan"
+] }
+input = "0.10"
+libc = "0.2"
+log = "0.4"
+mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
+nix = { version = "0.31", features = [
+  "event",
+  "fs",
+  "ioctl",
+  "mman",
+  "poll",
+  "signal",
+  "term"
+] }
+signal-hook = "0.4"
+thiserror = "2"
+xkbcommon = "0.9"
+yserver-core = { path = "crates/yserver-core" }
+yserver-protocol = { path = "crates/yserver-protocol" }
+
+[workspace.lints.clippy]
+# X11 protocol encoders and request handlers naturally take many
+# parameters (one per wire field). Wrapping them in structs adds churn
+# without aiding readability — the parameter list mirrors the spec.
+too_many_arguments = "allow"
 
 # Keep DWARF unwind info in release builds so `perf record --call-graph
 # dwarf` can resolve Rust frames. Without this, ~65% of samples in a
@@ -24,33 +65,3 @@ resolver = "3"
 # (~1-2% runtime cost) make the unwind path infallible.
 [profile.release]
 debug = true
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-only"
-repository = ""
-
-[workspace.lints.clippy]
-# X11 protocol encoders and request handlers naturally take many
-# parameters (one per wire field). Wrapping them in structs adds churn
-# without aiding readability — the parameter list mirrors the spec.
-too_many_arguments = "allow"
-
-[workspace.dependencies]
-yserver-core = { path = "crates/yserver-core" }
-yserver-protocol = { path = "crates/yserver-protocol" }
-log = "0.4"
-env_logger = "0.11"
-libc = "0.2"
-drm = "0.15"
-input = "0.10"
-nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "signal", "term"] }
-signal-hook = "0.4"
-crossbeam-channel = "0.5"
-mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
-freetype-rs = "0.38"
-xkbcommon = "0.9"
-ash = "0.38"
-gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
-thiserror = "2"
