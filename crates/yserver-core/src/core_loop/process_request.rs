@@ -56,7 +56,7 @@ use crate::{
 const XI2_MAJOR_OPCODE: u8 = 137;
 /// XInput extension first-error base (matches `nested.rs::XI2_FIRST_ERROR`).
 /// `XI_BadDevice = 0`, so the wire `BadDevice` code is `XI2_FIRST_ERROR + 0`.
-const XI2_FIRST_ERROR: u8 = 153;
+const XI2_FIRST_ERROR: u8 = 157;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 const XI2_SERVER_MAJOR_VERSION: u16 = 2;
 const XI2_SERVER_MINOR_VERSION: u16 = 4;
@@ -10125,31 +10125,57 @@ fn handle_xi2_request(
             // wire byte-for-byte, which Xlib appears to need for the
             // `XDevice` to register as fully usable even though only
             // the OtherClass entry is consumed for property events.
+            // Class tags (XI.h) + event_type_base offsets relative to
+            // `XI_FIRST_EVENT` (= 66; Xorg `Xi/extinit.c::FixExtensionEvents`):
+            //   Key(0)      base + 1  = 0x43   Button(1)   base + 3  = 0x45
+            //   Valuator(2) base + 5  = 0x47   Feedback(3) base 0 (no event)
+            //   Focus(5)    base + 6  = 0x48   Other(6)    base + 10 = 0x4c
+            const KEY_CLASS: u8 = 0;
             const BUTTON_CLASS: u8 = 1;
             const VALUATOR_CLASS: u8 = 2;
             const FEEDBACK_CLASS: u8 = 3;
+            const FOCUS_CLASS: u8 = 5;
             const OTHER_CLASS: u8 = 6;
-            // event_type_base offsets relative to `XI_FIRST_EVENT`:
-            //   DeviceButtonPress (0)     at base + 3 = 69 (0x45)
-            //   DeviceMotionNotify (0)    at base + 5 = 71 (0x47)
-            //   FeedbackClass has no event (base = 0 like Xorg)
-            //   DevicePropertyNotify (6)  at base + 10 = 76 (0x4c)
-            // Matches Xorg's `Xi/extinit.c::FixExtensionEvents` numbering.
-            let button_base = XI_FIRST_EVENT + 3;
-            let valuator_base = XI_FIRST_EVENT + 5;
-            let feedback_base = 0;
-            let other_base = XI_FIRST_EVENT + 10;
-            // num_classes=4 in the reply's data byte; length=2 (two
-            // extra 4-byte units = 8 bytes for the four entries).
-            let mut reply = x11::fixed_reply(byte_order, sequence, 4, 2);
-            reply.extend_from_slice(&[0u8; 24]);
-            reply.extend_from_slice(&[
-                BUTTON_CLASS, button_base,
-                VALUATOR_CLASS, valuator_base,
-                FEEDBACK_CLASS, feedback_base,
-                OTHER_CLASS, other_base,
-            ]);
-            debug!("client {} #{} XI1 OpenDevice", client_id.0, sequence.0);
+            // The class set MUST match the device's use: a pointer reports
+            // Button/Valuator/Feedback/Other; a keyboard reports
+            // Key/Feedback/Focus/Other (verified against mate-xorg.xtrace
+            // OpenDevice replies). Returning pointer classes for a keyboard
+            // contradicts ListInputDevices and trips clients' device model.
+            let deviceid = u16::from(*body.first().unwrap_or(&0));
+            let is_keyboard = deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD
+                || deviceid == crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+            let entries: [u8; 8] = if is_keyboard {
+                [
+                    KEY_CLASS, XI_FIRST_EVENT + 1,
+                    FEEDBACK_CLASS, 0,
+                    FOCUS_CLASS, XI_FIRST_EVENT + 6,
+                    OTHER_CLASS, XI_FIRST_EVENT + 10,
+                ]
+            } else {
+                [
+                    BUTTON_CLASS, XI_FIRST_EVENT + 3,
+                    VALUATOR_CLASS, XI_FIRST_EVENT + 5,
+                    FEEDBACK_CLASS, 0,
+                    OTHER_CLASS, XI_FIRST_EVENT + 10,
+                ]
+            };
+            // CRITICAL: `num_classes` lives at byte 8 of xOpenDeviceReply
+            // (the first field after the 8-byte header), NOT the detail
+            // byte. Clients (Xlib XOpenDevice, Chromium's XI device init)
+            // read it there; the old code passed it as `fixed_reply`'s
+            // detail byte, leaving byte 8 = 0, so num_classes read as 0 on
+            // the wire and the class array below was invisible. That made
+            // OpenDevice contradict ListInputDevices' per-device class
+            // count → Chromium fatal CHECK / SIGTRAP on startup.
+            // length=2 = two extra 4-byte units (8 bytes of class entries).
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 2);
+            reply.push(4); // byte 8: num_classes
+            reply.extend_from_slice(&[0u8; 23]); // bytes 9..=31: header pad
+            reply.extend_from_slice(&entries);
+            debug!(
+                "client {} #{} XI1 OpenDevice device={deviceid} -> {} classes",
+                client_id.0, sequence.0, 4
+            );
             buf.extend_from_slice(&reply);
         }
         // XI 1.x reply-required minors. xts opens probe XInput requests
@@ -18212,7 +18238,10 @@ mod tests {
         let wire = read_all_available(&mut peer);
         assert_eq!(wire.len(), 32, "error is 32 bytes");
         assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice = 153");
+        assert_eq!(
+            wire[1], XI2_FIRST_ERROR,
+            "BadDevice = XI2_FIRST_ERROR (157)"
+        );
         // sequence at bytes 2-3.
         assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 7);
     }
@@ -18658,7 +18687,10 @@ mod tests {
         let wire = read_all_available(&mut peer);
         assert_eq!(wire.len(), 32, "error is 32 bytes");
         assert_eq!(wire[0], 0, "error packet");
-        assert_eq!(wire[1], XI2_FIRST_ERROR, "BadDevice = 153");
+        assert_eq!(
+            wire[1], XI2_FIRST_ERROR,
+            "BadDevice = XI2_FIRST_ERROR (157)"
+        );
         assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 9, "sequence");
     }
 

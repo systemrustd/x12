@@ -15,7 +15,7 @@
 use yserver_protocol::x11::{self, ClientId, ResourceId};
 
 use crate::{
-    core_loop::fanout::{emit_window_event_to_state, fanout_event_to_clients},
+    core_loop::fanout::{fanout_event_to_clients, subscribers_by_id},
     host_x11::HostKeyEvent,
     resources::ROOT_WINDOW,
     server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource, ServerState, xi2_mask_for_client},
@@ -148,11 +148,13 @@ fn deliver_key_to_window(
     } else {
         KEY_RELEASE_MASK
     };
-    let mut dropped =
-        emit_window_event_to_state(state, target_window, mask_bit, |buf, seq, order| {
-            x11::encode_key_event(buf, order, key_event_wire(event, seq, target_window));
-        });
 
+    // Clients that selected XI2 for this key event on the window. Computed
+    // first because XI2 *shadows* core per client: a client receiving the
+    // XI2 form must NOT also receive the core form of the same physical
+    // event (Xorg behaviour). Without this, a client that selects both
+    // core (XSelectInput KeyPressMask) and XI2 (XISelectEvents) — e.g.
+    // Chromium's Ozone X11 layer — gets every keystroke twice.
     let xi2_evtype = xi2_evtype_for(event);
     let xi2_targets: Vec<ClientId> = state
         .clients
@@ -176,6 +178,21 @@ fn deliver_key_to_window(
             }
         })
         .collect();
+
+    // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
+    // excluding any client already getting the XI2 form above.
+    let core_targets: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit)
+        .into_iter()
+        .filter(|c| !xi2_targets.contains(c))
+        .collect();
+    let mut dropped = if core_targets.is_empty() {
+        Vec::new()
+    } else {
+        fanout_event_to_clients(state, &core_targets, |buf, seq, order| {
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, target_window));
+        })
+    };
+
     if !xi2_targets.is_empty() {
         let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
             encode_key_xi2(buf, order, seq, event, target_window);

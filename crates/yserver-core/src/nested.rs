@@ -21,6 +21,17 @@ use crate::{
     server::ServerState,
 };
 
+// Extension error-code bases. INVARIANT: each extension's reserved range
+// `[first_error, first_error + error_count)` must NOT overlap any other
+// extension's range — clients (notably Google Chrome's X11 layer) build an
+// error-code→extension map at connection setup and a strict build aborts
+// (SIGILL/ud2) on overlapping ranges. Extensions with zero errors use 0.
+// Current allocation (error counts in parens):
+//   RANDR 147 (5) · RENDER 152 (5) · XInput 157 (5) · [host XKB 162 (1)]
+//   · XFIXES 163 (1) · SYNC 164 (3) · DAMAGE 167 (1) · MIT-SHM 168 (1)
+//   · GLX 169 (13, →181). SHAPE/Composite/Present/DPMS/screensaver: 0.
+// Do NOT pack these 1 apart — a multi-error extension (RENDER=5, GLX=13)
+// would then overlap its neighbours.
 const RANDR_MAJOR_OPCODE: u8 = 128;
 const RANDR_FIRST_EVENT: u8 = 89;
 const RANDR_FIRST_ERROR: u8 = 147;
@@ -47,31 +58,31 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// (re-exported as [`crate::server::XI_FIRST_EVENT`]) and the XI2 event
 /// fan-outs.
 pub(crate) const XI2_FIRST_EVENT: u8 = 66;
-const XI2_FIRST_ERROR: u8 = 153;
+const XI2_FIRST_ERROR: u8 = 157;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 pub(crate) const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
-const XFIXES_FIRST_ERROR: u8 = 154;
+const XFIXES_FIRST_ERROR: u8 = 163;
 
 const SHAPE_MAJOR_OPCODE: u8 = 141;
 const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64
-const SHAPE_FIRST_ERROR: u8 = 155;
+const SHAPE_FIRST_ERROR: u8 = 0; // SHAPE defines no errors (match Xorg: first_error=0)
 
 const SYNC_MAJOR_OPCODE: u8 = 142;
 pub(crate) const SYNC_FIRST_EVENT: u8 = 83; // matches Xorg: Counter=83, Alarm=84
-const SYNC_FIRST_ERROR: u8 = 156;
+const SYNC_FIRST_ERROR: u8 = 164;
 
 const DAMAGE_MAJOR_OPCODE: u8 = 143;
 pub(crate) const DAMAGE_FIRST_EVENT: u8 = 91; // matches Xorg: DamageNotify=91
-const DAMAGE_FIRST_ERROR: u8 = 157;
+const DAMAGE_FIRST_ERROR: u8 = 167;
 
 const COMPOSITE_MAJOR_OPCODE: u8 = 144;
 const COMPOSITE_FIRST_EVENT: u8 = 0;
-const COMPOSITE_FIRST_ERROR: u8 = 158;
+const COMPOSITE_FIRST_ERROR: u8 = 0; // Composite defines no errors
 
 const PRESENT_MAJOR_OPCODE: u8 = 145;
 const PRESENT_FIRST_EVENT: u8 = 0; // Present uses XGE, no sequential event codes
-const PRESENT_FIRST_ERROR: u8 = 159;
+const PRESENT_FIRST_ERROR: u8 = 0; // Present defines no errors
 
 pub(crate) const DPMS_MAJOR_OPCODE: u8 = 134;
 
@@ -80,7 +91,7 @@ pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 162;
 
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65
-const MIT_SHM_FIRST_ERROR: u8 = 160;
+const MIT_SHM_FIRST_ERROR: u8 = 168;
 
 const XTEST_MAJOR_OPCODE: u8 = 146;
 
@@ -88,7 +99,7 @@ pub(crate) const DRI3_MAJOR_OPCODE: u8 = 147;
 
 pub(crate) const GLX_MAJOR_OPCODE: u8 = 148;
 pub(crate) const GLX_FIRST_EVENT: u8 = 95; // matches Xorg: Pbuffer=95, BufferSwap=96
-pub(crate) const GLX_FIRST_ERROR: u8 = 161;
+pub(crate) const GLX_FIRST_ERROR: u8 = 169; // 13 errors (169-181); routed past host XKB error base 162
 
 pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
 
