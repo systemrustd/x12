@@ -24404,8 +24404,19 @@ mod tests {
         );
     }
 
+    /// Xorg semantics (`DeliverGrabbedEvent`, dix/events.c:4361): the
+    /// `owner_events=true` natural walk is filtered to the GRAB
+    /// CLIENT — `TryClientEvents` (dix/events.c:2069) returns -1 for
+    /// any other client ("not delivered due to grab"), aborting
+    /// propagation; the press then falls back to the grab window.
+    ///
+    /// This test previously pinned the OPPOSITE ("delivers descendant
+    /// window regardless of owner", from the 2b2680e cinnamon wip) —
+    /// that leak is what wedged wmaker on HW 2026-06-04: the sync
+    /// grab froze the queue while the press went to the app client,
+    /// so the WM never called AllowEvents and clicks died.
     #[test]
-    fn xi_passive_grab_owner_events_delivers_descendant_window_regardless_of_owner() {
+    fn xi_passive_grab_owner_events_redirects_foreign_descendant_press_to_grab_client() {
         use crate::{
             backend::Backend,
             host_x11::{HostPointerEvent, PointerEventKind},
@@ -24500,15 +24511,30 @@ mod tests {
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
 
         let mut buf = [0u8; 128];
-        let child_read = child_peer.read(&mut buf);
-        assert!(
-            matches!(child_read, Ok(n) if n >= 32),
-            "owner_events=true passive grab must deliver descendant clicks to the descendant window even when a different client owns it; got {child_read:?}",
-        );
         let grab_read = grab_peer.read(&mut buf);
         assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "owner_events=true passive grab must not redirect descendant clicks to the grab owner; got {grab_read:?}",
+            matches!(grab_read, Ok(n) if n >= 32),
+            "press on a foreign-owned descendant must fall back to grab-window \
+             delivery to the GRAB client (Xorg dix/events.c:2069 aborts the \
+             natural walk on a foreign subscriber); got {grab_read:?}",
+        );
+        assert_eq!(buf[0], 4, "core ButtonPress to the grab client");
+        assert_eq!(
+            &buf[12..16],
+            &GRAB_WIN.to_le_bytes(),
+            "press reported on the grab window",
+        );
+        let child_read = child_peer.read(&mut buf);
+        let child_got_core_press =
+            matches!(child_read, Ok(n) if buf[..n.min(128)].chunks(32).any(|c| c[0] == 4));
+        assert!(
+            !child_got_core_press,
+            "the foreign descendant's owner must NOT see the core press while \
+             the grab holds; got {child_read:?}",
+        );
+        assert!(
+            state.frozen_pointer_event.is_some(),
+            "GrabModeSync activation with a delivery must freeze the queue",
         );
     }
 

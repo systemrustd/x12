@@ -276,56 +276,98 @@ pub fn pointer_event_fanout_to_state(
     release_passive_grab_on_button_release(state, event.kind);
 
     // Step 3 — passive button-grab matching for ButtonPress.
+    //
+    // Delivery mirrors Xorg `DeliverGrabbedEvent` (dix/events.c:4361):
+    //
+    // 1. With `owner_events=true`, run the natural propagation walk
+    //    FILTERED TO THE GRAB CLIENT — `TryClientEvents`
+    //    (dix/events.c:2069) returns -1 for any other client ("not
+    //    delivered due to grab"), which ABORTS the walk at that
+    //    window. Topology (hit being a descendant of the grab
+    //    window) is irrelevant; only the grab client's own event
+    //    masks qualify.
+    // 2. No natural delivery → report to the grab client on the
+    //    grab window, filtered by the grab's event_mask.
+    // 3. `GrabModeSync` freezes the pointer queue only when a
+    //    delivery happened (`FreezeThisEventIfNeededForSyncGrab`
+    //    runs under `if (deliveries)`), so the AllowEvents that
+    //    thaws it always has a recipient.
+    //
+    // Pre-fix the qualification accepted any descendant of the grab
+    // window — wmaker's click-to-focus sync grab on a CLIENT's
+    // window leaked the activating press to the app client while
+    // the queue froze; wmaker never saw the press, never called
+    // AllowEvents, and the pointer stream wedged (cursor moves,
+    // clicks dead — silence HW 2026-06-04).
     if !handled_core_via_grab
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
-        && let Some((grab, hit_window)) = try_match_passive_grab(state, xid_map, event)
+        && let Some((grab, _hit_window)) = try_match_passive_grab(state, xid_map, event)
     {
-        log::trace!(
-            "pointer_fanout: PASSIVE-GRAB match button={} grab_owner={:?} grab_window=0x{:x} mode={}",
+        log::debug!(
+            "pointer_fanout: PASSIVE-GRAB match button={} grab_owner={:?} grab_window=0x{:x} mode={} owner_events={}",
             event.detail,
             grab.owner,
             grab.grab_window.0,
             grab.pointer_mode,
+            grab.owner_events,
         );
         // Activate the passive grab atomically with the dispatch.
-        // `owner_events=true` qualifies for natural delivery when hit
-        // is the grab window, a descendant of it, OR owned by the
-        // grab client — see the Step-2 active-grab comment for the
-        // mate-panel regression that drove this ownership-aware check.
-        let target_qualifies_for_natural = hit_window == grab.grab_window
-            || state
-                .resources
-                .is_descendant_of(hit_window, grab.grab_window)
-            || state.resources.window_owner(hit_window) == Some(grab.owner);
-        let redirect_to_grab = !grab.owner_events || !target_qualifies_for_natural;
-        if grab.pointer_mode == 0 {
-            state.frozen_pointer_event = Some(event);
-        }
         state.pointer_grab = Some((grab.owner, grab.grab_window));
         state.pointer_grab_is_passive = true;
 
-        if redirect_to_grab {
-            if let Some(grab_target) = client_target_id(state, grab.owner) {
-                let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
-                    encode_pointer_event(
-                        buf,
-                        order,
-                        PointerEventKind::ButtonPress,
-                        seq,
-                        event.detail,
-                        event.time,
-                        grab.grab_window,
-                        ResourceId(0), // passive grab activation: no propagation child
-                        event,
-                        event.event_x,
-                        event.event_y,
-                    );
-                });
-                merge_dropped(&mut dropped, extras);
-            }
-            handled_core_via_grab = true;
+        let mask_bit = pointer_mask_bit(event.kind, event.state);
+        let natural = if grab.owner_events {
+            grabbed_natural_target(state, target, target_x, target_y, mask_bit, grab.owner)
+        } else {
+            None
+        };
+        let mut delivered = false;
+        if let Some((natural_window, event_x, event_y, child)) = natural {
+            let extras = fanout_event_to_clients(state, &[grab.owner], |buf, seq, order| {
+                encode_pointer_event(
+                    buf,
+                    order,
+                    PointerEventKind::ButtonPress,
+                    seq,
+                    event.detail,
+                    event.time,
+                    natural_window,
+                    child,
+                    event,
+                    event_x,
+                    event_y,
+                );
+            });
+            merge_dropped(&mut dropped, extras);
+            delivered = true;
+        } else if grab.event_mask & mask_bit != 0
+            && let Some(grab_target) = client_target_id(state, grab.owner)
+        {
+            let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
+                encode_pointer_event(
+                    buf,
+                    order,
+                    PointerEventKind::ButtonPress,
+                    seq,
+                    event.detail,
+                    event.time,
+                    grab.grab_window,
+                    ResourceId(0), // passive grab activation: no propagation child
+                    event,
+                    event.event_x,
+                    event.event_y,
+                );
+            });
+            merge_dropped(&mut dropped, extras);
+            delivered = true;
         }
+        if delivered && grab.pointer_mode == 0 {
+            state.frozen_pointer_event = Some(event);
+        }
+        // During a grab, core pointer events never reach other
+        // clients — both branches above are the only deliveries.
+        handled_core_via_grab = true;
     }
 
     // Step 4 — normal core propagation, only when no grab took ownership.
@@ -682,6 +724,51 @@ fn active_grab_target(
     Some((grab_window, target, gx, gy, owner_events))
 }
 
+/// Xorg `DeliverGrabbedEvent`'s `owner_events=true` natural-delivery
+/// walk (dix/events.c:4361 → `DeliverDeviceEvents` with the grab as
+/// client filter). Walk up from `start`; at the FIRST window where any
+/// client selected `mask_bits`:
+///
+/// - grab client among the subscribers → natural delivery there
+///   (returns the window, translated coords, and the X11 `child`);
+/// - only foreign subscribers → the walk ABORTS with no delivery
+///   (`TryClientEvents` dix/events.c:2069 returns -1, "not delivered
+///   due to grab"; `DeliverDeviceEvents` breaks on `deliveries < 0`).
+///   The caller then falls back to grab-window delivery.
+fn grabbed_natural_target(
+    state: &ServerState,
+    start: ResourceId,
+    start_x: i16,
+    start_y: i16,
+    mask_bits: u32,
+    grab_client: ClientId,
+) -> Option<(ResourceId, i16, i16, ResourceId)> {
+    let mut current = start;
+    let mut x = start_x;
+    let mut y = start_y;
+    let mut child: Option<ResourceId> = None;
+    for _ in 0..256 {
+        let subs = crate::core_loop::fanout::subscribers_by_id(state, current, mask_bits);
+        if !subs.is_empty() {
+            return subs.contains(&grab_client).then_some((
+                current,
+                x,
+                y,
+                child.unwrap_or(ResourceId(0)),
+            ));
+        }
+        let window = state.resources.window(current)?;
+        if window.parent == current {
+            return None;
+        }
+        x = x.wrapping_add(window.x);
+        y = y.wrapping_add(window.y);
+        child = Some(current);
+        current = window.parent;
+    }
+    None
+}
+
 fn release_passive_grab_on_button_release(state: &mut ServerState, kind: PointerEventKind) {
     if kind == PointerEventKind::ButtonRelease && state.pointer_grab_is_passive {
         state.pointer_grab = None;
@@ -977,6 +1064,150 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    /// wmaker wedge regression (2026-06-04, silence HW): a WM places a
+    /// SYNCHRONOUS `owner_events=true` button grab on a CLIENT's window
+    /// (click-to-focus). A press on that window's subtree must be
+    /// reported to the GRAB CLIENT on the grab window — per Xorg
+    /// `DeliverGrabbedEvent` (dix/events.c:4361), the `owner_events`
+    /// natural walk is filtered to the grab client: `TryClientEvents`
+    /// (dix/events.c:2069) returns -1 for any other client ("not
+    /// delivered due to grab"), aborting propagation, and the event
+    /// falls back to the grab window. Pre-fix, the descendant arm of
+    /// `target_qualifies_for_natural` leaked the press to the app
+    /// client while the sync grab froze the queue — the WM never saw
+    /// the press, never called AllowEvents, and the pointer stream
+    /// stayed frozen forever (cursor moves, clicks dead).
+    #[test]
+    fn passive_sync_grab_on_foreign_window_delivers_to_grab_client_and_freezes() {
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let grab_window = ResourceId(0x0020_0001); // app client's top-level
+        let child_window = ResourceId(0x0020_0002); // app client's child
+
+        let mut wm_peer = install_client(&mut state, 1);
+        let mut app_peer = install_client(&mut state, 2);
+
+        state.resources.create_window(
+            ClientId(2),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(2),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: child_window,
+                parent: grab_window,
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        let _ = state.resources.map_window(child_window);
+
+        // The WM has NO event mask anywhere on the chain — its
+        // interest is expressed solely via the grab. The app client
+        // selects ButtonPress on its child (the leak target pre-fix).
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .event_masks
+            .insert(child_window, 0x0000_0004);
+
+        // wmaker idiom: XGrabButton(AnyButton, AnyModifier, client_win,
+        // owner_events=True, ButtonPressMask, GrabModeSync,
+        // GrabModeAsync).
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window,
+            button: 0,         // AnyButton
+            modifiers: 0x8000, // AnyModifier
+            owner_events: true,
+            event_mask: 0x0000_0004, // ButtonPressMask
+            pointer_mode: 0,         // GrabModeSync
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, grab_window);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let wm_bytes = read_all_available(&mut wm_peer);
+        assert!(
+            wm_bytes.len() >= 32,
+            "sync passive grab must deliver the activating press to the \
+             grab client (the WM) — otherwise nobody ever AllowEvents and \
+             the frozen pointer queue wedges; got {} bytes",
+            wm_bytes.len(),
+        );
+        assert_eq!(wm_bytes[0], 4, "event type should be ButtonPress");
+        assert_eq!(
+            &wm_bytes[12..16],
+            &grab_window.0.to_le_bytes(),
+            "press must be reported on the grab window (Xorg grab-window \
+             fallback — the grab client has no mask on the natural chain)",
+        );
+
+        let app_bytes = read_all_available(&mut app_peer);
+        let app_core: Vec<&[u8]> = app_bytes.chunks(32).filter(|c| c[0] == 4).collect();
+        assert!(
+            app_core.is_empty(),
+            "the app client must NOT see the core press while the grab \
+             holds (Xorg TryClientEvents: 'not delivered due to grab'); \
+             got {} core ButtonPress event(s)",
+            app_core.len(),
+        );
+
+        assert!(
+            state.frozen_pointer_event.is_some(),
+            "GrabModeSync activation must freeze the pointer queue",
+        );
+        assert_eq!(
+            state.pointer_grab,
+            Some((ClientId(1), grab_window)),
+            "passive grab must be active for client 1",
+        );
     }
 
     #[test]
