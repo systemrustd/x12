@@ -538,11 +538,13 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
 /// and `reply->{min,max}KeyCode == keymap->{min,max}_key_code`;
 /// `get_type_names` asserts `reply->nTypes == keymap->num_types`.
 ///
-/// Names themselves go on the wire as the empty atom (id 0) — the
-/// keymap stays usable; xkbcommon records anonymous names. The
+/// All name slots carry REAL interned atoms (component names from
+/// the compiled RMLVO, canonical type/level names, per-key names
+/// from `xkb_keymap_key_get_name`). Plain libX11 clients
+/// (xdotool, e16) `XGetAtomName` every atom in this reply — the
+/// previous zero-atom stub made them exit on BadAtom. The
 /// `nLevelsPerType` list mirrors what `reply_get_map` published:
-/// `[1, 2]` for `ONE_LEVEL` and `TWO_LEVEL`. `sumof(nLevelsPerType)`
-/// = 3 atoms follow.
+/// `[1, 2, 1, 1]`; `sumof(nLevelsPerType)` = 5 atoms follow.
 pub(super) fn reply_get_names(
     keymap: &Keymap,
     intern_atom: &mut dyn FnMut(&str) -> u32,
@@ -632,22 +634,51 @@ pub(super) fn reply_get_names(
     // [28..32] pad
 
     // -- Body ----------------------------------------------------
-    // All atom values go out as 0 (None / "no name") — xkbcommon's
-    // `get_escaped_atom_name` returns early on `atom == 0` and
-    // records anonymous names, so this keeps the keymap usable.
+    // Every ATOM slot carries a REAL interned atom. The previous
+    // zero-atom stub was tuned for xkbcommon (whose
+    // `get_escaped_atom_name` short-circuits atom == 0) but plain
+    // libX11 clients (xdotool, e16) XGetAtomName every name in the
+    // reply — atom 0 → BadAtom → the default error handler exits
+    // the client (the e16-in-vng blocker).
     let mut off = 32;
-    // keycodesName + symbolsName + typesName + compatName: 4 zero
-    // ATOMs (already zero from the vec! init).
-    off += unconditional_names_bytes;
-    // typeNames: 4 ATOMs (zeroed).
-    off += key_type_names_bytes;
+    // keycodesName + symbolsName + typesName + compatName, in bit
+    // order (Keycodes=0, Symbols=2, Types=4, Compat=5). Values are
+    // the resolved KcCGST components for the RMLVO the server
+    // compiles (evdev/pc105/us — `KmsCore::new`), per
+    // `setxkbmap -print -rules evdev -model pc105 -layout us`;
+    // libxkbcommon resolves the same rules files, it just doesn't
+    // expose the component names through its API.
+    for name in [
+        "evdev+aliases(qwerty)", // keycodesName
+        "pc+us+inet(evdev)",     // symbolsName
+        "complete",              // typesName
+        "complete",              // compatName
+    ] {
+        let atom = intern_atom(name);
+        r[off..off + 4].copy_from_slice(&atom.to_le_bytes());
+        off += 4;
+    }
+    // typeNames: the canonical XKB names of the 4 types
+    // reply_get_map publishes (nTypes=4, XkbNumRequiredTypes).
+    for name in ["ONE_LEVEL", "TWO_LEVEL", "ALPHABETIC", "KEYPAD"] {
+        let atom = intern_atom(name);
+        r[off..off + 4].copy_from_slice(&atom.to_le_bytes());
+        off += 4;
+    }
     // KTLevelNames: nLevelsPerType[] = [1, 2, 1, 1], pad to 4-byte
-    // boundary (0 bytes, count already aligned), then 5 ATOMs (zeroed).
+    // boundary (0 bytes, count already aligned), then sumof(levels)
+    // = 5 level-name ATOMs in type order — the canonical XKB
+    // shift-level names.
     r[off] = 1; // ONE_LEVEL has 1 level
     r[off + 1] = 2; // TWO_LEVEL has 2 levels
     r[off + 2] = 1; // ALPHABETIC stub
     r[off + 3] = 1; // KEYPAD stub
-    off += kt_levels_count + kt_levels_count_pad + kt_level_names_count * 4;
+    off += kt_levels_count + kt_levels_count_pad;
+    for name in ["Base", "Base", "Shift", "Base", "Base"] {
+        let atom = intern_atom(name);
+        r[off..off + 4].copy_from_slice(&atom.to_le_bytes());
+        off += 4;
+    }
     // VirtualModNames: one ATOM per present vmod, ascending bit order.
     // `vmod.names` is already (index, name) in ascending index order.
     for (_idx, name) in &vmod.names {
@@ -655,7 +686,17 @@ pub(super) fn reply_get_names(
         r[off..off + 4].copy_from_slice(&atom.to_le_bytes());
         off += 4;
     }
-    // KeyNames: n_keys × 4 zero bytes (anonymous names).
+    // KeyNames: char[4] per key (NOT atoms) — the keymap's canonical
+    // key names ("ESC", "AE01", …) zero-padded/truncated to 4 bytes.
+    // Keys the keymap doesn't name stay all-zero (anonymous).
+    for i in 0..nk {
+        let kc = u32::from(min_kc) + u32::try_from(i).unwrap_or(u32::MAX);
+        if let Some(name) = keymap.key_get_name(Keycode::new(kc)) {
+            for (j, b) in name.bytes().take(4).enumerate() {
+                r[off + i * 4 + j] = b;
+            }
+        }
+    }
     off += key_names_bytes;
     debug_assert_eq!(off, total, "GetNames reply body length matches total");
     r
@@ -1058,6 +1099,19 @@ mod tests {
         assert_eq!(r[14], 4, "nTypes == XkbNumRequiredTypes");
     }
 
+    /// Interner fixture: hands out sequential ids from 100 and
+    /// records the order names were first seen.
+    fn recording_interner(seen: &mut Vec<String>) -> impl FnMut(&str) -> u32 + '_ {
+        move |name: &str| {
+            if let Some(pos) = seen.iter().position(|n| n == name) {
+                100 + u32::try_from(pos).unwrap()
+            } else {
+                seen.push(name.to_owned());
+                100 + u32::try_from(seen.len() - 1).unwrap()
+            }
+        }
+    }
+
     #[test]
     fn get_names_advertises_xkbcommon_unconditional_read_bits() {
         // xkbcommon-x11's `get_names()` (keymap.c:1139-1146) reads
@@ -1068,26 +1122,126 @@ mod tests {
         // leave stack garbage there, which the client then
         // dispatches as `GetAtomName(garbage)` requests. Advertise
         // bits 0|2|4|5 (= 0x35 = Keycodes|Symbols|Types|Compat)
-        // so xcb writes our zero atoms and xkbcommon skips the
-        // GetAtomName calls (atom == 0 short-circuits).
+        // so xcb writes real atoms into the fields.
         let km = test_keymap();
-        let r = reply_get_names(&km, &mut |_| 0xFFu32);
+        let mut seen = Vec::new();
+        let r = reply_get_names(&km, &mut recording_interner(&mut seen));
         let which = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
         let unconditionally_read = 0x0000_0035_u32;
         assert_eq!(
             which & unconditionally_read,
             unconditionally_read,
             "GetNames which (0x{which:08x}) must include Keycodes|Symbols|Types|Compat so \
-             xcb unpacks zeros into the struct fields xkbcommon-x11 reads unconditionally"
+             xcb unpacks real atoms into the struct fields xkbcommon-x11 reads unconditionally"
         );
         // The four unconditional ATOMs sit at offsets 32..48 in
         // bit order (Keycodes, Symbols, Types, Compat — Geometry
         // and PhysSymbols bits are not advertised, so xcb skips
-        // those slots). All values are 0.
-        for i in 0..4 {
+        // those slots). Each must be the interned atom of the
+        // resolved KcCGST component for the RMLVO the server
+        // compiles (evdev/pc105/us — core.rs `KmsCore::new`):
+        // `setxkbmap -print -rules evdev -model pc105 -layout us`.
+        // Plain-libX11 clients (xdotool, e16) XGetAtomName every
+        // one of these — atom 0 → BadAtom → exit (the vng guest
+        // blocker), so they must be real interned atoms.
+        let expected = [
+            "evdev+aliases(qwerty)", // keycodesName
+            "pc+us+inet(evdev)",     // symbolsName
+            "complete",              // typesName
+            "complete",              // compatName
+        ];
+        let mut check = recording_interner(&mut seen);
+        for (i, name) in expected.iter().enumerate() {
             let off = 32 + i * 4;
             let atom = u32::from_le_bytes([r[off], r[off + 1], r[off + 2], r[off + 3]]);
-            assert_eq!(atom, 0, "unconditional name atom at offset {off} is 0");
+            assert_ne!(
+                atom, 0,
+                "unconditional name atom at offset {off} must not be 0"
+            );
+            assert_eq!(
+                atom,
+                check(name),
+                "atom at offset {off} must be the interned id of {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_names_interns_type_and_level_name_atoms() {
+        // typeNames[4] (offsets 48..64) carry the canonical XKB
+        // names of the four types reply_get_map publishes;
+        // ktLevelNames (5 atoms after nLevelsPerType[4]) carry the
+        // canonical shift-level names. None may be 0 — libX11
+        // XGetAtomName(0)s otherwise.
+        let km = test_keymap();
+        let mut seen = Vec::new();
+        let r = reply_get_names(&km, &mut recording_interner(&mut seen));
+        let mut check = recording_interner(&mut seen);
+
+        let type_names = ["ONE_LEVEL", "TWO_LEVEL", "ALPHABETIC", "KEYPAD"];
+        for (i, name) in type_names.iter().enumerate() {
+            let off = 48 + i * 4;
+            let atom = u32::from_le_bytes([r[off], r[off + 1], r[off + 2], r[off + 3]]);
+            assert_eq!(
+                atom,
+                check(name),
+                "typeNames[{i}] must be the interned id of {name:?}"
+            );
+        }
+        // nLevelsPerType[4] at 64..68 (already covered elsewhere),
+        // then 5 level-name ATOMs at 68..88: ONE_LEVEL[Base],
+        // TWO_LEVEL[Base, Shift], ALPHABETIC[Base], KEYPAD[Base].
+        let level_names = ["Base", "Base", "Shift", "Base", "Base"];
+        for (i, name) in level_names.iter().enumerate() {
+            let off = 68 + i * 4;
+            let atom = u32::from_le_bytes([r[off], r[off + 1], r[off + 2], r[off + 3]]);
+            assert_eq!(
+                atom,
+                check(name),
+                "ktLevelNames[{i}] must be the interned id of {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_names_emits_real_key_names_from_keymap() {
+        // KeyNames are char[4] slots (not atoms). They must carry
+        // the keymap's canonical key names (xkb_keymap_key_get_name)
+        // zero-padded/truncated to 4 bytes — real state-derived
+        // data, not anonymous zeros (no-protocol-stubs rule).
+        let km = test_keymap();
+        let mut seen = Vec::new();
+        let r = reply_get_names(&km, &mut recording_interner(&mut seen));
+        let min_kc = usize::from(r[12]);
+        let n_keys = usize::from(r[19]);
+        let vmod_count = virtual_mods_from_keymap(&km).present_mask.count_ones() as usize;
+        // 32 header + 16 unconditional + 16 typeNames +
+        // (4 nLevelsPerType + 20 ktLevelNames) + vmods.
+        let key_names_off = 32 + 16 + 16 + 24 + vmod_count * 4;
+
+        // Spot-check a stable anchor: X keycode 9 is ESC in the
+        // evdev keycode set.
+        let esc = key_names_off + (9 - min_kc) * 4;
+        assert_eq!(
+            &r[esc..esc + 4],
+            b"ESC\0",
+            "X keycode 9 must be named ESC (evdev keycodes)"
+        );
+
+        // Every key's wire name must match the keymap's own name.
+        for i in 0..n_keys {
+            let kc = u32::try_from(min_kc + i).unwrap();
+            let name = km.key_get_name(Keycode::new(kc)).unwrap_or("");
+            let mut expected = [0u8; 4];
+            for (j, b) in name.bytes().take(4).enumerate() {
+                expected[j] = b;
+            }
+            let off = key_names_off + i * 4;
+            assert_eq!(
+                &r[off..off + 4],
+                &expected,
+                "key name for X keycode {kc} (keymap says {name:?})"
+            );
         }
     }
 
