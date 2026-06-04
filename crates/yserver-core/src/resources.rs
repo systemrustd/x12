@@ -1342,6 +1342,23 @@ impl ResourceTable {
             .any(|w| w.background_pixmap_host_xid == Some(host_xid))
     }
 
+    /// Returns true if a live client pixmap resource still owns `host_xid`.
+    ///
+    /// X11 lifetime rule for window backgrounds: installing a pixmap as a
+    /// window background does NOT transfer ownership to the server — the
+    /// client's pixmap stays fully usable (drawable, re-installable as bg)
+    /// until the client calls FreePixmap. The host-side pixmap may only be
+    /// released once BOTH are true: the client resource is gone AND no
+    /// window background references it. The CWA bg-replacement path freed
+    /// on the second condition alone, destroying client-owned pixmaps —
+    /// observed as e16 menu items blanking on hover (e16 swaps the item
+    /// window's bg between a kept "normal" pixmap and a transient hilite
+    /// pixmap; the swap to hilite host-freed the still-owned normal
+    /// pixmap, so the un-hover restore painted nothing).
+    pub fn host_xid_owned_by_pixmap(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.pixmaps.values().any(|p| p.host_xid == Some(host_xid))
+    }
+
     #[must_use]
     pub fn host_drawable_target(&self, id: ResourceId) -> Option<HostDrawableTarget> {
         // Phase 3.6 Step 6: every InputOutput window has its own host_xid

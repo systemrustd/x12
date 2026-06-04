@@ -4142,3 +4142,55 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         time; resolved by `b0b57f8`. A fresh nvidia run after the
         fix will likely show clean rendering on the appearance
         dialog and similar GTK CSD windows.
+
+---
+
+## e16 regressions — bg-pixmap lifetime fix (master, 2026-06-04)
+
+**Symptoms (silence HW, e16):** desktop-menu items blanked on
+hover/un-hover; bottom-left pager misrendered.
+
+**Root cause:** X11 lifetime rule — installing a pixmap as a window
+background does NOT transfer ownership; the client's pixmap must stay
+usable until the client frees it. The host-side pixmap may only be
+released when BOTH hold: the client resource is gone AND no window
+background references it. Two sites freed on the second condition
+alone, destroying still-client-owned pixmaps:
+
+- `handle_change_window_attributes` — bg replacement freed the
+  previous bg pixmap. e16 swaps item-window backgrounds between a
+  kept "normal" pixmap and a transient hilite pixmap on every
+  hover/un-hover; the swap host-freed the kept pixmap, so the
+  restore pointed at a dead host xid (window fell back to bg_pixel,
+  GetImage read zeros). Same churn drives the pager thumbnails.
+- DestroyWindow teardown — freed every retained bg host xid in the
+  subtree unconditionally (client ownership + outside-subtree bg
+  references unchecked).
+
+Fix: `Resources::host_xid_owned_by_pixmap` + orphan-rule guards at
+both sites (`handle_free_pixmap` already had the converse check).
+
+**Method:** request-log forensics (hover idiom: CopyArea slice +
+tiled fill + CompositeGlyphs → CWA bg swap → ClearArea) → extended
+SIGUSR2 drawables dump (per-window `win-` leaves + env-gated
+`xid-` full-store sweep, `YSERVER_DUMP_ALL_DRAWABLES=1`) showed
+storage-vs-scanout agreement (scene exonerated) and the kept item
+pixmaps missing from the store → standalone probe
+(`tools/e16-glyph-probe.c`) reproduced 12/12 in vng → guards
+eliminated by HW A/B (frame-builder off @ `ea24914~1` still bad;
+pool-ineligible dims @ MAX_POOLED_DIM=128 still bad) → fix verified
+probe-green in vng + e16 menu/pager HW-verified on silence.
+
+**Still open (characterized, separate fixes):**
+- SHAPE depth-1 masks: v2 has no `read_depth1_pixmap` impl (the v1
+  one died with `035cc9b`); all ShapeMask requests degrade to a
+  bounding-box rect AND `2a31500` now clips window draws to that
+  degraded shape. e16 detects the wrong GetRectangles reply and
+  clears the shape (recovery path).
+- `YSERVER_FRAME_BUILDER=off` kill-switch is bit-rotted: assert in
+  `close_open_frame` (engine.rs:1437) at startup.
+- XkbGetNames reply stuffs zero atoms + bits the client didn't
+  request; libX11 clients GetAtomName(0) → BadAtom → exit (kills
+  xdotool; blocks e16-under-vng repros).
+- Connection setup advertises `max-keycode=0`; Composite
+  GetOverlayWindow returns 0.

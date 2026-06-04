@@ -1254,7 +1254,20 @@ fn destroy_window_subtree(
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
 
+    // Same orphan rule as the CWA bg-replacement path: the destroyed
+    // subtree's retained bg pixmaps may still be client-owned (FreePixmap
+    // not yet issued) or referenced as the background of windows OUTSIDE
+    // the subtree (resources.destroy_window already ran, so the check
+    // sees only surviving windows). Free only the fully orphaned ones.
     for xid in &bg_pixmap_xids {
+        let Some(handle) = crate::backend::PixmapHandle::from_raw(*xid) else {
+            continue;
+        };
+        if state.resources.host_xid_referenced_by_window_bg(handle)
+            || state.resources.host_xid_owned_by_pixmap(handle)
+        {
+            continue;
+        }
         let _ = backend.free_pixmap(origin, *xid);
     }
     for entry in pending {
@@ -10762,10 +10775,19 @@ fn handle_change_window_attributes(
     let target_window = request.window;
     let cursor_id = request.cursor;
     let previous_bg_host_xid = state.resources.change_window_attributes(request);
+    // Release the replaced bg pixmap on the host ONLY if it is fully
+    // orphaned: no other window background references it AND the client
+    // no longer owns it (FreePixmap already happened — at which point
+    // handle_free_pixmap skipped the host free because the bg reference
+    // was still live). Freeing while the client still owns the pixmap
+    // destroyed it server-side: e16 menu items blanked on hover because
+    // the bg swap to the hilite pixmap host-freed the kept "normal"
+    // pixmap the un-hover restore then pointed back at.
     if let Some(old_host_xid) = previous_bg_host_xid
         && !state
             .resources
             .host_xid_referenced_by_window_bg(old_host_xid)
+        && !state.resources.host_xid_owned_by_pixmap(old_host_xid)
     {
         let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
     }
