@@ -75,15 +75,27 @@ totalled 1438 PASS over a smaller scenario set. This run is the first
 with the Xt/Xopen/XI sections included and the first to complete
 end-to-end.
 
-## rendercheck
+## rendercheck — bare-metal 2026-06-04, rendercheck 1.6, 900 s/test
 
-A fresh rendercheck run against yserver/KMS is underway on another
-machine (2026-06-04); numbers land here when it finishes.
+| category    |  PASS | TOTAL |
+|-------------|------:|------:|
+| fill        |    64 |    64 |
+| dcoords     |     2 |     2 |
+| scoords     |     1 |     1 |
+| mcoords     |     1 |     1 |
+| tscoords    |     2 |     2 |
+| tmcoords    |     2 |     2 |
+| blend       |     5 |     5 |
+| composite   |     5 |     5 |
+| cacomposite |     5 |     5 |
+| gradients   |  6081 |  6081 |
+| repeat      |   380 |   380 |
+| triangles   |   570 |   570 |
+| bug7366     |     1 |     1 |
+| **total**   | **7119** | **7119** |
 
-Last known (bare-metal 2026-05-10, rendercheck 1.6, 600 s/test):
-4470/4470 with composite + cacomposite INCOMPLETE on the 600 s
-budget; ynest reference 4478/4478 (100%).
+**100% pass.**
 
-> Use rendercheck ≥ 1.6. 1.5 has a bug in
+> Use rendercheck ≥ 1.6. Version 1.5 has a bug in
 > `gradients::render_to_gradient_test` that trips even against the
 > host X server.
