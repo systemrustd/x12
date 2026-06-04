@@ -33,49 +33,49 @@ TESTS=${3:-fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomp
 RENDERCHECK="${RENDERCHECK_BIN:-rendercheck}"
 
 if ! command -v "$RENDERCHECK" >/dev/null 2>&1 && ! [ -x "$RENDERCHECK" ]; then
-    echo "error: rendercheck not on PATH (pacman -S rendercheck) and \$RENDERCHECK_BIN not set" >&2
-    exit 1
+	echo "error: rendercheck not on PATH (pacman -S rendercheck) and \$RENDERCHECK_BIN not set" >&2
+	exit 1
 fi
 
 if ! DISPLAY="$DISPLAY_ARG" timeout 5 xdpyinfo >/dev/null 2>&1; then
-    echo "error: cannot connect to $DISPLAY_ARG" >&2
-    exit 2
+	echo "error: cannot connect to $DISPLAY_ARG" >&2
+	exit 2
 fi
 
-xset s off -dpms
+DISPLAY=$DISPLAY_ARG xset s off -dpms
 declare -i total_pass=0 total_seen=0 incomplete=0
 
 printf "%-14s %8s %8s %s\n" "test" "pass" "total" "status"
 printf "%-14s %8s %8s %s\n" "----" "----" "-----" "------"
 
-IFS=',' read -ra test_list <<< "$TESTS"
+IFS=',' read -ra test_list <<<"$TESTS"
 for t in "${test_list[@]}"; do
-    out=$(DISPLAY="$DISPLAY_ARG" timeout "$TIMEOUT" \
-        "$RENDERCHECK" -v -t "$t" --minimalrendering 2>&1) || rc=$?
-    LOG_DIR="/home/jos/Projects/yserver/target/rc-logs"
-    mkdir -p "$LOG_DIR" 2>/dev/null
-    echo "$out" > "$LOG_DIR/rc-$t.log" 2>/dev/null || true
-    rc=${rc:-0}
-    summary=$(echo "$out" | grep -E "tests passed of [0-9]+" | tail -1 || true)
-    if [[ -z "$summary" ]]; then
-        printf "%-14s %8s %8s %s\n" "$t" "?" "?" "INCOMPLETE (rc=$rc)"
-        incomplete+=1
-        continue
-    fi
-    pass=$(echo "$summary" | grep -oE "^[0-9]+")
-    tot=$(echo "$summary" | grep -oE "of [0-9]+" | grep -oE "[0-9]+")
-    total_pass+=$pass
-    total_seen+=$tot
-    status="OK"
-    if [[ $rc -eq 124 ]]; then
-        status="TIMEOUT-after-${TIMEOUT}s"
-    elif [[ $rc -ne 0 ]]; then
-        status="FAIL (rc=$rc)"
-    elif [[ "$pass" != "$tot" ]]; then
-        status="MISMATCH"
-    fi
-    printf "%-14s %8d %8d %s\n" "$t" "$pass" "$tot" "$status"
-    rc=0
+	out=$(DISPLAY="$DISPLAY_ARG" timeout "$TIMEOUT" \
+		"$RENDERCHECK" -v -t "$t" --minimalrendering 2>&1) || rc=$?
+	LOG_DIR="/home/jos/Projects/yserver/target/rc-logs"
+	mkdir -p "$LOG_DIR" 2>/dev/null
+	echo "$out" >"$LOG_DIR/rc-$t.log" 2>/dev/null || true
+	rc=${rc:-0}
+	summary=$(echo "$out" | grep -E "tests passed of [0-9]+" | tail -1 || true)
+	if [[ -z "$summary" ]]; then
+		printf "%-14s %8s %8s %s\n" "$t" "?" "?" "INCOMPLETE (rc=$rc)"
+		incomplete+=1
+		continue
+	fi
+	pass=$(echo "$summary" | grep -oE "^[0-9]+")
+	tot=$(echo "$summary" | grep -oE "of [0-9]+" | grep -oE "[0-9]+")
+	total_pass+=$pass
+	total_seen+=$tot
+	status="OK"
+	if [[ $rc -eq 124 ]]; then
+		status="TIMEOUT-after-${TIMEOUT}s"
+	elif [[ $rc -ne 0 ]]; then
+		status="FAIL (rc=$rc)"
+	elif [[ "$pass" != "$tot" ]]; then
+		status="MISMATCH"
+	fi
+	printf "%-14s %8d %8d %s\n" "$t" "$pass" "$tot" "$status"
+	rc=0
 done
 
 printf "%-14s %8s %8s %s\n" "----" "----" "-----" "------"
