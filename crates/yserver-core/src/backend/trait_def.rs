@@ -1623,11 +1623,19 @@ pub trait Backend: Send {
         pattern: &str,
     ) -> io::Result<Vec<u8>>;
 
+    /// `intern_atom` lets the backend attach font properties whose
+    /// values are atoms — most importantly `FONT` (XA_FONT=18)
+    /// carrying the resolved XLFD name. libX11's `XCreateFontSet`
+    /// resolves non-XLFD base names ("fixed") EXCLUSIVELY through the
+    /// first reply's FONT property (`omGeneric.c get_prop_name` →
+    /// `XGetFontProperty(fs, XA_FONT)` + `XGetAtomName`); without it
+    /// the locale charset reports missing and the fontset is NULL.
     fn list_fonts_with_info_proxy(
         &mut self,
         origin: Option<OriginContext>,
         max_names: u16,
         pattern: &str,
+        intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>>;
 
     fn get_atom_name(

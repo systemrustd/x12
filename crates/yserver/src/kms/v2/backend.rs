@@ -12349,6 +12349,7 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         max_names: u16,
         pattern: &str,
+        intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>> {
         let cap = usize::from(max_names);
         let matched: Vec<String> = self
@@ -12364,7 +12365,30 @@ impl Backend for KmsBackendV2 {
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
         for name in matched {
             match self.core.font_loader.open_font(&name) {
-                Ok((_face, metrics, _cache)) => entries.push((name, metrics)),
+                Ok((_face, mut metrics, _cache)) => {
+                    // Alias entries ("fixed"/"cursor"/"nil2") must go
+                    // out under a full XLFD name so XCreateFontSet can
+                    // parse a charset and re-open the exact name —
+                    // see FontLoader::alias_to_xlfd (e16-in-vng
+                    // XCreateFontSet NULL regression).
+                    let wire_name = if crate::kms::core::FontLoader::is_xlfd_pattern(&name) {
+                        name
+                    } else {
+                        crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
+                    };
+                    // FONT property (XA_FONT=18 → atom of the XLFD).
+                    // libX11's XCreateFontSet resolves non-XLFD base
+                    // names EXCLUSIVELY through this property
+                    // (omGeneric.c get_prop_name reads XA_FONT off the
+                    // first reply and GetAtomName's it); the reply
+                    // name alone is not consulted on that path.
+                    let font_atom = intern_atom(&wire_name);
+                    let mut props = Vec::with_capacity(8);
+                    props.extend_from_slice(&18u32.to_le_bytes()); // XA_FONT
+                    props.extend_from_slice(&font_atom.to_le_bytes());
+                    metrics.properties = props;
+                    entries.push((wire_name, metrics));
+                }
                 Err(err) => {
                     log::debug!("v2 ListFontsWithInfo: skipping {name:?} — open_font: {err}");
                 }
@@ -13012,12 +13036,84 @@ mod tests {
     fn v2_list_fonts_with_info_proxy_emits_terminator() {
         let mut b = KmsBackendV2::for_tests();
         let replies = b
-            .list_fonts_with_info_proxy(None, 4, "*")
+            .list_fonts_with_info_proxy(None, 4, "*", &mut |_| 0x99)
             .expect("list_fonts_with_info");
         assert!(!replies.is_empty(), "terminator reply must be present");
         let terminator = replies.last().expect("terminator");
         assert_eq!(terminator[0], 1);
         assert_eq!(terminator[1], 0);
+    }
+
+    /// `XCreateFontSet("fixed")` regression (e16-in-vng silent exit):
+    /// libX11's XLC takes the XLFD from the ListFontsWithInfo reply
+    /// NAME (or the FONT property), parses the charset from the last
+    /// two fields, and `OpenFont`s that name verbatim — verified by
+    /// tracing the probe against Xephyr (`tools/fontset-trace-xephyr.sh`:
+    /// LFWI('fixed') → name/-FONT atom
+    /// '-Misc-Fixed-…-C-60-ISO8859-1' → OpenFont(same)). A bare
+    /// alias name carries no charset, so XLC reports the C-locale
+    /// charset missing and returns a NULL fontset; e16 exits.
+    ///
+    /// Pin: an alias match must reply with a full XLFD name whose
+    /// registry-encoding tail is iso8859-1, and that exact name must
+    /// round-trip through open_font.
+    #[test]
+    fn v2_list_fonts_with_info_resolves_alias_to_xlfd_name() {
+        let mut b = KmsBackendV2::for_tests();
+        let mut interned: Vec<String> = Vec::new();
+        let replies = b
+            .list_fonts_with_info_proxy(None, 100, "fixed", &mut |name| {
+                interned.push(name.to_owned());
+                0x77 + u32::try_from(interned.len()).unwrap()
+            })
+            .expect("list_fonts_with_info");
+        assert!(
+            replies.len() >= 2,
+            "at least one info reply + terminator; got {}",
+            replies.len()
+        );
+        // LFWI info reply layout: name_len at byte 1, nProperties at
+        // bytes 46..48, properties (8 bytes each) at 60.., then name.
+        let info = &replies[0];
+        let name_len = usize::from(info[1]);
+        let n_props = usize::from(u16::from_le_bytes([info[46], info[47]]));
+        assert_eq!(n_props, 1, "exactly the FONT property");
+        let prop_name = u32::from_le_bytes([info[60], info[61], info[62], info[63]]);
+        let prop_value = u32::from_le_bytes([info[64], info[65], info[66], info[67]]);
+        assert_eq!(prop_name, 18, "property name must be XA_FONT (18)");
+        assert_eq!(
+            prop_value, 0x78,
+            "FONT property value must be the interned atom of the XLFD"
+        );
+        let name_off = 60 + n_props * 8;
+        let name = std::str::from_utf8(&info[name_off..name_off + name_len]).expect("utf8 name");
+        assert_eq!(
+            interned.first().map(String::as_str),
+            Some(name),
+            "the interned FONT string must be the wire name itself"
+        );
+        assert!(
+            name.starts_with('-'),
+            "alias 'fixed' must resolve to a full XLFD reply name; got {name:?}"
+        );
+        let fields: Vec<&str> = name.split('-').collect();
+        assert_eq!(
+            fields.len(),
+            15,
+            "XLFD has 14 fields (15 split parts with the leading dash); got {name:?}"
+        );
+        assert_eq!(
+            (fields[13], fields[14]),
+            ("iso8859", "1"),
+            "charset registry-encoding tail must be iso8859-1 so the \
+             C-locale XLC charset binds; got {name:?}"
+        );
+        // The exact reply name must be openable — XCreateFontSet
+        // OpenFonts it verbatim.
+        b.core
+            .font_loader
+            .open_font(name)
+            .expect("synthesized XLFD must round-trip through open_font");
     }
 
     /// Telemetry: counter sites fire at the Backend trait

@@ -1119,6 +1119,10 @@ impl Backend for HostX11Backend {
         origin: Option<OriginContext>,
         max_names: u16,
         pattern: &str,
+        // Host-X11 proxy forwards the host server's replies verbatim
+        // (the host already attaches FONT properties); no atoms to
+        // intern on this side.
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::list_fonts_with_info_proxy(this, max_names, pattern)

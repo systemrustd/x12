@@ -15157,9 +15157,21 @@ fn handle_list_fonts_with_info(
             "client {} #{} ListFontsWithInfo max={} pattern={:?}",
             client_id.0, sequence.0, request.max_names, request.pattern
         );
-        if let Ok(replies) =
-            backend.list_fonts_with_info_proxy(origin, request.max_names, &request.pattern)
-        {
+        // Thread the atom interner so the backend can attach the FONT
+        // property (value = atom of the resolved XLFD) — XCreateFontSet
+        // resolves non-XLFD base names exclusively through it. Same
+        // disjoint-borrow pattern as handle_xkb_request.
+        let replies = {
+            let atoms = &mut state.atoms;
+            let mut intern = |name: &str| atoms.intern(name, false).0;
+            backend.list_fonts_with_info_proxy(
+                origin,
+                request.max_names,
+                &request.pattern,
+                &mut intern,
+            )
+        };
+        if let Ok(replies) = replies {
             debug!(
                 "client {} #{} ListFontsWithInfo → {} replies (incl. terminator)",
                 client_id.0,

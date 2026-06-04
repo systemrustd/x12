@@ -120,6 +120,36 @@ impl FontLoader {
         name.starts_with('-')
     }
 
+    /// Resolve a bare alias catalog entry ("fixed", "cursor", "nil2")
+    /// to a full XLFD built from the resolved face's REAL metrics.
+    ///
+    /// `XCreateFontSet` clients need a charset to bind: libX11's XLC
+    /// reads the XLFD from the `ListFontsWithInfo` reply name (or the
+    /// `FONT` property), takes registry-encoding from the last two
+    /// fields, and `OpenFont`s that name verbatim (traced against
+    /// Xephyr — `tools/fontset-trace-xephyr.sh`). A bare alias name
+    /// has no charset → the C-locale ISO8859-1 set can't bind → NULL
+    /// fontset → e16 exits silently. The synthesized name round-trips
+    /// through [`Self::open_font`]: `parse_xlfd` recovers the alias as
+    /// the family (falling through fontconfig's monospace chain) and
+    /// the pixel size.
+    pub(crate) fn alias_to_xlfd(alias: &str, metrics: &FontMetrics) -> String {
+        let px = i32::from(metrics.font_ascent)
+            .saturating_add(i32::from(metrics.font_descent))
+            .max(1);
+        // XLFD AVERAGE_WIDTH is in tenths of pixels.
+        let avg_w = i32::from(metrics.max_bounds.character_width).max(1) * 10;
+        let spacing = if metrics.min_bounds.character_width == metrics.max_bounds.character_width {
+            "c"
+        } else {
+            "p"
+        };
+        format!(
+            "-misc-{alias}-medium-r-normal--{px}-{}-75-75-{spacing}-{avg_w}-iso8859-1",
+            px * 10,
+        )
+    }
+
     /// Pull (family, style, pixel_size) hints out of an XLFD pattern.
     /// XLFD field indices after splitting on '-' (leading '-' produces an
     /// empty 0th element):

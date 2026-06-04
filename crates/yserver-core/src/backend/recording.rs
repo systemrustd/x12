@@ -1185,6 +1185,7 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         _max_names: u16,
         _pattern: &str,
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>> {
         Ok(Vec::new())
     }
