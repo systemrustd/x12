@@ -4330,3 +4330,108 @@ grab-protocol XI2 gate; mass event-delivery FAILs → WarpPointer on
 KMS. The earlier "20-min timeout" mystery at Xlib12/XMaskEvent was
 the recipe's default `timeout=1200` budget for the WHOLE run, not a
 yserver bug.
+
+## Xlib9 bulk-drawing — second-fill drops between scene composes (open, 2026-06-04)
+
+**Symptom (vng, all ICDs).** `just xts-yserver Xlib9` on silence
+reproduces eiger's 970/1472 FAIL (180 PASS — within noise of the
+2026-06-04 baseline). Per-TCM the fails concentrate in stroke/fill
+ops: XDrawLines 73, XDrawArcs 68, XDrawSegments 65, XDrawLine 65,
+XDrawArc 61, XDrawRectangles 56, … — every drawing TCM fails most
+of its assertions. Even **XFillRectangle TP1** (the simplest "draw
+rect, GetImage, compare" — no GC iteration, no plane-mask) FAILs
+with an all-zero `bad` image (`Err000?.err`: `2328,0` = 9000 pixels
+of 0 across depth-1/8/24/32). The drawing didn't survive to the
+readback.
+
+**Cluster analysis (per-FAIL REPORT line):** 273 gx-raster-op
+("GX* fail expected V, got V" — every drawing TCM × ~15 GX ops),
+114 missing-error ("Got Success, Expecting BadDrawable/BadGC/
+BadMatch/BadValue"), 536 "other" (pixel-mismatch from line/arc
+geometry). Cluster tool: `awk '$1=="220"&&$3=="FAIL"' …/journal`
++ classify by REPORT regex (full pipeline in this session's log).
+
+**What I traced in vng** (`yserver-fb*.log` + per-rect `EMIT
+FillRect` log added during diagnosis, removed before commit):
+
+For XFillRectangle TP1, depth-24 window xid 0x400004, DrawableId(4):
+
+1. `allocate_window_storage` enqueues fill #1 (init, color
+   `[0,0,0,1]`, rect `(0,0 100×90)`) into frame `gen=3`.
+2. `maybe_composite` fires → closes frame `gen=3`
+   (`reason=LegacyScCompose`) and submits its CB.
+3. Scene compose's `record_compose_v2` samples DrawableId(4)
+   (SHADER_READ_ONLY_OPTIMAL) into the scanout BO.
+4. Client's XFillRectangle → backend.poly_fill_rectangle →
+   fill_solid_rects → engine.fill_rect_batch records fill #2
+   (color `[0,0,1/255,1]`, rect `(20,30 70×30)`) into a new
+   frame `gen=4`. `EMIT FillRect` log confirms **same image
+   handle, same image_view, old_layout=SHADER_READ_ONLY_OPTIMAL,
+   correct color, correct rect, correct extent (100×90)**.
+5. `maybe_composite` fires AGAIN → closes frame `gen=4`
+   (`reason=LegacyScCompose`) and submits its CB.
+6. Scene compose samples DrawableId(4) again.
+7. GetImage → engine.get_image → readback CB → `ticket.wait()`.
+8. Staging buffer reads as **`00 00 00 ff` everywhere** —
+   fill #2's pixels nowhere in storage; only fill #1's effect
+   survived.
+
+So at the yserver API surface, fill #2 is correctly recorded and
+its CB is submitted before the readback. The pixels just don't
+land. Confirmed both with Venus (`venus=true` virtio-vga-gl) and
+with `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
+forcing lavapipe → identical FAIL set, so it's **not** a Venus /
+virgl_renderer / amdgpu issue.
+
+**Distillation attempt** (`v2_two_fills_then_get_image_returns_
+second_fill` in `tests/v2_acceptance.rs`): backend-level repro —
+`KmsBackendV2::for_tests_with_vk()` + `create_subwindow` (depth-24,
+100×90, bg_pixel=0) + `map_subwindow` + `poly_fill_rectangle` at
+(20,30 70×30) with fg=1 + `get_image_pixels_for_tests`. The init
+fill from `allocate_window_storage` plus the XCALL PFR gives the
+same 2-fill shape as XTS. **Test PASSES on host AND inside vng
+(Venus).** So the bug is **not reachable** from a backend-level
+two-fills-then-readback sequence — the difference is that scene
+compose actually fires between fills in the live XTS run (in tests
+`kms_outputs_active=false` and `maybe_composite` short-circuits).
+
+**Working hypothesis.** Something at the
+**scene-compose ↔ next-paint-frame boundary** drops fill #2's
+writes. Candidates:
+- A barrier / access-mask hazard: compose's sample completes
+  later than expected, and fill #2's pre-barrier
+  (`src_stage=ALL_COMMANDS`, `src_access=SHADER_SAMPLED_READ |
+  TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE`) doesn't drain it
+  before the layout transition. The barrier masks LOOK right but
+  may be wrong against compose's actual queue submit.
+- A submit-ordering bug: `close_open_frame`'s
+  `flush_submit_group(FrameBuilder)` parks fill #2's CB into
+  `pending_group_ops` and then submits — but maybe the SceneCompose
+  flush that fires next clobbers or reorders something.
+- Storage aliasing: the `dst_image_view` recorded into fill #2's
+  `RecordedFillRect` becomes stale by submit time (recycled by
+  the pixmap pool, etc.).
+- A subtle render-pass issue with cmd_clear_attachments on a
+  partial rect when LOAD_OP=LOAD pulls in contents that compose
+  already sampled.
+
+**What the next session needs to do.** Either:
+- Build a unit-test repro that DRIVES scene compose between the
+  two fills (needs a way to force `kms_outputs_active=true` or
+  call `scene.tick`/`record_compose_v2` directly from the test);
+  or
+- Add a structured submit-event log (every `vkQueueSubmit2` with
+  CB handle, attached barriers, image handles touched) and rerun
+  XFillRectangle TCM in vng, then diff against a known-good Xorg
+  sequence under `xtrace`.
+
+Paused this session because each cycle costs ~30 s vng boot +
+TCM, and the next step is sync-layer work that wants careful
+diff-by-diff iteration. The investigation tool added is
+permanent: the failing-second-fill negative-result test plus the
+cluster table above. Unbreaking this likely unlocks ~800 of the
+Xlib9 970 FAILs in one shot (273 gx-raster-op + ~500 of "other"
+which are also two-fill verifications).
+
+Pivoting to the smaller `missing-error` cluster next (114 fails,
+deterministic, no Vulkan involvement).

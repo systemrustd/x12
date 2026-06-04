@@ -11406,6 +11406,98 @@ fn supported_pixmap_depth(depth: u8) -> bool {
     matches!(depth, 1 | 4 | 8 | 24 | 32)
 }
 
+/// Resolve a `Drawable` resource id to its kind + depth for error
+/// validation. Mirrors Xorg's `dixLookupDrawable` shape: the four
+/// outcomes the spec distinguishes.
+enum DrawableLookup {
+    InputOutputWindow { depth: u8 },
+    InputOnlyWindow,
+    Pixmap { depth: u8 },
+    Missing,
+}
+
+fn drawable_lookup(state: &ServerState, id: ResourceId) -> DrawableLookup {
+    if let Some(w) = state.resources.window(id) {
+        return match w.class {
+            crate::resources::WindowClass::InputOnly => DrawableLookup::InputOnlyWindow,
+            // `CopyFromParent` / `Other` only show up pre-CreateWindow
+            // resolution and shouldn't be reachable for a registered window;
+            // treat them the same as the regular InputOutput case.
+            crate::resources::WindowClass::InputOutput
+            | crate::resources::WindowClass::CopyFromParent
+            | crate::resources::WindowClass::Other(_) => {
+                DrawableLookup::InputOutputWindow { depth: w.depth }
+            }
+        };
+    }
+    if let Some(p) = state.resources.pixmap(id) {
+        return DrawableLookup::Pixmap { depth: p.depth };
+    }
+    DrawableLookup::Missing
+}
+
+/// Depth of any drawable (window or pixmap) by resource id, or `None`
+/// if the id doesn't resolve. Used to look up a GC's creation-time
+/// depth via the stored `gc.drawable`.
+fn resource_drawable_depth(state: &ServerState, id: ResourceId) -> Option<u8> {
+    state
+        .resources
+        .window(id)
+        .map(|w| w.depth)
+        .or_else(|| state.resources.pixmap(id).map(|p| p.depth))
+}
+
+/// Result of validating (drawable, gc) for a paint request. The
+/// shape mirrors Xorg's `VALIDATE_DRAWABLE_AND_GC` macro: emit
+/// BadDrawable, BadMatch (inputonly), BadGC, or BadMatch
+/// (gc-drawable-depth) in that priority order.
+///
+/// `gc-drawable-screen` is not modelled — yserver has one screen
+/// so the BadMatch-screen case is structurally unreachable, and
+/// XTS marks the corresponding TPs UNSUPPORTED on a single-screen
+/// server already.
+fn validate_drawable_and_gc(
+    state: &ServerState,
+    drawable: ResourceId,
+    gc: ResourceId,
+) -> Result<(), (u8, u32)> {
+    let target_depth = match drawable_lookup(state, drawable) {
+        DrawableLookup::InputOutputWindow { depth } | DrawableLookup::Pixmap { depth } => depth,
+        DrawableLookup::InputOnlyWindow => return Err((x11::error::BAD_MATCH, 0)),
+        DrawableLookup::Missing => return Err((x11::error::BAD_DRAWABLE, drawable.0)),
+    };
+    let Some(gc_entry) = state.resources.gc(gc) else {
+        return Err((x11::error::BAD_GC, gc.0));
+    };
+    // GC depth = depth of the drawable the GC was created against
+    // (X11: a GC's depth is fixed at CreateGC and matches its origin
+    // drawable's depth). If the origin drawable has since been freed,
+    // we can't recover its depth and skip the check — Xorg keeps
+    // the depth in the GC struct itself; until we do the same, a
+    // missing origin drawable means we silently accept the request
+    // rather than emit a spurious BadMatch.
+    if let Some(gc_depth) = resource_drawable_depth(state, gc_entry.drawable)
+        && gc_depth != target_depth
+    {
+        return Err((x11::error::BAD_MATCH, 0));
+    }
+    Ok(())
+}
+
+/// Sibling of [`validate_drawable_and_gc`] for paint ops that consume
+/// a drawable WITHOUT a GC depth-match constraint — the `src` side of
+/// `CopyPlane`, for instance, where any depth is acceptable because
+/// the plane mask extracts a single bit from whatever the source is.
+/// Still emits BadDrawable for missing and BadMatch for `InputOnly`
+/// windows.
+fn validate_drawable_only(state: &ServerState, drawable: ResourceId) -> Result<(), (u8, u32)> {
+    match drawable_lookup(state, drawable) {
+        DrawableLookup::InputOutputWindow { .. } | DrawableLookup::Pixmap { .. } => Ok(()),
+        DrawableLookup::InputOnlyWindow => Err((x11::error::BAD_MATCH, 0)),
+        DrawableLookup::Missing => Err((x11::error::BAD_DRAWABLE, drawable.0)),
+    }
+}
+
 /// Encode an X11 protocol error and ship it to the client through
 /// `client_io::write_or_buffer`. Mirrors `nested::emit_x11_error` but
 /// operates on the new `&mut ClientState` plumbing.
@@ -12759,31 +12851,13 @@ fn handle_put_image(
         request.depth,
         request.format,
     );
-    let gc_exists = state.resources.gc(request.gc).is_some();
-    let drawable_exists = state.resources.window(request.drawable).is_some()
-        || state.resources.pixmap(request.drawable).is_some();
+    if let Err((code, bad_value)) =
+        validate_drawable_and_gc(state, request.drawable, request.gc)
+    {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 72);
+    }
     let draw_state = state.resources.resolve_draw_state(request.gc);
     let target = state.resources.host_drawable_target(request.drawable);
-    if !gc_exists {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_GC,
-            request.gc.0,
-            72,
-        );
-    }
-    if !drawable_exists {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_DRAWABLE,
-            request.drawable.0,
-            72,
-        );
-    }
     if request.format != x11::ImageFormat::ZPixmap {
         return Ok(RequestOutcome::Handled);
     }
@@ -12974,6 +13048,11 @@ fn handle_image_text8(
         debug!("focus text drawable 0x{drawable_raw:x}");
         set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 76);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -13008,6 +13087,11 @@ fn handle_image_text16(
         debug!("focus text drawable 0x{drawable_raw:x}");
         set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 77);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -13972,6 +14056,11 @@ fn handle_poly_text8(
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 74);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -13996,6 +14085,11 @@ fn handle_poly_text16(
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 75);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14023,6 +14117,11 @@ fn handle_poly_point(
         let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let points = &body[8..];
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 64);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14068,6 +14167,11 @@ fn handle_poly_line(
     if let Some((gc_id, points)) = x11::poly_line_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 65);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14104,6 +14208,11 @@ fn handle_poly_segment(
     if let Some((gc_id, segments)) = x11::poly_segment_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 66);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14134,6 +14243,11 @@ fn handle_poly_rectangle(
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 67);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14164,6 +14278,11 @@ fn handle_poly_arc(
     if let Some((gc_id, arcs)) = x11::poly_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 68);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14196,6 +14315,11 @@ fn handle_fill_poly(
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let coord_mode = body[9];
         let points = &body[12..];
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 69);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14231,6 +14355,11 @@ fn handle_poly_fill_rectangle(
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 70);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14267,6 +14396,11 @@ fn handle_poly_fill_arc(
     if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
+        if let Err((code, bad_value)) =
+            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        {
+            return emit_x11_error(state, client_id, sequence, code, bad_value, 71);
+        }
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
@@ -14400,44 +14534,21 @@ fn handle_copy_area(
         request.width,
         request.height
     );
-    let gc_exists = state.resources.gc(request.gc).is_some();
-    let src_exists = state.resources.window(request.src).is_some()
-        || state.resources.pixmap(request.src).is_some();
-    let dst_exists = state.resources.window(request.dst).is_some()
-        || state.resources.pixmap(request.dst).is_some();
+    // Validate src + dst + gc together. Order mirrors Xorg's
+    // VALIDATE_DRAWABLE_AND_GC: src-side first (BadDrawable / BadMatch
+    // inputonly), then GC (BadGC), then dst-side, then cross-depth
+    // (BadMatch). Note: each call covers BadGC; the second is a
+    // redundant lookup but the cost is tiny and the deduplicated form
+    // would obscure the per-side error ordering Xorg follows.
+    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.src, request.gc) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 62);
+    }
+    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.dst, request.gc) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 62);
+    }
     let draw_state = state.resources.resolve_draw_state(request.gc);
     let src = state.resources.host_drawable_target(request.src);
     let dst = state.resources.host_drawable_target(request.dst);
-    if !gc_exists {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_GC,
-            request.gc.0,
-            62,
-        );
-    }
-    if !src_exists {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_DRAWABLE,
-            request.src.0,
-            62,
-        );
-    }
-    if !dst_exists {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_DRAWABLE,
-            request.dst.0,
-            62,
-        );
-    }
     if let (Some(src), Some(dst)) = (src.as_ref(), dst.as_ref()) {
         if src.depth() != dst.depth() {
             return emit_x11_error(
@@ -14808,13 +14919,17 @@ fn handle_copy_plane(
     if w == 0 || h == 0 {
         return Ok(RequestOutcome::Handled);
     }
-    let gc_exists = state.resources.gc(gc).is_some();
+    // CopyPlane: dst.depth must match gc.depth; src can be any depth
+    // (the plane mask extracts a single bit from src).
+    if let Err((code, bad_value)) = validate_drawable_only(state, src) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 63);
+    }
+    if let Err((code, bad_value)) = validate_drawable_and_gc(state, dst, gc) {
+        return emit_x11_error(state, client_id, sequence, code, bad_value, 63);
+    }
     let draw_state = state.resources.resolve_draw_state(gc);
     let src_target = state.resources.host_drawable_target(src);
     let dst_target = state.resources.host_drawable_target(dst);
-    if !gc_exists {
-        return emit_x11_error(state, client_id, sequence, x11::error::BAD_GC, gc.0, 63);
-    }
     if let (Some(srct), Some(dstt)) = (src_target, dst_target) {
         let st = draw_state.unwrap_or_default();
         backend.apply_clip_state(origin, &st.clip)?;

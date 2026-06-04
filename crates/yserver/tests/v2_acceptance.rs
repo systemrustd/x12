@@ -5819,3 +5819,96 @@ fn v2_read_depth1_pixmap_declines_depth32() {
     let got = b.read_depth1_pixmap(None, xid).expect("read_depth1_pixmap");
     assert!(got.is_none(), "depth-32 drawable must decline, got {got:?}");
 }
+
+/// xts5 Xlib9/XFillRectangle TP1 minimal repro: two consecutive
+/// `PolyFillRectangle` calls — first a full-drawable background clear
+/// (mimicking the Map-time fill that the X server applies to a freshly
+/// mapped window), then a small foreground rectangle at (20, 30, 70x30)
+/// — followed by `GetImage` over the whole drawable. The second fill's
+/// pixels MUST be visible in the readback; outside the rect, the
+/// background must show through.
+///
+/// In a vng XTS run on 2026-06-04 every TP1 fail showed an all-zero
+/// `bad` image — the first fill landed, the second fill vanished. This
+/// test captures that exact sequence so the bug can be bisected
+/// against `cargo test` instead of a 20s vng cycle.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_two_fills_then_get_image_returns_second_fill() {
+    use yserver_core::{
+        backend::WindowHandle,
+        host_x11::HostSubwindowVisual,
+    };
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Create a depth-24 child window at 0,0 sized 100×90, with
+    // background_pixel=W_BG=0 — matches makewin's setup.
+    // allocate_window_storage's init fill is the equivalent of the
+    // first fill we see in the XTS trace.
+    let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
+    let win = b
+        .create_subwindow(
+            None,
+            parent,
+            0,
+            0,
+            100,
+            90,
+            1,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            Some(0x0000_0000), // W_BG = 0
+            None,
+        )
+        .expect("create_subwindow");
+    let xid = win.as_raw();
+    b.map_subwindow(None, xid).expect("map_subwindow");
+
+    // XCALL fill at (20, 30, 70, 30) with fg=W_FG=1 (pixel value 1).
+    let small_rect = {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i16::to_le_bytes(20));
+        buf.extend_from_slice(&i16::to_le_bytes(30));
+        buf.extend_from_slice(&u16::to_le_bytes(70));
+        buf.extend_from_slice(&u16::to_le_bytes(30));
+        buf
+    };
+    b.poly_fill_rectangle(None, xid, 0x0000_0001, &small_rect)
+        .expect("XCALL fill");
+
+    // GetImage the whole drawable as ZPixmap, AllPlanes.
+    let bytes = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 100, 90, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+    assert_eq!(
+        bytes.len(),
+        100 * 90 * 4,
+        "depth-24 ZPixmap reply is 4 bytes/pixel (BGRA wire)",
+    );
+
+    // Pixel inside the rect — (50, 45). Expect BGRA [0x01, 0, 0, *].
+    let inside = (45 * 100 + 50) * 4;
+    assert_eq!(
+        bytes[inside], 0x01,
+        "inside-rect B byte must be 1 (second fill landed); full pixel = {:02x?}",
+        &bytes[inside..inside + 4],
+    );
+
+    // Pixel outside the rect — (5, 5). Expect BGRA [0, 0, 0, *].
+    let outside = (5 * 100 + 5) * 4;
+    assert_eq!(
+        bytes[outside], 0x00,
+        "outside-rect B byte must be 0 (Map clear background); full pixel = {:02x?}",
+        &bytes[outside..outside + 4],
+    );
+}
