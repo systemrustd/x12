@@ -102,9 +102,16 @@ pub const STRING_EXTENSIONS: u32 = 3;
 /// queries the *server* string (opcode 19) and refuses to create a GLES
 /// context if `GLX_ARB_create_context` is absent — an empty server string
 /// there breaks Chromium even though opcode 18 carried the list.
+///
+/// Only advertise what the server actually backs: libGL computes the
+/// effective extension list as client ∩ server, so every entry here changes
+/// client behavior. `GLX_INTEL_swap_event` was advertised without the
+/// `glXSelectEvent`/`GLX_BufferSwapComplete` plumbing behind it — cogl
+/// (Cinnamon/muffin) then parked its frame clock waiting for swap events
+/// that never arrived, freezing the stage after one black frame.
 pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
     GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
-    GLX_INTEL_swap_event GLX_ARB_fbconfig_float GLX_EXT_visual_info \
+    GLX_ARB_fbconfig_float GLX_EXT_visual_info \
     GLX_EXT_visual_rating GLX_EXT_import_context";
 
 #[must_use]
@@ -641,6 +648,10 @@ mod tests {
         );
         let body = String::from_utf8_lossy(&reply);
         assert!(body.contains("GLX_ARB_create_context"));
+        // Regression (cinnamon black screen): GLX_INTEL_swap_event must NOT
+        // be advertised until glXSelectEvent + GLX_BufferSwapComplete
+        // delivery exist — cogl parks its frame clock on the event otherwise.
+        assert!(!SERVER_EXTENSIONS.contains("GLX_INTEL_swap_event"));
     }
 
     #[test]
