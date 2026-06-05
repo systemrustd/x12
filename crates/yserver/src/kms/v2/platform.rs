@@ -1350,7 +1350,7 @@ impl PlatformBackend {
     #[must_use]
     pub(crate) fn format_for_depth(depth: u8) -> vk::Format {
         match depth {
-            1 | 8 => vk::Format::R8_UNORM,
+            1 | 4 | 8 => vk::Format::R8_UNORM,
             24 | 32 => vk::Format::B8G8R8A8_UNORM,
             other => {
                 log::warn!(

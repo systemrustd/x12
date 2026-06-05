@@ -787,6 +787,7 @@ pub(crate) struct KmsCore {
     // Default GC state (the in-progress GC values feeding paint paths)
     pub(crate) current_font: Option<u32>,
     pub(crate) current_function: GcFunction,
+    pub(crate) current_plane_mask: u32,
     pub(crate) current_foreground: u32,
     pub(crate) current_background: u32,
     pub(crate) current_fill: FillState,
@@ -918,6 +919,7 @@ impl KmsCore {
             pending_pointer_events: Vec::new(),
             current_font: None,
             current_function: GcFunction::Copy,
+            current_plane_mask: u32::MAX,
             current_foreground: 0,
             current_background: 0x00ff_ffff,
             current_fill: FillState::Solid,
@@ -997,6 +999,7 @@ impl KmsCore {
             pending_pointer_events: Vec::new(),
             current_font: None,
             current_function: GcFunction::Copy,
+            current_plane_mask: u32::MAX,
             current_foreground: 0,
             current_background: 0x00ff_ffff,
             current_fill: FillState::Solid,

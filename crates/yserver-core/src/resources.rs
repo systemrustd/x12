@@ -1342,6 +1342,17 @@ impl ResourceTable {
             .any(|w| w.background_pixmap_host_xid == Some(host_xid))
     }
 
+    /// Returns true if any GC currently retains `host_xid` as its clip mask,
+    /// tile, or stipple backing. Used by FreePixmap to keep host-side pixmaps
+    /// alive after the client frees the source pixmap resource.
+    pub fn host_xid_referenced_by_gc(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.gcs.values().any(|gc| {
+            gc.clip_pixmap_host_xid == Some(host_xid)
+                || gc.tile_host_xid == Some(host_xid)
+                || gc.stipple_host_xid == Some(host_xid)
+        })
+    }
+
     /// Returns true if a live client pixmap resource still owns `host_xid`.
     ///
     /// X11 lifetime rule for window backgrounds: installing a pixmap as a
@@ -1416,8 +1427,25 @@ impl ResourceTable {
             Some(Some(pixmap)) => Some(pixmap),
             _ => None,
         };
+        let clip_pixmap_host_xid = clip_pixmap
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
         let mut gc = Gc::with_defaults(request.gc, request.drawable, owner);
+        gc.depth = self
+            .window(request.drawable)
+            .map(|w| w.depth)
+            .or_else(|| self.pixmap(request.drawable).map(|p| p.depth))
+            .unwrap_or(0);
+        gc.tile_host_xid = request
+            .tile
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
+        gc.stipple_host_xid = request
+            .stipple
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
         gc.clip_pixmap = clip_pixmap;
+        gc.clip_pixmap_host_xid = clip_pixmap_host_xid;
         Self::apply_gc_change(
             &mut gc,
             GcChangeView {
@@ -1455,6 +1483,19 @@ impl ResourceTable {
     }
 
     pub fn change_gc(&mut self, request: GcChange) {
+        let clip_pixmap_host_xid = request
+            .clip_mask
+            .flatten()
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
+        let tile_host_xid = request
+            .tile
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
+        let stipple_host_xid = request
+            .stipple
+            .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
+            .and_then(|p| p.host_xid);
         let gc = self
             .gcs
             .entry(request.gc.0)
@@ -1487,6 +1528,15 @@ impl ResourceTable {
                 arc_mode: request.arc_mode,
             },
         );
+        if request.clip_mask.is_some() {
+            gc.clip_pixmap_host_xid = clip_pixmap_host_xid;
+        }
+        if request.tile.is_some() {
+            gc.tile_host_xid = tile_host_xid;
+        }
+        if request.stipple.is_some() {
+            gc.stipple_host_xid = stipple_host_xid;
+        }
     }
 
     /// Apply the `Some`-valued attributes of a CreateGC / ChangeGC
@@ -1605,6 +1655,7 @@ impl ResourceTable {
             .or_insert_with(|| Gc::with_defaults(request.gc, ResourceId(0), SERVER_OWNER));
         // SetClipRectangles supersedes any prior clip-mask pixmap.
         gc.clip_pixmap = None;
+        gc.clip_pixmap_host_xid = None;
         gc.clip_rectangles = Some(request.clip);
     }
 
@@ -1612,6 +1663,7 @@ impl ResourceTable {
         if let Some(g) = self.gcs.get_mut(&gc.0) {
             g.clip_rectangles = None;
             g.clip_pixmap = None;
+            g.clip_pixmap_host_xid = None;
         }
     }
 
@@ -1657,9 +1709,11 @@ impl ResourceTable {
         }
         if value_mask & 0x0000_0400 != 0 {
             dst_gc.tile = src_gc.tile;
+            dst_gc.tile_host_xid = src_gc.tile_host_xid;
         }
         if value_mask & 0x0000_0800 != 0 {
             dst_gc.stipple = src_gc.stipple;
+            dst_gc.stipple_host_xid = src_gc.stipple_host_xid;
         }
         if value_mask & 0x0000_1000 != 0 {
             dst_gc.tile_x_origin = src_gc.tile_x_origin;
@@ -1689,6 +1743,7 @@ impl ResourceTable {
             // rectangle-list cannot coexist).
             dst_gc.clip_rectangles = src_gc.clip_rectangles.clone();
             dst_gc.clip_pixmap = src_gc.clip_pixmap;
+            dst_gc.clip_pixmap_host_xid = src_gc.clip_pixmap_host_xid;
         }
         if value_mask & 0x0010_0000 != 0 {
             dst_gc.dash_offset = src_gc.dash_offset;
@@ -1734,10 +1789,7 @@ impl ResourceTable {
         if let Some(rects) = gc.clip_rectangles.clone() {
             return GcClipState::Rectangles(rects);
         }
-        if let Some(pixmap_id) = gc.clip_pixmap
-            && let Some(pixmap) = self.pixmaps.get(&pixmap_id.0)
-            && let Some(host_pixmap) = pixmap.host_xid
-        {
+        if let Some(host_pixmap) = gc.clip_pixmap_host_xid {
             return GcClipState::Pixmap {
                 host_pixmap,
                 clip_x_origin: gc.clip_x_origin,
@@ -1761,10 +1813,7 @@ impl ResourceTable {
         };
         match gc.fill_style {
             FillStyle::Tiled => {
-                let host_pixmap = gc
-                    .tile
-                    .and_then(|p| self.pixmaps.get(&p.0))
-                    .and_then(|p| p.host_xid);
+                let host_pixmap = gc.tile_host_xid;
                 match host_pixmap {
                     Some(host_pixmap) => GcFillState::Tiled {
                         host_pixmap,
@@ -1796,20 +1845,18 @@ impl ResourceTable {
         let gc = self.gcs.get(&gc_id.0)?;
 
         // Clip resolution: rectangles take priority over pixmap, both
-        // shifted by (clip_x_origin, clip_y_origin). Missing pixmap
-        // backing degrades to "no clip".
+        // shifted by (clip_x_origin, clip_y_origin). Clip pixmaps use the
+        // snapshotted host handle so the GC remains clipped after the
+        // client frees the source pixmap.
         let clip = if let Some(rects) = gc.clip_rectangles.clone() {
             ClipState::Rectangles {
                 origin: (gc.clip_x_origin, gc.clip_y_origin),
                 rects,
             }
-        } else if let Some(clip_pixmap_id) = gc.clip_pixmap {
-            match self.pixmaps.get(&clip_pixmap_id.0).and_then(|p| p.host_xid) {
-                Some(pixmap) => ClipState::Pixmap {
-                    origin: (gc.clip_x_origin, gc.clip_y_origin),
-                    pixmap,
-                },
-                None => ClipState::None,
+        } else if let Some(pixmap) = gc.clip_pixmap_host_xid {
+            ClipState::Pixmap {
+                origin: (gc.clip_x_origin, gc.clip_y_origin),
+                pixmap,
             }
         } else {
             ClipState::None
@@ -1821,27 +1868,21 @@ impl ResourceTable {
         let fill = match gc.fill_style {
             FillStyle::Solid => FillState::Solid,
             FillStyle::Tiled => gc
-                .tile
-                .and_then(|t| self.pixmaps.get(&t.0))
-                .and_then(|p| p.host_xid)
+                .tile_host_xid
                 .map(|pixmap| FillState::Tiled {
                     pixmap,
                     origin: (gc.tile_x_origin, gc.tile_y_origin),
                 })
                 .unwrap_or(FillState::Solid),
             FillStyle::Stippled => gc
-                .stipple
-                .and_then(|s| self.pixmaps.get(&s.0))
-                .and_then(|p| p.host_xid)
+                .stipple_host_xid
                 .map(|pixmap| FillState::Stippled {
                     pixmap,
                     origin: (gc.tile_x_origin, gc.tile_y_origin),
                 })
                 .unwrap_or(FillState::Solid),
             FillStyle::OpaqueStippled => gc
-                .stipple
-                .and_then(|s| self.pixmaps.get(&s.0))
-                .and_then(|p| p.host_xid)
+                .stipple_host_xid
                 .map(|pixmap| FillState::OpaqueStippled {
                     pixmap,
                     origin: (gc.tile_x_origin, gc.tile_y_origin),
@@ -2479,6 +2520,7 @@ pub struct Pixmap {
 pub struct Gc {
     pub id: ResourceId,
     pub drawable: ResourceId,
+    pub depth: u8,
     pub foreground: u32,
     pub background: u32,
     pub line_width: u16,
@@ -2490,6 +2532,11 @@ pub struct Gc {
     /// clip_y_origin)`. wmaker uses this for window-decoration symbols
     /// (close-button "X", miniaturize dot).
     pub clip_pixmap: Option<ResourceId>,
+    /// Host handle snapshotted when the clip-mask is installed into the
+    /// GC. GCs retain clip-mask semantics after the client frees the
+    /// source pixmap, so resolution must not depend solely on the live
+    /// pixmap resource table entry.
+    pub clip_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
     pub clip_x_origin: i16,
     pub clip_y_origin: i16,
     /// X11 GC `fill-style`. e16 paints popup backgrounds via Tiled fill,
@@ -2499,6 +2546,8 @@ pub struct Gc {
     pub fill_style: FillStyle,
     pub tile: Option<ResourceId>,
     pub stipple: Option<ResourceId>,
+    pub tile_host_xid: Option<crate::backend::PixmapHandle>,
+    pub stipple_host_xid: Option<crate::backend::PixmapHandle>,
     pub tile_x_origin: i16,
     pub tile_y_origin: i16,
     // Phase 6.2 additive scope: stored per-GC so they can be forwarded
@@ -2557,17 +2606,21 @@ impl Gc {
         Self {
             id,
             drawable,
+            depth: 0,
             foreground: 0,
             background: 0x00ff_ffff,
             line_width: 0,
             font: None,
             clip_rectangles: None,
             clip_pixmap: None,
+            clip_pixmap_host_xid: None,
             clip_x_origin: 0,
             clip_y_origin: 0,
             fill_style: FillStyle::Solid,
             tile: None,
             stipple: None,
+            tile_host_xid: None,
+            stipple_host_xid: None,
             tile_x_origin: 0,
             tile_y_origin: 0,
             line_style: LineStyle::Solid,
@@ -4161,7 +4214,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_draw_state_tiled_with_freed_tile_pixmap_degrades_to_solid() {
+    fn resolve_draw_state_tiled_with_freed_tile_pixmap_preserves_fill() {
         let mut t = ResourceTable::new();
         install_dummy_gc(&mut t, 0x500);
         install_pixmap_with_host_xid(&mut t, 0x600, 0xbeef);
@@ -4169,15 +4222,42 @@ mod tests {
         chg.fill_style = Some(FillStyle::Tiled.protocol_value());
         chg.tile = Some(ResourceId(0x600));
         t.change_gc(chg);
-        // Now free the tile pixmap; the GC still names it but the host
-        // backing is gone — the resolver must fall back to Solid.
+        // Freeing the source pixmap must not clear the GC's retained tile.
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
-        assert_eq!(state.fill, FillState::Solid);
+        assert_eq!(
+            state.fill,
+            FillState::Tiled {
+                pixmap: crate::backend::PixmapHandle::from_raw(0xbeef).unwrap(),
+                origin: (0, 0),
+            }
+        );
     }
 
     #[test]
-    fn resolve_draw_state_clip_pixmap_freed_degrades_to_unclipped() {
+    fn resolve_draw_state_stippled_with_freed_pixmap_preserves_fill() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0xabcd);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.fill_style = Some(FillStyle::Stippled.protocol_value());
+        chg.stipple = Some(ResourceId(0x600));
+        chg.tile_x_origin = Some(9);
+        chg.tile_y_origin = Some(17);
+        t.change_gc(chg);
+        let _ = t.free_pixmap(ResourceId(0x600));
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        assert_eq!(
+            state.fill,
+            FillState::Stippled {
+                pixmap: crate::backend::PixmapHandle::from_raw(0xabcd).unwrap(),
+                origin: (9, 17),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_draw_state_clip_pixmap_freed_preserves_clip() {
         let mut t = ResourceTable::new();
         install_dummy_gc(&mut t, 0x500);
         install_pixmap_with_host_xid(&mut t, 0x600, 0xcafe);
@@ -4186,7 +4266,42 @@ mod tests {
         t.change_gc(chg);
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
-        assert_eq!(state.clip, ClipState::None);
+        assert_eq!(
+            state.clip,
+            ClipState::Pixmap {
+                origin: (0, 0),
+                pixmap: crate::backend::PixmapHandle::from_raw(0xcafe).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn host_xid_referenced_by_gc_reports_retained_clip_tile_and_stipple() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x601, 0xaaa1);
+        install_pixmap_with_host_xid(&mut t, 0x602, 0xaaa2);
+        install_pixmap_with_host_xid(&mut t, 0x603, 0xaaa3);
+
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.clip_mask = Some(Some(ResourceId(0x601)));
+        chg.tile = Some(ResourceId(0x602));
+        chg.stipple = Some(ResourceId(0x603));
+        t.change_gc(chg);
+
+        let _ = t.free_pixmap(ResourceId(0x601));
+        let _ = t.free_pixmap(ResourceId(0x602));
+        let _ = t.free_pixmap(ResourceId(0x603));
+
+        assert!(
+            t.host_xid_referenced_by_gc(crate::backend::PixmapHandle::from_raw(0xaaa1).unwrap())
+        );
+        assert!(
+            t.host_xid_referenced_by_gc(crate::backend::PixmapHandle::from_raw(0xaaa2).unwrap())
+        );
+        assert!(
+            t.host_xid_referenced_by_gc(crate::backend::PixmapHandle::from_raw(0xaaa3).unwrap())
+        );
     }
 
     #[test]

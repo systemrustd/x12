@@ -48,7 +48,7 @@ use crate::{
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
         v2::{
-            engine::{RenderEngine, decode_x11_pixel_server_alpha},
+            engine::{RenderEngine, decode_x11_pixel_for_storage},
             platform::PlatformBackend,
             scene::SceneCompositor,
             store::{DrawableId, DrawableKind, DrawableStore, Storage},
@@ -189,6 +189,11 @@ pub struct KmsBackendV2 {
     /// button glyphs are the canonical client). Cleared whenever
     /// `current_clip` transitions away from `ClipState::Pixmap`.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
+    /// Cached readback of the current GC tile/stipple pixmap. Needed
+    /// because X11 GCs retain tile/stipple semantics after the client
+    /// frees the source pixmap; once the backing is gone from
+    /// `DrawableStore`, patterned fills must still use the last image.
+    pub(crate) fill_pattern_cache: Option<FillPatternCache>,
 
     /// Cached binary KMS power state. `true` at startup (outputs
     /// come up active); mutated only by `set_dpms_power`. Lets
@@ -333,6 +338,16 @@ pub struct KmsBackendV2 {
     /// Hotkey detector — used on the core thread in libseat mode
     /// (`on_libinput_ready`).
     hotkey: crate::input::hotkey::HotkeyDetector,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FillPatternCache {
+    pub(crate) pixmap_xid: u32,
+    pub(crate) origin: (i16, i16),
+    pub(crate) depth: u8,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 // SAFETY: `KmsBackendV2` lives entirely on the core-loop thread. The
@@ -552,6 +567,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
@@ -671,6 +687,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
@@ -1073,6 +1090,72 @@ impl KmsBackendV2 {
         Ok(base)
     }
 
+    /// Vk-backed test fixture with a live scene compositor and test
+    /// scanout pools. Unlike `for_tests_with_vk`, this can drive
+    /// `maybe_composite()` all the way through `scene.tick()` and an
+    /// actual compose submit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if Vk init, scanout-pool allocation, the render
+    /// engine, or the scene compositor fails to initialise.
+    #[doc(hidden)]
+    pub fn for_tests_with_vk_live_scene() -> Result<Self, io::Error> {
+        use std::sync::Arc;
+
+        let mut base = Self::for_tests_seed();
+        let vk = crate::kms::vk::device::VkContext::new().map_err(|e| {
+            io::Error::other(format!("v2 for_tests_with_vk_live_scene: VkContext: {e:?}"))
+        })?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
+            io::Error::other(format!(
+                "v2 for_tests_with_vk_live_scene: OpsCommandPool: {e:?}"
+            ))
+        })?;
+        let fence_pool = crate::kms::v2::platform::FencePool::new(Arc::clone(&vk));
+        let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
+        let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
+        for (i, layout) in base.platform.outputs.iter().enumerate() {
+            let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
+                Arc::clone(&vk),
+                Arc::clone(&base.platform.device),
+                u32::from(layout.width),
+                u32::from(layout.height),
+                3,
+                &layout.output.scanout_modifiers,
+            )
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "v2 for_tests_with_vk_live_scene: ScanoutBoPool[{i}] {}x{}: {e}",
+                    layout.width, layout.height
+                ))
+            })?;
+            let n = pool.bos.len();
+            scanout_pools.push(Some(pool));
+            bo_generations.push(vec![
+                crate::kms::v2::platform::BoGenerationEntry::default();
+                n
+            ]);
+        }
+        base.platform.vk = Some(vk);
+        base.platform.ops_command_pool = Some(ops_pool);
+        base.platform.fence_pool = Some(fence_pool);
+        base.platform.scanout_pools = scanout_pools;
+        base.platform.bo_generations = bo_generations;
+        base.engine = crate::kms::v2::engine::RenderEngine::new(&base.platform).map_err(|e| {
+            io::Error::other(format!(
+                "v2 for_tests_with_vk_live_scene: RenderEngine: {e:?}"
+            ))
+        })?;
+        base.scene = crate::kms::v2::scene::SceneCompositor::new(&base.platform).map_err(|e| {
+            io::Error::other(format!(
+                "v2 for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
+            ))
+        })?;
+        base.init_root_storage();
+        Ok(base)
+    }
+
     /// Stage 4b — test-only read of the alias registry. Returns
     /// a copy of the entry if the backing xid is tracked; the
     /// `pub(crate)` `KmsCore.alias_registry` is otherwise unreachable
@@ -1230,6 +1313,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
@@ -1304,7 +1388,11 @@ impl KmsBackendV2 {
             &mut self.platform,
             id,
             rect,
-            decode_x11_pixel_server_alpha(self.core.bg_pixel.unwrap_or(0x0050_5050), 24),
+            decode_x11_pixel_for_storage(
+                self.core.bg_pixel.unwrap_or(0x0050_5050),
+                24,
+                PlatformBackend::format_for_depth(24),
+            ),
         ) && self.platform.vk.is_some()
         {
             log::warn!("v2 init_root_storage: initial root fill failed: {e:?}");
@@ -2435,6 +2523,30 @@ impl KmsBackendV2 {
                 crate::kms::v2::submit_group::FlushReason::PageflipRetire,
             )
             .map(|_| ())
+    }
+
+    /// Test-side page-flip completion path for live-scene fixtures.
+    /// Mirrors the production `on_page_flip_ready` retire sequence
+    /// without reading DRM events from the test fixture's `/dev/null`
+    /// device.
+    ///
+    /// Returns the number of outputs whose pending scene ack retired.
+    pub fn simulate_scene_page_flip_complete_for_tests(
+        &mut self,
+    ) -> Result<usize, ash::vk::Result> {
+        self.simulate_page_flip_complete_for_tests()?;
+        let mut retired = 0usize;
+        for output_idx in 0..self.platform.outputs.len() {
+            if self
+                .scene
+                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
+            {
+                retired += 1;
+            }
+        }
+        self.engine.poll_retired(&self.platform);
+        self.poll_pending_retire_with_invalidate();
+        Ok(retired)
     }
 
     /// Phase B.2 Task 12: read the global `vkQueueSubmit2` counter
@@ -4394,6 +4506,55 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Refresh a pixmap clip-mask from the live source pixmap when
+    /// possible, then intersect `rects` against the current clip state.
+    /// If the source pixmap has been freed after installation into the GC,
+    /// the cached bytes remain valid and only the clip origin is updated.
+    fn intersect_with_current_clip_live(&mut self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
+        let pixmap_clip = match &self.core.current_clip {
+            ClipState::Pixmap { origin, pixmap } => Some((pixmap.as_raw(), *origin)),
+            _ => None,
+        };
+        if let Some((xid, origin)) = pixmap_clip {
+            if let Some(fresh) = self.read_clip_mask_bytes(xid, origin) {
+                self.clip_mask_cache = Some(fresh);
+            } else if let Some(cache) = self.clip_mask_cache.as_mut()
+                && cache.pixmap_xid == xid
+            {
+                cache.origin = origin;
+            }
+        }
+        self.intersect_with_current_clip(rects)
+    }
+
+    fn read_fill_pattern_cache(
+        &mut self,
+        host_pixmap_xid: u32,
+        origin: (i16, i16),
+    ) -> Option<FillPatternCache> {
+        let id = self.store.lookup(host_pixmap_xid)?;
+        let (depth, extent) = {
+            let d = self.store.get(id)?;
+            (d.depth, d.storage.extent)
+        };
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let bytes = self
+            .engine
+            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            .ok()?;
+        Some(FillPatternCache {
+            pixmap_xid: host_pixmap_xid,
+            origin,
+            depth,
+            width: extent.width,
+            height: extent.height,
+            bytes,
+        })
+    }
+
     /// Synchronously read a pixmap's full extent via `engine.get_image`
     /// and return a `ClipMaskCache` ready for `intersect_with_current_clip`
     /// consumption. Returns `None` if the pixmap isn't in the store, has
@@ -4432,10 +4593,10 @@ impl KmsBackendV2 {
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)
             .ok()?;
         // pack_from_storage convention: depth-1 → ((w + 31) / 32) * 4;
-        // depth-8 → ((w + 3) / 4) * 4. Both scanline-padded to 32 bits.
+        // depth-4/8 → ((w + 3) / 4) * 4. Both scanline-padded to 32 bits.
         let row_stride: u32 = match depth {
             1 => u32::from(width).div_ceil(32) * 4,
-            8 => u32::from(width).div_ceil(4) * 4,
+            4 | 8 => u32::from(width).div_ceil(4) * 4,
             _ => return None,
         };
         Some(crate::kms::backend::ClipMaskCache {
@@ -4669,6 +4830,151 @@ impl KmsBackendV2 {
         Some(Self::shift_rectangles_for_paint(&rects, offset).into_owned())
     }
 
+    /// Apply the GC's subwindow mode to fill-style rects expressed in the
+    /// destination window's local coordinates. `ClipByChildren` subtracts
+    /// every mapped automatic child window; `IncludeInferiors` leaves the
+    /// rects unchanged.
+    fn clip_fill_rects_by_subwindow_mode(
+        &self,
+        host_xid: u32,
+        rects: &[Rectangle16],
+    ) -> Vec<Rectangle16> {
+        if rects.is_empty()
+            || !matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::ClipByChildren,
+            )
+            || !self.windows_v2.contains_key(&host_xid)
+        {
+            return rects.to_vec();
+        }
+        let child_rects: Vec<ash::vk::Rect2D> = self
+            .windows_v2
+            .iter()
+            .filter_map(|(child_host_xid, geom)| {
+                if !(geom.parent == Some(host_xid) && geom.mapped) {
+                    return None;
+                }
+                let is_manually_redirected = self
+                    .store
+                    .lookup(*child_host_xid)
+                    .and_then(|id| self.store.get(id))
+                    .is_some_and(|d| !d.scene_participating);
+                if is_manually_redirected {
+                    return None;
+                }
+                Some(ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: i32::from(geom.x),
+                        y: i32::from(geom.y),
+                    },
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(geom.width),
+                        height: u32::from(geom.height),
+                    },
+                })
+            })
+            .collect();
+        if child_rects.is_empty() {
+            return rects.to_vec();
+        }
+        let mut out = Vec::new();
+        for r in rects {
+            if r.width == 0 || r.height == 0 {
+                continue;
+            }
+            let mut pieces = vec![ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(r.x),
+                    y: i32::from(r.y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(r.width),
+                    height: u32::from(r.height),
+                },
+            }];
+            for child in &child_rects {
+                let mut next = Vec::new();
+                for piece in pieces {
+                    next.extend(subtract_one_rect_clip(piece, *child));
+                }
+                pieces = next;
+                if pieces.is_empty() {
+                    break;
+                }
+            }
+            out.extend(pieces.into_iter().filter_map(|piece| {
+                let x = i16::try_from(piece.offset.x).ok()?;
+                let y = i16::try_from(piece.offset.y).ok()?;
+                let width = u16::try_from(piece.extent.width).ok()?;
+                let height = u16::try_from(piece.extent.height).ok()?;
+                Some(Rectangle16 {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            }));
+        }
+        out
+    }
+
+    fn collect_fill_rects_for_inferiors(
+        &self,
+        host_xid: u32,
+        rects: &[Rectangle16],
+    ) -> Vec<(u32, Vec<Rectangle16>)> {
+        fn walk(
+            backend: &KmsBackendV2,
+            parent_xid: u32,
+            rects: &[Rectangle16],
+            out: &mut Vec<(u32, Vec<Rectangle16>)>,
+        ) {
+            for (child_xid, geom) in &backend.windows_v2 {
+                let is_child = if parent_xid == backend.core.window_id {
+                    geom.parent == Some(backend.core.window_id) || geom.parent.is_none()
+                } else {
+                    geom.parent == Some(parent_xid)
+                };
+                if !is_child || !geom.mapped {
+                    continue;
+                }
+                let child_x = i32::from(geom.x);
+                let child_y = i32::from(geom.y);
+                let child_w = i32::from(geom.width);
+                let child_h = i32::from(geom.height);
+                let mut child_rects = Vec::new();
+                for r in rects {
+                    let rx0 = i32::from(r.x);
+                    let ry0 = i32::from(r.y);
+                    let rx1 = rx0 + i32::from(r.width);
+                    let ry1 = ry0 + i32::from(r.height);
+                    let ix0 = rx0.max(child_x);
+                    let iy0 = ry0.max(child_y);
+                    let ix1 = rx1.min(child_x + child_w);
+                    let iy1 = ry1.min(child_y + child_h);
+                    if ix0 < ix1 && iy0 < iy1 {
+                        child_rects.push(Rectangle16 {
+                            x: (ix0 - child_x) as i16,
+                            y: (iy0 - child_y) as i16,
+                            width: (ix1 - ix0) as u16,
+                            height: (iy1 - iy0) as u16,
+                        });
+                    }
+                }
+                if child_rects.is_empty() {
+                    continue;
+                }
+                out.push((*child_xid, child_rects.clone()));
+                walk(backend, *child_xid, &child_rects, out);
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(self, host_xid, rects, &mut out);
+        out
+    }
+
     /// [`fill_rects_honoring_fill_state`] for the Solid arm.
     ///
     /// `GcFunction::Copy` (the common case) goes through the fast
@@ -4707,11 +5013,11 @@ impl KmsBackendV2 {
         out: crate::kms::v2::stroke::StrokeOutput,
     ) {
         if !out.fg_rects.is_empty() {
-            let fg_clipped = self.intersect_with_current_clip(&out.fg_rects);
+            let fg_clipped = self.intersect_with_current_clip_live(&out.fg_rects);
             self.fill_solid_rects(target, foreground, &fg_clipped);
         }
         if !out.bg_rects.is_empty() {
-            let bg_clipped = self.intersect_with_current_clip(&out.bg_rects);
+            let bg_clipped = self.intersect_with_current_clip_live(&out.bg_rects);
             self.fill_solid_rects(target, background, &bg_clipped);
         }
     }
@@ -4727,24 +5033,45 @@ impl KmsBackendV2 {
         }
         let (dx, dy) = target.offset;
         let id = target.id;
+        let Some((depth, format, extent)) = self
+            .store
+            .get(id)
+            .map(|d| (d.depth, d.storage.format, d.storage.extent))
+        else {
+            return;
+        };
+        let full_mask = depth_plane_mask(depth);
+        let plane_mask = self.core.current_plane_mask & full_mask;
+        if plane_mask == 0 {
+            return;
+        }
+        let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
+        if depth < 8 || plane_mask != full_mask {
+            self.fill_solid_rects_cpu_fallback(
+                id,
+                extent,
+                depth,
+                function,
+                plane_mask,
+                fg & full_mask,
+                &shifted,
+            );
+            return;
+        }
         if !matches!(function, GcFunction::Copy) {
             // Compute `opaque_alpha` per the L1 server-α invariant:
             // depth-32 ARGB destinations take the LogicOp on all four
             // channels; depth-24/8/1 are server-owned-α so the
             // pipeline's write mask drops alpha to keep the dst byte
             // intact. Depth lookup via the drawable record.
-            let opaque_alpha = self.store.get(id).map(|d| d.depth != 32).unwrap_or(true);
-            // Stage 4a — shift window-local rects into backing-local
-            // coords when this paint resolves through a redirected
-            // ancestor. `Cow::Borrowed` when offset is (0, 0).
-            let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
+            let opaque_alpha = depth != 32;
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
                 id,
                 function,
                 opaque_alpha,
-                fg,
+                fg & full_mask,
                 &shifted,
             ) {
                 Ok(()) => {
@@ -4780,8 +5107,7 @@ impl KmsBackendV2 {
         // back α=0 (X-padding) and the window blends transparent —
         // the layer underneath leaks through, panel renders white
         // not teal. Matches v1's `try_vk_solid_fill` (kms/backend.rs:3512).
-        let depth = self.store.get(id).map(|d| d.depth).unwrap_or(24);
-        let color = decode_x11_pixel_server_alpha(fg, depth);
+        let color = decode_x11_pixel_for_storage(fg & full_mask, depth, format);
         // Stage 3f.15: coalesce N stroke rects into one CB + one
         // submit via engine.fill_rect_batch. PolySegment / PolyLine
         // / PolyRectangle fan-outs now pay O(1) submits per protocol
@@ -4822,21 +5148,85 @@ impl KmsBackendV2 {
         }
     }
 
+    fn fill_solid_rects_cpu_fallback(
+        &mut self,
+        id: DrawableId,
+        extent: ash::vk::Extent2D,
+        depth: u8,
+        function: yserver_core::backend::GcFunction,
+        plane_mask: u32,
+        fg: u32,
+        rects: &[Rectangle16],
+    ) {
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        let mut bytes =
+            match self
+                .engine
+                .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!("v2 fill_solid_rects_cpu_fallback: get_image failed: {e:?}");
+                    return;
+                }
+            };
+        let full_mask = depth_plane_mask(depth);
+        for r in rects {
+            let x0 = i32::from(r.x).max(0) as usize;
+            let y0 = i32::from(r.y).max(0) as usize;
+            let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(extent.width as i32);
+            let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(extent.height as i32);
+            if x1 <= x0 as i32 || y1 <= y0 as i32 {
+                continue;
+            }
+            for y in y0..y1 as usize {
+                for x in x0..x1 as usize {
+                    let dst = read_z_pixmap_pixel(&bytes, depth, extent.width, x, y) & full_mask;
+                    let out = apply_gc_function(function, fg, dst, plane_mask) & full_mask;
+                    write_z_pixmap_pixel(&mut bytes, depth, extent.width, x, y, out);
+                }
+            }
+        }
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            id,
+            ash::vk::Offset2D::default(),
+            extent,
+            &bytes,
+            depth,
+        ) {
+            log::warn!("v2 fill_solid_rects_cpu_fallback: put_image failed: {e:?}");
+            return;
+        }
+        self.telemetry.record_paint_submit();
+        self.trace_simple(
+            if matches!(function, yserver_core::backend::GcFunction::Copy) {
+                SubmitKind::FillBatch
+            } else {
+                SubmitKind::LogicFill
+            },
+            id,
+            u32::try_from(rects.len()).unwrap_or(u32::MAX),
+        );
+    }
+
     /// Fill `rects` on `id`, honouring `KmsCore.current_fill`. Used
     /// by the filled-shape ops (`PolyFillRectangle`, `PolyFillArc`,
     /// `FillPoly`, `FillRectangle`); stroke ops keep using
     /// [`fill_solid_rects`] because X11 strokes are always solid
     /// foreground regardless of GC fill-style.
     ///
-    /// `Tiled` with `GcFunction::Copy` drives a RENDER composite
-    /// (`OP_SRC`, `Repeat::Normal`) so the tile pixmap supplies the
-    /// destination colours — e16 paints popup backgrounds this way.
-    /// `Tiled` with a non-`Copy` function degenerates to a solid
-    /// logic-op fill (matches v1's behaviour — no real client drives
-    /// tiled+logic-op). `Stippled` / `OpaqueStippled` fall through
-    /// to solid for now; proper stipple support is post-Stage-3.
+    /// `Solid` stays on the fast GPU path. The patterned styles
+    /// (`Tiled`, `Stippled`, `OpaqueStippled`) use a CPU read/modify/write
+    /// fallback so X11 function, plane-mask, tile/stipple origin, and
+    /// opaque-background semantics all stay exact.
     fn fill_rects_honoring_fill_state(
         &mut self,
+        host_xid: u32,
         target: PaintTarget,
         fg: u32,
         rects: &[Rectangle16],
@@ -4845,33 +5235,242 @@ impl KmsBackendV2 {
         if rects.is_empty() {
             return;
         }
+        let include_inferiors = matches!(
+            self.core.current_subwindow_mode,
+            yserver_core::backend::SubwindowMode::IncludeInferiors,
+        ) && (self.windows_v2.contains_key(&host_xid)
+            || host_xid == self.core.window_id);
+        let inferior_work = if include_inferiors {
+            self.collect_fill_rects_for_inferiors(host_xid, rects)
+        } else {
+            Vec::new()
+        };
         let function = self.core.current_function;
         if matches!(function, GcFunction::NoOp) {
             return;
         }
+        let rects = self.clip_fill_rects_by_subwindow_mode(host_xid, rects);
+        if rects.is_empty() {
+            return;
+        }
         let fill = self.core.current_fill.clone();
         match fill {
-            FillState::Tiled { pixmap, origin } => {
-                let tile_xid = pixmap.as_raw();
-                if !matches!(function, GcFunction::Copy) {
-                    // Non-Copy + Tiled isn't covered by any current
-                    // client; degenerate to solid logic-op fill so
-                    // the function is honoured (matches v1).
+            FillState::Solid => {
+                self.fill_solid_rects(target, fg, &rects);
+            }
+            FillState::Tiled { .. }
+            | FillState::Stippled { .. }
+            | FillState::OpaqueStippled { .. } => {
+                self.fill_pattern_rects_cpu_fallback(target, fg, &rects, &fill);
+            }
+        }
+        for (child_xid, child_rects) in inferior_work {
+            if child_rects.is_empty() {
+                continue;
+            }
+            let Some(child_target) = self.resolve_paint_target(child_xid) else {
+                continue;
+            };
+            match &fill {
+                FillState::Solid => self.fill_solid_rects(child_target, fg, &child_rects),
+                FillState::Tiled { .. }
+                | FillState::Stippled { .. }
+                | FillState::OpaqueStippled { .. } => {
+                    self.fill_pattern_rects_cpu_fallback(child_target, fg, &child_rects, &fill);
+                }
+            }
+        }
+    }
+
+    fn fill_pattern_rects_cpu_fallback(
+        &mut self,
+        target: PaintTarget,
+        fg: u32,
+        rects: &[Rectangle16],
+        fill: &yserver_core::backend::FillState,
+    ) {
+        use yserver_core::backend::FillState;
+
+        if rects.is_empty() {
+            return;
+        }
+        let id = target.id;
+        let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.storage.extent)) else {
+            return;
+        };
+        let full_mask = depth_plane_mask(depth);
+        let plane_mask = self.core.current_plane_mask & full_mask;
+        if plane_mask == 0 {
+            return;
+        }
+        let dst_rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        let mut dst_bytes =
+            match self
+                .engine
+                .get_image(&mut self.store, &mut self.platform, id, dst_rect, depth)
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!("v2 fill_pattern_rects_cpu_fallback: get_image failed: {e:?}");
+                    return;
+                }
+            };
+
+        struct PatternSource {
+            depth: u8,
+            width: u32,
+            height: u32,
+            bytes: Vec<u8>,
+            origin: (i16, i16),
+        }
+
+        let pattern_source = match fill {
+            FillState::Tiled { pixmap, origin }
+            | FillState::Stippled { pixmap, origin }
+            | FillState::OpaqueStippled { pixmap, origin } => {
+                if let Some(fresh) = self.read_fill_pattern_cache(pixmap.as_raw(), *origin) {
+                    self.fill_pattern_cache = Some(fresh);
+                } else if let Some(cache) = self.fill_pattern_cache.as_mut() {
+                    if cache.pixmap_xid == pixmap.as_raw() {
+                        cache.origin = *origin;
+                    } else {
+                        self.fill_pattern_cache = None;
+                    }
+                } else {
+                    self.fill_pattern_cache = None;
+                }
+                let Some(cache) = self.fill_pattern_cache.as_ref() else {
+                    self.fill_solid_rects(target, fg, rects);
+                    return;
+                };
+                if cache.pixmap_xid != pixmap.as_raw() {
                     self.fill_solid_rects(target, fg, rects);
                     return;
                 }
-                if !self.try_tiled_fill(target, tile_xid, origin.0, origin.1, rects) {
-                    // Tile not in store / aliases dst / non-BGRA8
-                    // tile — degenerate to solid foreground.
-                    self.fill_solid_rects(target, fg, rects);
+                PatternSource {
+                    depth: cache.depth,
+                    width: cache.width,
+                    height: cache.height,
+                    bytes: cache.bytes.clone(),
+                    origin: cache.origin,
                 }
             }
-            FillState::Solid | FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
-                // Stipple support is post-Stage-3 (no real-app smoke
-                // client drives it on KMS). Fall through as solid.
+            FillState::Solid => {
                 self.fill_solid_rects(target, fg, rects);
+                return;
+            }
+        };
+
+        let function = self.core.current_function;
+        let bg = self.core.current_background & full_mask;
+        let fg = fg & full_mask;
+        let (dx, dy) = target.offset;
+        for r in rects {
+            let local_x0 = i32::from(r.x);
+            let local_y0 = i32::from(r.y);
+            let local_x1 = local_x0.saturating_add(i32::from(r.width));
+            let local_y1 = local_y0.saturating_add(i32::from(r.height));
+            for local_y in local_y0..local_y1 {
+                for local_x in local_x0..local_x1 {
+                    let storage_x = local_x + dx;
+                    let storage_y = local_y + dy;
+                    if storage_x < 0
+                        || storage_y < 0
+                        || storage_x >= extent.width as i32
+                        || storage_y >= extent.height as i32
+                    {
+                        continue;
+                    }
+                    let dst = read_z_pixmap_pixel(
+                        &dst_bytes,
+                        depth,
+                        extent.width,
+                        storage_x as usize,
+                        storage_y as usize,
+                    ) & full_mask;
+                    let out = match fill {
+                        FillState::Tiled { .. } => {
+                            let sx = (local_x - i32::from(pattern_source.origin.0))
+                                .rem_euclid(pattern_source.width as i32)
+                                as usize;
+                            let sy = (local_y - i32::from(pattern_source.origin.1))
+                                .rem_euclid(pattern_source.height as i32)
+                                as usize;
+                            let src = read_z_pixmap_pixel(
+                                &pattern_source.bytes,
+                                pattern_source.depth,
+                                pattern_source.width,
+                                sx,
+                                sy,
+                            ) & full_mask;
+                            apply_gc_function(function, src, dst, plane_mask) & full_mask
+                        }
+                        FillState::Stippled { .. } | FillState::OpaqueStippled { .. } => {
+                            let sx = (local_x - i32::from(pattern_source.origin.0))
+                                .rem_euclid(pattern_source.width as i32)
+                                as usize;
+                            let sy = (local_y - i32::from(pattern_source.origin.1))
+                                .rem_euclid(pattern_source.height as i32)
+                                as usize;
+                            let bit = read_z_pixmap_pixel(
+                                &pattern_source.bytes,
+                                pattern_source.depth,
+                                pattern_source.width,
+                                sx,
+                                sy,
+                            ) != 0;
+                            let src = if bit {
+                                Some(fg)
+                            } else if matches!(fill, FillState::OpaqueStippled { .. }) {
+                                Some(bg)
+                            } else {
+                                None
+                            };
+                            match src {
+                                Some(src) => {
+                                    apply_gc_function(function, src, dst, plane_mask) & full_mask
+                                }
+                                None => dst,
+                            }
+                        }
+                        FillState::Solid => dst,
+                    };
+                    write_z_pixmap_pixel(
+                        &mut dst_bytes,
+                        depth,
+                        extent.width,
+                        storage_x as usize,
+                        storage_y as usize,
+                        out,
+                    );
+                }
             }
         }
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            id,
+            ash::vk::Offset2D::default(),
+            extent,
+            &dst_bytes,
+            depth,
+        ) {
+            log::warn!("v2 fill_pattern_rects_cpu_fallback: put_image failed: {e:?}");
+            return;
+        }
+        self.telemetry.record_paint_submit();
+        self.trace_simple(
+            if matches!(function, yserver_core::backend::GcFunction::Copy) {
+                SubmitKind::FillBatch
+            } else {
+                SubmitKind::LogicFill
+            },
+            id,
+            u32::try_from(rects.len()).unwrap_or(u32::MAX),
+        );
     }
 
     /// Tile fill via `engine.render_composite` (Stage 3f.3). Returns
@@ -4884,6 +5483,7 @@ impl KmsBackendV2 {
     /// in backing coords; `src_x/src_y` stay window-local because
     /// they're a `(dst - tile_origin)` difference that doesn't
     /// depend on the absolute frame.
+    #[allow(dead_code)]
     fn try_tiled_fill(
         &mut self,
         dst: PaintTarget,
@@ -5069,9 +5669,10 @@ impl KmsBackendV2 {
         // (v1's create_subwindow behaviour); otherwise paint a
         // depth-appropriate safe default (3f.14).
         if storage_allocated && let Some(id) = self.store.lookup(host_xid) {
+            let format = PlatformBackend::format_for_depth(depth);
             let color = bg_pixel.map_or_else(
                 || default_window_init_color(depth),
-                |pixel| decode_x11_pixel_server_alpha(pixel, depth),
+                |pixel| decode_x11_pixel_for_storage(pixel, depth, format),
             );
             let rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
@@ -5259,7 +5860,12 @@ impl KmsBackendV2 {
         // compositor's alpha_passthrough path doesn't blend the
         // text bg out.
         let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
-        let color = decode_x11_pixel_server_alpha(background, depth);
+        let format = self
+            .store
+            .get(target.id)
+            .map(|d| d.storage.format)
+            .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
+        let color = decode_x11_pixel_for_storage(background, depth, format);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
                 x: x + target.offset.0,
@@ -6136,7 +6742,7 @@ fn write_drawable_ppm(
                 file.write_all(&row)?;
             }
         }
-        8 => {
+        4 | 8 => {
             let expected = w
                 .checked_mul(h)
                 .ok_or_else(|| io::Error::other("size overflow"))?;
@@ -6422,10 +7028,17 @@ fn apply_z_plane_mask(bytes: &mut [u8], depth: u8, mask: u32) {
                 bytes.fill(0);
             }
         }
-        8 => {
+        4 | 8 => {
             let m = (mask & 0xff) as u8;
-            for b in bytes.iter_mut() {
-                *b &= m;
+            if depth == 4 {
+                let m = m & 0x0f;
+                for b in bytes.iter_mut() {
+                    *b = (*b & 0x0f & m) | (((*b >> 4) & m) << 4);
+                }
+            } else {
+                for b in bytes.iter_mut() {
+                    *b &= m;
+                }
             }
         }
         24 | 32 => {
@@ -6438,6 +7051,98 @@ fn apply_z_plane_mask(bytes: &mut [u8], depth: u8, mask: u32) {
         // engine already errored and the handler sent the fallback).
         _ => bytes.fill(0),
     }
+}
+
+fn z_pixmap_row_stride(depth: u8, width: u32) -> usize {
+    match depth {
+        1 => width.div_ceil(32) as usize * 4,
+        4 => width.div_ceil(8) as usize * 4,
+        8 => (width as usize + 3) & !3,
+        24 | 32 => width as usize * 4,
+        _ => 0,
+    }
+}
+
+fn read_z_pixmap_pixel(bytes: &[u8], depth: u8, width: u32, x: usize, y: usize) -> u32 {
+    let stride = z_pixmap_row_stride(depth, width);
+    match depth {
+        1 => {
+            let byte = bytes[y * stride + x / 8];
+            u32::from((byte >> (x % 8)) & 1)
+        }
+        4 => {
+            let byte = bytes[y * stride + x / 2];
+            u32::from(if x.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                (byte >> 4) & 0x0f
+            })
+        }
+        8 => u32::from(bytes[y * stride + x]),
+        24 | 32 => {
+            let off = y * stride + x * 4;
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+        }
+        _ => 0,
+    }
+}
+
+fn write_z_pixmap_pixel(bytes: &mut [u8], depth: u8, width: u32, x: usize, y: usize, value: u32) {
+    let stride = z_pixmap_row_stride(depth, width);
+    match depth {
+        1 => {
+            let byte = &mut bytes[y * stride + x / 8];
+            let bit = 1u8 << (x % 8);
+            if value & 1 != 0 {
+                *byte |= bit;
+            } else {
+                *byte &= !bit;
+            }
+        }
+        4 => {
+            let byte = &mut bytes[y * stride + x / 2];
+            let nibble = (value & 0x0f) as u8;
+            if x.is_multiple_of(2) {
+                *byte = (*byte & 0xf0) | nibble;
+            } else {
+                *byte = (*byte & 0x0f) | (nibble << 4);
+            }
+        }
+        8 => bytes[y * stride + x] = value as u8,
+        24 | 32 => {
+            let off = y * stride + x * 4;
+            bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        _ => {}
+    }
+}
+
+fn apply_gc_function(
+    function: yserver_core::backend::GcFunction,
+    src: u32,
+    dst: u32,
+    mask: u32,
+) -> u32 {
+    use yserver_core::backend::GcFunction;
+    let op = match function {
+        GcFunction::Clear => 0,
+        GcFunction::And => src & dst,
+        GcFunction::AndReverse => src & !dst,
+        GcFunction::Copy => src,
+        GcFunction::AndInverted => !src & dst,
+        GcFunction::NoOp => dst,
+        GcFunction::Xor => src ^ dst,
+        GcFunction::Or => src | dst,
+        GcFunction::Nor => !(src | dst),
+        GcFunction::Equiv => !(src ^ dst),
+        GcFunction::Invert => !dst,
+        GcFunction::OrReverse => src | !dst,
+        GcFunction::CopyInverted => !src,
+        GcFunction::OrInverted => !src | dst,
+        GcFunction::Nand => !(src & dst),
+        GcFunction::Set => u32::MAX,
+    };
+    (op & mask) | (dst & !mask)
 }
 
 /// Repack Z-layout wire bytes (per `pack_from_storage`) into XYPixmap
@@ -6460,6 +7165,15 @@ fn z_to_xy_planes(z: &[u8], w: u32, h: u32, depth: u8, mask: u32) -> Vec<u8> {
                 // Already bitmap rows padded to 32 bits.
                 let byte = z[y * out_stride + x / 8];
                 u32::from((byte >> (x % 8)) & 1)
+            }
+            4 => {
+                let stride = w.div_ceil(8) as usize * 4;
+                let byte = z[y * stride + x / 2];
+                u32::from(if x.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    (byte >> 4) & 0x0f
+                })
             }
             8 => {
                 // Byte rows padded to 4 bytes.
@@ -7538,7 +8252,13 @@ impl Backend for KmsBackendV2 {
                             // (matches `allocate_window_storage`).
                             let color = bg_pixel.map_or_else(
                                 || default_window_init_color(depth),
-                                |pixel| decode_x11_pixel_server_alpha(pixel, depth),
+                                |pixel| {
+                                    decode_x11_pixel_for_storage(
+                                        pixel,
+                                        depth,
+                                        PlatformBackend::format_for_depth(depth),
+                                    )
+                                },
                             );
                             let rect = ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D::default(),
@@ -8547,12 +9267,17 @@ impl Backend for KmsBackendV2 {
             // force the stored α byte to 0xFF for the scene
             // compositor's pass-through draw to read opaque.
             let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
+            let format = self
+                .store
+                .get(target.id)
+                .map(|d| d.storage.format)
+                .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,
                 target.id,
                 rect,
-                decode_x11_pixel_server_alpha(pixel, depth),
+                decode_x11_pixel_for_storage(pixel, depth, format),
             ) {
                 log::warn!("v2 set_container_background_pixel: root fill failed: {e:?}");
             } else {
@@ -8731,6 +9456,7 @@ impl Backend for KmsBackendV2 {
 
     fn set_gc_fill_solid(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.core.current_fill = FillState::Solid;
+        self.fill_pattern_cache = None;
         Ok(())
     }
 
@@ -8749,12 +9475,15 @@ impl Backend for KmsBackendV2 {
         // both keeps the Backend trait surface uniform.
         let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
             self.core.current_fill = FillState::Solid;
+            self.fill_pattern_cache = None;
             return Ok(());
         };
         self.core.current_fill = FillState::Tiled {
             pixmap: handle,
             origin: (tile_x_origin, tile_y_origin),
         };
+        self.fill_pattern_cache =
+            self.read_fill_pattern_cache(host_pixmap, (tile_x_origin, tile_y_origin));
         Ok(())
     }
 
@@ -8774,12 +9503,16 @@ impl Backend for KmsBackendV2 {
         match clip {
             ClipState::Pixmap { origin, pixmap } => {
                 let xid = pixmap.as_raw();
-                let stale = match self.clip_mask_cache.as_ref() {
-                    Some(c) => c.pixmap_xid != xid || c.origin != *origin,
-                    None => true,
-                };
-                if stale {
-                    self.clip_mask_cache = self.read_clip_mask_bytes(xid, *origin);
+                if let Some(fresh) = self.read_clip_mask_bytes(xid, *origin) {
+                    self.clip_mask_cache = Some(fresh);
+                } else if let Some(cache) = self.clip_mask_cache.as_mut() {
+                    if cache.pixmap_xid == xid {
+                        cache.origin = *origin;
+                    } else {
+                        self.clip_mask_cache = None;
+                    }
+                } else {
+                    self.clip_mask_cache = None;
                 }
             }
             _ => {
@@ -8795,6 +9528,27 @@ impl Backend for KmsBackendV2 {
         fill: &FillState,
     ) -> io::Result<()> {
         self.core.current_fill = fill.clone();
+        match fill {
+            FillState::Tiled { pixmap, origin }
+            | FillState::Stippled { pixmap, origin }
+            | FillState::OpaqueStippled { pixmap, origin } => {
+                let xid = pixmap.as_raw();
+                if let Some(fresh) = self.read_fill_pattern_cache(xid, *origin) {
+                    self.fill_pattern_cache = Some(fresh);
+                } else if let Some(cache) = self.fill_pattern_cache.as_mut() {
+                    if cache.pixmap_xid == xid {
+                        cache.origin = *origin;
+                    } else {
+                        self.fill_pattern_cache = None;
+                    }
+                } else {
+                    self.fill_pattern_cache = None;
+                }
+            }
+            FillState::Solid => {
+                self.fill_pattern_cache = None;
+            }
+        }
         Ok(())
     }
 
@@ -8807,10 +9561,32 @@ impl Backend for KmsBackendV2 {
             self.core.current_font = Some(font.as_raw());
         }
         self.core.current_function = state.function;
+        self.core.current_plane_mask = state.plane_mask;
         self.core.current_foreground = state.foreground;
         self.core.current_background = state.background;
         self.core.current_fill = state.fill.clone();
         self.core.current_clip = state.clip.clone();
+        match &state.fill {
+            FillState::Tiled { pixmap, origin }
+            | FillState::Stippled { pixmap, origin }
+            | FillState::OpaqueStippled { pixmap, origin } => {
+                let xid = pixmap.as_raw();
+                if let Some(fresh) = self.read_fill_pattern_cache(xid, *origin) {
+                    self.fill_pattern_cache = Some(fresh);
+                } else if let Some(cache) = self.fill_pattern_cache.as_mut() {
+                    if cache.pixmap_xid == xid {
+                        cache.origin = *origin;
+                    } else {
+                        self.fill_pattern_cache = None;
+                    }
+                } else {
+                    self.fill_pattern_cache = None;
+                }
+            }
+            FillState::Solid => {
+                self.fill_pattern_cache = None;
+            }
+        }
         // Stage 4d Manual-redirect fix: drawing through a
         // `ClipByChildren` GC into a window must exclude every
         // mapped child window's area. Capture the mode here so
@@ -9157,6 +9933,7 @@ impl Backend for KmsBackendV2 {
         // Wire row stride for the src depth (matches pack_from_storage).
         let row_bytes: usize = match src_depth {
             1 => src_w.div_ceil(32) as usize * 4,
+            4 => src_w.div_ceil(8) as usize * 4,
             8 => (src_w as usize + 3) & !3,
             24 | 32 => src_w as usize * 4,
             _ => {
@@ -9191,6 +9968,15 @@ impl Backend for KmsBackendV2 {
                         let byte = src_bytes[row_off + (sx as usize) / 8];
                         let bit = (byte >> (sx as usize & 7)) & 1;
                         u32::from(bit)
+                    }
+                    4 => {
+                        let row_off = sy as usize * row_bytes;
+                        let byte = src_bytes[row_off + (sx as usize) / 2];
+                        u32::from(if (sx as usize).is_multiple_of(2) {
+                            byte & 0x0f
+                        } else {
+                            (byte >> 4) & 0x0f
+                        })
                     }
                     8 => {
                         let row_off = sy as usize * row_bytes;
@@ -9682,7 +10468,7 @@ impl Backend for KmsBackendV2 {
                 height: 1,
             });
         }
-        let rects = self.intersect_with_current_clip(&rects);
+        let rects = self.intersect_with_current_clip_live(&rects);
         self.fill_solid_rects(target, foreground, &rects);
         Ok(())
     }
@@ -9708,8 +10494,8 @@ impl Backend for KmsBackendV2 {
             offset += 8;
             rects.push(r);
         }
-        let rects = self.intersect_with_current_clip(&rects);
-        self.fill_rects_honoring_fill_state(target, foreground, &rects);
+        let rects = self.intersect_with_current_clip_live(&rects);
+        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
         Ok(())
     }
 
@@ -9754,8 +10540,8 @@ impl Backend for KmsBackendV2 {
         }
         if !rects.is_empty() {
             let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
-            let rects = self.intersect_with_current_clip(&clipped);
-            self.fill_rects_honoring_fill_state(target, foreground, &rects);
+            let rects = self.intersect_with_current_clip_live(&clipped);
+            self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
         }
         Ok(())
     }
@@ -9793,8 +10579,8 @@ impl Backend for KmsBackendV2 {
             .map(|(w, h)| (w as i32, h as i32))
             .unwrap_or((0, 0));
         let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
-        let rects = self.intersect_with_current_clip(&clipped);
-        self.fill_rects_honoring_fill_state(target, foreground, &rects);
+        let rects = self.intersect_with_current_clip_live(&clipped);
+        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
         Ok(())
     }
 
@@ -9812,13 +10598,13 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("fill_rectangle_unknown_xid");
             return Ok(());
         };
-        let rects = self.intersect_with_current_clip(&[Rectangle16 {
+        let rects = self.intersect_with_current_clip_live(&[Rectangle16 {
             x,
             y,
             width,
             height,
         }]);
-        self.fill_rects_honoring_fill_state(target, foreground, &rects);
+        self.fill_rects_honoring_fill_state(host_xid, target, foreground, &rects);
         Ok(())
     }
 
@@ -11887,6 +12673,7 @@ impl Backend for KmsBackendV2 {
         let height = u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX);
         let bpp: u8 = match depth {
             24 | 32 => 32,
+            4 | 8 => 8,
             d => d,
         };
         let export = crate::kms::vk::dri3::export_dmabuf(vk, imported)
@@ -12870,11 +13657,16 @@ mod tests {
     };
 
     mod get_image_planes {
-        use super::super::{apply_z_plane_mask, depth_plane_mask, z_to_xy_planes};
+        use super::super::{
+            apply_gc_function, apply_z_plane_mask, depth_plane_mask, read_z_pixmap_pixel,
+            write_z_pixmap_pixel, z_to_xy_planes,
+        };
+        use yserver_core::backend::GcFunction;
 
         #[test]
         fn depth_plane_mask_truncates_to_depth() {
             assert_eq!(depth_plane_mask(1), 0x1);
+            assert_eq!(depth_plane_mask(4), 0x0f);
             assert_eq!(depth_plane_mask(8), 0xff);
             assert_eq!(depth_plane_mask(24), 0x00ff_ffff);
             assert_eq!(depth_plane_mask(32), u32::MAX);
@@ -12893,6 +13685,25 @@ mod tests {
             let mut bytes = vec![0xab, 0x0f, 0xf0, 0x00];
             apply_z_plane_mask(&mut bytes, 8, 0x0f);
             assert_eq!(bytes, vec![0x0b, 0x0f, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn z_mask_depth4_masks_bytes() {
+            let mut bytes = vec![0xab, 0x0f, 0xf0, 0x00];
+            apply_z_plane_mask(&mut bytes, 4, 0x0f);
+            assert_eq!(bytes, vec![0x0b, 0x0f, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn xy_planes_depth4_unpacks_nibbles() {
+            // pixel0=1, pixel1=2 packed low-nibble first into 0x21.
+            let z = [0x21, 0x00, 0x00, 0x00];
+            let out = z_to_xy_planes(&z, 2, 1, 4, 0x3);
+            assert_eq!(out.len(), 2 * 4);
+            // Plane 1 first: pixel1 only.
+            assert_eq!(out[0], 0b0000_0010);
+            // Plane 0 second: pixel0 only.
+            assert_eq!(out[4], 0b0000_0001);
         }
 
         #[test]
@@ -12934,6 +13745,32 @@ mod tests {
         fn xy_planes_empty_mask_is_empty() {
             let z = [0u8; 16];
             assert!(z_to_xy_planes(&z, 2, 2, 24, 0).is_empty());
+        }
+
+        #[test]
+        fn depth4_z_pixmap_pixel_round_trip_uses_nibbles() {
+            let mut z = vec![0u8; 4];
+            write_z_pixmap_pixel(&mut z, 4, 2, 0, 0, 0x1);
+            write_z_pixmap_pixel(&mut z, 4, 2, 1, 0, 0xe);
+            assert_eq!(z[0], 0xe1);
+            assert_eq!(read_z_pixmap_pixel(&z, 4, 2, 0, 0), 0x1);
+            assert_eq!(read_z_pixmap_pixel(&z, 4, 2, 1, 0), 0xe);
+        }
+
+        #[test]
+        fn gc_function_respects_plane_mask() {
+            assert_eq!(
+                apply_gc_function(GcFunction::Copy, 0b1111, 0b0000, 0b0101),
+                0b0101
+            );
+            assert_eq!(
+                apply_gc_function(GcFunction::Invert, 0, 0b0011, 0b0001),
+                0b0010
+            );
+            assert_eq!(
+                apply_gc_function(GcFunction::Nor, 0b0001, 0b0010, 0b1111),
+                0b1100
+            );
         }
     }
 
@@ -14419,6 +15256,35 @@ mod tests {
         );
         b.clear_clip_rectangles(None).expect("ok");
         assert!(matches!(b.core.current_clip, ClipState::None));
+    }
+
+    #[test]
+    fn apply_clip_state_preserves_cached_pixmap_mask_after_free_and_origin_change() {
+        use yserver_core::backend::{ClipState, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: 0xABCD_EF01,
+            origin: (0, 0),
+            width: 5,
+            height: 5,
+            depth: 1,
+            row_stride: 4,
+            bytes: vec![
+                0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0,
+            ],
+        });
+        b.apply_clip_state(
+            None,
+            &ClipState::Pixmap {
+                origin: (7, 9),
+                pixmap: PixmapHandle::from_raw(0xABCD_EF01).unwrap(),
+            },
+        )
+        .expect("apply_clip_state");
+        let cache = b.clip_mask_cache.as_ref().expect("cache");
+        assert_eq!(cache.pixmap_xid, 0xABCD_EF01);
+        assert_eq!(cache.origin, (7, 9));
     }
 
     /// `set_gc_fill_tiled_stores_fill_state` — Stage 3f.3 bookkeeping
@@ -16095,6 +16961,81 @@ mod tests {
                 ),
             )
             .expect("seed_window allocate")
+    }
+
+    #[test]
+    fn clip_fill_rects_by_subwindow_mode_subtracts_mapped_child() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        child.width = 15;
+        child.height = 10;
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::ClipByChildren;
+
+        let out = b.clip_fill_rects_by_subwindow_mode(
+            0x100,
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 40,
+            }],
+        );
+        let got: std::collections::BTreeSet<(i16, i16, u16, u16)> = out
+            .into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        let want = std::collections::BTreeSet::from([
+            (0, 0, 40, 20),
+            (0, 30, 40, 10),
+            (0, 20, 10, 10),
+            (25, 20, 15, 10),
+        ]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn clip_fill_rects_by_subwindow_mode_include_inferiors_is_passthrough() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::IncludeInferiors;
+
+        let src = [Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 40,
+        }];
+        assert_eq!(b.clip_fill_rects_by_subwindow_mode(0x100, &src), src);
+    }
+
+    #[test]
+    fn collect_fill_rects_for_inferiors_translates_root_to_top_level_child() {
+        let mut b = KmsBackendV2::for_tests();
+        let root_xid = b.core.window_id;
+        let _top = seed_window(&mut b, 0x200, Some(root_xid), 10, 20);
+        let out = b.collect_fill_rects_for_inferiors(
+            b.core.window_id,
+            &[Rectangle16 {
+                x: 15,
+                y: 25,
+                width: 20,
+                height: 20,
+            }],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0x200);
+        assert_eq!(
+            out[0].1,
+            vec![Rectangle16 {
+                x: 5,
+                y: 5,
+                width: 20,
+                height: 20,
+            }]
+        );
     }
 
     /// Unknown xid → `None`. The resolver's first step is
@@ -17961,6 +18902,314 @@ mod tests {
             None,
         )
         .expect("process_request must succeed");
+    }
+
+    fn dispatch_configure_window_v2(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        window: yserver_protocol::x11::ResourceId,
+        x: Option<i16>,
+        y: Option<i16>,
+        border_width: Option<u16>,
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let mut mask = 0u16;
+        if x.is_some() {
+            mask |= 1 << 0;
+        }
+        if y.is_some() {
+            mask |= 1 << 1;
+        }
+        if border_width.is_some() {
+            mask |= 1 << 4;
+        }
+
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        if let Some(x) = x {
+            body.extend_from_slice(&(i32::from(x) as u32).to_le_bytes());
+        }
+        if let Some(y) = y {
+            body.extend_from_slice(&(i32::from(y) as u32).to_le_bytes());
+        }
+        if let Some(border_width) = border_width {
+            body.extend_from_slice(&u32::from(border_width).to_le_bytes());
+        }
+
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12, // ConfigureWindow
+                data: 0,
+                length_units: u32::try_from((4 + body.len()) / 4).expect("request length"),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request(ConfigureWindow) must succeed");
+    }
+
+    fn dispatch_poly_fill_rectangle_v2(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        drawable: yserver_protocol::x11::ResourceId,
+        gc: yserver_protocol::x11::ResourceId,
+        rects: &[Rectangle16],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let mut body = Vec::with_capacity(8 + rects.len() * 8);
+        body.extend_from_slice(&drawable.0.to_le_bytes());
+        body.extend_from_slice(&gc.0.to_le_bytes());
+        for rect in rects {
+            body.extend_from_slice(&rect.x.to_le_bytes());
+            body.extend_from_slice(&rect.y.to_le_bytes());
+            body.extend_from_slice(&rect.width.to_le_bytes());
+            body.extend_from_slice(&rect.height.to_le_bytes());
+        }
+
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 70, // PolyFillRectangle
+                data: 0,
+                length_units: u32::try_from((4 + body.len()) / 4).expect("request length"),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request(PolyFillRectangle) must succeed");
+    }
+
+    fn create_live_v2_window(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        xid: yserver_protocol::x11::ResourceId,
+        parent: yserver_protocol::x11::ResourceId,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> yserver_core::backend::WindowHandle {
+        use yserver_core::{
+            backend::Backend,
+            host_x11::HostSubwindowVisual,
+            resources::{ROOT_VISUAL, ROOT_WINDOW},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        state.resources.create_window(
+            ClientId(14),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: xid,
+                parent,
+                x,
+                y,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let host_parent = if parent == ROOT_WINDOW {
+            yserver_core::backend::WindowHandle::from_raw(backend.core.window_id).expect("root")
+        } else {
+            state
+                .resources
+                .window(parent)
+                .and_then(|w| w.host_xid)
+                .expect("parent host_xid")
+        };
+        let host = backend
+            .create_subwindow(
+                None,
+                host_parent,
+                x,
+                y,
+                width,
+                height,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 24,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("create_subwindow");
+        state.resources.window_mut(xid).expect("window").host_xid = Some(host);
+        if parent == ROOT_WINDOW {
+            backend
+                .register_top_level(None, xid, host.as_raw())
+                .expect("register_top_level");
+        } else {
+            backend
+                .register_subwindow(None, xid, host.as_raw())
+                .expect("register_subwindow");
+        }
+        let _ = state.resources.map_window(xid);
+        backend
+            .map_subwindow(None, host.as_raw())
+            .expect("map_subwindow");
+        host
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn process_request_root_fill_include_inferiors_matches_top_level_after_move() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
+
+        let mut state = yserver_core::server::ServerState::new();
+        let mut backend = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_v2(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let top = ResourceId(0x2000);
+        let gc = ResourceId(0x2001);
+        let child_base = 0x2100u32;
+        let grandchild_base = 0x2200u32;
+
+        let top_host =
+            create_live_v2_window(&mut state, &mut backend, top, ROOT_WINDOW, 11, 7, 100, 90);
+        let top_xid = top_host.as_raw();
+
+        backend
+            .fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+            .expect("clear top");
+        backend
+            .fill_rectangle(None, top_xid, 0x0000_00ff, 20, 30, 70, 30)
+            .expect("baseline fill");
+        let expected = backend
+            .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+            .expect("baseline get_image")
+            .expect("baseline bytes");
+        backend
+            .fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+            .expect("re-clear top");
+
+        state.resources.create_gc(
+            ClientId(14),
+            CreateGcRequest {
+                gc,
+                drawable: top,
+                function: None,
+                plane_mask: None,
+                foreground: Some(0x0000_00ff),
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: Some(1),
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        for i in 0..4 {
+            let child = ResourceId(child_base + i);
+            create_live_v2_window(
+                &mut state,
+                &mut backend,
+                child,
+                top,
+                (i * 20) as i16,
+                0,
+                10,
+                90,
+            );
+            for j in 0..9 {
+                create_live_v2_window(
+                    &mut state,
+                    &mut backend,
+                    ResourceId(grandchild_base + i * 16 + j),
+                    child,
+                    0,
+                    (j * 10) as i16,
+                    10,
+                    6,
+                );
+            }
+        }
+
+        let rect = [Rectangle16 {
+            x: 20,
+            y: 30,
+            width: 70,
+            height: 30,
+        }];
+
+        dispatch_poly_fill_rectangle_v2(&mut state, &mut backend, top, gc, &rect);
+        let top_include = backend
+            .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+            .expect("top include get_image")
+            .expect("top include bytes");
+        assert_eq!(
+            top_include, expected,
+            "top-level request path must match baseline"
+        );
+
+        backend
+            .fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+            .expect("re-clear top");
+
+        dispatch_configure_window_v2(&mut state, &mut backend, top, Some(0), Some(0), Some(0));
+
+        let geom = backend
+            .windows_v2
+            .get(&top_xid)
+            .expect("top geom after move");
+        assert_eq!(
+            (geom.x, geom.y),
+            (0, 0),
+            "backend geometry must track ConfigureWindow"
+        );
+
+        dispatch_poly_fill_rectangle_v2(&mut state, &mut backend, ROOT_WINDOW, gc, &rect);
+        let root_out = backend
+            .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+            .expect("root-path get_image")
+            .expect("root-path bytes");
+        assert_eq!(root_out, expected);
     }
 
     /// Register a client in `state.clients` so `process_request`'s

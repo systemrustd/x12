@@ -2695,24 +2695,16 @@ impl RenderEngine {
             return Err(RenderError::UnknownDrawable(target));
         };
         let extent = drawable.storage.extent;
+        let depth = drawable.depth;
         let image_view = drawable.storage.image_view;
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
         // Unpack the X11 wire pixel (preserve legacy at engine.rs:2546-2560).
-        // R8_UNORM dst (depth 1/8) takes fg in color[0]; BGRA8 dst takes BGR
-        // in channels 0..3. Alpha forced opaque — the pipeline write mask
-        // handles the opaque-alpha policy.
-        let color = if format == vk::Format::R8_UNORM {
-            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
-        } else {
-            [
-                ((fg >> 16) & 0xFF) as f32 / 255.0,
-                ((fg >> 8) & 0xFF) as f32 / 255.0,
-                (fg & 0xFF) as f32 / 255.0,
-                1.0,
-            ]
-        };
+        // R8_UNORM dst (depth 1/8) takes fg in color[0]; BGRA8 dst uses the
+        // same server-alpha policy as solid fills: depth-32 preserves the wire
+        // alpha byte, server-owned-alpha depths force opaque.
+        let color = decode_x11_pixel_for_storage(fg, depth, format);
 
         // Clamp rects to dst extent + drop empties (preserve legacy
         // filter_map at engine.rs:2562-2588).
@@ -3607,7 +3599,7 @@ impl RenderEngine {
         // upstream and routes to the gap path; we surface the
         // type-level reject so the backend wrapper can dedup-log.
         let dst_bpp: u32 = match src_depth {
-            1 | 8 => 1,
+            1 | 4 | 8 => 1,
             24 | 32 => 4,
             _ => return Err(RenderError::UnsupportedDepth(src_depth)),
         };
@@ -3767,7 +3759,7 @@ impl RenderEngine {
             return Err(RenderError::UnknownDrawable(src));
         };
         let storage_bpp: u32 = match out_depth {
-            1 | 8 => 1,
+            1 | 4 | 8 => 1,
             24 | 32 => 4,
             _ => return Err(RenderError::UnsupportedDepth(out_depth)),
         };
@@ -7498,7 +7490,9 @@ fn emit_recorded_fill_rect_into_cb(
             | vk::AccessFlags2::TRANSFER_WRITE
             | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        // LOAD-bearing render passes need attachment read access on open,
+        // same as the compositor path in vk::ops::render.
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
     );
 
     let render_area = vk::Rect2D {
@@ -7608,7 +7602,9 @@ fn emit_recorded_logic_fill_into_cb(
             | vk::AccessFlags2::TRANSFER_WRITE
             | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        // LOAD-bearing render passes need attachment read access on open,
+        // same as the compositor path in vk::ops::render.
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
     );
 
     let render_area = vk::Rect2D {
@@ -8583,6 +8579,7 @@ fn clamp_put_rect(
 fn x11_src_row_stride(depth: u8, width: u32) -> usize {
     let bits_per_row = match depth {
         1 => width,
+        4 => u32::from(4u8) * width,
         8 => u32::from(8u8) * width,
         24 | 32 => 32 * width,
         _ => 32 * width,
@@ -8663,6 +8660,25 @@ fn unpack_to_staging(
                 }
             }
         }
+        4 => {
+            let row_dst_bytes = dst_w as usize;
+            for row in 0..dst_h {
+                let src_row_off = (sy + row) as usize * src_row_bytes;
+                let row_src = &src[src_row_off..src_row_off + src_row_bytes];
+                unsafe {
+                    let dst = dst_ptr.add(row as usize * row_dst_bytes);
+                    for col in 0..dst_w as usize {
+                        let byte = row_src[col / 2];
+                        let nibble = if col % 2 == 0 {
+                            byte & 0x0f
+                        } else {
+                            (byte >> 4) & 0x0f
+                        };
+                        *dst.add(col) = nibble;
+                    }
+                }
+            }
+        }
         1 => {
             // 1 bit per pixel → 1 byte per pixel (0xFF if set,
             // 0x00 if clear). Unpack each requested column from
@@ -8719,6 +8735,25 @@ fn pack_from_storage(raw: &[u8], w: u32, h: u32, depth: u8) -> Result<Vec<u8>, R
                 let dst_off = row * row_dst_bytes;
                 out[dst_off..dst_off + w as usize]
                     .copy_from_slice(&raw[src_off..src_off + w as usize]);
+            }
+            Ok(out)
+        }
+        4 => {
+            // Two pixels per byte, low nibble first, rows padded to 32 bits.
+            let row_dst_bytes = w.div_ceil(8) as usize * 4;
+            let mut out = vec![0u8; row_dst_bytes * h as usize];
+            for row in 0..h as usize {
+                let src_off = row * w as usize;
+                let dst_off = row * row_dst_bytes;
+                for col in 0..w as usize {
+                    let nibble = raw[src_off + col] & 0x0f;
+                    let dst = &mut out[dst_off + col / 2];
+                    if col % 2 == 0 {
+                        *dst = (*dst & 0xf0) | nibble;
+                    } else {
+                        *dst = (*dst & 0x0f) | (nibble << 4);
+                    }
+                }
             }
             Ok(out)
         }
@@ -8781,6 +8816,29 @@ pub(crate) fn decode_x11_pixel_server_alpha(pixel: u32, depth: u8) -> [f32; 4] {
         c[3] = 1.0;
     }
     c
+}
+
+/// Decode an X11 pixel for direct storage writes.
+///
+/// `R8_UNORM` targets are alpha-mask style storages, so the byte must
+/// land in the attachment's first component, not the BGRA low byte
+/// interpretation used by `decode_x11_pixel_server_alpha`.
+#[must_use]
+pub(crate) fn decode_x11_pixel_for_storage(pixel: u32, depth: u8, format: vk::Format) -> [f32; 4] {
+    if format == vk::Format::R8_UNORM {
+        [
+            (pixel & 0xff) as f32 / 255.0,
+            0.0,
+            0.0,
+            if depth == 32 {
+                ((pixel >> 24) & 0xff) as f32 / 255.0
+            } else {
+                1.0
+            },
+        ]
+    } else {
+        decode_x11_pixel_server_alpha(pixel, depth)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -8869,6 +8927,9 @@ mod tests {
         assert_eq!(x11_src_row_stride(1, 9), 4);
         // depth-1, width 33 → ceil(33/32)*4 = 8.
         assert_eq!(x11_src_row_stride(1, 33), 8);
+        // depth-4 is nibble-packed and padded to 32 bits.
+        assert_eq!(x11_src_row_stride(4, 3), 4);
+        assert_eq!(x11_src_row_stride(4, 9), 8);
         // depth-8, width 3 → 24 bits padded to 32 → 4 bytes.
         assert_eq!(x11_src_row_stride(8, 3), 4);
         // depth-8, width 5 → 40 bits padded to 64 → 8 bytes.
@@ -8984,6 +9045,21 @@ mod tests {
         let mut out = vec![0u8; 16];
         unpack_to_staging(&src, src_extent, 0, 0, 2, 2, 32, out.as_mut_ptr()).unwrap();
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn depth4_unpack_and_pack_follow_nibble_layout() {
+        let src = vec![0x21u8, 0x00, 0x00, 0x00];
+        let src_extent = vk::Extent2D {
+            width: 2,
+            height: 1,
+        };
+        let mut out = vec![0u8; 2];
+        unpack_to_staging(&src, src_extent, 0, 0, 2, 1, 4, out.as_mut_ptr()).unwrap();
+        assert_eq!(out, vec![0x01, 0x02]);
+
+        let packed = pack_from_storage(&out, 2, 1, 4).unwrap();
+        assert_eq!(packed, vec![0x21, 0x00, 0x00, 0x00]);
     }
 
     // ── Vk-backed integration tests ─────────────────────────────
@@ -9230,6 +9306,69 @@ mod tests {
         engine.drain_all(&mut platform);
     }
 
+    /// `fill_rect` must write the source byte into `R8_UNORM`
+    /// storage, not treat it like BGRA. This locks the depth-8
+    /// GXcopy path that Xlib9 `XFillRectangle` exercises.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn fill_depth8_observes_r8_source_byte() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage = platform.allocate_drawable_storage(4, 4, 8).expect("alloc");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                8,
+                false,
+                storage,
+            )
+            .unwrap();
+
+        let color = decode_x11_pixel_for_storage(0x01, 8, vk::Format::R8_UNORM);
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                color,
+            )
+            .expect("fill_rect");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                8,
+            )
+            .expect("get_image");
+        for b in out {
+            assert_eq!(b, 0x01, "R8 fill must preserve the source byte");
+        }
+
+        engine.drain_all(&mut platform);
+    }
+
     /// Stage 3f.2: `engine.logic_fill` applies the per-`GcFunction`
     /// `VkLogicOp` per pixel. Drives `Xor` against a pre-loaded BGRA8
     /// pattern; expects each component to be the pre-load XOR'd with
@@ -9447,6 +9586,209 @@ mod tests {
                 assert_eq!(&out[off..off + 4], &[0x00, 0x00, 0xFF, 0xFF], "right red");
             }
         }
+
+        engine.drain_all(&mut platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
+        use yserver_core::backend::GcFunction;
+
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage = platform
+            .allocate_drawable_storage(2, 2, 32)
+            .expect("storage");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .expect("alloc");
+
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 2,
+                        height: 2,
+                    },
+                },
+                decode_x11_pixel_bgra(0),
+            )
+            .expect("clear");
+
+        engine
+            .logic_fill(
+                &mut store,
+                &mut platform,
+                id,
+                GcFunction::Copy,
+                /* opaque_alpha */ false,
+                /* fg */ 0x0000_0001,
+                &[Rectangle16 {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }],
+            )
+            .expect("logic_fill");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 2,
+                        height: 2,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, &[0x01, 0x00, 0x00, 0x00]);
+        }
+
+        engine.drain_all(&mut platform);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn logic_fill_r8_not_family_matches_x11_bytes() {
+        use yserver_core::backend::GcFunction;
+
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage = platform
+            .allocate_drawable_storage(2, 1, 8)
+            .expect("storage");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                8,
+                false,
+                storage,
+            )
+            .expect("alloc");
+
+        // Preload dst bytes [0x00, 0x03].
+        let pre = vec![0x00, 0x03, 0x00, 0x00];
+        engine
+            .put_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Offset2D::default(),
+                vk::Extent2D {
+                    width: 2,
+                    height: 1,
+                },
+                &pre,
+                8,
+            )
+            .expect("put_image");
+
+        let rect = Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+
+        engine
+            .logic_fill(
+                &mut store,
+                &mut platform,
+                id,
+                GcFunction::Set,
+                /* opaque_alpha */ true,
+                /* fg */ 0,
+                &[rect],
+            )
+            .expect("logic_fill set");
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                8,
+            )
+            .expect("get_image set");
+        assert_eq!(&out[..2], &[0xff, 0xff], "GXset must write all 1 bits");
+
+        engine
+            .put_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Offset2D::default(),
+                vk::Extent2D {
+                    width: 2,
+                    height: 1,
+                },
+                &pre,
+                8,
+            )
+            .expect("put_image reload");
+        engine
+            .logic_fill(
+                &mut store,
+                &mut platform,
+                id,
+                GcFunction::Invert,
+                /* opaque_alpha */ true,
+                /* fg */ 0,
+                &[rect],
+            )
+            .expect("logic_fill invert");
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                id,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                8,
+            )
+            .expect("get_image invert");
+        assert_eq!(&out[..2], &[0xff, 0xfc], "GXinvert must flip all 8 bits");
 
         engine.drain_all(&mut platform);
     }

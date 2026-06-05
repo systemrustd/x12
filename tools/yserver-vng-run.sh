@@ -14,13 +14,16 @@ set -euo pipefail
 HARNESS=${1:?harness required: 'xts' or 'rendercheck'}
 shift
 
-cd /home/jos/Projects/yserver
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+
+cd "$repo_root"
 # vng's guest /tmp is a fresh tmpfs — anything written to /tmp inside
 # the guest is invisible to the host post-exit. Stash yserver's
 # stderr/stdout in the project tree (host-mounted --rw via vng), so
 # post-mortems / crash logs survive. Env-overrideable for ad-hoc runs:
 #   YSERVER_VNG_LOG=/path/to/log  YSERVER_VNG_RUST_LOG=trace just rendercheck-yserver ...
-YSERVER_LOG="${YSERVER_VNG_LOG:-/home/jos/Projects/yserver/yserver-vng.log}"
+YSERVER_LOG="${YSERVER_VNG_LOG:-$repo_root/yserver-vng.log}"
 RUST_LOG="${YSERVER_VNG_RUST_LOG:-warn}" RUST_BACKTRACE=1 target/release/yserver > "$YSERVER_LOG" 2>&1 &
 pid=$!
 trap "kill $pid 2>/dev/null; wait $pid 2>/dev/null || true" EXIT

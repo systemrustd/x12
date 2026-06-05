@@ -23,7 +23,7 @@
 #![cfg(target_os = "linux")]
 
 use yserver::kms::v2::KmsBackendV2;
-use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState};
+use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
 use yserver_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
@@ -510,6 +510,244 @@ fn v2_copy_plane_depth1_extracts_mask_bits() {
         let off = x * 4;
         assert_eq!(&out[off..off + 4], exp, "copy_plane mismatch at x={x}",);
     }
+}
+
+/// Mirrors XTS XFillRectangle TP23 part 2: two tiled fills built from the
+/// same depth-1 bitmap but with foreground/background swapped, where the
+/// second draw uses GXxor and must match a solid `fg ^ bg` fill.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_fill_tiled_xor_with_reversed_tile_matches_solid_xor() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let fg: u32 = 0x0000_00ff;
+    let bg: u32 = 0x0000_ff00;
+    let xor_color: u32 = fg ^ bg;
+
+    let bitmap = b.create_pixmap(None, 1, 8, 1).expect("bitmap pixmap");
+    let bitmap_bytes: Vec<u8> = vec![0b0101_1010, 0, 0, 0];
+    b.put_image(None, bitmap.as_raw(), 1, 8, 1, 0, 0, &bitmap_bytes)
+        .expect("put depth-1 bitmap");
+
+    let tile_a = b.create_pixmap(None, 24, 8, 1).expect("tile a");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            foreground: fg,
+            background: bg,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply copyplane colors a");
+    b.copy_plane(None, bitmap.as_raw(), tile_a.as_raw(), 0, 0, 0, 0, 8, 1, 1)
+        .expect("copy_plane tile a");
+
+    let tile_b = b.create_pixmap(None, 24, 8, 1).expect("tile b");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            foreground: bg,
+            background: fg,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply copyplane colors b");
+    b.copy_plane(None, bitmap.as_raw(), tile_b.as_raw(), 0, 0, 0, 0, 8, 1, 1)
+        .expect("copy_plane tile b");
+
+    let expected = b.create_pixmap(None, 24, 8, 1).expect("expected pixmap");
+    b.fill_rectangle(None, expected.as_raw(), xor_color, 0, 0, 8, 1)
+        .expect("solid xor fill");
+    let expected_bytes = b
+        .get_image_pixels_for_tests(expected.as_raw(), 2, 0, 0, 8, 1, !0)
+        .expect("expected get_image")
+        .expect("expected bytes");
+
+    let dst = b.create_pixmap(None, 24, 8, 1).expect("dst pixmap");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            fill: FillState::Tiled {
+                pixmap: tile_a,
+                origin: (0, 0),
+            },
+            function: GcFunction::Copy,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply tiled state a");
+    b.fill_rectangle(None, dst.as_raw(), 0, 0, 0, 8, 1)
+        .expect("tiled fill a");
+
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            fill: FillState::Tiled {
+                pixmap: tile_b,
+                origin: (0, 0),
+            },
+            function: GcFunction::Xor,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply tiled xor state b");
+    b.fill_rectangle(None, dst.as_raw(), 0, 0, 0, 8, 1)
+        .expect("tiled fill xor b");
+
+    let out = b
+        .get_image_pixels_for_tests(dst.as_raw(), 2, 0, 0, 8, 1, !0)
+        .expect("dst get_image")
+        .expect("dst bytes");
+    assert_eq!(out, expected_bytes);
+}
+
+/// Mirrors XTS XFillRectangle TP27's root-window special case:
+/// drawing on the root with `IncludeInferiors` must update the
+/// overlapping top-level and descendant windows exactly as if the
+/// draw had targeted the top-level directly.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_root_fill_with_include_inferiors_matches_top_level_result() {
+    use yserver_core::{
+        backend::WindowHandle,
+        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+    };
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    let top = b
+        .create_subwindow(
+            None,
+            root,
+            11,
+            7,
+            100,
+            90,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("top-level");
+    let top_xid = top.as_raw();
+    b.map_subwindow(None, top_xid).expect("map top");
+
+    b.fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+        .expect("clear top");
+    b.fill_rectangle(None, top_xid, 0x0000_00ff, 20, 30, 70, 30)
+        .expect("baseline fill");
+    let expected = b
+        .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+        .expect("baseline get_image")
+        .expect("baseline bytes");
+
+    b.fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+        .expect("re-clear top");
+
+    for i in 0..4 {
+        let child = b
+            .create_subwindow(
+                None,
+                top,
+                (i * 20) as i16,
+                0,
+                10,
+                90,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 32,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("strip child");
+        b.map_subwindow(None, child.as_raw()).expect("map child");
+        for j in 0..9 {
+            let grandchild = b
+                .create_subwindow(
+                    None,
+                    child,
+                    0,
+                    (j * 10) as i16,
+                    10,
+                    6,
+                    0,
+                    HostSubwindowVisual::Explicit {
+                        depth: 32,
+                        visual_xid: 0,
+                        colormap_xid: 0,
+                    },
+                    None,
+                    None,
+                )
+                .expect("strip grandchild");
+            b.map_subwindow(None, grandchild.as_raw())
+                .expect("map grandchild");
+        }
+    }
+
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply include inferiors");
+
+    b.fill_rectangle(None, top_xid, 0x0000_00ff, 20, 30, 70, 30)
+        .expect("top fill include inferiors");
+    let top_include_out = b
+        .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+        .expect("top include get_image")
+        .expect("top include bytes");
+    assert_eq!(top_include_out, expected);
+
+    b.fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
+        .expect("re-clear top after include inferiors");
+
+    b.configure_subwindow(
+        None,
+        top_xid,
+        HostSubwindowConfig {
+            x: Some(0),
+            y: Some(0),
+            width: None,
+            height: None,
+            border_width: Some(0),
+            sibling: None,
+            stack_mode: None,
+        },
+    )
+    .expect("move top to root origin");
+
+    b.fill_rectangle(None, root.as_raw(), 0x0000_00ff, 20, 30, 70, 30)
+        .expect("root fill include inferiors");
+
+    let out = b
+        .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
+        .expect("root-path get_image")
+        .expect("root-path bytes");
+    assert_eq!(out, expected);
 }
 
 /// Stage 3e.2 acceptance: a 4×4 axis-aligned trapezoid (= filled
@@ -5835,10 +6073,7 @@ fn v2_read_depth1_pixmap_declines_depth32() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_two_fills_then_get_image_returns_second_fill() {
-    use yserver_core::{
-        backend::WindowHandle,
-        host_x11::HostSubwindowVisual,
-    };
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -5899,7 +6134,8 @@ fn v2_two_fills_then_get_image_returns_second_fill() {
     // Pixel inside the rect — (50, 45). Expect BGRA [0x01, 0, 0, *].
     let inside = (45 * 100 + 50) * 4;
     assert_eq!(
-        bytes[inside], 0x01,
+        bytes[inside],
+        0x01,
         "inside-rect B byte must be 1 (second fill landed); full pixel = {:02x?}",
         &bytes[inside..inside + 4],
     );
@@ -5907,8 +6143,111 @@ fn v2_two_fills_then_get_image_returns_second_fill() {
     // Pixel outside the rect — (5, 5). Expect BGRA [0, 0, 0, *].
     let outside = (5 * 100 + 5) * 4;
     assert_eq!(
-        bytes[outside], 0x00,
+        bytes[outside],
+        0x00,
         "outside-rect B byte must be 0 (Map clear background); full pixel = {:02x?}",
         &bytes[outside..outside + 4],
+    );
+}
+
+/// xts5 Xlib9/XFillRectangle TP1 compose-boundary repro: map a fresh
+/// window, force one real scene compose, retire its page-flip ack,
+/// then issue the foreground fill, force a second compose, and read
+/// the drawable back via GetImage.
+///
+/// The non-compose harness (`for_tests_with_vk`) already proves that
+/// "init fill + second fill + GetImage" works when no scene submit
+/// happens in between. This variant is the load-bearing one for the
+/// live XTS failure because it exercises the full
+/// `fill -> compose -> fill -> compose` rhythm with a real scene ack
+/// retirement between the two composes.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_compose_then_fill_then_get_image_returns_second_fill() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk_live_scene() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk/live scene: {e}");
+            return;
+        }
+    };
+
+    let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
+    let win = b
+        .create_subwindow(
+            None,
+            parent,
+            0,
+            0,
+            100,
+            90,
+            1,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            Some(0x0000_0000),
+            None,
+        )
+        .expect("create_subwindow");
+    let xid = win.as_raw();
+    b.map_subwindow(None, xid).expect("map_subwindow");
+
+    let composite_submits_before = b.telemetry().lifetime.composite_submits;
+    b.tick_maybe_composite_for_tests();
+    let composite_submits_after = b.telemetry().lifetime.composite_submits;
+    assert!(
+        composite_submits_after > composite_submits_before,
+        "fixture sanity: maybe_composite must perform a real compose submit before the second fill",
+    );
+    let retired = b
+        .simulate_scene_page_flip_complete_for_tests()
+        .expect("retire first compose ack");
+    assert!(
+        retired >= 1,
+        "fixture sanity: first compose must leave a pending scene ack to retire",
+    );
+
+    let small_rect = {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i16::to_le_bytes(20));
+        buf.extend_from_slice(&i16::to_le_bytes(30));
+        buf.extend_from_slice(&u16::to_le_bytes(70));
+        buf.extend_from_slice(&u16::to_le_bytes(30));
+        buf
+    };
+    b.poly_fill_rectangle(None, xid, 0x0000_0001, &small_rect)
+        .expect("foreground fill");
+
+    let composite_submits_before_second = b.telemetry().lifetime.composite_submits;
+    b.tick_maybe_composite_for_tests();
+    let composite_submits_after_second = b.telemetry().lifetime.composite_submits;
+    assert!(
+        composite_submits_after_second > composite_submits_before_second,
+        "fixture sanity: second maybe_composite must submit after the foreground fill",
+    );
+
+    let bytes = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 100, 90, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+    assert_eq!(bytes.len(), 100 * 90 * 4, "depth-24 ZPixmap is BGRA8");
+
+    let inside = (45 * 100 + 50) * 4;
+    assert_eq!(
+        bytes[inside],
+        0x01,
+        "inside-rect B byte must be 1 after compose-before-fill; pixel = {:02x?}",
+        &bytes[inside..inside + 4],
+    );
+
+    let outside = 0;
+    assert_eq!(
+        &bytes[outside..outside + 4],
+        &[0x00, 0x00, 0x00, 0xFF],
+        "outside the fill rect the mapped background must remain black",
     );
 }

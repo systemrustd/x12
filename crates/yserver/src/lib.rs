@@ -22,8 +22,28 @@ use nix::sys::{
 use yserver_core::{
     backend::Backend,
     core_loop::{self, Message, poll_tokens::ClientIdAllocator},
+    resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
     server::ServerState,
 };
+
+fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend) {
+    if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
+        root.host_xid = yserver_core::backend::WindowHandle::from_raw(backend.window_id());
+    }
+    state
+        .resources
+        .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
+    if let Some(host_colormap) = backend.argb_colormap_xid() {
+        state
+            .resources
+            .set_colormap_host_xid(ARGB_COLORMAP, host_colormap);
+    }
+    if let Some(host_argb_visual) = backend.argb_visual_xid() {
+        state
+            .resources
+            .set_visual_host_xid(ARGB_VISUAL, host_argb_visual);
+    }
+}
 
 pub fn run(display: u16) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
@@ -191,6 +211,7 @@ pub fn run(display: u16) -> io::Result<()> {
     let randr_outputs = backend.randr_outputs();
     let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
     state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
+    install_backend_root_bindings(&mut state, &backend);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -477,4 +498,43 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_backend_root_bindings;
+    use yserver_core::{
+        backend::Backend,
+        resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
+        server::ServerState,
+    };
+
+    #[test]
+    fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
+        let mut state = ServerState::new();
+        let backend = crate::kms::v2::KmsBackendV2::for_tests();
+
+        install_backend_root_bindings(&mut state, &backend as &dyn Backend);
+
+        let root = state.resources.window(ROOT_WINDOW).expect("root");
+        assert_eq!(root.host_xid.map(|h| h.as_raw()), Some(backend.window_id()));
+        let root_visual = state.resources.visual(ROOT_VISUAL).expect("root visual");
+        assert_eq!(
+            root_visual.host_visual_xid.map(|v| v.as_raw()),
+            Some(backend.root_visual_xid())
+        );
+        let argb_visual = state.resources.visual(ARGB_VISUAL).expect("argb visual");
+        assert_eq!(
+            argb_visual.host_visual_xid.map(|v| v.as_raw()),
+            backend.argb_visual_xid()
+        );
+        let argb_colormap = state
+            .resources
+            .colormap(ARGB_COLORMAP)
+            .expect("argb colormap");
+        assert_eq!(
+            argb_colormap.host_colormap_xid.map(|c| c.as_raw()),
+            backend.argb_colormap_xid()
+        );
+    }
 }

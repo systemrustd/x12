@@ -4331,7 +4331,7 @@ KMS. The earlier "20-min timeout" mystery at Xlib12/XMaskEvent was
 the recipe's default `timeout=1200` budget for the WHOLE run, not a
 yserver bug.
 
-## Xlib9 bulk-drawing — second-fill drops between scene composes (open, 2026-06-04)
+## Xlib9 bulk-drawing — second-fill drops between scene composes (resolved 2026-06-05, see follow-up section below)
 
 **Symptom (vng, all ICDs).** `just xts-yserver Xlib9` on silence
 reproduces eiger's 970/1472 FAIL (180 PASS — within noise of the
@@ -4435,3 +4435,42 @@ which are also two-fill verifications).
 
 Pivoting to the smaller `missing-error` cluster next (114 fails,
 deterministic, no Vulkan involvement).
+
+## Xlib9 `XFillRectangle` — resolved in KMS worktree (2026-06-05)
+
+The earlier "second fill drops after scene compose" hypothesis turned
+out to be incomplete. The reduced compose harness stayed green; the
+live XTS failures instead broke down into a stack of independent
+protocol and storage bugs in the KMS/v2 path. The narrow diag is now
+green:
+
+- `xts5/Xlib9/XFillRectangle/XFillRectangle`: `42 PASS / 1 NOTINUSE / 1 UNSUPPORTED`
+- final live run: `/home/jos/Projects/xts/results/2026-06-05-11:24:32`
+
+Main fixes that moved the case:
+
+- v2 color-attachment `LOAD` passes now open with
+  `COLOR_ATTACHMENT_READ | COLOR_ATTACHMENT_WRITE`, fixing stale
+  render-pass semantics after prior sampling.
+- depth 4 now uses the same `R8_UNORM` storage / row-pack path as
+  depth 8 instead of falling through `UnsupportedDepth(4)`.
+- solid fills now honor plane mask and sub-byte depth (`1`/`4`)
+  semantics via a CPU read/modify/write fallback for the NOT-family
+  logic ops and masked writes.
+- request-path error validation for `PolyFillRectangle` now returns
+  the expected `BadDrawable`, `BadGC`, and `BadMatch` cases.
+- patterned fills (`Tiled`, `Stippled`, `OpaqueStippled`) now go
+  through a CPU fallback that honors GC function, plane mask,
+  TS-origin, stipple background semantics, and `ClipByChildren`.
+- GC-retained clip/tile/stipple pixmaps now survive `FreePixmap` on
+  the host side, matching X11 lifetime semantics.
+- `PutImage` bitmap ingress fixes:
+  - `XYBitmap` uploads to depth-N drawables now expand bits with the
+    GC foreground/background and upload at the target depth.
+  - depth-1 `XYPixmap` uploads are normalized into the existing depth-1
+    ZPixmap path.
+- KMS startup now installs backend root bindings into `ServerState`,
+  fixing request-path root draws such as the `IncludeInferiors` case.
+
+The remaining `UNSUPPORTED` TP is the existing non-actionable XTS
+bucket rather than a live KMS regression in `XFillRectangle`.

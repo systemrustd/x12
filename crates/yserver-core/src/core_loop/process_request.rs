@@ -11436,17 +11436,6 @@ fn drawable_lookup(state: &ServerState, id: ResourceId) -> DrawableLookup {
     DrawableLookup::Missing
 }
 
-/// Depth of any drawable (window or pixmap) by resource id, or `None`
-/// if the id doesn't resolve. Used to look up a GC's creation-time
-/// depth via the stored `gc.drawable`.
-fn resource_drawable_depth(state: &ServerState, id: ResourceId) -> Option<u8> {
-    state
-        .resources
-        .window(id)
-        .map(|w| w.depth)
-        .or_else(|| state.resources.pixmap(id).map(|p| p.depth))
-}
-
 /// Result of validating (drawable, gc) for a paint request. The
 /// shape mirrors Xorg's `VALIDATE_DRAWABLE_AND_GC` macro: emit
 /// BadDrawable, BadMatch (inputonly), BadGC, or BadMatch
@@ -11469,16 +11458,12 @@ fn validate_drawable_and_gc(
     let Some(gc_entry) = state.resources.gc(gc) else {
         return Err((x11::error::BAD_GC, gc.0));
     };
-    // GC depth = depth of the drawable the GC was created against
-    // (X11: a GC's depth is fixed at CreateGC and matches its origin
-    // drawable's depth). If the origin drawable has since been freed,
-    // we can't recover its depth and skip the check — Xorg keeps
-    // the depth in the GC struct itself; until we do the same, a
-    // missing origin drawable means we silently accept the request
-    // rather than emit a spurious BadMatch.
-    if let Some(gc_depth) = resource_drawable_depth(state, gc_entry.drawable)
-        && gc_depth != target_depth
-    {
+    // GC depth is fixed at CreateGC to the depth of the origin drawable
+    // (X11 spec). Stored on the GC entry directly so it survives the
+    // origin drawable being freed. `depth == 0` means "GC was created
+    // before the depth field was tracked" — skip the check rather than
+    // emit a spurious BadMatch.
+    if gc_entry.depth != 0 && gc_entry.depth != target_depth {
         return Err((x11::error::BAD_MATCH, 0));
     }
     Ok(())
@@ -12851,42 +12836,97 @@ fn handle_put_image(
         request.depth,
         request.format,
     );
-    if let Err((code, bad_value)) =
-        validate_drawable_and_gc(state, request.drawable, request.gc)
-    {
+    if let Err((code, bad_value)) = validate_drawable_and_gc(state, request.drawable, request.gc) {
         return emit_x11_error(state, client_id, sequence, code, bad_value, 72);
     }
     let draw_state = state.resources.resolve_draw_state(request.gc);
     let target = state.resources.host_drawable_target(request.drawable);
-    if request.format != x11::ImageFormat::ZPixmap {
-        return Ok(RequestOutcome::Handled);
-    }
-    if request.left_pad != 0 {
-        return Ok(RequestOutcome::Handled);
-    }
     if let Some(target) = target {
-        if request.depth != target.depth() {
-            return Ok(RequestOutcome::Handled);
-        }
-        let Some(expected_len) = zpixmap_expected_len(request.width, request.height, request.depth)
-        else {
-            return Ok(RequestOutcome::Handled);
-        };
-        if request.data.len() < expected_len {
-            return Ok(RequestOutcome::Handled);
-        }
         let st = draw_state.unwrap_or_default();
+        let (image_bytes, upload_depth) = match request.format {
+            x11::ImageFormat::ZPixmap => {
+                if request.left_pad != 0 || request.depth != target.depth() {
+                    return Ok(RequestOutcome::Handled);
+                }
+                let Some(expected_len) =
+                    zpixmap_expected_len(request.width, request.height, request.depth)
+                else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                if request.data.len() < expected_len {
+                    return Ok(RequestOutcome::Handled);
+                }
+                (request.data[..expected_len].to_vec(), request.depth)
+            }
+            x11::ImageFormat::XyBitmap => {
+                // XYBitmap is a single depth-1 source plane interpreted through
+                // the GC foreground/background pixels. This is the path used by
+                // XCreateBitmapFromData() and XCreatePixmapFromBitmapData().
+                if request.depth != 1 {
+                    return Ok(RequestOutcome::Handled);
+                }
+                let Some(expected_len) =
+                    xybitmap_expected_len(request.width, request.height, request.left_pad)
+                else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                if request.data.len() < expected_len {
+                    return Ok(RequestOutcome::Handled);
+                }
+                let Some(bytes) = xybitmap_to_target_zpixmap(
+                    &request.data[..expected_len],
+                    request.width,
+                    request.height,
+                    request.left_pad,
+                    target.depth(),
+                    st.foreground,
+                    st.background,
+                ) else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                (bytes, target.depth())
+            }
+            x11::ImageFormat::XyPixmap => {
+                // Depth-1 XYPixmap is a single bitmap plane and can be
+                // normalized through the same repack as XYBitmap. Higher
+                // depths need multi-plane composition and remain unsupported
+                // here for now.
+                if request.depth != 1 || target.depth() != 1 {
+                    return Ok(RequestOutcome::Handled);
+                }
+                let Some(expected_len) =
+                    xybitmap_expected_len(request.width, request.height, request.left_pad)
+                else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                if request.data.len() < expected_len {
+                    return Ok(RequestOutcome::Handled);
+                }
+                let Some(bytes) = xybitmap_to_zpixmap(
+                    &request.data[..expected_len],
+                    request.width,
+                    request.height,
+                    request.left_pad,
+                ) else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                (bytes, request.depth)
+            }
+            x11::ImageFormat::Unknown(_) => {
+                return Ok(RequestOutcome::Handled);
+            }
+        };
         backend.apply_clip_state(origin, &st.clip)?;
         backend.apply_draw_state(origin, &st)?;
         backend.put_image(
             origin,
             target.host_xid(),
-            request.depth,
+            upload_depth,
             request.width,
             request.height,
             request.dst_x,
             request.dst_y,
-            &request.data[..expected_len],
+            &image_bytes,
         )?;
         let _dropped = accumulate_damage_to_state(
             state,
@@ -12918,6 +12958,110 @@ fn zpixmap_row_stride(width: u16, depth: u8) -> Option<usize> {
         1 => usize::from(width).div_ceil(32).checked_mul(4),
         _ => None,
     }
+}
+
+fn xybitmap_expected_len(width: u16, height: u16, left_pad: u8) -> Option<usize> {
+    let bits_per_row = usize::from(width).checked_add(usize::from(left_pad))?;
+    let stride_bytes = bits_per_row.div_ceil(32).checked_mul(4)?;
+    stride_bytes.checked_mul(usize::from(height))
+}
+
+fn xybitmap_to_zpixmap(data: &[u8], width: u16, height: u16, left_pad: u8) -> Option<Vec<u8>> {
+    let bits_per_row = usize::from(width).checked_add(usize::from(left_pad))?;
+    let src_row_stride = bits_per_row.div_ceil(32).checked_mul(4)?;
+    if data.len() < src_row_stride.checked_mul(usize::from(height))? {
+        return None;
+    }
+    let dst_row_stride = zpixmap_row_stride(width, 1)?;
+    let mut out = vec![0u8; dst_row_stride.checked_mul(usize::from(height))?];
+    let left_pad = usize::from(left_pad);
+    let width = usize::from(width);
+    for row in 0..usize::from(height) {
+        let src_row = &data[row * src_row_stride..(row + 1) * src_row_stride];
+        let dst_row = &mut out[row * dst_row_stride..(row + 1) * dst_row_stride];
+        for x in 0..width {
+            let src_bit = left_pad + x;
+            let src_byte = src_row[src_bit / 8];
+            if (src_byte >> (src_bit % 8)) & 1 != 0 {
+                dst_row[x / 8] |= 1 << (x % 8);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn depth_plane_mask(depth: u8) -> u32 {
+    if depth >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << depth) - 1
+    }
+}
+
+fn write_zpixmap_pixel(bytes: &mut [u8], width: usize, depth: u8, x: usize, y: usize, value: u32) {
+    let stride = zpixmap_row_stride(width as u16, depth).expect("validated target depth");
+    match depth {
+        1 => {
+            let byte = &mut bytes[y * stride + x / 8];
+            let bit = 1u8 << (x % 8);
+            if value & 1 != 0 {
+                *byte |= bit;
+            } else {
+                *byte &= !bit;
+            }
+        }
+        4 => {
+            let byte = &mut bytes[y * stride + x / 2];
+            let nibble = (value & 0x0f) as u8;
+            if x.is_multiple_of(2) {
+                *byte = (*byte & 0xf0) | nibble;
+            } else {
+                *byte = (*byte & 0x0f) | (nibble << 4);
+            }
+        }
+        8 => bytes[y * stride + x] = value as u8,
+        24 | 32 => {
+            let off = y * stride + x * 4;
+            bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        _ => {}
+    }
+}
+
+fn xybitmap_to_target_zpixmap(
+    data: &[u8],
+    width: u16,
+    height: u16,
+    left_pad: u8,
+    target_depth: u8,
+    fg: u32,
+    bg: u32,
+) -> Option<Vec<u8>> {
+    let bits_per_row = usize::from(width).checked_add(usize::from(left_pad))?;
+    let src_row_stride = bits_per_row.div_ceil(32).checked_mul(4)?;
+    if data.len() < src_row_stride.checked_mul(usize::from(height))? {
+        return None;
+    }
+    let dst_row_stride = zpixmap_row_stride(width, target_depth)?;
+    let mut out = vec![0u8; dst_row_stride.checked_mul(usize::from(height))?];
+    let left_pad = usize::from(left_pad);
+    let width = usize::from(width);
+    let fg = fg & depth_plane_mask(target_depth);
+    let bg = bg & depth_plane_mask(target_depth);
+    for row in 0..usize::from(height) {
+        let src_row = &data[row * src_row_stride..(row + 1) * src_row_stride];
+        for x in 0..width {
+            let src_bit = left_pad + x;
+            let src_byte = src_row[src_bit / 8];
+            let pixel = if (src_byte >> (src_bit % 8)) & 1 != 0 {
+                fg
+            } else {
+                bg
+            };
+            write_zpixmap_pixel(&mut out, width, target_depth, x, row, pixel);
+        }
+    }
+    Some(out)
 }
 
 /// Extract a tightly-packed `src_width × src_height × bpp(depth)`
@@ -13048,8 +13192,7 @@ fn handle_image_text8(
         debug!("focus text drawable 0x{drawable_raw:x}");
         set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 76);
         }
@@ -13087,8 +13230,7 @@ fn handle_image_text16(
         debug!("focus text drawable 0x{drawable_raw:x}");
         set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 77);
         }
@@ -14056,8 +14198,7 @@ fn handle_poly_text8(
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 74);
         }
@@ -14085,8 +14226,7 @@ fn handle_poly_text16(
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
         let drawable = ResourceId(drawable_raw);
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 75);
         }
@@ -14117,8 +14257,7 @@ fn handle_poly_point(
         let drawable = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let points = &body[8..];
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 64);
         }
@@ -14167,8 +14306,7 @@ fn handle_poly_line(
     if let Some((gc_id, points)) = x11::poly_line_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 65);
         }
@@ -14208,8 +14346,7 @@ fn handle_poly_segment(
     if let Some((gc_id, segments)) = x11::poly_segment_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 66);
         }
@@ -14243,8 +14380,7 @@ fn handle_poly_rectangle(
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 67);
         }
@@ -14278,8 +14414,7 @@ fn handle_poly_arc(
     if let Some((gc_id, arcs)) = x11::poly_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 68);
         }
@@ -14315,8 +14450,7 @@ fn handle_fill_poly(
         let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let coord_mode = body[9];
         let points = &body[12..];
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 69);
         }
@@ -14355,8 +14489,7 @@ fn handle_poly_fill_rectangle(
     if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 70);
         }
@@ -14396,8 +14529,7 @@ fn handle_poly_fill_arc(
     if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
         && let Some(drawable) = x11::drawable_request_id(body)
     {
-        if let Err((code, bad_value)) =
-            validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
+        if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 71);
         }
@@ -15215,7 +15347,10 @@ fn handle_free_pixmap(
         let still_referenced = removed
             .as_ref()
             .and_then(|p| p.host_xid)
-            .is_some_and(|xid| state.resources.host_xid_referenced_by_window_bg(xid));
+            .is_some_and(|xid| {
+                state.resources.host_xid_referenced_by_window_bg(xid)
+                    || state.resources.host_xid_referenced_by_gc(xid)
+            });
         if let Some(removed_pixmap) = removed
             && let Some(xid) = removed_pixmap.host_xid
             && !still_referenced
@@ -17510,13 +17645,16 @@ mod tests {
     };
 
     use yserver_protocol::x11::{
-        ClientByteOrder, ClientId, RequestHeader, SequenceNumber, screensaver as x11screensaver,
-        sync as x11sync,
+        ClientByteOrder, ClientId, CreateGcRequest, CreatePixmapRequest, CreateWindowRequest,
+        RequestHeader, ResourceId, SequenceNumber, screensaver as x11screensaver, sync as x11sync,
     };
 
     use super::*;
     use crate::{
-        backend::recording::{RecordedCall, RecordingBackend},
+        backend::{
+            FillStyle,
+            recording::{RecordedCall, RecordingBackend},
+        },
         resources::ROOT_WINDOW,
         server::{ClientState, ScreenSaverActive, ServerState},
     };
@@ -17568,6 +17706,77 @@ mod tests {
         out
     }
 
+    fn poly_fill_rectangle_body(drawable: u32, gc: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&drawable.to_le_bytes());
+        body.extend_from_slice(&gc.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body
+    }
+
+    fn free_pixmap_body(pixmap: u32) -> Vec<u8> {
+        pixmap.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn xybitmap_to_zpixmap_preserves_lsb_first_bits_without_left_pad() {
+        let src = [
+            0b0000_1101u8,
+            0,
+            0,
+            0, // row 0: 1 0 1 1
+            0b0000_0010u8,
+            0,
+            0,
+            0, // row 1: 0 1 0 0
+        ];
+        let out = xybitmap_to_zpixmap(&src, 4, 2, 0).expect("convert");
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn xybitmap_to_zpixmap_strips_left_pad_bits() {
+        let src = [
+            0b0011_0100u8,
+            0,
+            0,
+            0, // left_pad=2, payload bits => 1 0 1 1
+        ];
+        let out = xybitmap_to_zpixmap(&src, 4, 1, 2).expect("convert");
+        assert_eq!(out, vec![0b0000_1101u8, 0, 0, 0]);
+    }
+
+    #[test]
+    fn xybitmap_to_target_zpixmap_expands_bits_with_fg_bg_at_depth_24() {
+        let src = [
+            0b0000_0101u8,
+            0,
+            0,
+            0, // row: 1 0 1
+        ];
+        let out = xybitmap_to_target_zpixmap(&src, 3, 1, 0, 24, 0x0000_00ff, 0x0000_ff00)
+            .expect("convert");
+        assert_eq!(out.len(), 12);
+        assert_eq!(&out[0..4], &0x0000_00ffu32.to_le_bytes());
+        assert_eq!(&out[4..8], &0x0000_ff00u32.to_le_bytes());
+        assert_eq!(&out[8..12], &0x0000_00ffu32.to_le_bytes());
+    }
+
+    #[test]
+    fn xybitmap_to_target_zpixmap_expands_bits_with_fg_bg_at_depth_4() {
+        let src = [
+            0b0000_0110u8,
+            0,
+            0,
+            0, // row: 0 1 1
+        ];
+        let out = xybitmap_to_target_zpixmap(&src, 3, 1, 0, 4, 0x0d, 0x02).expect("convert");
+        assert_eq!(out, vec![0xd2, 0x0d, 0, 0]);
+    }
+
     fn sync_header(minor: u8) -> RequestHeader {
         RequestHeader {
             opcode: 142,
@@ -17606,6 +17815,399 @@ mod tests {
         b.push(1); // events = true
         b.extend_from_slice(&[0u8; 3]);
         b
+    }
+
+    #[test]
+    fn poly_fill_rectangle_unknown_drawable_returns_bad_drawable() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2000),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        let body = poly_fill_rectangle_body(0xdead_beef, 0x2000);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 70,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected 32-byte error reply, got {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+        let buf = &bytes[..32];
+        assert_eq!(buf[1], x11::error::BAD_DRAWABLE);
+        assert_eq!(buf[10], 70);
+    }
+
+    #[test]
+    fn poly_fill_rectangle_unknown_gc_returns_bad_gc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let body = poly_fill_rectangle_body(ROOT_WINDOW.0, 0xdead_beef);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 70,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected 32-byte error reply, got {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+        let buf = &bytes[..32];
+        assert_eq!(buf[1], x11::error::BAD_GC);
+        assert_eq!(buf[10], 70);
+    }
+
+    #[test]
+    fn free_pixmap_retains_host_pixmap_while_gc_clip_mask_still_references_it() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 1,
+                pixmap: ResourceId(0x3000),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(0x3000),
+            crate::backend::PixmapHandle::from_raw(0xcafe).unwrap(),
+        ));
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2000),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: Some(Some(ResourceId(0x3000))),
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &free_pixmap_body(0x3000),
+        )
+        .expect("free pixmap");
+
+        let calls = backend.calls.lock().expect("calls");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(0xcafe))),
+            "host pixmap must stay alive while retained by GC clip mask"
+        );
+    }
+
+    #[test]
+    fn free_pixmap_retains_host_pixmap_while_gc_tile_still_references_it() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 1,
+                pixmap: ResourceId(0x3001),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(0x3001),
+            crate::backend::PixmapHandle::from_raw(0xbeef).unwrap(),
+        ));
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2001),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: Some(FillStyle::Tiled.protocol_value()),
+                fill_rule: None,
+                tile: Some(ResourceId(0x3001)),
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &free_pixmap_body(0x3001),
+        )
+        .expect("free pixmap");
+
+        let calls = backend.calls.lock().expect("calls");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(0xbeef))),
+            "host pixmap must stay alive while retained by GC tile"
+        );
+    }
+
+    #[test]
+    fn poly_fill_rectangle_input_only_returns_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            CreateWindowRequest {
+                depth: 0,
+                window: ResourceId(0x1100),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+                border_width: 0,
+                class: 2,
+                visual: ResourceId(0),
+                ..Default::default()
+            },
+        );
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2000),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        let body = poly_fill_rectangle_body(0x1100, 0x2000);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 70,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected 32-byte error reply, got {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+        let buf = &bytes[..32];
+        assert_eq!(buf[1], x11::error::BAD_MATCH);
+        assert_eq!(buf[10], 70);
+    }
+
+    #[test]
+    fn poly_fill_rectangle_depth_mismatch_returns_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x1200),
+                drawable: ROOT_WINDOW,
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+        );
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2000),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        let body = poly_fill_rectangle_body(0x1200, 0x2000);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 70,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected 32-byte error reply, got {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+        let buf = &bytes[..32];
+        assert_eq!(buf[1], x11::error::BAD_MATCH);
+        assert_eq!(buf[10], 70);
     }
 
     // Reproduces the Cinnamon frame-sync deadlock: muffin arms a SYNC
