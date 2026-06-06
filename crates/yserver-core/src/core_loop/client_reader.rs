@@ -119,7 +119,7 @@ fn run(
         let (header, mut body) = frame;
         // Phase E: swap inbound BE-client request bodies in-place so the
         // rest of the dispatch path can decode bytes as little-endian.
-        x11::request_swap::swap_request_body(header.opcode, byte_order, &mut body);
+        x11::request_swap::swap_request_body(header.opcode, header.data, byte_order, &mut body);
         sequence = sequence.wrapping_add(1);
         // Phase 4.2.1 fix: pop only the fds this opcode actually
         // consumes. The previous unconditional `pop_fd()` per request

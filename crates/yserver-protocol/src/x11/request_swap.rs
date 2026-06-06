@@ -19,14 +19,41 @@ use super::{
     wire_swap::{FieldEntry, FieldKind, swap_in_place},
 };
 
-/// Apply the per-opcode swap table for `opcode` to `body`. No-op for
-/// little-endian clients, or for opcodes without a registered table.
-pub fn swap_request_body(opcode: u8, byte_order: ClientByteOrder, body: &mut [u8]) {
+/// Apply the per-opcode swap table for `major` (and `minor`, for
+/// extensions) to `body`. No-op for little-endian clients, or for
+/// (opcode, minor) pairs without a registered table.
+///
+/// For core opcodes (1–127), `minor` is the request's `data` byte and
+/// is ignored by the swap tables here (core layouts are uniquely
+/// determined by the major). For extensions (128+), `minor` is the
+/// extension's request type and selects the correct field-layout.
+pub fn swap_request_body(major: u8, minor: u8, byte_order: ClientByteOrder, body: &mut [u8]) {
     if matches!(byte_order, ClientByteOrder::LittleEndian) {
         return;
     }
-    if let Some(entries) = core_request_swap_table(opcode) {
+    let entries = if major < 128 {
+        core_request_swap_table(major)
+    } else {
+        extension_request_swap_table(major, minor)
+    };
+    if let Some(entries) = entries {
         swap_in_place(entries, byte_order, body);
+    }
+}
+
+/// Dispatch to a per-extension swap table by major opcode. yserver
+/// assigns a fixed major to every supported extension (see the
+/// `XI2_MAJOR_OPCODE` / `XFIXES_MAJOR_OPCODE` constants in
+/// `core_loop::process_request`), so the major→table mapping is
+/// stable. Other extensions pass through (their handlers either
+/// already read fields with explicit byte_order or are LE-only paths
+/// that no xts5 BE-byte-sex tests exercise yet).
+const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [FieldEntry]> {
+    match major {
+        // XInput extension (major fixed at 137 in
+        // `process_request::XI2_MAJOR_OPCODE`).
+        137 => xi_request_swap_table(minor),
+        _ => None,
     }
 }
 
@@ -366,6 +393,251 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
     })
 }
 
+/// Per-minor swap table for the XInput extension (major opcode 137).
+///
+/// Field offsets are relative to the body (post-header). Every multi-
+/// byte field that the matching handler reads (u16/u32/i16) needs an
+/// entry; u8 fields and u8[] tails do not. Cross-referenced against
+/// `XIproto.h` / `XI2proto.h` struct definitions.
+#[allow(clippy::too_many_lines)]
+const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
+    use FieldEntry::{ElementArrayTail, Fixed, OpaqueTail};
+    use FieldKind::{U16, U32};
+
+    macro_rules! u32f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: U32,
+            }
+        };
+    }
+    macro_rules! u16f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: U16,
+            }
+        };
+    }
+
+    Some(match minor {
+        // ── XI 1.x ─────────────────────────────────────────────────
+        // 1 GetExtensionVersion: nbytes(u16) [u16 pad] name(opaque)
+        1 => &[u16f!(0), OpaqueTail { from: 4 }],
+        // 2 ListInputDevices: (no body fields)
+        2 => &[],
+        // 3 OpenDevice, 4 CloseDevice: deviceid(u8) — no u16/u32
+        3 | 4 => &[],
+        // 5 SetDeviceMode: deviceid(u8) mode(u8) [u16 pad]
+        5 => &[],
+        // 6 SelectExtensionEvent: window(u32) count(u16) [u16 pad] classes(u32[])
+        6 => &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U32 }],
+        // 7 GetSelectedExtensionEvents: window(u32)
+        7 => &[u32f!(0)],
+        // 8 ChangeDeviceDontPropagateList: window(u32) count(u16)
+        //   mode(u8) [u8 pad] classes(u32[])
+        8 => &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U32 }],
+        // 9 GetDeviceDontPropagateList: window(u32)
+        9 => &[u32f!(0)],
+        // 10 GetDeviceMotionEvents: start(u32) stop(u32) device(u8) [u8 pad u16 pad]
+        10 => &[u32f!(0), u32f!(4)],
+        // 11 ChangeKeyboardDevice / 12 ChangePointerDevice: bytes only
+        11 | 12 => &[],
+        // 13 GrabDevice: window(u32) time(u32) count(u16) [u16 pad]
+        //   this_mode(u8) other_mode(u8) owner_events(u8) device(u8)
+        //   classes(u32[])
+        13 => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(8),
+            ElementArrayTail {
+                from: 16,
+                kind: U32,
+            },
+        ],
+        // 14 UngrabDevice: time(u32) device(u8) [u8 pad u16 pad]
+        14 => &[u32f!(0)],
+        // 15 GrabDeviceKey: window(u32) count(u16) modifiers(u16)
+        //   modifier_device(u8) grabbed_device(u8) key(u8) this_mode(u8)
+        //   other_mode(u8) owner_events(u8) [u16 pad] classes(u32[])
+        15 => &[
+            u32f!(0),
+            u16f!(4),
+            u16f!(6),
+            ElementArrayTail {
+                from: 16,
+                kind: U32,
+            },
+        ],
+        // 16 UngrabDeviceKey: window(u32) modifiers(u16) modifier_device(u8)
+        //   key(u8) grabbed_device(u8) [u8 pad u16 pad]
+        16 => &[u32f!(0), u16f!(4)],
+        // 17 GrabDeviceButton: window(u32) grabbed_device(u8) modifier_device(u8)
+        //   event_count(u16) modifiers(u16) this_mode(u8) other_mode(u8)
+        //   button(u8) ownerEvents(u8) [u16 pad] classes(u32[])
+        17 => &[
+            u32f!(0),
+            u16f!(6),
+            u16f!(8),
+            ElementArrayTail {
+                from: 16,
+                kind: U32,
+            },
+        ],
+        // 18 UngrabDeviceButton: window(u32) modifiers(u16) modifier_device(u8)
+        //   button(u8) grabbed_device(u8) [u8 pad u16 pad]
+        18 => &[u32f!(0), u16f!(4)],
+        // 19 AllowDeviceEvents: time(u32) mode(u8) deviceid(u8) [u16 pad]
+        19 => &[u32f!(0)],
+        // 20 GetDeviceFocus: device(u8) [u8 pad u16 pad]
+        20 => &[],
+        // 21 SetDeviceFocus: focus(u32) time(u32) revertTo(u8) device(u8) [u16 pad]
+        21 => &[u32f!(0), u32f!(4)],
+        // 22 GetFeedbackControl: device(u8) [u8 pad u16 pad]
+        22 => &[],
+        // 23 ChangeFeedbackControl: mask(u32) device(u8) feedbackid(u8)
+        //   [u16 pad] feedback(opaque — variant-dependent layout, leave as
+        //   opaque; tests don't exercise BE feedback control payloads).
+        23 => &[u32f!(0), OpaqueTail { from: 8 }],
+        // 24 GetDeviceKeyMapping: device(u8) first_keycode(u8) count(u8) [u8 pad]
+        24 => &[],
+        // 25 ChangeDeviceKeyMapping: device(u8) first_keycode(u8)
+        //   keysyms_per_keycode(u8) keycode_count(u8) keysyms(u32[])
+        25 => &[ElementArrayTail { from: 4, kind: U32 }],
+        // 26 GetDeviceModifierMapping: device(u8) [u8 pad u16 pad]
+        26 => &[],
+        // 27 SetDeviceModifierMapping: device(u8) keycodes_per_modifier(u8)
+        //   [u16 pad] keycodes(u8[])
+        27 => &[],
+        // 28 GetDeviceButtonMapping: device(u8) [u8 pad u16 pad]
+        28 => &[],
+        // 29 SetDeviceButtonMapping: device(u8) map_length(u8) [u16 pad] map(u8[])
+        29 => &[],
+        // 30 QueryDeviceState: device(u8) [u8 pad u16 pad]
+        30 => &[],
+        // 31 SendExtensionEvent: destination(u32) device(u8) propagate(u8)
+        //   count(u16) num_events(u8) [u8 pad u16 pad] events(opaque×num_events)
+        //   classes(u32[]). The synthetic event payload is the *sender's*
+        //   byte order (just like core SendEvent); leave as opaque for now.
+        31 => &[u32f!(0), u16f!(6), OpaqueTail { from: 12 }],
+        // 32 DeviceBell: device(u8) feedback_class(u8) feedback_id(u8) percent(i8)
+        32 => &[],
+        // 33 SetDeviceValuators: device(u8) first_valuator(u8) num_valuators(u8)
+        //   [u8 pad] valuators(u32[])
+        33 => &[ElementArrayTail { from: 4, kind: U32 }],
+        // 34 GetDeviceControl: control(u16) device(u8) [u8 pad]
+        34 => &[u16f!(0)],
+        // 35 ChangeDeviceControl: control(u16) device(u8) [u8 pad] ctl(opaque)
+        35 => &[u16f!(0), OpaqueTail { from: 4 }],
+        // 36 ListDeviceProperties: device(u8) [u8 pad u16 pad]
+        36 => &[],
+        // 37 ChangeDeviceProperty: property(u32) type(u32) device(u8)
+        //   format(u8) mode(u8) [u8 pad] num_items(u32) value(format-typed)
+        37 => &[u32f!(0), u32f!(4), u32f!(12), OpaqueTail { from: 16 }],
+        // 38 DeleteDeviceProperty: property(u32) device(u8) [u8 pad u16 pad]
+        38 => &[u32f!(0)],
+        // 39 GetDeviceProperty: property(u32) type(u32) longOffset(u32)
+        //   longLength(u32) device(u8) delete(u8) [u16 pad]
+        39 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(12)],
+        // ── XI 2 ───────────────────────────────────────────────────
+        // 40 XIQueryPointer: window(u32) deviceid(u16) [u16 pad]
+        40 => &[u32f!(0), u16f!(4)],
+        // 41 XIWarpPointer: src_win(u32) dst_win(u32) src_x(i32-fp1616)
+        //   src_y(i32-fp1616) src_w(u16) src_h(u16) dst_x(i32-fp1616)
+        //   dst_y(i32-fp1616) deviceid(u16) [u16 pad]. The fp1616 fields
+        //   are u32-wide, swap as u32.
+        41 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(12),
+            u16f!(16),
+            u16f!(18),
+            u32f!(20),
+            u32f!(24),
+            u16f!(28),
+        ],
+        // 42 XIChangeCursor: window(u32) cursor(u32) deviceid(u16) [u16 pad]
+        42 => &[u32f!(0), u32f!(4), u16f!(8)],
+        // 43 XIChangeHierarchy: num_changes(u8) [u8 pad u16 pad] changes(opaque)
+        43 => &[OpaqueTail { from: 4 }],
+        // 44 XISetClientPointer: window(u32) deviceid(u16) [u16 pad]
+        44 => &[u32f!(0), u16f!(4)],
+        // 45 XIGetClientPointer: window(u32)
+        45 => &[u32f!(0)],
+        // 46 XISelectEvents: window(u32) num_masks(u16) [u16 pad]
+        //   masks(opaque event-mask records, each: deviceid(u16) mask_len(u16)
+        //   mask(u8 × pad32(mask_len)))
+        46 => &[u32f!(0), u16f!(4), OpaqueTail { from: 8 }],
+        // 47 XIQueryVersion: major(u16) minor(u16)
+        47 => &[u16f!(0), u16f!(2)],
+        // 48 XIQueryDevice: deviceid(u16) [u16 pad]
+        48 => &[u16f!(0)],
+        // 49 XISetFocus: window(u32) time(u32) deviceid(u16) [u16 pad]
+        49 => &[u32f!(0), u32f!(4), u16f!(8)],
+        // 50 XIGetFocus: deviceid(u16) [u16 pad]
+        50 => &[u16f!(0)],
+        // 51 XIGrabDevice: window(u32) time(u32) cursor(u32) deviceid(u16)
+        //   mode(u8) paired_device_mode(u8) owner_events(u8) [u8 pad]
+        //   mask_len(u16) mask(u8 × pad32(mask_len))
+        51 => &[u32f!(0), u32f!(4), u32f!(8), u16f!(12), u16f!(18)],
+        // 52 XIUngrabDevice: time(u32) deviceid(u16) [u16 pad]
+        52 => &[u32f!(0), u16f!(4)],
+        // 53 XIAllowEvents: time(u32) deviceid(u16) event_mode(u8) [u8 pad]
+        //   touchid(u32 — XI 2.2+ only) grab_window(u32 — XI 2.2+ only)
+        53 => &[u32f!(0), u16f!(4), u32f!(8), u32f!(12)],
+        // 54 XIPassiveGrabDevice: time(u32) grab_window(u32) cursor(u32)
+        //   detail(u32) deviceid(u16) num_modifiers(u16) mask_len(u16)
+        //   grab_type(u8) grab_mode(u8) paired_device_mode(u8) owner_events(u8)
+        //   [u16 pad] mask(u8 × pad32(mask_len)) modifiers(u32 × num_modifiers)
+        54 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(12),
+            u16f!(16),
+            u16f!(18),
+            u16f!(20),
+            OpaqueTail { from: 28 },
+        ],
+        // 55 XIPassiveUngrabDevice: grab_window(u32) detail(u32) deviceid(u16)
+        //   num_modifiers(u16) grab_type(u8) [u8 pad u16 pad] modifiers(u32[])
+        55 => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(8),
+            u16f!(10),
+            ElementArrayTail {
+                from: 16,
+                kind: U32,
+            },
+        ],
+        // 56 XIListProperties: deviceid(u16) [u16 pad]
+        56 => &[u16f!(0)],
+        // 57 XIChangeProperty: deviceid(u16) mode(u8) format(u8) property(u32)
+        //   type(u32) num_items(u32) value(format-typed)
+        57 => &[
+            u16f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(12),
+            OpaqueTail { from: 16 },
+        ],
+        // 58 XIDeleteProperty: deviceid(u16) [u16 pad] property(u32)
+        58 => &[u16f!(0), u32f!(4)],
+        // 59 XIGetProperty: deviceid(u16) delete(u8) [u8 pad] property(u32)
+        //   type(u32) offset(u32) len(u32)
+        59 => &[u16f!(0), u32f!(4), u32f!(8), u32f!(12), u32f!(16)],
+        // 60 XIGetSelectedEvents: window(u32)
+        60 => &[u32f!(0)],
+        // 61 XIBarrierReleasePointer: num_barriers(u32) records(deviceid u16
+        //   pad u16 barrier u32 eventid u32 — 12 bytes each)
+        61 => &[u32f!(0), ElementArrayTail { from: 4, kind: U32 }],
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +645,7 @@ mod tests {
     #[test]
     fn opcode_4_destroy_window_swaps_window_id() {
         let mut body = vec![0xaa, 0xbb, 0xcc, 0xdd];
-        swap_request_body(4, ClientByteOrder::BigEndian, &mut body);
+        swap_request_body(4, 0, ClientByteOrder::BigEndian, &mut body);
         // u32 0xaabbccdd in BE → bytes [0xaa, 0xbb, 0xcc, 0xdd]; native LE
         // representation after swap → [0xdd, 0xcc, 0xbb, 0xaa].
         assert_eq!(body, vec![0xdd, 0xcc, 0xbb, 0xaa]);
@@ -389,7 +661,7 @@ mod tests {
             0x00, 0x55, // blue = 0x55
             0x00, 0x00, // pad
         ];
-        swap_request_body(84, ClientByteOrder::BigEndian, &mut body);
+        swap_request_body(84, 0, ClientByteOrder::BigEndian, &mut body);
         // After swap the body is in LE, decoded values stay the same.
         assert_eq!(
             u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
@@ -405,7 +677,7 @@ mod tests {
         let mut body = vec![1, 2, 3, 4];
         let original = body.clone();
         // 200 is well beyond core + extension space.
-        swap_request_body(200, ClientByteOrder::BigEndian, &mut body);
+        swap_request_body(200, 0, ClientByteOrder::BigEndian, &mut body);
         assert_eq!(body, original);
     }
 
@@ -413,7 +685,49 @@ mod tests {
     fn le_client_no_op() {
         let mut body = vec![0xaa, 0xbb, 0xcc, 0xdd];
         let original = body.clone();
-        swap_request_body(4, ClientByteOrder::LittleEndian, &mut body);
+        swap_request_body(4, 0, ClientByteOrder::LittleEndian, &mut body);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn xi_grab_device_button_swaps_window_field() {
+        // XI GrabDeviceButton body (after 4-byte header):
+        //   window(u32) grabbed_device(u8) modifier_device(u8)
+        //   event_count(u16) modifiers(u16) ...
+        let mut body = vec![
+            0x00, 0x60, 0x00, 0x00, // window = 0x00600000 in BE
+            4,    // grabbed_device
+            0,    // modifier_device
+            0x00, 0x01, // event_count = 1 in BE
+            0xff, 0xff, // modifiers = 0xffff (AnyModifier) — symmetric, but exercise swap
+            1, 1, 0, 1, // this_mode=Async other_mode=Async button=AnyButton owner=True
+            0, 0, // pad
+        ];
+        // XInputExtension major opcode = 137; X_GrabDeviceButton minor = 17.
+        swap_request_body(137, 17, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(
+            u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+            0x00600000,
+            "window field must be swapped from BE to LE",
+        );
+        assert_eq!(u16::from_le_bytes([body[6], body[7]]), 1, "event_count");
+    }
+
+    #[test]
+    fn xi_extension_unknown_minor_passes_through() {
+        // major=137 is XI, but minor=255 has no swap entry → no-op.
+        let mut body = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let original = body.clone();
+        swap_request_body(137, 255, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn non_xi_extension_passes_through() {
+        // major=140 (XFIXES) currently has no swap table → no-op.
+        let mut body = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let original = body.clone();
+        swap_request_body(140, 0, ClientByteOrder::BigEndian, &mut body);
         assert_eq!(body, original);
     }
 }

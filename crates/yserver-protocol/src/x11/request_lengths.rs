@@ -160,6 +160,173 @@ pub fn validate_core_request_length(opcode: u8, length_units: u32) -> bool {
     }
 }
 
+/// Return the length contract for an XInput extension minor opcode
+/// (XI 1.x: 1–39, XI2: 40–61), or `None` for opcodes outside that
+/// range. Values mirror Xorg's `REQUEST_SIZE_MATCH` / `REQUEST_AT_LEAST_SIZE`
+/// macros invoked at the top of each `ProcX*` handler in `Xi/*.c`.
+#[must_use]
+pub fn xi_request_length(minor: u8) -> Option<LenSpec> {
+    use LenSpec::{AtLeast, Fixed};
+    Some(match minor {
+        // ── XI 1.x ─────────────────────────────────────────────
+        1 => AtLeast(2),  // GetExtensionVersion         2 + (n+p)/4
+        2 => Fixed(1),    // ListInputDevices
+        3 => Fixed(2),    // OpenDevice
+        4 => Fixed(2),    // CloseDevice
+        5 => Fixed(2),    // SetDeviceMode
+        6 => AtLeast(3),  // SelectExtensionEvent        3 + count
+        7 => Fixed(2),    // GetSelectedExtensionEvents
+        8 => AtLeast(3),  // ChangeDeviceDontPropagateList 3 + count
+        9 => Fixed(2),    // GetDeviceDontPropagateList
+        10 => Fixed(4),   // GetDeviceMotionEvents
+        11 => Fixed(2),   // ChangeKeyboardDevice
+        12 => Fixed(2),   // ChangePointerDevice
+        13 => AtLeast(5), // GrabDevice                  5 + event_count
+        14 => Fixed(3),   // UngrabDevice
+        15 => AtLeast(5), // GrabDeviceKey               5 + event_count
+        16 => Fixed(4),   // UngrabDeviceKey
+        17 => AtLeast(5), // GrabDeviceButton            5 + event_count
+        18 => Fixed(4),   // UngrabDeviceButton
+        19 => Fixed(3),   // AllowDeviceEvents
+        20 => Fixed(2),   // GetDeviceFocus
+        21 => Fixed(4),   // SetDeviceFocus
+        22 => Fixed(2),   // GetFeedbackControl
+        23 => AtLeast(3), // ChangeFeedbackControl       3 + feedback_data
+        24 => Fixed(2),   // GetDeviceKeyMapping
+        25 => AtLeast(2), // ChangeDeviceKeyMapping      2 + (keysyms*keysyms_per_keycode)
+        26 => Fixed(2),   // GetDeviceModifierMapping
+        27 => AtLeast(2), // SetDeviceModifierMapping    2 + 2*keycodes_per_modifier
+        28 => Fixed(2),   // GetDeviceButtonMapping
+        29 => AtLeast(2), // SetDeviceButtonMapping      2 + pad_units(map_length)
+        30 => Fixed(2),   // QueryDeviceState
+        31 => AtLeast(4), // SendExtensionEvent          4 + events + event_count
+        32 => Fixed(2),   // DeviceBell
+        33 => AtLeast(2), // SetDeviceValuators          2 + num_valuators
+        34 => Fixed(2),   // GetDeviceControl
+        35 => AtLeast(3), // ChangeDeviceControl         3 + xDeviceCtl trailer (≥1 unit)
+        // ── XI 1.5 (device properties) ─────────────────────────
+        36 => Fixed(2),   // ListDeviceProperties
+        37 => AtLeast(5), // ChangeDeviceProperty        5 + value bytes
+        38 => Fixed(3),   // DeleteDeviceProperty
+        39 => Fixed(6),   // GetDeviceProperty
+        // ── XI 2 ───────────────────────────────────────────────
+        40 => Fixed(3),   // XIQueryPointer
+        41 => Fixed(9),   // XIWarpPointer
+        42 => Fixed(4),   // XIChangeCursor
+        43 => AtLeast(2), // XIChangeHierarchy           2 + num_changes hierarchy entries
+        44 => Fixed(3),   // XISetClientPointer
+        45 => Fixed(2),   // XIGetClientPointer
+        46 => AtLeast(3), // XISelectEvents              3 + num_masks event-masks
+        47 => Fixed(2),   // XIQueryVersion
+        48 => Fixed(2),   // XIQueryDevice
+        49 => AtLeast(4), // XISetFocus
+        50 => AtLeast(2), // XIGetFocus
+        51 => AtLeast(6), // XIGrabDevice                6 + mask_len
+        52 => Fixed(3),   // XIUngrabDevice
+        53 => AtLeast(3), // XIAllowEvents               3 + XI2.2 touch tail
+        54 => AtLeast(8), // XIPassiveGrabDevice         8 + mask + modifiers
+        55 => AtLeast(5), // XIPassiveUngrabDevice       5 + num_modifiers
+        56 => Fixed(2),   // XIListProperties
+        57 => AtLeast(5), // XIChangeProperty            5 + value bytes
+        58 => Fixed(3),   // XIDeleteProperty
+        59 => Fixed(6),   // XIGetProperty
+        60 => Fixed(2),   // XIGetSelectedEvents
+        61 => AtLeast(2), // XIBarrierReleasePointer     2 + num_barriers
+        _ => return None,
+    })
+}
+
+/// Returns `true` if `length_units` satisfies the XInput minor opcode's
+/// length contract. Unknown minors return `true` (dispatcher decides).
+#[must_use]
+pub fn validate_xi_request_length(minor: u8, length_units: u32) -> bool {
+    match xi_request_length(minor) {
+        Some(LenSpec::Fixed(n)) => length_units == n,
+        Some(LenSpec::AtLeast(n)) => length_units >= n,
+        None => true,
+    }
+}
+
+/// Compute the *exact* required `length_units` for a variable-length
+/// XInput minor opcode given its body. Returns `None` for opcodes whose
+/// length is fully determined by `xi_request_length` (i.e., `Fixed`) or
+/// for variable-length minors whose exact size depends on context we
+/// don't model here (e.g., XI 2.x property values whose width is
+/// format-dependent).
+///
+/// Body must be at least the spec minimum; callers should have already
+/// passed `validate_xi_request_length`.
+#[must_use]
+pub fn xi_exact_required_length(minor: u8, body: &[u8]) -> Option<u32> {
+    match minor {
+        // 1 GetExtensionVersion: 2 + pad_units(nbytes_at_body[0..2])
+        1 if body.len() >= 2 => {
+            let nbytes = read_u16_le(&body[0..2]);
+            Some(2 + pad_units(nbytes))
+        }
+        // 6 SelectExtensionEvent: 3 + count_at_body[4..6]
+        6 if body.len() >= 6 => {
+            let count = read_u16_le(&body[4..6]);
+            Some(3 + count)
+        }
+        // 8 ChangeDeviceDontPropagateList: 3 + count_at_body[4..6]
+        8 if body.len() >= 6 => {
+            let count = read_u16_le(&body[4..6]);
+            Some(3 + count)
+        }
+        // 13 GrabDevice: 5 + event_count_at_body[8..10]
+        13 if body.len() >= 10 => {
+            let count = read_u16_le(&body[8..10]);
+            Some(5 + count)
+        }
+        // 15 GrabDeviceKey: 5 + count_at_body[4..6]
+        15 if body.len() >= 6 => {
+            let count = read_u16_le(&body[4..6]);
+            Some(5 + count)
+        }
+        // 17 GrabDeviceButton: 5 + event_count_at_body[6..8]
+        17 if body.len() >= 8 => {
+            let count = read_u16_le(&body[6..8]);
+            Some(5 + count)
+        }
+        // 25 ChangeDeviceKeyMapping: 2 + (keysyms_per_keycode × keycode_count)
+        25 if body.len() >= 4 => {
+            let keysyms_per = u32::from(body[2]);
+            let count = u32::from(body[3]);
+            Some(2 + keysyms_per * count)
+        }
+        // 27 SetDeviceModifierMapping: 2 + 2 × keycodes_per_modifier
+        // (the array is keycodes_per_modifier × 8 keycodes = 8N bytes = 2N units)
+        27 if body.len() >= 2 => Some(2 + 2 * u32::from(body[1])),
+        // 29 SetDeviceButtonMapping: 2 + pad_units(map_length)
+        29 if body.len() >= 2 => Some(2 + pad_units(u32::from(body[1]))),
+        // 33 SetDeviceValuators: 2 + num_valuators_at_body[2]
+        33 if body.len() >= 3 => Some(2 + u32::from(body[2])),
+        // 35 ChangeDeviceControl: 2 + pad_units(xDeviceCtl.length).
+        // The embedded xDeviceCtl carries its own (CARD16 control,
+        // CARD16 length) at body[4..6]/[6..8]; `length` is the byte
+        // length of the variant block, which the request header must
+        // cover exactly (Xorg `Xi/chgdctl.c::SProcXChangeDeviceControl`
+        // does the same check piecewise per variant).
+        35 if body.len() >= 8 => {
+            let ctl_bytes = read_u16_le(&body[6..8]);
+            Some(2 + pad_units(ctl_bytes))
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` if `length_units` matches the *content-derived* exact
+/// length for `minor`, or `true` if the minor isn't content-aware here.
+/// Pair with `validate_xi_request_length` after the AtLeast gate.
+#[must_use]
+pub fn validate_xi_exact_request_length(minor: u8, length_units: u32, body: &[u8]) -> bool {
+    match xi_exact_required_length(minor, body) {
+        Some(required) => length_units == required,
+        None => true,
+    }
+}
+
 /// Helper: round `bytes` up to the next 4-byte multiple, expressed
 /// in 4-byte units.
 const fn pad_units(bytes: u32) -> u32 {
@@ -825,6 +992,90 @@ mod tests {
     #[test]
     fn send_event_is_fixed_11() {
         assert_eq!(core_request_length(25), Some(LenSpec::Fixed(11)));
+    }
+}
+
+#[cfg(test)]
+mod xi_length_tests {
+    use super::{LenSpec, validate_xi_request_length, xi_request_length};
+
+    #[test]
+    fn open_device_is_fixed_2() {
+        // xOpenDeviceReq is sizeof(8) bytes = 2 units. Underflow,
+        // exact, overflow:
+        assert!(!validate_xi_request_length(3, 1));
+        assert!(validate_xi_request_length(3, 2));
+        assert!(!validate_xi_request_length(3, 3));
+    }
+
+    #[test]
+    fn select_extension_event_is_at_least_3() {
+        // SelectExtensionEvent: 3 + event count.
+        assert!(!validate_xi_request_length(6, 2));
+        assert!(validate_xi_request_length(6, 3));
+        assert!(validate_xi_request_length(6, 50));
+    }
+
+    #[test]
+    fn grab_device_is_at_least_5() {
+        // GrabDevice carries a variable event-class list.
+        assert!(!validate_xi_request_length(13, 4));
+        assert!(validate_xi_request_length(13, 5));
+    }
+
+    #[test]
+    fn xi2_query_version_is_fixed_2() {
+        assert_eq!(xi_request_length(47), Some(LenSpec::Fixed(2)));
+        assert!(!validate_xi_request_length(47, 1));
+        assert!(!validate_xi_request_length(47, 3));
+    }
+
+    #[test]
+    fn unknown_minor_passes_through() {
+        // Minors above 61 / below 1 are not in our table; the
+        // dispatcher decides.
+        assert!(xi_request_length(0).is_none());
+        assert!(xi_request_length(62).is_none());
+        assert!(validate_xi_request_length(255, 1));
+    }
+
+    use super::{validate_xi_exact_request_length, xi_exact_required_length};
+
+    #[test]
+    fn get_extension_version_exact_length_uses_nbytes() {
+        // GetExtensionVersion: 2 + pad_units(nbytes), where pad_units
+        // rounds *up* to the next 4-byte unit.
+        // nbytes=0 → 2; nbytes=4 → 3; nbytes=5 → 4; nbytes=8 → 4.
+        let body_n0 = vec![0u8, 0, 0, 0];
+        let body_n4 = vec![4u8, 0, 0, 0];
+        let body_n5 = vec![5u8, 0, 0, 0];
+        let body_n8 = vec![8u8, 0, 0, 0];
+        assert_eq!(xi_exact_required_length(1, &body_n0), Some(2));
+        assert_eq!(xi_exact_required_length(1, &body_n4), Some(3));
+        assert_eq!(xi_exact_required_length(1, &body_n5), Some(4));
+        assert_eq!(xi_exact_required_length(1, &body_n8), Some(4));
+
+        // Exact match accepted, length+1 rejected.
+        assert!(validate_xi_exact_request_length(1, 4, &body_n8));
+        assert!(!validate_xi_exact_request_length(1, 5, &body_n8));
+    }
+
+    #[test]
+    fn grab_device_exact_length_uses_event_count() {
+        // GrabDevice: 5 + event_count. body[8..10] = event_count.
+        let mut body = vec![0u8; 12];
+        body[8] = 3;
+        assert_eq!(xi_exact_required_length(13, &body), Some(8));
+        // length=8 OK, length=9 (one greater) rejected.
+        assert!(validate_xi_exact_request_length(13, 8, &body));
+        assert!(!validate_xi_exact_request_length(13, 9, &body));
+    }
+
+    #[test]
+    fn fixed_minor_has_no_exact_length() {
+        // Fixed minors return None — the AtLeast/Fixed gate handles them.
+        assert_eq!(xi_exact_required_length(3, &[1, 0, 0, 0]), None);
+        assert_eq!(xi_exact_required_length(47, &[0u8; 4]), None);
     }
 }
 

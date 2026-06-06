@@ -94,6 +94,8 @@ pub const XI_DEVICE_MOTION_NOTIFY_OFFSET: u8 = 5;
 pub const XI_DEVICE_FOCUS_IN_OFFSET: u8 = 6;
 pub const XI_DEVICE_FOCUS_OUT_OFFSET: u8 = 7;
 pub const XI_DEVICE_STATE_NOTIFY_OFFSET: u8 = 10;
+pub const XI_DEVICE_MAPPING_NOTIFY_OFFSET: u8 = 11;
+pub const XI_CHANGE_DEVICE_NOTIFY_OFFSET: u8 = 12;
 /// DeviceKeyStateNotify(13) / DeviceButtonStateNotify(14) — the
 /// "reserved space of 3" continuation codes after ChangeDeviceNotify
 /// (XIproto.h:114-118). Only ever sent as MORE_EVENTS continuations of
@@ -1245,6 +1247,58 @@ pub fn encode_xi1_device_focus_event(
     #[allow(clippy::cast_possible_truncation)]
     out.push(deviceid as u8); // byte 13: deviceid (CARD8)
     out.extend_from_slice(&[0u8; 18]); // bytes 14-31: pad
+}
+
+/// XI 1.x `deviceMappingNotify` wire event (XIproto.h:1635-1655).
+/// Fired when SetDeviceModifierMapping / SetDeviceButtonMapping /
+/// ChangeDeviceKeyMapping changes the device's mapping state.
+///
+/// `request` is the kind of mapping that changed (XInput.h):
+///   0 = MappingModifier, 1 = MappingKeyboard, 2 = MappingPointer.
+/// `first_keycode` and `count` are only meaningful for MappingKeyboard
+/// (the keysym range that was rewritten); zero for the other two.
+pub fn encode_xi1_device_mapping_notify(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    deviceid: u8,
+    sequence: SequenceNumber,
+    time: u32,
+    request: u8,
+    first_keycode: u8,
+    count: u8,
+) {
+    out.push(event_type); // byte 0: type
+    out.push(deviceid); // byte 1: deviceid
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u32(byte_order, out, time); // bytes 4-7
+    out.push(request); // byte 8: request kind
+    out.push(first_keycode); // byte 9
+    out.push(count); // byte 10
+    out.extend_from_slice(&[0u8; 21]); // bytes 11-31: pad1 + 5×u32 pad
+}
+
+/// XI 1.x `changeDeviceNotify` wire event (XIproto.h:1660-1680).
+/// Fired when ChangeKeyboardDevice / ChangePointerDevice rebinds the
+/// device that backs the core pointer / keyboard.
+///
+/// `request` is the device kind that changed (XInput.h):
+///   0 = NewPointer, 1 = NewKeyboard.
+pub fn encode_xi1_change_device_notify(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    deviceid: u8,
+    sequence: SequenceNumber,
+    time: u32,
+    request: u8,
+) {
+    out.push(event_type); // byte 0: type
+    out.push(deviceid); // byte 1: deviceid
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u32(byte_order, out, time); // bytes 4-7
+    out.push(request); // byte 8: request kind
+    out.extend_from_slice(&[0u8; 23]); // bytes 9-31: pad
 }
 
 /// XI 1.x `deviceStateNotify` wire event (XIproto.h:1615-1630). The
