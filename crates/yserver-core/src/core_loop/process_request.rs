@@ -13163,6 +13163,20 @@ fn handle_create_window(
     let window_id = request.window;
     let parent = request.parent;
     let geometry = (request.x, request.y, request.width, request.height);
+    // Xorg `dix/dispatch.c::ProcCreateWindow` calls dixLookupWindow on
+    // the parent first; BadWindow if the parent xid is stale. xts5
+    // Xlib4 probes XCreateWindow / XCreateSimpleWindow with
+    // parent=badwin() and expects the protocol error.
+    if state.resources.window(parent).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            parent.0,
+            1,
+        );
+    }
     // BadIdChoice / BadMatch validation.
     let validation_failed = {
         let handle = state.clients.get(&client_id.0).expect("client registered");
@@ -13321,6 +13335,22 @@ fn handle_change_window_attributes(
     let Some(request) = x11::change_window_attributes_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    if state.resources.window(request.window).is_none() {
+        // Xorg `dix/dispatch.c::ProcChangeWindowAttributes` returns
+        // BadWindow via dixLookupWindow before applying any attribute
+        // changes. xts5 Xlib4 probes XChangeWindowAttributes and its
+        // wrappers (XSetWindowBackground / *BorderPixmap / *Colormap /
+        // XDefineCursor / XUndefineCursor / …) on badwin() and expects
+        // the protocol error.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            request.window.0,
+            2,
+        );
+    }
     if let Some(cursor) = request.cursor {
         debug!(
             "client {} CWA cursor: window 0x{:x} ← cursor 0x{:x}",
@@ -13572,6 +13602,23 @@ fn handle_configure_window(
             client_id.0, sequence.0
         );
         return Ok(RequestOutcome::Handled);
+    }
+    if state.resources.window(request.window).is_none() {
+        // Xorg `dix/dispatch.c::ProcConfigureWindow` returns BadWindow
+        // via dixLookupWindow before applying any geometry change.
+        // xts5 Xlib4 probes XConfigureWindow and its Xlib wrappers
+        // (XMoveWindow / XResizeWindow / XMoveResizeWindow /
+        // XRaiseWindow / XLowerWindow / XMapRaised — Xlib9 XRestack /
+        // XSetWindowBorderWidth) on badwin() and expects the protocol
+        // error.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            request.window.0,
+            12,
+        );
     }
     let pre = state
         .resources
@@ -13832,6 +13879,20 @@ fn handle_destroy_window(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::free_resource_id(body) {
+        // Xorg `dix/dispatch.c::ProcDestroyWindow` returns BadWindow
+        // via dixLookupWindow before tearing the subtree down. xts5
+        // Xlib4 probes XDestroyWindow on badwin() and expects the
+        // protocol error.
+        if state.resources.window(window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                window.0,
+                4,
+            );
+        }
         destroy_window_subtree(state, backend, origin, window);
     }
     debug!("client {} #{} DestroyWindow", client_id.0, sequence.0);
@@ -13848,6 +13909,18 @@ fn handle_destroy_subwindows(
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 4 {
         let parent = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        // Xorg `dix/dispatch.c::ProcDestroySubwindows` returns
+        // BadWindow for an unknown parent xid.
+        if state.resources.window(parent).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                parent.0,
+                5,
+            );
+        }
         let kids: Vec<ResourceId> = state.resources.children(parent).to_vec();
         for k in kids {
             destroy_window_subtree(state, backend, origin, k);
@@ -16280,7 +16353,18 @@ fn handle_map_window(
         .window(window)
         .map(|w| (w.parent, w.override_redirect, w.map_state))
     else {
-        return Ok(RequestOutcome::Handled);
+        // Xorg `dix/dispatch.c::ProcMapWindow` does `dixLookupWindow`
+        // first and returns BadWindow on lookup failure. xts5 Xlib4
+        // probes XMapWindow on a freed xid (badwin()) and expects the
+        // protocol error.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            window.0,
+            8,
+        );
     };
 
     // Per X11 protocol (Xorg `dix/window.c:2661`): "If the window is
@@ -16481,6 +16565,19 @@ fn handle_map_subwindows(
     let Some(parent) = x11::map_window_id(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    if state.resources.window(parent).is_none() {
+        // Xorg `dix/dispatch.c::ProcMapSubwindows` returns BadWindow
+        // for an unknown parent xid. xts5 Xlib4 probes XMapSubwindows
+        // on badwin() and expects the protocol error.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            parent.0,
+            9,
+        );
+    }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
     for child in children {
         let was_unmapped = state.resources.map_window(child);
@@ -16551,6 +16648,19 @@ fn handle_unmap_window(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::map_window_id(body) {
+        if state.resources.window(window).is_none() {
+            // Xorg `dix/dispatch.c::ProcUnmapWindow` returns BadWindow
+            // via dixLookupWindow before unmapping. xts5 Xlib4 probes
+            // XUnmapWindow on badwin() and expects the protocol error.
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                window.0,
+                10,
+            );
+        }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
         let was_mapped = state.resources.unmap_window(window);
         let parent = if was_mapped {
@@ -16789,6 +16899,19 @@ fn handle_circulate_window(
     }
     let container = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
     let direction = header.data;
+    if state.resources.window(container).is_none() {
+        // Xorg `dix/dispatch.c::ProcCirculateWindow` returns BadWindow
+        // via dixLookupWindow on an unknown xid. xts5 Xlib4 probes
+        // XCirculateSubwindows{,Up,Down} on badwin() and expects it.
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            container.0,
+            13,
+        );
+    }
     let chosen_child = {
         let kids = state.resources.children(container);
         match (direction, kids.first(), kids.last()) {
@@ -36243,5 +36366,138 @@ mod tests {
             wire.len(),
             &wire[..wire.len().min(64)],
         );
+    }
+
+    /// xts5 Xlib4 (`EWin.mc`) creates a window, destroys it, then
+    /// invokes each window-manipulation request on the freed xid and
+    /// expects a `BadWindow` protocol error back. Before this fix,
+    /// every handler silently returned `RequestOutcome::Handled`,
+    /// causing ~24 FAILs across the Xlib4 cluster
+    /// (`Got Success, Expecting BadWindow`).
+    ///
+    /// One test per affected handler so a regression names the
+    /// specific request rather than a single bundled failure.
+    #[test]
+    fn window_handlers_on_freed_xid_return_bad_window() {
+        use std::io::Read;
+        const APP: u32 = 200;
+        const BAD: u32 = 0x0080_dead;
+
+        // (opcode, header.data, body, label, requires_body_len)
+        let cases: &[(u8, u8, Vec<u8>, &str)] = &[
+            (
+                1,
+                24,
+                create_window_body_with_parent(BAD),
+                "CreateWindow(parent)",
+            ),
+            (
+                2,
+                0,
+                change_window_attributes_body(BAD),
+                "ChangeWindowAttributes",
+            ),
+            (4, 0, BAD.to_le_bytes().to_vec(), "DestroyWindow"),
+            (5, 0, BAD.to_le_bytes().to_vec(), "DestroySubwindows"),
+            (8, 0, BAD.to_le_bytes().to_vec(), "MapWindow"),
+            (9, 0, BAD.to_le_bytes().to_vec(), "MapSubwindows"),
+            (10, 0, BAD.to_le_bytes().to_vec(), "UnmapWindow"),
+            (11, 0, BAD.to_le_bytes().to_vec(), "UnmapSubwindows"),
+            (12, 0, configure_window_body(BAD), "ConfigureWindow"),
+            (13, 0, BAD.to_le_bytes().to_vec(), "CirculateWindow"),
+        ];
+
+        for (i, (opcode, data, body, label)) in cases.iter().enumerate() {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, APP + i as u32);
+            let mut backend = RecordingBackend::new();
+            let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body length fits");
+            let seq = SequenceNumber((i + 1) as u16);
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(APP + i as u32),
+                seq,
+                RequestHeader {
+                    opcode: *opcode,
+                    data: *data,
+                    length_units,
+                },
+                body,
+                None,
+            )
+            .expect("process_request");
+
+            peer.set_nonblocking(true).unwrap();
+            let mut buf = [0u8; 32];
+            peer.read_exact(&mut buf).unwrap_or_else(|e| {
+                panic!("{label}: expected 32-byte error reply, got {e:?}");
+            });
+            assert_eq!(
+                buf[0], 0,
+                "{label}: byte 0 = error class (0); got {}",
+                buf[0]
+            );
+            assert_eq!(
+                buf[1],
+                yserver_protocol::x11::error::BAD_WINDOW,
+                "{label}: expected BadWindow (3) for freed xid; got error code {}",
+                buf[1],
+            );
+            // bytes [4..8] = error_value (the bad xid)
+            let bad_value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            assert_eq!(
+                bad_value, BAD,
+                "{label}: error_value must echo the freed window xid"
+            );
+            // byte [10] = major_opcode (this is the request that errored)
+            assert_eq!(
+                buf[10], *opcode,
+                "{label}: BadWindow error must carry the request's \
+                 major opcode (expected {opcode}); got {}",
+                buf[10],
+            );
+        }
+    }
+
+    fn create_window_body_with_parent(parent_xid: u32) -> Vec<u8> {
+        // ProcCreateWindow body (header.data carries depth):
+        //   wid u32, parent u32, x i16, y i16, width u16, height u16,
+        //   border_width u16, class u16, visual u32, value_mask u32, …
+        // Use class=CopyFromParent(0), visual=CopyFromParent(0), no
+        // attributes — the parent BadWindow check fires first.
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&0x0080_0001u32.to_le_bytes()); // new wid (will not be used)
+        body.extend_from_slice(&parent_xid.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
+        body.extend_from_slice(&0i16.to_le_bytes()); // y
+        body.extend_from_slice(&10u16.to_le_bytes()); // width
+        body.extend_from_slice(&10u16.to_le_bytes()); // height
+        body.extend_from_slice(&0u16.to_le_bytes()); // border_width
+        body.extend_from_slice(&0u16.to_le_bytes()); // class
+        body.extend_from_slice(&0u32.to_le_bytes()); // visual
+        body.extend_from_slice(&0u32.to_le_bytes()); // value_mask
+        body
+    }
+
+    fn change_window_attributes_body(window_xid: u32) -> Vec<u8> {
+        // ProcChangeWindowAttributes body: window u32, value_mask u32,
+        // values…  No values needed — the window BadWindow check
+        // fires before attribute application.
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&window_xid.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // value_mask
+        body
+    }
+
+    fn configure_window_body(window_xid: u32) -> Vec<u8> {
+        // ProcConfigureWindow body: window u32, value_mask u16, pad
+        // u16, values…  No values needed — BadWindow check fires
+        // before mask is read.
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&window_xid.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // value_mask
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body
     }
 }
