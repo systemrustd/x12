@@ -10665,16 +10665,33 @@ fn handle_xi2_request(
             }
             // Store the mode (Relative=0 / Absolute=1) —
             // DeviceStateNotify reports it in the `classes_reported`
-            // bits above ModeBitsShift.
-            let mode = *body.get(1).unwrap_or(&0);
-            if mode <= 1 {
-                state
-                    .xi1_device_input_state
-                    .entry(dev)
-                    .or_default()
-                    .valuator_mode = mode;
-            }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // bits above ModeBitsShift. Xorg
+            // `Xi/setmode.c::ProcXSetDeviceMode` returns
+            // `AlreadyGrabbed` (reply byte 8) when another client
+            // holds the device's active grab; in that case the mode
+            // is NOT updated. xts5 XSetDeviceMode-2.
+            const ALREADY_GRABBED: u8 = 1;
+            let grabbed_elsewhere = state
+                .xi1_active_grabs
+                .get(&dev)
+                .is_some_and(|g| g.owner != client_id);
+            let status = if grabbed_elsewhere {
+                ALREADY_GRABBED
+            } else {
+                let mode = *body.get(1).unwrap_or(&0);
+                if mode <= 1 {
+                    state
+                        .xi1_device_input_state
+                        .entry(dev)
+                        .or_default()
+                        .valuator_mode = mode;
+                }
+                0
+            };
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            reply.push(status);
+            reply.extend_from_slice(&[0u8; 23]);
+            buf.extend_from_slice(&reply);
         }
         // GetSelectedExtensionEvents: { window }.
         7 => {
