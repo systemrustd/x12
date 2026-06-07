@@ -1370,27 +1370,6 @@ pub(crate) fn xi1_core_grab_bridge_release(
     xi1_compute_freezes(state);
 }
 
-/// Core AllowEvents → XI1-side `THAWED` for one device (Xorg
-/// AllowSome with newState=THAWED): thaw the device's own state when
-/// the client's grab controls it, and clear the device's own
-/// on-behalf hold — the PAIRED device is NOT touched (XTS
-/// XAllowDeviceEvents-18: AsyncPointer must not release a frozen
-/// keyboard). Grab deactivation paths use
-/// [`xi1_core_grab_bridge_release`] instead.
-pub(crate) fn xi1_core_allow_events_thaw(state: &mut ServerState, deviceid: u16, client: ClientId) {
-    if xi1_device_grab_owner(state, deviceid) == Some(client)
-        && let Some(sync) = state.xi1_frozen.get_mut(&deviceid)
-    {
-        sync.state = crate::server::Xi1SyncState::Thawed;
-    }
-    if let Some(sync) = state.xi1_frozen.get_mut(&deviceid)
-        && sync.other == Some(client)
-    {
-        sync.other = None;
-    }
-    xi1_compute_freezes(state);
-}
-
 /// The client owning the grab that controls `deviceid`'s sync state:
 /// the XI1 device grab, or the bridged core grab (core pointer grab ↔
 /// slave pointer, core keyboard grab ↔ slave keyboard) — in Xorg these

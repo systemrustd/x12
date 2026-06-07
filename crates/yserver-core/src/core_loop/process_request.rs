@@ -17332,47 +17332,126 @@ fn handle_allow_events(
         state.frozen_keyboard_event.is_some(),
     );
 
-    // Pointer side: AsyncPointer / SyncPointer / ReplayPointer, plus
-    // the *Both modes which thaw the pointer too.
-    let pointer_release = matches!(mode, 0 | 1 | 2 | 6 | 7);
+    // Port of Xorg AllowSome (dix/events.c:1823). `thisDev` is the
+    // pointer for the pointer modes and the keyboard for the keyboard
+    // and *Both modes; the request is a no-op unless this client's
+    // grab holds the device frozen, or the device is synced on this
+    // client's behalf.
+    use crate::server::Xi1SyncState;
+    let dev_this = if matches!(mode, 0..=2) {
+        crate::xinput::DEVICEID_SLAVE_POINTER
+    } else {
+        crate::xinput::DEVICEID_SLAVE_KEYBOARD
+    };
+    let grab_owner_of = |state: &ServerState, dev: u16| -> Option<ClientId> {
+        crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, dev).or_else(|| {
+            if dev == crate::xinput::DEVICEID_SLAVE_POINTER {
+                state.pointer_grab.map(|(c, _)| c)
+            } else {
+                None
+            }
+        })
+    };
+    let this_grabbed = grab_owner_of(state, dev_this) == Some(client_id);
+    let this_state = state
+        .xi1_frozen
+        .get(&dev_this)
+        .map_or(Xi1SyncState::Thawed, |f| f.state);
+    let this_synced = state.xi1_frozen.get(&dev_this).and_then(|f| f.other) == Some(client_id);
+    let core_frozen = if dev_this == crate::xinput::DEVICEID_SLAVE_POINTER {
+        state.frozen_pointer_event.is_some()
+    } else {
+        state.frozen_keyboard_event.is_some()
+    };
+    let frozen_strict = this_state >= Xi1SyncState::FrozenNoEvent || core_frozen;
+    if !((this_grabbed && frozen_strict) || this_synced) {
+        debug!(
+            "client {} #{} AllowEvents no-op (not frozen by this client: grabbed={this_grabbed} state={this_state:?} synced={this_synced})",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+
     let pointer_replay = mode == 2;
-    // Keyboard side: AsyncKeyboard / SyncKeyboard / ReplayKeyboard,
-    // plus the *Both modes.
-    let keyboard_release = matches!(mode, 3..=7);
     let keyboard_replay = mode == 5;
 
-    let frozen_pointer = if pointer_release {
+    // State transitions per mode (Xorg AllowSome switch). The queued
+    // events play AFTER the transition so the freeze gate at fanout
+    // entry sees the new state: Async → events flow; Sync →
+    // FreezeNextEvent lets them flow until the next key/button trips
+    // the re-freeze (FreezeThisEventIfNeededForSyncGrab).
+    let set_state = |state: &mut ServerState, dev: u16, st: Xi1SyncState| {
+        let f = state.xi1_frozen.entry(dev).or_default();
+        f.state = st;
+        if f.other == Some(client_id) {
+            f.other = None;
+        }
+    };
+    let dev_ptr = crate::xinput::DEVICEID_SLAVE_POINTER;
+    let dev_kbd = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+    match mode {
+        0 | 2 => set_state(state, dev_ptr, Xi1SyncState::Thawed),
+        1 => set_state(state, dev_ptr, Xi1SyncState::FreezeNextEvent),
+        3 | 5 => set_state(state, dev_kbd, Xi1SyncState::Thawed),
+        4 => set_state(state, dev_kbd, Xi1SyncState::FreezeNextEvent),
+        6 => {
+            // AsyncBoth thaws every device this client's grabs froze.
+            for dev in [dev_ptr, dev_kbd] {
+                if grab_owner_of(state, dev) == Some(client_id)
+                    || state.xi1_frozen.get(&dev).and_then(|f| f.other) == Some(client_id)
+                {
+                    set_state(state, dev, Xi1SyncState::Thawed);
+                }
+            }
+        }
+        _ => {
+            // SyncBoth arms FreezeBothNextEvent on the client's
+            // grabbed devices.
+            for dev in [dev_ptr, dev_kbd] {
+                if grab_owner_of(state, dev) == Some(client_id)
+                    || state.xi1_frozen.get(&dev).and_then(|f| f.other) == Some(client_id)
+                {
+                    set_state(state, dev, Xi1SyncState::FreezeBothNextEvent);
+                }
+            }
+        }
+    }
+
+    // Withheld pointer events. The activating press of a sync passive
+    // grab was already delivered to the grab owner — only Replay
+    // re-delivers it (to the natural target, grab bypassed); the
+    // async/sync releases just drop it. The QUEUE (events that arrived
+    // during the freeze, delivered to nobody) plays through the normal
+    // pipeline on every pointer-side release — Xorg
+    // PlayReleasedEvents; with the grab still active they route to
+    // the grab owner.
+    let pointer_side = matches!(mode, 0 | 1 | 2 | 6 | 7);
+    let frozen_pointer = if pointer_side {
         state.frozen_pointer_event.take()
     } else {
         None
     };
-    // Drain the queued events that arrived during the freeze. On
-    // replay they get re-delivered to natural targets in arrival
-    // order (matching Xorg PlayReleasedEvents); on non-replay
-    // releases (AsyncPointer / SyncPointer) we drop them — the grab
-    // owner already consumed the activating press, and per-event
-    // delivery semantics for "the events you held while frozen"
-    // diverge once the grab unfreezes asynchronously. Holding them
-    // until next press would be worse: stale events accumulate.
-    let frozen_pointer_queue = if pointer_release {
+    let frozen_pointer_queue = if pointer_side {
         std::mem::take(&mut state.frozen_pointer_queue)
     } else {
         std::collections::VecDeque::new()
     };
-    if pointer_release && state.pointer_grab_is_passive {
+    // NOT_GRABBED (Replay) releases the passive grab; Async/Sync keep
+    // it until the button release (Xorg: AllowEvents never ends an
+    // async-released passive grab early).
+    if pointer_replay && state.pointer_grab_is_passive {
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
+        state.pointer_confine_to = ResourceId(0);
     }
 
-    // ReplayKeyboard / *Both: release the passive keyboard grab this
-    // client holds and (for replay) re-deliver the frozen key to the
-    // focus window, bypassing the grab. Mirrors Xorg ComputeFreezes.
-    let frozen_keyboard = if keyboard_release {
+    let keyboard_side = matches!(mode, 3..=7);
+    let frozen_keyboard = if keyboard_side {
         state.frozen_keyboard_event.take()
     } else {
         None
     };
-    if keyboard_release
+    if keyboard_replay
         && state
             .active_keyboard_grab
             .is_some_and(|g| g.owner == client_id)
@@ -17382,6 +17461,16 @@ fn handle_allow_events(
         )
     {
         state.active_keyboard_grab = None;
+    }
+
+    // Play the withheld pointer queue for the non-replay releases
+    // (replay handles its own drain below, grab bypassed).
+    if pointer_side && !pointer_replay && !frozen_pointer_queue.is_empty() {
+        let xid_map = backend.xid_map().clone();
+        for queued in frozen_pointer_queue.clone() {
+            let _dropped =
+                pointer_event_fanout_to_state(state, backend, &xid_map, queued, true, false);
+        }
     }
 
     if pointer_replay && let Some(event) = frozen_pointer {
@@ -17418,26 +17507,10 @@ fn handle_allow_events(
     if keyboard_replay && let Some(event) = frozen_keyboard {
         let _dropped = replay_frozen_key_to_focus(state, event);
     }
-    // Core↔XI bridge: core sync grabs also freeze the XI1 device-sync
-    // state (xi1_check_grab_for_syncs in the grab handlers); a core
-    // AllowEvents that releases a side must release the XI1 hold too,
-    // or device events queue forever — Xorg has ONE AllowSome for both
-    // protocols. Per-device THAWED only: AsyncPointer must NOT touch a
-    // frozen keyboard (XTS XAllowDeviceEvents-18).
-    if pointer_release {
-        crate::core_loop::pointer_fanout::xi1_core_allow_events_thaw(
-            state,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
-            client_id,
-        );
-    }
-    if keyboard_release {
-        crate::core_loop::pointer_fanout::xi1_core_allow_events_thaw(
-            state,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-            client_id,
-        );
-    }
+    // ComputeFreezes: replay the per-device XI1 queues + withheld
+    // core keys now that the sync states changed (Xorg has ONE
+    // AllowSome for both protocols).
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state);
     Ok(RequestOutcome::Handled)
 }
 
