@@ -1051,6 +1051,9 @@ pub trait Backend: Send {
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>>;
 
+    /// `tile_origin` shifts where the bg tile is sampled — nonzero
+    /// for ParentRelative backgrounds, whose pattern aligns to the
+    /// OWNING ancestor's origin (X11 §window background).
     #[allow(clippy::too_many_arguments)]
     fn clear_area(
         &mut self,
@@ -1062,10 +1065,13 @@ pub trait Backend: Send {
         y: i16,
         width: u16,
         height: u16,
+        tile_origin: (i32, i32),
     ) -> io::Result<()> {
         self.clear_clip_rectangles(origin)?;
         if let Some(bg_host_xid) = background_pixmap_host_xid {
-            self.copy_area(origin, bg_host_xid, host_xid, x, y, x, y, width, height)
+            let sx = i16::try_from(i32::from(x) + tile_origin.0).unwrap_or(x);
+            let sy = i16::try_from(i32::from(y) + tile_origin.1).unwrap_or(y);
+            self.copy_area(origin, bg_host_xid, host_xid, sx, sy, x, y, width, height)
         } else {
             self.fill_rectangle(origin, host_xid, background_pixel, x, y, width, height)
         }

@@ -188,6 +188,8 @@ pub struct CreateWindowRequest {
     pub border_width: u16,
     pub class: u16,
     pub visual: ResourceId,
+    /// CW bit 0. 0 = None, 1 = ParentRelative, else a pixmap XID.
+    pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
     pub bit_gravity: Option<u8>,
     pub win_gravity: Option<u8>,
@@ -906,6 +908,7 @@ pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowReque
         border_width: read_u16_le(body.get(16..18)?),
         class: read_u16_le(body.get(18..20)?),
         visual: ResourceId(read_u32_le(body.get(20..24)?)),
+        background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
         bit_gravity: values.value(4).map(|v| v as u8),
         win_gravity: values.value(5).map(|v| v as u8),

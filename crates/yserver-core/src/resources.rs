@@ -210,6 +210,7 @@ impl Default for ResourceTable {
                 map_state: MapState::Viewable,
                 background_pixel: 0x00ff_ffff,
                 background_pixmap: None,
+                background_none: false,
                 background_pixmap_host_xid: None,
                 border_pixmap_host_xid: None,
                 override_redirect: false,
@@ -255,6 +256,7 @@ impl Default for ResourceTable {
                 map_state: MapState::Viewable,
                 background_pixel: 0,
                 background_pixmap: None,
+                background_none: false,
                 background_pixmap_host_xid: None,
                 border_pixmap_host_xid: None,
                 override_redirect: true,
@@ -466,8 +468,16 @@ impl ResourceTable {
             class: WindowClass::from_protocol(request.class),
             map_state: MapState::Unmapped,
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
-            background_pixmap: None,
-            background_pixmap_host_xid: None,
+            background_pixmap: request.background_pixmap.filter(|p| p.0 != 0),
+            background_pixmap_host_xid: request
+                .background_pixmap
+                .filter(|p| p.0 > 1)
+                .and_then(|p| self.pixmaps.get(&p.0).and_then(|pm| pm.host_xid)),
+            // X11 §CreateWindow: background-pixmap DEFAULTS to None;
+            // an explicit background-pixel (or a real pixmap /
+            // ParentRelative) provides a background.
+            background_none: request.background_pixel.is_none()
+                && !matches!(request.background_pixmap, Some(p) if p.0 != 0),
             border_pixmap_host_xid: None,
             override_redirect: request.override_redirect.unwrap_or(false),
             bit_gravity: request.bit_gravity.unwrap_or(0),
@@ -612,9 +622,15 @@ impl ResourceTable {
                 if let Some(host) = new_bg_host_xid {
                     window.background_pixmap_host_xid = host;
                 }
+                // CWBackPixmap = 0 → background None (clears leave
+                // contents untouched); any other value provides a bg.
+                window.background_none = bg_pixmap.0 == 0;
             }
             if let Some(background_pixel) = request.background_pixel {
                 window.background_pixel = background_pixel;
+                // An explicit background-pixel always provides a bg
+                // (precedence over background-pixmap, X11 §CWA).
+                window.background_none = false;
             }
             if let Some(v) = request.bit_gravity {
                 window.bit_gravity = v;
@@ -1339,12 +1355,24 @@ impl ResourceTable {
 
         let window = self.windows.get(&window_id.0)?;
         if matches!(window.background_pixmap, Some(bg) if bg.0 == 1) {
-            return self.window_resolved_background_inner(window.parent, seen);
+            // ParentRelative: inherit the parent's background; the
+            // tile stays aligned to the PARENT's origin, so this
+            // window samples it shifted by its own position.
+            let mut resolved = self.window_resolved_background_inner(window.parent, seen)?;
+            resolved.tile_origin_offset.0 += i32::from(window.x);
+            resolved.tile_origin_offset.1 += i32::from(window.y);
+            return Some(resolved);
+        }
+        if window.background_none {
+            // Background None: clears/exposes leave contents
+            // untouched (X11 §ClearArea / miPaintWindow early-out).
+            return None;
         }
 
         Some(ResolvedWindowBackground {
             background_pixel: window.background_pixel,
             background_pixmap_host_xid: window.background_pixmap_host_xid,
+            tile_origin_offset: (0, 0),
         })
     }
 
@@ -2415,6 +2443,10 @@ pub struct Window {
     pub map_state: MapState,
     pub background_pixel: u32,
     pub background_pixmap: Option<ResourceId>,
+    /// True when the effective background is None (X11 CreateWindow
+    /// DEFAULT, or explicit CWBackPixmap=0 without a pixel):
+    /// ClearArea/expose painting leaves contents untouched.
+    pub background_none: bool,
     /// Host XID of the bg pixmap, snapshotted at attrs-change time so
     /// it survives FreePixmap (X11 servers retain bg pixmaps independent
     /// of client refs).
@@ -2454,6 +2486,11 @@ pub struct Window {
 pub struct ResolvedWindowBackground {
     pub background_pixel: u32,
     pub background_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
+    /// Accumulated child→bg-owner offset across ParentRelative hops:
+    /// the tile pattern aligns to the OWNING window's origin, so the
+    /// child samples the tile at (x + offset) (X11 §window
+    /// background: "aligned with the parent's origin").
+    pub tile_origin_offset: (i32, i32),
 }
 
 /// Off-screen mirror backing a redirected window. `host_pixmap` is
@@ -2487,6 +2524,7 @@ impl Window {
             map_state: MapState::Unmapped,
             background_pixel: 0x00ff_ffff,
             background_pixmap: None,
+            background_none: false,
             background_pixmap_host_xid: None,
             border_pixmap_host_xid: None,
             override_redirect: false,
@@ -2934,6 +2972,9 @@ mod tests {
             parent.background_pixel = 0x00aa_bbcc;
             parent.background_pixmap = None;
             parent.background_pixmap_host_xid = None;
+            // Direct struct poke must mirror what a real CWA
+            // (background-pixel set) does to the None flag.
+            parent.background_none = false;
         }
         {
             let child = table.windows.get_mut(&0x200002).unwrap();

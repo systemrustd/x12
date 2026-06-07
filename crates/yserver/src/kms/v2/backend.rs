@@ -391,6 +391,7 @@ impl KmsBackendV2 {
         rank
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn clear_window_area_with_background(
         &mut self,
         host_xid: u32,
@@ -400,6 +401,7 @@ impl KmsBackendV2 {
         y: i16,
         width: u16,
         height: u16,
+        tile_origin: (i32, i32),
     ) -> io::Result<()> {
         use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
 
@@ -418,8 +420,10 @@ impl KmsBackendV2 {
                 == Some(ash::vk::Format::B8G8R8A8_UNORM)
             {
                 let rects = [CompositeRect {
-                    src_x: i32::from(x),
-                    src_y: i32::from(y),
+                    // ParentRelative tiles sample at the OWNING
+                    // window's alignment (tile_origin offset).
+                    src_x: i32::from(x) + tile_origin.0,
+                    src_y: i32::from(y) + tile_origin.1,
                     mask_x: 0,
                     mask_y: 0,
                     dst_x: dst_target.offset.0 + i32::from(x),
@@ -5383,22 +5387,28 @@ impl KmsBackendV2 {
         self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
     }
 
-    /// PutImage with a non-Copy GC function or partial plane-mask:
-    /// CPU read-modify-write combining the wire z-pixmap image with
-    /// the destination through `apply_gc_function`. Conformance path
-    /// only — real clients put with GXcopy.
+    /// PutImage with a non-Copy GC function, partial plane-mask, or
+    /// a pixmap clip-mask: CPU read-modify-write combining the wire
+    /// z-pixmap image with the destination through
+    /// `apply_gc_function`. `data` has row stride `data_width`
+    /// pixels; the transfer covers `transfer_w`×`transfer_h` pixels
+    /// starting at `src_off` within the image. Conformance path only
+    /// — real clients put with GXcopy and no bitmap clip.
     #[allow(clippy::too_many_arguments)]
     fn put_image_rop_cpu(
         &mut self,
         dst_id: DrawableId,
         dst_pos: ash::vk::Offset2D,
-        width: u16,
-        height: u16,
+        data_width: u16,
+        src_off: (i32, i32),
+        transfer_w: u16,
+        transfer_h: u16,
         data: &[u8],
         depth: u8,
         function: yserver_core::backend::GcFunction,
         plane_mask: u32,
     ) {
+        let width = data_width;
         let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
             return;
         };
@@ -5406,10 +5416,10 @@ impl KmsBackendV2 {
         // the clamped origin.
         let mut dx = dst_pos.x;
         let mut dy = dst_pos.y;
-        let mut sx = 0i32;
-        let mut sy = 0i32;
-        let mut w = i32::from(width);
-        let mut h = i32::from(height);
+        let mut sx = src_off.0;
+        let mut sy = src_off.1;
+        let mut w = i32::from(transfer_w);
+        let mut h = i32::from(transfer_h);
         if dx < 0 {
             sx -= dx;
             w += dx;
@@ -8607,9 +8617,16 @@ impl Backend for KmsBackendV2 {
         if self.window_viewable(host_xid) {
             let targets = self.collect_viewable_bg_paint_targets(host_xid);
             for (xid, bg_pixel, bg_pixmap, w, h) in targets {
-                if let Err(e) =
-                    self.clear_window_area_with_background(xid, bg_pixel, bg_pixmap, 0, 0, w, h)
-                {
+                if let Err(e) = self.clear_window_area_with_background(
+                    xid,
+                    bg_pixel,
+                    bg_pixmap,
+                    0,
+                    0,
+                    w,
+                    h,
+                    (0, 0),
+                ) {
                     log::debug!("v2 map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
                 }
             }
@@ -8710,6 +8727,7 @@ impl Backend for KmsBackendV2 {
                                 0,
                                 new_w,
                                 new_h,
+                                (0, 0),
                             ) {
                                 log::debug!(
                                     "v2 configure_subwindow: bg_pixmap resize init failed for xid {host_xid:#x}: {e:?}"
@@ -9601,6 +9619,7 @@ impl Backend for KmsBackendV2 {
             y,
             width,
             height,
+            (0, 0),
         )
     }
 
@@ -10198,9 +10217,60 @@ impl Backend for KmsBackendV2 {
         // `SetClipRectangles`). When the GC has explicit clip
         // rectangles, every paint is masked against them first;
         // `ClipState::None` means "no GC clip", and we keep the
-        // single-rect fast path. `ClipState::Pixmap` rasterises a
-        // mask — out of scope for this fix; pass through untouched
-        // (TODO mirrors v1's `intersect_with_current_clip`).
+        // single-rect fast path. `ClipState::Pixmap` intersects with
+        // the rasterized mask (pixel runs via
+        // intersect_with_current_clip_live).
+        if matches!(
+            self.core.current_clip,
+            yserver_core::backend::ClipState::Pixmap { .. }
+        ) {
+            let local = Rectangle16 {
+                x: dst_x,
+                y: dst_y,
+                width,
+                height,
+            };
+            let runs = self.intersect_with_current_clip_live(&[local]);
+            // Mask runs honor function/plane-mask via the CPU path
+            // (Copy through apply_gc_function = src — bitwise exact).
+            use yserver_core::backend::GcFunction;
+            let function = self.core.current_function;
+            if matches!(function, GcFunction::NoOp) {
+                return Ok(());
+            }
+            let dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let plane_mask = self.core.current_plane_mask & depth_plane_mask(dst_depth);
+            if plane_mask == 0 {
+                return Ok(());
+            }
+            for run in runs {
+                let sub_src = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: i32::from(src_x) + (i32::from(run.x) - i32::from(dst_x)),
+                        y: i32::from(src_y) + (i32::from(run.y) - i32::from(dst_y)),
+                    },
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(run.width),
+                        height: u32::from(run.height),
+                    },
+                };
+                let dst_pos = ash::vk::Offset2D {
+                    x: i32::from(run.x) + dst_target.offset.0,
+                    y: i32::from(run.y) + dst_target.offset.1,
+                };
+                self.copy_area_rop_cpu(
+                    src,
+                    dst_target.id,
+                    sub_src,
+                    dst_pos,
+                    function,
+                    plane_mask,
+                    dst_depth,
+                );
+            }
+            self.scene.wake_for_damage();
+            return Ok(());
+        }
         let post_gc_clip: Vec<ash::vk::Rect2D> =
             if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
                 &self.core.current_clip
@@ -10616,6 +10686,46 @@ impl Backend for KmsBackendV2 {
             if plane_mask == 0 {
                 return Ok(());
             }
+            let pixmap_clip = matches!(
+                self.core.current_clip,
+                yserver_core::backend::ClipState::Pixmap { .. }
+            );
+            if pixmap_clip {
+                // Bitmap clip-mask: intersect the put rect with the
+                // mask (pixel runs), then write each run through the
+                // CPU path (Copy through apply_gc_function = src).
+                let local = Rectangle16 {
+                    x: dst_x,
+                    y: dst_y,
+                    width,
+                    height,
+                };
+                let runs = self.intersect_with_current_clip_live(&[local]);
+                for run in runs {
+                    self.put_image_rop_cpu(
+                        target.id,
+                        ash::vk::Offset2D {
+                            x: i32::from(run.x) + target.offset.0,
+                            y: i32::from(run.y) + target.offset.1,
+                        },
+                        width,
+                        (
+                            i32::from(run.x) - i32::from(dst_x),
+                            i32::from(run.y) - i32::from(dst_y),
+                        ),
+                        run.width,
+                        run.height,
+                        data,
+                        depth,
+                        function,
+                        plane_mask,
+                    );
+                }
+                self.telemetry.record_paint_submit();
+                self.trace_simple(SubmitKind::PutImage, target.id, 1);
+                self.scene.wake_for_damage();
+                return Ok(());
+            }
             if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
                 self.put_image_rop_cpu(
                     target.id,
@@ -10623,6 +10733,8 @@ impl Backend for KmsBackendV2 {
                         x: i32::from(dst_x) + target.offset.0,
                         y: i32::from(dst_y) + target.offset.1,
                     },
+                    width,
+                    (0, 0),
                     width,
                     height,
                     data,
@@ -10835,6 +10947,7 @@ impl Backend for KmsBackendV2 {
         y: i16,
         width: u16,
         height: u16,
+        tile_origin: (i32, i32),
     ) -> io::Result<()> {
         self.clear_window_area_with_background(
             host_xid,
@@ -10844,6 +10957,7 @@ impl Backend for KmsBackendV2 {
             y,
             width,
             height,
+            tile_origin,
         )
     }
 

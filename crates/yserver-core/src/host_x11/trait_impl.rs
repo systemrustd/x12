@@ -597,7 +597,10 @@ impl Backend for HostX11Backend {
         y: i16,
         width: u16,
         height: u16,
+        _tile_origin: (i32, i32),
     ) -> io::Result<()> {
+        // ynest forwards ClearArea to the host, which resolves the
+        // window's background (incl. ParentRelative alignment) itself.
         self.with_active_origin(origin, |this| {
             HostX11Backend::clear_area(this, host_xid, x, y, width, height, false)
         })

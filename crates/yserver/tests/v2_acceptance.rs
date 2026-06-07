@@ -1515,7 +1515,7 @@ fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
 
     b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
         .expect("window blue");
-    b.clear_area(None, xid, 0, Some(tile.as_raw()), 3, 3, 4, 4)
+    b.clear_area(None, xid, 0, Some(tile.as_raw()), 3, 3, 4, 4, (0, 0))
         .expect("clear_area bg_pixmap");
 
     let out = b

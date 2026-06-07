@@ -17171,6 +17171,73 @@ fn handle_get_image(
     let Some(req) = x11::get_image_request(header.data, body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // Validation per Xorg ProcGetImage: format ∈ {XYPixmap, ZPixmap}
+    // → BadValue; drawable must exist → BadDrawable; the rect must
+    // lie fully within the drawable (windows additionally must be
+    // viewable) → BadMatch.
+    if req.format != 1 && req.format != 2 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(req.format),
+            73,
+        );
+    }
+    let rx0 = i32::from(req.x);
+    let ry0 = i32::from(req.y);
+    let rx1 = rx0 + i32::from(req.width);
+    let ry1 = ry0 + i32::from(req.height);
+    if let Some(w) = state.resources.window(req.drawable) {
+        // Windows: must be viewable; the rect may include the BORDER
+        // (xts XGetImage-7 reads (-1,-1)) but not extend past its
+        // outside edges; and — ignoring overlaps — the rect must be
+        // fully on the screen (XGetImage-15). Both → BadMatch.
+        let bw = i32::from(w.border_width);
+        let (ww, wh) = (i32::from(w.width), i32::from(w.height));
+        let viewable = w.map_state == crate::resources::MapState::Viewable;
+        let in_window = rx0 >= -bw && ry0 >= -bw && rx1 <= ww + bw && ry1 <= wh + bw;
+        let (abs_x, abs_y) = state.resources.window_absolute_position(req.drawable);
+        let (root_w, root_h) = state
+            .resources
+            .window(crate::resources::ROOT_WINDOW)
+            .map_or((i32::MAX, i32::MAX), |r| {
+                (i32::from(r.width), i32::from(r.height))
+            });
+        let on_screen =
+            abs_x + rx0 >= 0 && abs_y + ry0 >= 0 && abs_x + rx1 <= root_w && abs_y + ry1 <= root_h;
+        if !viewable || !in_window || !on_screen {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_MATCH,
+                req.drawable.0,
+                73,
+            );
+        }
+    } else if let Some(p) = state.resources.pixmap(req.drawable) {
+        if rx0 < 0 || ry0 < 0 || rx1 > i32::from(p.width) || ry1 > i32::from(p.height) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_MATCH,
+                req.drawable.0,
+                73,
+            );
+        }
+    } else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_DRAWABLE,
+            req.drawable.0,
+            73,
+        );
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -17675,6 +17742,39 @@ fn handle_clear_area(
 ) -> io::Result<RequestOutcome> {
     let exposures = header.data != 0;
     if let Some(request) = x11::clear_area_request(body) {
+        // Validation per Xorg ProcClearToBackground: exposures must
+        // be a BOOL (0/1) → BadValue; the drawable must be a window
+        // → BadWindow; InputOnly windows can't be cleared → BadMatch.
+        if header.data > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(header.data),
+                61,
+            );
+        }
+        let Some(window) = state.resources.window(request.window) else {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                request.window.0,
+                61,
+            );
+        };
+        if matches!(window.class, crate::resources::WindowClass::InputOnly) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_MATCH,
+                request.window.0,
+                61,
+            );
+        }
         let extents = state
             .resources
             .window(request.window)
@@ -17687,28 +17787,30 @@ fn handle_clear_area(
             let width = clear_extent(request.width, request.x, w_width);
             let height = clear_extent(request.height, request.y, w_height);
             if width != 0 && height != 0 {
-                let bg_pixel = resolved_bg.map(|bg| bg.background_pixel).unwrap_or(0);
-                let bg_pixmap_host = resolved_bg
-                    .and_then(|bg| bg.background_pixmap_host_xid)
-                    .map(|h| h.as_raw());
-                backend.clear_area(
-                    origin,
-                    target.host_xid(),
-                    bg_pixel,
-                    bg_pixmap_host,
-                    request.x,
-                    request.y,
-                    width,
-                    height,
-                )?;
-                let _dropped = accumulate_damage_to_state(
-                    state,
-                    request.window,
-                    request.x,
-                    request.y,
-                    width,
-                    height,
-                );
+                // Background None (X11 §ClearArea): the contents are
+                // left untouched — no paint, no damage. Expose events
+                // (below) still fire when requested.
+                if let Some(bg) = resolved_bg {
+                    backend.clear_area(
+                        origin,
+                        target.host_xid(),
+                        bg.background_pixel,
+                        bg.background_pixmap_host_xid.map(|h| h.as_raw()),
+                        request.x,
+                        request.y,
+                        width,
+                        height,
+                        bg.tile_origin_offset,
+                    )?;
+                    let _dropped = accumulate_damage_to_state(
+                        state,
+                        request.window,
+                        request.x,
+                        request.y,
+                        width,
+                        height,
+                    );
+                }
                 // X11 spec: when `exposures` is True (header.data),
                 // the server sends an Expose event for visible regions
                 // of the cleared rectangle.
@@ -18346,7 +18448,14 @@ fn handle_copy_plane(
         // (same contract as CopyArea).
         if !missing.is_empty() && state.resources.window(dst).is_some() {
             for (mx, my, mw, mh) in &missing {
-                backend.paint_window_background_rect(origin, dstt.host_xid(), *mx, *my, *mw, *mh)?;
+                backend.paint_window_background_rect(
+                    origin,
+                    dstt.host_xid(),
+                    *mx,
+                    *my,
+                    *mw,
+                    *mh,
+                )?;
                 let _dropped = accumulate_damage_to_state(state, dst, *mx, *my, *mw, *mh);
             }
         }
