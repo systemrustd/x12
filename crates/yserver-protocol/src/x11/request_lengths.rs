@@ -300,6 +300,15 @@ pub fn xi_exact_required_length(minor: u8, body: &[u8]) -> Option<u32> {
         27 if body.len() >= 2 => Some(2 + 2 * u32::from(body[1])),
         // 29 SetDeviceButtonMapping: 2 + pad_units(map_length)
         29 if body.len() >= 2 => Some(2 + pad_units(u32::from(body[1]))),
+        // 31 SendExtensionEvent: 4 base + 8 × num_events + count.
+        // body (post-header): destination(u32) deviceid(u8) propagate(u8)
+        //   count(u16) num_events(u8) pad×3 events(32 × num_events)
+        //   classes(u32 × count).
+        31 if body.len() >= 9 => {
+            let class_count = u32::from(read_u16_le(&body[6..8]));
+            let num_events = u32::from(body[8]);
+            Some(4 + 8 * num_events + class_count)
+        }
         // 33 SetDeviceValuators: 2 + num_valuators_at_body[2]
         33 if body.len() >= 3 => Some(2 + u32::from(body[2])),
         // 35 ChangeDeviceControl: 2 + pad_units(xDeviceCtl.length).

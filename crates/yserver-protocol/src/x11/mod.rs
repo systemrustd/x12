@@ -781,18 +781,25 @@ pub fn read_request(
 
     let mut length_units = u32::from(read_u16(byte_order, &header[2..4]));
     let body_len;
+    let mut malformed = false;
 
     if length_units == 0 && big_requests_enabled {
         let mut big_len = [0; 4];
         reader.read_exact(&mut big_len)?;
         length_units = read_u32(byte_order, &big_len);
         if length_units < 2 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid BIG-REQUESTS length {}", length_units),
-            ));
+            // Malformed BIG-REQUESTS: the 4-byte std header + 4-byte
+            // big-length field is itself 2 units, so a claimed total
+            // < 2 cannot fit the header. xts5 ListInputDevices-2
+            // sends `length=0, big=1` (a "1-unit BIG") and expects
+            // BadLength. Flag it so the dispatcher emits BadLength.
+            // No body to drain — for sub-header lengths the test
+            // client sends exactly the 8-byte (std + big) header.
+            malformed = true;
+            body_len = 0;
+        } else {
+            body_len = (length_units as usize * 4) - 8;
         }
-        body_len = (length_units as usize * 4) - 8;
     } else {
         if length_units < 1 {
             return Err(io::Error::new(
@@ -803,11 +810,49 @@ pub fn read_request(
         body_len = (length_units as usize * 4) - 4;
     }
 
+    // Cap absurd lengths so we don't allocate gigabytes of zeros for
+    // a request the dispatcher is about to reject. xts5's "length one
+    // greater than the maximum" probes (TOO_LONG) send
+    // `bigRequestLength = server_max + 1` AND the corresponding
+    // payload bytes on the wire; we have to drain those bytes to keep
+    // the socket in sync, but we don't have to allocate a buffer the
+    // size of the payload to do it. Flag the request as malformed so
+    // the dispatcher's max-length gate emits BadLength.
+    let max_units: u32 = if big_requests_enabled {
+        256 * 1024
+    } else {
+        u32::from(u16::MAX)
+    };
+    if !malformed && length_units > max_units {
+        malformed = true;
+    }
+
     let request = RequestHeader {
         opcode: header[0],
         data: header[1],
-        length_units,
+        // Override length to a sentinel that the dispatcher's
+        // `header.length_units > max_length_units` check will reject
+        // with BadLength. Preserves opcode/minor so the error reply
+        // names the right request.
+        length_units: if malformed { u32::MAX } else { length_units },
     };
+
+    if malformed {
+        // Drain the claimed body in 64 KiB chunks so we don't
+        // allocate body_len bytes just to throw them away. xts5
+        // TOO_LONG actually sends the over-max payload, so the
+        // bytes WILL arrive — we just don't care what they are.
+        if body_len > 0 {
+            let mut sink = [0u8; 65_536];
+            let mut remaining = body_len;
+            while remaining > 0 {
+                let take = remaining.min(sink.len());
+                reader.read_exact(&mut sink[..take])?;
+                remaining -= take;
+            }
+        }
+        return Ok(Some((request, Vec::new())));
+    }
 
     let mut body = vec![0; body_len];
     reader.read_exact(&mut body)?;
@@ -3634,6 +3679,55 @@ mod tests {
         assert_eq!(header.opcode, 1);
         assert_eq!(header.length_units, 3);
         assert_eq!(body, [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn read_request_flags_malformed_big_length_under_two_units() {
+        // xts5 ListInputDevices-2 sends `length=0, big=1` to probe
+        // BadLength on sub-header BIG-REQUESTS. We must NOT disconnect
+        // — emit a sentinel `length_units = u32::MAX` so the
+        // dispatcher's max-length gate fires BadLength.
+        let mut input = std::io::Cursor::new([
+            2, 0, 0, 0, // ListInputDevices opcode, length=0
+            1, 0, 0, 0, // BIG length = 1 (LE) — sub-header
+        ]);
+        let (header, body) = read_request(&mut input, ClientByteOrder::LittleEndian, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.opcode, 2);
+        assert_eq!(header.length_units, u32::MAX);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn read_request_flags_over_max_big_length_and_drains_body() {
+        // xts5 TOO_LONG: bigRequestLength = max+1 = 262145 with the
+        // matching payload bytes on the wire. We override length to
+        // the BadLength sentinel and drain the payload to keep the
+        // socket aligned for the next request.
+        const OVER_MAX: u32 = 256 * 1024 + 1; // 262145 units
+        const BODY_BYTES: usize = (OVER_MAX as usize * 4) - 8;
+        let mut input = Vec::with_capacity(8 + BODY_BYTES + 4);
+        input.extend_from_slice(&[1, 2, 0, 0]); // opcode, data, length=0
+        input.extend_from_slice(&OVER_MAX.to_le_bytes()); // BIG length
+        input.resize(input.len() + BODY_BYTES, 0xaa); // claimed payload
+        // Sentinel bytes after the malformed request — must be intact
+        // for the next read_request call.
+        input.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let mut cursor = std::io::Cursor::new(input);
+        let (header, body) = read_request(&mut cursor, ClientByteOrder::LittleEndian, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.opcode, 1);
+        assert_eq!(header.length_units, u32::MAX);
+        assert!(body.is_empty());
+
+        // The cursor should now be positioned at the sentinel.
+        assert_eq!(cursor.position() as usize, 8 + BODY_BYTES);
+        let mut next = [0u8; 4];
+        std::io::Read::read_exact(&mut cursor, &mut next).unwrap();
+        assert_eq!(next, [0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]

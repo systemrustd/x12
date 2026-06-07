@@ -12077,13 +12077,25 @@ fn handle_xi2_request(
             // XSendExtensionEvent-20 sends a stale window + bogus class
             // and expects the BadClass.
             let classes_off = 12 + num_events * 32;
+            // The XI swap table for minor 31 marks everything past the
+            // header as `OpaqueTail` because the per-event payload
+            // (the sender's byte order, like core SendEvent's xEvent
+            // template) must NOT be swapped. That leaves the trailing
+            // XEventClass[] in the client's native order; read each
+            // class with `byte_order` awareness rather than blind LE.
+            let read_class = |off: usize| -> Option<u32> {
+                let bytes = body.get(off..off + 4)?;
+                let arr = [bytes[0], bytes[1], bytes[2], bytes[3]];
+                Some(match byte_order {
+                    yserver_protocol::x11::ClientByteOrder::LittleEndian => u32::from_le_bytes(arr),
+                    yserver_protocol::x11::ClientByteOrder::BigEndian => u32::from_be_bytes(arr),
+                })
+            };
             for i in 0..class_count {
                 let off = classes_off + i * 4;
-                if off + 4 > body.len() {
+                let Some(class) = read_class(off) else {
                     break;
-                }
-                let class =
-                    u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+                };
                 if !xi1_device_valid(xi1_event_class_device(class)) {
                     return xi1_error(
                         state,
@@ -12107,13 +12119,16 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            // Deliver each supplied event to clients that selected its
-            // class on the destination window (propagate semantics not
-            // yet honoured — direct-window match only, like core
-            // SendEvent with propagate=False). The wire bytes are
-            // forwarded as the client built them, with the send_event
-            // bit set on the type and the per-recipient sequence
-            // patched in (Xorg dix SendEvent shape).
+            // Per Xorg `Xi/sendexev.c::ProcXSendExtensionEvent` →
+            // `Xi/exevents.c::SendEvent`: deliver ALL supplied events
+            // to clients whose selection intersects ANY of the
+            // request's class list. This preserves XI1 event chains
+            // (DeviceKeyPress + DeviceValuator continuation), which
+            // the client selects via the head class only — per-event
+            // filtering would drop the continuation, breaking xts5
+            // XSendExtensionEvent and any real chain consumer.
+            // Propagate semantics not yet honoured — direct-window
+            // match only, like core SendEvent with propagate=False.
             let dest_window = match dest {
                 // PointerWindow / InputFocus specials are rare in
                 // practice and need pointer/focus resolution; skip
@@ -12122,41 +12137,57 @@ fn handle_xi2_request(
                 w => Some(ResourceId(w)),
             };
             if let Some(dest_window) = dest_window {
-                for i in 0..num_events {
-                    let off = 12 + i * 32;
-                    let Some(ev) = body.get(off..off + 32) else {
+                // Collect the request's class list (already
+                // validated above for `xi1_device_valid`). Same
+                // byte-order reasoning as the BadClass loop above —
+                // classes are in the sender's native order because the
+                // XI swap table can't carve them out of the variable
+                // event payload that precedes them.
+                let mut request_classes: Vec<u32> = Vec::with_capacity(class_count);
+                for i in 0..class_count {
+                    let off = classes_off + i * 4;
+                    let Some(class) = read_class(off) else {
                         break;
                     };
-                    let ev_type = ev[0] & 0x7f;
-                    let class = (u32::from(dev) << 8) | u32::from(ev_type);
-                    let targets: Vec<ClientId> = state
-                        .clients
-                        .iter()
-                        .filter(|(_, c)| {
-                            c.xi1_window_event_classes
-                                .get(&dest_window)
-                                .is_some_and(|set| set.contains(&class))
-                        })
-                        .map(|(id, _)| ClientId(*id))
-                        .collect();
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let ev_bytes: [u8; 32] = ev.try_into().expect("32-byte slice");
-                    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-                        let mut out = ev_bytes;
-                        out[0] |= 0x80; // send_event
-                        let seq_bytes = match order {
-                            yserver_protocol::x11::ClientByteOrder::LittleEndian => {
-                                seq.0.to_le_bytes()
-                            }
-                            yserver_protocol::x11::ClientByteOrder::BigEndian => {
-                                seq.0.to_be_bytes()
-                            }
+                    request_classes.push(class);
+                }
+                let targets: Vec<ClientId> = state
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.xi1_window_event_classes
+                            .get(&dest_window)
+                            .is_some_and(|set| request_classes.iter().any(|cl| set.contains(cl)))
+                    })
+                    .map(|(id, _)| ClientId(*id))
+                    .collect();
+                if !targets.is_empty() {
+                    // Pre-snapshot all event bytes so the fanout
+                    // closure can borrow them per-recipient.
+                    let mut events_bytes: Vec<[u8; 32]> = Vec::with_capacity(num_events);
+                    for i in 0..num_events {
+                        let off = 12 + i * 32;
+                        let Some(ev) = body.get(off..off + 32) else {
+                            break;
                         };
-                        out[2] = seq_bytes[0];
-                        out[3] = seq_bytes[1];
-                        buf.extend_from_slice(&out);
+                        events_bytes.push(ev.try_into().expect("32-byte slice"));
+                    }
+                    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+                        for ev_bytes in &events_bytes {
+                            let mut out = *ev_bytes;
+                            out[0] |= 0x80; // send_event
+                            let seq_bytes = match order {
+                                yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                    seq.0.to_le_bytes()
+                                }
+                                yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                    seq.0.to_be_bytes()
+                                }
+                            };
+                            out[2] = seq_bytes[0];
+                            out[3] = seq_bytes[1];
+                            buf.extend_from_slice(&out);
+                        }
                     });
                 }
             }
