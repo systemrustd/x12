@@ -688,6 +688,15 @@ pub struct ServerState {
     /// (DeviceStateNotify source data). Missing entry = nothing down,
     /// Relative mode.
     pub xi1_device_input_state: HashMap<u16, Xi1DeviceInputState>,
+    /// XI 1.x per-window do-not-propagate set
+    /// (`XChangeDeviceDontPropagateList`). Each class packs
+    /// `(deviceid << 8) | event_code` like every other XI1 class.
+    /// `XSendExtensionEvent` honours this set during the propagate
+    /// walk — see `xi1_send_extension_event_resolve_targets`
+    /// (process_request.rs). The Xorg analogue is
+    /// `OtherInputMasks.dontPropagateMask[deviceid]`
+    /// (xserver.git Xi/getprop.c, exevents.c:2959).
+    pub xi1_window_dont_propagate: HashMap<ResourceId, HashSet<u32>>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
     /// Frozen key event held by a sync passive key grab, awaiting
@@ -926,6 +935,7 @@ impl ServerState {
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
             xi1_device_input_state: HashMap::new(),
+            xi1_window_dont_propagate: HashMap::new(),
             active_keyboard_grab: None,
             frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),

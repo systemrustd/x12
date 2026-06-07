@@ -8469,6 +8469,73 @@ fn xi1_window_exists(state: &ServerState, xid: u32) -> bool {
     state.resources.window(ResourceId(xid)).is_some()
 }
 
+/// Collect the set of XI1 clients receiving a `SendExtensionEvent`
+/// dispatched to `dest_window`. Implements Xorg
+/// `Xi/exevents.c::SendEvent` (xserver.git:2952-2965) selection +
+/// propagation, with two simplifications from the canonical path:
+///
+///  - per-window per-device do-not-propagate-mask is not yet modelled
+///    (xts5 SendEvent 11/12 leave it empty), so the walk doesn't
+///    trim classes as it ascends;
+///  - `propagate` doesn't honour the `effectiveFocus` stop when
+///    `dest_window` was resolved via `InputFocus` (the per-test
+///    coverage there is XTS purposes 7-10, which all use
+///    propagate=False).
+///
+/// `mask_is_zero` reflects the `CreateMaskFromList` result: empty
+/// when the only class in the list is `noextensioneventclass`
+/// (`_noExtensionEvent = 9`). On a zero mask, delivery falls through
+/// to the window's creator — Xorg's `DeliverToWindowOwner` short-
+/// circuit on `filter == CantBeFiltered`.
+fn xi1_send_extension_event_resolve_targets(
+    state: &ServerState,
+    dest_window: ResourceId,
+    request_classes: &[u32],
+    mask_is_zero: bool,
+    propagate: bool,
+) -> std::collections::HashSet<ClientId> {
+    let mut current = dest_window;
+    // The active class set shrinks as the walk crosses windows whose
+    // do-not-propagate-list bans a class (Xorg
+    // `wOtherInputMasks(pWin)->dontPropagateMask[d->id]`). When the
+    // remaining set is empty, propagation stops without delivery —
+    // xts5 XSendExtensionEvent-8.
+    let mut active: std::collections::HashSet<u32> = request_classes.iter().copied().collect();
+    for _ in 0..256 {
+        let mut targets: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+        if mask_is_zero {
+            if let Some(owner) = state.resources.window_owner(current) {
+                targets.insert(owner);
+            }
+        } else {
+            for (cid, c) in &state.clients {
+                if let Some(set) = c.xi1_window_event_classes.get(&current)
+                    && active.iter().any(|cl| set.contains(cl))
+                {
+                    targets.insert(ClientId(*cid));
+                }
+            }
+        }
+        if !targets.is_empty() || !propagate {
+            return targets;
+        }
+        // No selector at `current` — apply this window's
+        // do-not-propagate list to the active class set before walking
+        // up, then move to the parent.
+        if let Some(blocked) = state.xi1_window_dont_propagate.get(&current) {
+            active.retain(|c| !blocked.contains(c));
+            if active.is_empty() {
+                return std::collections::HashSet::new();
+            }
+        }
+        match state.resources.parent_of(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => return std::collections::HashSet::new(),
+        }
+    }
+    std::collections::HashSet::new()
+}
+
 fn handle_xi2_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -10657,6 +10724,7 @@ fn handle_xi2_request(
                 );
             }
             let count = usize::from(u16::from_le_bytes([body[4], body[5]]));
+            let mut classes: Vec<u32> = Vec::with_capacity(count);
             for i in 0..count {
                 let off = 8 + i * 4;
                 if off + 4 > body.len() {
@@ -10674,13 +10742,42 @@ fn handle_xi2_request(
                         minor,
                     );
                 }
+                classes.push(class);
+            }
+            // mode 0 = AddToList, 1 = DeleteFromList. Xorg
+            // `Xi/chgdprop.c::ChangeDeviceDontPropagateList` applies the
+            // change to `OtherInputMasks.dontPropagateMask[deviceid]`;
+            // the deviceid is encoded in the high byte of each class so
+            // the per-device split is implicit in the class set.
+            let entry = state
+                .xi1_window_dont_propagate
+                .entry(ResourceId(win))
+                .or_default();
+            if mode == 0 {
+                for c in &classes {
+                    entry.insert(*c);
+                }
+            } else {
+                for c in &classes {
+                    entry.remove(c);
+                }
+                if entry.is_empty() {
+                    state.xi1_window_dont_propagate.remove(&ResourceId(win));
+                }
             }
             debug!(
-                "client {} #{} XI1 ChangeDeviceDontPropagateList win=0x{win:x}",
+                "client {} #{} XI1 ChangeDeviceDontPropagateList win=0x{win:x} mode={mode} count={count}",
                 client_id.0, sequence.0
             );
         }
-        // GetDeviceDontPropagateList: { window }.
+        // GetDeviceDontPropagateList: { window }. Reply layout
+        // (XIproto.h:`xGetDeviceDontPropagateListReply`):
+        //   bytes 0..1 = reply opcode (1) + pad
+        //   bytes 2..4 = sequence
+        //   bytes 4..8 = length (32-bit units of trailing class array)
+        //   bytes 8..10 = count (CARD16)
+        //   bytes 10..32 = pad
+        //   trailing `count` × XEventClass (CARD32) at byte 32
         9 => {
             let win = u32::from_le_bytes([
                 *body.first().unwrap_or(&0),
@@ -10698,7 +10795,21 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let classes: Vec<u32> = state
+                .xi1_window_dont_propagate
+                .get(&ResourceId(win))
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default();
+            #[allow(clippy::cast_possible_truncation)]
+            let count = classes.len() as u16;
+            let length_words = u32::try_from(classes.len()).unwrap_or(u32::MAX);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, length_words);
+            x11::write_u16(byte_order, &mut reply, count); // bytes 8..10
+            reply.extend_from_slice(&[0u8; 22]); // pad to 32
+            for c in &classes {
+                x11::write_u32(byte_order, &mut reply, *c);
+            }
+            buf.extend_from_slice(&reply);
         }
         // GetDeviceMotionEvents: { start, stop, deviceid }. Motion
         // history needs valuators (Xorg Xi/getmev.c).
@@ -12209,21 +12320,14 @@ fn handle_xi2_request(
                     || request_classes
                         .iter()
                         .all(|c| (c & 0xff) as u8 == XI1_NO_EXTENSION_EVENT_OFFSET);
-                let mut targets: std::collections::HashSet<ClientId> =
-                    std::collections::HashSet::new();
-                if mask_is_zero {
-                    if let Some(owner) = state.resources.window_owner(dest_window) {
-                        targets.insert(owner);
-                    }
-                } else {
-                    for (cid, c) in &state.clients {
-                        if let Some(set) = c.xi1_window_event_classes.get(&dest_window)
-                            && request_classes.iter().any(|cl| set.contains(cl))
-                        {
-                            targets.insert(ClientId(*cid));
-                        }
-                    }
-                }
+                let propagate = matches!(body.get(5), Some(&p) if p != 0);
+                let targets = xi1_send_extension_event_resolve_targets(
+                    state,
+                    dest_window,
+                    &request_classes,
+                    mask_is_zero,
+                    propagate,
+                );
                 if !targets.is_empty() {
                     // Pre-snapshot all event bytes so the fanout
                     // closure can borrow them per-recipient.
@@ -23437,6 +23541,94 @@ mod tests {
             wire.len(),
             32,
             "InputFocus special resolves to device-focus window, creator gets event"
+        );
+    }
+
+    #[test]
+    fn xi1_send_extension_event_propagate_walks_to_selecting_ancestor() {
+        // xts5 XI/SendExtensionEvent purpose 11: 3-level window
+        // hierarchy, only the top has a selection for `dbpc`, send
+        // to bottom with propagate=True. Walk must reach the top.
+        // Mirrors Xorg SendEvent's `for (; pWin; pWin = pWin->parent)`
+        // loop (xserver.git Xi/exevents.c:2952-2962).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let grandparent_xid = 0x4000_0010u32;
+        let parent_xid = 0x4000_0011u32;
+        let child_xid = 0x4000_0012u32;
+        seed_test_window(&mut state, 2, grandparent_xid);
+        state.resources.create_window(
+            ClientId(2),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(parent_xid),
+                parent: ResourceId(grandparent_xid),
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(2),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(child_xid),
+                parent: ResourceId(parent_xid),
+                x: 0,
+                y: 0,
+                width: 25,
+                height: 25,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // Client 1 selects DeviceButtonPress (offset 3) on the
+        // GRANDPARENT only. Neither parent nor child have any
+        // selectors. With propagate=True, the dispatch must reach
+        // grandparent.
+        let dbpc = (4u32 << 8)
+            | u32::from(
+                crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+            );
+        if let Some(c) = state.clients.get_mut(&1) {
+            c.xi1_window_event_classes
+                .entry(ResourceId(grandparent_xid))
+                .or_default()
+                .insert(dbpc);
+        }
+
+        let mut event = [0u8; 32];
+        event[0] = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET;
+        let body = xi1_send_extension_event_body(child_xid, 4, true, &event, &[dbpc]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi1_send_extension_event_header(1),
+            &body,
+        )
+        .unwrap();
+
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            wire.len(),
+            32,
+            "propagate=True walks ancestors, grandparent selector receives event"
+        );
+        assert_eq!(
+            wire[0],
+            (crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET) | 0x80,
+            "type byte is DeviceButtonPress + send_event"
         );
     }
 
