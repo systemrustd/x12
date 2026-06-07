@@ -598,6 +598,84 @@ impl Default for ScreenSaverState {
     }
 }
 
+/// Core keyboard control state (`ChangeKeyboardControl` /
+/// `GetKeyboardControl` / `Bell`). Defaults mirror Xorg's
+/// `defaultKeyboardControl` (`dix/globals.c:63` + `include/input.h`
+/// `DEFAULT_*`).
+#[derive(Debug, Clone)]
+pub struct KeyboardControlState {
+    /// 0..=100. `DEFAULT_KEYBOARD_CLICK` = 0.
+    pub key_click_percent: u8,
+    /// 0..=100. `DEFAULT_BELL` = 50.
+    pub bell_percent: u8,
+    /// Hz. `DEFAULT_BELL_PITCH` = 400.
+    pub bell_pitch: u16,
+    /// Milliseconds. `DEFAULT_BELL_DURATION` = 100.
+    pub bell_duration: u16,
+    /// Global auto-repeat. `DEFAULT_AUTOREPEAT` = TRUE.
+    pub global_auto_repeat: bool,
+    /// Per-key auto-repeat bitmap (keycode N → byte N>>3, bit N&7).
+    pub auto_repeats: [u8; 32],
+    /// LED bitmask (led N → bit N-1). `DEFAULT_LEDS` = all off.
+    pub led_mask: u32,
+}
+
+/// Xorg `include/input.h` `DEFAULT_AUTOREPEATS`: keycodes 8..=135
+/// repeat, the rest don't.
+pub const DEFAULT_AUTO_REPEATS: [u8; 32] = [
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+impl KeyboardControlState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            key_click_percent: 0,
+            bell_percent: 50,
+            bell_pitch: 400,
+            bell_duration: 100,
+            global_auto_repeat: true,
+            auto_repeats: DEFAULT_AUTO_REPEATS,
+            led_mask: 0,
+        }
+    }
+}
+
+impl Default for KeyboardControlState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Core pointer control state (`ChangePointerControl` /
+/// `GetPointerControl`). Defaults mirror Xorg's
+/// `defaultPointerControl` (`dix/globals.c:74`): accel 2/1,
+/// threshold 4.
+#[derive(Debug, Clone)]
+pub struct PointerControlState {
+    pub accel_numerator: u16,
+    pub accel_denominator: u16,
+    pub threshold: u16,
+}
+
+impl PointerControlState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            accel_numerator: 2,
+            accel_denominator: 1,
+            threshold: 4,
+        }
+    }
+}
+
+impl Default for PointerControlState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-window XComposite redirect record stored in
 /// [`ServerState::composite_redirects`]. The `owner` is the client
 /// that issued the `RedirectWindow` / `RedirectSubwindows` — used
@@ -793,6 +871,10 @@ pub struct ServerState {
     pub dpms: DpmsState,
     /// MIT-SCREEN-SAVER extension state.
     pub screensaver: ScreenSaverState,
+    /// Core keyboard control (ChangeKeyboardControl/GetKeyboardControl).
+    pub keyboard_control: KeyboardControlState,
+    /// Core pointer control (ChangePointerControl/GetPointerControl).
+    pub pointer_control: PointerControlState,
     /// Per-client close-down mode set by `SetCloseDownMode` (opcode 112).
     /// Absent / 0 = Destroy (default); 1 = RetainPermanent; 2 = RetainTemporary.
     /// Only non-zero entries are stored. Read at disconnect time to decide
@@ -984,6 +1066,8 @@ impl ServerState {
             repeat_state: None,
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),
+            keyboard_control: KeyboardControlState::new(),
+            pointer_control: PointerControlState::new(),
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
             scroll_axis_value: [0; 2],

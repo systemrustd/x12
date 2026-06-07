@@ -205,9 +205,9 @@ pub fn process_request(
         36 => log_void(client_id, sequence, "GrabServer"),
         37 => log_void(client_id, sequence, "UngrabServer"),
         96 => log_void(client_id, sequence, "RecolorCursor"),
-        102 => log_void(client_id, sequence, "ChangeKeyboardControl"),
-        104 => log_void(client_id, sequence, "Bell"),
-        105 => log_void(client_id, sequence, "ChangePointerControl"),
+        102 => handle_change_keyboard_control(state, client_id, sequence, header, body),
+        104 => handle_bell(state, client_id, sequence, header),
+        105 => handle_change_pointer_control(state, client_id, sequence, header, body),
         107 => handle_set_screen_saver(state, client_id, sequence, header, body),
         115 => handle_force_screen_saver(state, backend, client_id, sequence, header),
         127 => log_void(client_id, sequence, "NoOperation"),
@@ -15014,51 +15014,356 @@ fn handle_list_installed_colormaps(
     Ok(write_to_client(client, client_id, &buf))
 }
 
-/// GetKeyboardControl (103): 52-byte reply (length=5).
+/// GetKeyboardControl (103): 52-byte reply (length=5). Reflects
+/// `ServerState::keyboard_control` (mirrors Xorg
+/// `ProcGetKeyboardControl`, `dix/devices.c:2257`).
 fn handle_get_keyboard_control(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetKeyboardControl", client_id.0, sequence.0);
+    let kc = state.keyboard_control.clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    // Layout: reply(1) global_auto_repeat=1(1) seq(2) length=5(4)
+    // Layout: reply(1) global_auto_repeat(1) seq(2) length=5(4)
     //         led_mask u32(4) key_click_pct u8(1) bell_pct u8(1)
     //         bell_pitch u16(2) bell_duration u16(2) pad(2)
     //         auto_repeats u8[32]   = 32 + 20 = 52 bytes
-    let mut buf = x11::fixed_reply(byte_order, sequence, 1, 5);
-    buf.resize(20, 0); // led_mask = 0, key_click=0, bell_pct=0, bell_pitch=0,
-    // bell_duration=0, pad=0
-    // auto_repeats: 32 bytes of "all keys auto-repeat" = 0xff bitmap.
-    buf.extend_from_slice(&[0xff; 32]);
+    let mut buf = x11::fixed_reply(byte_order, sequence, u8::from(kc.global_auto_repeat), 5);
+    let mut tmp = Vec::with_capacity(4);
+    x11::write_u32(byte_order, &mut tmp, kc.led_mask);
+    buf.extend_from_slice(&tmp);
+    buf.push(kc.key_click_percent);
+    buf.push(kc.bell_percent);
+    tmp.clear();
+    x11::write_u16(byte_order, &mut tmp, kc.bell_pitch);
+    buf.extend_from_slice(&tmp);
+    tmp.clear();
+    x11::write_u16(byte_order, &mut tmp, kc.bell_duration);
+    buf.extend_from_slice(&tmp);
+    buf.extend_from_slice(&[0, 0]); // pad
+    buf.extend_from_slice(&kc.auto_repeats);
     debug_assert_eq!(buf.len(), 52);
     Ok(write_to_client(client, client_id, &buf))
 }
 
-/// GetPointerControl (106): 32-byte reply.
+/// ChangeKeyboardControl (102): value-mask driven update of
+/// `ServerState::keyboard_control`. Mirrors Xorg
+/// `DoChangeKeyboardControl` (`dix/devices.c:2050`): validate and
+/// stage into a copy, commit only on full success.
+fn handle_change_keyboard_control(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    const KB_KEY_CLICK_PERCENT: u32 = 0x01;
+    const KB_BELL_PERCENT: u32 = 0x02;
+    const KB_BELL_PITCH: u32 = 0x04;
+    const KB_BELL_DURATION: u32 = 0x08;
+    const KB_LED: u32 = 0x10;
+    const KB_LED_MODE: u32 = 0x20;
+    const KB_KEY: u32 = 0x40;
+    const KB_AUTO_REPEAT_MODE: u32 = 0x80;
+    debug!(
+        "client {} #{} ChangeKeyboardControl",
+        client_id.0, sequence.0
+    );
+    if body.len() < 4 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
+    let mask = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    // Xorg BadLength: req_len must be exactly 2 + Ones(vmask) units.
+    if body.len() != 4 + 4 * mask.count_ones() as usize {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
+    let bad_value = |state: &mut ServerState, value: u32| {
+        emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            value,
+            header.opcode,
+        )
+    };
+    let mut ctrl = state.keyboard_control.clone();
+    // Sentinel: "no KBLed/KBKey given" → led-mode / auto-repeat-mode
+    // apply to all leds / the global flag (Xorg DO_ALL).
+    let mut led: Option<u8> = None;
+    let mut key: Option<u8> = None;
+    let mut values = body[4..].chunks_exact(4);
+    let mut bit = 1u32;
+    while bit != 0 {
+        let item = bit & mask;
+        bit <<= 1;
+        if item == 0 {
+            continue;
+        }
+        let Some(raw) = values
+            .next()
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        else {
+            break; // unreachable: length validated above
+        };
+        match item {
+            KB_KEY_CLICK_PERCENT => {
+                let t = raw as i8;
+                if t == -1 {
+                    ctrl.key_click_percent = 0; // DEFAULT_KEYBOARD_CLICK
+                } else if !(0..=100).contains(&t) {
+                    return bad_value(state, i32::from(t) as u32);
+                } else {
+                    ctrl.key_click_percent = t as u8;
+                }
+            }
+            KB_BELL_PERCENT => {
+                let t = raw as i8;
+                if t == -1 {
+                    ctrl.bell_percent = 50; // DEFAULT_BELL
+                } else if !(0..=100).contains(&t) {
+                    return bad_value(state, i32::from(t) as u32);
+                } else {
+                    ctrl.bell_percent = t as u8;
+                }
+            }
+            KB_BELL_PITCH => {
+                let t = raw as i16;
+                if t == -1 {
+                    ctrl.bell_pitch = 400; // DEFAULT_BELL_PITCH
+                } else if t < 0 {
+                    return bad_value(state, i32::from(t) as u32);
+                } else {
+                    ctrl.bell_pitch = t as u16;
+                }
+            }
+            KB_BELL_DURATION => {
+                let t = raw as i16;
+                if t == -1 {
+                    ctrl.bell_duration = 100; // DEFAULT_BELL_DURATION
+                } else if t < 0 {
+                    return bad_value(state, i32::from(t) as u32);
+                } else {
+                    ctrl.bell_duration = t as u16;
+                }
+            }
+            KB_LED => {
+                let l = raw as u8;
+                if !(1..=32).contains(&l) {
+                    return bad_value(state, u32::from(l));
+                }
+                if mask & KB_LED_MODE == 0 {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        0,
+                        header.opcode,
+                    );
+                }
+                led = Some(l);
+            }
+            KB_LED_MODE => {
+                let t = raw as u8;
+                match (t, led) {
+                    (0, None) => ctrl.led_mask = 0,
+                    (0, Some(l)) => ctrl.led_mask &= !(1u32 << (l - 1)),
+                    (1, None) => ctrl.led_mask = !0,
+                    (1, Some(l)) => ctrl.led_mask |= 1u32 << (l - 1),
+                    _ => return bad_value(state, u32::from(t)),
+                }
+            }
+            KB_KEY => {
+                let k = raw as u8;
+                // min_keycode advertised in the setup reply is 8;
+                // max is 255 so no upper check is reachable for a u8.
+                if k < 8 {
+                    return bad_value(state, u32::from(k));
+                }
+                if mask & KB_AUTO_REPEAT_MODE == 0 {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        0,
+                        header.opcode,
+                    );
+                }
+                key = Some(k);
+            }
+            KB_AUTO_REPEAT_MODE => {
+                let t = raw as u8;
+                match (t, key) {
+                    (0, None) => ctrl.global_auto_repeat = false,
+                    (1, None) => ctrl.global_auto_repeat = true,
+                    (2, None) => ctrl.global_auto_repeat = true, // DEFAULT_AUTOREPEAT
+                    (0, Some(k)) => {
+                        ctrl.auto_repeats[usize::from(k >> 3)] &= !(1 << (k & 7));
+                    }
+                    (1, Some(k)) => {
+                        ctrl.auto_repeats[usize::from(k >> 3)] |= 1 << (k & 7);
+                    }
+                    (2, Some(k)) => {
+                        let i = usize::from(k >> 3);
+                        let m = 1 << (k & 7);
+                        ctrl.auto_repeats[i] = (ctrl.auto_repeats[i] & !m)
+                            | (crate::server::DEFAULT_AUTO_REPEATS[i] & m);
+                    }
+                    _ => return bad_value(state, u32::from(t)),
+                }
+            }
+            _ => {
+                // Unknown mask bit: Xorg's default case → BadValue.
+                return bad_value(state, mask);
+            }
+        }
+    }
+    state.keyboard_control = ctrl;
+    Ok(RequestOutcome::Handled)
+}
+
+/// Bell (104): validate percent (header data byte, INT8 −100..=100,
+/// Xorg `ProcBell` `dix/devices.c:2288`). yserver has no audible
+/// bell output; the request succeeds without side effects, like
+/// Xorg on a bell-less device.
+fn handle_bell(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+) -> io::Result<RequestOutcome> {
+    let percent = header.data as i8;
+    debug!(
+        "client {} #{} Bell percent={}",
+        client_id.0, sequence.0, percent
+    );
+    if !(-100..=100).contains(&percent) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            i32::from(percent) as u32,
+            header.opcode,
+        );
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+/// ChangePointerControl (105): update `ServerState::pointer_control`.
+/// Mirrors Xorg `ProcChangePointerControl` (`dix/devices.c:2326`):
+/// stage into a copy, commit only on full success.
+fn handle_change_pointer_control(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    debug!(
+        "client {} #{} ChangePointerControl",
+        client_id.0, sequence.0
+    );
+    // Body: accel_num i16, accel_denom i16, threshold i16,
+    // do_accel u8, do_thresh u8 = 8 bytes.
+    if body.len() < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
+    let accel_num = i16::from_le_bytes([body[0], body[1]]);
+    let accel_denom = i16::from_le_bytes([body[2], body[3]]);
+    let threshold = i16::from_le_bytes([body[4], body[5]]);
+    let do_accel = body[6];
+    let do_thresh = body[7];
+    let bad_value = |state: &mut ServerState, value: u32| {
+        emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            value,
+            header.opcode,
+        )
+    };
+    if do_accel > 1 {
+        return bad_value(state, u32::from(do_accel));
+    }
+    if do_thresh > 1 {
+        return bad_value(state, u32::from(do_thresh));
+    }
+    let mut ctrl = state.pointer_control.clone();
+    if do_accel == 1 {
+        match accel_num {
+            -1 => ctrl.accel_numerator = 2, // DEFAULT_PTR_NUMERATOR
+            n if n < 0 => return bad_value(state, i32::from(n) as u32),
+            n => ctrl.accel_numerator = n as u16,
+        }
+        match accel_denom {
+            -1 => ctrl.accel_denominator = 1, // DEFAULT_PTR_DENOMINATOR
+            n if n <= 0 => return bad_value(state, i32::from(n) as u32),
+            n => ctrl.accel_denominator = n as u16,
+        }
+    }
+    if do_thresh == 1 {
+        match threshold {
+            -1 => ctrl.threshold = 4, // DEFAULT_PTR_THRESHOLD
+            n if n < 0 => return bad_value(state, i32::from(n) as u32),
+            n => ctrl.threshold = n as u16,
+        }
+    }
+    state.pointer_control = ctrl;
+    Ok(RequestOutcome::Handled)
+}
+
+/// GetPointerControl (106): 32-byte reply reflecting
+/// `ServerState::pointer_control` (Xorg `ProcGetPointerControl`,
+/// `dix/devices.c:2405`).
 fn handle_get_pointer_control(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetPointerControl", client_id.0, sequence.0);
+    let pc = state.pointer_control.clone();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    // accel_num=1 accel_denom=1 threshold=4 (sane defaults).
     let mut buf = x11::fixed_reply(byte_order, sequence, 0, 0);
     let mut tmp = Vec::with_capacity(2);
-    x11::write_u16(byte_order, &mut tmp, 1);
+    x11::write_u16(byte_order, &mut tmp, pc.accel_numerator);
     buf.extend_from_slice(&tmp);
     tmp.clear();
-    x11::write_u16(byte_order, &mut tmp, 1);
+    x11::write_u16(byte_order, &mut tmp, pc.accel_denominator);
     buf.extend_from_slice(&tmp);
     tmp.clear();
-    x11::write_u16(byte_order, &mut tmp, 4);
+    x11::write_u16(byte_order, &mut tmp, pc.threshold);
     buf.extend_from_slice(&tmp);
     buf.resize(32, 0);
     Ok(write_to_client(client, client_id, &buf))
@@ -33912,6 +34217,301 @@ mod tests {
             u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             3
         );
+    }
+
+    /// Build a ChangeKeyboardControl body: mask + one u32 per set bit.
+    fn kbctrl_body(mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = mask.to_le_bytes().to_vec();
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    fn kbctrl_header() -> RequestHeader {
+        RequestHeader {
+            opcode: 102,
+            data: 0,
+            length_units: 2,
+        }
+    }
+
+    #[test]
+    fn change_keyboard_control_stores_bell_fields() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        // key-click(0x01)=30, bell-percent(0x02)=80, bell-pitch(0x04)=528,
+        // bell-duration(0x08)=200
+        let body = kbctrl_body(0x0f, &[30, 80, 528, 200]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.key_click_percent, 30);
+        assert_eq!(state.keyboard_control.bell_percent, 80);
+        assert_eq!(state.keyboard_control.bell_pitch, 528);
+        assert_eq!(state.keyboard_control.bell_duration, 200);
+    }
+
+    #[test]
+    fn change_keyboard_control_minus_one_restores_defaults() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state.keyboard_control.bell_percent = 7;
+        state.keyboard_control.bell_pitch = 7;
+        let neg1 = 0xffff_ffffu32;
+        let body = kbctrl_body(0x0f, &[neg1, neg1, neg1, neg1]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.key_click_percent, 0);
+        assert_eq!(state.keyboard_control.bell_percent, 50);
+        assert_eq!(state.keyboard_control.bell_pitch, 400);
+        assert_eq!(state.keyboard_control.bell_duration, 100);
+    }
+
+    #[test]
+    fn change_keyboard_control_led_without_mode_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // led(0x10)=3 without led-mode(0x20) → BadMatch (Xorg
+        // dix/devices.c:2121).
+        let body = kbctrl_body(0x10, &[3]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    }
+
+    #[test]
+    fn change_keyboard_control_key_without_repeat_mode_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // key(0x40)=64 without auto-repeat-mode(0x80) → BadMatch
+        // (Xorg dix/devices.c:2158).
+        let body = kbctrl_body(0x40, &[64]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    }
+
+    #[test]
+    fn change_keyboard_control_led_mask_bits() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        // led-mode On for leds 1, 20, 32 → bits 0, 19, 31.
+        for led in [1u32, 20, 32] {
+            let body = kbctrl_body(0x30, &[led, 1]);
+            let _ = handle_change_keyboard_control(
+                &mut state,
+                ClientId(1),
+                SequenceNumber(1),
+                kbctrl_header(),
+                &body,
+            );
+        }
+        assert_eq!(state.keyboard_control.led_mask, 0x8008_0001);
+        // led-mode Off with no led → all off.
+        let body = kbctrl_body(0x20, &[0]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.led_mask, 0);
+    }
+
+    #[test]
+    fn change_keyboard_control_per_key_and_global_auto_repeat() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        // key=64 auto-repeat-mode=Off → clear bit (64>>3=8, bit 0).
+        let body = kbctrl_body(0xc0, &[64, 0]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.auto_repeats[8] & 0x01, 0);
+        // global auto-repeat Off (no key).
+        let body = kbctrl_body(0x80, &[0]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert!(!state.keyboard_control.global_auto_repeat);
+    }
+
+    #[test]
+    fn change_keyboard_control_bad_value_does_not_commit() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // valid bell-percent(0x02)=80 staged, then key-click... order is
+        // mask-bit order: key-click(0x01)=101 (out of range) errors and
+        // nothing commits.
+        let body = kbctrl_body(0x03, &[101, 80]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            101
+        );
+        assert_eq!(state.keyboard_control.bell_percent, 50, "no partial commit");
+    }
+
+    #[test]
+    fn get_keyboard_control_reflects_state() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.keyboard_control.key_click_percent = 21;
+        state.keyboard_control.bell_percent = 12;
+        state.keyboard_control.bell_pitch = 402;
+        state.keyboard_control.bell_duration = 222;
+        state.keyboard_control.global_auto_repeat = false;
+        state.keyboard_control.led_mask = 0x8008_000f;
+        let _ = handle_get_keyboard_control(&mut state, ClientId(1), SequenceNumber(1));
+        let bytes = read_all_available(&mut peer);
+        // reply(0) global_auto_repeat(1) seq(2-3) len(4-7) led_mask(8-11)
+        // key_click(12) bell_pct(13) bell_pitch(14-15) bell_duration(16-17)
+        assert_eq!(bytes[0], 1);
+        assert_eq!(bytes[1], 0, "global_auto_repeat off");
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0x8008_000f
+        );
+        assert_eq!(bytes[12], 21);
+        assert_eq!(bytes[13], 12);
+        assert_eq!(u16::from_le_bytes([bytes[14], bytes[15]]), 402);
+        assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 222);
+        assert_eq!(&bytes[20..52], &crate::server::DEFAULT_AUTO_REPEATS);
+    }
+
+    #[test]
+    fn bell_out_of_range_percent_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let header = RequestHeader {
+            opcode: 104,
+            data: 101u8, // percent=101 (and -101 = 155u8 also invalid)
+            length_units: 1,
+        };
+        let _ = handle_bell(&mut state, ClientId(1), SequenceNumber(1), header);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn change_pointer_control_stores_and_restores() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let header = RequestHeader {
+            opcode: 105,
+            data: 0,
+            length_units: 3,
+        };
+        // accel 12/11, threshold 43, do_accel=1 do_thresh=1
+        let body = [12, 0, 11, 0, 43, 0, 1, 1];
+        let _ = handle_change_pointer_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        assert_eq!(state.pointer_control.accel_numerator, 12);
+        assert_eq!(state.pointer_control.accel_denominator, 11);
+        assert_eq!(state.pointer_control.threshold, 43);
+        // -1 everywhere restores defaults 2/1, threshold 4.
+        let body = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1];
+        let _ = handle_change_pointer_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        assert_eq!(state.pointer_control.accel_numerator, 2);
+        assert_eq!(state.pointer_control.accel_denominator, 1);
+        assert_eq!(state.pointer_control.threshold, 4);
+    }
+
+    #[test]
+    fn change_pointer_control_zero_denominator_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let header = RequestHeader {
+            opcode: 105,
+            data: 0,
+            length_units: 3,
+        };
+        // denominator 0 → BadValue (Xorg dix/devices.c:2362 `<= 0`).
+        let body = [2, 0, 0, 0, 4, 0, 1, 0];
+        let _ = handle_change_pointer_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(
+            state.pointer_control.accel_numerator, 2,
+            "no partial commit"
+        );
+    }
+
+    #[test]
+    fn get_pointer_control_reflects_state() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.pointer_control.accel_numerator = 34;
+        state.pointer_control.accel_denominator = 35;
+        state.pointer_control.threshold = 36;
+        let _ = handle_get_pointer_control(&mut state, ClientId(1), SequenceNumber(1));
+        let bytes = read_all_available(&mut peer);
+        // reply(0) pad(1) seq(2-3) len(4-7) accel_num(8-9) accel_den(10-11)
+        // threshold(12-13)
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 34);
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 35);
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 36);
     }
 
     #[test]

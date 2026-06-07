@@ -305,7 +305,7 @@ pub fn xi_exact_required_length(minor: u8, body: &[u8]) -> Option<u32> {
         //   count(u16) num_events(u8) pad×3 events(32 × num_events)
         //   classes(u32 × count).
         31 if body.len() >= 9 => {
-            let class_count = u32::from(read_u16_le(&body[6..8]));
+            let class_count = read_u16_le(&body[6..8]);
             let num_events = u32::from(body[8]);
             Some(4 + 8 * num_events + class_count)
         }

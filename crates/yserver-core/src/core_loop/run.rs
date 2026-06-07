@@ -1061,6 +1061,14 @@ pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev:
     backend.on_host_input(state, ev);
 }
 
+/// Whether a keycode currently auto-repeats per core
+/// ChangeKeyboardControl state: the global flag gates everything,
+/// then the per-key bitmap decides (Xorg `kbdfeed->ctrl.autoRepeat`
+/// + `autoRepeats[]`).
+fn key_auto_repeats(kc: &crate::server::KeyboardControlState, keycode: u8) -> bool {
+    kc.global_auto_repeat && kc.auto_repeats[usize::from(keycode >> 3)] & (1 << (keycode & 7)) != 0
+}
+
 /// Arm / refresh / clear `state.repeat_state` from an incoming host
 /// input event. X11 spec: only the most recently pressed key
 /// repeats — pressing a different key replaces the armed key;
@@ -1078,6 +1086,14 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
             .is_some_and(|r| r.event.keycode == key.keycode && r.event.pressed);
         if synthetic {
             // This is a repeat we just fired; don't reset the timer.
+            return;
+        }
+        // ChangeKeyboardControl gate: global auto-repeat off disables
+        // all repeat; otherwise the per-key bitmap decides. A
+        // non-repeating press still replaces (disarms) the armed key —
+        // only the most recently pressed key may repeat.
+        if !key_auto_repeats(&state.keyboard_control, key.keycode) {
+            state.repeat_state = None;
             return;
         }
         state.repeat_state = Some(KeyRepeatState {
@@ -1104,6 +1120,12 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) {
     let Some(armed) = state.repeat_state else {
         return;
     };
+    // Repeat may have been disabled (ChangeKeyboardControl) after the
+    // key was armed — disarm instead of firing.
+    if !key_auto_repeats(&state.keyboard_control, armed.event.keycode) {
+        state.repeat_state = None;
+        return;
+    }
     let now = Instant::now();
     if now < armed.next_fire {
         return;

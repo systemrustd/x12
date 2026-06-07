@@ -171,10 +171,8 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // Recycled below only for `!retain` clients — see IdAllocator::release.
     let released_base = state.clients.get(&client_id.0).map(|c| c.resource_id_base);
     state.clients.remove(&client_id.0);
-    if !retain {
-        if let Some(base) = released_base {
-            state.id_allocator.release(base);
-        }
+    if !retain && let Some(base) = released_base {
+        state.id_allocator.release(base);
     }
 
     let dead_windows: std::collections::HashSet<ResourceId> =
