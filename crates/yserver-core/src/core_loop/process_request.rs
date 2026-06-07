@@ -11390,6 +11390,31 @@ fn handle_xi2_request(
                 );
             }
             let button = body[12];
+            // Validate the trailing XEventClass array (Xorg
+            // `Xi/grabdevb.c::ProcXGrabDeviceButton` →
+            // `CreateMaskFromList` → `BadClass`). Each class's high
+            // byte names a device id; any unknown deviceid is
+            // BadClass, including the `0xFFFFFFFF` sentinel xts5
+            // GrabDeviceButton-21 builds. event_count lives at
+            // body[6..8] per `xGrabDeviceButtonReq`.
+            let event_count = usize::from(u16::from_le_bytes([body[6], body[7]]));
+            for i in 0..event_count {
+                let off = 16 + i * 4;
+                let Some(slice) = body.get(off..off + 4) else {
+                    break;
+                };
+                let class = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                if !xi1_device_valid(xi1_event_class_device(class)) {
+                    return xi1_error(
+                        state,
+                        client_id,
+                        sequence,
+                        XI1_ERROR_BAD_CLASS,
+                        class,
+                        minor,
+                    );
+                }
+            }
             if state.xi1_passive_grabs.iter().any(|g| {
                 !g.is_key
                     && g.owner != client_id
@@ -12670,7 +12695,24 @@ fn handle_xi2_request(
                     }
                 }
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // Xorg `Xi/chgdctl.c::ProcXChangeDeviceControl` returns
+            // `AlreadyGrabbed` (status byte 8) when another client
+            // holds an active grab on the device — xts5
+            // ChangeDeviceControl-10.
+            const ALREADY_GRABBED: u8 = 1;
+            let grabbed_elsewhere = state
+                .xi1_active_grabs
+                .get(&dev)
+                .is_some_and(|g| g.owner != client_id);
+            let status = if grabbed_elsewhere {
+                ALREADY_GRABBED
+            } else {
+                0
+            };
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            reply.push(status);
+            reply.extend_from_slice(&[0u8; 23]);
+            buf.extend_from_slice(&reply);
         }
         _ => {
             debug!(
