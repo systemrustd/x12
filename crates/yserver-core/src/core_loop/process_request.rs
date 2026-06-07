@@ -12617,7 +12617,17 @@ fn handle_xi2_request(
         }
         // GetDeviceControl: { control, deviceid }. DEVICE_RESOLUTION(1)
         // is the only control defined for XI 1.x core; it needs
-        // valuators.
+        // valuators. Reply layout (`xGetDeviceControlReply` +
+        // `xDeviceResolutionState`, XIproto.h):
+        //   bytes 0..32  standard reply header (length in 32-bit
+        //                units of the trailing buf)
+        //   bytes 32..40 xDeviceResolutionState header:
+        //                control(2)=1, length(2)=trailing-bytes,
+        //                num_valuators(4)
+        //   bytes 40..   3 × num_valuators × CARD32 — resolutions,
+        //                min_resolutions, max_resolutions.
+        // xts5 ChangeDeviceControl-1/-2 set + read back via
+        // GetDeviceControl; without a real reply the test SEGFAULTs.
         34 => {
             let control =
                 u16::from_le_bytes([*body.first().unwrap_or(&0), *body.get(1).unwrap_or(&0)]);
@@ -12645,7 +12655,39 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let num_axes = usize::from(XI1_POINTER_AXES);
+            let stored = state.xi1_resolution.get(&dev).cloned();
+            let resolutions: Vec<[i32; 3]> = (0..num_axes)
+                .map(|i| {
+                    stored
+                        .as_ref()
+                        .and_then(|v| v.get(i).copied())
+                        .unwrap_or([0, 0, 0])
+                })
+                .collect();
+            // 8 bytes xDeviceResolutionState header + 3 × num_axes × 4
+            let trailing_bytes = 8 + 3 * num_axes * 4;
+            let length_units = u32::try_from(trailing_bytes / 4).unwrap_or(u32::MAX);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, length_units);
+            // Pad bytes 8..32 of the standard reply header.
+            reply.extend_from_slice(&[0u8; 24]);
+            // xDeviceResolutionState header
+            x11::write_u16(byte_order, &mut reply, 1); // control = DEVICE_RESOLUTION
+            #[allow(clippy::cast_possible_truncation)]
+            let ctl_len = trailing_bytes as u16;
+            x11::write_u16(byte_order, &mut reply, ctl_len);
+            x11::write_u32(byte_order, &mut reply, u32::try_from(num_axes).unwrap_or(0));
+            // Three runs over axes: resolution, min_resolution, max_resolution.
+            for r in &resolutions {
+                x11::write_u32(byte_order, &mut reply, r[0].cast_unsigned());
+            }
+            for r in &resolutions {
+                x11::write_u32(byte_order, &mut reply, r[1].cast_unsigned());
+            }
+            for r in &resolutions {
+                x11::write_u32(byte_order, &mut reply, r[2].cast_unsigned());
+            }
+            buf.extend_from_slice(&reply);
         }
         // ChangeDeviceControl: { control, deviceid } + xDeviceCtl
         // { control, length, first_valuator, num_valuators, pad2,

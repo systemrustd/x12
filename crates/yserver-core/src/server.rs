@@ -710,6 +710,12 @@ pub struct ServerState {
     /// inherit from the backend keymap. Xorg
     /// `Xi/setmmap.c::ProcXSetDeviceModifierMapping`.
     pub xi1_modifier_map: HashMap<u16, (u8, Vec<u8>)>,
+    /// XI 1.x per-device per-axis DEVICE_RESOLUTION control values.
+    /// Each row is `[resolution, min_resolution, max_resolution]`
+    /// for a single valuator (Xorg `dev->valuator->axes[i]`). Missing
+    /// or short entries default to zero — xts5 ChangeDeviceControl
+    /// 1 / 2 walk the resolution back through `XGetDeviceControl`.
+    pub xi1_resolution: HashMap<u16, Vec<[i32; 3]>>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
     /// Frozen key event held by a sync passive key grab, awaiting
@@ -951,6 +957,7 @@ impl ServerState {
             xi1_window_dont_propagate: HashMap::new(),
             xi1_button_map: HashMap::new(),
             xi1_modifier_map: HashMap::new(),
+            xi1_resolution: HashMap::new(),
             active_keyboard_grab: None,
             frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
