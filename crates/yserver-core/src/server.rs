@@ -179,6 +179,9 @@ pub struct PassiveButtonGrab {
     pub owner_events: bool,
     pub event_mask: u32,
     pub pointer_mode: u8,
+    /// 0 = GrabModeSync: the grab activation also freezes the
+    /// KEYBOARD on the grab's behalf (Xorg CheckGrabForSyncs).
+    pub keyboard_mode: u8,
     /// True when the grab was established through the XI2 protocol
     /// (XIPassiveGrabDevice) rather than core GrabButton. Grab
     /// redirection delivers to the owner in the protocol the grab
@@ -3432,6 +3435,7 @@ mod tests {
                 owner_events: true,
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
+                keyboard_mode: 1,
                 via_xi2: true,
             });
         }
@@ -3578,6 +3582,7 @@ mod tests {
                 owner_events: true,
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
+                keyboard_mode: 1,
                 via_xi2: true,
             });
         }

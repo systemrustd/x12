@@ -9927,6 +9927,7 @@ fn handle_xi2_request(
                             owner_events,
                             event_mask: 0xFFFF_FFFF,
                             pointer_mode: grab_mode,
+                            keyboard_mode: 1,
                             via_xi2: true,
                         });
                     }
@@ -21522,6 +21523,7 @@ fn handle_grab_button(
             owner_events,
             event_mask,
             pointer_mode,
+            keyboard_mode,
             via_xi2: false,
         });
         debug!(
@@ -29763,6 +29765,7 @@ mod tests {
             owner_events: false,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
+            keyboard_mode: 1,
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
@@ -29880,6 +29883,7 @@ mod tests {
             owner_events: true,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0, // Synchronous → triggers freeze
+            keyboard_mode: 1,
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
@@ -30023,6 +30027,7 @@ mod tests {
             owner_events: true,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
+            keyboard_mode: 1,
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)

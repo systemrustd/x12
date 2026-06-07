@@ -130,10 +130,19 @@ pub fn pointer_event_fanout_to_state(
     // Crossings (Enter/Leave) and the replay path itself bypass —
     // crossings are pointer-tracking notifications Xorg doesn't
     // queue, and the replay re-entry mustn't recursively re-queue.
+    // The device is frozen either by a sync passive grab holding the
+    // activating press, or by the unified per-device sync state (an
+    // explicit GrabPointer(GrabModeSync), an AllowEvents(SyncPointer)
+    // re-arm, or a hold on behalf of the other device's grab — Xorg
+    // ComputeFreezes switches the whole device to the enqueue proc).
+    let pointer_frozen_unified = state
+        .xi1_frozen
+        .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+        .is_some_and(crate::server::Xi1Freeze::frozen);
     if !is_replay
         && handle_grabs
-        && state.pointer_grab_is_passive
-        && state.frozen_pointer_event.is_some()
+        && (pointer_frozen_unified
+            || (state.pointer_grab_is_passive && state.frozen_pointer_event.is_some()))
         && !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify,
@@ -366,6 +375,18 @@ pub fn pointer_event_fanout_to_state(
         if delivered && grab.pointer_mode == 0 {
             state.frozen_pointer_event = Some(event);
         }
+        // Xorg ActivatePointerGrab → CheckGrabForSyncs: a sync
+        // pointer_mode freezes the pointer's device stream; a sync
+        // keyboard_mode holds the KEYBOARD on this grab's behalf
+        // (XGrabButton-18/19/20 freeze the keyboard via a button
+        // grab and thaw it with AllowEvents).
+        xi1_check_grab_for_syncs(
+            state,
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            grab.owner,
+            grab.pointer_mode == 0,
+            grab.keyboard_mode == 0,
+        );
         // During a grab, core pointer events never reach other
         // clients — both branches above are the only deliveries.
         handled_core_via_grab = true;
@@ -1136,6 +1157,23 @@ pub(crate) fn xi1_compute_freezes(state: &mut ServerState) {
             let _ = xi1_route_device_event(state, q, true);
         }
     }
+    // Core pointer events withheld under the unified freeze: when the
+    // pointer thaws outside the AllowEvents pointer-release path
+    // (which drains the queue itself before thawing), drop the stale
+    // backlog — holding them until the next freeze would replay
+    // ancient events.
+    let ptr_frozen = state
+        .xi1_frozen
+        .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+        .is_some_and(crate::server::Xi1Freeze::frozen);
+    if !ptr_frozen && state.frozen_pointer_event.is_none() && !state.frozen_pointer_queue.is_empty()
+    {
+        log::debug!(
+            "xi1_compute_freezes: dropping {} stale withheld core pointer events",
+            state.frozen_pointer_queue.len()
+        );
+        state.frozen_pointer_queue.clear();
+    }
 }
 
 /// Port of Xorg `CheckGrabForSyncs` (dix/events.c:1424-1450): set the
@@ -1442,9 +1480,16 @@ fn grabbed_natural_target(
 
 fn release_passive_grab_on_button_release(state: &mut ServerState, kind: PointerEventKind) {
     if kind == PointerEventKind::ButtonRelease && state.pointer_grab_is_passive {
+        let owner = state.pointer_grab.map(|(c, _)| c);
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
+        // Xorg DeactivatePointerGrab: releasing the grab also releases
+        // the sync holds it placed (a sync keyboard_mode froze the
+        // keyboard on this grab's behalf — XGrabButton-19).
+        if let Some(owner) = owner {
+            xi1_core_grab_bridge_release(state, crate::xinput::DEVICEID_SLAVE_POINTER, owner);
+        }
     }
 }
 
@@ -1883,6 +1928,7 @@ mod tests {
             owner_events: true,
             event_mask: 0x0000_0004, // ButtonPressMask
             pointer_mode: 0,         // GrabModeSync
+            keyboard_mode: 1,
             via_xi2: false,
         });
 
