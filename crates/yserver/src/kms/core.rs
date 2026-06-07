@@ -482,7 +482,35 @@ impl FontLoader {
             // X11 font dirs.
             let _ = face.select_size(0);
         }
-        let (metrics, char_cache) = compute_font_metrics(&face);
+        let pcf = pcf_file_info(path);
+        // Ink metrics iff the PCF carries the table; BDF files always
+        // (Xorg's bdf reader computes ink unconditionally); scalable
+        // faces use cell metrics (old behavior).
+        let use_ink = match &pcf {
+            Some(info) => info.has_ink_metrics,
+            None => !face.is_scalable(),
+        };
+        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
+        // PCF authoritative overrides — Xorg's QueryFont serves
+        // these from the file's tables, not from re-derivation:
+        // default_char (encodings header), min/max_bounds + font
+        // ascent/descent (accelerators, ink variants when present).
+        if let Some(pcf) = pcf {
+            if let Some(default_char) = pcf.default_char {
+                metrics.default_char = default_char;
+            }
+            // min/max_bounds intentionally NOT taken from the accel
+            // table: R6+ servers fold them from per-char metrics,
+            // excluding all-zero entries (xtfont3/4's #if
+            // XT_X_RELEASE==6 expectations) — compute_font_metrics
+            // does exactly that.
+            if let Some(a) = pcf.font_ascent {
+                metrics.font_ascent = a;
+            }
+            if let Some(d) = pcf.font_descent {
+                metrics.font_descent = d;
+            }
+        }
         Ok((face, metrics, char_cache))
     }
 
@@ -534,32 +562,208 @@ impl FontLoader {
         } else {
             let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
         }
-        let (metrics, char_cache) = compute_font_metrics(&face);
+        let (metrics, char_cache) = compute_font_metrics(&face, false);
         Ok((face, metrics, char_cache))
     }
 }
 
-fn compute_char_info(face: &freetype::Face, ch: char) -> ProtocolCharInfo {
+/// Per-char QueryFont metrics. Mirrors Xorg's table choice:
+/// - `use_ink` (PCF with an INK_METRICS table, or BDF — Xorg's bdf
+///   reader always computes ink): CharInfo = the inked bounding box
+///   scanned off the monochrome bitmap (equals bdftopcf's ink
+///   computation). Blank-but-existing glyphs (xtfont1 char 0) keep
+///   their advance width with zero ink extents.
+/// - otherwise (PCF without ink table, scalable faces): CharInfo =
+///   the glyph cell (METRICS table / BBX shape — xtfont0's all-zero
+///   10×10 C002 still reports rb 10, asc 10).
+fn compute_char_info(face: &freetype::Face, ch: char, use_ink: bool) -> ProtocolCharInfo {
     let glyph_idx = ch as usize;
-    let _ = face.load_char(glyph_idx, freetype::face::LoadFlag::RENDER);
+    let flags = if use_ink {
+        freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_MONO
+    } else {
+        freetype::face::LoadFlag::RENDER
+    };
+    let _ = face.load_char(glyph_idx, flags);
     let glyph = face.glyph();
     let bitmap = glyph.bitmap();
     let metrics = glyph.metrics();
-
     let width = (metrics.horiAdvance >> 6) as i16;
-    let left_side_bearing = (metrics.horiBearingX >> 6) as i16;
-    let right_side_bearing = left_side_bearing + bitmap.width() as i16;
-    let ascent = (metrics.horiBearingY >> 6) as i16;
-    let descent = (bitmap.rows() as i16) - ascent;
 
+    if !use_ink {
+        let left_side_bearing = (metrics.horiBearingX >> 6) as i16;
+        let right_side_bearing = left_side_bearing + bitmap.width() as i16;
+        let ascent = (metrics.horiBearingY >> 6) as i16;
+        let descent = (bitmap.rows() as i16) - ascent;
+        return ProtocolCharInfo {
+            left_side_bearing,
+            right_side_bearing,
+            character_width: width,
+            ascent,
+            descent,
+            attributes: 0,
+        };
+    }
+
+    let w = bitmap.width() as usize;
+    let h = bitmap.rows() as usize;
+    let pitch = bitmap.pitch();
+    let buf = bitmap.buffer();
+    let mono = matches!(bitmap.pixel_mode(), Ok(freetype::bitmap::PixelMode::Mono));
+    let set_at = |row: usize, col: usize| -> bool {
+        let row_start = if pitch >= 0 {
+            row * pitch as usize
+        } else {
+            (h - 1 - row) * (pitch as isize).unsigned_abs()
+        };
+        if mono {
+            buf.get(row_start + (col >> 3)).copied().unwrap_or(0) & (0x80 >> (col & 7)) != 0
+        } else {
+            buf.get(row_start + col).copied().unwrap_or(0) >= 128
+        }
+    };
+    // Ink bounding box in bitmap-local coords: (r0, r1, c0, c1).
+    let mut ink: Option<(usize, usize, usize, usize)> = None;
+    for row in 0..h {
+        for col in 0..w {
+            if set_at(row, col) {
+                ink = Some(match ink {
+                    None => (row, row, col, col),
+                    Some((r0, r1, c0, c1)) => (r0.min(row), r1.max(row), c0.min(col), c1.max(col)),
+                });
+            }
+        }
+    }
+    let Some((r0, r1, c0, c1)) = ink else {
+        // No ink: advance only (X11 "exists" iff any field nonzero,
+        // so a blank space-like glyph still exists via its width).
+        return ProtocolCharInfo {
+            left_side_bearing: 0,
+            right_side_bearing: 0,
+            character_width: width,
+            ascent: 0,
+            descent: 0,
+            attributes: 0,
+        };
+    };
+    let origin_x = glyph.bitmap_left() as i16; // bearing of bitmap col 0
+    let top = glyph.bitmap_top() as i16; // rows above baseline of row 0
     ProtocolCharInfo {
-        left_side_bearing,
-        right_side_bearing,
+        left_side_bearing: origin_x + c0 as i16,
+        right_side_bearing: origin_x + c1 as i16 + 1,
         character_width: width,
-        ascent,
-        descent,
+        ascent: top - r0 as i16,
+        descent: (r1 as i16 + 1) - top,
         attributes: 0,
     }
+}
+
+/// PCF file facts FreeType doesn't expose.
+struct PcfFileInfo {
+    /// BDF_ENCODINGS header default_char — bdftopcf moves
+    /// DEFAULT_CHAR out of the property table.
+    default_char: Option<u16>,
+    /// Whether the file carries an INK_METRICS table (Xorg serves
+    /// per-char ink metrics iff present; cell metrics otherwise).
+    has_ink_metrics: bool,
+    /// Accelerator-table font bounds. Xorg's QueryFont reply takes
+    /// min/max_bounds from here (the INK variants when the
+    /// accelerator format carries them), not from re-derivation.
+    min_bounds: Option<ProtocolCharInfo>,
+    max_bounds: Option<ProtocolCharInfo>,
+    font_ascent: Option<i16>,
+    font_descent: Option<i16>,
+}
+
+/// Parse the PCF table directory for [`PcfFileInfo`]. Returns None
+/// for non-PCF/compressed/odd files.
+fn pcf_file_info(path: &std::path::Path) -> Option<PcfFileInfo> {
+    const PCF_ACCELERATORS: u32 = 1 << 1;
+    const PCF_INK_METRICS: u32 = 1 << 4;
+    const PCF_BDF_ENCODINGS: u32 = 1 << 5;
+    const PCF_BDF_ACCELERATORS: u32 = 1 << 8;
+    const PCF_ACCEL_W_INKBOUNDS: u32 = 0x0000_0100;
+    let data = std::fs::read(path).ok()?;
+    if data.get(0..4)? != b"\x01fcp" {
+        return None;
+    }
+    let count = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?);
+    let mut info = PcfFileInfo {
+        default_char: None,
+        has_ink_metrics: false,
+        min_bounds: None,
+        max_bounds: None,
+        font_ascent: None,
+        font_descent: None,
+    };
+    let read_i16 = |off: usize, big: bool| -> Option<i16> {
+        let raw: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
+        Some(if big {
+            i16::from_be_bytes(raw)
+        } else {
+            i16::from_le_bytes(raw)
+        })
+    };
+    let read_i32 = |off: usize, big: bool| -> Option<i32> {
+        let raw: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+        Some(if big {
+            i32::from_be_bytes(raw)
+        } else {
+            i32::from_le_bytes(raw)
+        })
+    };
+    // Uncompressed metrics entry: lsb, rsb, width, ascent, descent
+    // (i16 each) + attributes (u16) = 12 bytes.
+    let read_metrics = |off: usize, big: bool| -> Option<ProtocolCharInfo> {
+        Some(ProtocolCharInfo {
+            left_side_bearing: read_i16(off, big)?,
+            right_side_bearing: read_i16(off + 2, big)?,
+            character_width: read_i16(off + 4, big)?,
+            ascent: read_i16(off + 6, big)?,
+            descent: read_i16(off + 8, big)?,
+            attributes: 0,
+        })
+    };
+    let mut accel_off: Option<usize> = None;
+    let mut bdf_accel_off: Option<usize> = None;
+    for i in 0..count as usize {
+        let base = 8 + 16 * i;
+        let ttype = u32::from_le_bytes(data.get(base..base + 4)?.try_into().ok()?);
+        let off = u32::from_le_bytes(data.get(base + 12..base + 16)?.try_into().ok()?) as usize;
+        match ttype {
+            PCF_INK_METRICS => info.has_ink_metrics = true,
+            PCF_ACCELERATORS => accel_off = Some(off),
+            PCF_BDF_ACCELERATORS => bdf_accel_off = Some(off),
+            PCF_BDF_ENCODINGS => {
+                let fmt = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
+                let big = fmt & (1 << 2) != 0; // PCF_BYTE_MASK → MSB first
+                // Encodings header: min/max byte2, min/max byte1,
+                // default_char — five i16s after the format word.
+                info.default_char = read_i16(off + 12, big).and_then(|v| u16::try_from(v).ok());
+            }
+            _ => {}
+        }
+    }
+    // BDF_ACCELERATORS (post-encoding recompute) wins over the
+    // plain table, matching Xorg's pcfReadFont preference.
+    if let Some(off) = bdf_accel_off.or(accel_off) {
+        let fmt = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
+        let big = fmt & (1 << 2) != 0;
+        // Layout after format: 8 flag/pad bytes, fontAscent i32,
+        // fontDescent i32, maxOverlap i32, minbounds (12),
+        // maxbounds (12), then ink variants when the accel format
+        // has PCF_ACCEL_W_INKBOUNDS.
+        info.font_ascent = read_i32(off + 12, big).and_then(|v| i16::try_from(v).ok());
+        info.font_descent = read_i32(off + 16, big).and_then(|v| i16::try_from(v).ok());
+        let bounds_off = off + 24;
+        let (min_off, max_off) = if fmt & PCF_ACCEL_W_INKBOUNDS != 0 {
+            (bounds_off + 24, bounds_off + 36)
+        } else {
+            (bounds_off, bounds_off + 12)
+        };
+        info.min_bounds = read_metrics(min_off, big);
+        info.max_bounds = read_metrics(max_off, big);
+    }
+    Some(info)
 }
 
 /// FFI for FreeType's BDF/PCF property accessor — freetype-sys
@@ -689,7 +893,10 @@ fn read_bdf_properties(face: &freetype::Face) -> Vec<(String, FontPropValue)> {
 /// 2-byte xtfonts have NO row 0 at all). Scalable faces stay capped
 /// at the single-byte range — fontconfig-backed unicode faces would
 /// otherwise produce 64K-entry CharInfo grids on every QueryFont.
-fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
+fn compute_font_metrics(
+    face: &freetype::Face,
+    use_ink: bool,
+) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
     let cap: u32 = if face.is_scalable() { 0xFF } else { 0xFFFF };
     let mut present: Vec<u32> = face
         .chars()
@@ -752,7 +959,16 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
                 continue;
             }
             let ch = ch.expect("checked above");
-            let ci = compute_char_info(face, ch);
+            let ci = compute_char_info(face, ch, use_ink);
+            // Encoded-but-all-zero glyphs (xtfont3's DWIDTH-0 chars)
+            // still EXIST (all_chars_exist unaffected — Xorg counts
+            // encoding presence) but are excluded from the bounds
+            // fold (R6 FontComputeInfoAccelerators semantics).
+            if ci == ProtocolCharInfo::default() {
+                char_infos.push(ci);
+                char_info_cache.insert(ch, ci);
+                continue;
+            }
             min_bounds.left_side_bearing = min_bounds.left_side_bearing.min(ci.left_side_bearing);
             max_bounds.left_side_bearing = max_bounds.left_side_bearing.max(ci.left_side_bearing);
             min_bounds.right_side_bearing =
@@ -787,8 +1003,20 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
             })?
         })
     };
-    let font_ascent = prop_i16("FONT_ASCENT").unwrap_or(max_bounds.ascent);
-    let font_descent = prop_i16("FONT_DESCENT").unwrap_or(max_bounds.descent);
+    // FONT_ASCENT/FONT_DESCENT properties first; bitmap faces then
+    // fall back to the PCF accelerator values FreeType surfaces as
+    // size metrics (bdftopcf moves these OUT of the property table);
+    // last resort = glyph-bound extremes. Scalable faces keep the
+    // bounds-derived values (FT face ascender is typically larger
+    // than the ASCII ink extremes — don't shift xterm row heights).
+    let bitmap_face = !face.is_scalable();
+    let sm = face.size_metrics().filter(|_| bitmap_face);
+    let font_ascent = prop_i16("FONT_ASCENT")
+        .or_else(|| sm.map(|m| (m.ascender >> 6) as i16))
+        .unwrap_or(max_bounds.ascent);
+    let font_descent = prop_i16("FONT_DESCENT")
+        .or_else(|| sm.map(|m| (-m.descender >> 6) as i16))
+        .unwrap_or(max_bounds.descent);
     let default_char = named_properties
         .iter()
         .find_map(|(n, v)| {
@@ -799,7 +1027,12 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
             })?
         })
         .unwrap_or_else(|| {
-            if present_set.contains(&0x20) {
+            if bitmap_face {
+                // PCF: default_char lives in the encodings table —
+                // open_font_file overrides from the file; 0 = "no
+                // default" (Xorg's initial value).
+                0
+            } else if present_set.contains(&0x20) {
                 0x20
             } else {
                 u16::try_from(min_code).unwrap_or(0)
@@ -1696,7 +1929,7 @@ mod pcf_tests {
     /// when present; skips silently otherwise.
     #[test]
     fn open_real_pcf_has_charmap_coverage() {
-        let path = std::path::Path::new("/home/jos/Projects/xts/build-fresh/xts5/fonts");
+        let path = std::path::Path::new("/home/jos/Projects/xts/xts5/fonts");
         if !path.join("fonts.dir").is_file() {
             eprintln!("skipping: xts build-fresh fonts not present");
             return;
@@ -1706,16 +1939,58 @@ mod pcf_tests {
             .set_font_path(&[path.to_string_lossy().into_owned()])
             .unwrap();
         let (_face, metrics, cache) = loader.open_font("xtfont0").unwrap();
-        // xtfont0.bdf: chars at encodings 1..=3, DEFAULT_CHAR 0,
-        // FONT_ASCENT 20, FONT_DESCENT 3.
+        // Ground truth = the compiled-in XTS expectation
+        // (xts5/fonts/xtfont0.c): encodings 1..=68 (sparse),
+        // default_char 0 (PCF encodings table), FONT_ASCENT 20 /
+        // FONT_DESCENT 3 (PCF accelerators via FT size metrics —
+        // bdftopcf strips both from the property table), and CELL
+        // per-char metrics (no INK_METRICS table in this file).
         assert_eq!(metrics.min_char_or_byte2, 1, "PCF charmap coverage");
-        assert_eq!(metrics.max_char_or_byte2, 3);
+        assert_eq!(metrics.max_char_or_byte2, 68);
         assert_eq!(metrics.font_ascent, 20);
         assert_eq!(metrics.font_descent, 3);
         assert_eq!(metrics.default_char, 0);
+        assert!(!metrics.all_chars_exist, "encodings are sparse");
         assert!(!cache.is_empty(), "glyphs must load through the charmap");
         let c1 = cache.get(&char::from_u32(1).unwrap()).expect("char 1");
         assert_eq!(c1.character_width, 10, "10x10 block glyph");
+        // C002: all-blank bitmap, BBX 10x10, advance 2 — cell
+        // metrics (rb 10, asc 10), NOT zero ink.
+        let c2 = cache.get(&char::from_u32(2).unwrap()).expect("char 2");
+        assert_eq!(
+            (c2.right_side_bearing, c2.character_width, c2.ascent),
+            (10, 2, 10)
+        );
+    }
+
+    /// xtfont1 HAS an INK_METRICS table → per-char CharInfo must be
+    /// the ink extents (blank char 0 = zero ink + advance 7).
+    #[test]
+    fn open_real_pcf_serves_ink_metrics_when_table_present() {
+        let path = std::path::Path::new("/home/jos/Projects/xts/xts5/fonts");
+        if !path.join("fonts.dir").is_file() {
+            eprintln!("skipping: xts fonts not present");
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[path.to_string_lossy().into_owned()])
+            .unwrap();
+        let (_face, metrics, cache) = loader.open_font("xtfont1").unwrap();
+        assert_eq!(metrics.default_char, 0);
+        assert_eq!(metrics.font_ascent, 10);
+        let c0 = cache.get(&char::from_u32(0).unwrap()).expect("char 0");
+        assert_eq!(
+            (c0.right_side_bearing, c0.character_width, c0.ascent),
+            (0, 7, 0),
+            "blank glyph: zero ink, advance kept"
+        );
+        let c1 = cache.get(&char::from_u32(1).unwrap()).expect("char 1");
+        assert_eq!(
+            (c1.right_side_bearing, c1.character_width, c1.ascent),
+            (6, 7, 5),
+            "ink-cropped extents (PCF INK_METRICS parity)"
+        );
     }
 
     /// 2-byte matrix font (xtfont2: encodings 0x2121..0x307E, no row
@@ -1724,7 +1999,7 @@ mod pcf_tests {
     /// ASCII fallback — the XDrawString16 28→10 regression).
     #[test]
     fn open_real_two_byte_pcf_has_matrix_coverage() {
-        let path = std::path::Path::new("/home/jos/Projects/xts/build-fresh/xts5/fonts");
+        let path = std::path::Path::new("/home/jos/Projects/xts/xts5/fonts");
         if !path.join("fonts.dir").is_file() {
             eprintln!("skipping: xts build-fresh fonts not present");
             return;
@@ -1745,5 +2020,78 @@ mod pcf_tests {
             cache.contains_key(&char::from_u32(0x2121).unwrap()),
             "first 2-byte glyph loads through the charmap"
         );
+    }
+}
+
+#[cfg(test)]
+mod xtfont_probe {
+    use super::*;
+
+    #[test]
+    fn probe_all_xtfonts() {
+        let path = std::path::Path::new("/home/jos/Projects/xts/xts5/fonts");
+        if !path.join("fonts.dir").is_file() {
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[path.to_string_lossy().into_owned()])
+            .unwrap();
+        for i in 0..=6 {
+            let name = format!("xtfont{i}");
+            match loader.open_font(&name) {
+                Ok((_f, m, _c)) => {
+                    eprintln!(
+                        "{name}: byte1 {}..{} byte2 {}..{} default {} ascent {} descent {} nprops {} all_exist {}",
+                        m.min_byte1,
+                        m.max_byte1,
+                        m.min_char_or_byte2,
+                        m.max_char_or_byte2,
+                        m.default_char,
+                        m.font_ascent,
+                        m.font_descent,
+                        m.named_properties.len(),
+                        m.all_chars_exist
+                    );
+                    eprintln!(
+                        "  props: {:?}",
+                        m.named_properties
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    let b = &m.min_bounds;
+                    eprintln!(
+                        "  minb: {} {} {} {} {}",
+                        b.left_side_bearing,
+                        b.right_side_bearing,
+                        b.character_width,
+                        b.ascent,
+                        b.descent
+                    );
+                    let b = &m.max_bounds;
+                    eprintln!(
+                        "  maxb: {} {} {} {} {}",
+                        b.left_side_bearing,
+                        b.right_side_bearing,
+                        b.character_width,
+                        b.ascent,
+                        b.descent
+                    );
+                    for (idx, ci) in m.char_infos.iter().take(5).enumerate() {
+                        eprintln!(
+                            "  char[{}]: lb {} rb {} w {} asc {} desc {}",
+                            idx,
+                            ci.left_side_bearing,
+                            ci.right_side_bearing,
+                            ci.character_width,
+                            ci.ascent,
+                            ci.descent
+                        );
+                    }
+                }
+                Err(e) => eprintln!("{name}: ERR {e}"),
+            }
+        }
     }
 }

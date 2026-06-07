@@ -395,7 +395,7 @@ pub struct OpenFontRequest {
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CharInfo {
     pub left_side_bearing: i16,
     pub right_side_bearing: i16,
