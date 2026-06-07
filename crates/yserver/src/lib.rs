@@ -210,6 +210,17 @@ pub fn run(display: u16) -> io::Result<()> {
 
     let randr_outputs = backend.randr_outputs();
     let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
+    // Tie the libinput thread's `clock::server_time_ms()` baseline
+    // to ServerState's `start_instant` so the input-event timestamps
+    // and the `state.timestamp_now()` clock used by the
+    // UngrabPointer / AllowEvents / SetInputFocus time-check arms
+    // share the same origin. Without this, the two `Instant`s were
+    // initialised ~1.8 s apart (clock::START lazy-init on the input
+    // thread's first dispatch, well after this point), and X clients
+    // saw event timestamps drift behind `state.timestamp_now()` by
+    // the same amount — wedging menu close paths that ungrab with
+    // saved press timestamps.
+    crate::clock::init(state.start_instant);
     state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
     install_backend_root_bindings(&mut state, &backend);
 
