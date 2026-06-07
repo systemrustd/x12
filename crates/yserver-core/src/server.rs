@@ -820,6 +820,21 @@ pub struct ServerState {
     /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
     /// motion to this window's rectangle.
     pub pointer_confine_to: ResourceId,
+    /// Currently-pressed pointer buttons, bit b-1 for button b —
+    /// fills the button half of the core event state for synthetic
+    /// (XTest) events and gates passive-grab activation ("no other
+    /// buttons down").
+    pub buttons_down: u16,
+    /// Core modifier state derived from `keys_down` × the modifier
+    /// mapping — the state mask attached to synthetic events whose
+    /// producers (XTestFakeInput) don't carry one. Held-key
+    /// semantics; the Lock latch is not modelled.
+    pub core_mod_state: u16,
+    /// Re-entrancy guard for the confinement warp: `warp_pointer_root`
+    /// synchronously re-enters the pointer fanout with the generated
+    /// motion; a coordinate mismatch between the clamp target and the
+    /// re-derived event must not warp again (stack overflow).
+    pub confine_warp_active: bool,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1108,6 +1123,9 @@ impl ServerState {
             modifier_mapping_override: None,
             keys_down: [0u8; 32],
             pointer_confine_to: ResourceId(0),
+            buttons_down: 0,
+            core_mod_state: 0,
+            confine_warp_active: false,
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
@@ -1947,6 +1965,11 @@ impl ServerState {
         button: u8,
         state_mask: u16,
     ) -> Option<PassiveButtonGrab> {
+        // X11 GrabButton: the grab activates only when "no other
+        // buttons ... are logically down" (XGrabButton-1).
+        if button >= 1 && self.buttons_down & !(1u16 << (button - 1)) != 0 {
+            return None;
+        }
         // Xorg CheckDeviceGrabs walks the sprite trace TOP-DOWN (root
         // first): a grab on an ancestor takes precedence over the same
         // grab deeper in the tree (XTS XGrabButton-4), and root-window

@@ -65,6 +65,25 @@ pub fn pointer_event_fanout_to_state(
         }
         event.detail = mapped;
     }
+    // Track logical buttons-down + fill synthetic (state == 0) events
+    // with the live modifier/button state — X11 state is the state
+    // BEFORE the event, so capture prior to the bitmap update.
+    let buttons_before = state.buttons_down;
+    if matches!(
+        event.kind,
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+    ) && (1..=16).contains(&event.detail)
+    {
+        let bit = 1u16 << (event.detail - 1);
+        if event.kind == PointerEventKind::ButtonPress {
+            state.buttons_down |= bit;
+        } else {
+            state.buttons_down &= !bit;
+        }
+    }
+    if event.state == 0 {
+        event.state = state.core_mod_state | (buttons_before << 8);
+    }
     // Pointer confinement (Xorg CheckPhysLimits): while a confined
     // grab is active, motion outside the confine rectangle is
     // replaced by a warp to the nearest inside point; press/release
@@ -81,17 +100,21 @@ pub fn pointer_event_fanout_to_state(
         let cx = i32::from(event.root_x).clamp(x0, (x1 - 1).max(x0));
         let cy = i32::from(event.root_y).clamp(y0, (y1 - 1).max(y0));
         if cx != i32::from(event.root_x) || cy != i32::from(event.root_y) {
-            if event.kind == PointerEventKind::MotionNotify {
-                // Swallow the stray motion; the warp regenerates a
-                // clamped one through the normal input path.
-                #[allow(clippy::cast_possible_truncation)]
-                backend.warp_pointer_root(state, cx, cy);
-                return Vec::new();
-            }
+            // Clamp in place — the event delivers at the nearest
+            // inside point — and pull the physical cursor along.
+            // `warp_pointer_root` re-enters this fanout with the
+            // generated motion; the guard stops a second warp if the
+            // re-derived coordinates still disagree (recursing here
+            // overflowed the stack — 2026-06-07 round-5 crash).
             #[allow(clippy::cast_possible_truncation)]
             {
                 event.root_x = cx as i16;
                 event.root_y = cy as i16;
+            }
+            if !state.confine_warp_active {
+                state.confine_warp_active = true;
+                backend.warp_pointer_root(state, cx, cy);
+                state.confine_warp_active = false;
             }
         }
     }

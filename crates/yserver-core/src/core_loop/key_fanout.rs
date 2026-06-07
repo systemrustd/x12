@@ -28,8 +28,6 @@ const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
 const XI2_SLAVE_KEYBOARD_DEVICE_ID: u16 = 5;
-/// Modifier bits delivered on the wire (Shift|Lock|Control|Mod1|Mod4 = 0x004d).
-const WIRE_MODIFIER_MASK: u16 = 0x004d;
 
 /// Fan a host key event out to nested clients.
 ///
@@ -43,6 +41,7 @@ pub fn key_event_fanout_to_state(
 ) -> Vec<ClientId> {
     // QueryKeymap bitmap — device key state tracks the physical
     // event regardless of where (or whether) it gets delivered.
+    let prior_mods = state.core_mod_state;
     {
         let byte = usize::from(event.keycode / 8);
         let bit = 1u8 << (event.keycode % 8);
@@ -51,6 +50,37 @@ pub fn key_event_fanout_to_state(
         } else {
             state.keys_down[byte] &= !bit;
         }
+    }
+    // Recompute the core modifier state from keys_down × the modifier
+    // mapping (SetModifierMapping override first, else the backend's
+    // keymap-derived table). Held-key semantics — the Lock latch is
+    // not modelled.
+    {
+        let modmap = state
+            .modifier_mapping_override
+            .clone()
+            .or_else(|| backend.get_modifier_mapping(None).ok());
+        if let Some((kpm, keys)) = modmap
+            && kpm > 0
+        {
+            let mut mask = 0u16;
+            for (m, row) in keys.chunks(usize::from(kpm)).take(8).enumerate() {
+                let held = row.iter().any(|&kc| {
+                    kc != 0 && state.keys_down[usize::from(kc / 8)] & (1 << (kc % 8)) != 0
+                });
+                if held {
+                    mask |= 1 << m;
+                }
+            }
+            state.core_mod_state = mask;
+        }
+    }
+    // Synthetic events (XTestFakeInput) arrive with state == 0 — fill
+    // in the tracked modifier + button state (X11: state is the state
+    // BEFORE the event, so modifiers use the pre-update mask).
+    let mut event = event;
+    if event.state == 0 {
+        event.state = prior_mods | (state.buttons_down << 8);
     }
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
@@ -337,7 +367,7 @@ fn key_event_wire(
         root_y: event.root_y,
         event_x: event.event_x,
         event_y: event.event_y,
-        state: event.state & WIRE_MODIFIER_MASK,
+        state: event.state,
     }
 }
 
@@ -363,7 +393,7 @@ fn encode_key_xi2(
         event.root_y,
         event.event_x,
         event.event_y,
-        event.state & WIRE_MODIFIER_MASK,
+        event.state,
         u32::from(event.keycode),
         XI2_SLAVE_KEYBOARD_DEVICE_ID,
         0, // flags: no XIPointerEmulated on key events
