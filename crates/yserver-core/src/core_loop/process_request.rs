@@ -12419,7 +12419,9 @@ fn handle_xi2_request(
                 client_id.0, sequence.0
             );
         }
-        // SetDeviceValuators: { deviceid, first_valuator, num_valuators }.
+        // SetDeviceValuators: { deviceid, first_valuator, num_valuators,
+        //   pad1, INT32 values[num_valuators] }. Body layout follows
+        // `xSetDeviceValuatorsReq` (XIproto.h:1144-1153).
         33 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let first = *body.get(1).unwrap_or(&0);
@@ -12447,7 +12449,42 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // Xorg `Xi/setdval.c::ProcXSetDeviceValuators` returns
+            // `AlreadyGrabbed` when another client holds an active
+            // grab on the device. `xSetDeviceValuatorsReply.status`
+            // sits at byte 8 (right after the 8-byte standard reply
+            // header) — XIproto.h:1249-1261.
+            const ALREADY_GRABBED: u8 = 1;
+            let grabbed_elsewhere = state
+                .xi1_active_grabs
+                .get(&dev)
+                .is_some_and(|g| g.owner != client_id);
+            if grabbed_elsewhere {
+                let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+                reply.push(ALREADY_GRABBED); // byte 8: status
+                reply.extend_from_slice(&[0u8; 23]); // bytes 9-31: pad
+                buf.extend_from_slice(&reply);
+            } else {
+                // Persist the new axis values into
+                // `xi1_device_input_state` so the next
+                // DeviceStateNotify / QueryDeviceState reports them.
+                // xts5 XSetDeviceValuators 1 / 2 read each axis back
+                // immediately after the set and expect the supplied
+                // value verbatim.
+                let entry = state.xi1_device_input_state.entry(dev).or_default();
+                for i in 0..usize::from(num) {
+                    let off = 4 + i * 4;
+                    let Some(slice) = body.get(off..off + 4) else {
+                        break;
+                    };
+                    let value = i32::from_le_bytes(slice.try_into().expect("4-byte slice"));
+                    let idx = usize::from(first) + i;
+                    if let Some(slot) = entry.valuators.get_mut(idx) {
+                        *slot = value;
+                    }
+                }
+                buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            }
         }
         // GetDeviceControl: { control, deviceid }. DEVICE_RESOLUTION(1)
         // is the only control defined for XI 1.x core; it needs
