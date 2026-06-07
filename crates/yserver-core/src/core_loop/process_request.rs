@@ -13177,6 +13177,54 @@ fn handle_create_window(
             1,
         );
     }
+    // Xorg `dix/window.c::CreateWindow:769-786` resolves
+    // `class == CopyFromParent` against the parent, then enforces:
+    //   - class must be InputOutput or InputOnly → BadValue.
+    //   - parent class InputOnly + child class != InputOnly → BadMatch.
+    //   - class InputOnly + (border_width != 0 || depth != 0) → BadMatch.
+    // xts5 Xlib4: XCreateSimpleWindow-10 (parent InputOnly path),
+    // XCreateWindow-31 (InputOnly+border_width), XCreateWindow-43
+    // (parent InputOnly + InputOutput child), XCreateWindow-44
+    // (InputOnly + non-zero depth).
+    let parent_class = state
+        .resources
+        .window(parent)
+        .map(|w| w.class)
+        .expect("parent existence verified above");
+    let parent_class_value = parent_class.protocol_value();
+    let effective_class = match request.class {
+        0 => parent_class_value, // CopyFromParent → parent's class
+        v => v,
+    };
+    if effective_class != 1 && effective_class != 2 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(request.class),
+            1,
+        );
+    }
+    if matches!(parent_class, crate::resources::WindowClass::InputOnly) && effective_class != 2 {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+    }
+    if effective_class == 2 && (request.border_width != 0 || request.depth != 0) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+    }
+    // InputOnly value-mask check, same legal-mask as
+    // ChangeWindowAttributes — xts5 Xlib4 XCreateWindow-24 cycles
+    // every illegal bit through value_mask and expects BadMatch.
+    if effective_class == 2 {
+        const INPUTONLY_LEGAL_MASK: u32 = 0x0020   // CWWinGravity
+            | 0x0200                                // CWOverrideRedirect
+            | 0x0800                                // CWEventMask
+            | 0x1000                                // CWDontPropagate
+            | 0x4000; // CWCursor
+        if (request.value_mask & !INPUTONLY_LEGAL_MASK) != 0 {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+        }
+    }
     // BadIdChoice / BadMatch validation.
     let validation_failed = {
         let handle = state.clients.get(&client_id.0).expect("client registered");
@@ -13379,6 +13427,27 @@ fn handle_change_window_attributes(
             request.window.0,
             2,
         );
+    }
+    // Xorg `dix/window.c::ChangeWindowAttributes:1174`: an InputOnly
+    // window may only carry the `INPUTONLY_LEGAL_MASK` bits
+    // (CWWinGravity, CWEventMask, CWDontPropagate, CWOverrideRedirect,
+    // CWCursor); any other bit → BadMatch. xts5 Xlib4
+    // XChangeWindowAttributes-26 cycles every illegal bit through the
+    // value_mask and expects BadMatch from each.
+    const INPUTONLY_LEGAL_MASK: u32 = 0x0020   // CWWinGravity
+        | 0x0200                                // CWOverrideRedirect
+        | 0x0800                                // CWEventMask
+        | 0x1000                                // CWDontPropagate
+        | 0x4000; // CWCursor
+    let target_class = state
+        .resources
+        .window(request.window)
+        .map(|w| w.class)
+        .expect("window existence verified above");
+    if matches!(target_class, crate::resources::WindowClass::InputOnly)
+        && (request.value_mask & !INPUTONLY_LEGAL_MASK) != 0
+    {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
     }
     // Resource-id validation of attribute values, mirroring Xorg's
     // `dix/window.c::ChangeWindowAttributes` per-attribute
@@ -13691,6 +13760,69 @@ fn handle_configure_window(
             request.window.0,
             12,
         );
+    }
+    // Xorg `dix/window.c::ConfigureWindow` checks (in order, before
+    // any geometry change or SubstructureRedirect dispatch):
+    //   1. InputOnly + CWBorderWidth → BadMatch (xts5 Xlib4
+    //      XConfigureWindow-33 / XSetWindowBorderWidth-6).
+    //   2. CWSibling without CWStackMode → BadMatch (XConfigureWindow-30).
+    //   3. CWStackMode value > 4 → BadValue.
+    //   4. CWSibling: sibling xid unknown → BadWindow; sibling not
+    //      actually a sibling of `window` or sibling==window → BadMatch
+    //      (XConfigureWindow-31).
+    //   5. CWWidth=0 or CWHeight=0 → BadValue (XConfigureWindow-32).
+    const CW_BORDER_WIDTH: u16 = 0x0010;
+    const CW_SIBLING: u16 = 0x0020;
+    const CW_STACK_MODE: u16 = 0x0040;
+    let window_class = state
+        .resources
+        .window(request.window)
+        .map(|w| w.class)
+        .expect("window existence verified above");
+    let window_parent = state
+        .resources
+        .window(request.window)
+        .map(|w| w.parent)
+        .expect("window existence verified above");
+    if matches!(window_class, crate::resources::WindowClass::InputOnly)
+        && (request.value_mask & CW_BORDER_WIDTH) != 0
+    {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 12);
+    }
+    if (request.value_mask & CW_SIBLING) != 0 && (request.value_mask & CW_STACK_MODE) == 0 {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 12);
+    }
+    if let Some(mode) = request.stack_mode
+        && mode > 4
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(mode),
+            12,
+        );
+    }
+    if let Some(sibling) = request.sibling {
+        let sibling_window = state.resources.window(sibling);
+        if sibling_window.is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                sibling.0,
+                12,
+            );
+        }
+        let sibling_parent = sibling_window.map(|w| w.parent);
+        if sibling_parent != Some(window_parent) || sibling == request.window {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 12);
+        }
+    }
+    if request.width == Some(0) || request.height == Some(0) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 12);
     }
     let pre = state
         .resources
@@ -36682,6 +36814,285 @@ mod tests {
                 "{label}: error must carry the ChangeWindowAttributes \
                  major opcode (2); got {}",
                 buf[10],
+            );
+        }
+    }
+
+    /// xts5 Xlib4 ConfigureWindow validations beyond BadWindow.
+    /// Mirrors Xorg `dix/window.c::ConfigureWindow:2203-2266` — every
+    /// check fires *before* any state mutation.
+    #[test]
+    fn configure_window_validates_inputonly_sibling_and_size() {
+        use std::io::Read;
+        const APP: u32 = 400;
+        const PARENT: u32 = 0x00a0_0001;
+        const INPUT_ONLY: u32 = 0x00a0_0002;
+        const SIB_A: u32 = 0x00a0_0003;
+        const SIB_B: u32 = 0x00a0_0004;
+        const ORPHAN: u32 = 0x00a0_0005;
+        const BAD_SIB: u32 = 0x00a0_dead;
+        const CW_X: u16 = 0x0001;
+        const CW_WIDTH: u16 = 0x0004;
+        const CW_HEIGHT: u16 = 0x0008;
+        const CW_BORDER_WIDTH: u16 = 0x0010;
+        const CW_SIBLING: u16 = 0x0020;
+        const CW_STACK_MODE: u16 = 0x0040;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        // Two siblings under PARENT and one orphan that's not their sibling.
+        for (id, parent, class) in [
+            (PARENT, crate::resources::ROOT_WINDOW.0, 1u16),
+            (INPUT_ONLY, PARENT, 2u16),
+            (SIB_A, PARENT, 1u16),
+            (SIB_B, PARENT, 1u16),
+            (ORPHAN, crate::resources::ROOT_WINDOW.0, 1u16),
+        ] {
+            state.resources.create_window(
+                ClientId(APP),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(id),
+                    parent: ResourceId(parent),
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                    border_width: 0,
+                    class,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // (label, body, expected_error)
+        let cases: Vec<(&str, Vec<u8>, u8)> = vec![
+            (
+                "InputOnly + CWBorderWidth → BadMatch",
+                build_configure_body(INPUT_ONLY, CW_BORDER_WIDTH, &[1u16.to_le_bytes()]),
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+            (
+                "CWSibling without CWStackMode → BadMatch",
+                build_configure_body(
+                    SIB_A,
+                    CW_SIBLING,
+                    &[(SIB_B as u32).to_le_bytes(); 1]
+                        .iter()
+                        .map(|b| {
+                            let mut buf = [0u8; 2];
+                            buf.copy_from_slice(&b[..2]);
+                            buf
+                        })
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+            (
+                "CWSibling with non-sibling → BadMatch",
+                build_configure_body_u32(SIB_A, CW_SIBLING | CW_STACK_MODE, ORPHAN, 0),
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+            (
+                "CWSibling with unknown xid → BadWindow",
+                build_configure_body_u32(SIB_A, CW_SIBLING | CW_STACK_MODE, BAD_SIB, 0),
+                yserver_protocol::x11::error::BAD_WINDOW,
+            ),
+            (
+                "CWWidth=0 → BadValue",
+                build_configure_body(SIB_A, CW_WIDTH, &[0u16.to_le_bytes()]),
+                yserver_protocol::x11::error::BAD_VALUE,
+            ),
+            (
+                "CWHeight=0 → BadValue",
+                build_configure_body(SIB_A, CW_HEIGHT, &[0u16.to_le_bytes()]),
+                yserver_protocol::x11::error::BAD_VALUE,
+            ),
+            (
+                "CWX alone → no error (MOVE_WIN path)",
+                build_configure_body(SIB_A, CW_X, &[5u16.to_le_bytes()]),
+                0, // 0 means: expect NO error reply
+            ),
+        ];
+
+        for (i, (label, body, expected_err)) in cases.iter().enumerate() {
+            let seq = SequenceNumber((i + 1) as u16);
+            let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body length fits");
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(APP),
+                seq,
+                RequestHeader {
+                    opcode: 12,
+                    data: 0,
+                    length_units,
+                },
+                body,
+                None,
+            )
+            .expect("process_request");
+
+            peer.set_nonblocking(true).unwrap();
+            let mut buf = [0u8; 32];
+            match peer.read_exact(&mut buf) {
+                Ok(()) => {
+                    if *expected_err == 0 {
+                        panic!("{label}: did not expect an error reply, got {buf:?}");
+                    }
+                    assert_eq!(buf[0], 0, "{label}: byte 0 = error class (0)");
+                    assert_eq!(
+                        buf[1], *expected_err,
+                        "{label}: error code mismatch — got {}",
+                        buf[1]
+                    );
+                }
+                Err(e) if *expected_err == 0 => {
+                    // Expected — no error reply.
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                }
+                Err(e) => {
+                    panic!("{label}: expected error reply with code {expected_err}, got {e:?}")
+                }
+            }
+        }
+    }
+
+    fn build_configure_body(window_xid: u32, value_mask: u16, values: &[[u8; 2]]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8 + values.len() * 4);
+        body.extend_from_slice(&window_xid.to_le_bytes());
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        for v in values {
+            body.extend_from_slice(v);
+            body.extend_from_slice(&0u16.to_le_bytes()); // each value is u32 on the wire
+        }
+        body
+    }
+
+    fn build_configure_body_u32(window_xid: u32, value_mask: u16, v0: u32, v1: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&window_xid.to_le_bytes());
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&v0.to_le_bytes());
+        body.extend_from_slice(&v1.to_le_bytes());
+        body
+    }
+
+    /// xts5 Xlib4 XCreateWindow CreateWindow class/border/depth rules:
+    /// parent InputOnly + child InputOutput → BadMatch (test 43),
+    /// InputOnly + non-zero border_width → BadMatch (test 31),
+    /// InputOnly + non-zero depth → BadMatch (test 44).
+    #[test]
+    fn create_window_validates_class_constraints() {
+        use std::io::Read;
+        const APP: u32 = 500;
+        const PARENT_IPO: u32 = 0x00b0_0001;
+        const PARENT_IPI: u32 = 0x00b0_0002;
+        const CHILD: u32 = 0x00b0_0003;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        // One InputOutput parent and one InputOnly parent.
+        for (id, parent, class) in [
+            (PARENT_IPO, crate::resources::ROOT_WINDOW.0, 1u16),
+            (PARENT_IPI, crate::resources::ROOT_WINDOW.0, 2u16),
+        ] {
+            state.resources.create_window(
+                ClientId(APP),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(id),
+                    parent: ResourceId(parent),
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 50,
+                    border_width: 0,
+                    class,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // (label, depth, parent, class, border_width, expected_err)
+        let cases: &[(&str, u8, u32, u16, u16, u8)] = &[
+            (
+                "parent InputOnly + class InputOutput",
+                24,
+                PARENT_IPI,
+                1,
+                0,
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+            (
+                "class InputOnly + non-zero border_width",
+                0,
+                PARENT_IPO,
+                2,
+                1,
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+            (
+                "class InputOnly + non-zero depth",
+                24,
+                PARENT_IPO,
+                2,
+                0,
+                yserver_protocol::x11::error::BAD_MATCH,
+            ),
+        ];
+
+        for (i, (label, depth, parent, class, bw, expected_err)) in cases.iter().enumerate() {
+            let mut body = Vec::with_capacity(32);
+            body.extend_from_slice(&CHILD.to_le_bytes());
+            body.extend_from_slice(&parent.to_le_bytes());
+            body.extend_from_slice(&0i16.to_le_bytes()); // x
+            body.extend_from_slice(&0i16.to_le_bytes()); // y
+            body.extend_from_slice(&10u16.to_le_bytes()); // width
+            body.extend_from_slice(&10u16.to_le_bytes()); // height
+            body.extend_from_slice(&bw.to_le_bytes()); // border_width
+            body.extend_from_slice(&class.to_le_bytes()); // class
+            body.extend_from_slice(&0u32.to_le_bytes()); // visual = CopyFromParent
+            body.extend_from_slice(&0u32.to_le_bytes()); // value_mask
+            let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+            let seq = SequenceNumber((i + 1) as u16);
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(APP),
+                seq,
+                RequestHeader {
+                    opcode: 1,
+                    data: *depth,
+                    length_units,
+                },
+                &body,
+                None,
+            )
+            .expect("process_request");
+
+            peer.set_nonblocking(true).unwrap();
+            let mut buf = [0u8; 32];
+            peer.read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("{label}: expected error reply, got {e:?}"));
+            assert_eq!(buf[0], 0, "{label}: byte 0 = error class");
+            assert_eq!(
+                buf[1], *expected_err,
+                "{label}: expected error code {expected_err}, got {}",
+                buf[1]
+            );
+            assert_eq!(
+                buf[10], 1,
+                "{label}: BadMatch must carry CreateWindow opcode"
             );
         }
     }

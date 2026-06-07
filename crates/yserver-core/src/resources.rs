@@ -454,6 +454,18 @@ impl ResourceTable {
         } else {
             request.visual
         };
+        // Per Xorg `dix/window.c::CreateWindow:769-770`: class
+        // CopyFromParent (wire value 0) inherits the parent's
+        // resolved class — *not* stored as a sentinel. Storing the
+        // literal sentinel made GetWindowAttributes report class=0
+        // (xts5 Xlib4 XCreateSimpleWindow-1 / XCreateWindow-7), and
+        // confuses any downstream class-based validation (e.g. the
+        // child-of-InputOnly BadMatch gate that needs to know the
+        // child's effective class).
+        let resolved_class = match request.class {
+            0 => parent.map_or(WindowClass::InputOutput, |p| p.class),
+            other => WindowClass::from_protocol(other),
+        };
         let window = Window {
             id: request.window,
             parent: request.parent,
@@ -465,7 +477,7 @@ impl ResourceTable {
             border_width: request.border_width,
             depth: resolved_depth,
             visual: resolved_visual,
-            class: WindowClass::from_protocol(request.class),
+            class: resolved_class,
             map_state: MapState::Unmapped,
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
             background_pixmap: request.background_pixmap.filter(|p| p.0 != 0),

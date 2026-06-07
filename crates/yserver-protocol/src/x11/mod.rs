@@ -188,6 +188,10 @@ pub struct CreateWindowRequest {
     pub border_width: u16,
     pub class: u16,
     pub visual: ResourceId,
+    /// Raw CW value_mask preserved for downstream validation (e.g. the
+    /// InputOnly legal-mask check needs to know exactly which bits the
+    /// client set, not just which typed fields the parser decoded).
+    pub value_mask: u32,
     /// CW bit 0. 0 = None, 1 = ParentRelative, else a pixmap XID.
     pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
@@ -208,6 +212,8 @@ pub struct CreateWindowRequest {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChangeWindowAttributesRequest {
     pub window: ResourceId,
+    /// Raw CW value_mask preserved for InputOnly legal-mask validation.
+    pub value_mask: u32,
     pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
     pub bit_gravity: Option<u8>,
@@ -908,6 +914,7 @@ pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowReque
         border_width: read_u16_le(body.get(16..18)?),
         class: read_u16_le(body.get(18..20)?),
         visual: ResourceId(read_u32_le(body.get(20..24)?)),
+        value_mask,
         background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
         bit_gravity: values.value(4).map(|v| v as u8),
@@ -930,6 +937,7 @@ pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttri
     let values = value_list(value_mask, body.get(8..)?);
     Some(ChangeWindowAttributesRequest {
         window: ResourceId(read_u32_le(body.get(0..4)?)),
+        value_mask,
         background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
         bit_gravity: values.value(4).map(|v| v as u8),
