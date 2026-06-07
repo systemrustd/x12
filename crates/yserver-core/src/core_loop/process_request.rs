@@ -13557,6 +13557,22 @@ fn handle_configure_window(
     let Some(request) = x11::configure_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // X11 spec / Xorg `dix/window.c::ConfigureWindow`: ConfigureWindow
+    // on the root window is accepted (no error) but has no visible
+    // effect — root geometry is owned by the screen/RandR, not by the
+    // client. Without this short-circuit we apply the client's
+    // width/height to `state.resources.window(ROOT_WINDOW)` and every
+    // subsequent on-screen check (e.g. GetImage's BadMatch validation)
+    // breaks because root reports the client's tiny dimensions instead
+    // of the KMS scanout dims. xts5 produced a 70x61 root resize that
+    // cascaded into ~1000 UNRES.
+    if request.window == ROOT_WINDOW {
+        debug!(
+            "client {} #{} ConfigureWindow on root — dropped (matches Xorg semantics)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     let pre = state
         .resources
         .window(request.window)
