@@ -11081,8 +11081,15 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
         }
-        // UngrabDevice (void): { time, deviceid }.
+        // UngrabDevice (void): { time, deviceid }. Body: time at
+        // bytes 0..4, deviceid at byte 4 — `xUngrabDeviceReq`.
         14 => {
+            let time = u32::from_le_bytes([
+                *body.first().unwrap_or(&0),
+                *body.get(1).unwrap_or(&0),
+                *body.get(2).unwrap_or(&0),
+                *body.get(3).unwrap_or(&0),
+            ]);
             let dev = u16::from(*body.get(4).unwrap_or(&0));
             if !xi1_device_valid(dev) {
                 return xi1_error(
@@ -11094,10 +11101,18 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if state
-                .xi1_active_grabs
-                .get(&dev)
-                .is_some_and(|g| g.owner == client_id)
+            // Xorg `Xi/ungrdev.c::ProcXUngrabDevice` requires the
+            // request's time to be in `[grabTime, currentTime]`
+            // (CurrentTime = 0 passes both checks). Out-of-range
+            // timestamps silently skip the release — xts5
+            // XUngrabDevice-2 asserts this.
+            let now = state.timestamp_now();
+            let time_ok = time == 0 || (time >= state.xi1_last_grab_time && time <= now);
+            if time_ok
+                && state
+                    .xi1_active_grabs
+                    .get(&dev)
+                    .is_some_and(|g| g.owner == client_id)
             {
                 crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, dev);
             }
