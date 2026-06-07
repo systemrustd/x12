@@ -851,6 +851,27 @@ pub trait Backend: Send {
         vec!["built-ins".to_string()]
     }
 
+    /// Paint a window's background (pixel or tile) into a
+    /// window-local rect. Used by CopyArea/CopyPlane missing-source
+    /// semantics (X11 §CopyArea: when the destination is a window
+    /// with bg != None, destination regions corresponding to
+    /// unavailable source are tiled with the background, GXcopy +
+    /// all-ones plane-mask). Default no-op; KMS implements via its
+    /// window bg machinery. TODO(ynest): forward as a host ClearArea
+    /// so the host repaints its own bg (we clamp the copy before the
+    /// host sees it, so the host no longer bg-tiles on its own).
+    fn paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _x: i16,
+        _y: i16,
+        _width: u16,
+        _height: u16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn close_font(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()>;
 
     fn create_cursor(

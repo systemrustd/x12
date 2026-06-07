@@ -17745,6 +17745,139 @@ fn handle_clear_area(
     Ok(RequestOutcome::Handled)
 }
 
+/// Drawable size in its own coordinate space (windows: interior
+/// w×h; pixmaps: w×h). None for unknown resources.
+fn drawable_size(state: &ServerState, id: ResourceId) -> Option<(u16, u16)> {
+    if let Some(w) = state.resources.window(id) {
+        return Some((w.width, w.height));
+    }
+    state.resources.pixmap(id).map(|p| (p.width, p.height))
+}
+
+/// Source-availability split for CopyArea/CopyPlane (X11 §CopyArea;
+/// Xorg miHandleExposures): the part of the requested source rect
+/// outside the source drawable's bounds is not copied. Returns the
+/// available source sub-rect (None when fully outside) and the
+/// missing sub-rects translated to DESTINATION coordinates — each
+/// becomes one GraphicsExpose; an empty list means NoExposure.
+#[allow(clippy::type_complexity)]
+fn copy_area_source_split(
+    state: &ServerState,
+    src: ResourceId,
+    src_x: i16,
+    src_y: i16,
+    dst_x: i16,
+    dst_y: i16,
+    width: u16,
+    height: u16,
+) -> (
+    Option<(i16, i16, i16, i16, u16, u16)>,
+    Vec<(i16, i16, u16, u16)>,
+) {
+    let Some((sw, sh)) = drawable_size(state, src) else {
+        // Unknown source geometry: keep the old conservative
+        // behavior (copy as requested, no missing region).
+        return (
+            Some((src_x, src_y, dst_x, dst_y, width, height)),
+            Vec::new(),
+        );
+    };
+    let rx0 = i32::from(src_x);
+    let ry0 = i32::from(src_y);
+    let rx1 = rx0 + i32::from(width);
+    let ry1 = ry0 + i32::from(height);
+    let ax0 = rx0.max(0);
+    let ay0 = ry0.max(0);
+    let ax1 = rx1.min(i32::from(sw));
+    let ay1 = ry1.min(i32::from(sh));
+    // Translate a source-coordinate sub-rect into dst coordinates.
+    let to_dst = |x0: i32, y0: i32, x1: i32, y1: i32| -> (i16, i16, u16, u16) {
+        let dx = i32::from(dst_x) + (x0 - rx0);
+        let dy = i32::from(dst_y) + (y0 - ry0);
+        (
+            i16::try_from(dx).unwrap_or(i16::MAX),
+            i16::try_from(dy).unwrap_or(i16::MAX),
+            u16::try_from(x1 - x0).unwrap_or(0),
+            u16::try_from(y1 - y0).unwrap_or(0),
+        )
+    };
+    if ax1 <= ax0 || ay1 <= ay0 {
+        // Fully outside: nothing copies, the whole rect is exposed.
+        return (None, vec![to_dst(rx0, ry0, rx1, ry1)]);
+    }
+    let mut missing: Vec<(i16, i16, u16, u16)> = Vec::new();
+    // Band decomposition of requested − available: top, bottom,
+    // left-of-middle, right-of-middle.
+    if ay0 > ry0 {
+        missing.push(to_dst(rx0, ry0, rx1, ay0));
+    }
+    if ay1 < ry1 {
+        missing.push(to_dst(rx0, ay1, rx1, ry1));
+    }
+    if ax0 > rx0 {
+        missing.push(to_dst(rx0, ay0, ax0, ay1));
+    }
+    if ax1 < rx1 {
+        missing.push(to_dst(ax1, ay0, rx1, ay1));
+    }
+    let avail = (
+        i16::try_from(ax0).unwrap_or(0),
+        i16::try_from(ay0).unwrap_or(0),
+        i16::try_from(i32::from(dst_x) + (ax0 - rx0)).unwrap_or(i16::MAX),
+        i16::try_from(i32::from(dst_y) + (ay0 - ry0)).unwrap_or(i16::MAX),
+        u16::try_from(ax1 - ax0).unwrap_or(0),
+        u16::try_from(ay1 - ay0).unwrap_or(0),
+    );
+    (Some(avail), missing)
+}
+
+/// Emit the CopyArea/CopyPlane graphics-exposures contract events to
+/// the requesting client: one GraphicsExpose per missing dst-coord
+/// sub-rect (count = number still to follow), or one NoExposure when
+/// the source was fully available. Only called when the GC has
+/// graphics-exposures=True; the events go to the REQUESTOR
+/// unconditionally (not gated by any event mask).
+fn emit_copy_exposures(
+    state: &mut ServerState,
+    client_id: ClientId,
+    dst: ResourceId,
+    missing: &[(i16, i16, u16, u16)],
+    major_opcode: u8,
+) {
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return;
+    };
+    let seq = SequenceNumber(
+        client
+            .last_sequence
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if missing.is_empty() {
+        let mut buf = Vec::with_capacity(32);
+        x11::encode_no_exposure_event(&mut buf, seq, client.byte_order, dst, 0, major_opcode);
+        let _ = write_to_client(client, client_id, &buf);
+        return;
+    }
+    let total = missing.len();
+    for (i, (x, y, w, h)) in missing.iter().enumerate() {
+        let mut buf = Vec::with_capacity(32);
+        x11::encode_graphics_expose_event(
+            &mut buf,
+            seq,
+            client.byte_order,
+            dst,
+            u16::try_from(*x).unwrap_or(0),
+            u16::try_from(*y).unwrap_or(0),
+            *w,
+            *h,
+            0,
+            u16::try_from(total - 1 - i).unwrap_or(0),
+            major_opcode,
+        );
+        let _ = write_to_client(client, client_id, &buf);
+    }
+}
+
 fn handle_copy_area(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -17802,6 +17935,35 @@ fn handle_copy_area(
         let st = draw_state.unwrap_or_default();
         backend.apply_clip_state(origin, &st.clip)?;
         backend.apply_draw_state(origin, &st)?;
+        // Clamp the copy to the AVAILABLE part of the source drawable
+        // (X11 §CopyArea): out-of-bounds source regions are never
+        // copied; they become the GraphicsExpose region below.
+        let (avail, missing) = copy_area_source_split(
+            state,
+            request.src,
+            request.src_x,
+            request.src_y,
+            request.dst_x,
+            request.dst_y,
+            request.width,
+            request.height,
+        );
+        let request = match avail {
+            Some((sx, sy, dx, dy, w, h)) => x11::CopyAreaRequest {
+                src_x: sx,
+                src_y: sy,
+                dst_x: dx,
+                dst_y: dy,
+                width: w,
+                height: h,
+                ..request
+            },
+            None => x11::CopyAreaRequest {
+                width: 0,
+                height: 0,
+                ..request
+            },
+        };
         // Stage 4d Manual-redirect fix (codex 2026-05-18): when the
         // destination is a window, the X11 spec requires copy_area to
         // honour (a) the GC's clip-mask if rectangular and (b) the
@@ -17816,7 +17978,11 @@ fn handle_copy_area(
         // backend trait shape and applies to v1 and v2 uniformly.
         // ClipState::Pixmap (mask-pixmap clip) is out of scope for this
         // fix and passes through untouched.
-        let copy_sub_rects = copy_area_effective_dst_rects(state, request.dst, &st, &request);
+        let copy_sub_rects = if request.width == 0 || request.height == 0 {
+            Vec::new()
+        } else {
+            copy_area_effective_dst_rects(state, request.dst, &st, &request)
+        };
         if copy_sub_rects.is_empty() {
             debug!(
                 "client {} #{} CopyArea fully clipped, no backend call",
@@ -17853,42 +18019,27 @@ fn handle_copy_area(
             let _dropped =
                 accumulate_damage_to_state(state, dst_id, sub.x, sub.y, sub.width, sub.height);
         }
-        // Note: GraphicsExpose / NoExposure below still fires even
-        // when the copy was fully clipped (codex 2026-05-18 follow-up).
-        // Clients with `graphics-exposures=True` rely on receiving
-        // exactly one of those events per handled CopyArea regardless
-        // of whether the server actually copied any pixels.
-        // X11 spec: when graphics-exposures is True, send GraphicsExpose
-        // for the regions of source that weren't visible (or NoExposure
-        // when fully visible). We don't track source obscurity, so we
-        // conservatively emit GraphicsExpose covering the whole dest
-        // to the requesting client (GraphicsExpose isn't gated by
-        // ExposureMask — it always goes to the requestor).
+        // X11 §CopyArea: destination regions corresponding to
+        // unavailable source are TILED WITH THE DST WINDOW'S
+        // BACKGROUND (bg != None), with GXcopy + all-ones plane-mask
+        // — independent of the graphics-exposures setting.
+        if !missing.is_empty() && state.resources.window(request.dst).is_some() {
+            for (mx, my, mw, mh) in &missing {
+                backend.paint_window_background_rect(origin, dst.host_xid(), *mx, *my, *mw, *mh)?;
+                let _dropped = accumulate_damage_to_state(state, request.dst, *mx, *my, *mw, *mh);
+            }
+        }
+        // Graphics-exposures contract (still fires when the copy was
+        // fully clipped — codex 2026-05-18 follow-up): GraphicsExpose
+        // per missing source sub-rect (out-of-bounds source region),
+        // NoExposure when the source was fully available. Events go
+        // to the requestor unconditionally (not mask-gated).
         let graphics_exposures = state
             .resources
             .gc(request.gc)
             .is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures && let Some(client) = state.clients.get_mut(&client_id.0) {
-            let mut buf = Vec::with_capacity(32);
-            let seq = SequenceNumber(
-                client
-                    .last_sequence
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-            x11::encode_graphics_expose_event(
-                &mut buf,
-                seq,
-                client.byte_order,
-                request.dst,
-                request.dst_x as u16,
-                request.dst_y as u16,
-                request.width,
-                request.height,
-                0,
-                0,
-                62, // CopyArea
-            );
-            let _ = write_to_client(client, client_id, &buf);
+        if graphics_exposures {
+            emit_copy_exposures(state, client_id, request.dst, &missing, 62);
         }
     }
     Ok(RequestOutcome::Handled)
@@ -18173,42 +18324,37 @@ fn handle_copy_plane(
         let st = draw_state.unwrap_or_default();
         backend.apply_clip_state(origin, &st.clip)?;
         backend.apply_draw_state(origin, &st)?;
-        backend.copy_plane(
-            origin,
-            srct.host_xid(),
-            dstt.host_xid(),
-            sx,
-            sy,
-            dx,
-            dy,
-            w,
-            h,
-            plane,
-        )?;
-        let _dropped = accumulate_damage_to_state(state, dst, dx, dy, w, h);
-        // GraphicsExpose to the requestor when graphics-exposures is True.
+        // Clamp to the available source region (same contract as
+        // CopyArea — out-of-bounds source becomes GraphicsExpose).
+        let (avail, missing) = copy_area_source_split(state, src, sx, sy, dx, dy, w, h);
+        if let Some((asx, asy, adx, ady, aw, ah)) = avail {
+            backend.copy_plane(
+                origin,
+                srct.host_xid(),
+                dstt.host_xid(),
+                asx,
+                asy,
+                adx,
+                ady,
+                aw,
+                ah,
+                plane,
+            )?;
+            let _dropped = accumulate_damage_to_state(state, dst, adx, ady, aw, ah);
+        }
+        // Missing-source dst regions get the dst window's background
+        // (same contract as CopyArea).
+        if !missing.is_empty() && state.resources.window(dst).is_some() {
+            for (mx, my, mw, mh) in &missing {
+                backend.paint_window_background_rect(origin, dstt.host_xid(), *mx, *my, *mw, *mh)?;
+                let _dropped = accumulate_damage_to_state(state, dst, *mx, *my, *mw, *mh);
+            }
+        }
+        // GraphicsExpose / NoExposure to the requestor when
+        // graphics-exposures is True.
         let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
-        if graphics_exposures && let Some(client) = state.clients.get_mut(&client_id.0) {
-            let mut buf = Vec::with_capacity(32);
-            let seq = SequenceNumber(
-                client
-                    .last_sequence
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-            x11::encode_graphics_expose_event(
-                &mut buf,
-                seq,
-                client.byte_order,
-                dst,
-                dx as u16,
-                dy as u16,
-                w,
-                h,
-                0,
-                0,
-                63, // CopyPlane
-            );
-            let _ = write_to_client(client, client_id, &buf);
+        if graphics_exposures {
+            emit_copy_exposures(state, client_id, dst, &missing, 63);
         }
     }
     debug!(
@@ -32637,6 +32783,44 @@ mod tests {
         );
     }
 
+    /// X11 §CopyArea source-availability split: requested source
+    /// rect vs source drawable bounds → (clamped copy, missing
+    /// dst-coord rects for GraphicsExpose).
+    #[test]
+    fn copy_area_source_split_right_half_missing() {
+        let mut state = ServerState::new();
+        // 100×100 pixmap as the source.
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(0x700),
+                drawable: crate::resources::ROOT_WINDOW,
+                width: 100,
+                height: 100,
+            },
+        );
+        // Copy 100 wide from x=50 → right 50 missing.
+        let (avail, missing) =
+            copy_area_source_split(&state, ResourceId(0x700), 50, 0, 0, 0, 100, 100);
+        assert_eq!(avail, Some((50, 0, 0, 0, 50, 100)), "clamped copy");
+        assert_eq!(
+            missing,
+            vec![(50, 0, 50, 100)],
+            "missing right half in DST coords (xts XCopyArea-4 expects x=50 w=50)"
+        );
+        // Fully in-bounds → NoExposure (empty missing list).
+        let (avail, missing) =
+            copy_area_source_split(&state, ResourceId(0x700), 0, 0, 10, 10, 80, 80);
+        assert_eq!(avail, Some((0, 0, 10, 10, 80, 80)));
+        assert!(missing.is_empty(), "fully available → NoExposure");
+        // Fully out of bounds → no copy, whole rect exposed.
+        let (avail, missing) =
+            copy_area_source_split(&state, ResourceId(0x700), 200, 0, 5, 5, 30, 30);
+        assert!(avail.is_none());
+        assert_eq!(missing, vec![(5, 5, 30, 30)]);
+    }
+
     /// Stage 4d follow-up (codex review 2026-05-18): when ClipByChildren
     /// (or any other clipping) fully covers the destination so no pixels
     /// are actually copied, the X11 spec still requires the server to
@@ -32806,18 +32990,22 @@ mod tests {
             "fully-clipped CopyArea must NOT call backend.copy_area",
         );
 
-        // But the GraphicsExpose event must still have been sent.
+        // The graphics-exposures contract still fires for a fully
+        // dst-clipped copy — but as NoExposure: the SOURCE was fully
+        // available (GraphicsExpose only describes missing source
+        // regions; dst-side child clipping doesn't expose anything).
         let mut buf = [0u8; 64];
         let n = peer.read(&mut buf).unwrap_or(0);
         assert!(
             n >= 32,
-            "expected a 32-byte GraphicsExpose event even for a \
+            "expected a 32-byte NoExposure event even for a \
              fully-clipped CopyArea (codex review 2026-05-18); got \
              {n} bytes",
         );
         assert_eq!(
-            buf[0], 13,
-            "first byte must be GraphicsExpose (event type 13)",
+            buf[0], 14,
+            "first byte must be NoExposure (event type 14) — source \
+             fully available",
         );
     }
 

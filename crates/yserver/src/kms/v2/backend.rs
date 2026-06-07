@@ -5271,6 +5271,208 @@ impl KmsBackendV2 {
         );
     }
 
+    /// CopyArea with a non-Copy GC function or partial plane-mask:
+    /// CPU read-modify-write. Reads the source and destination
+    /// sub-rects (clamped to both drawables), applies
+    /// `apply_gc_function(src, dst)` per pixel, writes back. The
+    /// conformance path only — real clients copy with GXcopy.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_area_rop_cpu(
+        &mut self,
+        src_id: DrawableId,
+        dst_id: DrawableId,
+        src_rect: ash::vk::Rect2D,
+        dst_pos: ash::vk::Offset2D,
+        function: yserver_core::backend::GcFunction,
+        plane_mask: u32,
+        depth: u8,
+    ) {
+        let Some(src_extent) = self.store.get(src_id).map(|d| d.storage.extent) else {
+            return;
+        };
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+            return;
+        };
+        // Clamp the transfer so both the source read and the
+        // destination write stay in bounds; shift both sides by the
+        // same delta.
+        let mut sx = src_rect.offset.x;
+        let mut sy = src_rect.offset.y;
+        let mut dx = dst_pos.x;
+        let mut dy = dst_pos.y;
+        let mut w = src_rect.extent.width as i32;
+        let mut h = src_rect.extent.height as i32;
+        let clamp_low = |pos: &mut i32, other: &mut i32, len: &mut i32| {
+            if *pos < 0 {
+                *other -= *pos;
+                *len += *pos;
+                *pos = 0;
+            }
+        };
+        clamp_low(&mut sx, &mut dx, &mut w);
+        clamp_low(&mut sy, &mut dy, &mut h);
+        clamp_low(&mut dx, &mut sx, &mut w);
+        clamp_low(&mut dy, &mut sy, &mut h);
+        w = w
+            .min(src_extent.width as i32 - sx)
+            .min(dst_extent.width as i32 - dx);
+        h = h
+            .min(src_extent.height as i32 - sy)
+            .min(dst_extent.height as i32 - dy);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let rect = |x: i32, y: i32| ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D {
+                width: w as u32,
+                height: h as u32,
+            },
+        };
+        let src_bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            src_id,
+            rect(sx, sy),
+            depth,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("v2 copy_area_rop_cpu: src get_image failed: {e:?}");
+                return;
+            }
+        };
+        let mut dst_bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            dst_id,
+            rect(dx, dy),
+            depth,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("v2 copy_area_rop_cpu: dst get_image failed: {e:?}");
+                return;
+            }
+        };
+        let full_mask = depth_plane_mask(depth);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let s = read_z_pixmap_pixel(&src_bytes, depth, w as u32, x, y) & full_mask;
+                let d = read_z_pixmap_pixel(&dst_bytes, depth, w as u32, x, y) & full_mask;
+                let out = apply_gc_function(function, s, d, plane_mask) & full_mask;
+                write_z_pixmap_pixel(&mut dst_bytes, depth, w as u32, x, y, out);
+            }
+        }
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            dst_id,
+            ash::vk::Offset2D { x: dx, y: dy },
+            ash::vk::Extent2D {
+                width: w as u32,
+                height: h as u32,
+            },
+            &dst_bytes,
+            depth,
+        ) {
+            log::warn!("v2 copy_area_rop_cpu: put_image failed: {e:?}");
+            return;
+        }
+        self.telemetry.record_paint_submit();
+        self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
+    }
+
+    /// PutImage with a non-Copy GC function or partial plane-mask:
+    /// CPU read-modify-write combining the wire z-pixmap image with
+    /// the destination through `apply_gc_function`. Conformance path
+    /// only — real clients put with GXcopy.
+    #[allow(clippy::too_many_arguments)]
+    fn put_image_rop_cpu(
+        &mut self,
+        dst_id: DrawableId,
+        dst_pos: ash::vk::Offset2D,
+        width: u16,
+        height: u16,
+        data: &[u8],
+        depth: u8,
+        function: yserver_core::backend::GcFunction,
+        plane_mask: u32,
+    ) {
+        let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
+            return;
+        };
+        // Clamp to the destination; track the source-image offset of
+        // the clamped origin.
+        let mut dx = dst_pos.x;
+        let mut dy = dst_pos.y;
+        let mut sx = 0i32;
+        let mut sy = 0i32;
+        let mut w = i32::from(width);
+        let mut h = i32::from(height);
+        if dx < 0 {
+            sx -= dx;
+            w += dx;
+            dx = 0;
+        }
+        if dy < 0 {
+            sy -= dy;
+            h += dy;
+            dy = 0;
+        }
+        w = w.min(dst_extent.width as i32 - dx);
+        h = h.min(dst_extent.height as i32 - dy);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let dst_rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: dx, y: dy },
+            extent: ash::vk::Extent2D {
+                width: w as u32,
+                height: h as u32,
+            },
+        };
+        let mut dst_bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            dst_id,
+            dst_rect,
+            depth,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("v2 put_image_rop_cpu: dst get_image failed: {e:?}");
+                return;
+            }
+        };
+        let full_mask = depth_plane_mask(depth);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let s = read_z_pixmap_pixel(
+                    data,
+                    depth,
+                    u32::from(width),
+                    x + sx as usize,
+                    y + sy as usize,
+                ) & full_mask;
+                let d = read_z_pixmap_pixel(&dst_bytes, depth, w as u32, x, y) & full_mask;
+                let out = apply_gc_function(function, s, d, plane_mask) & full_mask;
+                write_z_pixmap_pixel(&mut dst_bytes, depth, w as u32, x, y, out);
+            }
+        }
+        if let Err(e) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            dst_id,
+            dst_rect.offset,
+            dst_rect.extent,
+            &dst_bytes,
+            depth,
+        ) {
+            log::warn!("v2 put_image_rop_cpu: put_image failed: {e:?}");
+        }
+    }
+
     /// Fill `rects` on `id`, honouring `KmsCore.current_fill`. Used
     /// by the filled-shape ops (`PolyFillRectangle`, `PolyFillArc`,
     /// `FillPoly`, `FillRectangle`); stroke ops keep using
@@ -9373,6 +9575,35 @@ impl Backend for KmsBackendV2 {
         self.core.font_loader.font_path.clone()
     }
 
+    fn paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let Some(geom) = self.windows_v2.get(&host_xid) else {
+            return Ok(());
+        };
+        let (bg_pixel, bg_pixmap) = (geom.bg_pixel, geom.bg_pixmap);
+        if bg_pixel.is_none() && bg_pixmap.is_none() {
+            // Background None: contents stay undefined (miPaintWindow
+            // early-out).
+            return Ok(());
+        }
+        self.clear_window_area_with_background(
+            host_xid,
+            bg_pixel.unwrap_or(0),
+            bg_pixmap,
+            x,
+            y,
+            width,
+            height,
+        )
+    }
+
     fn create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -10074,6 +10305,49 @@ impl Backend for KmsBackendV2 {
             // to paint. Spec-correct under ClipByChildren.
             return Ok(());
         }
+        // GC function + plane-mask on copies (X11 §CopyArea uses the
+        // full rop set). The engine blit is raw GXcopy; anything else
+        // (or a partial plane mask) takes the CPU read-modify-write
+        // path. NoOp = spec-correct no-op.
+        {
+            use yserver_core::backend::GcFunction;
+            let function = self.core.current_function;
+            if matches!(function, GcFunction::NoOp) {
+                return Ok(());
+            }
+            let dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let full_mask = depth_plane_mask(dst_depth);
+            let plane_mask = self.core.current_plane_mask & full_mask;
+            if plane_mask == 0 {
+                return Ok(());
+            }
+            if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
+                for sub in &sub_rects {
+                    let sub_src = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(src_x) + (sub.offset.x - i32::from(dst_x)),
+                            y: i32::from(src_y) + (sub.offset.y - i32::from(dst_y)),
+                        },
+                        extent: sub.extent,
+                    };
+                    let dst_pos = ash::vk::Offset2D {
+                        x: sub.offset.x + dst_target.offset.0,
+                        y: sub.offset.y + dst_target.offset.1,
+                    };
+                    self.copy_area_rop_cpu(
+                        src,
+                        dst_target.id,
+                        sub_src,
+                        dst_pos,
+                        function,
+                        plane_mask,
+                        dst_depth,
+                    );
+                }
+                self.scene.wake_for_damage();
+                return Ok(());
+            }
+        }
         // Stage 5 Task 3 POC: route copy_area to COW through the
         // frame-builder path. Marco's compositor pump is the hot
         // workload (silence trace: 47k of 62k copy_areas target
@@ -10325,13 +10599,42 @@ impl Backend for KmsBackendV2 {
         // GC clipping is honoured upstream by `clear_clip_rectangles`
         // when the dispatcher zeroes the clip (the MIT-SHM /
         // ImageText callers do this); Stage 2c's engine ignores
-        // the GC's clip rectangles otherwise. Stage 3 plugs
-        // RENDER + planemask + GC.function back in.
-        if !matches!(
-            self.core.current_function,
-            yserver_core::backend::GcFunction::Copy,
-        ) {
-            self.log_v2_gap("put_image_non_gxcopy");
+        // the GC's clip rectangles otherwise.
+        // GC function + plane-mask (X11 §PutImage combines the wire
+        // image with the destination through the full rop set):
+        // non-Copy or partial plane-mask takes the CPU
+        // read-modify-write path; NoOp is a spec no-op.
+        {
+            use yserver_core::backend::GcFunction;
+            let function = self.core.current_function;
+            if matches!(function, GcFunction::NoOp) {
+                return Ok(());
+            }
+            let dst_depth = self.store.get(target.id).map_or(depth, |d| d.depth);
+            let full_mask = depth_plane_mask(dst_depth);
+            let plane_mask = self.core.current_plane_mask & full_mask;
+            if plane_mask == 0 {
+                return Ok(());
+            }
+            if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
+                self.put_image_rop_cpu(
+                    target.id,
+                    ash::vk::Offset2D {
+                        x: i32::from(dst_x) + target.offset.0,
+                        y: i32::from(dst_y) + target.offset.1,
+                    },
+                    width,
+                    height,
+                    data,
+                    depth,
+                    function,
+                    plane_mask,
+                );
+                self.telemetry.record_paint_submit();
+                self.trace_simple(SubmitKind::PutImage, target.id, 1);
+                self.scene.wake_for_damage();
+                return Ok(());
+            }
         }
         if let Err(e) = self.engine.put_image(
             &mut self.store,
