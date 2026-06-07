@@ -1865,8 +1865,89 @@ fn handle_render_request(
                 );
             }
         }
-        31 | 36 => {
-            // CreateAnimCursor / CreateConicalGradient — stubs.
+        31 => {
+            // RENDER::CreateAnimCursor — body: cid(4), [cursor(4),
+            // delay(4)]*N. Port of Xorg
+            // `render/render.c::ProcRenderCreateAnimCursor:1783`:
+            // validate cid is a fresh client-range xid, validate every
+            // sub-cursor exists, register the cid as a real Cursor
+            // resource so downstream CWA(CWCursor=this) /
+            // XFixesSetCursorName / DefineCursor see a live xid.
+            //
+            // Frame animation is not implemented yet: the new cursor
+            // inherits the FIRST sub-cursor's host_xid (static
+            // degeneration). The user sees the first frame instead of
+            // a spinning sequence, but the resource semantics are
+            // correct and there is no BadCursor on subsequent CWA.
+            // Previously this arm was a stub that silently dropped
+            // the xid — combined with the BadCursor gate in
+            // handle_change_window_attributes, that wedged caja /
+            // thunar on every app launch via marco's busy-cursor
+            // path.
+            if body.len() < 12 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            let validation_failed = {
+                let handle = state.clients.get(&client_id.0).expect("client registered");
+                let owned = crate::server::IdAllocator::validate_owned(
+                    cursor_id.0,
+                    handle.resource_id_base,
+                    handle.resource_id_mask,
+                );
+                !owned || state.resources.xid_in_use(cursor_id)
+            };
+            if validation_failed {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ID_CHOICE,
+                    cursor_id.0,
+                    header.opcode,
+                );
+            }
+            let pairs = &body[4..];
+            if pairs.is_empty() || pairs.len() % 8 != 0 {
+                // Malformed list — match Xorg's `BadLength` shape via
+                // the existing length validator above (`request_lengths`).
+                // Falling through preserves prior behaviour for malformed
+                // bodies without inventing a new error path.
+                return Ok(RequestOutcome::Handled);
+            }
+            let mut first_host: Option<u32> = None;
+            for chunk in pairs.chunks_exact(8) {
+                let sub = ResourceId(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                if !state.resources.cursor_exists(sub) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_CURSOR,
+                        sub.0,
+                        header.opcode,
+                    );
+                }
+                if first_host.is_none() {
+                    first_host = state.resources.cursor_host_xid(sub);
+                }
+            }
+            state.resources.create_glyph_cursor(client_id, cursor_id);
+            if let Some(host_raw) = first_host
+                && let Some(handle) = crate::backend::CursorHandle::from_raw(host_raw)
+            {
+                state.resources.set_cursor_host_xid(cursor_id, handle);
+            }
+            log::debug!(
+                "client {} RENDER::CreateAnimCursor cursor=0x{:x} (static \
+                 degeneration to first sub-cursor host_xid={:?})",
+                client_id.0,
+                cursor_id.0,
+                first_host,
+            );
+        }
+        36 => {
+            // CreateConicalGradient — stub.
         }
         32 => {
             // AddTraps — backend dispatch is a stub, but match the
@@ -13496,12 +13577,6 @@ fn handle_change_window_attributes(
             x11::error::BAD_CURSOR,
             cursor.0,
             2,
-        );
-    }
-    if let Some(cursor) = request.cursor {
-        debug!(
-            "client {} CWA cursor: window 0x{:x} ← cursor 0x{:x}",
-            client_id.0, request.window.0, cursor.0
         );
     }
     if let Some(bg_pixmap) = request.background_pixmap {
