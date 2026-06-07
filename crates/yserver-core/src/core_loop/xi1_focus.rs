@@ -69,23 +69,18 @@ pub fn device_focus(state: &ServerState, deviceid: u16) -> Xi1DeviceFocus {
 
 /// Resolve a raw focus value to a delivery target. `FollowKeyboard`
 /// follows the core keyboard focus (Xorg `FollowKeyboardWin` →
-/// `inputInfo.keyboard->focus->win`); yserver's core focus has no
-/// PointerRoot representation — `focused_window == ROOT_WINDOW` is the
-/// "nothing explicitly focused" initial state, which behaves as
-/// PointerRoot for key delivery, so map it there.
+/// `inputInfo.keyboard->focus->win`), which carries its own
+/// None/PointerRoot/window distinction in `state.core_focus`.
 #[must_use]
 pub fn resolve_focus(state: &ServerState, raw: u32) -> Xi1FocusTarget {
     match raw {
         FOCUS_NONE => Xi1FocusTarget::None,
         FOCUS_POINTER_ROOT => Xi1FocusTarget::PointerRoot,
-        FOCUS_FOLLOW_KEYBOARD => {
-            let core = crate::core_loop::key_fanout::current_focus(state);
-            if core == ROOT_WINDOW {
-                Xi1FocusTarget::PointerRoot
-            } else {
-                Xi1FocusTarget::Window(core)
-            }
-        }
+        FOCUS_FOLLOW_KEYBOARD => match state.core_focus.raw {
+            0 => Xi1FocusTarget::None,
+            1 => Xi1FocusTarget::PointerRoot,
+            w => Xi1FocusTarget::Window(ResourceId(w)),
+        },
         w => Xi1FocusTarget::Window(ResourceId(w)),
     }
 }
@@ -1011,6 +1006,7 @@ mod tests {
         assert_eq!(key_delivery_route(&state, DEV), (win, Xi1FocusRoute::Walk),);
         // ...and with a core focus set, it follows it.
         state.pointer_root = (0, 0);
+        state.core_focus.raw = win.0;
         for c in state.clients.values_mut() {
             c.focused_window = win;
         }

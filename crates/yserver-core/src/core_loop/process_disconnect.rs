@@ -275,6 +275,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         crate::core_loop::process_request::reset_idletime_state_after_suspend_release(state);
     }
     state.button_grabs.retain(|g| g.owner != client_id);
+    state.key_grabs.retain(|g| g.owner != client_id);
     if state
         .pointer_grab
         .is_some_and(|(owner, _)| owner == client_id)
@@ -283,6 +284,22 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
         state.frozen_pointer_queue.clear();
+    }
+    // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
+    // client's ACTIVE grabs must go too, or the stale record makes
+    // every later GrabPointer/GrabKeyboard return AlreadyGrabbed.
+    if state
+        .active_pointer_grab
+        .is_some_and(|g| g.owner == client_id)
+    {
+        state.active_pointer_grab = None;
+    }
+    if state
+        .active_keyboard_grab
+        .is_some_and(|g| g.owner == client_id)
+    {
+        state.active_keyboard_grab = None;
+        state.frozen_keyboard_event = None;
     }
     // XI 1.x grab teardown: drop the client's passive grabs, release
     // its active device grabs, and thaw any devices its grabs froze —

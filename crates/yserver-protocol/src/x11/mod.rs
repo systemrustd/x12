@@ -2591,8 +2591,9 @@ pub fn write_get_input_focus_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     focus: ResourceId,
+    revert_to: u8,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(byte_order, sequence, 1, 0);
+    let mut reply = fixed_reply(byte_order, sequence, revert_to, 0);
     write_u32(byte_order, &mut reply, focus.0);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)

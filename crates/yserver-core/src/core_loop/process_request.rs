@@ -22,9 +22,7 @@
 use std::{collections::HashSet, io, os::fd::OwnedFd};
 
 use log::{debug, trace};
-use yserver_protocol::x11::{
-    self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
-};
+use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
 
 use crate::{
     backend::{Backend, OriginContext, params::FillState},
@@ -43,7 +41,6 @@ use crate::{
         key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::pointer_event_fanout_to_state,
     },
-    crossings::{CrossingKind as TreeCrossingKind, normal_mode_crossings},
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
     server::{ScreenSaverActive, ServerState, XI_FIRST_EVENT},
@@ -249,12 +246,12 @@ pub fn process_request(
         40 => handle_translate_coordinates(state, client_id, sequence, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
         26 => handle_grab_pointer(state, backend, origin, client_id, sequence, header, body),
-        27 => handle_ungrab_pointer(state, backend, origin, client_id, sequence),
+        27 => handle_ungrab_pointer(state, backend, origin, client_id, sequence, body),
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
-        31 => handle_grab_keyboard(state, backend, origin, client_id, sequence, body),
-        32 => handle_ungrab_keyboard(state, backend, origin, client_id, sequence),
+        31 => handle_grab_keyboard(state, backend, origin, client_id, sequence, header, body),
+        32 => handle_ungrab_keyboard(state, backend, origin, client_id, sequence, body),
         33 => handle_grab_key(state, client_id, sequence, header, body),
         34 => handle_ungrab_key(state, client_id, sequence, header, body),
         // ── font / size queries (pure state-read replies) ──
@@ -323,8 +320,8 @@ pub fn process_request(
         76 => handle_image_text8(state, backend, origin, client_id, sequence, header, body),
         77 => handle_image_text16(state, backend, origin, client_id, sequence, header, body),
         // ── focus + AllowEvents ──
-        42 => handle_set_input_focus(state, client_id, sequence, body),
-        35 => handle_allow_events(state, backend, client_id, sequence, header),
+        42 => handle_set_input_focus(state, client_id, sequence, header, body),
+        35 => handle_allow_events(state, backend, client_id, sequence, header, body),
         // ── extension queries ──
         98 => handle_query_extension(state, backend, client_id, sequence, body),
         99 => handle_list_extensions(state, backend, client_id, sequence),
@@ -1150,6 +1147,15 @@ fn destroy_window_subtree(
     crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
     let mut order: Vec<ResourceId> = Vec::new();
     collect_destroy_order(&state.resources, root, &mut order);
+    // Core focus inside the dying subtree reverts before teardown —
+    // Xorg DeleteWindowFromAnyEvents, same shape as the XI1 revert
+    // above (the RevertToParent walk needs the surviving ancestors).
+    if state.core_focus.raw > 1 {
+        let focus_win = ResourceId(state.core_focus.raw);
+        if order.contains(&focus_win) {
+            revert_core_focus_from(state, focus_win, &order);
+        }
+    }
     let mut pending: Vec<PendingDestroy> = Vec::new();
     for w in &order {
         let (parent, was_mapped, host_xid) =
@@ -1297,6 +1303,10 @@ fn destroy_window_subtree(
         }
         fanout_destroy_sequence_to_state(state, &entry);
     }
+    // Active core grabs whose grab window just died deactivate (Xorg
+    // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
+    // the resource table now, so the viewability probe sees them off.
+    release_core_grabs_for_unviewable(state, backend, origin);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -13370,13 +13380,6 @@ fn handle_create_window(
             // until the backing-pixmap path lands.
         }
     }
-    if window_wants_keyboard_focus(state, client_id, window_id) {
-        debug!(
-            "focus decision: client {} CreateWindow focus 0x{:x}",
-            client_id.0, window_id.0
-        );
-        set_focused_window_to_state(state, client_id, window_id);
-    }
     // CreateNotify on parent (SubstructureNotify subscribers).
     let create_notify_targets = subscribers_by_id(state, parent, 0x0008_0000);
     if !create_notify_targets.is_empty() {
@@ -13573,14 +13576,6 @@ fn handle_change_window_attributes(
     // `_NET_WM_MOVERESIZE` drag stole focus to that window, which then
     // turned the dragged app's own child-focus move into a
     // `FocusOut(Nonlinear)` (GTK4 backdrop) and broke the drag.
-    if request.event_mask.is_some() && window_wants_keyboard_focus(state, client_id, target_window)
-    {
-        debug!(
-            "focus decision: client {} ChangeWindowAttributes focus 0x{:x}",
-            client_id.0, target_window.0
-        );
-        set_focused_window_to_state(state, client_id, target_window);
-    }
 
     if target_window != ROOT_WINDOW
         && (request.background_pixel.is_some() || request.background_pixmap.is_some())
@@ -13646,66 +13641,6 @@ fn handle_change_window_attributes(
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
-}
-
-fn window_is_desktop_window_type(state: &mut ServerState, window_id: ResourceId) -> bool {
-    let window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
-    let desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
-    let Some(property) = state.resources.window_property(window_id, window_type) else {
-        return false;
-    };
-    if property.format != properties::PropertyFormat::F32 || !property.data.len().is_multiple_of(4)
-    {
-        return false;
-    }
-    property
-        .data
-        .chunks_exact(4)
-        .map(|chunk| AtomId(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
-        .any(|atom| atom == desktop)
-}
-
-fn window_wants_input_focus_hint(state: &mut ServerState, window_id: ResourceId) -> bool {
-    let wm_hints = AtomId(35);
-    let Some(property) = state.resources.window_property(window_id, wm_hints) else {
-        return false;
-    };
-    if property.format != properties::PropertyFormat::F32 || property.data.len() < 8 {
-        return false;
-    }
-
-    // `WM_HINTS` is a client-supplied 32-bit property. We do not
-    // persist its byte order, so accept either endianness here.
-    for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
-        let flags = x11::read_u32(byte_order, &property.data[0..4]);
-        let input = x11::read_u32(byte_order, &property.data[4..8]);
-        // Xlib's XWMHints uses `flags & InputHint` to mark `input`
-        // as meaningful; the field itself is a boolean.
-        if flags & 0x0000_0001 != 0 && input != 0 {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn window_wants_keyboard_focus(
-    state: &mut ServerState,
-    client_id: ClientId,
-    window_id: ResourceId,
-) -> bool {
-    let mask = state
-        .clients
-        .get(&client_id.0)
-        .and_then(|c| c.event_masks.get(&window_id).copied())
-        .unwrap_or(0);
-    let viewable = state
-        .resources
-        .window(window_id)
-        .is_some_and(|w| w.map_state == MapState::Viewable);
-    viewable
-        && !window_is_desktop_window_type(state, window_id)
-        && ((mask & 0x3) != 0 || window_wants_input_focus_hint(state, window_id))
 }
 
 fn window_host_xid(state: &ServerState, window: ResourceId) -> u32 {
@@ -14174,87 +14109,6 @@ fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'static str> {
         .collect()
 }
 
-/// Update `client.focused_window` and emit the FocusOut/FocusIn pair to
-/// FocusChange-mask subscribers. Mirrors `nested::set_focused_window`
-/// against the per-client `focused_window` field added in A1.
-fn set_focused_window_to_state(state: &mut ServerState, client_id: ClientId, window: ResourceId) {
-    if window == ResourceId(0) {
-        log::trace!(
-            "set_focused_window: client {} -> NONE (ignored)",
-            client_id.0
-        );
-        return;
-    }
-    // Focus is a single global value in X11 — every client's
-    // GetInputFocus should observe the same target. The
-    // `ClientState::focused_window` field is mirrored across clients
-    // (the docstring on `current_focus` describes this) so the key
-    // fanout's walk-clients-find-first-non-root pick is well-defined.
-    // Without the mirror, multi-client sessions where the WM and the
-    // app both call SetInputFocus on their own internal windows make
-    // `current_focus` return whichever client's row HashMap iteration
-    // visits first — typically the WM, so keys never reach the app.
-    let prev = match state.clients.get(&client_id.0) {
-        Some(c) if c.focused_window == window => return,
-        Some(c) => c.focused_window,
-        None => return,
-    };
-    log::trace!(
-        "set_focused_window: client {} prev=0x{:x} -> 0x{:x} (mirroring to {} clients)",
-        client_id.0,
-        prev.0,
-        window.0,
-        state.clients.len(),
-    );
-    for c in state.clients.values_mut() {
-        c.focused_window = window;
-    }
-    let (ptr_x, ptr_y) = state.pointer_root;
-    let crossings = normal_mode_crossings(state, prev, window);
-    if crossings.is_empty() {
-        let _dropped =
-            emit_window_event_to_state(state, window, FOCUS_CHANGE_MASK, |buf, seq, order| {
-                x11::encode_focus_event(buf, seq, order, true, window);
-            });
-        let _dropped =
-            emit_xi2_focus_event_to_state(state, window, 9, XI2_MAJOR_OPCODE, 0, 0, ptr_x, ptr_y);
-        return;
-    }
-    for crossing in crossings {
-        if crossing.window == ROOT_WINDOW {
-            continue;
-        }
-        let focus_in = matches!(crossing.kind, TreeCrossingKind::Enter);
-        let evtype = if focus_in { 9 } else { 10 };
-        let _dropped = emit_window_event_to_state(
-            state,
-            crossing.window,
-            FOCUS_CHANGE_MASK,
-            |buf, seq, order| {
-                x11::encode_focus_event_with_mode_detail(
-                    buf,
-                    seq,
-                    order,
-                    focus_in,
-                    crossing.window,
-                    0,
-                    crossing.detail,
-                );
-            },
-        );
-        let _dropped = emit_xi2_focus_event_to_state(
-            state,
-            crossing.window,
-            evtype,
-            XI2_MAJOR_OPCODE,
-            0,
-            crossing.detail,
-            ptr_x,
-            ptr_y,
-        );
-    }
-}
-
 fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
     if requested != 0 {
         return requested;
@@ -14719,17 +14573,19 @@ fn handle_get_input_focus(
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetInputFocus", client_id.0, sequence.0);
+    let focus = state.core_focus;
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    let focus = if client.focused_window == ResourceId(0) {
-        ROOT_WINDOW
-    } else {
-        client.focused_window
-    };
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_input_focus_reply(&mut buf, byte_order, sequence, focus)?;
+    x11::write_get_input_focus_reply(
+        &mut buf,
+        byte_order,
+        sequence,
+        ResourceId(focus.raw),
+        focus.revert_to,
+    )?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -16475,8 +16331,6 @@ fn handle_image_text8(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
-        debug!("focus text drawable 0x{drawable_raw:x}");
-        set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
         if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
@@ -16513,8 +16367,6 @@ fn handle_image_text16(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some((drawable_raw, gc_id, text_body)) = x11::image_text8_data(body) {
-        debug!("focus text drawable 0x{drawable_raw:x}");
-        set_focused_window_to_state(state, client_id, ResourceId(drawable_raw));
         let drawable = ResourceId(drawable_raw);
         if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, ResourceId(gc_id))
         {
@@ -16647,23 +16499,6 @@ fn handle_map_window(
         // (sets it back to false) must land last.
         maybe_activate_child_under_redirected_parent(state, backend, origin, window);
         reapply_redirect_mode_after_map(state, backend, origin, window);
-    }
-
-    let wants_focus = {
-        let mask = state
-            .clients
-            .get(&client_id.0)
-            .and_then(|c| c.event_masks.get(&window).copied())
-            .unwrap_or(0);
-        let viewable = state
-            .resources
-            .window(window)
-            .is_some_and(|w| w.map_state == MapState::Viewable);
-        viewable && (mask & 0x3) != 0
-    };
-    if wants_focus {
-        debug!("focus key window 0x{:x}", window.0);
-        set_focused_window_to_state(state, client_id, window);
     }
 
     if let Some((parent, override_redir)) = map_info {
@@ -16804,13 +16639,6 @@ fn handle_map_subwindows(
             // children-on-show) also notify subscribed compositors.
             let _dropped = accumulate_damage_full_to_state(state, child);
         }
-        if window_wants_keyboard_focus(state, client_id, child) {
-            debug!(
-                "focus decision: client {} MapSubwindows focus 0x{:x}",
-                client_id.0, child.0
-            );
-            set_focused_window_to_state(state, client_id, child);
-        }
         if was_unmapped {
             let _dropped =
                 emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
@@ -16913,6 +16741,13 @@ fn handle_unmap_window(
             // DeleteDeviceFromAnyExtEvents). After UnmapNotify, matching
             // Xorg's UnmapWindow → UnrealizeTree ordering.
             crate::core_loop::xi1_focus::revert_unviewable_focus(state);
+            // Core focus likewise (Xorg UnrealizeTree →
+            // DeleteWindowFromAnyEvents): covers the focus window
+            // itself or any unmapped ancestor.
+            revert_core_focus_if_unviewable(state);
+            // Active grabs on a window that just became unviewable
+            // deactivate too (same Xorg path).
+            release_core_grabs_for_unviewable(state, backend, origin);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -16966,6 +16801,8 @@ fn handle_unmap_subwindows(
         });
     }
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
+    revert_core_focus_if_unviewable(state);
+    release_core_grabs_for_unviewable(state, backend, origin);
     debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -17360,12 +17197,46 @@ fn handle_allow_events(
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     // Core AllowEvents modes (X11 spec):
     //   0 AsyncPointer  1 SyncPointer   2 ReplayPointer
     //   3 AsyncKeyboard 4 SyncKeyboard  5 ReplayKeyboard
     //   6 AsyncBoth     7 SyncBoth
     let mode = header.data;
+    if mode > 7 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(mode),
+            35,
+        );
+    }
+    // Xorg AllowSome: the request is a no-op when its time is LATER
+    // than the current time or EARLIER than the client's grab time
+    // (XAllowEvents-12/13). Pointer modes gate on the pointer's grab
+    // time, keyboard and *Both modes on the keyboard's.
+    let time = body
+        .get(0..4)
+        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let grab_time = if matches!(mode, 0..=2) {
+        state.last_pointer_grab_time
+    } else {
+        state.last_keyboard_grab_time
+    };
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(grab_time);
+    if time != 0 && (time > now || time < grab_time) {
+        debug!(
+            "client {} #{} AllowEvents ignored (time {time} outside [{grab_time}, {now}])",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     debug!(
         "client {} #{} AllowEvents mode={} frozen_pointer={} frozen_keyboard={}",
         client_id.0,
@@ -17488,17 +17359,199 @@ fn handle_set_input_focus(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(window) = x11::input_focus_window(body) {
+        // Validation per Xorg SetInputFocus (dix/events.c): revert_to
+        // ∈ {None, PointerRoot, Parent} else BadValue; a focus window
+        // (anything other than None(0)/PointerRoot(1)) must exist
+        // (BadWindow) and be viewable (BadMatch).
+        let revert_to = header.data;
+        if revert_to > 2 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(revert_to),
+                42,
+            );
+        }
+        if window.0 > 1 {
+            let Some(w) = state.resources.window(window) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window.0,
+                    42,
+                );
+            };
+            if w.map_state != crate::resources::MapState::Viewable {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    window.0,
+                    42,
+                );
+            }
+        }
+        // Xorg SetInputFocus: requests with a time LATER than the
+        // current time or EARLIER than the last focus time are
+        // silently ignored.
+        let time = body
+            .get(4..8)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let now = state
+            .timestamp_now()
+            .max(state.xi1_last_input_time)
+            .max(state.core_focus.time);
+        if time != 0 && (time > now || time < state.core_focus.time) {
+            debug!(
+                "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
+                client_id.0, sequence.0, state.core_focus.time
+            );
+            return Ok(RequestOutcome::Handled);
+        }
         debug!(
-            "focus decision: client {} SetInputFocus 0x{:x}",
+            "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
             client_id.0, window.0
         );
-        set_focused_window_to_state(state, client_id, window);
+        let from_raw = state.core_focus.raw;
+        let to_raw = window.0;
+        if from_raw != to_raw {
+            emit_core_focus_transition(state, from_raw, to_raw, 0);
+        }
+        state.core_focus = crate::server::CoreFocus {
+            raw: to_raw,
+            revert_to,
+            time: if time == 0 { now } else { time },
+        };
+        // Legacy mirror — the key fanout's `current_focus` and other
+        // readers still consult the per-client field; None/PointerRoot
+        // map to ROOT_WINDOW there (the fanout resolves PointerRoot
+        // through `state.core_focus` directly).
+        let mirror = match to_raw {
+            0 | 1 => ROOT_WINDOW,
+            w => ResourceId(w),
+        };
+        for c in state.clients.values_mut() {
+            c.focused_window = mirror;
+        }
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Focus revert when the focus window (or an ancestor) becomes
+/// unviewable or is destroyed — Xorg `DeleteWindowFromAnyEvents`
+/// (dix/events.c:5889-5931), reached from both `UnrealizeTree`
+/// (unmap) and window deletion. Reverts per `revert_to`: None →
+/// None; PointerRoot → PointerRoot; Parent → nearest viewable
+/// ancestor, and `revert_to` collapses to RevertToNone.
+fn revert_core_focus_from(state: &mut ServerState, win: ResourceId, dying: &[ResourceId]) {
+    if state.core_focus.raw != win.0 || win == ROOT_WINDOW {
+        return;
+    }
+    let mode = if state.active_keyboard_grab.is_some() {
+        3 // NotifyWhileGrabbed
+    } else {
+        0 // NotifyNormal
+    };
+    let (to_raw, new_revert) = match state.core_focus.revert_to {
+        2 => {
+            // RevertToParent: the nearest surviving viewable ancestor
+            // (Xorg's `while (!parent->realized)` walk — `dying`
+            // marks windows in a subtree being destroyed, which are
+            // still Viewable at this point but won't survive).
+            let mut parent = state
+                .resources
+                .window(win)
+                .map_or(ROOT_WINDOW, |w| w.parent);
+            loop {
+                if parent == ROOT_WINDOW {
+                    break;
+                }
+                let Some(w) = state.resources.window(parent) else {
+                    parent = ROOT_WINDOW;
+                    break;
+                };
+                if w.map_state == crate::resources::MapState::Viewable && !dying.contains(&parent) {
+                    break;
+                }
+                if w.parent == parent {
+                    break;
+                }
+                parent = w.parent;
+            }
+            (parent.0, 0)
+        }
+        1 => (1, state.core_focus.revert_to),
+        _ => (0, state.core_focus.revert_to),
+    };
+    emit_core_focus_transition(state, win.0, to_raw, mode);
+    state.core_focus.raw = to_raw;
+    state.core_focus.revert_to = new_revert;
+    let mirror = match to_raw {
+        0 | 1 => ROOT_WINDOW,
+        w => ResourceId(w),
+    };
+    for c in state.clients.values_mut() {
+        c.focused_window = mirror;
+    }
+}
+
+/// Unmap-side focus revert: fire `revert_core_focus_from` when the
+/// focus window stopped being viewable (covers an unmapped ancestor —
+/// Xorg unrealizes the whole tree and hits the focus check per child).
+fn revert_core_focus_if_unviewable(state: &mut ServerState) {
+    let raw = state.core_focus.raw;
+    if raw <= 1 {
+        return;
+    }
+    let viewable = state
+        .resources
+        .window(ResourceId(raw))
+        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+    if !viewable {
+        revert_core_focus_from(state, ResourceId(raw), &[]);
+    }
+}
+
+/// Emit the FocusOut/FocusIn chain for a core focus transition
+/// (`crate::crossings::focus_transition_events`) through the normal
+/// per-window event-mask filter, plus the matching XI2 focus events
+/// on the endpoint windows. `mode` is the wire NotifyNormal(0) /
+/// NotifyWhileGrabbed(3) / NotifyGrab(1) / NotifyUngrab(2) value.
+fn emit_core_focus_transition(state: &mut ServerState, from_raw: u32, to_raw: u32, mode: u8) {
+    let pointer_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+    let events = crate::crossings::focus_transition_events(state, from_raw, to_raw, pointer_win);
+    let (ptr_x, ptr_y) = state.pointer_root;
+    for e in events {
+        let _dropped =
+            emit_window_event_to_state(state, e.window, FOCUS_CHANGE_MASK, |buf, seq, order| {
+                x11::encode_focus_event_with_mode_detail(
+                    buf, seq, order, e.focus_in, e.window, mode, e.detail,
+                );
+            });
+        // XI2 mirrors only the real FocusIn/FocusOut pairs (evtype
+        // 9/10) on the windows the core chain touches.
+        let evtype = if e.focus_in { 9 } else { 10 };
+        let _dropped = emit_xi2_focus_event_to_state(
+            state,
+            e.window,
+            evtype,
+            XI2_MAJOR_OPCODE,
+            mode,
+            e.detail,
+            ptr_x,
+            ptr_y,
+        );
+    }
 }
 
 fn handle_get_image(
@@ -20411,18 +20464,6 @@ fn handle_change_property(
             x11::encode_property_notify_event(buf, seq, order, window, property, timestamp, false);
         },
     );
-    if state
-        .atoms
-        .name(req.property)
-        .is_some_and(|name| name == "WM_HINTS")
-        && window_wants_keyboard_focus(state, client_id, req.window)
-    {
-        debug!(
-            "focus decision: client {} WM_HINTS focus 0x{:x}",
-            client_id.0, req.window.0
-        );
-        set_focused_window_to_state(state, client_id, req.window);
-    }
     debug!("client {} #{} ChangeProperty", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -20656,6 +20697,18 @@ fn handle_query_best_size(
     Ok(write_to_client(client, client_id, &buf))
 }
 
+/// Core pointer-grab event mask: ButtonPress..KeymapState — X.h
+/// `PointerGrabMask`. Requests selecting bits outside this set get
+/// `BadValue` (Xorg `ProcGrabPointer` / `ProcGrabButton` /
+/// `ProcChangeActivePointerGrab`).
+const POINTER_GRAB_MASK: u32 = 0x7FFC;
+/// X.h `AnyModifier` — wire encoding 1<<15.
+const ANY_MODIFIER: u16 = 0x8000;
+/// X.h `AllModifiersMask` — Shift..Mod5, the 8 real modifier bits.
+/// `modifiers` values outside this (other than `AnyModifier`) get
+/// `BadValue` (Xorg `CheckGrabValues`).
+const ALL_MODIFIERS_MASK: u16 = 0x00FF;
+
 fn handle_grab_pointer(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -20665,6 +20718,7 @@ fn handle_grab_pointer(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let mut status: u8 = 0;
     if body.len() >= 20 {
         // GrabPointer wire shape: header opcode/data/length, then
         // window(4) event-mask(2) pointer-mode(1) keyboard-mode(1)
@@ -20674,57 +20728,172 @@ fn handle_grab_pointer(
         let owner_events = header.data != 0;
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let event_mask = u16::from_le_bytes([body[4], body[5]]);
+        let confine_to = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
         let cursor = ResourceId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
         let time = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
-        let prev_grab_window = state
+        // Validation, in Xorg's order (ProcGrabPointer → GrabDevice):
+        // eventMask → confine_to lookup → keyboard/pointer mode →
+        // owner_events → grab_window lookup → cursor lookup.
+        if u32::from(event_mask) & !POINTER_GRAB_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(event_mask),
+                26,
+            );
+        }
+        if confine_to.0 != 0 && state.resources.window(confine_to).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                confine_to.0,
+                26,
+            );
+        }
+        if body[7] > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(body[7]),
+                26,
+            );
+        }
+        if body[6] > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(body[6]),
+                26,
+            );
+        }
+        if header.data > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(header.data),
+                26,
+            );
+        }
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                26,
+            );
+        }
+        if cursor.0 != 0 && !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                26,
+            );
+        }
+        // Grab status, in Xorg GrabDevice's check order (X.h values:
+        // GrabSuccess 0, AlreadyGrabbed 1, GrabInvalidTime 2,
+        // GrabNotViewable 3, GrabFrozen 4). Failure leaves all grab
+        // state untouched.
+        let now = state
+            .timestamp_now()
+            .max(state.xi1_last_input_time)
+            .max(state.last_pointer_grab_time);
+        let viewable = state
+            .resources
+            .window(grab_window)
+            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        let confine_viewable = confine_to.0 == 0
+            || state
+                .resources
+                .window(confine_to)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        let grabbed_by_other = state
             .active_pointer_grab
-            .filter(|g| g.owner == client_id)
-            .map(|g| g.grab_window);
-        state.pointer_grab = Some((client_id, grab_window));
-        state.pointer_grab_is_passive = false;
-        state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
-            owner: client_id,
-            grab_window,
-            event_mask,
-            cursor,
-            time,
-            owner_events,
-            via_xi2: false,
-        });
-        // Core↔XI bridge (Xorg has ONE deviceGrab per device): a core
-        // sync grab freezes the device's XI1 event stream too — XTS
-        // XAllowDeviceEvents-3 freezes via XGrabPointer(GrabModeSync)
-        // and thaws via XAllowDeviceEvents. body[6]=pointer_mode,
-        // body[7]=keyboard_mode (0 = GrabModeSync).
-        crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
-            state,
-            crate::xinput::DEVICEID_SLAVE_POINTER,
-            client_id,
-            body[6] == 0,
-            body[7] == 0,
-        );
-        // Synthesised crossings on grab activation — marco's title-bar
-        // popup menu uses core GrabPointer/GrabKeyboard (not XI2). GTK3
-        // popup machinery needs Leave(mode=NotifyGrab) on the previous
-        // grab window followed by Enter(mode=NotifyGrab) on the new
-        // grab window. Same shape as the XI2 path; see comments there.
-        emit_core_grab_activation_crossings(
-            state,
-            backend,
-            origin,
-            client_id,
-            prev_grab_window,
-            grab_window,
-            CrossingKind::Pointer,
-        );
+            .is_some_and(|g| g.owner != client_id)
+            || state.pointer_grab.is_some_and(|(c, _)| c != client_id);
+        // Frozen on behalf of another client's grab on the paired
+        // device (Xorg: sync.frozen && sync.other && !SameClient).
+        let frozen_by_other = state
+            .xi1_frozen
+            .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+            .is_some_and(|f| f.frozen() && f.other.is_some_and(|c| c != client_id));
+        if grabbed_by_other {
+            status = 1; // AlreadyGrabbed
+        } else if !viewable || !confine_viewable {
+            status = 3; // GrabNotViewable
+        } else if time != 0 && (time < state.last_pointer_grab_time || time > now) {
+            status = 2; // GrabInvalidTime
+        } else if frozen_by_other {
+            status = 4; // GrabFrozen
+        } else {
+            let prev_grab_window = state
+                .active_pointer_grab
+                .filter(|g| g.owner == client_id)
+                .map(|g| g.grab_window);
+            state.pointer_grab = Some((client_id, grab_window));
+            state.pointer_grab_is_passive = false;
+            state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+                owner: client_id,
+                grab_window,
+                event_mask,
+                cursor,
+                time,
+                owner_events,
+                via_xi2: false,
+            });
+            state.last_pointer_grab_time = if time == 0 { now } else { time };
+            // Core↔XI bridge (Xorg has ONE deviceGrab per device): a core
+            // sync grab freezes the device's XI1 event stream too — XTS
+            // XAllowDeviceEvents-3 freezes via XGrabPointer(GrabModeSync)
+            // and thaws via XAllowDeviceEvents. body[6]=pointer_mode,
+            // body[7]=keyboard_mode (0 = GrabModeSync).
+            crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+                state,
+                crate::xinput::DEVICEID_SLAVE_POINTER,
+                client_id,
+                body[6] == 0,
+                body[7] == 0,
+            );
+            // Synthesised crossings on grab activation — marco's title-bar
+            // popup menu uses core GrabPointer/GrabKeyboard (not XI2). GTK3
+            // popup machinery needs Leave(mode=NotifyGrab) on the previous
+            // grab window followed by Enter(mode=NotifyGrab) on the new
+            // grab window. Same shape as the XI2 path; see comments there.
+            emit_core_grab_activation_crossings(
+                state,
+                backend,
+                origin,
+                client_id,
+                prev_grab_window,
+                grab_window,
+                CrossingKind::Pointer,
+            );
+        }
     }
-    debug!("client {} #{} GrabPointer", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} GrabPointer status={status}",
+        client_id.0, sequence.0
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_grab_reply(&mut buf, byte_order, sequence, 0)?;
+    x11::write_grab_reply(&mut buf, byte_order, sequence, status)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -20846,7 +21015,50 @@ fn handle_ungrab_pointer(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    // Xorg ProcUngrabPointer: deactivate only when the request time is
+    // neither LATER than the current time nor EARLIER than the
+    // last-grab time, AND the active grab belongs to this client.
+    let time = body
+        .get(0..4)
+        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.last_pointer_grab_time);
+    if time != 0 && (time > now || time < state.last_pointer_grab_time) {
+        debug!(
+            "client {} #{} UngrabPointer ignored (time {time} outside [{}, {now}])",
+            client_id.0, sequence.0, state.last_pointer_grab_time
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    let held_by_client = state
+        .active_pointer_grab
+        .is_some_and(|g| g.owner == client_id)
+        || state.pointer_grab.is_some_and(|(c, _)| c == client_id);
+    if !held_by_client {
+        debug!(
+            "client {} #{} UngrabPointer ignored (no grab held by client)",
+            client_id.0, sequence.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    deactivate_core_pointer_grab(state, backend, origin, client_id);
+    debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
+    Ok(RequestOutcome::Handled)
+}
+
+/// Tear down the active core pointer grab held by `client_id` —
+/// shared by UngrabPointer and the unmap/destroy deactivation path
+/// (Xorg `DeactivateGrab` reached from `DeleteWindowFromAnyEvents`).
+fn deactivate_core_pointer_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+) {
     let prev_grab_window = state
         .active_pointer_grab
         .filter(|g| g.owner == client_id)
@@ -20872,8 +21084,6 @@ fn handle_ungrab_pointer(
             CrossingKind::Pointer,
         );
     }
-    debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
 }
 
 fn emit_core_grab_deactivation_crossing(
@@ -20958,8 +21168,113 @@ fn handle_grab_button(
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let event_mask = u32::from(u16::from_le_bytes([body[4], body[5]]));
         let pointer_mode = body[6];
+        let keyboard_mode = body[7];
+        let confine_to = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+        let cursor = ResourceId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
         let owner_events = header.data != 0;
         let modifiers = u16::from_le_bytes([body[18], body[19]]);
+        // Validation, in Xorg's ProcGrabButton order: pointer_mode →
+        // keyboard_mode → modifiers → owner_events → event_mask →
+        // grab_window → confine_to → cursor → conflicting-grab
+        // BadAccess (AddPassiveGrabToList).
+        if pointer_mode > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(pointer_mode),
+                28,
+            );
+        }
+        if keyboard_mode > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(keyboard_mode),
+                28,
+            );
+        }
+        if modifiers != ANY_MODIFIER && modifiers & !ALL_MODIFIERS_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(modifiers),
+                28,
+            );
+        }
+        if header.data > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(header.data),
+                28,
+            );
+        }
+        if event_mask & !POINTER_GRAB_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                event_mask,
+                28,
+            );
+        }
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                28,
+            );
+        }
+        if confine_to.0 != 0 && state.resources.window(confine_to).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                confine_to.0,
+                28,
+            );
+        }
+        if cursor.0 != 0 && !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                28,
+            );
+        }
+        // A passive grab that would override another client's grab on
+        // the same window is a BadAccess (Xorg GrabMatchesSecond via
+        // AddPassiveGrabToList): button details overlap when either
+        // side is AnyButton(0) or they are equal; modifiers likewise
+        // with AnyModifier. Core grabs only conflict with core grabs
+        // (grabtype mismatch never matches).
+        let conflicts = state.button_grabs.iter().any(|g| {
+            g.grab_window == grab_window
+                && g.owner != client_id
+                && !g.via_xi2
+                && (g.button == button || g.button == 0 || button == 0)
+                && (g.modifiers == modifiers
+                    || g.modifiers == ANY_MODIFIER
+                    || modifiers == ANY_MODIFIER)
+        });
+        if conflicts {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 28);
+        }
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
                 && g.grab_window == grab_window
@@ -20996,6 +21311,27 @@ fn handle_ungrab_button(
         let button = header.data;
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let modifiers = u16::from_le_bytes([body[4], body[5]]);
+        // Xorg ProcUngrabButton: modifiers BadValue → window BadWindow.
+        if modifiers != ANY_MODIFIER && modifiers & !ALL_MODIFIERS_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(modifiers),
+                29,
+            );
+        }
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                29,
+            );
+        }
         state.button_grabs.retain(|g| {
             !(g.owner == client_id
                 && g.grab_window == grab_window
@@ -21021,12 +21357,41 @@ fn handle_change_active_pointer_grab(
         let cursor = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let event_mask = u16::from_le_bytes([body[8], body[9]]);
-        if let Some(g) = state.active_pointer_grab.as_mut()
+        // Xorg ProcChangeActivePointerGrab: eventMask BadValue →
+        // cursor BadCursor; both fire even when no grab is active.
+        if u32::from(event_mask) & !POINTER_GRAB_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(event_mask),
+                30,
+            );
+        }
+        if cursor.0 != 0 && !state.resources.cursor_exists(cursor) {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_CURSOR,
+                cursor.0,
+                30,
+            );
+        }
+        // Xorg ProcChangeActivePointerGrab: no-op when the request
+        // time is LATER than current or EARLIER than the grab time.
+        let now = state
+            .timestamp_now()
+            .max(state.xi1_last_input_time)
+            .max(state.last_pointer_grab_time);
+        let time_ok = time == 0 || (time >= state.last_pointer_grab_time && time <= now);
+        if time_ok
+            && let Some(g) = state.active_pointer_grab.as_mut()
             && g.owner == client_id
         {
             g.event_mask = event_mask;
             g.cursor = cursor;
-            g.time = time;
         }
     }
     debug!(
@@ -21042,47 +21407,124 @@ fn handle_grab_keyboard(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let mut status: u8 = 0;
     if body.len() >= 12 {
         let grab_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        let prev_grab_window = state
+        // Validation per Xorg GrabDevice: keyboard_mode (body[9]) →
+        // pointer_mode (body[8]) → owner_events (header data byte) →
+        // grab_window lookup.
+        if body[9] > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(body[9]),
+                31,
+            );
+        }
+        if body[8] > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(body[8]),
+                31,
+            );
+        }
+        if header.data > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(header.data),
+                31,
+            );
+        }
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                31,
+            );
+        }
+        // Grab status, mirroring handle_grab_pointer (Xorg GrabDevice
+        // check order). Failure leaves all grab state untouched.
+        let time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        let now = state
+            .timestamp_now()
+            .max(state.xi1_last_input_time)
+            .max(state.last_keyboard_grab_time);
+        let viewable = state
+            .resources
+            .window(grab_window)
+            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        let grabbed_by_other = state
             .active_keyboard_grab
-            .filter(|g| g.owner == client_id)
-            .map(|g| g.grab_window);
-        state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
-            owner: client_id,
-            grab_window,
-            source: crate::server::ActiveKeyboardGrabSource::Explicit,
-            via_xi2: false,
-        });
-        // Core↔XI bridge — see handle_grab_pointer. GrabKeyboard wire:
-        // window(4) time(4) pointer_mode(1) keyboard_mode(1); this
-        // device = keyboard, other = pointer.
-        crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
-            state,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-            client_id,
-            body[9] == 0,
-            body[8] == 0,
-        );
-        emit_core_grab_activation_crossings(
-            state,
-            backend,
-            origin,
-            client_id,
-            prev_grab_window,
-            grab_window,
-            CrossingKind::Keyboard,
-        );
+            .is_some_and(|g| g.owner != client_id);
+        let frozen_by_other = state
+            .xi1_frozen
+            .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            .is_some_and(|f| f.frozen() && f.other.is_some_and(|c| c != client_id));
+        if grabbed_by_other {
+            status = 1; // AlreadyGrabbed
+        } else if !viewable {
+            status = 3; // GrabNotViewable
+        } else if time != 0 && (time < state.last_keyboard_grab_time || time > now) {
+            status = 2; // GrabInvalidTime
+        } else if frozen_by_other {
+            status = 4; // GrabFrozen
+        } else {
+            let prev_grab_window = state
+                .active_keyboard_grab
+                .filter(|g| g.owner == client_id)
+                .map(|g| g.grab_window);
+            state.active_keyboard_grab = Some(crate::server::ActiveKeyboardGrab {
+                owner: client_id,
+                grab_window,
+                source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                via_xi2: false,
+            });
+            state.last_keyboard_grab_time = if time == 0 { now } else { time };
+            // Core↔XI bridge — see handle_grab_pointer. GrabKeyboard wire:
+            // window(4) time(4) pointer_mode(1) keyboard_mode(1); this
+            // device = keyboard, other = pointer.
+            crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+                state,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                client_id,
+                body[9] == 0,
+                body[8] == 0,
+            );
+            emit_core_grab_activation_crossings(
+                state,
+                backend,
+                origin,
+                client_id,
+                prev_grab_window,
+                grab_window,
+                CrossingKind::Keyboard,
+            );
+        }
     }
-    debug!("client {} #{} GrabKeyboard", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} GrabKeyboard status={status}",
+        client_id.0, sequence.0
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_grab_reply(&mut buf, byte_order, sequence, 0)?;
+    x11::write_grab_reply(&mut buf, byte_order, sequence, status)?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -21092,7 +21534,38 @@ fn handle_ungrab_keyboard(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    // Time validation — see handle_ungrab_pointer (Xorg
+    // ProcUngrabKeyboard has the identical CompareTimeStamps gate).
+    let time = body
+        .get(0..4)
+        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.last_keyboard_grab_time);
+    if time != 0 && (time > now || time < state.last_keyboard_grab_time) {
+        debug!(
+            "client {} #{} UngrabKeyboard ignored (time {time} outside [{}, {now}])",
+            client_id.0, sequence.0, state.last_keyboard_grab_time
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    deactivate_core_keyboard_grab(state, backend, origin, client_id);
+    debug!("client {} #{} UngrabKeyboard", client_id.0, sequence.0);
+    Ok(RequestOutcome::Handled)
+}
+
+/// Tear down the active core keyboard grab held by `client_id` —
+/// shared by UngrabKeyboard and the unmap/destroy deactivation path
+/// (see [`deactivate_core_pointer_grab`]).
+fn deactivate_core_keyboard_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+) {
     let prev_grab_window = state
         .active_keyboard_grab
         .filter(|g| g.owner == client_id)
@@ -21102,6 +21575,7 @@ fn handle_ungrab_keyboard(
         .is_some_and(|g| g.owner == client_id)
     {
         state.active_keyboard_grab = None;
+        state.frozen_keyboard_event = None;
         // Core↔XI bridge: release any XI1-side hold the grab placed.
         crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
             state,
@@ -21119,8 +21593,33 @@ fn handle_ungrab_keyboard(
             CrossingKind::Keyboard,
         );
     }
-    debug!("client {} #{} UngrabKeyboard", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+}
+
+/// Xorg `DeleteWindowFromAnyEvents` grab leg: an active core grab
+/// whose grab window stopped being viewable (unmap of it or an
+/// ancestor, or destroy) deactivates. Call after the map-state /
+/// resource changes have landed.
+fn release_core_grabs_for_unviewable(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+) {
+    let viewable = |state: &ServerState, w: ResourceId| {
+        state
+            .resources
+            .window(w)
+            .is_some_and(|win| win.map_state == crate::resources::MapState::Viewable)
+    };
+    if let Some((owner, grab_window)) = state.pointer_grab
+        && !viewable(state, grab_window)
+    {
+        deactivate_core_pointer_grab(state, backend, origin, owner);
+    }
+    if let Some(g) = state.active_keyboard_grab
+        && !viewable(state, g.grab_window)
+    {
+        deactivate_core_keyboard_grab(state, backend, origin, g.owner);
+    }
 }
 
 fn handle_grab_key(
@@ -21132,6 +21631,87 @@ fn handle_grab_key(
 ) -> io::Result<RequestOutcome> {
     if let Some(req) = x11::parse_grab_key(body, header.data != 0) {
         let grab_window = ResourceId(req.grab_window);
+        // Validation per Xorg ProcGrabKey: CheckGrabValues (modes,
+        // owner_events, modifiers) → keycode range → grab_window
+        // lookup → conflicting-grab BadAccess.
+        if req.keyboard_mode > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.keyboard_mode),
+                33,
+            );
+        }
+        if req.pointer_mode > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.pointer_mode),
+                33,
+            );
+        }
+        if header.data > 1 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(header.data),
+                33,
+            );
+        }
+        if req.modifiers != ANY_MODIFIER && req.modifiers & !ALL_MODIFIERS_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.modifiers),
+                33,
+            );
+        }
+        // Keycode must be within the advertised [min_keycode,
+        // max_keycode] range (8..=255 — the setup reply's values) or
+        // AnyKey(0).
+        if req.keycode != 0 && req.keycode < 8 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.keycode),
+                33,
+            );
+        }
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                33,
+            );
+        }
+        // BadAccess when another client already holds an overlapping
+        // passive key grab on this window — see the GrabButton
+        // conflict check for the overlap rule.
+        let conflicts = state.key_grabs.iter().any(|g| {
+            g.grab_window == grab_window
+                && g.owner != client_id
+                && !g.via_xi2
+                && (g.keycode == req.keycode || g.keycode == 0 || req.keycode == 0)
+                && (g.modifiers == req.modifiers
+                    || g.modifiers == ANY_MODIFIER
+                    || req.modifiers == ANY_MODIFIER)
+        });
+        if conflicts {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 33);
+        }
         state.key_grabs.retain(|g| {
             !(g.owner == client_id
                 && g.grab_window == grab_window
@@ -21166,6 +21746,38 @@ fn handle_ungrab_key(
 ) -> io::Result<RequestOutcome> {
     if let Some(req) = x11::parse_ungrab_key(body, header.data) {
         let grab_window = ResourceId(req.grab_window);
+        // Xorg ProcUngrabKey: window lookup → keycode range →
+        // modifiers BadValue.
+        if state.resources.window(grab_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                grab_window.0,
+                34,
+            );
+        }
+        if req.keycode != 0 && req.keycode < 8 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.keycode),
+                34,
+            );
+        }
+        if req.modifiers != ANY_MODIFIER && req.modifiers & !ALL_MODIFIERS_MASK != 0 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(req.modifiers),
+                34,
+            );
+        }
         state.key_grabs.retain(|g| {
             !(g.owner == client_id
                 && g.grab_window == grab_window
@@ -25198,10 +25810,13 @@ mod tests {
             .xi2_masks
             .insert((ResourceId(CHILD), 3), (1 << 9) | (1 << 10));
 
-        set_focused_window_to_state(&mut state, ClientId(CLIENT), ResourceId(TOP));
-        let _ = read_all_available(&mut peer);
-
-        set_focused_window_to_state(&mut state, ClientId(CLIENT), ResourceId(CHILD));
+        state.core_focus = crate::server::CoreFocus {
+            raw: TOP,
+            revert_to: 0,
+            time: 0,
+        };
+        emit_core_focus_transition(&mut state, TOP, CHILD, 0);
+        state.core_focus.raw = CHILD;
         let bytes = read_all_available(&mut peer);
 
         assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
@@ -25239,188 +25854,9 @@ mod tests {
             u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
             CHILD
         );
-        let focused = state.clients.get(&CLIENT).expect("client").focused_window;
         assert_eq!(
-            focused,
-            ResourceId(CHILD),
+            state.core_focus.raw, CHILD,
             "keyboard focus should track child"
-        );
-    }
-
-    #[test]
-    fn wm_hints_input_focuses_viewable_window_on_property_change() {
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        const CLIENT: u32 = 53;
-        const WIN: u32 = 0x0360_0006;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        let mut peer = install_client(&mut state, CLIENT);
-
-        state.resources.create_window(
-            ClientId(CLIENT),
-            CreateWindowRequest {
-                depth: 24,
-                window: ResourceId(WIN),
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 240,
-                height: 120,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-
-        handle_map_window(
-            &mut state,
-            &mut backend,
-            None,
-            ClientId(CLIENT),
-            SequenceNumber(1),
-            &WIN.to_le_bytes(),
-        )
-        .expect("MapWindow");
-        let _ = read_all_available(&mut peer);
-
-        assert_eq!(
-            state.clients.get(&CLIENT).unwrap().focused_window,
-            ROOT_WINDOW,
-            "window should not be focused before WM_HINTS arrives"
-        );
-
-        let wm_hints = state.atoms.intern("WM_HINTS", false);
-        let mut body = Vec::new();
-        body.extend_from_slice(&WIN.to_le_bytes());
-        body.extend_from_slice(&wm_hints.0.to_le_bytes());
-        body.extend_from_slice(&wm_hints.0.to_le_bytes());
-        body.push(32);
-        body.extend_from_slice(&[0u8; 3]);
-        body.extend_from_slice(&9u32.to_le_bytes());
-        let mut hints = vec![0u8; 36];
-        hints[0..4].copy_from_slice(&1u32.to_le_bytes());
-        hints[4..8].copy_from_slice(&1u32.to_le_bytes());
-        body.extend_from_slice(&hints);
-
-        handle_change_property(
-            &mut state,
-            &mut backend,
-            ClientId(CLIENT),
-            SequenceNumber(2),
-            RequestHeader {
-                opcode: 18,
-                data: 0,
-                length_units: 0,
-            },
-            &body,
-        )
-        .expect("ChangeProperty");
-
-        assert_eq!(
-            state.clients.get(&CLIENT).unwrap().focused_window,
-            ResourceId(WIN),
-            "WM_HINTS.input should promote focus when the window is viewable"
-        );
-    }
-
-    #[test]
-    fn wm_hints_input_does_not_focus_desktop_window() {
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        const CLIENT: u32 = 54;
-        const WIN: u32 = 0x0360_0007;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        let mut peer = install_client(&mut state, CLIENT);
-
-        state.resources.create_window(
-            ClientId(CLIENT),
-            CreateWindowRequest {
-                depth: 24,
-                window: ResourceId(WIN),
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 240,
-                height: 120,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-
-        handle_map_window(
-            &mut state,
-            &mut backend,
-            None,
-            ClientId(CLIENT),
-            SequenceNumber(1),
-            &WIN.to_le_bytes(),
-        )
-        .expect("MapWindow");
-        let _ = read_all_available(&mut peer);
-
-        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
-        let atom_desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
-
-        let mut set_type_body = Vec::new();
-        set_type_body.extend_from_slice(&WIN.to_le_bytes());
-        set_type_body.extend_from_slice(&atom_window_type.0.to_le_bytes());
-        set_type_body.extend_from_slice(&atom_window_type.0.to_le_bytes());
-        set_type_body.push(32);
-        set_type_body.extend_from_slice(&[0u8; 3]);
-        set_type_body.extend_from_slice(&1u32.to_le_bytes());
-        set_type_body.extend_from_slice(&atom_desktop.0.to_le_bytes());
-        set_type_body.extend_from_slice(&[0u8; 4]);
-        handle_change_property(
-            &mut state,
-            &mut backend,
-            ClientId(CLIENT),
-            SequenceNumber(2),
-            RequestHeader {
-                opcode: 18,
-                data: 0,
-                length_units: 0,
-            },
-            &set_type_body,
-        )
-        .expect("ChangeProperty desktop type");
-
-        let wm_hints = state.atoms.intern("WM_HINTS", false);
-        let mut hints_body = Vec::new();
-        hints_body.extend_from_slice(&WIN.to_le_bytes());
-        hints_body.extend_from_slice(&wm_hints.0.to_le_bytes());
-        hints_body.extend_from_slice(&wm_hints.0.to_le_bytes());
-        hints_body.push(32);
-        hints_body.extend_from_slice(&[0u8; 3]);
-        hints_body.extend_from_slice(&9u32.to_le_bytes());
-        let mut hints = vec![0u8; 36];
-        hints[0..4].copy_from_slice(&1u32.to_le_bytes());
-        hints[4..8].copy_from_slice(&1u32.to_le_bytes());
-        hints_body.extend_from_slice(&hints);
-        handle_change_property(
-            &mut state,
-            &mut backend,
-            ClientId(CLIENT),
-            SequenceNumber(3),
-            RequestHeader {
-                opcode: 18,
-                data: 0,
-                length_units: 0,
-            },
-            &hints_body,
-        )
-        .expect("ChangeProperty WM_HINTS");
-
-        assert_eq!(
-            state.clients.get(&CLIENT).unwrap().focused_window,
-            ROOT_WINDOW,
-            "desktop windows should not take focus from WM_HINTS.input"
         );
     }
 
@@ -27815,6 +28251,7 @@ mod tests {
             .insert(ResourceId(GUARD_XID), 0x1); // KeyPress
 
         // Establish the real focus on FOCUSED_XID before the CWA.
+        state.core_focus.raw = FOCUSED_XID;
         for c in state.clients.values_mut() {
             c.focused_window = ResourceId(FOCUSED_XID);
         }
@@ -29868,9 +30305,14 @@ mod tests {
         // Cache the pointer position; prior focus is on an unrelated window
         // so a Focus crossing actually fires onto FOCUS_WIN.
         state.pointer_root = (631, 641);
-        state.clients.get_mut(&CLIENT_ID).unwrap().focused_window = ResourceId(PREV_WIN);
+        state.core_focus = crate::server::CoreFocus {
+            raw: PREV_WIN,
+            revert_to: 0,
+            time: 0,
+        };
 
-        set_focused_window_to_state(&mut state, ClientId(CLIENT_ID), ResourceId(FOCUS_WIN));
+        emit_core_focus_transition(&mut state, PREV_WIN, FOCUS_WIN, 0);
+        state.core_focus.raw = FOCUS_WIN;
 
         let mut buf = [0u8; 128];
         let n = peer.read(&mut buf).expect("focus event");
@@ -29921,6 +30363,7 @@ mod tests {
             c.focused_window = ResourceId(FOCUS_WIN);
             c.event_masks.insert(ResourceId(FOCUS_WIN), KEY_PRESS_MASK);
         }
+        state.core_focus.raw = FOCUS_WIN;
 
         // A sync passive key grab held by the WM is active, with a
         // frozen press waiting.
@@ -29952,6 +30395,7 @@ mod tests {
             ClientId(GRAB_CLIENT_ID),
             SequenceNumber(1),
             header,
+            &[0u8; 4],
         )
         .expect("allow events replay keyboard");
 
@@ -36542,6 +36986,7 @@ mod tests {
             None,
             ClientId(CLIENT_ID),
             SequenceNumber(17),
+            &[0u8; 4],
         )
         .expect("handle_ungrab_pointer");
 

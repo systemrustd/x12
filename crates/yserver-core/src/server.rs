@@ -262,6 +262,32 @@ pub struct Xi1ActiveGrab {
     pub passive_detail: Option<u8>,
 }
 
+/// Core keyboard focus state — Xorg `FocusClassRec` (win/revert/time)
+/// for the virtual core keyboard.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreFocus {
+    /// Raw wire focus value: `0` = None, `1` = PointerRoot, anything
+    /// else a window xid.
+    pub raw: u32,
+    /// 0 = RevertToNone, 1 = RevertToPointerRoot, 2 = RevertToParent.
+    pub revert_to: u8,
+    /// Last focus-change time — SetInputFocus requests with an earlier
+    /// time are ignored (Xorg `focus->time`).
+    pub time: u32,
+}
+
+impl Default for CoreFocus {
+    /// Xorg initial focus (dix/devices.c `InitFocusClassDeviceStruct`):
+    /// PointerRoot with RevertToNone.
+    fn default() -> Self {
+        Self {
+            raw: 1,
+            revert_to: 0,
+            time: 0,
+        }
+    }
+}
+
 /// XI 1.x per-device freeze bookkeeping for synchronous grabs.
 #[derive(Debug, Default)]
 pub struct Xi1Freeze {
@@ -752,6 +778,18 @@ pub struct ServerState {
     /// XI 1.x last-device-grab time (GrabDevice timestamp validation +
     /// passive-grab activation updates it — XTS XGrabDeviceKey-3).
     pub xi1_last_grab_time: u32,
+    /// Core last-pointer-grab time — Xorg `deviceGrab.grabTime` for the
+    /// pointer. GrabPointer/UngrabPointer/ChangeActivePointerGrab/
+    /// AllowEvents timestamp validation (GrabInvalidTime / no-op).
+    pub last_pointer_grab_time: u32,
+    /// Core last-keyboard-grab time — Xorg `deviceGrab.grabTime` for
+    /// the keyboard (GrabKeyboard/UngrabKeyboard validation).
+    pub last_keyboard_grab_time: u32,
+    /// Core keyboard focus — Xorg `FocusClassRec` for the virtual core
+    /// keyboard. Global across clients (X11 has ONE core focus); the
+    /// per-client `focused_window` mirror is kept in sync for legacy
+    /// readers.
+    pub core_focus: CoreFocus,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1032,6 +1070,9 @@ impl ServerState {
             xi1_passive_grabs: Vec::new(),
             xi1_active_grabs: HashMap::new(),
             xi1_last_grab_time: 0,
+            last_pointer_grab_time: 0,
+            last_keyboard_grab_time: 0,
+            core_focus: CoreFocus::default(),
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
@@ -1871,9 +1912,23 @@ impl ServerState {
         button: u8,
         state_mask: u16,
     ) -> Option<PassiveButtonGrab> {
+        // Xorg CheckDeviceGrabs walks the sprite trace TOP-DOWN (root
+        // first): a grab on an ancestor takes precedence over the same
+        // grab deeper in the tree (XTS XGrabButton-4), and root-window
+        // WM grabs match clicks anywhere.
+        let mut chain = vec![window];
         let mut current = window;
-        let mut depth = 0usize;
-        loop {
+        for _ in 0..256 {
+            let Some(w) = self.resources.window(current) else {
+                break;
+            };
+            if w.parent == current {
+                break;
+            }
+            chain.push(w.parent);
+            current = w.parent;
+        }
+        for current in chain.into_iter().rev() {
             for grab in &self.button_grabs {
                 if grab.grab_window != current {
                     continue;
@@ -1883,15 +1938,6 @@ impl ServerState {
                 if button_match && mod_match {
                     return Some(grab.clone());
                 }
-            }
-            let w = self.resources.window(current)?;
-            if w.parent == current || w.parent == crate::resources::ROOT_WINDOW {
-                break;
-            }
-            current = w.parent;
-            depth += 1;
-            if depth > 256 {
-                break;
             }
         }
         None
@@ -1909,39 +1955,27 @@ impl ServerState {
         keycode: u8,
         state_mask: u16,
     ) -> Option<&KeyGrab> {
+        // Top-down walk (root first) — Xorg CheckDeviceGrabs checks
+        // the focus trace from the root down, so an ancestor's grab
+        // takes precedence (see find_passive_grab).
+        let mut chain = vec![window];
         let mut current = window;
-        let mut depth = 0usize;
-        let mut tried_root = false;
-        loop {
-            for grab in &self.key_grabs {
-                if grab.grab_window != current {
-                    continue;
-                }
-                let key_match = grab.keycode == 0 || grab.keycode == keycode;
-                let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                if key_match && mod_match {
-                    return Some(grab);
-                }
-            }
-            if current == crate::resources::ROOT_WINDOW {
-                tried_root = true;
-                break;
-            }
+        for _ in 0..256 {
             let Some(w) = self.resources.window(current) else {
                 break;
             };
             if w.parent == current {
                 break;
             }
+            chain.push(w.parent);
             current = w.parent;
-            depth += 1;
-            if depth > 256 {
-                break;
-            }
         }
-        if !tried_root && current != crate::resources::ROOT_WINDOW {
+        if !chain.contains(&crate::resources::ROOT_WINDOW) {
+            chain.push(crate::resources::ROOT_WINDOW);
+        }
+        for current in chain.into_iter().rev() {
             for grab in &self.key_grabs {
-                if grab.grab_window != crate::resources::ROOT_WINDOW {
+                if grab.grab_window != current {
                     continue;
                 }
                 let key_match = grab.keycode == 0 || grab.keycode == keycode;

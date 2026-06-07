@@ -34,6 +34,9 @@ pub const NOTIFY_VIRTUAL: u8 = 1;
 pub const NOTIFY_INFERIOR: u8 = 2;
 pub const NOTIFY_NONLINEAR: u8 = 3;
 pub const NOTIFY_NONLINEAR_VIRTUAL: u8 = 4;
+pub const NOTIFY_POINTER: u8 = 5;
+pub const NOTIFY_POINTER_ROOT: u8 = 6;
+pub const NOTIFY_DETAIL_NONE: u8 = 7;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CrossingKind {
@@ -224,6 +227,317 @@ fn compute_crossing_chain(
         child: ResourceId(0),
     });
     events
+}
+
+/// One FocusIn/FocusOut event of a focus transition. FocusIn/Out have
+/// no `child` field (unlike crossings), so window + direction + detail
+/// fully describe the wire event; the caller supplies `mode`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FocusEvent {
+    pub window: ResourceId,
+    pub focus_in: bool,
+    /// One of the `NOTIFY_*` constants (including Pointer /
+    /// PointerRoot / DetailNone).
+    pub detail: u8,
+}
+
+/// Compute the FocusOut/FocusIn event sequence for the core keyboard
+/// focus moving from `from_raw` to `to_raw` — port of Xorg
+/// `CoreFocusEvents` (dix/enterleave.c:1395) reduced to the
+/// single-keyboard case (`HasFocus`/`FirstFocusChild`/`HasOtherPointer`
+/// are always false/None without MPX).
+///
+/// `from_raw`/`to_raw` are the wire focus values: `0` = None, `1` =
+/// PointerRoot, anything else a window xid. `pointer_win` is the
+/// deepest window currently containing the pointer (the spec's "P" for
+/// the NotifyPointer runs).
+#[must_use]
+pub fn focus_transition_events(
+    state: &ServerState,
+    from_raw: u32,
+    to_raw: u32,
+    pointer_win: ResourceId,
+) -> Vec<FocusEvent> {
+    use crate::resources::ROOT_WINDOW;
+
+    let mut ev: Vec<FocusEvent> = Vec::new();
+    if from_raw == to_raw {
+        return ev;
+    }
+    let root = ROOT_WINDOW;
+    let p = pointer_win;
+    let special = |r: u32| r == 0 || r == 1;
+    let is_anc = |a: ResourceId, b: ResourceId| -> bool {
+        a != b && ancestor_chain(state, b).iter().skip(1).any(|w| *w == a)
+    };
+
+    // FocusOut(NotifyPointer) run from P up to `pwin_parent`
+    // (exclusive; through it when `inclusive`) — Xorg
+    // `CoreFocusOutNotifyPointerEvents`.
+    let out_pointer_run = |ev: &mut Vec<FocusEvent>,
+                           pwin_parent: ResourceId,
+                           exclude: Option<ResourceId>,
+                           inclusive: bool| {
+        if !(is_anc(pwin_parent, p) || (pwin_parent == p && inclusive)) {
+            return;
+        }
+        if let Some(x) = exclude
+            && (is_anc(x, p) || is_anc(p, x))
+        {
+            return;
+        }
+        for w in ancestor_chain(state, p) {
+            if !inclusive && w == pwin_parent {
+                break;
+            }
+            ev.push(FocusEvent {
+                window: w,
+                focus_in: false,
+                detail: NOTIFY_POINTER,
+            });
+            if inclusive && w == pwin_parent {
+                break;
+            }
+        }
+    };
+    // FocusIn(NotifyPointer) run from `pwin_parent` (exclusive;
+    // included when `inclusive`) down to P — Xorg
+    // `CoreFocusInNotifyPointerEvents`.
+    let in_pointer_run = |ev: &mut Vec<FocusEvent>,
+                          pwin_parent: ResourceId,
+                          exclude: Option<ResourceId>,
+                          inclusive: bool| {
+        if exclude == Some(p) || (pwin_parent != p && !is_anc(pwin_parent, p)) {
+            return;
+        }
+        if let Some(x) = exclude
+            && (is_anc(x, p) || is_anc(p, x))
+        {
+            return;
+        }
+        let mut run: Vec<ResourceId> = Vec::new();
+        for w in ancestor_chain(state, p) {
+            if !inclusive && w == pwin_parent {
+                break;
+            }
+            run.push(w);
+            if inclusive && w == pwin_parent {
+                break;
+            }
+        }
+        for w in run.into_iter().rev() {
+            ev.push(FocusEvent {
+                window: w,
+                focus_in: true,
+                detail: NOTIFY_POINTER,
+            });
+        }
+    };
+
+    match (special(from_raw), special(to_raw)) {
+        // PointerRoot ↔ None — Xorg CoreFocusPointerRootNoneSwitch.
+        (true, true) => {
+            if from_raw == 1 && to_raw != 1 {
+                out_pointer_run(&mut ev, root, None, true);
+            }
+            ev.push(FocusEvent {
+                window: root,
+                focus_in: false,
+                detail: if from_raw == 1 {
+                    NOTIFY_POINTER_ROOT
+                } else {
+                    NOTIFY_DETAIL_NONE
+                },
+            });
+            ev.push(FocusEvent {
+                window: root,
+                focus_in: true,
+                detail: if to_raw == 1 {
+                    NOTIFY_POINTER_ROOT
+                } else {
+                    NOTIFY_DETAIL_NONE
+                },
+            });
+            if to_raw == 1 {
+                in_pointer_run(&mut ev, root, None, true);
+            }
+        }
+        // Window A → PointerRoot/None — Xorg CoreFocusToPointerRootOrNone.
+        (false, true) => {
+            let a = ResourceId(from_raw);
+            out_pointer_run(&mut ev, a, None, false);
+            ev.push(FocusEvent {
+                window: a,
+                focus_in: false,
+                detail: NOTIFY_NONLINEAR,
+            });
+            // FocusOut(NonlinearVirtual) on A's ancestors up to and
+            // including the root (Xorg passes NullWindow as ancestor).
+            for w in ancestor_chain(state, a).into_iter().skip(1) {
+                ev.push(FocusEvent {
+                    window: w,
+                    focus_in: false,
+                    detail: NOTIFY_NONLINEAR_VIRTUAL,
+                });
+            }
+            ev.push(FocusEvent {
+                window: root,
+                focus_in: true,
+                detail: if to_raw == 1 {
+                    NOTIFY_POINTER_ROOT
+                } else {
+                    NOTIFY_DETAIL_NONE
+                },
+            });
+            if to_raw == 1 {
+                in_pointer_run(&mut ev, root, None, true);
+            }
+        }
+        // PointerRoot/None → window B — Xorg CoreFocusFromPointerRootOrNone.
+        (true, false) => {
+            let b = ResourceId(to_raw);
+            if from_raw == 1 {
+                out_pointer_run(&mut ev, root, None, true);
+            }
+            ev.push(FocusEvent {
+                window: root,
+                focus_in: false,
+                detail: if from_raw == 1 {
+                    NOTIFY_POINTER_ROOT
+                } else {
+                    NOTIFY_DETAIL_NONE
+                },
+            });
+            if b != root {
+                ev.push(FocusEvent {
+                    window: root,
+                    focus_in: true,
+                    detail: NOTIFY_NONLINEAR_VIRTUAL,
+                });
+                // Windows strictly between root and B, top-down.
+                let bchain = ancestor_chain(state, b);
+                let mut mids: Vec<ResourceId> = Vec::new();
+                for w in bchain.iter().skip(1) {
+                    if *w == root {
+                        break;
+                    }
+                    mids.push(*w);
+                }
+                for w in mids.into_iter().rev() {
+                    ev.push(FocusEvent {
+                        window: w,
+                        focus_in: true,
+                        detail: NOTIFY_NONLINEAR_VIRTUAL,
+                    });
+                }
+            }
+            ev.push(FocusEvent {
+                window: b,
+                focus_in: true,
+                detail: NOTIFY_NONLINEAR,
+            });
+            in_pointer_run(&mut ev, b, None, false);
+        }
+        // Window A → window B — to-ancestor / to-descendant / nonlinear.
+        (false, false) => {
+            let a = ResourceId(from_raw);
+            let b = ResourceId(to_raw);
+            if is_anc(b, a) {
+                // Xorg CoreFocusToAncestor.
+                ev.push(FocusEvent {
+                    window: a,
+                    focus_in: false,
+                    detail: NOTIFY_ANCESTOR,
+                });
+                for w in ancestor_chain(state, a).into_iter().skip(1) {
+                    if w == b {
+                        break;
+                    }
+                    ev.push(FocusEvent {
+                        window: w,
+                        focus_in: false,
+                        detail: NOTIFY_VIRTUAL,
+                    });
+                }
+                ev.push(FocusEvent {
+                    window: b,
+                    focus_in: true,
+                    detail: NOTIFY_INFERIOR,
+                });
+                in_pointer_run(&mut ev, b, Some(a), false);
+            } else if is_anc(a, b) {
+                // Xorg CoreFocusToDescendant.
+                out_pointer_run(&mut ev, a, Some(b), false);
+                ev.push(FocusEvent {
+                    window: a,
+                    focus_in: false,
+                    detail: NOTIFY_INFERIOR,
+                });
+                let bchain = ancestor_chain(state, b);
+                let mut mids: Vec<ResourceId> = Vec::new();
+                for w in bchain.iter().skip(1) {
+                    if *w == a {
+                        break;
+                    }
+                    mids.push(*w);
+                }
+                for w in mids.into_iter().rev() {
+                    ev.push(FocusEvent {
+                        window: w,
+                        focus_in: true,
+                        detail: NOTIFY_VIRTUAL,
+                    });
+                }
+                ev.push(FocusEvent {
+                    window: b,
+                    focus_in: true,
+                    detail: NOTIFY_ANCESTOR,
+                });
+            } else {
+                // Xorg CoreFocusNonLinear.
+                let a_chain = ancestor_chain(state, a);
+                let b_chain = ancestor_chain(state, b);
+                let common = lowest_common_ancestor(&a_chain, &b_chain);
+                out_pointer_run(&mut ev, a, None, false);
+                ev.push(FocusEvent {
+                    window: a,
+                    focus_in: false,
+                    detail: NOTIFY_NONLINEAR,
+                });
+                for w in a_chain.iter().skip(1) {
+                    if Some(*w) == common {
+                        break;
+                    }
+                    ev.push(FocusEvent {
+                        window: *w,
+                        focus_in: false,
+                        detail: NOTIFY_NONLINEAR_VIRTUAL,
+                    });
+                }
+                let mut mids: Vec<ResourceId> = Vec::new();
+                for w in b_chain.iter().skip(1) {
+                    if Some(*w) == common {
+                        break;
+                    }
+                    mids.push(*w);
+                }
+                for w in mids.into_iter().rev() {
+                    ev.push(FocusEvent {
+                        window: w,
+                        focus_in: true,
+                        detail: NOTIFY_NONLINEAR_VIRTUAL,
+                    });
+                }
+                ev.push(FocusEvent {
+                    window: b,
+                    focus_in: true,
+                    detail: NOTIFY_NONLINEAR,
+                });
+                in_pointer_run(&mut ev, b, None, false);
+            }
+        }
+    }
+    ev
 }
 
 /// `[start, parent_of_start, parent_of_parent, ..., root]`, terminated
@@ -462,6 +776,92 @@ mod tests {
             vec![NOTIFY_NONLINEAR, NOTIFY_NONLINEAR],
         );
         assert_eq!(children_only(&events), vec![ResourceId(0), ResourceId(0)]);
+    }
+
+    fn fe(window: ResourceId, focus_in: bool, detail: u8) -> FocusEvent {
+        FocusEvent {
+            window,
+            focus_in,
+            detail,
+        }
+    }
+
+    #[test]
+    fn focus_pointerroot_to_window_emits_root_out_then_in_chain() {
+        // root → A → B; focus PointerRoot(1) → B, pointer outside B.
+        let mut state = ServerState::new();
+        let a = make_window(&mut state, 0x0010_0200, ROOT_WINDOW);
+        let b = make_window(&mut state, 0x0010_0201, a);
+        let p = make_window(&mut state, 0x0010_0202, ROOT_WINDOW); // pointer window
+        let ev = focus_transition_events(&state, 1, b.0, p);
+        assert_eq!(
+            ev,
+            vec![
+                // PointerRoot: NotifyPointer run P→root inclusive.
+                fe(p, false, NOTIFY_POINTER),
+                fe(ROOT_WINDOW, false, NOTIFY_POINTER),
+                fe(ROOT_WINDOW, false, NOTIFY_POINTER_ROOT),
+                fe(ROOT_WINDOW, true, NOTIFY_NONLINEAR_VIRTUAL),
+                fe(a, true, NOTIFY_NONLINEAR_VIRTUAL),
+                fe(b, true, NOTIFY_NONLINEAR),
+            ],
+        );
+    }
+
+    #[test]
+    fn focus_window_to_none_walks_out_to_root() {
+        // root → A → B; focus B → None, pointer in B's child.
+        let mut state = ServerState::new();
+        let a = make_window(&mut state, 0x0010_0210, ROOT_WINDOW);
+        let b = make_window(&mut state, 0x0010_0211, a);
+        let p = make_window(&mut state, 0x0010_0212, b);
+        let ev = focus_transition_events(&state, b.0, 0, p);
+        assert_eq!(
+            ev,
+            vec![
+                fe(p, false, NOTIFY_POINTER),
+                fe(b, false, NOTIFY_NONLINEAR),
+                fe(a, false, NOTIFY_NONLINEAR_VIRTUAL),
+                fe(ROOT_WINDOW, false, NOTIFY_NONLINEAR_VIRTUAL),
+                fe(ROOT_WINDOW, true, NOTIFY_DETAIL_NONE),
+            ],
+        );
+    }
+
+    #[test]
+    fn focus_none_to_pointerroot_switch() {
+        let mut state = ServerState::new();
+        let p = make_window(&mut state, 0x0010_0220, ROOT_WINDOW);
+        let ev = focus_transition_events(&state, 0, 1, p);
+        assert_eq!(
+            ev,
+            vec![
+                fe(ROOT_WINDOW, false, NOTIFY_DETAIL_NONE),
+                fe(ROOT_WINDOW, true, NOTIFY_POINTER_ROOT),
+                // NotifyPointer run root (inclusive) down to P.
+                fe(ROOT_WINDOW, true, NOTIFY_POINTER),
+                fe(p, true, NOTIFY_POINTER),
+            ],
+        );
+    }
+
+    #[test]
+    fn focus_window_to_descendant_uses_inferior_then_ancestor() {
+        // root → A → B → C; focus A → C, pointer elsewhere.
+        let mut state = ServerState::new();
+        let a = make_window(&mut state, 0x0010_0230, ROOT_WINDOW);
+        let b = make_window(&mut state, 0x0010_0231, a);
+        let c = make_window(&mut state, 0x0010_0232, b);
+        let p = make_window(&mut state, 0x0010_0233, ROOT_WINDOW);
+        let ev = focus_transition_events(&state, a.0, c.0, p);
+        assert_eq!(
+            ev,
+            vec![
+                fe(a, false, NOTIFY_INFERIOR),
+                fe(b, true, NOTIFY_VIRTUAL),
+                fe(c, true, NOTIFY_ANCESTOR),
+            ],
+        );
     }
 
     #[test]

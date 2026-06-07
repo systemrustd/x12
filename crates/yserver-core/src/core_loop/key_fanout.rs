@@ -173,7 +173,7 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
 /// `ComputeFreezes` → `DeliverFocusedEvent` (dix/events.c:1360).
 pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
     let focus = current_focus(state);
-    if focus == ROOT_WINDOW {
+    if focus == ResourceId(0) {
         return Vec::new();
     }
     let mut dropped = deliver_key_to_window(state, &event, focus);
@@ -415,10 +415,17 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
 
     let focus = current_focus(state);
 
-    // Press: try to match a passive key grab, activating it.
+    // Press: try to match a passive key grab, activating it. With
+    // focus None the grab walk still runs from the root — WM hotkey
+    // grabs on the root fire regardless of focus.
+    let grab_walk_start = if focus == ResourceId(0) {
+        ROOT_WINDOW
+    } else {
+        focus
+    };
     if event.pressed
         && let Some((owner, grab_window, pointer_mode, keyboard_mode, via_xi2)) = state
-            .find_key_grab(focus, event.keycode, event.state)
+            .find_key_grab(grab_walk_start, event.keycode, event.state)
             .map(|g| {
                 (
                     g.owner,
@@ -459,25 +466,26 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         };
     }
 
-    // Drop key events that would land on root with no grab.
-    if focus == ROOT_WINDOW {
+    // Focus None: keys are discarded (only grabs see them) — Xorg
+    // DeliverFocusedEvent with focus->win == NoneWin.
+    if focus == ResourceId(0) {
         return KeyRoute::Drop;
     }
     KeyRoute::Window(focus)
 }
 
-/// Pick the current keyboard focus.
+/// Resolve the current keyboard focus to a delivery window.
 ///
-/// Per-client `focused_window` is intended to be a global value
-/// mirrored across clients. Pick the first non-ROOT focus we see; if
-/// every client is rooted, return `ROOT_WINDOW`.
+/// Reads the global `state.core_focus` (the Xorg `FocusClassRec`
+/// model): None → `ResourceId(0)` (keys are discarded, grabs only);
+/// PointerRoot → the deepest window under the pointer; a window xid →
+/// that window.
 pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
-    state
-        .clients
-        .values()
-        .map(|c| c.focused_window)
-        .find(|f| *f != ROOT_WINDOW)
-        .unwrap_or(ROOT_WINDOW)
+    match state.core_focus.raw {
+        0 => ResourceId(0),
+        1 => deepest_window_at_pointer(state),
+        w => ResourceId(w),
+    }
 }
 
 /// XI1 DeviceKeyPress/Release delivery for the slave keyboard —
@@ -705,6 +713,7 @@ mod tests {
         // Focused client selects core KeyPress on its window.
         let mut focus_peer = install_kf(&mut state, 9, ResourceId(FOCUS_WIN), KEY_PRESS_MASK, 0);
         state.clients.get_mut(&9).unwrap().focused_window = ResourceId(FOCUS_WIN);
+        state.core_focus.raw = FOCUS_WIN;
 
         let _ = replay_frozen_key_to_focus(&mut state, key_event(true, 33));
         assert!(
