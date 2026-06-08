@@ -868,6 +868,14 @@ rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords
 # torn down. WAYLAND_* are unset belt-and-braces; a real VT wouldn't
 # have them set anyway. Rejects pty / SSH / graphical-terminal callers
 # via a /dev/ttyN check on stdin — mirrors real `startx`.
+#
+# Runs STANDALONE from a bare TTY, so (unlike the `-hw` desktop
+# recipes) it does NOT override XDG_RUNTIME_DIR — it inherits the TTY
+# login's real /run/user/UID + systemd --user instance. That is what
+# makes gcr-ssh-agent (and the keyring-unlocked SSH keys) reachable in
+# the session with no extra wiring here: ~/.xinitrc must NOT repoint
+# XDG_RUNTIME_DIR at a temp dir (an x11trace setup once did, which
+# pointed SSH_AUTH_SOCK at a dead /tmp/.../gcr/ssh).
 startx log="warn":
     cargo build --release --bin yserver
     bash -c '\
