@@ -9854,36 +9854,13 @@ fn handle_xi2_request(
             // for touch grabs; we don't implement touch, so the
             // extension fields are ignored.
             //
-            // Modes per XI2 spec:
-            //   0 = XIAsyncDevice — release the grab and thaw the
-            //       device. The activating press was already delivered
-            //       to the grab owner (dropped here), but events
-            //       withheld during the freeze replay to their natural
-            //       target (Xorg PlayReleasedEvents runs on every thaw).
-            //   1 = XISyncDevice  — process the frozen event then
-            //       refreeze; we're always-async, so no-op.
-            //   2 = XIReplayDevice — release the grab and replay the
-            //       frozen event against the natural target,
-            //       bypassing this grab.
-            //   3 = XIAsyncPairedDevice / 4 = XISyncPair —
-            //       paired-device modes (pointer/keyboard pair).
-            //   5 = XIAsyncPair / 6 = XISyncPair (XI 2.2 form).
-            //   7 = XIAcceptTouch / 8 = XIRejectTouch (XI 2.2 touch).
-            //
-            // Why this matters: mutter/muffin/cinnamon shell install
-            // click-to-focus passive button grabs on every new top
-            // level (sync pointer mode in the original spec). On each
-            // button press, the WM examines the click, performs focus
-            // management, then calls XIAllowEvents to release the
-            // grab and let the natural target receive the click.
-            // Before this handler existed, the call was a no-op:
-            // yserver hardcodes async pointer mode on passive button
-            // grabs so the press is delivered to the natural XI2
-            // target via the grab-unaware fanout regardless, but the
-            // `state.pointer_grab` record stays set until ButtonRelease,
-            // and any motion in between is redirected to the WM
-            // instead of the natural target — confusing GTK gesture
-            // controllers.
+            // mutter/muffin/cinnamon install click-to-focus passive
+            // button grabs (sync) and keybinding key grabs (sync); on each
+            // press they examine it then call XIAllowEvents to thaw/replay.
+            // The mode (XIAsyncDevice/XISyncDevice/XIReplayDevice/…) +
+            // deviceid map onto a core AllowSome mode — see
+            // `xi2_allow_mode_to_core` — and run through the shared
+            // `apply_allow_events` below.
             let (deviceid, mode) = if body.len() >= 8 {
                 (u16::from_le_bytes([body[4], body[5]]), body[6])
             } else {
@@ -9893,102 +9870,20 @@ fn handle_xi2_request(
                 "client {} #{} XIAllowEvents deviceid={} mode={}",
                 client_id.0, sequence.0, deviceid, mode
             );
-            // AsyncDevice / ReplayDevice / paired-async modes all
-            // release the grab on the requested device. The paired-
-            // sync modes leave the grab in place. Touch modes are
-            // out of scope. `deviceid` selects which device's grab the
-            // mode applies to (master pointer = 2, master keyboard = 3);
-            // the paired modes (3/5) also release the partner device.
-            let releases_grab = matches!(mode, 0 | 2 | 3 | 5);
-            let replay = mode == 2;
-            let targets_keyboard = deviceid == 3;
-            let targets_paired = matches!(mode, 3 | 5);
-
-            // Pointer grab release/replay (when the call targets the
-            // pointer device, or a paired mode releases both).
-            if (!targets_keyboard || targets_paired)
-                && releases_grab
-                && state
-                    .pointer_grab
-                    .is_some_and(|(owner, _)| owner == client_id)
-            {
-                let frozen = state.frozen_pointer_event.take();
-                let frozen_queue = std::mem::take(&mut state.frozen_pointer_queue);
-                state.pointer_grab = None;
-                state.pointer_grab_is_passive = false;
-                state.active_pointer_grab = None;
-                // Thaw the unified per-device sync state that
-                // `xi1_check_grab_for_syncs` engaged when the sync passive
-                // grab activated. The CORE AllowEvents handler drives this
-                // via the AllowSome state machine ending in
-                // `xi1_compute_freezes`; the XI2 handler historically did
-                // NOT touch `xi1_frozen` at all (it predates the unified
-                // core-pointer freeze). So after a muffin sync-passive-grab
-                // cycle `xi1_frozen[POINTER]` stayed FrozenNoEvent and the
-                // unified-freeze gate queued — then dropped — every later
-                // core pointer event: the Cinnamon-only "stuck button /
-                // desktop rubber-band" regression.
-                //
-                // Use `xi1_check_grab_for_syncs(..., this_sync=false,
-                // other_sync=false)` rather than the blunt `xi1_thaw_device`:
-                // a sync button grab with `keyboard_mode=sync` also holds
-                // the KEYBOARD on this grab's behalf (`xi1_frozen[KEYBOARD]
-                // .other = owner`), and that cross-hold withholds CORE key
-                // events (`core_key_queue`). Per Xorg `DeactivateGrab` /
-                // `CheckGrabForSyncs`, releasing this grab must drop the
-                // paired-device hold it placed — `xi1_thaw_device` only
-                // resets the named device and would leak the keyboard hold.
-                // This call clears both this client's pointer freeze and its
-                // keyboard cross-hold, then `xi1_compute_freezes` replays the
-                // withheld events. Thaw BEFORE replaying the pointer queue so
-                // the gate is open; `frozen_queue` is already mem::taken, so
-                // `xi1_compute_freezes` can't re-drop it.
-                crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
-                    state,
-                    crate::xinput::DEVICEID_SLAVE_POINTER,
-                    client_id,
-                    false,
-                    false,
-                );
-                let xid_map = backend.xid_map().clone();
-                // ReplayDevice re-delivers the activating press to the
-                // natural target (grab bypassed); Async/paired-async
-                // consumed it at the grab owner already, so it's dropped.
-                if replay && let Some(event) = frozen {
-                    let _dropped = pointer_event_fanout_to_state(
-                        state, backend, &xid_map, event, false, false,
-                    );
-                }
-                // Events withheld DURING the freeze (motion + release of a
-                // desktop drag) were delivered to nobody — replay them now
-                // through the normal pipeline regardless of mode. Xorg
-                // PlayReleasedEvents runs on every thaw, not just Replay.
-                // is_replay=false so the XI2 fanout actually runs: the
-                // Cinnamon desktop listens via XI2, not core.
-                for queued in frozen_queue {
-                    let _dropped = pointer_event_fanout_to_state(
-                        state, backend, &xid_map, queued, false, false,
-                    );
-                }
-            }
-
-            // Keyboard grab release/replay (when the call targets the
-            // keyboard device, or a paired mode releases both).
-            if (targets_keyboard || targets_paired)
-                && releases_grab
-                && state
-                    .active_keyboard_grab
-                    .is_some_and(|g| g.owner == client_id)
-                && matches!(
-                    state.active_keyboard_grab.map(|g| g.source),
-                    Some(crate::server::ActiveKeyboardGrabSource::PassiveKey { .. })
-                )
-            {
-                let frozen = state.frozen_keyboard_event.take();
-                state.active_keyboard_grab = None;
-                if replay && let Some(event) = frozen {
-                    let _dropped = replay_frozen_key_to_focus(state, event);
-                }
+            let time = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            // Map the XI2 mode + target deviceid onto the equivalent core
+            // AllowSome mode and run the SHARED `apply_allow_events`. This
+            // used to be a partial reimplementation that diverged from the
+            // core path and caused recurring freezes (desktop rubber-band =
+            // Async/Replay thaw gap; Cinnamon input freeze = XISyncDevice
+            // treated as a no-op). Touch modes (XIAcceptTouch/XIRejectTouch)
+            // are unsupported → no-op.
+            if let Some(core_mode) = xi2_allow_mode_to_core(mode, deviceid) {
+                return apply_allow_events(state, backend, client_id, sequence, core_mode, time);
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -17446,13 +17341,57 @@ fn handle_allow_events(
             35,
         );
     }
+    let time = body
+        .get(0..4)
+        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    apply_allow_events(state, backend, client_id, sequence, mode, time)
+}
+
+/// Map an XI2 `XIAllowEvents` mode + target `deviceid` onto the equivalent
+/// core `AllowSome` mode consumed by [`apply_allow_events`]. `deviceid` 3 is
+/// the master keyboard; anything else is the pointer. The paired modes act on
+/// the OTHER device. Touch modes (`XIAcceptTouch`=6 / `XIRejectTouch`=7) and
+/// anything unknown are unsupported → `None` (no-op). XI2 mode constants per
+/// `X11/extensions/XI2.h`: AsyncDevice=0, SyncDevice=1, ReplayDevice=2,
+/// AsyncPairedDevice=3, AsyncPair=4, SyncPair=5.
+fn xi2_allow_mode_to_core(xi2_mode: u8, deviceid: u16) -> Option<u8> {
+    let kbd = deviceid == 3;
+    // Core modes: 0 AsyncPointer 1 SyncPointer 2 ReplayPointer
+    //             3 AsyncKeyboard 4 SyncKeyboard 5 ReplayKeyboard
+    //             6 AsyncBoth 7 SyncBoth
+    Some(match xi2_mode {
+        0 => u8::from(kbd) * 3,     // XIAsyncDevice  → Async{Pointer,Keyboard}
+        1 => 1 + u8::from(kbd) * 3, // XISyncDevice   → Sync{Pointer,Keyboard}
+        2 => 2 + u8::from(kbd) * 3, // XIReplayDevice → Replay{Pointer,Keyboard}
+        3 => u8::from(!kbd) * 3,    // XIAsyncPairedDevice → async the PAIRED device
+        4 => 6,                     // XIAsyncPair → AsyncBoth
+        5 => 7,                     // XISyncPair  → SyncBoth
+        _ => return None,           // XIAcceptTouch / XIRejectTouch / unknown
+    })
+}
+
+/// Shared `AllowSome` implementation (Xorg `dix/events.c:1823`), driven by
+/// BOTH core `AllowEvents` (mode straight from the request) AND XI2
+/// `XIAllowEvents` (mode mapped from the XI2 mode + deviceid; see
+/// [`xi2_allow_mode_to_core`]). Routing the XI2 path through here — rather
+/// than the old partial reimplementation in the XI2 handler — kills a
+/// recurring class of divergence bugs where the XI2 copy mishandled modes
+/// the core path got right (the desktop rubber-band = Async/Replay thaw
+/// gap; the Cinnamon input freeze = `XISyncDevice`/mode-1 treated as a
+/// no-op). `mode` is a CORE AllowEvents mode (0..=7); `time` is the
+/// request timestamp.
+fn apply_allow_events(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    mode: u8,
+    time: u32,
+) -> io::Result<RequestOutcome> {
     // Xorg AllowSome: the request is a no-op when its time is LATER
     // than the current time or EARLIER than the client's grab time
     // (XAllowEvents-12/13). Pointer modes gate on the pointer's grab
     // time, keyboard and *Both modes on the keyboard's.
-    let time = body
-        .get(0..4)
-        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let grab_time = if matches!(mode, 0..=2) {
         state.last_pointer_grab_time
     } else {
@@ -17662,8 +17601,14 @@ fn handle_allow_events(
     if pointer_side && !pointer_replay && !frozen_pointer_queue.is_empty() {
         let xid_map = backend.xid_map().clone();
         for queued in frozen_pointer_queue.clone() {
+            // is_replay=false: events withheld at the freeze gate were
+            // delivered to nobody, so they need FULL core + XI2 fanout now
+            // (an XI2-only natural target — the Cinnamon desktop, mate-panel
+            // — gets nothing with is_replay=true). Matches the Replay drain
+            // below; the device sync state was already updated above so the
+            // freeze gate lets these through.
             let _dropped =
-                pointer_event_fanout_to_state(state, backend, &xid_map, queued, true, false);
+                pointer_event_fanout_to_state(state, backend, &xid_map, queued, false, false);
         }
     }
 
@@ -29496,10 +29441,18 @@ mod tests {
         let _peer = install_client(&mut state, CLIENT_ID);
         let mut backend = RecordingBackend::new();
 
-        // Seed a passive grab that has activated (set by the
-        // pointer-fanout Step 3 path when a click matched).
+        // Seed a SYNC passive grab that has activated: the grab is held,
+        // the device frozen, and the activating press stored — exactly the
+        // state the pointer-fanout Step-3 path leaves after a matched click.
         state.pointer_grab = Some((ClientId(CLIENT_ID), ResourceId(GRAB_WIN)));
         state.pointer_grab_is_passive = true;
+        state.xi1_frozen.insert(
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::server::Xi1Freeze {
+                state: crate::server::Xi1SyncState::FrozenNoEvent,
+                ..Default::default()
+            },
+        );
 
         // Body per `xXIAllowEventsReq`: time(4) + deviceid(2) +
         // mode(1) + pad(1). deviceid=2 (master pointer), mode=0
@@ -29526,11 +29479,17 @@ mod tests {
         )
         .expect("allow events");
 
+        // AsyncDevice thaws the frozen pointer so events flow again (Xorg
+        // AsyncPointer). Per Xorg the passive grab itself persists until the
+        // button is released — what matters is the device is no longer
+        // frozen (the freeze gate would otherwise queue every later event).
         assert!(
-            state.pointer_grab.is_none(),
-            "AsyncDevice releases the passive pointer grab"
+            !state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                .is_some_and(crate::server::Xi1Freeze::frozen),
+            "AsyncDevice must thaw the frozen pointer device"
         );
-        assert!(!state.pointer_grab_is_passive);
     }
 
     #[test]
@@ -30165,9 +30124,181 @@ mod tests {
         );
     }
 
+    /// XI2 mode → core AllowSome mode mapping ([`xi2_allow_mode_to_core`]).
+    #[test]
+    fn xi2_allow_mode_to_core_maps_all_modes() {
+        // pointer (deviceid 2): Async/Sync/Replay → Pointer variants.
+        assert_eq!(xi2_allow_mode_to_core(0, 2), Some(0)); // AsyncDevice → AsyncPointer
+        assert_eq!(xi2_allow_mode_to_core(1, 2), Some(1)); // SyncDevice → SyncPointer
+        assert_eq!(xi2_allow_mode_to_core(2, 2), Some(2)); // ReplayDevice → ReplayPointer
+        // keyboard (deviceid 3): → Keyboard variants.
+        assert_eq!(xi2_allow_mode_to_core(0, 3), Some(3)); // → AsyncKeyboard
+        assert_eq!(xi2_allow_mode_to_core(1, 3), Some(4)); // → SyncKeyboard
+        assert_eq!(xi2_allow_mode_to_core(2, 3), Some(5)); // → ReplayKeyboard
+        // paired: AsyncPairedDevice acts on the OTHER device.
+        assert_eq!(xi2_allow_mode_to_core(3, 2), Some(3)); // ptr grab → async keyboard
+        assert_eq!(xi2_allow_mode_to_core(3, 3), Some(0)); // kbd grab → async pointer
+        assert_eq!(xi2_allow_mode_to_core(4, 2), Some(6)); // AsyncPair → AsyncBoth
+        assert_eq!(xi2_allow_mode_to_core(5, 2), Some(7)); // SyncPair  → SyncBoth
+        // touch / unknown → unsupported.
+        assert_eq!(xi2_allow_mode_to_core(6, 2), None); // XIAcceptTouch
+        assert_eq!(xi2_allow_mode_to_core(7, 2), None); // XIRejectTouch
+    }
+
+    /// Regression: XI2 `XIAllowEvents(XISyncDevice)` (mode 1) must thaw the
+    /// frozen device and replay the withheld queue. It used to be a no-op
+    /// ("we're always-async"), so muffin's click-to-focus SYNC path (mutter
+    /// `events.c` `maybe_unfreeze_pointer_events(EVENTS_UNFREEZE_SYNC)`)
+    /// could not clear the freeze → `QUEUE-WHILE-FROZEN` piled up → the
+    /// Cinnamon clicks-and-typing-dead freeze. Now routed through the shared
+    /// `apply_allow_events` (core SyncPointer).
+    #[test]
+    fn xi_allow_events_sync_device_thaws_and_drains_queue() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+        };
+        const GRAB_CLIENT_ID: u32 = 1;
+        const TARGET_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0010_0071;
+        const TARGET_WIN: u32 = 0x0020_0072;
+        const HOST_XID: u32 = 0xCAFE_0007;
+
+        let mut state = ServerState::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut target_peer = install_client(&mut state, TARGET_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        target_peer.set_nonblocking(true).expect("nonblocking");
+
+        for (client, win) in [(GRAB_CLIENT_ID, GRAB_WIN), (TARGET_CLIENT_ID, TARGET_WIN)] {
+            state.resources.create_window(
+                ClientId(client),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(win));
+        }
+        state
+            .clients
+            .get_mut(&TARGET_CLIENT_ID)
+            .expect("target")
+            .event_masks
+            .insert(ResourceId(TARGET_WIN), 0x0000_000c);
+
+        // Activated SYNC passive grab: held, frozen, activating press stored,
+        // a release withheld during the freeze.
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = true;
+        state.xi1_frozen.insert(
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::server::Xi1Freeze {
+                state: crate::server::Xi1SyncState::FrozenNoEvent,
+                ..Default::default()
+            },
+        );
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x10,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        state.frozen_pointer_event = Some(press);
+        state.frozen_pointer_queue.push_back(HostPointerEvent {
+            kind: PointerEventKind::ButtonRelease,
+            time: 0x20,
+            ..press
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
+            .expect("register host xid");
+
+        // XIAllowEvents XISyncDevice (mode 1) on master pointer (deviceid 2).
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.push(1); // mode = XISyncDevice
+        body.push(0); // pad
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 53,
+            length_units: 3,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("allow events");
+
+        assert!(
+            !state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                .is_some_and(crate::server::Xi1Freeze::frozen),
+            "XISyncDevice must thaw the frozen pointer (was a no-op → Cinnamon freeze)"
+        );
+        assert!(
+            state.frozen_pointer_queue.is_empty(),
+            "withheld queue must be drained on XISyncDevice"
+        );
+
+        let mut saw_release = false;
+        for _ in 0..8 {
+            let mut chunk = [0u8; 256];
+            match target_peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut i = 0;
+                    while i + 32 <= n {
+                        if chunk[i] & 0x7F == 5 {
+                            saw_release = true;
+                        }
+                        i += 32;
+                    }
+                    if saw_release {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("target read failed: {e}"),
+            }
+        }
+        assert!(
+            saw_release,
+            "natural target must receive the withheld ButtonRelease on XISyncDevice"
+        );
+    }
+
     #[test]
     fn xi_allow_events_replay_device_releases_active_pointer_grab() {
-        use crate::{backend::Backend, resources::ROOT_VISUAL, server::ActivePointerGrab};
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::ActivePointerGrab,
+        };
 
         const GRAB_CLIENT_ID: u32 = 1;
         const TARGET_WIN: u32 = 0x0020_0052;
@@ -30204,6 +30335,28 @@ mod tests {
             time: 0,
             owner_events: false,
             via_xi2: true,
+        });
+        // ReplayDevice only acts on a FROZEN device with a stored event to
+        // replay (Xorg AllowSome) — engage the sync freeze + activating press.
+        state.xi1_frozen.insert(
+            crate::xinput::DEVICEID_SLAVE_POINTER,
+            crate::server::Xi1Freeze {
+                state: crate::server::Xi1SyncState::FrozenNoEvent,
+                ..Default::default()
+            },
+        );
+        state.frozen_pointer_event = Some(HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
             .expect("register host xid");
