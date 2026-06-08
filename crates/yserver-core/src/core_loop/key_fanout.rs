@@ -41,7 +41,17 @@ pub fn key_event_fanout_to_state(
 ) -> Vec<ClientId> {
     // QueryKeymap bitmap — device key state tracks the physical
     // event regardless of where (or whether) it gets delivered.
-    let prior_mods = state.core_mod_state;
+    //
+    // NOTE: we deliberately do NOT reconstruct modifier state here and
+    // stamp it onto the event. The backend already cooks the
+    // authoritative xkb modifier state into `event.state`
+    // (`cook_host_key` → `serialize_modifiers`, and XTest fakes are
+    // cooked the same way via `on_host_input`). A second server-side
+    // tracker (keys_down × modifier-map) is a redundant source of
+    // truth that drifts from xkb — `synthesize_held_releases` on a
+    // VT-switch clears keys_down without touching xkb — and any
+    // `state == 0` override then clobbers every unmodified keypress
+    // with the stale modifier ("stuck Ctrl, can't type in wezterm").
     {
         let byte = usize::from(event.keycode / 8);
         let bit = 1u8 << (event.keycode % 8);
@@ -50,37 +60,6 @@ pub fn key_event_fanout_to_state(
         } else {
             state.keys_down[byte] &= !bit;
         }
-    }
-    // Recompute the core modifier state from keys_down × the modifier
-    // mapping (SetModifierMapping override first, else the backend's
-    // keymap-derived table). Held-key semantics — the Lock latch is
-    // not modelled.
-    {
-        let modmap = state
-            .modifier_mapping_override
-            .clone()
-            .or_else(|| backend.get_modifier_mapping(None).ok());
-        if let Some((kpm, keys)) = modmap
-            && kpm > 0
-        {
-            let mut mask = 0u16;
-            for (m, row) in keys.chunks(usize::from(kpm)).take(8).enumerate() {
-                let held = row.iter().any(|&kc| {
-                    kc != 0 && state.keys_down[usize::from(kc / 8)] & (1 << (kc % 8)) != 0
-                });
-                if held {
-                    mask |= 1 << m;
-                }
-            }
-            state.core_mod_state = mask;
-        }
-    }
-    // Synthetic events (XTestFakeInput) arrive with state == 0 — fill
-    // in the tracked modifier + button state (X11: state is the state
-    // BEFORE the event, so modifiers use the pre-update mask).
-    let mut event = event;
-    if event.state == 0 {
-        event.state = prior_mods | (state.buttons_down << 8);
     }
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
@@ -833,6 +812,43 @@ mod tests {
     /// selection, only the grab), and freezes the event for replay.
     /// This is the dead-`p`-in-wezterm fix: previously the press was
     /// delivered via window selection on the grab window, so a grab
+    /// Regression: an unmodified keypress (cooked `state == 0`) must
+    /// be delivered with `state == 0` — the fanout must NOT OR in any
+    /// server-tracked modifier state. Pre-fix, a stale modifier
+    /// tracker (`core_mod_state`, drifted from xkb by a release that
+    /// bypassed the cook path on VT-switch) clobbered every plain key
+    /// with ControlMask → "stuck Ctrl, can't type in wezterm".
+    #[test]
+    fn unmodified_key_delivered_with_clean_state() {
+        const WIN: u32 = 0x0020_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_kf(&mut state, 9, ResourceId(WIN), KEY_PRESS_MASK, 0);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        state.core_focus.raw = WIN;
+        // A modifier-map row mapping keycode 37 → Control, plus 37
+        // held: a re-introduced "reconstruct modifier state from
+        // keys_down × modmap and stamp it" path would compute
+        // ControlMask and clobber the unmodified 'a' below. The
+        // contract is that the fanout trusts the cooked `event.state`
+        // (here 0) and stamps nothing.
+        state.modifier_mapping_override = Some((1, vec![0, 0, 37, 0, 0, 0, 0, 0]));
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 37));
+        let _ = received_bytes(&mut peer);
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert!(n >= 32, "expected a KeyPress event, got {n} bytes");
+        assert_eq!(buf[0] & 0x7f, 2, "must be a KeyPress");
+        let delivered_state = u16::from_le_bytes([buf[28], buf[29]]);
+        assert_eq!(
+            delivered_state, 0,
+            "unmodified keypress must carry state 0, not the stale tracker's ControlMask",
+        );
+    }
+
     /// owner that registered via XIPassiveGrabDevice received nothing.
     #[test]
     fn sync_passive_key_grab_delivers_to_owner_and_freezes() {

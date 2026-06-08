@@ -1908,7 +1908,7 @@ fn handle_render_request(
                 );
             }
             let pairs = &body[4..];
-            if pairs.is_empty() || pairs.len() % 8 != 0 {
+            if pairs.is_empty() || !pairs.len().is_multiple_of(8) {
                 // Malformed list — match Xorg's `BadLength` shape via
                 // the existing length validator above (`request_lengths`).
                 // Falling through preserves prior behaviour for malformed

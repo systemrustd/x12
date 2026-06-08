@@ -65,10 +65,12 @@ pub fn pointer_event_fanout_to_state(
         }
         event.detail = mapped;
     }
-    // Track logical buttons-down + fill synthetic (state == 0) events
-    // with the live modifier/button state — X11 state is the state
-    // BEFORE the event, so capture prior to the bitmap update.
-    let buttons_before = state.buttons_down;
+    // Track logical buttons-down for the passive-grab activation
+    // predicate (`find_passive_grab` rejects a grab when another
+    // button is already down — XGrabButton-1). This is NOT stamped
+    // onto delivered events: the backend cooks the authoritative
+    // modifier/button state into `event.state` (see the modifier
+    // source-of-truth note in `key_fanout`).
     if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
@@ -80,9 +82,6 @@ pub fn pointer_event_fanout_to_state(
         } else {
             state.buttons_down &= !bit;
         }
-    }
-    if event.state == 0 {
-        event.state = state.core_mod_state | (buttons_before << 8);
     }
     // Pointer confinement (Xorg CheckPhysLimits): while a confined
     // grab is active, motion outside the confine rectangle is

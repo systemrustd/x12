@@ -825,11 +825,6 @@ pub struct ServerState {
     /// (XTest) events and gates passive-grab activation ("no other
     /// buttons down").
     pub buttons_down: u16,
-    /// Core modifier state derived from `keys_down` × the modifier
-    /// mapping — the state mask attached to synthetic events whose
-    /// producers (XTestFakeInput) don't carry one. Held-key
-    /// semantics; the Lock latch is not modelled.
-    pub core_mod_state: u16,
     /// Re-entrancy guard for the confinement warp: `warp_pointer_root`
     /// synchronously re-enters the pointer fanout with the generated
     /// motion; a coordinate mismatch between the clamp target and the
@@ -1124,7 +1119,6 @@ impl ServerState {
             keys_down: [0u8; 32],
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
-            core_mod_state: 0,
             confine_warp_active: false,
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
