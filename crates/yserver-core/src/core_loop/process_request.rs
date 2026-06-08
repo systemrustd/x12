@@ -17464,12 +17464,31 @@ fn handle_allow_events(
     };
     let dev_ptr = crate::xinput::DEVICEID_SLAVE_POINTER;
     let dev_kbd = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+    // Xorg AllowSome `othersFrozen`: the *Both modes (AsyncBoth /
+    // SyncBoth) only act when ANOTHER device this client grabbed is
+    // itself frozen (dix/events.c:1872, 1886 — `if (othersFrozen)`).
+    // Without this gate a client could thaw/re-freeze its own device
+    // via *Both even when no paired device is frozen, leaving later
+    // grabs in the wrong sync state. In the two-device model "others"
+    // relative to dev_this (keyboard, for *Both) is the pointer.
+    let others_frozen = {
+        let other = if dev_this == dev_kbd {
+            dev_ptr
+        } else {
+            dev_kbd
+        };
+        grab_owner_of(state, other) == Some(client_id)
+            && state
+                .xi1_frozen
+                .get(&other)
+                .is_some_and(|f| f.state >= Xi1SyncState::FrozenNoEvent)
+    };
     match mode {
         0 | 2 => set_state(state, dev_ptr, Xi1SyncState::Thawed),
         1 => set_state(state, dev_ptr, Xi1SyncState::FreezeNextEvent),
         3 | 5 => set_state(state, dev_kbd, Xi1SyncState::Thawed),
         4 => set_state(state, dev_kbd, Xi1SyncState::FreezeNextEvent),
-        6 => {
+        6 if others_frozen => {
             // AsyncBoth thaws every device this client's grabs froze.
             for dev in [dev_ptr, dev_kbd] {
                 if grab_owner_of(state, dev) == Some(client_id)
@@ -17479,7 +17498,7 @@ fn handle_allow_events(
                 }
             }
         }
-        _ => {
+        7 if others_frozen => {
             // SyncBoth arms FreezeBothNextEvent on the client's
             // grabbed devices.
             for dev in [dev_ptr, dev_kbd] {
@@ -17490,6 +17509,9 @@ fn handle_allow_events(
                 }
             }
         }
+        // *Both with no paired device frozen → no-op (Xorg).
+        6 | 7 => {}
+        _ => {}
     }
 
     // Withheld pointer events. The activating press of a sync passive
@@ -17511,13 +17533,24 @@ fn handle_allow_events(
     } else {
         std::collections::VecDeque::new()
     };
-    // NOT_GRABBED (Replay) releases the passive grab; Async/Sync keep
-    // it until the button release (Xorg: AllowEvents never ends an
-    // async-released passive grab early).
+    // NOT_GRABBED (Replay) deactivates a frozen-with-event grab on
+    // this device — passive AND explicit (Xorg dix/events.c:1898 calls
+    // DeactivateGrab regardless of grab kind). Async/Sync keep the
+    // grab until the natural button release. Without the explicit
+    // branch a GrabPointer(GrabModeSync) replays the frozen event but
+    // stays active → user-visible stuck grab.
+    let pointer_has_event = frozen_pointer.is_some() || !frozen_pointer_queue.is_empty();
     if pointer_replay && state.pointer_grab_is_passive {
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.pointer_confine_to = ResourceId(0);
+    } else if pointer_replay
+        && pointer_has_event
+        && state
+            .active_pointer_grab
+            .is_some_and(|g| g.owner == client_id)
+    {
+        deactivate_core_pointer_grab(state, client_id);
     }
 
     let keyboard_side = matches!(mode, 3..=7);
@@ -17530,12 +17563,24 @@ fn handle_allow_events(
         && state
             .active_keyboard_grab
             .is_some_and(|g| g.owner == client_id)
-        && matches!(
+    {
+        let is_passive = matches!(
             state.active_keyboard_grab.map(|g| g.source),
             Some(crate::server::ActiveKeyboardGrabSource::PassiveKey { .. })
-        )
-    {
-        state.active_keyboard_grab = None;
+        );
+        let kbd_has_event = frozen_keyboard.is_some()
+            || state
+                .xi1_frozen
+                .get(&dev_kbd)
+                .is_some_and(|f| !f.core_key_queue.is_empty() || !f.queue.is_empty());
+        if is_passive {
+            state.active_keyboard_grab = None;
+        } else if kbd_has_event {
+            // Explicit GrabKeyboard(GrabModeSync): deactivate on replay
+            // too (Xorg NOT_GRABBED → DeactivateGrab), emitting the
+            // FocusOut(NotifyUngrab) chain. Else the grab stays stuck.
+            deactivate_core_keyboard_grab(state, client_id);
+        }
     }
 
     // Play the withheld pointer queue for the non-replay releases
@@ -30678,6 +30723,75 @@ mod tests {
             n >= 32 && buf[0] == 2,
             "replayed KeyPress (event type 2) must reach the focused client; got n={n} type={}",
             buf[0]
+        );
+    }
+
+    /// Regression (codex review): ReplayKeyboard must release an
+    /// EXPLICIT GrabKeyboard(GrabModeSync), not just a passive key
+    /// grab — Xorg NOT_GRABBED calls DeactivateGrab regardless of
+    /// grab kind (dix/events.c:1898). Pre-fix the grab stayed active
+    /// after the replay → stuck keyboard.
+    #[test]
+    fn core_replay_keyboard_releases_explicit_sync_grab() {
+        use crate::{
+            host_x11::HostKeyEvent,
+            server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource},
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const FOCUS_WIN: u32 = 0x0020_0071;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        state.core_focus.raw = FOCUS_WIN;
+
+        // Explicit GrabKeyboard(GrabModeSync): active grab + the
+        // device frozen-no-event, with a key withheld in the freeze
+        // queue (the "with event" condition for replay).
+        state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ROOT_WINDOW,
+            owner_events: false,
+            source: ActiveKeyboardGrabSource::Explicit,
+            via_xi2: false,
+        });
+        {
+            let f = state
+                .xi1_frozen
+                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .or_default();
+            f.state = crate::server::Xi1SyncState::FrozenNoEvent;
+            f.core_key_queue.push_back(HostKeyEvent {
+                pressed: true,
+                keycode: 38,
+                time: 0x2222,
+                root_x: 1,
+                root_y: 2,
+                event_x: 1,
+                event_y: 2,
+                state: 0,
+            });
+        }
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 35,
+            data: 5, // ReplayKeyboard
+            length_units: 2,
+        };
+        handle_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &[0u8; 4],
+        )
+        .expect("allow events replay keyboard");
+
+        assert!(
+            state.active_keyboard_grab.is_none(),
+            "ReplayKeyboard must deactivate the explicit sync keyboard grab",
         );
     }
 
