@@ -1014,6 +1014,162 @@ impl Drop for DrawableImage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GLX TFP exportable image
+// ---------------------------------------------------------------------------
+
+/// BGRA8 is yserver's single-plane backing format for depth-24/32 pixmaps.
+pub const EXPORT_FORMAT_BGRA8: vk::Format = vk::Format::B8G8R8A8_UNORM;
+
+/// A freshly-allocated external-memory image that can be exported as a
+/// dma-buf fd.
+///
+/// Unlike [`DrawableImage`] (which aliases imported client memory), this type
+/// owns server-allocated, export-capable memory.  It is the allocation product
+/// of [`allocate_exportable`]; the export itself is performed by
+/// [`crate::kms::vk::dri3::export_backing`].
+pub struct ExportableImage {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub extent: vk::Extent2D,
+    pub format: vk::Format,
+    /// Row stride in bytes, from `vkGetImageSubresourceLayout`.
+    pub stride: u32,
+    /// Total memory size in bytes, from `vkGetImageSubresourceLayout`.
+    pub size: u64,
+    /// DRM format modifier; `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path.
+    pub modifier: u64,
+    /// Kept so `Drop` can call `vkFreeMemory` / `vkDestroyImage`.
+    vk: Arc<VkContext>,
+}
+
+impl Drop for ExportableImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.vk.device.free_memory(self.memory, None);
+            self.vk.device.destroy_image(self.image, None);
+        }
+    }
+}
+
+/// Allocate an external-memory, dma-buf-exportable `VkImage` + `VkDeviceMemory`.
+///
+/// **LINEAR tiling only** — no `DRM_FORMAT_MODIFIER_EXT` path.  Mesa imports a
+/// linear single-plane BGRA8 dma-buf without trouble, and a COLOR-aspect
+/// `vkGetImageSubresourceLayout` query gives the correct stride/size for the
+/// single-plane export.  The modifier branch is deferred; if it is added later
+/// it must switch the layout query to `MEMORY_PLANE_0` aspect and thread the
+/// real modifier through `ExportableImage.modifier`.
+///
+/// Mirrors the alloc pattern in `tests/dri3_fd_leak.rs` (`create_dmabuf_export`).
+pub fn allocate_exportable(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ExportableImage, vk::Result> {
+    const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+    let mut ext_mem = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut ext_mem);
+
+    let image = unsafe { vk.device.create_image(&image_info, None)? };
+
+    let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+    let mem_props = unsafe {
+        vk.instance
+            .get_physical_device_memory_properties(vk.physical_device)
+    };
+
+    let memory_type_index = pick_memory_type(
+        &mem_props,
+        mem_reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .or_else(|| {
+        // Fallback: any compatible type (e.g. on lavapipe / integrated GPU
+        // all memory is HOST_VISIBLE with no DEVICE_LOCAL-only type).
+        pick_memory_type(
+            &mem_props,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        )
+    });
+
+    let memory_type_index = match memory_type_index {
+        Some(i) => i,
+        None => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        }
+    };
+
+    let mut export_alloc = vk::ExportMemoryAllocateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(memory_type_index)
+        .push_next(&mut export_alloc)
+        .push_next(&mut dedicated);
+
+    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(e);
+    }
+
+    let subresource = vk::ImageSubresource {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        mip_level: 0,
+        array_layer: 0,
+    };
+    let layout = unsafe { vk.device.get_image_subresource_layout(image, subresource) };
+
+    Ok(ExportableImage {
+        image,
+        memory,
+        extent: vk::Extent2D { width, height },
+        format,
+        stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
+        size: layout.size,
+        modifier: DRM_FORMAT_MOD_LINEAR,
+        vk: Arc::clone(vk),
+    })
+}
+
 fn pick_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,

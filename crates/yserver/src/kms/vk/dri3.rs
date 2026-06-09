@@ -193,6 +193,34 @@ pub struct DmabufExport {
     pub stride: u32,
 }
 
+/// Export a server-allocated [`super::target::ExportableImage`] as a fresh
+/// dma-buf fd.
+///
+/// Shared by the GLX-TFP promotion path (server-owned exportable images).
+/// Requires `VK_KHR_external_memory_fd`; returns `Err` if the extension is
+/// absent.
+pub fn export_backing(
+    vk: &VkContext,
+    img: &super::target::ExportableImage,
+) -> std::io::Result<DmabufExport> {
+    let ext = vk
+        .external_memory_fd
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("VK_KHR_external_memory_fd unavailable"))?;
+    let info = vk::MemoryGetFdInfoKHR::default()
+        .memory(img.memory)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let raw_fd = unsafe { ext.get_memory_fd(&info) }
+        .map_err(|e| std::io::Error::other(format!("vkGetMemoryFdKHR: {e}")))?;
+    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")
+        .map_err(|e| std::io::Error::other(format!("invalid fd from vkGetMemoryFdKHR: {e}")))?;
+    Ok(DmabufExport {
+        fd,
+        size: u32::try_from(img.size).unwrap_or(u32::MAX),
+        stride: img.stride,
+    })
+}
+
 /// Import a client-supplied dma-buf into a `DrawableImage` per design
 /// §3.2. Takes ownership of `dma_buf_fd`. On success the fd lifetime
 /// is owned by the resulting `DrawableImage`; on failure the OwnedFd
