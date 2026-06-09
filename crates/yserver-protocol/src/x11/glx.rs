@@ -67,6 +67,10 @@ pub const MINOR_VERSION: u32 = 4;
 /// `BadRenderRequest` is the canonical reply for an indirect-rendering
 /// minor opcode the server doesn't implement; `UnsupportedPrivateRequest`
 /// is for `VendorPrivate`/`VendorPrivateWithReply` we don't handle.
+/// `BadPixmap` (3) is returned when `glXCreatePixmap` is called with an
+/// XID that does not name a valid X pixmap — matches `/usr/include/GL/glxproto.h`
+/// `GLXBadPixmap = 3` and Xorg `glx/glxcmds.c:185`.
+pub const ERROR_GLX_BAD_PIXMAP: u8 = 3;
 pub const ERROR_GLX_BAD_RENDER_REQUEST: u8 = 6;
 pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 8;
 

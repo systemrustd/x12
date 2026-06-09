@@ -203,6 +203,24 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .retain(|_, fence| fence.owner != client_id);
     state.sync_pending_awaits.retain(|a| a.client != client_id);
     state.glx_contexts.retain(|_, c| c.owner != client_id);
+    // Release export-lifetime refs for any GLXPixmaps the client still held.
+    // Collect the x_drawable XIDs first (only borrow glx_drawables), then
+    // resolve host_xid via resources (separate borrow), then call backend.
+    let owned_glx_x_drawables: Vec<u32> = state
+        .glx_drawables
+        .values()
+        .filter(|d| d.owner == client_id)
+        .map(|d| d.x_drawable)
+        .collect();
+    for x_drawable in owned_glx_x_drawables {
+        if let Some(host_xid) = state
+            .resources
+            .pixmap(ResourceId(x_drawable))
+            .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+        {
+            backend.release_glx_pixmap_export(host_xid);
+        }
+    }
     state.glx_drawables.retain(|_, d| d.owner != client_id);
     state
         .damage_objects

@@ -120,6 +120,10 @@ pub enum RecordedCall {
         cursor_host_xid: u32,
     },
     SetDpmsPower(u8),
+    /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
+    AcquireGlxPixmapExport(u32),
+    /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
+    ReleaseGlxPixmapExport(u32),
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -1284,6 +1288,20 @@ impl Backend for RecordingBackend {
         } else {
             Ok(())
         }
+    }
+
+    fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedCall::AcquireGlxPixmapExport(host_xid));
+    }
+
+    fn release_glx_pixmap_export(&mut self, host_xid: u32) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedCall::ReleaseGlxPixmapExport(host_xid));
     }
 }
 

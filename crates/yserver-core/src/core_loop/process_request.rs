@@ -398,7 +398,7 @@ pub fn process_request(
             attached_fd,
         ),
         // ── GLX extension dispatcher ──
-        148 => handle_glx_request(state, client_id, sequence, header, body),
+        148 => handle_glx_request(state, backend, client_id, sequence, header, body),
         // ── X-Resource (XRes) extension dispatcher ──
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
         // ── MIT-SCREEN-SAVER extension dispatcher ──
@@ -8159,6 +8159,7 @@ fn handle_x_resource_request(
 
 fn handle_glx_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -8356,6 +8357,32 @@ fn handle_glx_request(
         x11glx::CREATE_WINDOW | x11glx::CREATE_PIXMAP => {
             let parsed = x11glx::parse_create_glx_window(body);
             if let Some(req) = parsed {
+                // For CREATE_PIXMAP: validate the X pixmap exists.
+                // CREATE_WINDOW wraps an X window XID, which we don't
+                // validate here (windows have a different resource type).
+                if minor == x11glx::CREATE_PIXMAP
+                    && state
+                        .resources
+                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
+                        .is_none()
+                {
+                    debug!(
+                        "client {} #{} GLX::CreatePixmap glx_xid=0x{:x} \
+                         x_pixmap=0x{:x} not found -> GLXBadPixmap",
+                        client_id.0, sequence.0, req.glx_window, req.x_window
+                    );
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::GLX_FIRST_ERROR
+                            + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                        req.x_window,
+                        u16::from(header.data),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+
                 state.glx_drawables.insert(
                     req.glx_window,
                     crate::server::GlxDrawable {
@@ -8367,6 +8394,22 @@ fn handle_glx_request(
                         attributes: Vec::new(),
                     },
                 );
+
+                // For CREATE_PIXMAP: acquire an export-lifetime ref on the
+                // backing so the ExportedBacking entry (and its dmabuf fd)
+                // outlives any early FreePixmap until glXDestroyPixmap.
+                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
+                    state
+                        .resources
+                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
+                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                } else {
+                    None
+                };
+                if let Some(host_xid) = acquire_host_xid {
+                    backend.acquire_glx_pixmap_export(host_xid);
+                }
+
                 debug!(
                     "client {} #{} GLX::CreateDrawable minor={minor} \
                      glx_xid=0x{:x} x_drawable=0x{:x} fbconfig=0x{:x}",
@@ -8416,6 +8459,22 @@ fn handle_glx_request(
             } else {
                 0
             };
+            // For DESTROY_PIXMAP: release the export-lifetime ref taken at
+            // CREATE_PIXMAP. Resolve the X pixmap XID → host_xid before
+            // removing the GlxDrawable entry.
+            let release_host_xid = if minor == x11glx::DESTROY_PIXMAP {
+                state.glx_drawables.get(&xid).and_then(|d| {
+                    state
+                        .resources
+                        .pixmap(yserver_protocol::x11::ResourceId(d.x_drawable))
+                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                })
+            } else {
+                None
+            };
+            if let Some(host_xid) = release_host_xid {
+                backend.release_glx_pixmap_export(host_xid);
+            }
             state.glx_drawables.remove(&xid);
             debug!(
                 "client {} #{} GLX::DestroyDrawable minor={minor} glx_xid=0x{:x}",
@@ -38767,5 +38826,177 @@ mod tests {
         // Still equal length across configs.
         let len = configs[0].len();
         assert!(configs.iter().all(|c| c.len() == len));
+    }
+
+    /// GLX Task 3.4: `glXCreatePixmap` records the X drawable in
+    /// `glx_drawables`, calls `acquire_glx_pixmap_export` on the backend,
+    /// and `glXDestroyPixmap` clears the entry and calls
+    /// `release_glx_pixmap_export`.
+    #[test]
+    fn glx_create_pixmap_records_x_drawable_and_destroy_clears_it() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Register an X pixmap in the resource table with a known host_xid.
+        let x_pixmap_xid: u32 = 0x2000;
+        let host_xid_raw: u32 = 0xdead_0001;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                ResourceId(x_pixmap_xid),
+                crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
+            ),
+            "set_pixmap_host_xid must succeed"
+        );
+
+        let glx_xid: u32 = 0x4000_0001;
+        let fbconfig: u32 = 0x101;
+
+        // Build a GLX CREATE_PIXMAP request body:
+        // [screen(u32)][fbconfig(u32)][x_window(u32)][glx_window(u32)]
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen = 0
+        create_body.extend_from_slice(&fbconfig.to_le_bytes());
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,                 // GLX_MAJOR_OPCODE
+                data: x11glx::CREATE_PIXMAP, // minor = 22
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+
+        // Verify the GlxDrawable was recorded.
+        let d = state
+            .glx_drawables
+            .get(&glx_xid)
+            .expect("GlxDrawable must be present after CreatePixmap");
+        assert_eq!(
+            d.x_drawable, x_pixmap_xid,
+            "x_drawable must point to the X pixmap"
+        );
+        assert_eq!(d.fbconfig, fbconfig);
+
+        // Verify acquire was forwarded to the backend.
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host_xid_raw)),
+            "AcquireGlxPixmapExport must be recorded after CreatePixmap"
+        );
+
+        // Build a GLX DESTROY_PIXMAP request body: [glx_xid(u32)]
+        let destroy_body = glx_xid.to_le_bytes().to_vec();
+        let length_units = u32::try_from(1 + destroy_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::DESTROY_PIXMAP, // minor = 23
+                length_units,
+            },
+            &destroy_body,
+            None,
+        )
+        .expect("process_request DESTROY_PIXMAP");
+
+        // GlxDrawable must be removed.
+        assert!(
+            !state.glx_drawables.contains_key(&glx_xid),
+            "GlxDrawable must be removed after DestroyPixmap"
+        );
+
+        // Verify release was forwarded to the backend.
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::ReleaseGlxPixmapExport(host_xid_raw)),
+            "ReleaseGlxPixmapExport must be recorded after DestroyPixmap"
+        );
+    }
+
+    /// GLX Task 3.4: `glXCreatePixmap` with a non-existent X pixmap XID
+    /// must reply with a GLXBadPixmap error rather than silently inserting.
+    #[test]
+    fn glx_create_pixmap_with_missing_x_pixmap_returns_glx_bad_pixmap() {
+        use yserver_protocol::x11::glx as x11glx;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Use an XID that was never registered.
+        let bad_x_pixmap_xid: u32 = 0x9999;
+        let glx_xid: u32 = 0x4000_0002;
+
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        create_body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        create_body.extend_from_slice(&bad_x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request should not hard-error");
+        assert!(matches!(outcome, RequestOutcome::Handled));
+
+        // Nothing inserted in glx_drawables.
+        assert!(
+            !state.glx_drawables.contains_key(&glx_xid),
+            "GlxDrawable must NOT be inserted when X pixmap does not exist"
+        );
+
+        // Error packet must be delivered: GLXBadPixmap = GLX_FIRST_ERROR + 3 = 172.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("GLXBadPixmap error packet must be delivered");
+        assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
+        let expected_code =
+            crate::nested::GLX_FIRST_ERROR + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP;
+        assert_eq!(
+            buf[1], expected_code,
+            "expected GLXBadPixmap ({}), got {}",
+            expected_code, buf[1]
+        );
     }
 }

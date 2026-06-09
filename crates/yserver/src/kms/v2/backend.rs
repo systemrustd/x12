@@ -9165,6 +9165,14 @@ impl Backend for KmsBackendV2 {
         self.dmabuf_export_supported
     }
 
+    fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
+        KmsBackendV2::acquire_glx_pixmap_export(self, host_xid);
+    }
+
+    fn release_glx_pixmap_export(&mut self, host_xid: u32) {
+        KmsBackendV2::release_glx_pixmap_export(self, host_xid);
+    }
+
     /// Stage 4c.4 — flip a window's scene-participation under
     /// COMPOSITE redirect. Delegates to `DrawableStore::
     /// set_scene_participating` (which clears unpresented

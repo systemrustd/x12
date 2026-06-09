@@ -1640,6 +1640,30 @@ pub trait Backend: Send {
     }
 
     // ──────────────────────────────────────────────────────────────
+    // GLX_EXT_texture_from_pixmap export-lifetime management
+    // ──────────────────────────────────────────────────────────────
+
+    /// Increment the GLX-consumer refcount on the exported backing for
+    /// `host_xid`. Called when `glXCreatePixmap` (CREATE_PIXMAP) records
+    /// a new `GlxDrawable` that wraps an X pixmap. The KMS backend
+    /// (`KmsBackendV2`) routes this to `acquire_glx_pixmap_export` which
+    /// calls `ensure_exported_entry` (takes the one-time lifetime ref)
+    /// and increments `glx_refs`. Non-KMS backends (host-X11,
+    /// `RecordingBackend`) keep the default no-op.
+    fn acquire_glx_pixmap_export(&mut self, _host_xid: u32) {
+        // no-op for backends without GLX-TFP export tracking
+    }
+
+    /// Decrement the GLX-consumer refcount on the exported backing for
+    /// `host_xid` and tear it down when `glx_refs` reaches 0. Called
+    /// from three sites: `glXDestroyPixmap`, the `DESTROY_PIXMAP`
+    /// catch-all, and the per-client disconnect cleanup. Non-KMS backends
+    /// keep the default no-op.
+    fn release_glx_pixmap_export(&mut self, _host_xid: u32) {
+        // no-op for backends without GLX-TFP export tracking
+    }
+
+    // ──────────────────────────────────────────────────────────────
     // Other extensions
     // ──────────────────────────────────────────────────────────────
 
