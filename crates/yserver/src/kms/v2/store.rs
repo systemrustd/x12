@@ -133,6 +133,34 @@ pub(crate) struct Storage {
     /// owned by `Storage` (we build it fresh against the borrowed
     /// image) and is destroyed explicitly in `Storage::destroy`.
     pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
+    /// GLX-TFP (Task 1.2): set once this server-owned storage has been
+    /// migrated onto dma-buf-exportable memory via
+    /// [`Self::adopt_exportable`]. Distinct from
+    /// `imported_drawable.is_some()` (which is the DRI3-import case):
+    /// a promoted image owns server-allocated, export-capable memory
+    /// outright. A promoted image MUST NOT be returned to the
+    /// `PixmapPool` (pool images are OPTIMAL/non-exportable) — see the
+    /// `!self.promoted_exportable` guard in [`Self::destroy`].
+    pub(crate) promoted_exportable: bool,
+    /// GLX-TFP (Task 1.2): row stride (bytes) of the exportable image,
+    /// captured from `vkGetImageSubresourceLayout` at allocation time
+    /// so the DRI3 export reply (Task 1.3) never has to re-query it.
+    /// `0` for non-promoted storage.
+    pub(crate) export_stride: u32,
+    /// GLX-TFP (Task 1.2): total memory size (bytes) of the exportable
+    /// image, captured at allocation time. `0` for non-promoted
+    /// storage.
+    pub(crate) export_size: u64,
+}
+
+/// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
+/// Destroyed by the engine only once the fence guarding the old image's
+/// last render has signaled.
+pub(crate) struct RetiredImage {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub image_view: vk::ImageView,
+    pub sample_view: vk::ImageView,
 }
 
 impl Storage {
@@ -160,6 +188,9 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: None,
+            promoted_exportable: false,
+            export_stride: 0,
+            export_size: 0,
         }
     }
 
@@ -191,6 +222,9 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: Some(drawable),
+            promoted_exportable: false,
+            export_stride: 0,
+            export_size: 0,
         }
     }
 
@@ -216,6 +250,9 @@ impl Storage {
             current_layout: pooled.current_layout,
             is_test_stub: false,
             imported_drawable: None,
+            promoted_exportable: false,
+            export_stride: 0,
+            export_size: 0,
         }
     }
 
@@ -242,7 +279,53 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: true,
             imported_drawable: None,
+            promoted_exportable: false,
+            export_stride: 0,
+            export_size: 0,
         }
+    }
+
+    /// True when this storage's memory is already dma-buf-exportable
+    /// (DRI3-imported, or previously promoted). Used to avoid
+    /// re-promoting an already-exportable drawable.
+    pub(crate) fn is_exportable(&self) -> bool {
+        self.imported_drawable.is_some() || self.promoted_exportable
+    }
+
+    /// Adopt a freshly-allocated exportable image as this drawable's
+    /// permanent backing. Caller MUST have copied old→new content and
+    /// invalidated the view cache, and MUST destroy the returned old
+    /// handles only after the old image's last render fence has
+    /// signaled (see `RenderEngine::retire_image_after`).
+    ///
+    /// `export_stride`/`export_size` come from the exportable image's
+    /// `vkGetImageSubresourceLayout` at allocation time and are stored
+    /// so the DRI3 export reply (Task 1.3) never has to re-query them.
+    pub(crate) fn adopt_exportable(
+        &mut self,
+        new_image: vk::Image,
+        new_memory: vk::DeviceMemory,
+        new_sample_view: vk::ImageView,
+        new_image_view: vk::ImageView,
+        new_layout: vk::ImageLayout,
+        export_stride: u32,
+        export_size: u64,
+    ) -> RetiredImage {
+        let retired = RetiredImage {
+            image: self.image,
+            memory: self.memory,
+            image_view: self.image_view,
+            sample_view: self.sample_view,
+        };
+        self.image = new_image;
+        self.memory = new_memory;
+        self.image_view = new_image_view;
+        self.sample_view = new_sample_view;
+        self.current_layout = new_layout;
+        self.promoted_exportable = true;
+        self.export_stride = export_stride;
+        self.export_size = export_size;
+        retired
     }
 
     /// Destroy the underlying Vk handles. Called by
@@ -302,7 +385,13 @@ impl Storage {
         }
         // Pool-return path: only attempt for non-null handles and
         // when the platform has a pool wired (production path).
-        if self.image != vk::Image::null()
+        // Promoted (exportable) images are NEVER pool-eligible — the
+        // pool only holds OPTIMAL-tiled, non-exportable images; a
+        // LINEAR exportable image returned here would corrupt the
+        // pool's size/format buckets and silently hand out
+        // export-capable memory to ordinary pixmaps.
+        if !self.promoted_exportable
+            && self.image != vk::Image::null()
             && self.image_view != vk::ImageView::null()
             && self.memory != vk::DeviceMemory::null()
             && let Some(pool) = platform.pixmap_pool.as_ref()

@@ -48,7 +48,7 @@ use super::{
     glyph_atlas::V2GlyphAtlas,
     platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
-    store::{DrawableId, DrawableStore},
+    store::{DrawableId, DrawableStore, RetiredImage},
 };
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
@@ -644,6 +644,14 @@ struct RenderEngineInner {
     /// at engine construction from YSERVER_FRAME_BUILDER_TIMEOUT_MS
     /// (default 16 ms). Hot-path check in maybe_composite.
     frame_builder_timeout: std::time::Duration,
+    /// GLX-TFP (Task 1.2): old Vk handles displaced by pixmap
+    /// promotion, each paired with the fence guarding the old image's
+    /// last render. Drained by [`RenderEngine::poll_retired`] once the
+    /// fence signals (or `None`/already-signaled → freed eagerly by
+    /// `retire_image_after`). Kept separate from `submitted` because
+    /// the retire isn't gated on one of *our* CBs — it rides whatever
+    /// ticket last touched the drawable.
+    retired_promoted_images: Vec<(RetiredImage, Option<FenceTicket>)>,
 }
 
 impl RenderEngineInner {
@@ -1073,6 +1081,7 @@ impl RenderEngine {
                 frame_builder: super::frame_builder::FrameBuilder::new(),
                 frame_builder_timeout:
                     super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
+                retired_promoted_images: Vec::new(),
             }),
         })
     }
@@ -1153,6 +1162,59 @@ impl RenderEngine {
             }
             // The Arcs inside the record drop here, releasing pinned resources.
             drop(record);
+        }
+        // GLX-TFP (Task 1.2): free old promotion-displaced images whose
+        // guarding fence has signaled. No ordering relationship to the
+        // queues above (each rides its own ticket), so retain-filter
+        // rather than pop-prefix.
+        if !inner.retired_promoted_images.is_empty() {
+            let vk = Arc::clone(&inner.vk);
+            inner.retired_promoted_images.retain(|(retired, guard)| {
+                let signaled = guard.as_ref().is_none_or(|t| t.poll_signaled(&vk));
+                if signaled {
+                    Self::destroy_retired_image(&vk, retired);
+                }
+                !signaled
+            });
+        }
+    }
+
+    /// Destroy the Vk handles of a promotion-displaced [`RetiredImage`].
+    /// Order: sample_view, image_view, image, memory (views before the
+    /// image they reference; image before its backing memory). Null
+    /// handles are no-ops per the Vulkan spec.
+    fn destroy_retired_image(vk: &VkContext, retired: &RetiredImage) {
+        unsafe {
+            if retired.sample_view != vk::ImageView::null() {
+                vk.device.destroy_image_view(retired.sample_view, None);
+            }
+            if retired.image_view != vk::ImageView::null() {
+                vk.device.destroy_image_view(retired.image_view, None);
+            }
+            if retired.image != vk::Image::null() {
+                vk.device.destroy_image(retired.image, None);
+            }
+            if retired.memory != vk::DeviceMemory::null() {
+                vk.device.free_memory(retired.memory, None);
+            }
+        }
+    }
+
+    /// Push old promotion-displaced handles onto the deferred-destroy
+    /// list. If `guard` is `None` or already signaled, the handles are
+    /// destroyed immediately; otherwise they're parked until
+    /// [`Self::poll_retired`] observes the fence signal.
+    fn retire_image_after(&mut self, retired: RetiredImage, guard: Option<FenceTicket>) {
+        let Some(inner) = self.inner.as_mut() else {
+            // No Vk inner: nothing to destroy against. (The handles are
+            // necessarily null in the stub case.)
+            return;
+        };
+        let ready = guard.as_ref().is_none_or(|t| t.poll_signaled(&inner.vk));
+        if ready {
+            Self::destroy_retired_image(&inner.vk, &retired);
+        } else {
+            inner.retired_promoted_images.push((retired, guard));
         }
     }
 
@@ -1244,6 +1306,17 @@ impl RenderEngine {
             }
             // Record drops; pins drop; Arcs decrement.
             drop(record);
+        }
+        // GLX-TFP (Task 1.2): wait out + free any promotion-displaced
+        // images still parked. The earlier `submitted` / `pending_frames`
+        // waits don't necessarily cover their guarding tickets (a guard
+        // can be a foreign ticket), so wait each explicitly.
+        let vk = Arc::clone(&inner.vk);
+        for (retired, guard) in inner.retired_promoted_images.drain(..) {
+            if let Some(t) = guard.as_ref() {
+                let _ = t.wait(&vk);
+            }
+            Self::destroy_retired_image(&vk, &retired);
         }
     }
 
@@ -2426,6 +2499,17 @@ impl RenderEngine {
     /// dangling Vk handles since `vk::ImageView`'s underlying image
     /// is gone.
     pub(crate) fn notify_drawable_retired(&mut self, id: DrawableId) {
+        self.invalidate_drawable_views(id);
+    }
+
+    /// Drop (and `vkDestroyImageView`) every cached drawable view keyed
+    /// on `id`. Shared body of [`Self::notify_drawable_retired`] (called
+    /// when a drawable's storage is destroyed) and the GLX-TFP promotion
+    /// path (called after `Storage::adopt_exportable` swaps the backing
+    /// image — the cache keys on `DrawableId` only and never re-checks
+    /// the `VkImage` handle, so a swap without invalidation would keep
+    /// sampling the OLD image).
+    pub(crate) fn invalidate_drawable_views(&mut self, id: DrawableId) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2439,6 +2523,208 @@ impl RenderEngine {
             }
             false
         });
+    }
+
+    /// GLX-TFP (Task 1.2): permanently migrate a server-owned pixmap
+    /// onto dma-buf-exportable storage (glamor's model). Idempotent —
+    /// returns early if the drawable is already exportable (DRI3 import
+    /// or a prior promotion).
+    ///
+    /// Steps: (a) allocate an exportable image; (b)+(c) copy the old
+    /// content into it and block until the copy completes; (d) build
+    /// fresh sample + attachment views over the new image; (e) swap the
+    /// `Storage` handles; (f) invalidate the drawable's cached views
+    /// (the cache keys on `DrawableId` and never re-checks the
+    /// `VkImage`, so a swap without this keeps sampling the old image);
+    /// (g) retire the old handles once their guarding fence signals.
+    ///
+    /// # Errors
+    ///
+    /// `NoVk` (stub engine), `UnknownDrawable`, or any propagated
+    /// `vk::Result` from allocation / view creation / the blocking copy.
+    pub(crate) fn promote_drawable_exportable(
+        &mut self,
+        platform: &mut PlatformBackend,
+        store: &mut DrawableStore,
+        id: DrawableId,
+    ) -> Result<(), RenderError> {
+        if self.inner.is_none() {
+            return Err(RenderError::NoVk);
+        }
+        // Idempotency check first — avoid the flush cost if already done.
+        {
+            let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
+            if d.storage.is_exportable() {
+                return Ok(());
+            }
+        }
+
+        // Submit-boundary (codex review): any open frame / parked submit
+        // group may hold CBs that captured cached views of the OLD image
+        // but have NOT been submitted to the queue yet. The copy below
+        // relies on same-queue submission ordering to read finalized
+        // old-image content, and `retire_image_after` later destroys the
+        // old handles + invalidated views once `last_render_ticket`
+        // signals. Both are only sound if every prior user of the old
+        // image is already submitted. Close the open frame and flush the
+        // submit group here to establish that boundary (mirrors
+        // `get_image`'s SyncWait close before its readback). After this,
+        // `last_render_ticket` names the newest in-flight ticket that
+        // touched the drawable.
+        self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
+        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)?;
+
+        // Metadata read (post-close: current_layout reflects any
+        // transition the frame close recorded).
+        let (extent, format, depth, old_layout, old_image) = {
+            let d = store.get(id).ok_or(RenderError::UnknownDrawable(id))?;
+            let s = &d.storage;
+            (s.extent, s.format, s.depth, s.current_layout, s.image)
+        };
+
+        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+
+        // (a) allocate exportable target.
+        let exp =
+            crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
+
+        // (b)+(c) copy old content → new image, block until complete.
+        self.copy_image_blocking(platform, old_image, old_layout, exp.image, extent)?;
+        let new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+        // (d) build new views (same depth-aware swizzle the store uses).
+        let sample_view = PlatformBackend::build_sample_view(&vk, exp.image, format, depth)?;
+        let image_view = match PlatformBackend::build_attachment_view(&vk, exp.image, format) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { vk.device.destroy_image_view(sample_view, None) };
+                return Err(e.into());
+            }
+        };
+
+        // (e) swap storage, taking ownership of the exportable image's
+        //     raw handles (into_raw_parts prevents the ExportableImage
+        //     Drop from double-freeing them).
+        let (exp_image, exp_memory, exp_stride, exp_size) = exp.into_raw_parts();
+        let retired = {
+            let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
+            d.storage.adopt_exportable(
+                exp_image,
+                exp_memory,
+                sample_view,
+                image_view,
+                new_layout,
+                exp_stride,
+                exp_size,
+            )
+        };
+
+        // (f) invalidate the view cache for this DrawableId.
+        self.invalidate_drawable_views(id);
+
+        // (g) retire old handles once the old image's last render fence
+        //     signals (clone the ticket; None → retire eagerly).
+        let guard = store.get(id).and_then(|d| d.last_render_ticket.clone());
+        self.retire_image_after(retired, guard);
+        Ok(())
+    }
+
+    /// GLX-TFP (Task 1.2): blocking old→new image copy used by the
+    /// promotion path. Records, on a dedicated one-shot CB + fence
+    /// (`run_one_shot_op` waits for the fence before returning):
+    ///   - `src`: `src_layout` → `TRANSFER_SRC_OPTIMAL`
+    ///   - `dst`: `UNDEFINED` → `TRANSFER_DST_OPTIMAL`
+    ///   - `vkCmdCopyImage` (full `extent`, COLOR, 1 mip / 1 layer)
+    ///   - `dst`: `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL`
+    ///
+    /// Promotion is rare (once per pixmap, on first GLX bind), so a
+    /// dedicated fence wait is acceptable.
+    ///
+    /// # Errors
+    ///
+    /// `NoVk`, or any propagated `vk::Result` from CB recording / submit
+    /// / fence wait.
+    fn copy_image_blocking(
+        &mut self,
+        platform: &PlatformBackend,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        extent: vk::Extent2D,
+    ) -> Result<(), RenderError> {
+        let inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
+        let vk = Arc::clone(&inner.vk);
+        let pool = platform
+            .ops_command_pool_handle()
+            .ok_or(RenderError::NoVk)?;
+
+        crate::kms::vk::ops::run_one_shot_op(&vk, pool, |vk, cb| {
+            let full_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+
+            let pre = [
+                // src → TRANSFER_SRC_OPTIMAL
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(src_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(src)
+                    .subresource_range(full_range),
+                // dst (UNDEFINED) → TRANSFER_DST_OPTIMAL
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::empty())
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(dst)
+                    .subresource_range(full_range),
+            ];
+            let dep = vk::DependencyInfo::default().image_memory_barriers(&pre);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+
+            let layers = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1);
+            let region = [vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })];
+            unsafe {
+                vk.device.cmd_copy_image(
+                    cb,
+                    src,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                );
+            }
+
+            let post = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(dst)
+                .subresource_range(full_range)];
+            let dep = vk::DependencyInfo::default().image_memory_barriers(&post);
+            unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+            Ok(())
+        })?;
+        Ok(())
     }
 
     // ── Op: fill_rect / fill_rect_batch ─────────────────────────

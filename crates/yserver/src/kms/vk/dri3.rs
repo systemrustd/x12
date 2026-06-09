@@ -219,6 +219,38 @@ pub fn export_backing(
     })
 }
 
+/// Export a promoted pixmap's exportable memory as a fresh dma-buf fd.
+///
+/// GLX-TFP (Task 1.2/1.3): once a pixmap has been promoted onto
+/// exportable storage, its raw `vk::DeviceMemory` handle lives on the
+/// `Storage` (the `ExportableImage` wrapper was decomposed via
+/// `into_raw_parts`), and the `stride`/`size` were captured at
+/// allocation time. This exports that memory directly without
+/// reconstructing an `ExportableImage`. Requires
+/// `VK_KHR_external_memory_fd`.
+pub fn export_promoted(
+    vk: &VkContext,
+    _image: vk::Image,
+    memory: vk::DeviceMemory,
+    stride: u32,
+    size: u64,
+) -> Result<DmabufExport, vk::Result> {
+    let ext = vk
+        .external_memory_fd
+        .as_ref()
+        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+    let info = vk::MemoryGetFdInfoKHR::default()
+        .memory(memory)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
+    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_promoted")?;
+    Ok(DmabufExport {
+        fd,
+        size: u32::try_from(size).unwrap_or(u32::MAX),
+        stride,
+    })
+}
+
 /// Import a client-supplied dma-buf into a `DrawableImage` per design
 /// §3.2. Takes ownership of `dma_buf_fd`. On success the fd lifetime
 /// is owned by the resulting `DrawableImage`; on failure the OwnedFd

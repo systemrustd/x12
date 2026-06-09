@@ -1285,6 +1285,55 @@ impl KmsBackendV2 {
         Some((drawable.storage.image_view, drawable.storage.sample_view))
     }
 
+    /// GLX-TFP (Task 1.2) test shim: clone the backend's
+    /// `Arc<VkContext>` so tests can drive raw Vulkan readback
+    /// (re-import + staging copy) against the same device.
+    #[doc(hidden)]
+    pub fn test_vk_arc(&self) -> Option<std::sync::Arc<crate::kms::vk::device::VkContext>> {
+        self.platform.vk.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// GLX-TFP (Task 1.2) test shim: promote a server-owned pixmap onto
+    /// exportable storage and export the resulting dma-buf. Drives the
+    /// production `RenderEngine::promote_drawable_exportable` +
+    /// `dri3::export_backing` paths.
+    #[doc(hidden)]
+    pub fn promote_and_export_pixmap_for_tests(
+        &mut self,
+        xid: u32,
+    ) -> io::Result<crate::kms::vk::dri3::DmabufExport> {
+        let id = self
+            .store
+            .lookup(xid)
+            .ok_or_else(|| io::Error::other(format!("promote: unknown xid {xid:#x}")))?;
+        self.engine
+            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+            .map_err(|e| io::Error::other(format!("promote_drawable_exportable: {e:?}")))?;
+        let vk = self
+            .platform
+            .vk
+            .as_ref()
+            .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
+        let (image, memory, stride, size) = {
+            let d = self
+                .store
+                .get(id)
+                .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
+            (
+                d.storage.image,
+                d.storage.memory,
+                d.storage.export_stride,
+                d.storage.export_size,
+            )
+        };
+        // Export the promoted memory directly (the Storage now owns the
+        // exportable image's handles; we don't have the ExportableImage
+        // wrapper any more, so build the export from the raw handles +
+        // the stride/size adopt_exportable stored).
+        crate::kms::vk::dri3::export_promoted(vk, image, memory, stride, size)
+            .map_err(|e| io::Error::other(format!("export_promoted: {e:?}")))
+    }
+
     /// Test-only read of whether the Composite Overlay Window is
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol

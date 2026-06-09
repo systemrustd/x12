@@ -1043,6 +1043,33 @@ pub struct ExportableImage {
     vk: Arc<VkContext>,
 }
 
+impl ExportableImage {
+    /// Decompose into the raw Vk handles + export metadata WITHOUT
+    /// running [`Drop`], transferring ownership of `image` / `memory`
+    /// to the caller. Used by the GLX-TFP promotion path
+    /// (`RenderEngine::promote_drawable_exportable`), which swaps these
+    /// handles into a `Storage` whose own teardown then owns them.
+    ///
+    /// **Does NOT use `mem::forget`** — that would leak the
+    /// `Arc<VkContext>` strong-count, eventually preventing
+    /// `VkContext::Drop`'s `device_wait_idle` + `destroy_device` (the
+    /// same hazard `DrawableImage::into_pool_entry` documents). Instead
+    /// the struct is wrapped in `ManuallyDrop` so `Drop` never fires on
+    /// the Vk handles, then the `Arc<VkContext>` is read out and
+    /// dropped normally, decrementing the strong-count as it should.
+    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64) {
+        let mut md = std::mem::ManuallyDrop::new(self);
+        let image = md.image;
+        let memory = md.memory;
+        let stride = md.stride;
+        let size = md.size;
+        // Drop the Arc<VkContext> normally (decrement strong-count)
+        // without destroying the Vk handles the caller now owns.
+        unsafe { std::ptr::drop_in_place(&mut md.vk) };
+        (image, memory, stride, size)
+    }
+}
+
 impl Drop for ExportableImage {
     fn drop(&mut self) {
         // image must be destroyed before the memory it was bound to

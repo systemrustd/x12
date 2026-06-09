@@ -1344,6 +1344,32 @@ impl PlatformBackend {
         unsafe { vk.device.create_image_view(&info, None) }
     }
 
+    /// Build a fresh attachment-side `vk::ImageView` over `image` with
+    /// an IDENTITY component swizzle. This matches what
+    /// [`Self::allocate_drawable_storage`]'s fresh-alloc path builds for
+    /// `Storage::image_view` (the colour-attachment view —
+    /// VUID-VkFramebufferCreateInfo-pAttachments-00891 requires IDENTITY
+    /// for attachment views). Used by the GLX-TFP promotion path
+    /// (`RenderEngine::promote_drawable_exportable`) to rebuild the
+    /// attachment view over the newly-adopted exportable image.
+    pub(crate) fn build_attachment_view(
+        vk: &crate::kms::vk::device::VkContext,
+        image: vk::Image,
+        format: vk::Format,
+    ) -> Result<vk::ImageView, vk::Result> {
+        let info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        unsafe { vk.device.create_image_view(&info, None) }
+    }
+
     /// Map an X11 drawable depth to its v2 storage format. Mirrors
     /// `DrawableImage::format_for_pixmap_depth` (v1) so the two
     /// don't drift.
