@@ -33,6 +33,18 @@ pub struct VkContext {
     /// when false, `kms::vk::dri3::supported_modifiers` returns
     /// `[DRM_FORMAT_MOD_LINEAR]` per design §4 fallback matrix.
     pub image_drm_format_modifier: bool,
+    /// GLX-TFP: per-driver tiling strategy for the exported image,
+    /// cached on first successful allocation. LINEAR is preferred —
+    /// Turnip / Adreno same-GPU dma-buf sharing only delivers live
+    /// pixels through LINEAR (its modifier-tiled UBWC keeps
+    /// compression metadata in driver caches that don't reach the
+    /// dma-buf-backed memory, so the GL importer samples a frozen
+    /// snapshot). RADV rejects LINEAR + COLOR_ATTACHMENT + dma-buf
+    /// with `VK_ERROR_FORMAT_NOT_SUPPORTED`, in which case
+    /// [`super::target::allocate_exportable`] falls back to the
+    /// modifier path and caches that. Empty until the first
+    /// allocation attempt.
+    pub tfp_tiling_strategy: std::sync::OnceLock<super::target::TilingStrategy>,
     pub graphics_queue_family: u32,
     pub graphics_queue: vk::Queue,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
@@ -305,6 +317,7 @@ impl VkContext {
             external_memory_fd,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,
+            tfp_tiling_strategy: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,
             debug_messenger,

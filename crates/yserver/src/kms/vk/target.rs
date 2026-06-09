@@ -1097,21 +1097,44 @@ impl Drop for ExportableImage {
     }
 }
 
+/// GLX-TFP tiling strategy for the exported image, cached on
+/// [`crate::kms::vk::device::VkContext::tfp_tiling_strategy`] after
+/// the first successful allocation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TilingStrategy {
+    /// `VK_IMAGE_TILING_LINEAR` + dma-buf. Preferred on Turnip / Adreno
+    /// — its UBWC modifier tile keeps compression metadata in driver
+    /// caches that do not reach the dma-buf-backed memory on same-GPU
+    /// share, so the Mesa GL importer samples a frozen snapshot. LINEAR
+    /// has no compression metadata, so live writes are immediately
+    /// visible.
+    Linear,
+    /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. Required on RADV /
+    /// RDNA2 — that driver rejects `LINEAR + COLOR_ATTACHMENT + dma-buf`
+    /// with `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+    Modifier,
+}
+
 /// Allocate an external-memory, dma-buf-exportable `VkImage` + `VkDeviceMemory`.
 ///
-/// **Modifier-first.** On RADV/RDNA2 a renderable+sampleable
-/// `VK_IMAGE_TILING_LINEAR` image cannot be dma-buf-exported
-/// (`vkCreateImage` → `VK_ERROR_FORMAT_NOT_SUPPORTED`); the driver
-/// requires `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. So when
-/// `VK_EXT_image_drm_format_modifier` is available and the driver
-/// advertises at least one export-capable single-plane modifier for
-/// `format` ([`crate::kms::vk::dri3::export_capable_modifiers`]), this
-/// allocates a modifier-tiled image, reads back the driver-chosen
-/// modifier with `vkGetImageDrmFormatModifierPropertiesEXT`, and queries
-/// the layout via the `MEMORY_PLANE_0` aspect (mandatory for
-/// modifier-tiled images — `COLOR` is a validation error).
+/// **LINEAR-preferred, modifier-fallback.** The strategy is selected
+/// once per `VkContext` and cached on its `tfp_tiling_strategy`
+/// `OnceLock`:
 ///
-/// Falls back to the historical `LINEAR` path when the extension is
+/// - Empty (first call): try LINEAR first. If `vkCreateImage` accepts
+///   it (Turnip, Mesa software, most non-AMD drivers), cache
+///   [`TilingStrategy::Linear`]. If it rejects with
+///   `FORMAT_NOT_SUPPORTED` (RADV/RDNA2), try the modifier path with
+///   the driver's export-capable single-plane modifiers list and cache
+///   [`TilingStrategy::Modifier`] on success.
+/// - Set: dispatch directly to the cached path, skipping the failing
+///   probe each call.
+///
+/// The modifier path uses `VkImageDrmFormatModifierListCreateInfoEXT`
+/// with the list from [`crate::kms::vk::dri3::export_capable_modifiers`],
+/// reads back the driver-chosen modifier with
+/// `vkGetImageDrmFormatModifierPropertiesEXT`, and queries the layout
+/// via the `MEMORY_PLANE_0` aspect (mandatory for modifier-tiled —
 /// absent or no modifier qualifies (e.g. lavapipe under `cargo test`),
 /// where a linear single-plane BGRA8 dma-buf imports without trouble and
 /// a `COLOR`-aspect layout query is correct.
@@ -1124,24 +1147,66 @@ pub fn allocate_exportable(
     height: u32,
     format: vk::Format,
 ) -> Result<ExportableImage, vk::Result> {
-    let modifiers = if vk.image_drm_format_modifier {
-        super::dri3::export_capable_modifiers(vk, format)
-    } else {
-        Vec::new()
-    };
-
-    if modifiers.is_empty() {
-        return allocate_exportable_linear(vk, width, height, format);
+    if let Some(strategy) = vk.tfp_tiling_strategy.get() {
+        return allocate_with_strategy(vk, width, height, format, *strategy);
     }
 
-    match allocate_exportable_modifier(vk, width, height, format, &modifiers) {
-        Ok(img) => Ok(img),
+    // First allocation: probe LINEAR first. Turnip / Adreno requires
+    // it for same-GPU coherence (UBWC's compression metadata stays in
+    // driver caches and the Mesa GL importer reads stale tiles).
+    match allocate_exportable_linear(vk, width, height, format) {
+        Ok(img) => {
+            let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Linear);
+            return Ok(img);
+        }
         Err(e) => {
-            // On RADV the LINEAR fallback will simply reproduce the
-            // FORMAT_NOT_SUPPORTED, but it is harmless and keeps drivers
-            // where modifier creation fails for other reasons working.
-            log::warn!("allocate_exportable: modifier path failed ({e:?}); falling back to LINEAR");
-            allocate_exportable_linear(vk, width, height, format)
+            // RADV / RDNA2 path: LINEAR + COLOR_ATTACHMENT + dma-buf
+            // → `VK_ERROR_FORMAT_NOT_SUPPORTED`. Fall through to the
+            // modifier path. Log at debug — RADV ALWAYS lands here on
+            // first export; warning would be noise.
+            log::debug!("allocate_exportable: LINEAR probe failed ({e:?}); trying modifier path");
+        }
+    }
+
+    if !vk.image_drm_format_modifier {
+        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+    }
+    let modifiers = super::dri3::export_capable_modifiers(vk, format);
+    if modifiers.is_empty() {
+        return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+    }
+    match allocate_exportable_modifier(vk, width, height, format, &modifiers) {
+        Ok(img) => {
+            let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Modifier);
+            Ok(img)
+        }
+        Err(e) => {
+            log::warn!(
+                "allocate_exportable: both LINEAR and modifier paths failed (modifier err {e:?})"
+            );
+            Err(e)
+        }
+    }
+}
+
+fn allocate_with_strategy(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    strategy: TilingStrategy,
+) -> Result<ExportableImage, vk::Result> {
+    match strategy {
+        TilingStrategy::Linear => allocate_exportable_linear(vk, width, height, format),
+        TilingStrategy::Modifier => {
+            if !vk.image_drm_format_modifier {
+                return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+            }
+            let modifiers = super::dri3::export_capable_modifiers(vk, format);
+            if modifiers.is_empty() {
+                return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+            }
+            allocate_exportable_modifier(vk, width, height, format, &modifiers)
         }
     }
 }
