@@ -543,6 +543,29 @@ yserver-cinnamon-hw log="warn":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
 
+# Bring up yserver ALONE on :7 (no compositor / no GL client), then run
+# the GLX TFP probe as the FIRST and only client — so its dri3-screen /
+# texture_from_pixmap result is representative of muffin's first-client
+# position. Run from a free VT/tty on the HW box (needs DRM master).
+# Output: probe result on stdout + /tmp/tfp-probe.out, yserver log in
+# yserver-hw-bare.log. yserver is killed when the probe finishes.
+yserver-tfp-probe-hw log="warn":
+    cargo build --bin yserver
+    gcc tools/glx-tfp-probe.c -lGL -lX11 -o ./tfp-probe
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-bare.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        echo "=== GLX TFP probe (sole client) ===";\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 \
+            XDG_RUNTIME_DIR="$xdg_rd" LIBGL_DEBUG=verbose \
+            ./tfp-probe 2>&1 | tee tfp-probe.out \
+            | grep -iE "screen|texture_from_pixmap|USABLE|matching|radeonsi|cfg [0-9]|returned";\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null'
+
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
 # the fake display `:8`; x11trace tunnels everything to yserver
@@ -861,6 +884,16 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
 # Run rendercheck on host
 rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
+
+yserver-hw log="warn":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver 7 > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env DISPLAY=":7" xterm -geometry 100x80-100+0;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
 
 # Picks the lowest free X display by scanning /tmp/.X11-unix/, brings
 # yserver up there, then runs ~/.xinitrc (or /etc/X11/xinit/xinitrc
