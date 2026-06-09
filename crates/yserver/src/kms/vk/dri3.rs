@@ -230,7 +230,6 @@ pub fn export_backing(
 /// `VK_KHR_external_memory_fd`.
 pub fn export_promoted(
     vk: &VkContext,
-    _image: vk::Image,
     memory: vk::DeviceMemory,
     stride: u32,
     size: u64,

@@ -1314,13 +1314,12 @@ impl KmsBackendV2 {
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
-        let (image, memory, stride, size) = {
+        let (memory, stride, size) = {
             let d = self
                 .store
                 .get(id)
                 .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
             (
-                d.storage.image,
                 d.storage.memory,
                 d.storage.export_stride,
                 d.storage.export_size,
@@ -1328,9 +1327,9 @@ impl KmsBackendV2 {
         };
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
-        // wrapper any more, so build the export from the raw handles +
-        // the stride/size adopt_exportable stored).
-        crate::kms::vk::dri3::export_promoted(vk, image, memory, stride, size)
+        // wrapper any more, so build the export from the raw memory handle
+        // + the stride/size adopt_exportable stored).
+        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size)
             .map_err(|e| io::Error::other(format!("export_promoted: {e:?}")))
     }
 

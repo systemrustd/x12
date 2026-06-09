@@ -2603,11 +2603,15 @@ impl RenderEngine {
         };
 
         // (e) swap storage, taking ownership of the exportable image's
-        //     raw handles (into_raw_parts prevents the ExportableImage
-        //     Drop from double-freeing them).
-        let (exp_image, exp_memory, exp_stride, exp_size) = exp.into_raw_parts();
+        //     raw handles. The drawable existence check happens BEFORE
+        //     `into_raw_parts` so an absent drawable can't leak the four
+        //     raw handles (`into_raw_parts` disarms `ExportableImage`'s
+        //     Drop, so a bail-out after it would orphan image/memory and
+        //     the two views). Unreachable in the single-threaded engine,
+        //     but cheap to make leak-proof.
         let retired = {
             let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
+            let (exp_image, exp_memory, exp_stride, exp_size) = exp.into_raw_parts();
             d.storage.adopt_exportable(
                 exp_image,
                 exp_memory,
