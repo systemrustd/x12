@@ -852,6 +852,65 @@ RENDER paint paths. Specifically:
    divergence was measured) as the load-bearing validation.
    yoga remains the rate-canary post-fix.
 
+## GLX texture-from-pixmap (branch `feat/glx-texture-from-pixmap`, 2026-06-10)
+
+**Status: TFP IN USE end-to-end, HW-verified on yoga (X1E/Turnip) and bee
+(6900HX/RADV).** `GLX_EXT_texture_from_pixmap` — the live-texture compositing
+path Compiz / picom-glx / muffin need (no copy-upload fallback). Unblocks
+`project_compiz_is_required`.
+
+Spec/plan: `docs/superpowers/{specs,plans}/2026-06-09-glx-texture-from-pixmap.md`
+(post-implementation findings appended to the plan). Root-cause findings:
+`docs/superpowers/findings/2026-06-09-glx-tfp-radv-export-rootcause.md`.
+
+**What landed (four components + the unlock):**
+- **Phase 0 — exportable image.** `allocate_exportable` (`kms/vk/target.rs`)
+  allocates a dma-buf-exportable VkImage. Tiling is **LINEAR-preferred,
+  modifier-fallback**, cached per `VkContext::tfp_tiling_strategy`
+  (`0eb7432`): Turnip needs LINEAR (UBWC keeps compression metadata in driver
+  caches that don't reach the dma-buf on same-GPU share → frozen snapshot);
+  RADV rejects LINEAR+COLOR_ATTACHMENT+dma-buf so falls through to modifier.
+  (The original modifier-first default was wrong on Turnip.)
+- **Phase 1 — DRI3 `BuffersFromPixmap` (op 8) export.** Un-deferred; emits
+  per-plane fd/stride/offset + the driver-chosen DRM modifier, threaded
+  `ExportableImage → Storage::export_modifier → reply`. op-3 delegates to it.
+  Also fixed scanout's modifier-BO layout query to `MEMORY_PLANE_0` aspect.
+- **Phase 2 — dma-buf sync.** `IMPORT/EXPORT_SYNC_FILE` ioctls wired + firing
+  (GL-reads-while-we-write hazard); correct, but were NOT the Turnip unblocker
+  (LINEAR was).
+- **Phase 3/4 — GLX surface + DRI3 plumbing** (pre-existing on the branch).
+- **THE UNLOCK — GLX fbconfig/visual matchability (`061aa131`).** mesa's GLX
+  dri3 *screen* creation failed `No matching fbConfigs or visuals found`
+  (upstream of any export — the plan's "GLX surface is correct" premise was
+  wrong). `driConfigEqual` (mesa `src/glx/dri_common.c` attribMap)
+  scalar-compares the server's config against the client driver's
+  `__DRIconfig`; three of yserver's synthesized attrs didn't match radeonsi:
+  depth-24 `alpha 0→8` / `buffer_size 24→32`, depth-24 `BIND_TO_TEXTURE_RGBA
+  0→1`, and `BIND_TO_TEXTURE_TARGETS 2D|RECT → GLX_DONT_CARE` (DONT_CARE is
+  the matcher's wildcard; the only portable value). Diagnosed by dumping
+  radeonsi's live configs via `tools/glx-cfgdump.c`.
+
+**Wire-level proof TFP is live (not copy-upload fallback), bee xtrace:**
+6× `glXCreatePixmap` + **5× DRI3 `BuffersFromPixmap` (op 8)** + 5×
+`GetSupportedModifiers` + 5× `PixmapFromBuffers`. Note `glXBindTexImageEXT`
+does NOT appear in the X trace — under DRI3 it's handled client-side by mesa
+(re-sampling the already-imported dma-buf), so the wire-level TFP-in-use
+signal is the op-8 export count; the per-frame Bind shows only in a
+client-side apitrace (yoga session: 86× Bind / 82× Release).
+
+**Stale-frame fix was SEPARATE and upstream (master `8b93ce6`).** The
+cinnamon-settings stale-pane repro was a DAMAGE-emission bug, not TFP:
+`damage_fanout.rs` applied `NonEmpty`'s one-shot gate to all levels, but
+muffin uses `BoundingBox` (level 2) which per the X11 DAMAGE spec + Xorg
+`damageext.c:136-153` must emit on EVERY paint. TFP alone would not have
+cured it.
+
+Validation: `cargo test -p yserver-core --lib` 721/721, `-p yserver --lib`
+441/441, clippy + fmt clean. **Open follow-ups (non-blocking):**
+`shaderDemoteToHelperInvocation` VVL error (latent, also flagged under
+MIT-SCREEN-SAVER above), and `vkDestroySemaphore`-in-use VVL errors during
+the live GL-client load.
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
