@@ -8569,21 +8569,137 @@ fn handle_glx_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11glx::VENDOR_PRIVATE | x11glx::VENDOR_PRIVATE_WITH_REPLY => {
-            // Modern Mesa direct-rendering doesn't go this route.
-            debug!(
-                "client {} #{} GLX::VendorPrivate (rejected: GLXUnsupportedPrivateRequest)",
-                client_id.0, sequence.0
-            );
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                crate::nested::GLX_FIRST_ERROR
-                    + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
-                0,
-                u16::from(header.data),
-                crate::nested::GLX_MAJOR_OPCODE,
-            );
+            // Dispatch known vendor codes; reject everything else with
+            // GLXUnsupportedPrivateRequest (modern Mesa direct-rendering
+            // never reaches this path).
+            //
+            // VendorPrivate body layout:
+            //   [0..4]   vendor_code  (u32 LE)
+            //   [4..8]   context_tag  (u32 LE, informational)
+            //   [8..12]  glx_drawable (u32 LE, GLXPixmap XID)
+            //   [12..16] buffer       (u32 LE, e.g. GLX_FRONT_LEFT_EXT)
+            let vendor_code = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            match vendor_code {
+                x11glx::VENDOR_CODE_BIND_TEX_IMAGE => {
+                    // glXBindTexImageEXT (indirect path, EXT completeness).
+                    // Direct-context compositors (muffin) ride DRI3 and never
+                    // hit this. For indirect contexts: resolve the GLXPixmap to
+                    // its underlying X pixmap, ensure it is export-promoted
+                    // (so any indirect GL texture sampling reads live content),
+                    // and return success. BindTexImageEXT has no reply.
+                    let glx_drawable = if body.len() >= 12 {
+                        u32::from_le_bytes([body[8], body[9], body[10], body[11]])
+                    } else {
+                        0
+                    };
+                    debug!(
+                        "client {} #{} GLX::BindTexImageEXT glx_drawable=0x{glx_drawable:x}",
+                        client_id.0, sequence.0
+                    );
+                    if let Some(d) = state.glx_drawables.get(&glx_drawable) {
+                        // Ensure the backing is promoted to exportable storage so
+                        // indirect GL texture sampling can read live content.
+                        // acquire_glx_pixmap_export is idempotent (increments
+                        // a refcount; the one-time promotion happens on the first
+                        // call). Using it here rather than a separate lightweight
+                        // promote avoids introducing new backend surface area.
+                        //
+                        // TODO(glx-tfp): indirect texture *sampling* (serving
+                        // glTexImage2D-equivalent data from the promoted backing)
+                        // is not yet implemented; the bind succeeds so clients
+                        // do not receive a protocol error, but the texture
+                        // content will not be updated until indirect GL sampling
+                        // is wired up.
+                        if let Some(host_xid) = d.glx_export_host_xid {
+                            backend.acquire_glx_pixmap_export(host_xid);
+                        }
+                        // No reply for VENDOR_PRIVATE; for VENDOR_PRIVATE_WITH_REPLY
+                        // send an empty success reply so the client does not block.
+                        if minor == x11glx::VENDOR_PRIVATE_WITH_REPLY {
+                            let reply = x11glx::encode_get_drawable_attributes_reply(
+                                byte_order,
+                                sequence,
+                                &[],
+                            );
+                            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                                return Ok(RequestOutcome::Handled);
+                            };
+                            return Ok(write_to_client(client, client_id, &reply));
+                        }
+                    } else {
+                        debug!(
+                            "client {} #{} GLX::BindTexImageEXT \
+                             glx_drawable=0x{glx_drawable:x} not found -> GLXBadPixmap",
+                            client_id.0, sequence.0
+                        );
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            crate::nested::GLX_FIRST_ERROR
+                                + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                            glx_drawable,
+                            u16::from(header.data),
+                            crate::nested::GLX_MAJOR_OPCODE,
+                        );
+                    }
+                }
+                x11glx::VENDOR_CODE_RELEASE_TEX_IMAGE => {
+                    // glXReleaseTexImageEXT (indirect path, EXT completeness).
+                    // Mirror the bind: resolve and drop the promote-ref if we
+                    // held one. Unknown GLXPixmap XIDs are silently ignored
+                    // (no error — matches Xorg glx/glxcmds.c behaviour for
+                    // stale release after destroy).
+                    let glx_drawable = if body.len() >= 12 {
+                        u32::from_le_bytes([body[8], body[9], body[10], body[11]])
+                    } else {
+                        0
+                    };
+                    debug!(
+                        "client {} #{} GLX::ReleaseTexImageEXT glx_drawable=0x{glx_drawable:x}",
+                        client_id.0, sequence.0
+                    );
+                    if let Some(Some(host_xid)) = state
+                        .glx_drawables
+                        .get(&glx_drawable)
+                        .map(|d| d.glx_export_host_xid)
+                    {
+                        backend.release_glx_pixmap_export(host_xid);
+                    }
+                    // No reply for VENDOR_PRIVATE; for VENDOR_PRIVATE_WITH_REPLY
+                    // send an empty success reply.
+                    if minor == x11glx::VENDOR_PRIVATE_WITH_REPLY {
+                        let reply =
+                            x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &[]);
+                        let Some(client) = state.clients.get_mut(&client_id.0) else {
+                            return Ok(RequestOutcome::Handled);
+                        };
+                        return Ok(write_to_client(client, client_id, &reply));
+                    }
+                }
+                _ => {
+                    // All other vendor codes are unsupported.
+                    debug!(
+                        "client {} #{} GLX::VendorPrivate \
+                         vendor_code={vendor_code} (rejected: GLXUnsupportedPrivateRequest)",
+                        client_id.0, sequence.0
+                    );
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::GLX_FIRST_ERROR
+                            + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
+                        0,
+                        u16::from(header.data),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            }
         }
         other => {
             // Indirect-rendering opcodes 1..=198 + anything else we
@@ -39126,5 +39242,148 @@ mod tests {
             "expected GLXBadPixmap ({}), got {}",
             expected_code, buf[1]
         );
+    }
+
+    /// GLX Task 3.5: `VendorPrivate` with vendor_code 1330 (`BindTexImageEXT`)
+    /// over a valid GLXPixmap must NOT be rejected with
+    /// `GLXUnsupportedPrivateRequest`; it must succeed (return `Handled`
+    /// with no error packet delivered to the client).
+    ///
+    /// Secondary assertion: an unknown vendor code still gets
+    /// `GLXUnsupportedPrivateRequest` (preservation of the fallthrough).
+    #[test]
+    fn bind_tex_image_ext_is_dispatched_not_rejected() {
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Register an X pixmap with a known host_xid — mirrors the
+        // Task 3.4 test setup so we can get a GlxDrawable into state.
+        let x_pixmap_xid: u32 = 0x2000;
+        let host_xid_raw: u32 = 0xdead_1330;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 32,
+                height: 32,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
+            ),
+            "set_pixmap_host_xid must succeed"
+        );
+
+        // First, call GLX::CreatePixmap to insert a GlxDrawable.
+        let glx_xid: u32 = 0x4000_0002;
+        let fbconfig: u32 = 0x101;
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen = 0
+        create_body.extend_from_slice(&fbconfig.to_le_bytes());
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+
+        // Build a VendorPrivate body for BindTexImageEXT (1330):
+        //   [vendor_code=1330][context_tag=0][glx_drawable=glx_xid][buffer=GLX_FRONT_LEFT_EXT]
+        let mut bind_body = Vec::new();
+        bind_body.extend_from_slice(&x11glx::VENDOR_CODE_BIND_TEX_IMAGE.to_le_bytes());
+        bind_body.extend_from_slice(&0u32.to_le_bytes()); // context_tag
+        bind_body.extend_from_slice(&glx_xid.to_le_bytes());
+        bind_body.extend_from_slice(&x11glx::GLX_FRONT_LEFT_EXT.to_le_bytes());
+        let length_units = u32::try_from(1 + bind_body.len().div_ceil(4)).expect("fits");
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE, // minor = 16
+                length_units,
+            },
+            &bind_body,
+            None,
+        )
+        .expect("process_request VENDOR_PRIVATE BindTexImageEXT must not hard-error");
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "BindTexImageEXT must return Handled, got {outcome:?}"
+        );
+
+        // No error packet must be delivered to the client.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        match peer.read(&mut buf) {
+            Ok(0) | Err(_) => { /* no data written — correct */ }
+            Ok(n) => {
+                assert_ne!(
+                    buf[0], 0,
+                    "BindTexImageEXT must not deliver an X11 error packet; \
+                     got {n} bytes, first byte={} (0=Error)",
+                    buf[0]
+                );
+            }
+        }
+        peer.set_nonblocking(false).unwrap();
+
+        // The unsupported-private rejection must still fire for unknown codes.
+        let mut unknown_body = Vec::new();
+        unknown_body.extend_from_slice(&9999u32.to_le_bytes()); // unknown vendor code
+        unknown_body.extend_from_slice(&0u32.to_le_bytes());
+        unknown_body.extend_from_slice(&0u32.to_le_bytes());
+        unknown_body.extend_from_slice(&0u32.to_le_bytes());
+        let length_units = u32::try_from(1 + unknown_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE,
+                length_units,
+            },
+            &unknown_body,
+            None,
+        )
+        .expect("process_request VENDOR_PRIVATE unknown must not hard-error");
+
+        // Error packet for the unknown vendor code.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf2 = [0u8; 32];
+        peer.read_exact(&mut buf2)
+            .expect("GLXUnsupportedPrivateRequest error packet must be delivered");
+        assert_eq!(buf2[0], 0, "byte 0 must be 0 (Error class)");
+        let expected_unsupported = crate::nested::GLX_FIRST_ERROR
+            + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST;
+        assert_eq!(
+            buf2[1], expected_unsupported,
+            "expected GLXUnsupportedPrivateRequest ({expected_unsupported}), got {}",
+            buf2[1]
+        );
+        peer.set_nonblocking(false).unwrap();
     }
 }

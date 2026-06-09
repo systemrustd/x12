@@ -74,6 +74,50 @@ pub const ERROR_GLX_BAD_PIXMAP: u8 = 3;
 pub const ERROR_GLX_BAD_RENDER_REQUEST: u8 = 6;
 pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 8;
 
+/// VendorPrivate codes for `GLX_EXT_texture_from_pixmap` indirect path.
+/// Values from `glx/glxext.h` (`GLX_BIND_TEX_IMAGE_EXT` / `GLX_RELEASE_TEX_IMAGE_EXT`).
+pub const VENDOR_CODE_BIND_TEX_IMAGE: u32 = 1330;
+pub const VENDOR_CODE_RELEASE_TEX_IMAGE: u32 = 1331;
+
+/// Buffer token for `glXBindTexImageEXT`. Confirmed against
+/// `/usr/include/GL/glxext.h`: `#define GLX_FRONT_LEFT_EXT 0x20DE`.
+/// The indirect bind path accepts any buffer value (single front buffer);
+/// this constant is exported for tests / documentation.
+pub const GLX_FRONT_LEFT_EXT: u32 = 0x20DE;
+
+/// Parsed VendorPrivate / VendorPrivateWithReply body for
+/// `BindTexImageEXT` (1330) and `ReleaseTexImageEXT` (1331).
+///
+/// Wire layout (little-endian u32 quads):
+/// ```text
+/// [0..4]   vendor_code   (u32)
+/// [4..8]   context_tag   (u32, informational — indirect GLX context id)
+/// [8..12]  glx_drawable  (u32, GLXPixmap XID)
+/// [12..16] buffer        (u32, e.g. GLX_FRONT_LEFT_EXT — informational)
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VendorPrivateTexImageRequest {
+    pub vendor_code: u32,
+    pub context_tag: u32,
+    pub glx_drawable: u32,
+    pub buffer: u32,
+}
+
+/// Parse the body of a VendorPrivate request for `BindTexImageEXT` or
+/// `ReleaseTexImageEXT`. Returns `None` if the body is shorter than 16 bytes.
+#[must_use]
+pub fn parse_vendor_private_tex_image(body: &[u8]) -> Option<VendorPrivateTexImageRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(VendorPrivateTexImageRequest {
+        vendor_code: read_u32_le(body),
+        context_tag: read_u32_le(&body[4..]),
+        glx_drawable: read_u32_le(&body[8..]),
+        buffer: read_u32_le(&body[12..]),
+    })
+}
+
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
