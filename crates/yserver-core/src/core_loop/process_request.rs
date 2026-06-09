@@ -7620,26 +7620,92 @@ fn handle_dri3_request(
             }
         }
         x11dri3::BUFFERS_FROM_PIXMAP => {
-            // DRI3 op 8 (BUFFERS_FROM_PIXMAP); deferred. yserver's backings are
-            // single-plane BGRA8 (LINEAR), which Xorg's dri3_fd_from_pixmap
-            // exports via the single-fd BufferFromPixmap (op 3) — it only falls
-            // back to the multi-plane fds_from_pixmap when the single-fd path is
-            // absent (xserver dri3/dri3_screen.c:112). So BufferFromPixmap above
-            // is the correct minimal contract; implement op 8 only when yserver
-            // starts exporting multi-plane or modifier-bearing buffers.
-            debug!(
-                "client {} #{} DRI3::BuffersFromPixmap (deferred — single-plane BGRA8 exports via BufferFromPixmap op 3)",
-                client_id.0, sequence.0
-            );
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_ALLOC,
-                0,
-                u16::from(header.data),
-                DRI3_MAJOR_OPCODE,
-            );
+            // DRI3 op 8 (BUFFERS_FROM_PIXMAP). mesa's loader_dri3 uses op 8
+            // (not op 3) whenever the server advertises DRI3 >= 1.2 — and a
+            // modifier-tiled backing (the RADV export path) is unusable by the
+            // client without the modifier op 8 carries. yserver exports a
+            // single plane, so the reply has nfd=1.
+            let Some(pixmap) = x11dri3::parse_buffers_from_pixmap(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            let host_xid = match state
+                .resources
+                .pixmap(yserver_protocol::x11::ResourceId(pixmap))
+                .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+            {
+                Some(h) => h,
+                None => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        pixmap,
+                        u16::from(header.data),
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            };
+            match backend.dri3_export_pixmap_buffers(host_xid) {
+                Ok(export) => {
+                    debug!(
+                        "client {} #{} DRI3::BuffersFromPixmap pixmap=0x{pixmap:x} {}x{} stride={} offset={} modifier=0x{:x} depth={} bpp={}",
+                        client_id.0,
+                        sequence.0,
+                        export.width,
+                        export.height,
+                        export.stride,
+                        export.offset,
+                        export.modifier,
+                        export.depth,
+                        export.bpp,
+                    );
+                    let reply = x11dri3::encode_buffers_from_pixmap_reply(
+                        byte_order,
+                        sequence,
+                        export.width,
+                        export.height,
+                        export.modifier,
+                        export.depth,
+                        export.bpp,
+                        &[export.stride],
+                        &[export.offset],
+                    );
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        return Ok(RequestOutcome::Handled);
+                    };
+                    let raw = std::os::fd::AsRawFd::as_raw_fd(&export.fd);
+                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
+                        log::warn!("DRI3::BuffersFromPixmap SCM_RIGHTS dispatch failed: {e}");
+                        return Ok(RequestOutcome::Disconnect(client_id));
+                    }
+                    drop(export.fd);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} DRI3::BuffersFromPixmap pixmap=0x{pixmap:x} -> BadPixmap ({err})",
+                        client_id.0, sequence.0
+                    );
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_PIXMAP,
+                        pixmap,
+                        u16::from(header.data),
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
         }
         x11dri3::GET_SUPPORTED_MODIFIERS => {
             let req = match x11dri3::parse_get_supported_modifiers(body) {
@@ -38868,6 +38934,67 @@ mod tests {
         );
 
         // Read the 32-byte X error packet from the peer socket.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("BadPixmap error packet must be delivered to client");
+        assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
+        assert_eq!(
+            buf[1],
+            x11::error::BAD_PIXMAP,
+            "expected BadPixmap ({}), got {}",
+            x11::error::BAD_PIXMAP,
+            buf[1]
+        );
+    }
+
+    /// DRI3::BuffersFromPixmap (op 8): like op 3, a backend export
+    /// failure must emit `BadPixmap` (the modifier-aware multi-plane
+    /// reply shares op 3's error contract). The default RecordingBackend
+    /// returns Err from `dri3_export_pixmap_buffers`.
+    #[test]
+    fn buffers_from_pixmap_export_failure_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let pixmap_xid: u32 = 0x1000;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap_xid),
+            crate::backend::PixmapHandle::from_raw(0xdead_cafe).unwrap(),
+        ));
+
+        let body = pixmap_xid.to_le_bytes().to_vec();
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode: 147, // DRI3_MAJOR_OPCODE
+                data: 8,     // BUFFERS_FROM_PIXMAP
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request should not hard-error");
+
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "expected Handled, got {outcome:?}"
+        );
+
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
         peer.read_exact(&mut buf)

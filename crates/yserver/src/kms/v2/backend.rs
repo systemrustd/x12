@@ -24,9 +24,9 @@ use std::{
 
 use yserver_core::{
     backend::{
-        AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentCaps,
-        WindowHandle,
+        AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
+        Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, OriginContext, PictureHandle,
+        PixmapHandle, PresentCaps, WindowHandle,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -1390,7 +1390,7 @@ impl KmsBackendV2 {
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
-        let (memory, stride, size) = {
+        let (memory, stride, size, modifier) = {
             let d = self
                 .store
                 .get(id)
@@ -1399,13 +1399,14 @@ impl KmsBackendV2 {
                 d.storage.memory,
                 d.storage.export_stride,
                 d.storage.export_size,
+                d.storage.export_modifier,
             )
         };
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
         // wrapper any more, so build the export from the raw memory handle
-        // + the stride/size adopt_exportable stored).
-        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size)
+        // + the stride/size/modifier adopt_exportable stored).
+        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size, modifier)
             .map_err(|e| io::Error::other(format!("export_promoted: {e:?}")))
     }
 
@@ -13587,6 +13588,22 @@ impl Backend for KmsBackendV2 {
         &mut self,
         host_xid: u32,
     ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+        // op 3 is the single-fd, no-modifier subset of op 8. Share the
+        // promote+export path and drop the modifier/offset (op 3's reply
+        // has no field for them). stride truncates CARD32 → CARD16.
+        let e = self.dri3_export_pixmap_buffers(host_xid)?;
+        Ok((
+            e.size,
+            e.width,
+            e.height,
+            u16::try_from(e.stride).unwrap_or(u16::MAX),
+            e.depth,
+            e.bpp,
+            e.fd,
+        ))
+    }
+
+    fn dri3_export_pixmap_buffers(&mut self, host_xid: u32) -> io::Result<Dri3PixmapExport> {
         // Resolve xid → DrawableId before any mutable borrows.
         let id = self.store.lookup(host_xid).ok_or_else(|| {
             io::Error::other(format!("DRI3 export: unknown pixmap 0x{host_xid:x}"))
@@ -13647,11 +13664,10 @@ impl Backend for KmsBackendV2 {
                 drawable.storage.memory,
                 drawable.storage.export_stride,
                 drawable.storage.export_size,
+                drawable.storage.export_modifier,
             )
             .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
         };
-
-        let stride16 = u16::try_from(export.stride).unwrap_or(u16::MAX);
 
         // GLX-TFP (Tasks 2.3 + 2.4): record/refresh the export tracking
         // entry. Repeated exports (muffin re-exports per damage) reuse the
@@ -13672,7 +13688,17 @@ impl Backend for KmsBackendV2 {
             self.store.set_exported_sync_fd(id, sync_dup);
         }
 
-        Ok((export.size, width, height, stride16, depth, bpp, export.fd))
+        Ok(Dri3PixmapExport {
+            size: export.size,
+            width,
+            height,
+            stride: export.stride,
+            offset: export.offset,
+            depth,
+            bpp,
+            modifier: export.modifier,
+            fd: export.fd,
+        })
     }
 
     fn dri3_fence_from_fd(&mut self, fence_xid: u32, fd: std::os::fd::OwnedFd) -> io::Result<()> {

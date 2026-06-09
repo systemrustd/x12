@@ -989,11 +989,20 @@ fn allocate_vk_scanout_image(
     };
 
     // Row pitch from the driver. We need this for KMS addfb2.
+    // Modifier-tiled images MUST be queried with a MEMORY_PLANE aspect;
+    // COLOR is a validation error (the single-plane scanout buffer is
+    // plane 0). LINEAR-tiled fallbacks keep the COLOR aspect.
+    let layout_aspect = match plan {
+        ScanoutAllocationPlan::DrmModifier(_) => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+        ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
+            vk::ImageAspectFlags::COLOR
+        }
+    };
     let layout = unsafe {
         vk.device.get_image_subresource_layout(
             image,
             vk::ImageSubresource {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: layout_aspect,
                 mip_level: 0,
                 array_layer: 0,
             },

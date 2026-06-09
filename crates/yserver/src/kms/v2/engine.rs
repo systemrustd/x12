@@ -2663,7 +2663,7 @@ impl RenderEngine {
         //     but cheap to make leak-proof.
         let retired = {
             let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
-            let (exp_image, exp_memory, exp_stride, exp_size) = exp.into_raw_parts();
+            let (exp_image, exp_memory, exp_stride, exp_size, exp_modifier) = exp.into_raw_parts();
             d.storage.adopt_exportable(
                 exp_image,
                 exp_memory,
@@ -2672,6 +2672,7 @@ impl RenderEngine {
                 new_layout,
                 exp_stride,
                 exp_size,
+                exp_modifier,
             )
         };
 

@@ -276,6 +276,11 @@ pub fn export_dmabuf(
         fd,
         size,
         stride: pitch,
+        offset: u32::try_from(layout.offset).unwrap_or(0),
+        // DrawableImage (imported client buffers) does not currently
+        // track its DRM modifier; report LINEAR. The TFP export path uses
+        // export_promoted/export_backing, which carry the real modifier.
+        modifier: DRM_FORMAT_MOD_LINEAR,
     })
 }
 
@@ -284,6 +289,16 @@ pub struct DmabufExport {
     pub fd: std::os::fd::OwnedFd,
     pub size: u32,
     pub stride: u32,
+    /// Byte offset of plane 0 in the dma-buf. Always 0 for yserver's
+    /// single-plane, dedicated-allocation exports; carried so the
+    /// `BuffersFromPixmap` (op 8) reply can report it per-plane.
+    pub offset: u32,
+    /// DRM format modifier of the exported buffer. `DRM_FORMAT_MOD_LINEAR`
+    /// (0) for LINEAR-tiled exports; the driver-chosen modifier for the
+    /// `DRM_FORMAT_MODIFIER_EXT` path. The client MUST receive this to
+    /// import a modifier-tiled buffer correctly — which is why TFP needs
+    /// op 8 (op 3's reply has no modifier field).
+    pub modifier: u64,
 }
 
 /// Export a server-allocated [`super::target::ExportableImage`] as a fresh
@@ -309,6 +324,8 @@ pub fn export_backing(
         fd,
         size: u32::try_from(img.size).unwrap_or(u32::MAX),
         stride: img.stride,
+        offset: 0,
+        modifier: img.modifier,
     })
 }
 
@@ -326,6 +343,7 @@ pub fn export_promoted(
     memory: vk::DeviceMemory,
     stride: u32,
     size: u64,
+    modifier: u64,
 ) -> Result<DmabufExport, vk::Result> {
     let ext = vk
         .external_memory_fd
@@ -340,6 +358,8 @@ pub fn export_promoted(
         fd,
         size: u32::try_from(size).unwrap_or(u32::MAX),
         stride,
+        offset: 0,
+        modifier,
     })
 }
 

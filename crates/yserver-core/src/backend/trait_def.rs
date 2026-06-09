@@ -230,6 +230,27 @@ impl Dri3Caps {
     }
 }
 
+/// Result of a DRI3 `BuffersFromPixmap` (op 8) export — the single-plane
+/// modifier-aware superset of what `BufferFromPixmap` (op 3) returns.
+///
+/// yserver exports are single-plane BGRA8, so `offset` is 0 and there is
+/// one `(stride, offset)` pair; the struct exists so the op-8 reply can
+/// carry the DRM `modifier`, which op 3 cannot. `stride` is `u32` (op 8
+/// uses CARD32 strides; op 3 truncates to CARD16). The `fd`'s ownership
+/// transfers to the caller.
+#[derive(Debug)]
+pub struct Dri3PixmapExport {
+    pub size: u32,
+    pub width: u16,
+    pub height: u16,
+    pub stride: u32,
+    pub offset: u32,
+    pub depth: u8,
+    pub bpp: u8,
+    pub modifier: u64,
+    pub fd: std::os::fd::OwnedFd,
+}
+
 /// Stage 5 Task 6.1: opaque handle to a DRI3 xshmfence's underlying
 /// shared-memory segment. Concrete impl in `yserver::kms::xshmfence::
 /// FenceMapping`. Held as `Arc<dyn XshmfenceHandle>` by the deferred
@@ -1509,6 +1530,19 @@ pub trait Backend: Send {
         _host_xid: u32,
     ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
         Err(io::Error::other("DRI3 export unsupported on this backend"))
+    }
+
+    /// Export a pixmap for DRI3 `BuffersFromPixmap` (op 8): the same
+    /// dma-buf as [`Self::dri3_export_pixmap`] plus the DRM modifier and
+    /// per-plane offset the multi-plane reply carries. Mesa's loader_dri3
+    /// uses op 8 (not op 3) whenever the server advertises DRI3 ≥ 1.2, so
+    /// a modifier-tiled backing MUST be exported through here.
+    ///
+    /// Default impl is unsupported.
+    fn dri3_export_pixmap_buffers(&mut self, _host_xid: u32) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other(
+            "DRI3 BuffersFromPixmap unsupported on this backend",
+        ))
     }
 
     /// Import a `sync_file` fd as the backing of an XSync `Fence`

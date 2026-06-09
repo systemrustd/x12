@@ -17,8 +17,8 @@ pub use params::{
     JoinStyle, LineStyle, SubwindowMode,
 };
 pub use trait_def::{
-    ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, Dri3Caps, HostSocketStatus,
-    PresentCaps, PresentWake, SyncobjHandle, XshmfenceHandle,
+    ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, Dri3Caps, Dri3PixmapExport,
+    HostSocketStatus, PresentCaps, PresentWake, SyncobjHandle, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

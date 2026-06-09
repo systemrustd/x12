@@ -151,6 +151,12 @@ pub(crate) struct Storage {
     /// image, captured at allocation time. `0` for non-promoted
     /// storage.
     pub(crate) export_size: u64,
+    /// GLX-TFP (Phase 1): DRM format modifier of the exportable image,
+    /// read back from `vkGetImageDrmFormatModifierPropertiesEXT` at
+    /// promotion time. `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path or
+    /// non-promoted storage. Carried into the `BuffersFromPixmap` (op 8)
+    /// reply — a modifier-tiled buffer is unusable by the client without it.
+    pub(crate) export_modifier: u64,
 }
 
 /// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
@@ -191,6 +197,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_modifier: 0,
         }
     }
 
@@ -225,6 +232,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_modifier: 0,
         }
     }
 
@@ -253,6 +261,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_modifier: 0,
         }
     }
 
@@ -282,6 +291,7 @@ impl Storage {
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
+            export_modifier: 0,
         }
     }
 
@@ -310,6 +320,7 @@ impl Storage {
         new_layout: vk::ImageLayout,
         export_stride: u32,
         export_size: u64,
+        export_modifier: u64,
     ) -> RetiredImage {
         let retired = RetiredImage {
             image: self.image,
@@ -325,6 +336,7 @@ impl Storage {
         self.promoted_exportable = true;
         self.export_stride = export_stride;
         self.export_size = export_size;
+        self.export_modifier = export_modifier;
         retired
     }
 

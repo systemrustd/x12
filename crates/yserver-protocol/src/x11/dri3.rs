@@ -385,6 +385,65 @@ pub fn encode_get_supported_modifiers_reply(
     out
 }
 
+/// Encode an `xDRI3BuffersFromPixmapReply` (op 8).
+///
+/// Wire layout (dri3proto.h `xDRI3BuffersFromPixmapReply`, xcbproto
+/// `dri3.xml` BuffersFromPixmap reply — 32-byte header then the
+/// variable arrays):
+/// ```text
+///   type(1) nfd(1) sequence(2) length(4)        // length = 2*nfd 4-byte units
+///   width(2) height(2) pad(4)
+///   modifier(8)
+///   depth(1) bpp(1) pad(6)                       // -> 32 bytes
+///   strides: CARD32 * nfd
+///   offsets: CARD32 * nfd
+/// ```
+/// The `nfd` file descriptors travel out-of-band via SCM_RIGHTS; this
+/// encodes only the inline bytes. `strides` and `offsets` must be the
+/// same length (one entry per plane); `nfd` is taken from that length.
+#[must_use]
+pub fn encode_buffers_from_pixmap_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    width: u16,
+    height: u16,
+    modifier: u64,
+    depth: u8,
+    bpp: u8,
+    strides: &[u32],
+    offsets: &[u32],
+) -> Vec<u8> {
+    debug_assert_eq!(
+        strides.len(),
+        offsets.len(),
+        "BuffersFromPixmap: one stride and one offset per plane"
+    );
+    let nfd = u8::try_from(strides.len()).expect("DRI3 plane count fits in u8");
+    // length counts the payload in 4-byte units: nfd strides + nfd offsets.
+    let length = 2 * u32::from(nfd);
+
+    let mut out = Vec::with_capacity(32 + 8 * strides.len());
+    out.push(1);
+    out.push(nfd);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, length);
+    write_u16(byte_order, &mut out, width);
+    write_u16(byte_order, &mut out, height);
+    out.extend_from_slice(&[0u8; 4]); // pad
+    write_u64(byte_order, &mut out, modifier);
+    out.push(depth);
+    out.push(bpp);
+    out.extend_from_slice(&[0u8; 6]); // pad
+    debug_assert_eq!(out.len(), 32);
+    for &s in strides {
+        write_u32(byte_order, &mut out, s);
+    }
+    for &o in offsets {
+        write_u32(byte_order, &mut out, o);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +715,71 @@ mod tests {
         let reply = encode_fd_from_fence_reply(ClientByteOrder::LittleEndian, SequenceNumber(5));
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[1], 1);
+    }
+
+    #[test]
+    fn buffers_from_pixmap_reply_single_plane_layout() {
+        // Byte offsets per dri3proto.h xDRI3BuffersFromPixmapReply /
+        // xcbproto dri3.xml. Single plane: nfd=1, length=2 units.
+        let reply = encode_buffers_from_pixmap_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(11),
+            /* width */ 256,
+            /* height */ 128,
+            /* modifier */ 0x0123_4567_89ab_cdef,
+            /* depth */ 24,
+            /* bpp */ 32,
+            /* strides */ &[1024],
+            /* offsets */ &[0],
+        );
+        // 32-byte header + 1 stride (4) + 1 offset (4) = 40.
+        assert_eq!(reply.len(), 40);
+        assert_eq!(reply[0], 1, "X_Reply");
+        assert_eq!(reply[1], 1, "nfd == 1 plane");
+        assert_eq!(u16::from_le_bytes(reply[2..4].try_into().unwrap()), 11);
+        assert_eq!(
+            u32::from_le_bytes(reply[4..8].try_into().unwrap()),
+            2,
+            "length = 2*nfd 4-byte units"
+        );
+        assert_eq!(u16::from_le_bytes(reply[8..10].try_into().unwrap()), 256);
+        assert_eq!(u16::from_le_bytes(reply[10..12].try_into().unwrap()), 128);
+        assert_eq!(
+            u64::from_le_bytes(reply[16..24].try_into().unwrap()),
+            0x0123_4567_89ab_cdef,
+            "modifier at byte 16"
+        );
+        assert_eq!(reply[24], 24, "depth");
+        assert_eq!(reply[25], 32, "bpp");
+        // strides[0] at byte 32, offsets[0] at byte 36.
+        assert_eq!(u32::from_le_bytes(reply[32..36].try_into().unwrap()), 1024);
+        assert_eq!(u32::from_le_bytes(reply[36..40].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn buffers_from_pixmap_reply_multi_plane_length() {
+        let reply = encode_buffers_from_pixmap_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            64,
+            64,
+            0,
+            24,
+            32,
+            &[10, 20, 30],
+            &[0, 100, 200],
+        );
+        assert_eq!(reply[1], 3, "nfd == 3 planes");
+        assert_eq!(
+            u32::from_le_bytes(reply[4..8].try_into().unwrap()),
+            6,
+            "length = 2*3"
+        );
+        assert_eq!(reply.len(), 32 + 3 * 4 + 3 * 4);
+        // strides then offsets.
+        assert_eq!(u32::from_le_bytes(reply[32..36].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(reply[44..48].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(reply[48..52].try_into().unwrap()), 100);
     }
 
     #[test]
