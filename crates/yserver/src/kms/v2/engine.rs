@@ -1263,10 +1263,32 @@ impl RenderEngine {
         }
         // Flush any open SubmitGroup first; this commits parked ops
         // into `submitted` so the loop below sees the right set.
-        if let Err(e) =
-            self.flush_submit_group(platform, super::submit_group::FlushReason::Shutdown)
+        //
+        // GLX-TFP: this shutdown flush drives `platform.flush_submit_group`
+        // directly (no exported-write publish): at drain_all the engine
+        // has no `store` borrow, and the GL consumer is going away, so
+        // re-publishing write fences here is pointless. The engine's
+        // commit-of-parked-ops bookkeeping below is replicated from the
+        // `flush_submit_group` wrapper.
+        let result = platform.flush_submit_group(super::submit_group::FlushReason::Shutdown);
+        if let Some(outcome) = platform.take_last_flush_outcome()
+            && let Some(inner) = self.inner.as_mut()
         {
-            log::warn!("v2 drain_all: flush_submit_group failed: {e:?}");
+            inner.pending_flush_outcomes.push(outcome);
+        }
+        match (result, self.inner.as_mut()) {
+            (Ok(_), Some(inner)) => {
+                for op in inner.pending_group_ops.drain(..) {
+                    inner.submitted.push_back(op);
+                }
+            }
+            (Err(e), inner_opt) => {
+                if let Some(inner) = inner_opt {
+                    inner.pending_group_ops.clear();
+                }
+                log::warn!("v2 drain_all: flush_submit_group failed: {e:?}");
+            }
+            (Ok(_), None) => {}
         }
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -1328,10 +1350,32 @@ impl RenderEngine {
     /// the engine.
     pub(crate) fn flush_submit_group(
         &mut self,
+        store: &mut DrawableStore,
         platform: &mut PlatformBackend,
         reason: super::submit_group::FlushReason,
     ) -> Result<super::platform::FlushOutcome, vk::Result> {
-        let result = platform.flush_submit_group(reason);
+        // GLX-TFP (Task 2.3): drain the exported drawables written since
+        // the last flush; the platform waits on / publishes their dma-buf
+        // implicit-sync fences around this submit. `Arc<OwnedFd>` clones
+        // keep the fds alive across the call without re-borrowing `store`.
+        //
+        // Only drain when a real `vkQueueSubmit2` will occur (group
+        // non-empty). The platform short-circuits an empty group without
+        // submitting (an open render-batch/COW may be mid-recording); if
+        // we drained here on that no-submit path we'd silently drop the
+        // recorded exported writes and the eventual real submit would skip
+        // their wait/publish. Leaving them queued lets the next non-empty
+        // flush pick them up.
+        let exported = if platform.submit_group_size() > 0 {
+            store.take_exported_writes()
+        } else {
+            Vec::new()
+        };
+        let exported_borrows: Vec<std::os::fd::BorrowedFd<'_>> = {
+            use std::os::fd::AsFd as _;
+            exported.iter().map(|f| f.as_fd()).collect()
+        };
+        let result = platform.flush_submit_group_with_exports(reason, &exported_borrows);
         // Drain the platform's last_flush_outcome regardless of Ok/Err
         // — both branches in platform's flush_submit_group populate it
         // before returning. The engine queues it for backend telemetry
@@ -1367,10 +1411,11 @@ impl RenderEngine {
     /// cap; if so, drive a `MaxSize` flush.
     pub(crate) fn maybe_auto_flush_submit_group(
         &mut self,
+        store: &mut DrawableStore,
         platform: &mut PlatformBackend,
     ) -> Result<(), RenderError> {
         if platform.submit_group_size() >= platform.submit_group_max_size() {
-            self.flush_submit_group(platform, super::submit_group::FlushReason::MaxSize)
+            self.flush_submit_group(store, platform, super::submit_group::FlushReason::MaxSize)
                 .map_err(RenderError::Vk)?;
         }
         Ok(())
@@ -1688,8 +1733,11 @@ impl RenderEngine {
         }
 
         // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
-        let flush_outcome =
-            self.flush_submit_group(platform, super::submit_group::FlushReason::FrameBuilder);
+        let flush_outcome = self.flush_submit_group(
+            store,
+            platform,
+            super::submit_group::FlushReason::FrameBuilder,
+        );
 
         match flush_outcome {
             Ok(_) => {
@@ -2572,7 +2620,11 @@ impl RenderEngine {
         // `last_render_ticket` names the newest in-flight ticket that
         // touched the drawable.
         self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
-        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)?;
+        self.flush_submit_group(
+            store,
+            platform,
+            super::submit_group::FlushReason::SyncBoundary,
+        )?;
 
         // Metadata read (post-close: current_layout reflects any
         // transition the frame close recorded).
@@ -3827,7 +3879,7 @@ impl RenderEngine {
             coalesced_count,
         });
         // `inner` borrow released. Auto-flush for render_batch (no semaphore path).
-        self.maybe_auto_flush_submit_group(platform)?;
+        self.maybe_auto_flush_submit_group(store, platform)?;
         Ok(Some(coalesced_count))
     }
 
@@ -4037,8 +4089,12 @@ impl RenderEngine {
         // ticket.wait() observes a queued signal-op. Both are needed:
         // this one drains prior buffered paint; the second flushes the
         // readback CB itself.
-        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)
-            .map_err(RenderError::Vk)?;
+        self.flush_submit_group(
+            store,
+            platform,
+            super::submit_group::FlushReason::SyncBoundary,
+        )
+        .map_err(RenderError::Vk)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -4127,8 +4183,12 @@ impl RenderEngine {
         // Phase A: end_and_submit_op now only appends to the SubmitGroup.
         // Drive the explicit flush so the fence has a queued signal-op
         // before we wait on it.
-        self.flush_submit_group(platform, super::submit_group::FlushReason::SyncBoundary)
-            .map_err(RenderError::Vk)?;
+        self.flush_submit_group(
+            store,
+            platform,
+            super::submit_group::FlushReason::SyncBoundary,
+        )
+        .map_err(RenderError::Vk)?;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -11471,6 +11531,7 @@ mod tests {
             .expect("close blue-prefill frame");
         engine
             .flush_submit_group(
+                &mut store,
                 &mut platform,
                 super::super::submit_group::FlushReason::SyncBoundary,
             )
@@ -11519,6 +11580,7 @@ mod tests {
             .expect("close red-batch frame");
         engine
             .flush_submit_group(
+                &mut store,
                 &mut platform,
                 super::super::submit_group::FlushReason::SyncBoundary,
             )

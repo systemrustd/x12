@@ -1698,6 +1698,27 @@ impl PlatformBackend {
         &mut self,
         reason: FlushReason,
     ) -> Result<FlushOutcome, vk::Result> {
+        self.flush_submit_group_with_exports(reason, &[])
+    }
+
+    /// GLX-TFP (Task 2.3): flush variant that performs bidirectional
+    /// dma-buf implicit sync around the submit for the `exported_writes`
+    /// drawables (their dma-buf fds, deduped by the caller):
+    ///
+    /// 1. **read→write wait** — before `vkQueueSubmit2`, CPU-poll each
+    ///    exported dma-buf's WRITE-scope fence (`wait_dmabuf_write_ready`,
+    ///    50 ms; `TimedOut` → WARN + proceed) so we don't overwrite a
+    ///    buffer a GL consumer is still sampling.
+    /// 2. **signal semaphore** — when the list is non-empty, attach an
+    ///    exportable SYNC_FD signal semaphore to the submit.
+    /// 3. **write→read publish** — after submit, export that semaphore's
+    ///    sync_file and IMPORT it onto each exported dma-buf as a WRITE
+    ///    fence, so Mesa's implicit-sync GL read waits on our write.
+    pub(crate) fn flush_submit_group_with_exports(
+        &mut self,
+        reason: FlushReason,
+        exported_writes: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<FlushOutcome, vk::Result> {
         // Empty-group fast path: do NOT consume the ticket.  An open
         // cow/render_batch may still be mid-recording (ticket Some,
         // entries empty).  Dropping the ticket here would force the
@@ -1736,11 +1757,40 @@ impl PlatformBackend {
             self.force_next_submit_failure = false;
             return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST);
         }
+        // GLX-TFP read→write wait: before overwriting an exported
+        // dma-buf, CPU-poll its WRITE-scope fence so we don't clobber a
+        // buffer a GL consumer is still sampling. Bounded (50 ms) and
+        // deadlock-safe — `TimedOut` warns and proceeds.
+        for fd in exported_writes {
+            if let crate::kms::vk::dri3::DmabufWait::TimedOut =
+                crate::kms::vk::dri3::wait_dmabuf_write_ready(*fd, 50)
+            {
+                log::warn!(
+                    "glx-tfp: write-wait on exported dma-buf (fd {}) timed out; proceeding",
+                    fd.as_raw_fd()
+                );
+            }
+        }
+        // GLX-TFP write→read publish: when any exported drawable is
+        // written, attach an exportable SYNC_FD signal semaphore to THIS
+        // submit so its completion can be re-imported onto the dma-bufs
+        // as a WRITE fence after submit.
+        let export_signal: Option<PresentCompletionSignal> = if exported_writes.is_empty() {
+            None
+        } else {
+            match create_present_completion_signal(Arc::clone(vk)) {
+                Ok(sig) => Some(sig),
+                Err(e) => {
+                    log::warn!("glx-tfp: failed to create export signal semaphore: {e:?}");
+                    None
+                }
+            }
+        };
         let cb_infos: Vec<vk::CommandBufferSubmitInfo<'_>> = entries
             .iter()
             .map(|e| vk::CommandBufferSubmitInfo::default().command_buffer(e.cb))
             .collect();
-        let sig_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = entries
+        let mut sig_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = entries
             .iter()
             .filter_map(|e| {
                 e.signal.map(|s| {
@@ -1750,6 +1800,13 @@ impl PlatformBackend {
                 })
             })
             .collect();
+        if let Some(sig) = export_signal.as_ref() {
+            sig_infos.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(sig.semaphore())
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+            );
+        }
         let submit = [{
             let s = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
             if sig_infos.is_empty() {
@@ -1764,6 +1821,12 @@ impl PlatformBackend {
                 .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
         } {
             Ok(()) => {
+                // GLX-TFP write→read publish: export the submit's
+                // completion sync_file and import it onto every exported
+                // dma-buf the group wrote.
+                if let Some(sig) = export_signal.as_ref() {
+                    Self::publish_export_write_fences(sig, exported_writes);
+                }
                 let outcome = FlushOutcome {
                     flushed_entries: n,
                     reason,
@@ -1773,6 +1836,32 @@ impl PlatformBackend {
                 Ok(outcome)
             }
             Err(e) => self.abort_flush(entries, n, reason, e),
+        }
+    }
+
+    /// GLX-TFP (Task 2.3 Step 3): export `signal`'s completed-write
+    /// sync_file and IMPORT it as a WRITE fence onto each exported
+    /// dma-buf, so an implicit-sync GL read on the imported texture waits
+    /// on yserver's write before sampling. `Unsupported` (old
+    /// kernel/driver) is silently tolerated; other errors warn.
+    fn publish_export_write_fences(
+        signal: &PresentCompletionSignal,
+        exported_writes: &[std::os::fd::BorrowedFd<'_>],
+    ) {
+        let sync_fd = match signal.export_sync_file_fd() {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("glx-tfp: export_sync_file for write-fence publish failed: {e:?}");
+                return;
+            }
+        };
+        for fd in exported_writes {
+            if let Err(e) = crate::kms::vk::dri3::import_dmabuf_write_fence(*fd, sync_fd.as_fd())
+                && e.kind() != io::ErrorKind::Unsupported
+            {
+                log::warn!("glx-tfp: import write fence failed: {e}");
+            }
         }
     }
 

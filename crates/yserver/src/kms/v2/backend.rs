@@ -329,6 +329,43 @@ pub struct KmsBackendV2 {
     /// Hotkey detector — used on the core thread in libseat mode
     /// (`on_libinput_ready`).
     hotkey: crate::input::hotkey::HotkeyDetector,
+
+    /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
+    /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
+    /// AT MOST ONE entry per drawable regardless of how many times
+    /// `BufferFromPixmap` is issued for it (muffin re-exports per damage).
+    /// Canonical owner of the export lifetime ref + the dup'd dma-buf fd;
+    /// a parallel sync-only fd dup lives on `store.exported_sync` so the
+    /// engine's flush chokepoint can reach it.
+    exported_dmabufs: HashMap<crate::kms::v2::store::DrawableId, ExportedBacking>,
+}
+
+/// GLX-TFP export state for one drawable. See `exported_dmabufs`.
+struct ExportedBacking {
+    /// A dup of the exported dma-buf fd, kept for implicit-sync fence
+    /// I/O. `None` until the first `BufferFromPixmap` export (an entry
+    /// can exist earlier, created by an `acquire_glx_pixmap_export` from
+    /// `glXCreatePixmap`).
+    fd: Option<std::os::fd::OwnedFd>,
+    /// How many live GLXPixmaps reference this backing. Teardown fires
+    /// when this reaches 0.
+    glx_refs: u32,
+    /// True once the single lifetime ref has been taken (so teardown
+    /// releases it exactly once).
+    lifetime_ref_held: bool,
+    /// The backing's `DrawableId`, captured at ref-take time so teardown
+    /// can decref the store entry directly even if the `by_xid` mapping
+    /// was detached by an intervening `FreePixmap` (PendingFence).
+    backing_id: crate::kms::v2::store::DrawableId,
+    /// The backing's host-xid handle, captured at ref-take time so
+    /// teardown can release the alias_registry counter (keyed by xid)
+    /// even after the store entry is gone.
+    backing: PixmapHandle,
+    /// Which counter holds the lifetime ref: `true` = `alias_registry`
+    /// (NameWindowPixmap'd redirect backing); `false` = `DrawableStore`
+    /// refcount (plain pixmap). Captured at take time so an alias
+    /// torn-down between take and release can't misroute the decref.
+    lifetime_via_alias: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -645,6 +682,7 @@ impl KmsBackendV2 {
             core_libinput_fd: -1,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            exported_dmabufs: HashMap::new(),
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -765,6 +803,7 @@ impl KmsBackendV2 {
             core_libinput_fd,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            exported_dmabufs: HashMap::new(),
         };
         b.init_root_storage();
         if let Err(e) = b.init_cursor_sprite() {
@@ -1421,6 +1460,7 @@ impl KmsBackendV2 {
             core_libinput_fd: -1,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            exported_dmabufs: HashMap::new(),
         }
     }
 
@@ -2068,6 +2108,138 @@ impl KmsBackendV2 {
         })
     }
 
+    // ── GLX-TFP (Tasks 2.3 + 2.4): exported-backing lifetime ─────────
+
+    /// Ensure an `ExportedBacking` entry exists for `id`, taking the
+    /// single backing lifetime ref on first creation. Idempotent.
+    ///
+    /// Spelled as an explicit `contains_key` → take-ref → `insert` →
+    /// `get_mut` rather than `entry().or_insert_with(..)` because taking
+    /// the lifetime ref needs `&mut self` (alias_registry / store), which
+    /// would conflict with an `entry` borrow of `self.exported_dmabufs`.
+    fn ensure_exported_entry(
+        &mut self,
+        id: crate::kms::v2::store::DrawableId,
+        backing: PixmapHandle,
+    ) -> &mut ExportedBacking {
+        if !self.exported_dmabufs.contains_key(&id) {
+            // ONE lifetime ref per backing, released exactly once in teardown.
+            let via_alias = self.take_backing_lifetime_ref(id, backing);
+            self.exported_dmabufs.insert(
+                id,
+                ExportedBacking {
+                    fd: None,
+                    glx_refs: 0,
+                    lifetime_ref_held: true,
+                    backing_id: id,
+                    backing,
+                    lifetime_via_alias: via_alias,
+                },
+            );
+        }
+        self.exported_dmabufs
+            .get_mut(&id)
+            .expect("entry just ensured")
+    }
+
+    /// Take ONE lifetime ref on the backing's owning counter so the
+    /// storage survives an early `FreePixmap` while a GL consumer still
+    /// references it. Returns `true` if the ref was taken on
+    /// `alias_registry` (NameWindowPixmap'd redirect backing), `false`
+    /// if on the `DrawableStore` refcount (plain pixmap).
+    fn take_backing_lifetime_ref(
+        &mut self,
+        id: crate::kms::v2::store::DrawableId,
+        backing: PixmapHandle,
+    ) -> bool {
+        if self.core.alias_registry.get(backing).is_some() {
+            self.core.alias_registry.incref(backing);
+            true
+        } else {
+            self.store.incref(id);
+            false
+        }
+    }
+
+    /// Release the single lifetime ref taken in `take_backing_lifetime_ref`.
+    /// Routes to the counter recorded at take time. For the alias path a
+    /// final decref frees the backing via the same release path
+    /// `free_pixmap` uses; for the plain path the store decref frees the
+    /// storage when its own refcount also hits zero.
+    fn release_backing_lifetime_ref(&mut self, entry: &ExportedBacking) {
+        if entry.lifetime_via_alias {
+            // Alias path: decref the registry (keyed by xid); on final ref
+            // free the backing via the same store decref `free_pixmap` uses.
+            if self.core.alias_registry.decref(entry.backing) {
+                self.store_decref_with_invalidate(entry.backing_id);
+            }
+        } else {
+            // Plain path: drop the extra store ref taken at acquire time.
+            // Use the captured DrawableId — the `by_xid` mapping may have
+            // been detached by an intervening FreePixmap (PendingFence).
+            self.store_decref_with_invalidate(entry.backing_id);
+        }
+    }
+
+    /// GLX-TFP (Task 3.4 callers): record that a GLXPixmap now references
+    /// the export of `host_xid`. Creates the entry (+ lifetime ref) if
+    /// this is the first arrival. Public so the GLX protocol surface can
+    /// call it. No-op on an unknown xid.
+    pub fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
+        let Some(id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        let Some(backing) = PixmapHandle::from_raw(host_xid) else {
+            return;
+        };
+        self.ensure_exported_entry(id, backing).glx_refs += 1;
+    }
+
+    /// GLX-TFP (Task 3.4 callers): a GLXPixmap referencing the export of
+    /// `host_xid` is gone. Drops one `glx_refs` and tears the export down
+    /// when it reaches zero.
+    pub fn release_glx_pixmap_export(&mut self, host_xid: u32) {
+        let Some(id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        if let Some(e) = self.exported_dmabufs.get_mut(&id) {
+            e.glx_refs = e.glx_refs.saturating_sub(1);
+        }
+        self.maybe_teardown_export(id);
+    }
+
+    /// GLX-TFP: tear the export down iff no GLX consumer references it
+    /// (`glx_refs == 0`). Drops the dup'd fd, clears the store's sync-fd
+    /// dup, and releases the single lifetime ref. While `glx_refs > 0`
+    /// this is a no-op (defer-destroy-while-referenced). There is NO
+    /// `x_pixmap_freed` flag — an early `FreePixmap` is bridged by the
+    /// lifetime ref and resolved here once `glx_refs` hits 0.
+    fn maybe_teardown_export(&mut self, id: crate::kms::v2::store::DrawableId) {
+        let ready = matches!(self.exported_dmabufs.get(&id), Some(e) if e.glx_refs == 0);
+        if !ready {
+            return;
+        }
+        if let Some(e) = self.exported_dmabufs.remove(&id) {
+            // Drop the store's parallel sync-fd dup so no write can be
+            // routed through a torn-down export.
+            self.store.clear_exported_sync_fd(id);
+            // `e.fd` (our dup) closes on drop; the kernel buffer survives
+            // while any GL consumer still holds its own fd.
+            if e.lifetime_ref_held {
+                self.release_backing_lifetime_ref(&e);
+            }
+        }
+    }
+
+    /// GLX-TFP test introspection: true iff `host_xid` currently has an
+    /// `ExportedBacking` entry.
+    #[doc(hidden)]
+    pub fn has_export_entry(&self, host_xid: u32) -> bool {
+        self.store
+            .lookup(host_xid)
+            .is_some_and(|id| self.exported_dmabufs.contains_key(&id))
+    }
+
     /// Bridge `store.poll_pending_retire` to
     /// `engine.notify_drawable_retired`. Per the rationale on
     /// `store_decref_with_invalidate`, drawables that were
@@ -2116,6 +2288,7 @@ impl KmsBackendV2 {
     pub fn engine_flush_submit_group_for_tests(&mut self) -> Result<(), ash::vk::Result> {
         self.engine
             .flush_submit_group(
+                &mut self.store,
                 &mut self.platform,
                 crate::kms::v2::submit_group::FlushReason::SyncBoundary,
             )
@@ -2584,6 +2757,7 @@ impl KmsBackendV2 {
         }
         self.engine
             .flush_submit_group(
+                &mut self.store,
                 &mut self.platform,
                 crate::kms::v2::submit_group::FlushReason::PageflipRetire,
             )
@@ -7940,6 +8114,7 @@ impl Backend for KmsBackendV2 {
             log::warn!("v2 on_page_flip_ready: flush_render_batch failed: {e:?}");
         }
         if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PageflipRetire,
         ) {
@@ -8053,6 +8228,7 @@ impl Backend for KmsBackendV2 {
             // flushed here. Drive through the engine wrapper so
             // parked `pending_group_ops` commit too.
             if let Err(e) = self.engine.flush_submit_group(
+                &mut self.store,
                 &mut self.platform,
                 crate::kms::v2::submit_group::FlushReason::SceneCompose,
             ) {
@@ -9545,6 +9721,14 @@ impl Backend for KmsBackendV2 {
         // doesn't guarantee that ordering though, and v2 gates
         // here so an early FreePixmap on a still-held alias
         // doesn't drop the backing while a redirect still uses it.
+        // GLX-TFP (Task 2.4): resolve the DrawableId BEFORE any decref so
+        // we can tear down (or defer) the export tracking after the normal
+        // client decref runs. For an export-only entry (glx_refs == 0)
+        // this releases our lifetime ref and frees the backing now; for
+        // the defer case (glx_refs > 0) it is a no-op and our lifetime ref
+        // keeps the storage alive until glXDestroyPixmap.
+        let export_id = self.store.lookup(host_xid);
+
         if let Some(handle) = yserver_core::backend::PixmapHandle::from_raw(host_xid)
             && self.core.alias_registry.get(handle).is_some()
         {
@@ -9553,10 +9737,16 @@ impl Backend for KmsBackendV2 {
             {
                 self.store_decref_with_invalidate(id);
             }
+            if let Some(id) = export_id {
+                self.maybe_teardown_export(id);
+            }
             return Ok(());
         }
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
+        }
+        if let Some(id) = export_id {
+            self.maybe_teardown_export(id);
         }
         Ok(())
     }
@@ -13362,6 +13552,26 @@ impl Backend for KmsBackendV2 {
         };
 
         let stride16 = u16::try_from(export.stride).unwrap_or(u16::MAX);
+
+        // GLX-TFP (Tasks 2.3 + 2.4): record/refresh the export tracking
+        // entry. Repeated exports (muffin re-exports per damage) reuse the
+        // existing entry and its single lifetime ref — the fd dup + sync
+        // tracking install only on the FIRST export. Always return the
+        // ORIGINAL fd to the client.
+        let backing = PixmapHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other(format!("DRI3 export: bad xid 0x{host_xid:x}")))?;
+        if self
+            .exported_dmabufs
+            .get(&id)
+            .is_none_or(|e| e.fd.is_none())
+        {
+            let dup = export.fd.try_clone()?;
+            // Parallel sync-only dup for the engine flush chokepoint.
+            let sync_dup = std::sync::Arc::new(dup.try_clone()?);
+            self.ensure_exported_entry(id, backing).fd = Some(dup);
+            self.store.set_exported_sync_fd(id, sync_dup);
+        }
+
         Ok((export.size, width, height, stride16, depth, bpp, export.fd))
     }
 
@@ -13555,6 +13765,7 @@ impl Backend for KmsBackendV2 {
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
         if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,
         ) {

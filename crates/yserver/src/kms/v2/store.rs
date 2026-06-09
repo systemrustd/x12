@@ -25,7 +25,7 @@
     reason = "DrawableStore primitives are consumed by Stages 2c–2e"
 )]
 
-use std::collections::HashMap;
+use std::{collections::HashMap, os::fd::OwnedFd, sync::Arc};
 
 use ash::vk;
 
@@ -680,6 +680,19 @@ pub(crate) struct DrawableStore {
     /// Drawables that hit refcount-zero but whose ticket isn't
     /// signaled yet. `poll_pending_retire` drains.
     pending_retire: Vec<DrawableId>,
+    /// GLX-TFP (Task 2.3): dma-buf fds for drawables that have been
+    /// exported to a GL consumer, indexed by `DrawableId`. The backend
+    /// (`KmsBackendV2::exported_dmabufs`) owns the canonical lifetime
+    /// record; this map is a parallel sync-only dup the backend keeps in
+    /// lockstep so the engine's flush chokepoint (which sees `store` +
+    /// `platform` but NOT the backend) can resolve fds for bidirectional
+    /// implicit sync. `Arc` so the engine can cheaply collect borrows
+    /// across the `&mut self` flush.
+    exported_sync: HashMap<DrawableId, Arc<OwnedFd>>,
+    /// GLX-TFP (Task 2.3): exported `DrawableId`s written since the last
+    /// flush. `touch_render_fence` pushes here when the stamped id is in
+    /// `exported_sync`; `take_exported_writes` drains it at flush.
+    exported_writes: Vec<DrawableId>,
 }
 
 impl DrawableStore {
@@ -689,7 +702,48 @@ impl DrawableStore {
             entries: HashMap::new(),
             by_xid: HashMap::new(),
             pending_retire: Vec::new(),
+            exported_sync: HashMap::new(),
+            exported_writes: Vec::new(),
         }
+    }
+
+    /// GLX-TFP (Task 2.3): register/replace the sync-only dma-buf fd dup
+    /// for an exported drawable. Called by the backend when an
+    /// `ExportedBacking` first gains its fd.
+    pub(crate) fn set_exported_sync_fd(&mut self, id: DrawableId, fd: Arc<OwnedFd>) {
+        self.exported_sync.insert(id, fd);
+    }
+
+    /// GLX-TFP (Task 2.3): drop the sync-only fd dup for `id`. Called by
+    /// the backend at export teardown. Also purges any pending
+    /// `exported_writes` entry so a torn-down export can't be waited on.
+    pub(crate) fn clear_exported_sync_fd(&mut self, id: DrawableId) {
+        self.exported_sync.remove(&id);
+        self.exported_writes.retain(|&w| w != id);
+    }
+
+    /// GLX-TFP (Task 2.3): true iff `id` currently has a sync-only dma-buf
+    /// fd registered (i.e. is live-exported to a GL consumer).
+    pub(crate) fn is_exported(&self, id: DrawableId) -> bool {
+        self.exported_sync.contains_key(&id)
+    }
+
+    /// GLX-TFP (Task 2.3): drain the exported-writes accumulator and
+    /// resolve each id to its sync fd `Arc`, deduped. Returned at the
+    /// flush chokepoint so the platform can wait/publish around the
+    /// `vkQueueSubmit2`. Entries whose fd was cleared between stamp and
+    /// flush are skipped.
+    pub(crate) fn take_exported_writes(&mut self) -> Vec<Arc<OwnedFd>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for id in self.exported_writes.drain(..) {
+            if seen.insert(id)
+                && let Some(fd) = self.exported_sync.get(&id)
+            {
+                out.push(Arc::clone(fd));
+            }
+        }
+        out
     }
 
     /// Allocate a fresh drawable. The caller has already built
@@ -1025,6 +1079,14 @@ impl DrawableStore {
     pub(crate) fn touch_render_fence(&mut self, id: DrawableId, ticket: FenceTicket) {
         if let Some(d) = self.entries.get_mut(&id) {
             d.last_render_ticket = Some(ticket);
+        }
+        // GLX-TFP (Task 2.3): every write stamps its destination here, so
+        // this is the single point that catches ALL mutation paths
+        // (fills/clears/copies/composite/uploads). Record exported
+        // destinations for the bidirectional implicit-sync wait/publish
+        // at the flush chokepoint.
+        if self.exported_sync.contains_key(&id) {
+            self.exported_writes.push(id);
         }
     }
 

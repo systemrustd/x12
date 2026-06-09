@@ -57,3 +57,51 @@ pub fn signaled_sync_file(vk: &VkContext) -> OwnedFd {
 
     sync_fd
 }
+
+/// True iff `fd` (a dma-buf fd) can be re-imported as a Vulkan image via
+/// the production `DrawableImage::from_dmabuf` path. Used to prove that a
+/// backing's exported dma-buf is still live after a `FreePixmap` while a
+/// GLX consumer holds a reference. Uses Vulkan re-import (NOT mmap) — the
+/// exported memory is DEVICE_LOCAL and may not be CPU-mappable on a dGPU.
+pub fn dmabuf_is_importable(
+    vk: &std::sync::Arc<VkContext>,
+    fd: std::os::fd::BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    depth: u8,
+) -> bool {
+    use std::os::fd::AsFd;
+    use yserver::kms::vk::target::{DrawableImage, EXPORT_FORMAT_BGRA8};
+
+    // depth carried for API parity with the caller's intent; the
+    // exported backing is always BGRA8 (32bpp) after promotion.
+    let _ = depth;
+
+    let dup = match fd.try_clone_to_owned() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("dmabuf_is_importable: dup failed: {e}");
+            return false;
+        }
+    };
+    // A LINEAR-modifier BGRA8 import. A row-aligned stride is sufficient
+    // for the import to validate; the actual stride is queried by the
+    // production export path, but re-import only needs a plausible one.
+    let stride = width * 4;
+    match DrawableImage::from_dmabuf(
+        std::sync::Arc::clone(vk),
+        dup.as_fd().try_clone_to_owned().expect("dup2"),
+        width,
+        height,
+        EXPORT_FORMAT_BGRA8,
+        0, // DRM_FORMAT_MOD_LINEAR
+        &[0],
+        &[stride],
+    ) {
+        Ok(_img) => true,
+        Err(e) => {
+            eprintln!("dmabuf_is_importable: from_dmabuf failed: {e:?}");
+            false
+        }
+    }
+}

@@ -407,3 +407,154 @@ fn import_sync_file_accepts_a_signaled_fence() {
         "import_dmabuf_write_fence returned unexpected error: {r:?}"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Task 2.4: exported-backing lifetime (acquire / release / FreePixmap)
+// ───────────────────────────────────────────────────────────────────
+
+/// RETENTION + RELEASE: a GLXPixmap reference keeps the exported backing
+/// alive across an early `FreePixmap`; the export is torn down only once
+/// the last GLX ref is released.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
+    use std::os::fd::AsFd;
+
+    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let vk = backend.test_vk_arc().expect("vk arc present");
+
+    // depth-32 BGRA8 server-owned pixmap (matches the exported format).
+    let host_xid = backend
+        .allocate_test_pixmap_bgra(32, 32)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Simulate glXCreatePixmap acquiring a GLX ref, then the export.
+    backend.acquire_glx_pixmap_export(host_xid);
+    let (.., fd) = backend
+        .dri3_export_pixmap(host_xid)
+        .expect("dri3_export_pixmap");
+    assert!(
+        backend.has_export_entry(host_xid),
+        "export entry should exist after export"
+    );
+
+    // RETENTION: client frees the X pixmap while the GLXPixmap still
+    // references it. The entry + lifetime ref must survive, and the
+    // dma-buf must still be importable via Vulkan re-import.
+    backend.free_pixmap(None, host_xid).expect("free_pixmap");
+    assert!(
+        backend.has_export_entry(host_xid),
+        "export entry must survive FreePixmap while glx_refs > 0"
+    );
+    assert!(
+        common::dmabuf_is_importable(&vk, fd.as_fd(), 32, 32, 32),
+        "backing freed while export still GLX-referenced"
+    );
+
+    // RELEASE: glXDestroyPixmap drops the last GLX ref → entry +
+    // lifetime ref gone.
+    backend.release_glx_pixmap_export(host_xid);
+    assert!(
+        !backend.has_export_entry(host_xid),
+        "export entry must be torn down once glx_refs hits 0 (no leak)"
+    );
+}
+
+/// A bare `BufferFromPixmap` with no GLX acquire must not leak: at
+/// `FreePixmap` the export-only entry (`glx_refs == 0`) is torn down.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn export_only_entry_is_cleaned_up_at_free_pixmap() {
+    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let host_xid = backend
+        .allocate_test_pixmap_bgra(32, 32)
+        .expect("allocate_test_pixmap_bgra");
+
+    let _ = backend
+        .dri3_export_pixmap(host_xid)
+        .expect("dri3_export_pixmap");
+    assert!(
+        backend.has_export_entry(host_xid),
+        "export-only entry should exist after export"
+    );
+
+    backend.free_pixmap(None, host_xid).expect("free_pixmap"); // glx_refs == 0 → immediate teardown
+    assert!(
+        !backend.has_export_entry(host_xid),
+        "export-only entry (glx_refs == 0) must be torn down at FreePixmap"
+    );
+}
+
+/// Task 2.3 flush-wiring smoke: after writing an exported drawable and
+/// flushing, the bidirectional-sync publish path runs without panicking
+/// and the export remains live. The real sync-ordering validation is the
+/// HW gate (Task 5.1) — there's no GL consumer in-process to observe the
+/// imported write fence, so this asserts the hook is reachable and the
+/// export survives a write+flush, not the fence semantics themselves.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn exported_drawable_write_then_flush_runs_sync_publish() {
+    use yserver_core::backend::Backend;
+
+    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let host_xid = backend
+        .allocate_test_pixmap_bgra(32, 32)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Acquire + export so the drawable is tracked as live-exported.
+    backend.acquire_glx_pixmap_export(host_xid);
+    let _ = backend
+        .dri3_export_pixmap(host_xid)
+        .expect("dri3_export_pixmap");
+    assert!(backend.has_export_entry(host_xid));
+
+    // Write the exported drawable (fill) — stamps touch_render_fence on
+    // the exported id, which records it into the per-flush exported_writes
+    // accumulator.
+    let mut rect = Vec::new();
+    rect.extend_from_slice(&i16::to_le_bytes(0));
+    rect.extend_from_slice(&i16::to_le_bytes(0));
+    rect.extend_from_slice(&u16::to_le_bytes(32));
+    rect.extend_from_slice(&u16::to_le_bytes(32));
+    backend
+        .poly_fill_rectangle(None, host_xid, 0xFF00_FF00, &rect)
+        .expect("poly_fill_rectangle");
+
+    // Close + flush: drives the chokepoint's wait/publish for the
+    // exported write. Must not panic; export stays live.
+    backend
+        .engine_close_open_frame_for_timeout_for_tests()
+        .expect("close open frame");
+    backend
+        .engine_flush_submit_group_for_tests()
+        .expect("flush submit group");
+
+    assert!(
+        backend.has_export_entry(host_xid),
+        "export must remain live across a write + flush"
+    );
+
+    // Release to avoid a leak in the test.
+    backend.release_glx_pixmap_export(host_xid);
+    assert!(!backend.has_export_entry(host_xid));
+}
