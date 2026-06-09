@@ -1021,6 +1021,22 @@ impl Drop for DrawableImage {
 /// BGRA8 is yserver's single-plane backing format for depth-24/32 pixmaps.
 pub const EXPORT_FORMAT_BGRA8: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
+/// Usage flags for a GLX-TFP exportable image: it is rendered into as a
+/// promoted window backing (`COLOR_ATTACHMENT`), copied into during
+/// promotion (`TRANSFER_DST`) and out of for readback (`TRANSFER_SRC`),
+/// and sampled by the composite pass (`SAMPLED`).
+///
+/// Must stay in lock-step with the usage passed to the modifier
+/// capability probe ([`crate::kms::vk::dri3::export_capable_modifiers`]):
+/// the driver may accept a modifier for one usage set and reject it for
+/// another, so the probe and the create must ask the identical question.
+pub(crate) const EXPORT_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+        | vk::ImageUsageFlags::SAMPLED.as_raw()
+        | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
+);
+
 /// A freshly-allocated external-memory image that can be exported as a
 /// dma-buf fd.
 ///
@@ -1082,15 +1098,139 @@ impl Drop for ExportableImage {
 
 /// Allocate an external-memory, dma-buf-exportable `VkImage` + `VkDeviceMemory`.
 ///
-/// **LINEAR tiling only** — no `DRM_FORMAT_MODIFIER_EXT` path.  Mesa imports a
-/// linear single-plane BGRA8 dma-buf without trouble, and a COLOR-aspect
-/// `vkGetImageSubresourceLayout` query gives the correct stride/size for the
-/// single-plane export.  The modifier branch is deferred; if it is added later
-/// it must switch the layout query to `MEMORY_PLANE_0` aspect and thread the
-/// real modifier through `ExportableImage.modifier`.
+/// **Modifier-first.** On RADV/RDNA2 a renderable+sampleable
+/// `VK_IMAGE_TILING_LINEAR` image cannot be dma-buf-exported
+/// (`vkCreateImage` → `VK_ERROR_FORMAT_NOT_SUPPORTED`); the driver
+/// requires `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`. So when
+/// `VK_EXT_image_drm_format_modifier` is available and the driver
+/// advertises at least one export-capable single-plane modifier for
+/// `format` ([`crate::kms::vk::dri3::export_capable_modifiers`]), this
+/// allocates a modifier-tiled image, reads back the driver-chosen
+/// modifier with `vkGetImageDrmFormatModifierPropertiesEXT`, and queries
+/// the layout via the `MEMORY_PLANE_0` aspect (mandatory for
+/// modifier-tiled images — `COLOR` is a validation error).
 ///
-/// Mirrors the alloc pattern in `tests/dri3_fd_leak.rs` (`create_dmabuf_export`).
+/// Falls back to the historical `LINEAR` path when the extension is
+/// absent or no modifier qualifies (e.g. lavapipe under `cargo test`),
+/// where a linear single-plane BGRA8 dma-buf imports without trouble and
+/// a `COLOR`-aspect layout query is correct.
+///
+/// Mirrors the modifier/linear plan dispatch in [`super::scanout`]
+/// (`allocate_vk_scanout_image`).
 pub fn allocate_exportable(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ExportableImage, vk::Result> {
+    let modifiers = if vk.image_drm_format_modifier {
+        super::dri3::export_capable_modifiers(vk, format)
+    } else {
+        Vec::new()
+    };
+
+    if modifiers.is_empty() {
+        return allocate_exportable_linear(vk, width, height, format);
+    }
+
+    match allocate_exportable_modifier(vk, width, height, format, &modifiers) {
+        Ok(img) => Ok(img),
+        Err(e) => {
+            // On RADV the LINEAR fallback will simply reproduce the
+            // FORMAT_NOT_SUPPORTED, but it is harmless and keeps drivers
+            // where modifier creation fails for other reasons working.
+            log::warn!("allocate_exportable: modifier path failed ({e:?}); falling back to LINEAR");
+            allocate_exportable_linear(vk, width, height, format)
+        }
+    }
+}
+
+/// Modifier-tiled exportable allocation (RADV path). The chosen
+/// `modifiers` come from [`crate::kms::vk::dri3::export_capable_modifiers`];
+/// the driver selects one from the list and reports it back.
+fn allocate_exportable_modifier(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    modifiers: &[u64],
+) -> Result<ExportableImage, vk::Result> {
+    let modifier_ext = vk
+        .image_drm_format_modifier_ext
+        .as_ref()
+        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+
+    let mut ext_mem = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut modifier_list =
+        vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(modifiers);
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(EXPORT_IMAGE_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut ext_mem)
+        .push_next(&mut modifier_list);
+
+    let image = unsafe { vk.device.create_image(&image_info, None)? };
+
+    let memory = match bind_exportable_memory(vk, image) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(e);
+        }
+    };
+
+    // Read back the modifier the driver actually picked from the list.
+    let mut mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+    if let Err(e) =
+        unsafe { modifier_ext.get_image_drm_format_modifier_properties(image, &mut mod_props) }
+    {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(e);
+    }
+
+    // Modifier-tiled images MUST be queried with a MEMORY_PLANE aspect;
+    // COLOR is a validation error. We only accept single-plane modifiers
+    // (export reply carries one plane), so plane 0 is the whole image.
+    let subresource = vk::ImageSubresource {
+        aspect_mask: vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+        mip_level: 0,
+        array_layer: 0,
+    };
+    let layout = unsafe { vk.device.get_image_subresource_layout(image, subresource) };
+
+    Ok(ExportableImage {
+        image,
+        memory,
+        extent: vk::Extent2D { width, height },
+        format,
+        stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
+        size: layout.size,
+        modifier: mod_props.drm_format_modifier,
+        vk: Arc::clone(vk),
+    })
+}
+
+/// Historical `VK_IMAGE_TILING_LINEAR` exportable allocation. Used on
+/// drivers without `VK_EXT_image_drm_format_modifier` or with no
+/// export-capable modifier for `format`.
+fn allocate_exportable_linear(
     vk: &Arc<VkContext>,
     width: u32,
     height: u32,
@@ -1111,18 +1251,47 @@ pub fn allocate_exportable(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::LINEAR)
-        .usage(
-            vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        )
+        .usage(EXPORT_IMAGE_USAGE)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext_mem);
 
     let image = unsafe { vk.device.create_image(&image_info, None)? };
 
+    let memory = match bind_exportable_memory(vk, image) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(e);
+        }
+    };
+
+    let subresource = vk::ImageSubresource {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        mip_level: 0,
+        array_layer: 0,
+    };
+    let layout = unsafe { vk.device.get_image_subresource_layout(image, subresource) };
+
+    Ok(ExportableImage {
+        image,
+        memory,
+        extent: vk::Extent2D { width, height },
+        format,
+        stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
+        size: layout.size,
+        modifier: 0, // DRM_FORMAT_MOD_LINEAR
+        vk: Arc::clone(vk),
+    })
+}
+
+/// Allocate dma-buf-exportable, dedicated `VkDeviceMemory` for `image`
+/// and bind it. Shared by the modifier and linear exportable paths.
+/// On error the caller still owns `image` and must destroy it.
+fn bind_exportable_memory(
+    vk: &Arc<VkContext>,
+    image: vk::Image,
+) -> Result<vk::DeviceMemory, vk::Result> {
     let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
     let mem_props = unsafe {
         vk.instance
@@ -1142,15 +1311,8 @@ pub fn allocate_exportable(
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::empty(),
         )
-    });
-
-    let memory_type_index = match memory_type_index {
-        Some(i) => i,
-        None => {
-            unsafe { vk.device.destroy_image(image, None) };
-            return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
-        }
-    };
+    })
+    .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
 
     let mut export_alloc = vk::ExportMemoryAllocateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -1161,39 +1323,13 @@ pub fn allocate_exportable(
         .push_next(&mut export_alloc)
         .push_next(&mut dedicated);
 
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            unsafe { vk.device.destroy_image(image, None) };
-            return Err(e);
-        }
-    };
+    let memory = unsafe { vk.device.allocate_memory(&alloc_info, None)? };
 
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
-        unsafe {
-            vk.device.free_memory(memory, None);
-            vk.device.destroy_image(image, None);
-        }
+        unsafe { vk.device.free_memory(memory, None) };
         return Err(e);
     }
-
-    let subresource = vk::ImageSubresource {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        mip_level: 0,
-        array_layer: 0,
-    };
-    let layout = unsafe { vk.device.get_image_subresource_layout(image, subresource) };
-
-    Ok(ExportableImage {
-        image,
-        memory,
-        extent: vk::Extent2D { width, height },
-        format,
-        stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
-        size: layout.size,
-        modifier: 0, // DRM_FORMAT_MOD_LINEAR
-        vk: Arc::clone(vk),
-    })
+    Ok(memory)
 }
 
 fn pick_memory_type(

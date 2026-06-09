@@ -137,6 +137,99 @@ fn can_import_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> boo
         .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
+/// DRM format modifiers the driver can **export** as a single-plane
+/// DMA_BUF image for `format` with the GLX-TFP export usage
+/// ([`super::target::EXPORT_IMAGE_USAGE`]).
+///
+/// Sibling of [`supported_modifiers`], but for the *export* direction:
+/// it requires the `EXPORTABLE` external-memory feature (not merely a
+/// compatible handle type) and a single-plane layout, because the TFP
+/// export reply carries exactly one plane. Returns an empty vec when
+/// `VK_EXT_image_drm_format_modifier` is unavailable or no modifier
+/// qualifies — callers then fall back to the LINEAR export path.
+#[must_use]
+pub fn export_capable_modifiers(vk: &VkContext, format: vk::Format) -> Vec<u64> {
+    if !vk.image_drm_format_modifier {
+        return Vec::new();
+    }
+
+    let modifier_count = match list_modifier_count(vk, format) {
+        Ok(n) if n > 0 => n,
+        _ => return Vec::new(),
+    };
+
+    let mut props_storage =
+        vec![vk::DrmFormatModifierPropertiesEXT::default(); modifier_count as usize];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut props_storage);
+    let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe {
+        vk.instance.get_physical_device_format_properties2(
+            vk.physical_device,
+            format,
+            &mut format_props,
+        );
+    }
+    let entries = list.drm_format_modifier_count as usize;
+
+    let mut accepted = Vec::with_capacity(entries);
+    for prop in props_storage.iter().take(entries) {
+        if prop.drm_format_modifier_plane_count == 1
+            && can_export_modifier(vk, format, prop.drm_format_modifier)
+        {
+            accepted.push(prop.drm_format_modifier);
+        }
+    }
+    accepted
+}
+
+/// Probe whether `(format, modifier)` can be allocated as a server-owned
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` image and **exported** as a
+/// DMA_BUF with the GLX-TFP export usage.
+///
+/// Mirrors [`can_import_modifier`]'s chain construction, but checks the
+/// `EXPORTABLE` external-memory feature and uses
+/// [`super::target::EXPORT_IMAGE_USAGE`] (which must match the usage the
+/// allocation actually requests).
+fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    external_info.p_next = std::ptr::from_mut(&mut modifier_info).cast::<c_void>();
+
+    let mut format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(super::target::EXPORT_IMAGE_USAGE);
+    format_info.p_next = std::ptr::from_mut(&mut external_info).cast::<c_void>();
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+
+    let result = unsafe {
+        vk.instance.get_physical_device_image_format_properties2(
+            vk.physical_device,
+            &format_info,
+            &mut props2,
+        )
+    };
+
+    if result.is_err() {
+        return false;
+    }
+    let props = external_props.external_memory_properties;
+    props
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        && props
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+}
+
 /// One plane of a multi-plane DMA_BUF import. Phase 4.2 only accepts
 /// `num_planes == 1` (RGB single-plane); the multi-plane shape is
 /// kept on the API so future YCbCr work doesn't need to widen
