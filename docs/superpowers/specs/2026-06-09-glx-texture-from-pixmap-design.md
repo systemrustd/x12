@@ -87,7 +87,7 @@ Per codex's sequencing; lets the MVP land + HW-validate before the robust tail:
 
 1. **Exportable-pixmap promotion** (component 1): external-memory image alloc, content+layout copy, storage swap, **view-cache invalidation**, in-flight-CB retire, extend `dri3_export_pixmap`. Unit-test the export + liveness.
 2. **Bidirectional dma-buf sync** (component 2): make yserver's Vulkan writes participate in dma-buf implicit fencing on exported images (both directions) + alias lifetime. This is the riskiest piece — prototype + HW-verify the intermittency is gone here.
-3. **GLX surface** (component 3): runtime capability-gate the extension; bind-to-texture FBConfig/drawable attrs with the exact Xorg values; GLXPixmap resource tracking; open the `VendorPrivate` bind/release path (indirect).
+3. **GLX surface** (component 3): runtime capability-gate the extension; bind-to-texture FBConfig/drawable attrs in Xorg reply *order* with Xorg-compatible values (RGB/RGBA per yserver's depth policy, MIPMAP=0, TARGETS=2D|RECTANGLE, Y_INVERTED=GLX_DONT_CARE); GLXPixmap resource tracking; open the `VendorPrivate` bind/release path (indirect).
 4. **DRI3**: confirm `BufferFromPixmap` suffices (it does for single-plane BGRA8); defer `BuffersFromPixmap`.
 
 MVP = phases 1–3 enough for muffin's direct path → cinnamon-settings redraws live (the HW gate). Robust tail = indirect `BindTexImageEXT`, full FBConfig matrix, multi-plane/modifiers.
