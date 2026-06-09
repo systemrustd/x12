@@ -529,8 +529,8 @@ yserver-xfce-hw-perf log="warn" freq="999":
         SESSION_NAME=xfce SESSION_COMMAND='xfce4-session --display :7' \
         tools/profile-mate.sh
 
-yserver-cinnamon-hw log="debug,yserver::kms::v2::scene=trace":
-    cargo build --bin yserver
+yserver-cinnamon-hw log="warn":
+    cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
