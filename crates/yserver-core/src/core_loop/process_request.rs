@@ -8007,7 +8007,7 @@ fn glx_extension_string(tfp_supported: bool) -> String {
     s
 }
 
-fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
+fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
     let mut out = Vec::with_capacity(4);
     let depth = 24;
@@ -8021,7 +8021,7 @@ fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
         for &double_buffered in &[1u32, 0u32] {
             let fbconfig_id = next_fbconfig_id;
             next_fbconfig_id += 1;
-            out.push(vec![
+            let mut config = vec![
                 (g::GLX_VISUAL_ID, visual_id),
                 (g::GLX_FBCONFIG_ID, fbconfig_id),
                 (g::GLX_X_VISUAL_TYPE, g::GLX_TRUE_COLOR),
@@ -8047,7 +8047,32 @@ fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
                 (g::GLX_TRANSPARENT_TYPE, g::GLX_NONE),
                 (g::GLX_SAMPLE_BUFFERS, 0),
                 (g::GLX_SAMPLES, 0),
-            ]);
+            ];
+            // Append bind-to-texture pairs in Xorg's exact reply order
+            // (glxcmds.c:1094-1100 / glxdricommon.c:165) when TFP is supported.
+            // RGB/RGBA values are yserver depth-policy (not Xorg-exact): depth-24
+            // advertises RGBA=false because its sample_view forces α=1 (BgraNoAlpha).
+            // If a client rejects this set, revisit to "both true" per spec §3.
+            if tfp_supported {
+                // Depth derived from visual id: 0x102 → depth-24, 0x103 → depth-32.
+                let (rgb, rgba) = match visual_id {
+                    0x102 => (1u32, 0u32), // depth-24: opaque; sample_view forces α=1
+                    0x103 => (1u32, 1u32), // depth-32: RGBA
+                    _ => (1, 0),
+                };
+                config.push((g::GLX_BIND_TO_TEXTURE_RGB_EXT, rgb));
+                config.push((g::GLX_BIND_TO_TEXTURE_RGBA_EXT, rgba));
+                // MIPMAP: not backed, but pair MUST be present for contract.
+                config.push((g::GLX_BIND_TO_MIPMAP_TEXTURE_EXT, 0));
+                config.push((
+                    g::GLX_BIND_TO_TEXTURE_TARGETS_EXT,
+                    g::GLX_TEXTURE_2D_BIT_EXT | g::GLX_TEXTURE_RECTANGLE_BIT_EXT,
+                ));
+                // Y_INVERTED in FBConfig = GLX_DONT_CARE (differs from drawable-attributes
+                // where it is 0/GL_FALSE — do not confuse them; glxcmds.c:1093).
+                config.push((g::GLX_Y_INVERTED_EXT, g::GLX_DONT_CARE));
+            }
+            out.push(config);
         }
     }
     out
@@ -8217,7 +8242,7 @@ fn handle_glx_request(
             // Synthesise FBConfigs from each X visual × singleBuf /
             // doubleBuf. Mesa picks one matching the app's request
             // via glXChooseFBConfig.
-            let configs = synthesise_glx_fb_configs();
+            let configs = synthesise_glx_fb_configs(state.glx_tfp_supported);
             let config_refs: Vec<&[(u32, u32)]> = configs.iter().map(|c| c.as_slice()).collect();
             let reply = x11glx::encode_get_fb_configs_reply(byte_order, sequence, &config_refs);
             debug!(
@@ -38668,5 +38693,79 @@ mod tests {
         // Base extensions always present.
         assert!(with.contains("GLX_ARB_create_context"));
         assert!(without.contains("GLX_ARB_create_context"));
+    }
+
+    #[test]
+    fn fbconfigs_emit_bind_to_texture_pairs_in_xorg_order() {
+        use yserver_protocol::x11::glx as g;
+        let configs = synthesise_glx_fb_configs(true);
+        // All configs same length (wire encoder requirement).
+        let len = configs[0].len();
+        assert!(configs.iter().all(|c| c.len() == len));
+
+        for c in &configs {
+            // Find the bind-to-texture block; it must appear as a contiguous run in this order.
+            let idx = c
+                .iter()
+                .position(|(k, _)| *k == g::GLX_BIND_TO_TEXTURE_RGB_EXT)
+                .expect("RGB present");
+            let order = [
+                g::GLX_BIND_TO_TEXTURE_RGB_EXT,
+                g::GLX_BIND_TO_TEXTURE_RGBA_EXT,
+                g::GLX_BIND_TO_MIPMAP_TEXTURE_EXT,
+                g::GLX_BIND_TO_TEXTURE_TARGETS_EXT,
+                g::GLX_Y_INVERTED_EXT,
+            ];
+            for (i, key) in order.iter().enumerate() {
+                assert_eq!(c[idx + i].0, *key, "wrong order at offset {i}");
+            }
+            // Values:
+            assert_eq!(c[idx + 2].1, 0, "MIPMAP must be 0/false");
+            assert_eq!(
+                c[idx + 3].1,
+                g::GLX_TEXTURE_2D_BIT_EXT | g::GLX_TEXTURE_RECTANGLE_BIT_EXT
+            );
+            assert_eq!(
+                c[idx + 4].1,
+                g::GLX_DONT_CARE,
+                "Y_INVERTED in FBConfig is GLX_DONT_CARE"
+            );
+        }
+
+        // Depth policy: depth-24 (visual 0x102) RGB=true RGBA=false; depth-32 (0x103) RGB=true RGBA=true.
+        let depth24 = configs
+            .iter()
+            .find(|c| c.iter().any(|(k, v)| *k == g::GLX_VISUAL_ID && *v == 0x102))
+            .unwrap();
+        let d24 = depth24
+            .iter()
+            .position(|(k, _)| *k == g::GLX_BIND_TO_TEXTURE_RGB_EXT)
+            .unwrap();
+        assert_eq!(depth24[d24].1, 1); // RGB true
+        assert_eq!(depth24[d24 + 1].1, 0); // RGBA false on depth-24
+
+        let depth32 = configs
+            .iter()
+            .find(|c| c.iter().any(|(k, v)| *k == g::GLX_VISUAL_ID && *v == 0x103))
+            .unwrap();
+        let d32 = depth32
+            .iter()
+            .position(|(k, _)| *k == g::GLX_BIND_TO_TEXTURE_RGB_EXT)
+            .unwrap();
+        assert_eq!(depth32[d32 + 1].1, 1); // RGBA true on depth-32
+    }
+
+    #[test]
+    fn fbconfigs_omit_bind_to_texture_when_tfp_unsupported() {
+        use yserver_protocol::x11::glx as g;
+        let configs = synthesise_glx_fb_configs(false);
+        assert!(
+            configs
+                .iter()
+                .all(|c| c.iter().all(|(k, _)| *k != g::GLX_BIND_TO_TEXTURE_RGB_EXT))
+        );
+        // Still equal length across configs.
+        let len = configs[0].len();
+        assert!(configs.iter().all(|c| c.len() == len));
     }
 }
