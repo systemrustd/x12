@@ -378,6 +378,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // overrides `dpms_capable()`, the snapshot picks it up
     // automatically.
     state.dpms = crate::server::DpmsState::new(backend.dpms_capable());
+    state.glx_tfp_supported = backend.supports_dmabuf_export();
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
     // bg pixmap) produce visible output in the nested viewport.

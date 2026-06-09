@@ -222,6 +222,7 @@ pub fn run(display: u16) -> io::Result<()> {
     // saved press timestamps.
     crate::clock::init(state.start_instant);
     state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
+    state.glx_tfp_supported = backend.supports_dmabuf_export();
     install_backend_root_bindings(&mut state, &backend);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");

@@ -338,6 +338,12 @@ pub struct KmsBackendV2 {
     /// a parallel sync-only fd dup lives on `store.exported_sync` so the
     /// engine's flush chokepoint can reach it.
     exported_dmabufs: HashMap<crate::kms::v2::store::DrawableId, ExportedBacking>,
+
+    /// Cached result of `probe_dmabuf_export_support` run once at
+    /// construction.  When `true`, `ServerState::glx_tfp_supported` is
+    /// set and the GLX extension string advertises
+    /// `GLX_EXT_texture_from_pixmap`.
+    dmabuf_export_supported: bool,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
@@ -386,6 +392,27 @@ pub(crate) struct FillPatternCache {
 // between threads after construction — the same pattern used by the
 // existing `!Send` KMS fields (`XkbContext`, `XkbState`, etc.).
 unsafe impl Send for KmsBackendV2 {}
+
+/// Probe whether this Vulkan context can allocate and export a BGRA8
+/// dma-buf image.  Called ONCE at backend construction; result is cached
+/// in `KmsBackendV2::dmabuf_export_supported`.
+///
+/// Allocates a 1×1 `BGRA8` external-memory image and immediately
+/// exports it.  Both the image and the fd are dropped at the end of
+/// this function (`ExportableImage::Drop` destroys image + memory,
+/// `DmabufExport::fd` is an `OwnedFd` that closes on drop), so no
+/// resources leak from the probe.
+fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkContext>) -> bool {
+    use crate::kms::vk::{
+        dri3::export_backing,
+        target::{EXPORT_FORMAT_BGRA8, allocate_exportable},
+    };
+    let Ok(img) = allocate_exportable(vk, 1, 1, EXPORT_FORMAT_BGRA8) else {
+        return false;
+    };
+    export_backing(vk, &img).is_ok()
+    // `img` drops here → `ExportableImage::Drop` frees VkImage + VkDeviceMemory.
+}
 
 impl KmsBackendV2 {
     /// Test-only entry point: drives the production `get_image` path
@@ -642,6 +669,10 @@ impl KmsBackendV2 {
              Stage 2c/2d on first client request",
             platform.outputs.len(),
         );
+        let dmabuf_export_supported = platform
+            .vk
+            .as_ref()
+            .is_some_and(probe_dmabuf_export_support);
         let mut b = Self {
             core,
             platform,
@@ -683,6 +714,7 @@ impl KmsBackendV2 {
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
+            dmabuf_export_supported,
         };
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -762,6 +794,10 @@ impl KmsBackendV2 {
              virtual screen; VT switching enabled",
             platform.outputs.len(),
         );
+        let dmabuf_export_supported = platform
+            .vk
+            .as_ref()
+            .is_some_and(probe_dmabuf_export_support);
         let mut b = Self {
             core,
             platform,
@@ -804,6 +840,7 @@ impl KmsBackendV2 {
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
+            dmabuf_export_supported,
         };
         b.init_root_storage();
         if let Err(e) = b.init_cursor_sprite() {
@@ -1461,6 +1498,7 @@ impl KmsBackendV2 {
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
+            dmabuf_export_supported: false,
         }
     }
 
@@ -9121,6 +9159,10 @@ impl Backend for KmsBackendV2 {
     /// that the `92a2a83 → 3751c11` revert established.
     fn supports_redirect_activation(&self) -> bool {
         true
+    }
+
+    fn supports_dmabuf_export(&self) -> bool {
+        self.dmabuf_export_supported
     }
 
     /// Stage 4c.4 — flip a window's scene-participation under

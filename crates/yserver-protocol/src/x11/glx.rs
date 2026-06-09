@@ -114,6 +114,10 @@ pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_conte
     GLX_ARB_fbconfig_float GLX_EXT_visual_info \
     GLX_EXT_visual_rating GLX_EXT_import_context";
 
+/// Extension token appended to the advertised extension string when the
+/// backend can allocate and export a BGRA8 dma-buf (probed once at init).
+pub const TFP_EXTENSION: &str = "GLX_EXT_texture_from_pixmap";
+
 #[must_use]
 pub fn parse_query_server_string(body: &[u8]) -> Option<QueryServerStringRequest> {
     if body.len() < 8 {

@@ -7998,6 +7998,18 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
     out
 }
 
+/// Build the GLX extension string.  The base extensions are always
+/// present; `GLX_EXT_texture_from_pixmap` is appended only when the
+/// backend confirmed at init that it can export a BGRA8 dma-buf.
+fn glx_extension_string(tfp_supported: bool) -> String {
+    let mut s = String::from(yserver_protocol::x11::glx::SERVER_EXTENSIONS);
+    if tfp_supported {
+        s.push(' ');
+        s.push_str(yserver_protocol::x11::glx::TFP_EXTENSION);
+    }
+    s
+}
+
 fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
     let mut out = Vec::with_capacity(4);
@@ -8154,10 +8166,16 @@ fn handle_glx_request(
         x11glx::QUERY_SERVER_STRING => {
             let req = x11glx::parse_query_server_string(body);
             let name = req.map_or(0, |r| r.name);
-            let s = match name {
+            // Build the extension string lazily so we only pay the
+            // allocation cost when the client actually asks for it.
+            let ext_string;
+            let s: &str = match name {
                 x11glx::STRING_VENDOR => "yserver",
                 x11glx::STRING_VERSION => "1.4",
-                x11glx::STRING_EXTENSIONS => x11glx::SERVER_EXTENSIONS,
+                x11glx::STRING_EXTENSIONS => {
+                    ext_string = glx_extension_string(state.glx_tfp_supported);
+                    &ext_string
+                }
                 _ => "",
             };
             let reply = x11glx::encode_string_reply(byte_order, sequence, s);
@@ -8170,8 +8188,8 @@ fn handle_glx_request(
             // Per design §3.5 — list of GLX extensions Mesa probes for.
             // Same list as the server string (opcode 19) — see
             // `x11glx::SERVER_EXTENSIONS`.
-            let reply =
-                x11glx::encode_string_reply(byte_order, sequence, x11glx::SERVER_EXTENSIONS);
+            let ext_string = glx_extension_string(state.glx_tfp_supported);
+            let reply = x11glx::encode_string_reply(byte_order, sequence, &ext_string);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -38642,5 +38660,16 @@ mod tests {
             x11::error::BAD_PIXMAP,
             buf[1]
         );
+    }
+
+    #[test]
+    fn glx_extension_string_includes_tfp_only_when_capable() {
+        let with = glx_extension_string(true);
+        let without = glx_extension_string(false);
+        assert!(with.contains("GLX_EXT_texture_from_pixmap"));
+        assert!(!without.contains("GLX_EXT_texture_from_pixmap"));
+        // Base extensions always present.
+        assert!(with.contains("GLX_ARB_create_context"));
+        assert!(without.contains("GLX_ARB_create_context"));
     }
 }

@@ -673,6 +673,17 @@ pub trait Backend: Send {
         false
     }
 
+    /// Whether this backend can allocate and export a BGRA8 dma-buf via
+    /// the Vulkan external-memory path.  When `true`, the GLX extension
+    /// string includes `GLX_EXT_texture_from_pixmap`.
+    ///
+    /// **Cached at construction** (real probe in `KmsBackendV2::new`);
+    /// this getter is a trivial field read — no Vulkan calls.
+    /// Default `false` covers all non-KMS backends.
+    fn supports_dmabuf_export(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can actually power-cycle a display.
     /// `yserver-hw` returns `true`; ynest and recording backends
     /// return `false`. `ServerState` snapshots this at init so the

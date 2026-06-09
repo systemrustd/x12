@@ -938,6 +938,11 @@ pub struct ServerState {
     /// GLX drawables (windows, pixmaps, pbuffers) — keyed by the GLX
     /// drawable XID the client chose at create-time.
     pub glx_drawables: HashMap<u32, GlxDrawable>,
+    /// `GLX_EXT_texture_from_pixmap` is advertised only when the backend
+    /// confirmed at init that it can allocate and export a BGRA8 dma-buf.
+    /// Set once from `backend.supports_dmabuf_export()` during startup;
+    /// read by the GLX string-builder in `process_request.rs`.
+    pub glx_tfp_supported: bool,
     /// Server-side key auto-repeat state. Set to `Some` while a key
     /// is held; cleared on the matching release or replaced when a
     /// different key is pressed (X11 spec: only the most recently
@@ -1150,6 +1155,7 @@ impl ServerState {
             glx_contexts: HashMap::new(),
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
+            glx_tfp_supported: false,
             sync_pending_awaits: Vec::new(),
             repeat_state: None,
             dpms: DpmsState::new(false),
