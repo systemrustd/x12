@@ -7910,10 +7910,7 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     use yserver_protocol::x11::glx as g;
     // GLX_TEXTURE_TARGET_EXT, GLX_Y_INVERTED_EXT and GLX_FBCONFIG_ID
     // are the three Mesa actually consults; everything else is
-    // optional decoration. EXT atom values per glxext.h.
-    const GLX_TEXTURE_TARGET_EXT: u32 = 0x20D6;
-    const GLX_TEXTURE_2D_EXT: u32 = 0x20DC;
-    const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
+    // optional decoration. EXT atom values per glx.rs (glxext.h verified).
     let drawable = state.glx_drawables.get(&xid);
     let fbconfig = drawable.map_or(0, |d| d.fbconfig);
     // Resolve drawable geometry. For a pbuffer the size lives in the
@@ -7940,8 +7937,8 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     };
     let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(10);
     attribs.push((g::GLX_FBCONFIG_ID, fbconfig));
-    attribs.push((GLX_TEXTURE_TARGET_EXT, GLX_TEXTURE_2D_EXT));
-    attribs.push((GLX_Y_INVERTED_EXT, 0));
+    attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+    attribs.push((g::GLX_Y_INVERTED_EXT, 0));
     // GLX_RENDER_TYPE — direct-render clients tag this off the
     // FBConfig they chose; report RGBA for our synthesized configs.
     attribs.push((g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT));

@@ -257,6 +257,22 @@ pub const GLX_PBUFFER_WIDTH: u32 = 0x8041;
 pub const GLX_SAMPLE_BUFFERS: u32 = 100_000;
 pub const GLX_SAMPLES: u32 = 100_001;
 
+// GLX_EXT_texture_from_pixmap tokens (glxext.h, 0x20D0–0x20DE range).
+// Verified against /usr/include/GL/glxext.h.
+pub const GLX_BIND_TO_TEXTURE_RGB_EXT: u32 = 0x20D0;
+pub const GLX_BIND_TO_TEXTURE_RGBA_EXT: u32 = 0x20D1;
+pub const GLX_BIND_TO_MIPMAP_TEXTURE_EXT: u32 = 0x20D2;
+pub const GLX_BIND_TO_TEXTURE_TARGETS_EXT: u32 = 0x20D3;
+pub const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
+pub const GLX_TEXTURE_TARGET_EXT: u32 = 0x20D6;
+pub const GLX_TEXTURE_2D_EXT: u32 = 0x20DC;
+// Bind-to-texture target bitmask values (GLX_TEXTURE_*_BIT_EXT).
+pub const GLX_TEXTURE_1D_BIT_EXT: u32 = 0x0001;
+pub const GLX_TEXTURE_2D_BIT_EXT: u32 = 0x0002;
+pub const GLX_TEXTURE_RECTANGLE_BIT_EXT: u32 = 0x0004;
+// GLX_DONT_CARE: used for FBConfig "don't care" values (Xorg glxcmds.c:1093).
+pub const GLX_DONT_CARE: u32 = 0xFFFF_FFFF;
+
 // Values
 pub const GLX_TRUE_COLOR: u32 = 0x8002;
 pub const GLX_NONE: u32 = 0x8000;
