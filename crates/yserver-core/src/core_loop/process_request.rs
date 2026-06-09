@@ -7599,8 +7599,10 @@ fn handle_dri3_request(
                 }
                 Err(err) => {
                     // Xorg dri3/dri3_request.c:277 maps export failure to BadPixmap.
-                    // BadDrawable is reserved for the unresolvable-XID case above;
-                    // BadAlloc is reserved for send_reply_with_fd failure.
+                    // BadDrawable is reserved for the unresolvable-XID case above.
+                    // Note: Xorg returns BadAlloc when sending the fd fails; yserver
+                    // instead disconnects (see the send_reply_with_fd path above) —
+                    // a broken SCM_RIGHTS socket is unrecoverable for the client.
                     debug!(
                         "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadPixmap ({err})",
                         client_id.0, sequence.0
