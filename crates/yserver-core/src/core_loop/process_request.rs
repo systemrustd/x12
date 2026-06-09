@@ -7620,11 +7620,15 @@ fn handle_dri3_request(
             }
         }
         x11dri3::BUFFERS_FROM_PIXMAP => {
-            // Phase 4.2 deferred per design §6 open question. The only
-            // realistic consumer is multi-plane screen recording;
-            // single-plane export uses BufferFromPixmap above.
+            // DRI3 op 8 (BUFFERS_FROM_PIXMAP); deferred. yserver's backings are
+            // single-plane BGRA8 (LINEAR), which Xorg's dri3_fd_from_pixmap
+            // exports via the single-fd BufferFromPixmap (op 3) — it only falls
+            // back to the multi-plane fds_from_pixmap when the single-fd path is
+            // absent (xserver dri3/dri3_screen.c:112). So BufferFromPixmap above
+            // is the correct minimal contract; implement op 8 only when yserver
+            // starts exporting multi-plane or modifier-bearing buffers.
             debug!(
-                "client {} #{} DRI3::BuffersFromPixmap (deferred — single-plane only via BufferFromPixmap)",
+                "client {} #{} DRI3::BuffersFromPixmap (deferred — single-plane BGRA8 exports via BufferFromPixmap op 3)",
                 client_id.0, sequence.0
             );
             return emit_x11_error_with_minor(
