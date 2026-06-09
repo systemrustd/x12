@@ -1663,6 +1663,28 @@ pub trait Backend: Send {
         // no-op for backends without GLX-TFP export tracking
     }
 
+    /// GLX-TFP Task 3.5: promote the backing for `host_xid` to
+    /// dma-buf-exportable storage (idempotent) WITHOUT touching the
+    /// lifetime refcount (`glx_refs`) or allocating/exporting a dmabuf fd.
+    ///
+    /// Called from the indirect-context `glXBindTexImageEXT` path. The
+    /// GLXPixmap's create-time lifetime ref (taken by
+    /// `acquire_glx_pixmap_export` at `glXCreatePixmap`) already keeps the
+    /// backing alive until `glXDestroyPixmap`; bind only needs the storage
+    /// promoted so indirect sampling reads live content. Crucially this is
+    /// SEPARATE from the lifetime refcount: compositors call
+    /// `BindTexImageEXT` repeatedly (per-frame / on damage, with implicit
+    /// rebind), so coupling it to `glx_refs` would leak the backing.
+    ///
+    /// Returns `true` if the backing is exportable after the call. The KMS
+    /// backend (`KmsBackendV2`) routes this to the engine's idempotent
+    /// `promote_drawable_exportable` (its `is_exportable()` check
+    /// short-circuits a no-op rebind). Non-KMS / `RecordingBackend` default
+    /// to `false`.
+    fn promote_pixmap_exportable(&mut self, _host_xid: u32) -> bool {
+        false
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Other extensions
     // ──────────────────────────────────────────────────────────────

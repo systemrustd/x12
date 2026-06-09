@@ -2269,6 +2269,52 @@ impl KmsBackendV2 {
         }
     }
 
+    /// GLX-TFP (Task 3.5 `glXBindTexImageEXT`): promote the backing for
+    /// `host_xid` to dma-buf-exportable storage, idempotently, WITHOUT
+    /// touching `glx_refs` or `exported_dmabufs` (no fd alloc/export).
+    /// Returns whether the backing is exportable after the call.
+    ///
+    /// This is the lightweight bind hook — distinct from
+    /// `acquire_glx_pixmap_export` (which manages the GLXPixmap LIFETIME
+    /// ref). Binds happen repeatedly (per-frame); coupling them to the
+    /// lifetime refcount would leak the backing. The engine's
+    /// `promote_drawable_exportable` short-circuits via `is_exportable()`
+    /// so repeated binds cost nothing after the first.
+    pub fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
+        let Some(id) = self.store.lookup(host_xid) else {
+            return false;
+        };
+        // Already exportable → idempotent no-op (the common rebind case).
+        if self
+            .store
+            .get(id)
+            .map(|d| d.storage.is_exportable())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // First bind: promote. Requires Vulkan; if unavailable, report
+        // not-exportable rather than erroring (bind still succeeds at the
+        // protocol layer — see process_request's BindTexImageEXT TODO).
+        if self.platform.vk.is_none() {
+            return false;
+        }
+        match self
+            .engine
+            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+        {
+            Ok(()) => self
+                .store
+                .get(id)
+                .map(|d| d.storage.is_exportable())
+                .unwrap_or(false),
+            Err(e) => {
+                log::warn!("GLX BindTexImageEXT promote 0x{host_xid:x} failed: {e:?}");
+                false
+            }
+        }
+    }
+
     /// GLX-TFP test introspection: true iff `host_xid` currently has an
     /// `ExportedBacking` entry.
     #[doc(hidden)]
@@ -9171,6 +9217,10 @@ impl Backend for KmsBackendV2 {
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
         KmsBackendV2::release_glx_pixmap_export(self, host_xid);
+    }
+
+    fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
+        KmsBackendV2::promote_pixmap_exportable(self, host_xid)
     }
 
     /// Stage 4c.4 — flip a window's scene-participation under

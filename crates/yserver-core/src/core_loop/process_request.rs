@@ -8603,10 +8603,18 @@ fn handle_glx_request(
                     if let Some(d) = state.glx_drawables.get(&glx_drawable) {
                         // Ensure the backing is promoted to exportable storage so
                         // indirect GL texture sampling can read live content.
-                        // acquire_glx_pixmap_export is idempotent (increments
-                        // a refcount; the one-time promotion happens on the first
-                        // call). Using it here rather than a separate lightweight
-                        // promote avoids introducing new backend surface area.
+                        //
+                        // CRITICAL: use promote_pixmap_exportable, NOT
+                        // acquire_glx_pixmap_export. Bind is decoupled from the
+                        // GLXPixmap LIFETIME refcount (glx_refs): TFP compositors
+                        // rebind every frame / on damage (the spec allows rebind
+                        // without an intervening release), so calling acquire here
+                        // would grow glx_refs unboundedly and the backing would
+                        // never tear down after glXDestroyPixmap. promote is
+                        // idempotent (the engine short-circuits via is_exportable)
+                        // and touches no refcount. The backing is already kept
+                        // alive by glXCreatePixmap's acquire (glx_refs >= 1 until
+                        // glXDestroyPixmap).
                         //
                         // TODO(glx-tfp): indirect texture *sampling* (serving
                         // glTexImage2D-equivalent data from the promoted backing)
@@ -8615,7 +8623,7 @@ fn handle_glx_request(
                         // content will not be updated until indirect GL sampling
                         // is wired up.
                         if let Some(host_xid) = d.glx_export_host_xid {
-                            backend.acquire_glx_pixmap_export(host_xid);
+                            let _ = backend.promote_pixmap_exportable(host_xid);
                         }
                         // No reply for VENDOR_PRIVATE; for VENDOR_PRIVATE_WITH_REPLY
                         // send an empty success reply so the client does not block.
@@ -8650,26 +8658,29 @@ fn handle_glx_request(
                 }
                 x11glx::VENDOR_CODE_RELEASE_TEX_IMAGE => {
                     // glXReleaseTexImageEXT (indirect path, EXT completeness).
-                    // Mirror the bind: resolve and drop the promote-ref if we
-                    // held one. Unknown GLXPixmap XIDs are silently ignored
-                    // (no error — matches Xorg glx/glxcmds.c behaviour for
-                    // stale release after destroy).
+                    //
+                    // CRITICAL: this is a LIFETIME no-op. It must NOT call
+                    // release_glx_pixmap_export — that decrements the
+                    // GLXPixmap's create-time lifetime ref (glx_refs), which
+                    // glXDestroyPixmap owns. A release without a matching bind
+                    // (or more releases than binds) would drive glx_refs to 0
+                    // and tear down the backing WHILE THE GLXPixmap IS STILL
+                    // ALIVE. Release only ends the texture binding; since bind
+                    // is promote-only (no refcount taken), there is nothing to
+                    // undo here. The promoted storage stays promoted (cheap,
+                    // and a likely-imminent rebind reuses it). Unknown GLXPixmap
+                    // XIDs are silently ignored (no error — matches Xorg
+                    // glx/glxcmds.c behaviour for stale release after destroy).
                     let glx_drawable = if body.len() >= 12 {
                         u32::from_le_bytes([body[8], body[9], body[10], body[11]])
                     } else {
                         0
                     };
                     debug!(
-                        "client {} #{} GLX::ReleaseTexImageEXT glx_drawable=0x{glx_drawable:x}",
+                        "client {} #{} GLX::ReleaseTexImageEXT glx_drawable=0x{glx_drawable:x} \
+                         (lifetime no-op)",
                         client_id.0, sequence.0
                     );
-                    if let Some(Some(host_xid)) = state
-                        .glx_drawables
-                        .get(&glx_drawable)
-                        .map(|d| d.glx_export_host_xid)
-                    {
-                        backend.release_glx_pixmap_export(host_xid);
-                    }
                     // No reply for VENDOR_PRIVATE; for VENDOR_PRIVATE_WITH_REPLY
                     // send an empty success reply.
                     if minor == x11glx::VENDOR_PRIVATE_WITH_REPLY {
@@ -39385,5 +39396,187 @@ mod tests {
             buf2[1]
         );
         peer.set_nonblocking(false).unwrap();
+    }
+
+    /// GLX Task 3.5 regression (codex review): `BindTexImageEXT` /
+    /// `ReleaseTexImageEXT` must be DECOUPLED from the GLXPixmap LIFETIME
+    /// refcount (`glx_refs`).
+    ///
+    /// Bind uses the promote-only hook (`promote_pixmap_exportable`),
+    /// idempotently, taking NO lifetime ref — so repeated rebinds (the
+    /// normal TFP per-frame pattern) do not grow `glx_refs` and leak the
+    /// backing. Release is a lifetime no-op — it must NOT call
+    /// `release_glx_pixmap_export`, or a release without a matching bind
+    /// would tear the backing down while the GLXPixmap is still alive.
+    ///
+    /// Against the OLD acquire/release-based logic this test FAILS: the
+    /// three binds would record three `AcquireGlxPixmapExport` (and no
+    /// `PromotePixmapExportable`), and the release would record a
+    /// `ReleaseGlxPixmapExport`.
+    #[test]
+    fn bind_release_tex_image_do_not_touch_lifetime_refcount() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Register an X pixmap with a known host_xid.
+        let x_pixmap_xid: u32 = 0x2100;
+        let host_xid_raw: u32 = 0xdead_1331;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 32,
+                height: 32,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
+            ),
+            "set_pixmap_host_xid must succeed"
+        );
+
+        // glXCreatePixmap inserts the GlxDrawable and takes the ONE lifetime
+        // acquire ref (this is the legitimate AcquireGlxPixmapExport).
+        let glx_xid: u32 = 0x4000_0003;
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        create_body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+
+        // Exactly one acquire (the lifetime ref) so far; no promote yet.
+        let after_create = backend.calls();
+        assert_eq!(
+            after_create
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::AcquireGlxPixmapExport(_)))
+                .count(),
+            1,
+            "glXCreatePixmap must take exactly one lifetime acquire ref"
+        );
+        let acquires_before_binds = after_create
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::AcquireGlxPixmapExport(_)))
+            .count();
+        let releases_before_binds = after_create
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReleaseGlxPixmapExport(_)))
+            .count();
+
+        // Build a BindTexImageEXT VendorPrivate body.
+        let mut bind_body = Vec::new();
+        bind_body.extend_from_slice(&x11glx::VENDOR_CODE_BIND_TEX_IMAGE.to_le_bytes());
+        bind_body.extend_from_slice(&0u32.to_le_bytes()); // context_tag
+        bind_body.extend_from_slice(&glx_xid.to_le_bytes());
+        bind_body.extend_from_slice(&x11glx::GLX_FRONT_LEFT_EXT.to_le_bytes());
+        let bind_units = u32::try_from(1 + bind_body.len().div_ceil(4)).expect("fits");
+
+        // Bind THREE times (compositor per-frame / implicit-rebind pattern).
+        for seq in 2u16..=4 {
+            process_request(
+                &mut state,
+                &mut backend,
+                client_id,
+                SequenceNumber(seq),
+                RequestHeader {
+                    opcode: 148,
+                    data: x11glx::VENDOR_PRIVATE,
+                    length_units: bind_units,
+                },
+                &bind_body,
+                None,
+            )
+            .expect("process_request BindTexImageEXT");
+        }
+
+        let after_binds = backend.calls();
+        // Each bind recorded a PromotePixmapExportable (the lightweight hook).
+        assert_eq!(
+            after_binds
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    RecordedCall::PromotePixmapExportable(h) if *h == host_xid_raw
+                ))
+                .count(),
+            3,
+            "each BindTexImageEXT must record PromotePixmapExportable, not Acquire"
+        );
+        // The binds must NOT have taken any extra lifetime ref.
+        assert_eq!(
+            after_binds
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::AcquireGlxPixmapExport(_)))
+                .count(),
+            acquires_before_binds,
+            "BindTexImageEXT must NOT take a lifetime acquire ref (no leak on rebind)"
+        );
+        assert_eq!(
+            after_binds
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::ReleaseGlxPixmapExport(_)))
+                .count(),
+            releases_before_binds,
+            "BindTexImageEXT must NOT change the lifetime release count"
+        );
+
+        // Now ReleaseTexImageEXT — must be a lifetime no-op.
+        let mut rel_body = Vec::new();
+        rel_body.extend_from_slice(&x11glx::VENDOR_CODE_RELEASE_TEX_IMAGE.to_le_bytes());
+        rel_body.extend_from_slice(&0u32.to_le_bytes()); // context_tag
+        rel_body.extend_from_slice(&glx_xid.to_le_bytes());
+        rel_body.extend_from_slice(&x11glx::GLX_FRONT_LEFT_EXT.to_le_bytes());
+        let rel_units = u32::try_from(1 + rel_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE,
+                length_units: rel_units,
+            },
+            &rel_body,
+            None,
+        )
+        .expect("process_request ReleaseTexImageEXT");
+
+        // THE REGRESSION ASSERTION: release must NOT have dropped the
+        // lifetime ref — the backing survives until glXDestroyPixmap.
+        let after_release = backend.calls();
+        assert_eq!(
+            after_release
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::ReleaseGlxPixmapExport(_)))
+                .count(),
+            releases_before_binds,
+            "ReleaseTexImageEXT must NOT call release_glx_pixmap_export \
+             (lifetime ref untouched; backing survives until glXDestroyPixmap)"
+        );
     }
 }

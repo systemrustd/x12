@@ -124,6 +124,9 @@ pub enum RecordedCall {
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
     ReleaseGlxPixmapExport(u32),
+    /// GLX-TFP Task 3.5: `promote_pixmap_exportable(host_xid)` called
+    /// (the lightweight bind hook — does NOT touch the lifetime refcount).
+    PromotePixmapExportable(u32),
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -1302,6 +1305,16 @@ impl Backend for RecordingBackend {
             .lock()
             .unwrap()
             .push(RecordedCall::ReleaseGlxPixmapExport(host_xid));
+    }
+
+    fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedCall::PromotePixmapExportable(host_xid));
+        // RecordingBackend has no real GPU storage; report not-exportable.
+        // Tests assert on the recorded call, not the return value.
+        false
     }
 }
 
