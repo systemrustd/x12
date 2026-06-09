@@ -8040,7 +8040,9 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
     const TRUE_COLOR: u32 = 4;
     let mut out: Vec<VisualConfig> = Vec::with_capacity(4);
     for &(visual_id, alpha_bits, rgb_bits) in &[
-        (0x102_u32, 0_u32, 24_u32), // ROOT_VISUAL — TrueColor RGB
+        // Must match the client driver's configs (see synthesise_glx_fb_configs):
+        // radeonsi advertises alpha-8 / 32-bit-buffer for both depths.
+        (0x102_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
         (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
     ] {
         for &double_buffer in &[true, false] {
@@ -8085,7 +8087,16 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     let mut next_fbconfig_id: u32 = 0x101;
     for &(visual_id, alpha_size, total_buffer_size) in &[
         // (X visual id, alpha bits, total color buffer bits)
-        (0x102_u32, 0_u32, 24_u32), // ROOT_VISUAL — TrueColor RGB
+        //
+        // These MUST match the client driver's __DRIconfig attributes
+        // exactly, or mesa's driConfigEqual rejects them all and GLX dri3
+        // screen creation fails with "No matching fbConfigs or visuals
+        // found" (no direct GLX → no TFP). radeonsi advertises BOTH its
+        // depth-24 and depth-32 TrueColor configs as 8-bit-alpha,
+        // 32-bit-buffer (the GL backbuffer is BGRA8 regardless of the X
+        // visual's opacity), so we mirror that for both. The depth-24 X
+        // visual stays opaque on screen; the alpha is GL-side only.
+        (0x102_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
         (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
     ] {
         for &double_buffered in &[1u32, 0u32] {
@@ -8120,24 +8131,24 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
             ];
             // Append bind-to-texture pairs in Xorg's exact reply order
             // (glxcmds.c:1094-1100 / glxdricommon.c:165) when TFP is supported.
-            // RGB/RGBA values are yserver depth-policy (not Xorg-exact): depth-24
-            // advertises RGBA=false because its sample_view forces α=1 (BgraNoAlpha).
-            // If a client rejects this set, revisit to "both true" per spec §3.
+            //
+            // These attributes are scalar-compared by mesa's driConfigEqual
+            // against the client driver's __DRIconfig (attribMap in
+            // src/glx/dri_common.c), so they MUST match what radeonsi
+            // advertises or the whole config is rejected and dri3 screen
+            // creation fails ("No matching fbConfigs or visuals found").
+            // HW-verified on bee (radeonsi via Xwayland): every TFP config
+            // reports BIND_RGB=1, BIND_RGBA=1, and BIND_TARGETS=GLX_DONT_CARE.
+            // So advertise RGBA=1 for BOTH depths (depth-24 windows are
+            // opaque; the sample_view forces α=1, so an RGBA bind reads as
+            // opaque — correct) and DONT_CARE for targets (matches any
+            // driver target bitmask, as Xwayland itself does).
             if tfp_supported {
-                // Depth derived from visual id: 0x102 → depth-24, 0x103 → depth-32.
-                let (rgb, rgba) = match visual_id {
-                    0x102 => (1u32, 0u32), // depth-24: opaque; sample_view forces α=1
-                    0x103 => (1u32, 1u32), // depth-32: RGBA
-                    _ => (1, 0),
-                };
-                config.push((g::GLX_BIND_TO_TEXTURE_RGB_EXT, rgb));
-                config.push((g::GLX_BIND_TO_TEXTURE_RGBA_EXT, rgba));
+                config.push((g::GLX_BIND_TO_TEXTURE_RGB_EXT, 1));
+                config.push((g::GLX_BIND_TO_TEXTURE_RGBA_EXT, 1));
                 // MIPMAP: not backed, but pair MUST be present for contract.
                 config.push((g::GLX_BIND_TO_MIPMAP_TEXTURE_EXT, 0));
-                config.push((
-                    g::GLX_BIND_TO_TEXTURE_TARGETS_EXT,
-                    g::GLX_TEXTURE_2D_BIT_EXT | g::GLX_TEXTURE_RECTANGLE_BIT_EXT,
-                ));
+                config.push((g::GLX_BIND_TO_TEXTURE_TARGETS_EXT, g::GLX_DONT_CARE));
                 // Y_INVERTED in FBConfig = GLX_DONT_CARE (differs from drawable-attributes
                 // where it is 0/GL_FALSE — do not confuse them; glxcmds.c:1093).
                 config.push((g::GLX_Y_INVERTED_EXT, g::GLX_DONT_CARE));
@@ -39048,7 +39059,9 @@ mod tests {
             assert_eq!(c[idx + 2].1, 0, "MIPMAP must be 0/false");
             assert_eq!(
                 c[idx + 3].1,
-                g::GLX_TEXTURE_2D_BIT_EXT | g::GLX_TEXTURE_RECTANGLE_BIT_EXT
+                g::GLX_DONT_CARE,
+                "BIND_TO_TEXTURE_TARGETS is GLX_DONT_CARE so it matches any \
+                 client-driver target bitmask (driConfigEqual)"
             );
             assert_eq!(
                 c[idx + 4].1,
@@ -39057,7 +39070,9 @@ mod tests {
             );
         }
 
-        // Depth policy: depth-24 (visual 0x102) RGB=true RGBA=false; depth-32 (0x103) RGB=true RGBA=true.
+        // Both depths advertise RGB=true RGBA=true, matching radeonsi's
+        // TFP configs (HW-verified). RGBA=true on depth-24 is correct:
+        // opaque windows sample as α=1.
         let depth24 = configs
             .iter()
             .find(|c| c.iter().any(|(k, v)| *k == g::GLX_VISUAL_ID && *v == 0x102))
@@ -39067,7 +39082,7 @@ mod tests {
             .position(|(k, _)| *k == g::GLX_BIND_TO_TEXTURE_RGB_EXT)
             .unwrap();
         assert_eq!(depth24[d24].1, 1); // RGB true
-        assert_eq!(depth24[d24 + 1].1, 0); // RGBA false on depth-24
+        assert_eq!(depth24[d24 + 1].1, 1); // RGBA true on depth-24 (match radeonsi)
 
         let depth32 = configs
             .iter()
