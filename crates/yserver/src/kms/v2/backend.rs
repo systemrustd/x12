@@ -13297,20 +13297,39 @@ impl Backend for KmsBackendV2 {
         &mut self,
         host_xid: u32,
     ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
-        let Some(vk) = self.platform.vk.as_ref() else {
-            return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
-        };
+        // Resolve xid → DrawableId before any mutable borrows.
         let id = self.store.lookup(host_xid).ok_or_else(|| {
             io::Error::other(format!("DRI3 export: unknown pixmap 0x{host_xid:x}"))
         })?;
+
+        // Promote-if-needed: migrate server-owned pixmaps onto dma-buf-exportable
+        // storage (glamor model). Idempotent — early-returns if already exportable.
+        if !self
+            .store
+            .get(id)
+            .map(|d| d.storage.is_exportable())
+            .unwrap_or(false)
+        {
+            // promote_drawable_exportable needs &mut self.engine/platform/store,
+            // so we must not hold any shared borrow across this call.
+            if self.platform.vk.is_none() {
+                return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
+            }
+            self.engine
+                .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+                .map_err(|e| io::Error::other(format!("DRI3 export promote: {e:?}")))?;
+        }
+
+        // Re-fetch after promotion (storage has been swapped).
+        let vk = self
+            .platform
+            .vk
+            .as_ref()
+            .ok_or_else(|| io::Error::other("DRI3 export: Vulkan unavailable"))?;
         let drawable = self.store.get(id).ok_or_else(|| {
             io::Error::other(format!("DRI3 export: store entry missing 0x{host_xid:x}"))
         })?;
-        let imported = drawable.storage.imported_drawable.as_ref().ok_or_else(|| {
-            io::Error::other(format!(
-                "DRI3 export: pixmap 0x{host_xid:x} has no imported backing"
-            ))
-        })?;
+
         let depth = drawable.depth;
         let width = u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX);
         let height = u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX);
@@ -13319,8 +13338,29 @@ impl Backend for KmsBackendV2 {
             4 | 8 => 8,
             d => d,
         };
-        let export = crate::kms::vk::dri3::export_dmabuf(vk, imported)
-            .map_err(|e| io::Error::other(format!("DRI3 export_dmabuf: {e:?}")))?;
+
+        // Export: imported images go through the DrawableImage path; promoted /
+        // server-owned images use export_promoted on the storage's raw memory
+        // handle + stride/size carried from allocation-time layout query.
+        let export = if let Some(imported) = drawable.storage.imported_drawable.as_ref() {
+            crate::kms::vk::dri3::export_dmabuf(vk, imported)
+                .map_err(|e| io::Error::other(format!("DRI3 export_dmabuf: {e:?}")))?
+        } else {
+            debug_assert!(
+                drawable.storage.export_stride != 0 && drawable.storage.export_size != 0,
+                "promoted storage missing export metadata (stride={} size={})",
+                drawable.storage.export_stride,
+                drawable.storage.export_size,
+            );
+            crate::kms::vk::dri3::export_promoted(
+                vk,
+                drawable.storage.memory,
+                drawable.storage.export_stride,
+                drawable.storage.export_size,
+            )
+            .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
+        };
+
         let stride16 = u16::try_from(export.stride).unwrap_or(u16::MAX);
         Ok((export.size, width, height, stride16, depth, bpp, export.fd))
     }

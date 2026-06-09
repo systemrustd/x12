@@ -7598,15 +7598,18 @@ fn handle_dri3_request(
                     return Ok(RequestOutcome::Handled);
                 }
                 Err(err) => {
+                    // Xorg dri3/dri3_request.c:277 maps export failure to BadPixmap.
+                    // BadDrawable is reserved for the unresolvable-XID case above;
+                    // BadAlloc is reserved for send_reply_with_fd failure.
                     debug!(
-                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadAlloc ({err})",
+                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadPixmap ({err})",
                         client_id.0, sequence.0
                     );
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
-                        x11::error::BAD_ALLOC,
+                        x11::error::BAD_PIXMAP,
                         pixmap,
                         u16::from(header.data),
                         DRI3_MAJOR_OPCODE,
@@ -38563,5 +38566,79 @@ mod tests {
                 "{label}: BadMatch must carry CreateWindow opcode"
             );
         }
+    }
+
+    /// DRI3::BufferFromPixmap: when the backend's `dri3_export_pixmap`
+    /// returns Err (e.g. no exportable backing, Vulkan unavailable, or
+    /// any promotion failure), the dispatcher must emit `BadPixmap`
+    /// (error code 4) — matching Xorg `dri3/dri3_request.c:277`.
+    /// Previously this emitted `BadAlloc` (11).
+    #[test]
+    fn buffer_from_pixmap_export_failure_returns_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // RecordingBackend does not override dri3_export_pixmap, so the
+        // default trait implementation returns Err("DRI3 export unsupported
+        // on this backend") — exactly the failure case we're testing.
+        let mut backend = RecordingBackend::new();
+
+        // Register a pixmap in the resource table with a valid host_xid so
+        // the handler reaches the dri3_export_pixmap call (not the
+        // BadDrawable path).
+        let pixmap_xid: u32 = 0x1000;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                ResourceId(pixmap_xid),
+                crate::backend::PixmapHandle::from_raw(0xdead_cafe).unwrap(),
+            ),
+            "set_pixmap_host_xid must succeed"
+        );
+
+        // BufferFromPixmap body: 4-byte pixmap XID (little-endian).
+        let body = pixmap_xid.to_le_bytes().to_vec();
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode: 147, // DRI3_MAJOR_OPCODE
+                data: 3,     // BUFFER_FROM_PIXMAP
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request should not hard-error");
+
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "expected Handled, got {outcome:?}"
+        );
+
+        // Read the 32-byte X error packet from the peer socket.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("BadPixmap error packet must be delivered to client");
+        assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
+        assert_eq!(
+            buf[1],
+            x11::error::BAD_PIXMAP,
+            "expected BadPixmap ({}), got {}",
+            x11::error::BAD_PIXMAP,
+            buf[1]
+        );
     }
 }

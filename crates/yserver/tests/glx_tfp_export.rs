@@ -271,3 +271,51 @@ fn promotion_preserves_content_and_is_live() {
         "post-promotion write not visible in dmabuf — not live"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Task 1.3: dri3_export_pixmap promotes server-owned pixmaps
+// ───────────────────────────────────────────────────────────────────
+
+/// The real `dri3_export_pixmap` path must succeed on a server-owned
+/// (non-imported) pixmap after the promote-if-needed gate lands.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn dri3_export_promotes_server_owned_pixmap() {
+    use std::os::fd::AsRawFd;
+    use yserver_core::backend::Backend;
+
+    let mut backend = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // allocate_test_pixmap_bgra creates a plain server-owned pixmap
+    // (no imported backing) — depth 32, BGRA8.
+    let host_xid = backend
+        .allocate_test_pixmap_bgra(64, 32)
+        .expect("allocate_test_pixmap_bgra failed (Vk present but alloc failed?)");
+
+    // Before this task, dri3_export_pixmap returned Err for server-owned
+    // pixmaps (imported_drawable gate). After this task it must promote
+    // and succeed.
+    let (size, w, h, stride, depth, bpp, fd) = backend
+        .dri3_export_pixmap(host_xid)
+        .expect("export server-owned pixmap");
+
+    assert_eq!(w, 64, "width mismatch");
+    assert_eq!(h, 32, "height mismatch");
+    assert_eq!(depth, 32, "depth mismatch");
+    assert_eq!(bpp, 32, "bpp mismatch");
+    assert!(
+        u32::from(stride) >= 64 * 4,
+        "stride {stride} too small for 64px BGRA8 row"
+    );
+    assert!(
+        size >= u32::from(stride) * 32,
+        "size {size} too small for stride {stride} * 32 rows"
+    );
+    assert!(fd.as_raw_fd() >= 0, "invalid fd");
+}
