@@ -586,7 +586,22 @@ fn accumulate_at_level(
             d.rects.push(rect_i16);
         }
         let geometry_changed = last_reported_geometry.is_some_and(|prev| prev != geom_rect);
-        if state.clients.contains_key(&owner.0) && (!fired || geometry_changed) {
+        // Per X11 DAMAGE proto + Xorg `damageext/damageext.c:136-153`
+        // (`DamageExtReport`): Raw / Delta / BoundingBox levels emit
+        // a `DamageNotify` on EVERY damage event; only NonEmpty has
+        // the one-shot-per-Subtract semantic (emit on empty→non-empty
+        // transition, silent until the client Subtracts). The
+        // `geometry_changed` re-report fallback survives for NonEmpty
+        // because the spec requires the geometry payload to be
+        // current.
+        let level_allows_emit = match level {
+            x11damage::report_level::RAW_RECTANGLES
+            | x11damage::report_level::DELTA_RECTANGLES
+            | x11damage::report_level::BOUNDING_BOX => true,
+            x11damage::report_level::NON_EMPTY => !fired || geometry_changed,
+            _ => false,
+        };
+        if state.clients.contains_key(&owner.0) && level_allows_emit {
             // Per X11 DAMAGE spec + Xorg `damageext/damageext.c:117-126`
             // (`DamageExtNotify` with `pBoxes == NULL`): NonEmpty events
             // carry the full drawable extent in `area`, not the actual
@@ -798,17 +813,82 @@ mod tests {
     }
 
     fn add_damage_on(state: &mut ServerState, owner: u32, damage_id: u32, drawable: ResourceId) {
+        add_damage_on_with_level(state, owner, damage_id, drawable, 3);
+    }
+
+    fn add_damage_on_with_level(
+        state: &mut ServerState,
+        owner: u32,
+        damage_id: u32,
+        drawable: ResourceId,
+        level: u8,
+    ) {
         state.damage_objects.insert(
             damage_id,
             DamageObject {
                 owner: ClientId(owner),
                 drawable,
-                level: 3, // NonEmpty — same level marco uses
+                level,
                 rects: Vec::new(),
                 pending_notify_fired: false,
                 last_reported_geometry: None,
             },
         );
+    }
+
+    /// Pair-stream test client: keeps the reader half of the
+    /// socketpair alive so emitted events can be drained and
+    /// inspected. Wraps `add_client` + returns the reader.
+    fn add_client_with_reader(state: &mut ServerState, client_id: u32, base: u32) -> UnixStream {
+        let (a, b) = UnixStream::pair().expect("UnixStream::pair");
+        b.set_nonblocking(true)
+            .expect("set test reader nonblocking");
+        state.clients.insert(
+            client_id,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: base,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        b
+    }
+
+    /// Drain the test reader plus any buffered outbound and count
+    /// `DamageNotify` events (event code 91). Each X11 event is 32
+    /// bytes; first byte at each 32-byte chunk is the event code.
+    fn count_damage_notify_events(
+        reader: &mut UnixStream,
+        state: &ServerState,
+        client_id: u32,
+    ) -> usize {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        if let Some(client) = state.clients.get(&client_id) {
+            buf.extend(client.outbound.iter().copied());
+        }
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf.chunks_exact(32)
+            .filter(|c| c[0] == DAMAGE_FIRST_EVENT)
+            .count()
     }
 
     /// Load-bearing test: paint into a child window fires damage on
@@ -872,6 +952,82 @@ mod tests {
         assert!(
             w_dmg.pending_notify_fired,
             "W's damage object must have fired its notify too",
+        );
+    }
+
+    /// X11 DAMAGE proto + Xorg `damageext/damageext.c:136-153` —
+    /// `DamageExtReport` fires on every damage for Raw/Delta/
+    /// BoundingBox levels (one-shot-per-Subtract semantics is
+    /// exclusive to `DamageReportNonEmpty`). Cinnamon / muffin
+    /// register `BoundingBox` damage; two paints between Subtracts
+    /// must yield TWO `DamageNotify` events. Pre-fix the gate
+    /// `(!fired || geometry_changed)` was applied uniformly to all
+    /// levels, collapsing the second paint into the first cycle and
+    /// halving the rate vs Xorg in the captured cinnamon repro
+    /// (yserver 176 vs Xorg 315 notifies for the same workload).
+    #[test]
+    fn bounding_box_level_emits_on_every_paint() {
+        let mut state = ServerState::new();
+        let mut reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 500, 400);
+        add_damage_on_with_level(
+            &mut state,
+            1,
+            0xe000_0001,
+            w_id,
+            x11damage::report_level::BOUNDING_BOX,
+        );
+
+        let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            1,
+            "first paint must emit a DamageNotify on BoundingBox level",
+        );
+
+        let _ = accumulate_damage_to_state(&mut state, w_id, 50, 50, 30, 40);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            1,
+            "BoundingBox level must emit on EVERY paint (per X11 DAMAGE \
+             spec + Xorg damageext.c:136-146); paint-without-Subtract \
+             still fires. We already drained the first emit so this \
+             assertion measures only the second paint's emit. Pre-fix \
+             count is 0 because the gate applies NonEmpty's one-shot \
+             semantics to all levels — that's the cinnamon scroll-\
+             stale regression.",
+        );
+    }
+
+    /// Companion: NonEmpty (level 3) keeps its spec-correct one-shot
+    /// semantics — emit once on empty→non-empty transition, silent
+    /// until Subtract. Ensures the fix doesn't over-reach.
+    #[test]
+    fn non_empty_level_emits_once_per_subtract_cycle() {
+        let mut state = ServerState::new();
+        let mut reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 500, 400);
+        add_damage_on_with_level(
+            &mut state,
+            1,
+            0xe000_0001,
+            w_id,
+            x11damage::report_level::NON_EMPTY,
+        );
+
+        let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            1,
+            "first paint must emit on NonEmpty too",
+        );
+
+        let _ = accumulate_damage_to_state(&mut state, w_id, 50, 50, 30, 40);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            0,
+            "NonEmpty must NOT re-emit until the client Subtracts \
+             (drained reader → no fresh events for the second paint)",
         );
     }
 
