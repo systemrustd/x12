@@ -51,6 +51,8 @@ pub fn signaled_sync_file(vk: &VkContext) -> OwnedFd {
 
     // The semaphore payload has been exported (consumed by SYNC_FD
     // semantics); destroy the Vulkan handle.
+    // SAFETY: we created `semaphore`, the device is alive, and the prior
+    // queue_wait_idle guarantees no submission still references it.
     unsafe { vk.device.destroy_semaphore(semaphore, None) };
 
     sync_fd
