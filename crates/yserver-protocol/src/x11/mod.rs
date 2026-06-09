@@ -1988,11 +1988,20 @@ pub fn encode_xi2_device_event(
     // `buttons` mask to reconstruct GdkEvent.state — double-counting
     // is harmless but writing button bits into modifier fields is
     // spec-incorrect).
+    //
+    // base / latched / locked / effective: Xorg (dix/eventconvert.c:720-723)
+    // fills `base_mods` from the modifiers of keys logically down, not only
+    // `effective`. yserver tracks only the cooked `state` (= effective), so
+    // mirror it into `base` too (latched/locked unmodelled → 0). With base
+    // left at 0, a WM whose keybinding matcher reads `mods.base`
+    // (mutter/muffin) sees a grabbed Ctrl-Alt-<key> carrying NO modifiers
+    // and never fires the binding — dead Ctrl-Alt-arrow workspace switching
+    // while plain typing (modifier-independent) still works.
     let modifier_bits = u32::from(state & 0x00FF);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, modifier_bits);
+    write_u32(byte_order, out, modifier_bits); // base
+    write_u32(byte_order, out, 0); // latched
+    write_u32(byte_order, out, 0); // locked
+    write_u32(byte_order, out, modifier_bits); // effective
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
 
@@ -2099,12 +2108,13 @@ pub fn encode_xi2_motion_with_scroll(
 
     // mods: base, latched, locked, effective — KEYBOARD modifier bits
     // only (0x00FF mask); button bits in state[8..=12] go into the
-    // separate `buttons` mask below, not mods.
+    // separate `buttons` mask below, not mods. `base` mirrors `effective`
+    // (Xorg fills base from held-key modifiers; see encode_xi2_device_event).
     let modifier_bits = u32::from(state & 0x00FF);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, modifier_bits);
+    write_u32(byte_order, out, modifier_bits); // base
+    write_u32(byte_order, out, 0); // latched
+    write_u32(byte_order, out, 0); // locked
+    write_u32(byte_order, out, modifier_bits); // effective
 
     out.extend_from_slice(&[0; 4]); // group
 
@@ -2467,12 +2477,13 @@ pub fn encode_xi2_crossing_event(
 
     // mods: base, latched, locked, effective — KEYBOARD modifier bits
     // only (0x00FF mask); button bits in state[8..=12] go into the
-    // separate `buttons` mask below, not mods.
+    // separate `buttons` mask below, not mods. `base` mirrors `effective`
+    // (Xorg fills base from held-key modifiers; see encode_xi2_device_event).
     let modifier_bits = u32::from(state & 0x00FF);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, 0);
-    write_u32(byte_order, out, modifier_bits);
+    write_u32(byte_order, out, modifier_bits); // base
+    write_u32(byte_order, out, 0); // latched
+    write_u32(byte_order, out, 0); // locked
+    write_u32(byte_order, out, modifier_bits); // effective
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
     write_u32(byte_order, out, 0); // button mask
