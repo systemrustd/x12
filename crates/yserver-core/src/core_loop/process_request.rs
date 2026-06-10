@@ -23666,7 +23666,7 @@ mod tests {
             let name = String::from_utf8(wire[name_start..name_start + name_len].to_vec()).unwrap();
             // Advance: 12-byte info header + name (padded to 4) + classes.
             let mut pos = name_start + name_len;
-            while pos % 4 != 0 {
+            while !pos.is_multiple_of(4) {
                 pos += 1;
             }
             // Walk class blocks by their 4-byte-unit length field (u16 at
@@ -23916,7 +23916,7 @@ mod tests {
             let num_classes = u16::from_le_bytes([wire[off + 6], wire[off + 7]]);
             let name_len = u16::from_le_bytes([wire[off + 8], wire[off + 9]]) as usize;
             let mut pos = off + 12 + name_len;
-            while pos % 4 != 0 {
+            while !pos.is_multiple_of(4) {
                 pos += 1;
             }
             let classes_start = pos;
@@ -31860,7 +31860,7 @@ mod tests {
         // 4. The keyboard must still deliver: a fresh key press reaches
         //    the focused window's client.
         let mut drain = [0u8; 512];
-        while app.read(&mut drain).map_or(false, |n| n > 0) {}
+        while app.read(&mut drain).is_ok_and(|n| n > 0) {}
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
         let mut buf = [0u8; 64];
         let n = app.read(&mut buf).unwrap_or(0);
@@ -36888,10 +36888,7 @@ mod tests {
             &[],
         );
         let bytes = read_all_available(&mut peer);
-        assert!(
-            !bytes.iter().any(|b| *b == 35),
-            "no notify when state didn't change"
-        );
+        assert!(!bytes.contains(&35), "no notify when state didn't change");
     }
 
     #[test]
@@ -37801,7 +37798,7 @@ mod tests {
         );
         let idle = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
         assert!(
-            idle >= 19_000 && idle <= 30_000,
+            (19_000..=30_000).contains(&idle),
             "idle≈20_000ms (slack for test scheduling); got {idle}"
         );
         let mask = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
@@ -37905,7 +37902,7 @@ mod tests {
         );
         let bytes2 = read_all_available(&mut peer);
         assert!(
-            !bytes2.iter().any(|&b| b == 92),
+            !bytes2.contains(&92),
             "client without NOTIFY_MASK bit must not receive notify"
         );
     }
@@ -38033,7 +38030,7 @@ mod tests {
         assert_eq!(bytes[0], 1, "reply tag");
         let value = read_query_counter_reply_value(&bytes);
         assert!(
-            value >= 29_000 && value <= 35_000,
+            (29_000..=35_000).contains(&value),
             "IDLETIME ≈ 30_000ms ± scheduling slack; got {value}"
         );
     }
@@ -38069,7 +38066,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         let value = read_query_counter_reply_value(&bytes);
         assert!(
-            value >= 400 && value <= 5_000,
+            (400..=5_000).contains(&value),
             "VCP IDLETIME ≈ 500ms; got {value}"
         );
     }
@@ -38104,7 +38101,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         let value = read_query_counter_reply_value(&bytes);
         assert!(
-            value >= 100 && value <= 3_000,
+            (100..=3_000).contains(&value),
             "VCK IDLETIME ≈ 200ms; got {value}"
         );
     }
@@ -38271,7 +38268,7 @@ mod tests {
         body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
         body.extend_from_slice(&x11sync::VALUE_TYPE_RELATIVE.to_le_bytes()); // u32
         body.extend_from_slice(&xsync_i64(10_000)); // value = 10_000 relative
-        body.extend_from_slice(&(x11sync::TEST_POSITIVE_TRANSITION as u32).to_le_bytes());
+        body.extend_from_slice(&x11sync::TEST_POSITIVE_TRANSITION.to_le_bytes());
         body.extend_from_slice(&xsync_i64(0)); // delta = 0
         body.push(1); // events = true
         body.extend_from_slice(&[0u8; 3]);
@@ -38327,7 +38324,7 @@ mod tests {
         body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes()); // value_type = Absolute
         body.extend_from_slice(&xsync_i64(60_000)); // value = 60_000
-        body.extend_from_slice(&(x11sync::TEST_POSITIVE_COMPARISON as u32).to_le_bytes());
+        body.extend_from_slice(&x11sync::TEST_POSITIVE_COMPARISON.to_le_bytes());
         body.extend_from_slice(&xsync_i64(0)); // delta = 0 → goes Inactive on fire
         body.push(1); // events = true
         body.extend_from_slice(&[0u8; 3]);
@@ -38349,7 +38346,7 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         // AlarmNotify event: type = SYNC_FIRST_EVENT(83) + ALARM_NOTIFY_KIND(1) = 84
         assert!(
-            bytes.iter().any(|&b| b == 84),
+            bytes.contains(&84),
             "AlarmNotify must fire at create-time for an already-idle PositiveComparison alarm; got {:?}",
             bytes
         );
@@ -38385,7 +38382,7 @@ mod tests {
         body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&xsync_i64(60_000));
-        body.extend_from_slice(&(x11sync::TEST_POSITIVE_TRANSITION as u32).to_le_bytes());
+        body.extend_from_slice(&x11sync::TEST_POSITIVE_TRANSITION.to_le_bytes());
         body.extend_from_slice(&xsync_i64(0));
         body.push(1);
         body.extend_from_slice(&[0u8; 3]);
@@ -38406,7 +38403,7 @@ mod tests {
 
         let bytes = read_all_available(&mut peer);
         assert!(
-            !bytes.iter().any(|&b| b == 84),
+            !bytes.contains(&84),
             "PositiveTransition with old==new at create-time must not fire"
         );
         assert_eq!(
@@ -39058,7 +39055,7 @@ mod tests {
                 build_configure_body(
                     SIB_A,
                     CW_SIBLING,
-                    &[(SIB_B as u32).to_le_bytes(); 1]
+                    [SIB_B.to_le_bytes(); 1]
                         .iter()
                         .map(|b| {
                             let mut buf = [0u8; 2];

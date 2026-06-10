@@ -1171,7 +1171,7 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
         assert!(
-            state.per_device_last_activity.get(&3).is_none(),
+            !state.per_device_last_activity.contains_key(&3),
             "test precondition: no per-device entry"
         );
 
