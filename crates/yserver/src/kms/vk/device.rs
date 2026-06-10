@@ -351,6 +351,106 @@ impl VkContext {
     }
 }
 
+/// Pre-flight check run BEFORE any DRM open / modeset: enumerate the
+/// Vulkan physical devices (instance-level only — no VkDevice, no DRM,
+/// no master, no screen blank) and refuse when every available device
+/// is a software rasterizer (`CPU` type — llvmpipe/lavapipe).
+///
+/// Rationale: driving real KMS scanout off software Vulkan hard-hangs
+/// the machine (observed on two KMS drivers: simpledrm and nvidia-drm —
+/// no ping, no journal, power-cycle required). The in-bring-up guard in
+/// `PlatformBackend::from_platform_init` exists too, but it runs after
+/// the initial modeset; this preflight refuses while the console is
+/// still intact, before yserver has touched the GPU at all.
+///
+/// Conservative on probe errors: if the loader / instance / enumeration
+/// itself fails, this returns `Ok(())` and lets the real `VkContext::new`
+/// produce its proper error — the preflight only blocks the one case it
+/// can positively identify (all-software device list).
+///
+/// `YSERVER_ALLOW_SOFTWARE_VULKAN=1` skips the check (deliberate
+/// software-scanout setups, e.g. lavapipe under vng). Venus reports
+/// `VIRTUAL_GPU`, not `CPU`, and passes.
+pub fn ensure_hardware_vulkan_for_scanout() -> Result<(), String> {
+    if std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_some() {
+        log::warn!(
+            "YSERVER_ALLOW_SOFTWARE_VULKAN set — skipping the hardware-Vulkan \
+             preflight; a software rasterizer driving real KMS scanout can \
+             hard-hang the machine"
+        );
+        return Ok(());
+    }
+
+    let entry = match unsafe { ash::Entry::load() } {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("hw-Vulkan preflight: loader unavailable ({e}); deferring to full init");
+            return Ok(());
+        }
+    };
+    let create_info = vk::InstanceCreateInfo::default();
+    let instance = match unsafe { entry.create_instance(&create_info, None) } {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!(
+                "hw-Vulkan preflight: instance creation failed ({e}); deferring to full init"
+            );
+            return Ok(());
+        }
+    };
+
+    // Collect (name, type) for every device, then destroy the instance
+    // before deciding — no resource outlives the probe.
+    let devices: Vec<(String, vk::PhysicalDeviceType)> =
+        match unsafe { instance.enumerate_physical_devices() } {
+            Ok(pds) => pds
+                .into_iter()
+                .map(|pd| {
+                    let props = unsafe { instance.get_physical_device_properties(pd) };
+                    let name = props
+                        .device_name_as_c_str()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "<unnamed>".into());
+                    (name, props.device_type)
+                })
+                .collect(),
+            Err(e) => {
+                unsafe { instance.destroy_instance(None) };
+                log::warn!("hw-Vulkan preflight: enumeration failed ({e}); deferring to full init");
+                return Ok(());
+            }
+        };
+    unsafe { instance.destroy_instance(None) };
+
+    if devices.is_empty() {
+        log::warn!("hw-Vulkan preflight: no Vulkan devices found; deferring to full init");
+        return Ok(());
+    }
+    if devices
+        .iter()
+        .any(|(_, ty)| *ty != vk::PhysicalDeviceType::CPU)
+    {
+        return Ok(());
+    }
+
+    let listing = devices
+        .iter()
+        .map(|(name, ty)| format!("{name} ({ty:?})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "every available Vulkan device is a software rasterizer: [{listing}]. \
+         Driving real KMS scanout off software Vulkan (llvmpipe/lavapipe) \
+         hard-hangs the machine. Refusing to start BEFORE touching the GPU. \
+         Install a hardware Vulkan driver for the scanout GPU (radv / anv / nvk), \
+         or check the GPU driver setup (e.g. proprietary driver removed but \
+         nouveau not loaded leaves only llvmpipe). To override deliberately, \
+         set YSERVER_ALLOW_SOFTWARE_VULKAN=1."
+    );
+    log::error!("hw-Vulkan preflight: {msg}");
+    Err(msg)
+}
+
 fn validation_layer_present(entry: &ash::Entry, name: &CStr) -> bool {
     match unsafe { entry.enumerate_instance_layer_properties() } {
         Ok(layers) => layers

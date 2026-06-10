@@ -622,6 +622,9 @@ impl PlatformBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
+        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
+        // no master, console stays intact). See the preflight's docs.
+        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
         let platform_init = core_platform_init_with_fd(device_path, card_fd, commit)?;
         Self::from_platform_init(platform_init)
     }
@@ -645,6 +648,9 @@ impl PlatformBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
+        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
+        // no master, console stays intact). See the preflight's docs.
+        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
         let platform_init = core_platform_init(device_path, commit)?;
         Self::from_platform_init(platform_init)
     }
