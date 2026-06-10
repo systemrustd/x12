@@ -674,9 +674,36 @@ impl PlatformBackend {
             }
         };
         log::info!(
-            "v2 PlatformBackend: VkContext ready (driver_id={:?})",
+            "v2 PlatformBackend: VkContext ready (driver_id={:?}, device_type={:?})",
             vk.driver_id,
+            vk.device_type,
         );
+
+        // Refuse to drive real KMS scanout off a software rasterizer.
+        // If the only Vulkan device is llvmpipe/lavapipe (CPU type) —
+        // typically because the GPU's hardware Vulkan driver is missing
+        // (e.g. nvidia removed but nouveau not loaded, so Mesa falls back
+        // to llvmpipe) — then exporting a host-memory buffer and handing
+        // it to a real GPU's atomic scanout commit HARD-HANGS the machine
+        // (observed on nouveau/Pascal: no SSH, nothing in the journal).
+        // Fail fast with an actionable error instead of wedging the box.
+        // Venus (virtio-gpu) reports VIRTUAL_GPU, not CPU, so it is not
+        // affected; the env override exists for any deliberate
+        // software-scanout setup (e.g. lavapipe under vng).
+        if vk.is_software_rasterizer()
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "v2 PlatformBackend: the only Vulkan device is a software rasterizer \
+                 (device_type=CPU, driver_id={:?} — llvmpipe/lavapipe). Driving real KMS \
+                 scanout off software Vulkan hard-hangs the machine on hardware that can't \
+                 scan out a host-memory buffer. Refusing to start. Install a hardware Vulkan \
+                 driver for the scanout GPU (radv / anv / nvk), or check your GPU/driver setup \
+                 (e.g. nvidia removed but nouveau not loaded → Mesa falls back to llvmpipe). \
+                 To override (e.g. virtio-gpu under vng), set YSERVER_ALLOW_SOFTWARE_VULKAN=1.",
+                vk.driver_id,
+            )));
+        }
 
         let ops_command_pool = OpsCommandPool::new(Arc::clone(&vk))
             .map_err(|e| io::Error::other(format!("ops command pool: {e:?}")))?;

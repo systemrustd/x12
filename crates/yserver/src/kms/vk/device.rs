@@ -55,6 +55,11 @@ pub struct VkContext {
     /// went away with the Vulkan-first pivot).
     #[allow(dead_code)]
     pub driver_id: vk::DriverId,
+    /// `VkPhysicalDeviceProperties::deviceType` of the picked device.
+    /// `CPU` means a software rasterizer (llvmpipe/lavapipe) — usable
+    /// for headless tests but NOT for real KMS scanout (see
+    /// [`Self::is_software_rasterizer`]).
+    pub device_type: vk::PhysicalDeviceType,
 }
 
 impl VkContext {
@@ -305,6 +310,9 @@ impl VkContext {
         unsafe {
             instance.get_physical_device_properties2(physical_device, &mut props2);
         }
+        // Read from props2 (which mutably borrows driver_props) before
+        // reading driver_props directly, so props2's borrow ends first.
+        let device_type = props2.properties.device_type;
         let driver_id = driver_props.driver_id;
 
         Ok(Arc::new(VkContext {
@@ -322,7 +330,24 @@ impl VkContext {
             graphics_queue,
             debug_messenger,
             driver_id,
+            device_type,
         }))
+    }
+
+    /// True when the picked Vulkan device is a software rasterizer
+    /// (`VK_PHYSICAL_DEVICE_TYPE_CPU`, i.e. llvmpipe/lavapipe).
+    ///
+    /// Fine for headless rendering/tests, but driving **real KMS
+    /// scanout** off a software device hard-hangs the machine on
+    /// hardware that can't scan out the CPU/host-memory buffer
+    /// (observed: nouveau on Pascal — the GPU's atomic commit wedges).
+    /// The scanout bring-up refuses by default when this is true;
+    /// see `PlatformBackend::from_platform_init`. Venus (virtio-gpu
+    /// passthrough) reports `VIRTUAL_GPU`, not `CPU`, so it is not
+    /// caught here.
+    #[must_use]
+    pub fn is_software_rasterizer(&self) -> bool {
+        self.device_type == vk::PhysicalDeviceType::CPU
     }
 }
 
