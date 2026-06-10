@@ -8357,6 +8357,13 @@ fn handle_glx_request(
                     ext_string = glx_extension_string(state.glx_tfp_supported);
                     &ext_string
                 }
+                // libglvnd vendor-neutral dispatch: tells the client which
+                // libGLX_<vendor>.so drives this screen. Only queried
+                // because we advertise GLX_EXT_libglvnd; returning "mesa"
+                // (matching Xorg) makes libglvnd load libGLX_mesa instead
+                // of falling back to a default that resolves to no vendor
+                // on Asahi → NULL glXQueryExtensionsString → cogl SIGSEGV.
+                x11glx::VENDOR_NAMES_EXT => x11glx::VENDOR_NAMES,
                 _ => "",
             };
             let reply = x11glx::encode_string_reply(byte_order, sequence, s);

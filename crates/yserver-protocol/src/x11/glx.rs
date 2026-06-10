@@ -143,6 +143,22 @@ pub const STRING_VENDOR: u32 = 1;
 pub const STRING_VERSION: u32 = 2;
 pub const STRING_EXTENSIONS: u32 = 3;
 
+/// `GLX_VENDOR_NAMES_EXT` (`glxext.h`, 0x20F6) — the name libglvnd's
+/// vendor-neutral dispatch passes to `glXQueryServerString` to learn
+/// which client GLX vendor library drives this screen. Gated behind the
+/// server advertising `GLX_EXT_libglvnd` in its extension string: only
+/// then does libglvnd issue this query (HW-verified by tracing glxinfo
+/// against Xorg). Without it, libglvnd falls back to a built-in default
+/// vendor — which resolves to mesa on most setups but to *nothing* on
+/// Asahi/ALARM, so `glXQueryExtensionsString` returns NULL and
+/// cogl/clutter (Cinnamon) crashes in `cogl_renderer_connect`.
+pub const VENDOR_NAMES_EXT: u32 = 0x20F6;
+
+/// The client GLX vendor library name yserver reports for
+/// `GLX_VENDOR_NAMES_EXT` — Mesa's `libGLX_mesa.so` drives our DRI3
+/// screens. Matches what Xorg returns for the same query.
+pub const VENDOR_NAMES: &str = "mesa";
+
 /// The GLX extensions yserver advertises. Returned for BOTH
 /// `glXQueryServerString(GLX_EXTENSIONS)` (opcode 19, `QUERY_SERVER_STRING`,
 /// `STRING_EXTENSIONS`) and `glXQueryExtensionsString` (opcode 18,
@@ -157,10 +173,16 @@ pub const STRING_EXTENSIONS: u32 = 3;
 /// `glXSelectEvent`/`GLX_BufferSwapComplete` plumbing behind it — cogl
 /// (Cinnamon/muffin) then parked its frame clock waiting for swap events
 /// that never arrived, freezing the stage after one black frame.
+///
+/// `GLX_EXT_libglvnd` is load-bearing: its presence is what makes
+/// libglvnd issue the `GLX_VENDOR_NAMES_EXT` (0x20F6) query (see
+/// [`VENDOR_NAMES_EXT`]) instead of guessing a default vendor. Xorg
+/// advertises it; without it libglvnd's fallback returns no vendor on
+/// Asahi/ALARM → NULL `glXQueryExtensionsString` → Cinnamon/cogl SIGSEGV.
 pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
     GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
     GLX_ARB_fbconfig_float GLX_EXT_visual_info \
-    GLX_EXT_visual_rating GLX_EXT_import_context";
+    GLX_EXT_visual_rating GLX_EXT_import_context GLX_EXT_libglvnd";
 
 /// Extension token appended to the advertised extension string when the
 /// backend can allocate and export a BGRA8 dma-buf (probed once at init).
@@ -720,6 +742,28 @@ mod tests {
         // be advertised until glXSelectEvent + GLX_BufferSwapComplete
         // delivery exist — cogl parks its frame clock on the event otherwise.
         assert!(!SERVER_EXTENSIONS.contains("GLX_INTEL_swap_event"));
+        // Regression (cinnamon SIGSEGV on Asahi): GLX_EXT_libglvnd is what
+        // makes libglvnd query GLX_VENDOR_NAMES_EXT instead of guessing a
+        // default vendor — without it libglvnd resolves no vendor on
+        // Asahi/ALARM and glXQueryExtensionsString returns NULL. Must stay
+        // paired with the VENDOR_NAMES_EXT handler in process_request.rs.
+        assert!(SERVER_EXTENSIONS.contains("GLX_EXT_libglvnd"));
+    }
+
+    #[test]
+    fn vendor_names_query_reports_mesa() {
+        // libglvnd's vendor-neutral dispatch issues
+        // glXQueryServerString(GLX_VENDOR_NAMES_EXT=0x20F6) once it sees
+        // GLX_EXT_libglvnd advertised; the reply names the client GLX
+        // vendor library (libGLX_mesa) that drives our DRI3 screens.
+        assert_eq!(VENDOR_NAMES_EXT, 0x20F6);
+        assert_eq!(VENDOR_NAMES, "mesa");
+        let reply = encode_string_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            VENDOR_NAMES,
+        );
+        assert!(String::from_utf8_lossy(&reply).contains("mesa"));
     }
 
     #[test]
