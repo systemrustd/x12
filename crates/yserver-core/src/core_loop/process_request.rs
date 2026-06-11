@@ -33592,7 +33592,7 @@ mod tests {
                      which leaves marco's compositor unable to mark the moved \
                      window dirty. Got {} bytes; first 32: {:02x?}",
                     all.len(),
-                    &all.get(..32.min(all.len())).unwrap_or(&[]),
+                    all.get(..32.min(all.len())).unwrap_or(&[]),
                 )
             });
         // Per X11 DAMAGE proto: DamageNotify.geometry encodes the
