@@ -8838,7 +8838,15 @@ fn handle_glx_request(
                     // Request body:
                     //   [0..4]  vendorCode (already read)
                     //   [4..8]  pad1
-                    //   [8..12] screen
+                    //   [8..12] screen — intentionally ignored (yserver is
+                    //           single-screen; configs are valid for any screen,
+                    //           same as the GLX 1.3 GET_FB_CONFIGS handler).
+                    // GetFBConfigsSGIX is a reply-bearing call; if a malformed
+                    // client sends it as plain VENDOR_PRIVATE (no reply expected)
+                    // do NOT write a reply, or we desync its reply stream.
+                    if minor != x11glx::VENDOR_PRIVATE_WITH_REPLY {
+                        return Ok(RequestOutcome::Handled);
+                    }
                     let configs = synthesise_glx_fb_configs(state.glx_tfp_supported);
                     let config_refs: Vec<&[(u32, u32)]> =
                         configs.iter().map(|c| c.as_slice()).collect();
