@@ -8147,8 +8147,15 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
 /// Build the GLX extension string.  The base extensions are always
 /// present; `GLX_EXT_texture_from_pixmap` is appended only when the
 /// backend confirmed at init that it can export a BGRA8 dma-buf.
+/// `GLX_SGIX_fbconfig` is always appended (the three VendorPrivate
+/// dispatch arms are fully implemented — advertise-after-implement).
 fn glx_extension_string(tfp_supported: bool) -> String {
     let mut s = String::from(yserver_protocol::x11::glx::SERVER_EXTENSIONS);
+    // GLX_SGIX_fbconfig: always present — GetFBConfigsSGIX /
+    // CreateContextWithConfigSGIX / CreateGLXPixmapWithConfigSGIX are
+    // fully dispatched (VendorPrivate arms above).
+    s.push(' ');
+    s.push_str(yserver_protocol::x11::glx::SGIX_FBCONFIG_EXTENSION);
     if tfp_supported {
         s.push(' ');
         s.push_str(yserver_protocol::x11::glx::TFP_EXTENSION);
@@ -8818,6 +8825,147 @@ fn handle_glx_request(
                             glx_drawable,
                             u16::from(header.data),
                             crate::nested::GLX_MAJOR_OPCODE,
+                        );
+                    }
+                }
+                x11glx::VENDOR_CODE_GET_FB_CONFIGS_SGIX => {
+                    // glXGetFBConfigsSGIX (VendorPrivateWithReply, vendor
+                    // code 65540).  Proxied to synthesise_glx_fb_configs
+                    // and encoded with the GLX 1.3 GetFBConfigsReply wire
+                    // format — glxproto.h defines no separate SGIX reply
+                    // struct; the extension reuses the same layout.
+                    //
+                    // Request body:
+                    //   [0..4]  vendorCode (already read)
+                    //   [4..8]  pad1
+                    //   [8..12] screen
+                    let configs = synthesise_glx_fb_configs(state.glx_tfp_supported);
+                    let config_refs: Vec<&[(u32, u32)]> =
+                        configs.iter().map(|c| c.as_slice()).collect();
+                    let reply = x11glx::encode_get_fb_configs_sgix_reply(
+                        byte_order,
+                        sequence,
+                        &config_refs,
+                    );
+                    debug!(
+                        "client {} #{} GLX::GetFBConfigsSGIX -> {} configs × {} props",
+                        client_id.0,
+                        sequence.0,
+                        config_refs.len(),
+                        config_refs.first().map_or(0, |c| c.len()),
+                    );
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        return Ok(RequestOutcome::Handled);
+                    };
+                    return Ok(write_to_client(client, client_id, &reply));
+                }
+                x11glx::VENDOR_CODE_CREATE_CONTEXT_WITH_CONFIG_SGIX => {
+                    // glXCreateContextWithConfigSGIX (VendorPrivate, no
+                    // reply, vendor code 65541).  Proxied to the existing
+                    // context-creation logic: insert a GlxContext record.
+                    //
+                    // Request body:
+                    //   [0..4]  vendorCode
+                    //   [4..8]  pad1
+                    //   [8..12] context XID
+                    //   [12..16] fbconfig
+                    //   [16..20] screen
+                    //   [20..24] renderType
+                    //   [24..28] shareList
+                    //   [28]    isDirect
+                    //   [29..32] reserved
+                    if let Some(req) = x11glx::parse_create_context_with_config_sgix(body) {
+                        state.glx_contexts.insert(
+                            req.context,
+                            crate::server::GlxContext {
+                                owner: client_id,
+                                fbconfig: req.fbconfig,
+                                render_type: req.render_type,
+                            },
+                        );
+                        debug!(
+                            "client {} #{} GLX::CreateContextWithConfigSGIX \
+                             xid=0x{:x} fbconfig=0x{:x}",
+                            client_id.0, sequence.0, req.context, req.fbconfig
+                        );
+                    } else {
+                        debug!(
+                            "client {} #{} GLX::CreateContextWithConfigSGIX \
+                             (body too short, parse failed)",
+                            client_id.0, sequence.0
+                        );
+                    }
+                }
+                x11glx::VENDOR_CODE_CREATE_GLX_PIXMAP_WITH_CONFIG_SGIX => {
+                    // glXCreateGLXPixmapWithConfigSGIX (VendorPrivate, no
+                    // reply, vendor code 65542).  Proxied to the existing
+                    // CREATE_PIXMAP path: validate X pixmap, record the
+                    // GlxDrawable, call acquire_glx_pixmap_export.
+                    //
+                    // Request body:
+                    //   [0..4]  vendorCode
+                    //   [4..8]  pad1
+                    //   [8..12]  screen
+                    //   [12..16] fbconfig
+                    //   [16..20] pixmap (X pixmap XID)
+                    //   [20..24] glxpixmap (GLXPixmap XID)
+                    if let Some(req) = x11glx::parse_create_glx_pixmap_with_config_sgix(body) {
+                        // Validate that the X pixmap exists.
+                        if state
+                            .resources
+                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
+                            .is_none()
+                        {
+                            debug!(
+                                "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
+                                 glx_xid=0x{:x} x_pixmap=0x{:x} not found -> GLXBadPixmap",
+                                client_id.0, sequence.0, req.glx_pixmap, req.pixmap
+                            );
+                            return emit_x11_error_with_minor(
+                                state,
+                                client_id,
+                                sequence,
+                                crate::nested::GLX_FIRST_ERROR
+                                    + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                                req.pixmap,
+                                u16::from(header.data),
+                                crate::nested::GLX_MAJOR_OPCODE,
+                            );
+                        }
+                        // Resolve host_xid at create time (same lifetime
+                        // semantics as CREATE_PIXMAP — see comment there).
+                        let acquire_host_xid = state
+                            .resources
+                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
+                            .and_then(|p| p.host_xid.map(|h| h.as_raw()));
+
+                        state.glx_drawables.insert(
+                            req.glx_pixmap,
+                            crate::server::GlxDrawable {
+                                owner: client_id,
+                                x_drawable: req.pixmap,
+                                fbconfig: req.fbconfig,
+                                width: 0,
+                                height: 0,
+                                attributes: Vec::new(),
+                                glx_export_host_xid: acquire_host_xid,
+                            },
+                        );
+
+                        if let Some(host_xid) = acquire_host_xid {
+                            backend.acquire_glx_pixmap_export(host_xid);
+                        }
+
+                        debug!(
+                            "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
+                             glx_xid=0x{:x} x_pixmap=0x{:x} fbconfig=0x{:x}",
+                            client_id.0, sequence.0, req.glx_pixmap, req.pixmap, req.fbconfig
+                        );
+                    } else {
+                        debug!(
+                            "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
+                             (body too short, parse failed)",
+                            client_id.0, sequence.0
                         );
                     }
                 }
@@ -40228,5 +40376,277 @@ mod tests {
             Some(0x77)
         );
         assert!(state.resources.cursor_is_anim(ResourceId(0x4000)));
+    }
+
+    // ── GLX_SGIX_fbconfig dispatch tests ─────────────────────────────────────
+
+    /// Build a VendorPrivateWithReply body for `GetFBConfigsSGIX` (vendor
+    /// code 65540):
+    ///   [0..4]  vendorCode
+    ///   [4..8]  pad1 = 0
+    ///   [8..12] screen = 0
+    fn build_get_fb_configs_sgix_body(screen: u32) -> Vec<u8> {
+        use yserver_protocol::x11::glx as x11glx;
+        let mut body = Vec::new();
+        body.extend_from_slice(&x11glx::VENDOR_CODE_GET_FB_CONFIGS_SGIX.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&screen.to_le_bytes());
+        body
+    }
+
+    /// `VendorPrivateWithReply` with vendor_code `GetFBConfigsSGIX` (65540)
+    /// must NOT be rejected with `GLXUnsupportedPrivateRequest`; it must
+    /// return a non-empty GetFBConfigs reply (real configs, not a stub).
+    #[test]
+    fn get_fb_configs_sgix_is_dispatched_not_rejected() {
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let body = build_get_fb_configs_sgix_body(0);
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE_WITH_REPLY,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request must not hard-error");
+
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "GetFBConfigsSGIX must return Handled, got {outcome:?}"
+        );
+
+        // Must NOT deliver an error packet.
+        peer.set_nonblocking(true).unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            !bytes.is_empty(),
+            "GetFBConfigsSGIX must deliver a reply packet"
+        );
+        assert_ne!(
+            bytes[0], 0,
+            "byte 0 must not be 0 (Error); got {bytes:02x?}"
+        );
+        // byte 0 = 1 (Reply), byte 8..12 = num_FB_configs > 0.
+        assert_eq!(bytes[0], 1, "byte 0 must be Reply type");
+        let num_configs = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert!(
+            num_configs > 0,
+            "GetFBConfigsSGIX must return at least one FBConfig, got {num_configs}"
+        );
+        peer.set_nonblocking(false).unwrap();
+    }
+
+    /// `VendorPrivate` with vendor_code `CreateContextWithConfigSGIX`
+    /// (65541) must insert a `GlxContext` entry (no reply, no error).
+    #[test]
+    fn create_context_with_config_sgix_inserts_context() {
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let context_xid: u32 = 0xABCD_0001;
+        let fbconfig: u32 = 0x101;
+
+        // Build CreateContextWithConfigSGIX body:
+        //   [0..4]  vendorCode = 65541
+        //   [4..8]  pad1 = 0
+        //   [8..12] context = context_xid
+        //   [12..16] fbconfig = 0x101
+        //   [16..20] screen = 0
+        //   [20..24] renderType = 1
+        //   [24..28] shareList = 0
+        //   [28] isDirect = 1
+        //   [29..32] reserved = 0
+        let mut body = Vec::new();
+        body.extend_from_slice(&x11glx::VENDOR_CODE_CREATE_CONTEXT_WITH_CONFIG_SGIX.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&context_xid.to_le_bytes());
+        body.extend_from_slice(&fbconfig.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&1u32.to_le_bytes()); // renderType
+        body.extend_from_slice(&0u32.to_le_bytes()); // shareList
+        body.push(1u8); // isDirect
+        body.push(0u8); // reserved1
+        body.extend_from_slice(&0u16.to_le_bytes()); // reserved2
+
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request must not hard-error");
+
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "CreateContextWithConfigSGIX must return Handled, got {outcome:?}"
+        );
+
+        // GlxContext must be inserted.
+        assert!(
+            state.glx_contexts.contains_key(&context_xid),
+            "GlxContext must be inserted for xid=0x{context_xid:x}"
+        );
+        let ctx = &state.glx_contexts[&context_xid];
+        assert_eq!(ctx.fbconfig, fbconfig, "fbconfig must be recorded");
+
+        // No error packet.
+        peer.set_nonblocking(true).unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.is_empty(),
+            "CreateContextWithConfigSGIX must not deliver an error; got {bytes:02x?}"
+        );
+        peer.set_nonblocking(false).unwrap();
+    }
+
+    /// `VendorPrivate` with vendor_code `CreateGLXPixmapWithConfigSGIX`
+    /// (65542) must insert a `GlxDrawable` entry and call
+    /// `acquire_glx_pixmap_export` — same semantics as `CREATE_PIXMAP`.
+    #[test]
+    fn create_glx_pixmap_with_config_sgix_inserts_drawable_and_acquires() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Register an X pixmap with a known host_xid.
+        let x_pixmap_xid: u32 = 0x3000;
+        let host_xid_raw: u32 = 0xdead_5542;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 64,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
+            ),
+            "set_pixmap_host_xid must succeed"
+        );
+
+        let glx_xid: u32 = 0x5000_0010;
+        let fbconfig: u32 = 0x101;
+
+        // Build CreateGLXPixmapWithConfigSGIX body:
+        //   [0..4]  vendorCode = 65542
+        //   [4..8]  pad1 = 0
+        //   [8..12]  screen = 0
+        //   [12..16] fbconfig = 0x101
+        //   [16..20] pixmap = x_pixmap_xid
+        //   [20..24] glxpixmap = glx_xid
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            &x11glx::VENDOR_CODE_CREATE_GLX_PIXMAP_WITH_CONFIG_SGIX.to_le_bytes(),
+        );
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&fbconfig.to_le_bytes());
+        body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        body.extend_from_slice(&glx_xid.to_le_bytes());
+
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::VENDOR_PRIVATE,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request must not hard-error");
+
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "CreateGLXPixmapWithConfigSGIX must return Handled, got {outcome:?}"
+        );
+
+        // GlxDrawable must be inserted.
+        assert!(
+            state.glx_drawables.contains_key(&glx_xid),
+            "GlxDrawable must be inserted for glx_xid=0x{glx_xid:x}"
+        );
+        let drawable = &state.glx_drawables[&glx_xid];
+        assert_eq!(drawable.x_drawable, x_pixmap_xid, "x_drawable must be set");
+        assert_eq!(drawable.fbconfig, fbconfig, "fbconfig must be recorded");
+        assert_eq!(
+            drawable.glx_export_host_xid,
+            Some(host_xid_raw),
+            "host_xid must be stored for later release"
+        );
+
+        // acquire_glx_pixmap_export must have been called (same as CREATE_PIXMAP).
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host_xid_raw)),
+            "AcquireGlxPixmapExport must be recorded"
+        );
+
+        // No error packet.
+        peer.set_nonblocking(true).unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.is_empty(),
+            "CreateGLXPixmapWithConfigSGIX must not deliver an error; got {bytes:02x?}"
+        );
+        peer.set_nonblocking(false).unwrap();
+    }
+
+    /// After both dispatch and extension-string advertisement are live,
+    /// the computed GLX extension string must contain `GLX_SGIX_fbconfig`.
+    #[test]
+    fn glx_extension_string_contains_sgix_fbconfig() {
+        // glx_extension_string() is a private fn; mirror its logic here.
+        // The base SERVER_EXTENSIONS + SGIX_FBCONFIG_EXTENSION.
+        use yserver_protocol::x11::glx as x11glx;
+        let mut s = String::from(x11glx::SERVER_EXTENSIONS);
+        s.push(' ');
+        s.push_str(x11glx::SGIX_FBCONFIG_EXTENSION);
+        assert!(
+            s.contains("GLX_SGIX_fbconfig"),
+            "glx_extension_string must contain GLX_SGIX_fbconfig when supported"
+        );
     }
 }

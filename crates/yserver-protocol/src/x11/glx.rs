@@ -79,6 +79,18 @@ pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 8;
 pub const VENDOR_CODE_BIND_TEX_IMAGE: u32 = 1330;
 pub const VENDOR_CODE_RELEASE_TEX_IMAGE: u32 = 1331;
 
+/// VendorPrivate(WithReply) opcodes for `GLX_SGIX_fbconfig`.
+/// Values from `/usr/include/GL/glxproto.h` `X_GLXvop_*` defines.
+///
+/// ```text
+/// #define X_GLXvop_GetFBConfigsSGIX               65540
+/// #define X_GLXvop_CreateContextWithConfigSGIX    65541
+/// #define X_GLXvop_CreateGLXPixmapWithConfigSGIX  65542
+/// ```
+pub const VENDOR_CODE_GET_FB_CONFIGS_SGIX: u32 = 65540;
+pub const VENDOR_CODE_CREATE_CONTEXT_WITH_CONFIG_SGIX: u32 = 65541;
+pub const VENDOR_CODE_CREATE_GLX_PIXMAP_WITH_CONFIG_SGIX: u32 = 65542;
+
 /// Buffer token for `glXBindTexImageEXT`. Confirmed against
 /// `/usr/include/GL/glxext.h`: `#define GLX_FRONT_LEFT_EXT 0x20DE`.
 /// The indirect bind path accepts any buffer value (single front buffer);
@@ -187,6 +199,12 @@ pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_conte
 /// Extension token appended to the advertised extension string when the
 /// backend can allocate and export a BGRA8 dma-buf (probed once at init).
 pub const TFP_EXTENSION: &str = "GLX_EXT_texture_from_pixmap";
+
+/// Extension token for `GLX_SGIX_fbconfig` — the pre-GLX-1.3 vendor-private
+/// spelling of the FBConfig API.  Compiz and other legacy compositors require
+/// it.  Appended to the advertised extension string only after the
+/// VendorPrivate dispatch for opcodes 65540–65542 is implemented.
+pub const SGIX_FBCONFIG_EXTENSION: &str = "GLX_SGIX_fbconfig";
 
 #[must_use]
 pub fn parse_query_server_string(body: &[u8]) -> Option<QueryServerStringRequest> {
@@ -422,6 +440,138 @@ pub fn encode_get_fb_configs_empty_reply(
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
+}
+
+/// Encode a `GetFBConfigsSGIX` reply (`VendorPrivateWithReply`, vendor
+/// code 65540).
+///
+/// glxproto.h has no separate `xGLXGetFBConfigsSGIXReply` typedef — the
+/// SGI extension reuses the GLX 1.3 `xGLXGetFBConfigsReply` wire layout
+/// (confirmed: only the request struct is defined for SGIX, not a reply).
+/// So this function is a thin alias over [`encode_get_fb_configs_reply`]
+/// with the same byte layout:
+///
+/// ```text
+/// 1   Reply
+/// 1   pad
+/// 2   sequence
+/// 4   length = num_FB_configs * num_properties * 2 (in 4-byte units)
+/// 4   num_FB_configs
+/// 4   num_properties
+/// 16  pad
+/// (num_FB_configs * num_properties) (CARD32 attrib, CARD32 value) pairs
+/// ```
+#[must_use]
+pub fn encode_get_fb_configs_sgix_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    configs: &[&[(u32, u32)]],
+) -> Vec<u8> {
+    // Wire format is identical to the GLX 1.3 GetFBConfigsReply — proxy
+    // directly.  (glxproto.h defines xGLXGetFBConfigsSGIXReq but no
+    // separate reply struct; the SGIX reply uses the same layout.)
+    encode_get_fb_configs_reply(byte_order, sequence, configs)
+}
+
+/// Parse the body of a `GetFBConfigsSGIX` `VendorPrivateWithReply`
+/// request.  Returns the screen number, or `None` if the body is too
+/// short.
+///
+/// Wire body layout (`xGLXGetFBConfigsSGIXReq` minus the 4-byte X
+/// request header; inside VendorPrivate the full body including the
+/// vendor_code is present):
+/// ```text
+/// [0..4]   vendor_code  (u32 LE) = 65540 — already extracted by caller
+/// [4..8]   pad1         (unused contextTag slot)
+/// [8..12]  screen       (CARD32)
+/// ```
+#[must_use]
+pub fn parse_get_fb_configs_sgix(body: &[u8]) -> Option<u32> {
+    if body.len() < 12 {
+        return None;
+    }
+    Some(read_u32_le(&body[8..]))
+}
+
+/// Parsed `CreateContextWithConfigSGIX` request body.
+///
+/// Wire layout (`xGLXCreateContextWithConfigSGIXReq` minus 4-byte
+/// X header; vendor_code+pad1 precede these fields in VendorPrivate):
+/// ```text
+/// [0..4]   vendor_code  (u32 LE) = 65541
+/// [4..8]   pad1
+/// [8..12]  context      (GLXContextID — client-chosen XID)
+/// [12..16] fbconfig     (GLXFBConfigID)
+/// [16..20] screen       (CARD32)
+/// [20..24] renderType   (CARD32)
+/// [24..28] shareList    (GLXContextID)
+/// [28]     isDirect     (BOOL)
+/// [29..32] reserved
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateContextWithConfigSgixRequest {
+    pub context: u32,
+    pub fbconfig: u32,
+    pub screen: u32,
+    pub render_type: u32,
+    pub share_list: u32,
+    pub is_direct: bool,
+}
+
+/// Parse a `CreateContextWithConfigSGIX` VendorPrivate body.
+/// Returns `None` if body is shorter than 29 bytes.
+#[must_use]
+pub fn parse_create_context_with_config_sgix(
+    body: &[u8],
+) -> Option<CreateContextWithConfigSgixRequest> {
+    if body.len() < 29 {
+        return None;
+    }
+    Some(CreateContextWithConfigSgixRequest {
+        context: read_u32_le(&body[8..]),
+        fbconfig: read_u32_le(&body[12..]),
+        screen: read_u32_le(&body[16..]),
+        render_type: read_u32_le(&body[20..]),
+        share_list: read_u32_le(&body[24..]),
+        is_direct: body[28] != 0,
+    })
+}
+
+/// Parsed `CreateGLXPixmapWithConfigSGIX` request body.
+///
+/// Wire layout (`xGLXCreateGLXPixmapWithConfigSGIXReq` minus 4-byte
+/// X header; vendor_code+pad1 precede these fields in VendorPrivate):
+/// ```text
+/// [0..4]   vendor_code  (u32 LE) = 65542
+/// [4..8]   pad1
+/// [8..12]  screen       (CARD32)
+/// [12..16] fbconfig     (GLXFBConfigID)
+/// [16..20] pixmap       (X pixmap XID)
+/// [20..24] glxpixmap    (GLXPixmap XID)
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateGlxPixmapWithConfigSgixRequest {
+    pub screen: u32,
+    pub fbconfig: u32,
+    pub pixmap: u32,
+    pub glx_pixmap: u32,
+}
+
+/// Parse a `CreateGLXPixmapWithConfigSGIX` VendorPrivate body.
+/// Returns `None` if body is shorter than 24 bytes.
+#[must_use]
+pub fn parse_create_glx_pixmap_with_config_sgix(
+    body: &[u8],
+) -> Option<CreateGlxPixmapWithConfigSgixRequest> {
+    if body.len() < 24 {
+        return None;
+    }
+    Some(CreateGlxPixmapWithConfigSgixRequest {
+        screen: read_u32_le(&body[8..]),
+        fbconfig: read_u32_le(&body[12..]),
+        pixmap: read_u32_le(&body[16..]),
+        glx_pixmap: read_u32_le(&body[20..]),
+    })
 }
 
 /// One GLX 1.2 visual config entry.
@@ -851,5 +1001,170 @@ mod tests {
             GLX_VISUAL_ID
         );
         assert_eq!(u32::from_le_bytes(reply[36..40].try_into().unwrap()), 0x102);
+    }
+
+    // ── GLX_SGIX_fbconfig tests ──────────────────────────────────────────────
+
+    /// Verify the SGIX vendor opcode constants are pinned to the values
+    /// defined in `/usr/include/GL/glxproto.h`.
+    #[test]
+    fn sgix_fbconfig_vendor_opcodes_match_glxproto() {
+        // Values from glxproto.h:
+        //   #define X_GLXvop_GetFBConfigsSGIX               65540
+        //   #define X_GLXvop_CreateContextWithConfigSGIX    65541
+        //   #define X_GLXvop_CreateGLXPixmapWithConfigSGIX  65542
+        assert_eq!(VENDOR_CODE_GET_FB_CONFIGS_SGIX, 65540);
+        assert_eq!(VENDOR_CODE_CREATE_CONTEXT_WITH_CONFIG_SGIX, 65541);
+        assert_eq!(VENDOR_CODE_CREATE_GLX_PIXMAP_WITH_CONFIG_SGIX, 65542);
+    }
+
+    /// `encode_get_fb_configs_sgix_reply` must produce the same byte layout
+    /// as `encode_get_fb_configs_reply` — glxproto.h defines no separate SGIX
+    /// reply struct; the SGI extension reuses the GLX 1.3 wire format.
+    #[test]
+    fn get_fb_configs_sgix_reply_matches_glx13_layout() {
+        let cfg_a: &[(u32, u32)] = &[(GLX_FBCONFIG_ID, 0x101), (GLX_VISUAL_ID, 0x102)];
+        let cfg_b: &[(u32, u32)] = &[(GLX_FBCONFIG_ID, 0x102), (GLX_VISUAL_ID, 0x103)];
+        let configs: &[&[(u32, u32)]] = &[cfg_a, cfg_b];
+
+        let sgix_reply = encode_get_fb_configs_sgix_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(5),
+            configs,
+        );
+        let glx13_reply =
+            encode_get_fb_configs_reply(ClientByteOrder::LittleEndian, SequenceNumber(5), configs);
+
+        // Wire layouts must be identical.
+        assert_eq!(
+            sgix_reply, glx13_reply,
+            "SGIX and GLX 1.3 GetFBConfigs reply must have the same wire format"
+        );
+
+        // Spot-check the key offsets per xGLXGetFBConfigsReply:
+        // byte 0  = Reply (1)
+        // byte 1  = pad
+        // byte 2..4 = sequence
+        // byte 4..8 = length in 4-byte units = num_configs * num_props * 2
+        // byte 8..12 = num_FB_configs
+        // byte 12..16 = num_properties
+        assert_eq!(sgix_reply[0], 1, "byte 0 must be Reply type");
+        let length = u32::from_le_bytes(sgix_reply[4..8].try_into().unwrap());
+        // 2 configs × 2 props × 2 = 8 4-byte units
+        assert_eq!(length, 8, "length field");
+        let num_configs = u32::from_le_bytes(sgix_reply[8..12].try_into().unwrap());
+        assert_eq!(num_configs, 2, "num_FB_configs at offset 8");
+        let num_props = u32::from_le_bytes(sgix_reply[12..16].try_into().unwrap());
+        assert_eq!(num_props, 2, "num_properties at offset 12");
+        // payload starts at byte 32
+        assert_eq!(
+            sgix_reply.len(),
+            32 + 2 * 2 * 8,
+            "total reply size = 32-byte header + 2 configs × 2 props × 8 bytes/pair"
+        );
+        // First (attrib, value) pair of first config at byte 32.
+        assert_eq!(
+            u32::from_le_bytes(sgix_reply[32..36].try_into().unwrap()),
+            GLX_FBCONFIG_ID,
+            "first attrib must be GLX_FBCONFIG_ID"
+        );
+        assert_eq!(
+            u32::from_le_bytes(sgix_reply[36..40].try_into().unwrap()),
+            0x101,
+            "first value must be 0x101"
+        );
+    }
+
+    /// `parse_get_fb_configs_sgix` must extract the screen number from
+    /// bytes [8..12] of the VendorPrivate body.
+    #[test]
+    fn parse_get_fb_configs_sgix_extracts_screen() {
+        // Build a minimal SGIX GetFBConfigsSGIX VendorPrivate body:
+        //   [0..4]  vendorCode = 65540
+        //   [4..8]  pad1 = 0
+        //   [8..12] screen = 3
+        let mut body = Vec::new();
+        body.extend_from_slice(&VENDOR_CODE_GET_FB_CONFIGS_SGIX.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&3u32.to_le_bytes()); // screen
+        assert_eq!(parse_get_fb_configs_sgix(&body), Some(3));
+        // Too short → None
+        assert_eq!(parse_get_fb_configs_sgix(&body[..8]), None);
+    }
+
+    /// `parse_create_context_with_config_sgix` must extract all fields
+    /// per the `xGLXCreateContextWithConfigSGIXReq` layout.
+    #[test]
+    fn parse_create_context_with_config_sgix_fields() {
+        // [0..4]  vendorCode = 65541
+        // [4..8]  pad1 = 0
+        // [8..12] context = 0xABC
+        // [12..16] fbconfig = 0x101
+        // [16..20] screen = 0
+        // [20..24] renderType = 1 (GLX_RGBA_TYPE)
+        // [24..28] shareList = 0
+        // [28]    isDirect = 1
+        // [29..32] reserved = 0
+        let mut body = Vec::new();
+        body.extend_from_slice(&VENDOR_CODE_CREATE_CONTEXT_WITH_CONFIG_SGIX.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&0xABCu32.to_le_bytes()); // context
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&1u32.to_le_bytes()); // renderType
+        body.extend_from_slice(&0u32.to_le_bytes()); // shareList
+        body.push(1u8); // isDirect
+        body.push(0u8); // reserved1
+        body.extend_from_slice(&0u16.to_le_bytes()); // reserved2
+
+        let req = parse_create_context_with_config_sgix(&body).expect("parse");
+        assert_eq!(req.context, 0xABC);
+        assert_eq!(req.fbconfig, 0x101);
+        assert_eq!(req.screen, 0);
+        assert_eq!(req.render_type, 1);
+        assert_eq!(req.share_list, 0);
+        assert!(req.is_direct);
+        // Too short → None
+        assert_eq!(parse_create_context_with_config_sgix(&body[..20]), None);
+    }
+
+    /// `parse_create_glx_pixmap_with_config_sgix` must extract all fields
+    /// per the `xGLXCreateGLXPixmapWithConfigSGIXReq` layout.
+    #[test]
+    fn parse_create_glx_pixmap_with_config_sgix_fields() {
+        // [0..4]  vendorCode = 65542
+        // [4..8]  pad1 = 0
+        // [8..12]  screen = 0
+        // [12..16] fbconfig = 0x101
+        // [16..20] pixmap = 0x2000
+        // [20..24] glxpixmap = 0x5000_0001
+        let mut body = Vec::new();
+        body.extend_from_slice(&VENDOR_CODE_CREATE_GLX_PIXMAP_WITH_CONFIG_SGIX.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&0x2000u32.to_le_bytes()); // pixmap
+        body.extend_from_slice(&0x5000_0001u32.to_le_bytes()); // glxpixmap
+
+        let req = parse_create_glx_pixmap_with_config_sgix(&body).expect("parse");
+        assert_eq!(req.screen, 0);
+        assert_eq!(req.fbconfig, 0x101);
+        assert_eq!(req.pixmap, 0x2000);
+        assert_eq!(req.glx_pixmap, 0x5000_0001);
+        // Too short → None
+        assert_eq!(parse_create_glx_pixmap_with_config_sgix(&body[..16]), None);
+    }
+
+    /// `SERVER_EXTENSIONS` must NOT yet contain `GLX_SGIX_fbconfig` —
+    /// that token is appended only via the `glx_extension_string` builder
+    /// in process_request.rs after the dispatch works.  This test ensures
+    /// the base constant stays clean (advertise-after-implement ordering).
+    #[test]
+    fn sgix_fbconfig_not_in_base_server_extensions() {
+        assert!(
+            !SERVER_EXTENSIONS.contains("GLX_SGIX_fbconfig"),
+            "GLX_SGIX_fbconfig must NOT be in SERVER_EXTENSIONS base constant; \
+             it is appended separately via glx_extension_string when supported"
+        );
     }
 }
