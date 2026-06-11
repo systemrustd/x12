@@ -14653,26 +14653,40 @@ impl Backend for KmsBackendV2 {
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
         for name in matched {
-            // fonts.dir names go out VERBATIM (Xorg FPE behavior);
-            // the alias→XLFD rewrite below applies only to built-in
-            // aliases, which carry no charset of their own.
-            let is_path_font = matches!(
-                self.core.font_loader.resolve(&name),
-                Some(crate::kms::core::FontResolution::File { .. })
-            );
+            // Capture the fonts.dir KEY that resolve() matches for path
+            // fonts; it — not the bare matched alias, not the file-
+            // embedded FONT atom — is the round-trippable XA_FONT.
+            let path_entry_key = match self.core.font_loader.resolve(&name) {
+                Some(crate::kms::core::FontResolution::File { entry_name, .. }) => Some(entry_name),
+                _ => None,
+            };
             match self.core.font_loader.open_font(&name) {
                 Ok((_face, mut metrics, _cache)) => {
-                    // Alias entries ("fixed"/"cursor"/"nil2") must go
-                    // out under a full XLFD name so XCreateFontSet can
-                    // parse a charset and re-open the exact name —
-                    // see FontLoader::alias_to_xlfd (e16-in-vng
-                    // XCreateFontSet NULL regression).
-                    let wire_name =
-                        if is_path_font || crate::kms::core::FontLoader::is_xlfd_pattern(&name) {
-                            name
-                        } else {
-                            crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
-                        };
+                    // Reply NAME keeps Xorg FPE behavior: path / XLFD
+                    // names go out verbatim; a bare built-in alias
+                    // ("fixed"/"cursor"/"nil2") is rewritten to a full
+                    // XLFD so XCreateFontSet can parse a charset.
+                    let wire_name = if path_entry_key.is_some()
+                        || crate::kms::core::FontLoader::is_xlfd_pattern(&name)
+                    {
+                        name.clone()
+                    } else {
+                        crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
+                    };
+                    // XA_FONT must be a charset-bearing XLFD that
+                    // round-trips through open_font (libX11 OpenFonts it
+                    // verbatim — omGeneric.c get_prop_name). For a path
+                    // font that's the fonts.dir KEY resolve() matched;
+                    // the PCF's embedded FONT atom can diverge from the
+                    // key (point/dpi/avg-width fields — e.g. Debian
+                    // xfonts-* 19px misc-fixed) and then fail to reopen.
+                    let font_prop_name = match path_entry_key {
+                        Some(entry) => entry,
+                        None if crate::kms::core::FontLoader::is_xlfd_pattern(&name) => {
+                            name.clone()
+                        }
+                        None => crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics),
+                    };
                     // Properties: file-embedded (BDF/PCF) ones when
                     // present, interned here; always ensure FONT
                     // (XA_FONT=18 → atom of the wire name) —
@@ -14683,18 +14697,21 @@ impl Backend for KmsBackendV2 {
                     // name alone is not consulted on that path.
                     let named = std::mem::take(&mut metrics.named_properties);
                     let mut props = Vec::with_capacity(named.len() * 8 + 8);
-                    let mut has_font = false;
                     for (pname, value) in &named {
+                        // XA_FONT (18) is re-emitted below as `wire_name`
+                        // — the name the server can actually re-open. A
+                        // PCF's file-embedded FONT atom can diverge from
+                        // its fonts.dir entry key (point/dpi/avg-width
+                        // fields); reporting the embedded one breaks the
+                        // XCreateFontSet round-trip (libX11 OpenFonts
+                        // XA_FONT verbatim, but `resolve()` only matches
+                        // fonts.dir keys) on font sets where they differ
+                        // — e.g. Debian xfonts-* 19px misc-fixed. Skip
+                        // the embedded FONT here.
                         if pname == "FONT" {
-                            has_font = true;
+                            continue;
                         }
-                        // XA_FONT is predefined (18) — don't depend
-                        // on the callback knowing the well-known set.
-                        let name_atom = if pname == "FONT" {
-                            18
-                        } else {
-                            intern_atom(pname)
-                        };
+                        let name_atom = intern_atom(pname);
                         let v: u32 = match value {
                             yserver_protocol::x11::FontPropValue::Card(c) => *c,
                             #[allow(clippy::cast_sign_loss)]
@@ -14704,11 +14721,12 @@ impl Backend for KmsBackendV2 {
                         props.extend_from_slice(&name_atom.to_le_bytes());
                         props.extend_from_slice(&v.to_le_bytes());
                     }
-                    if !has_font {
-                        let font_atom = intern_atom(&wire_name);
-                        props.extend_from_slice(&18u32.to_le_bytes()); // XA_FONT
-                        props.extend_from_slice(&font_atom.to_le_bytes());
-                    }
+                    // Always emit XA_FONT (18) = the round-trippable name
+                    // (fonts.dir key for path fonts; the synthesized
+                    // charset-bearing XLFD for built-in aliases).
+                    let font_atom = intern_atom(&font_prop_name);
+                    props.extend_from_slice(&18u32.to_le_bytes());
+                    props.extend_from_slice(&font_atom.to_le_bytes());
                     metrics.properties = props;
                     entries.push((wire_name, metrics));
                 }

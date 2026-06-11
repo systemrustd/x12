@@ -239,12 +239,20 @@ impl FontLoader {
     /// carry a fonts.dir on this system, with "built-ins" always last.
     pub(crate) fn default_font_path() -> Vec<String> {
         const CANDIDATES: &[&str] = &[
+            // Arch/Fedora layout (/usr/share/fonts/<subdir>) and the
+            // Debian/Ubuntu layout (/usr/share/fonts/X11/<subdir>, where
+            // xfonts-base/75dpi/100dpi install). The filter below drops
+            // whichever set lacks a fonts.dir, so both distros work.
             "/usr/share/fonts/misc",
+            "/usr/share/fonts/X11/misc",
             "/usr/share/fonts/TTF",
             "/usr/share/fonts/OTF",
             "/usr/share/fonts/Type1",
+            "/usr/share/fonts/X11/Type1",
             "/usr/share/fonts/100dpi",
+            "/usr/share/fonts/X11/100dpi",
             "/usr/share/fonts/75dpi",
+            "/usr/share/fonts/X11/75dpi",
         ];
         let mut path: Vec<String> = CANDIDATES
             .iter()
