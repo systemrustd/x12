@@ -41,6 +41,10 @@ Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVE
 the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
 cards, but untested.
 
+## Demo
+
+With TFP implemented, we now support compiz, demo here:
+
 ## Hardware tested
 
 `yserver` (standalone DRM/KMS) has been tested end-to-end against a
