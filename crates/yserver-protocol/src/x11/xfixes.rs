@@ -28,6 +28,7 @@ pub const SET_WINDOW_SHAPE_REGION: u8 = 21;
 pub const SET_PICTURE_CLIP_REGION: u8 = 22;
 pub const SET_CURSOR_NAME: u8 = 23;
 pub const GET_CURSOR_NAME: u8 = 24;
+pub const GET_CURSOR_IMAGE_AND_NAME: u8 = 25;
 pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
@@ -503,6 +504,85 @@ pub fn encode_get_cursor_image_reply(
     out
 }
 
+/// Straight-BGRA8 → premultiplied-ARGB32 wire pixels, appended to
+/// `out` in the client's byte order. Shared by the GetCursorImage and
+/// GetCursorImageAndName encoders.
+fn append_premultiplied_argb(byte_order: ClientByteOrder, out: &mut Vec<u8>, bgra_straight: &[u8]) {
+    for px in bgra_straight.chunks_exact(4) {
+        let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+        let pm = |c: u8| -> u8 {
+            let prod = u16::from(c) * u16::from(a) + 127;
+            ((prod + (prod >> 8)) >> 8) as u8
+        };
+        let argb: u32 = (u32::from(a) << 24)
+            | (u32::from(pm(r)) << 16)
+            | (u32::from(pm(g)) << 8)
+            | u32::from(pm(b));
+        write_u32(byte_order, out, argb);
+    }
+}
+
+/// XFIXES `GetCursorImageAndName` reply (opcode 25, Xorg
+/// `xfixes/cursor.c` `ProcXFixesGetCursorImageAndName`). Identical to
+/// [`encode_get_cursor_image_reply`] except the 8 trailing header pad
+/// bytes carry the cursor-name atom + name length, and the cursor
+/// name string follows the (premultiplied ARGB) image, padded to a
+/// 4-byte boundary. `length` counts image words + name words.
+///
+/// **Missing-reply hang fix (2026-06-11):** real X screen recorders
+/// (e.g. gpu-screen-recorder) call this to grab the cursor; without a
+/// reply they block forever in `poll()`. `cursor_atom`/`name` may be
+/// `0`/empty when the active cursor is unnamed (a valid X state).
+#[must_use]
+pub fn encode_get_cursor_image_and_name_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    xhot: u16,
+    yhot: u16,
+    cursor_serial: u32,
+    cursor_atom: u32,
+    name: &[u8],
+    bgra_straight: &[u8],
+) -> Vec<u8> {
+    let pixel_count = usize::from(width) * usize::from(height);
+    let payload_bytes = pixel_count * 4;
+    debug_assert_eq!(bgra_straight.len(), payload_bytes);
+    let name_padded = (name.len() + 3) & !3;
+    #[allow(clippy::cast_possible_truncation)]
+    let length = (pixel_count + name_padded / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, length);
+    write_i16(byte_order, &mut out, x);
+    write_i16(byte_order, &mut out, y);
+    write_u16(byte_order, &mut out, width);
+    write_u16(byte_order, &mut out, height);
+    write_u16(byte_order, &mut out, xhot);
+    write_u16(byte_order, &mut out, yhot);
+    write_u32(byte_order, &mut out, cursor_serial);
+    write_u32(byte_order, &mut out, cursor_atom);
+    #[allow(clippy::cast_possible_truncation)]
+    write_u16(byte_order, &mut out, name.len() as u16);
+    write_u16(byte_order, &mut out, 0); // pad
+    debug_assert_eq!(out.len(), 32);
+    append_premultiplied_argb(byte_order, &mut out, bgra_straight);
+    out.extend_from_slice(name);
+    out.resize(32 + payload_bytes + name_padded, 0);
+    out
+}
+
+/// Empty `GetCursorImageAndName` reply (0×0 cursor, no name) — for
+/// backends without a live cursor source (`ynest`, `RecordingBackend`).
+#[must_use]
+pub fn encode_get_cursor_image_and_name_empty_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    encode_get_cursor_image_and_name_reply(byte_order, sequence, 0, 0, 0, 0, 0, 0, 0, 0, &[], &[])
+}
+
 #[must_use]
 pub fn encode_fetch_region_reply(
     byte_order: ClientByteOrder,
@@ -591,6 +671,51 @@ mod tests {
         assert_eq!(reply[33], 0x00); // G premul
         assert_eq!(reply[34], 0x80); // R premul (within ±1 ULP)
         assert_eq!(reply[35], 0x80); // A untouched
+    }
+
+    /// GetCursorImageAndName (opcode 25) — the missing-reply gsr hang
+    /// fix. Header carries the name atom + length; the name follows the
+    /// image, padded to 4 bytes; `length` counts image + name words.
+    #[test]
+    fn get_cursor_image_and_name_reply_carries_name_after_image() {
+        let bgra = [0u8, 0, 0xFF, 0xFF]; // 1×1 opaque red
+        let name = b"left_ptr"; // 8 bytes → already 4-aligned
+        let reply = encode_get_cursor_image_and_name_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            10,
+            20,
+            1,
+            1,
+            1,
+            2,
+            99,
+            0x2a,
+            name,
+            &bgra,
+        );
+        // length = 1 image word + 2 name words (8 bytes / 4).
+        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(reply[20..24].try_into().unwrap()), 99); // serial
+        assert_eq!(u32::from_le_bytes(reply[24..28].try_into().unwrap()), 0x2a); // atom
+        assert_eq!(u16::from_le_bytes([reply[28], reply[29]]), 8); // nbytes
+        // Header (32) + 1 pixel (4) + name (8).
+        assert_eq!(reply.len(), 32 + 4 + 8);
+        assert_eq!(&reply[32..36], &[0x00, 0x00, 0xFF, 0xFF]); // premul ARGB pixel
+        assert_eq!(&reply[36..44], name); // name string after the image
+    }
+
+    /// Empty variant (no live cursor) — valid 0×0/unnamed reply, no
+    /// payload, so a None-cursor backend still answers (no client hang).
+    #[test]
+    fn get_cursor_image_and_name_empty_reply_is_header_only() {
+        let reply = encode_get_cursor_image_and_name_empty_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+        );
+        assert_eq!(reply.len(), 32);
+        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0); // length
+        assert_eq!(u16::from_le_bytes([reply[28], reply[29]]), 0); // nbytes
     }
 
     #[test]

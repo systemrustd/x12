@@ -3446,6 +3446,38 @@ fn handle_xfixes_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
+        x11xfixes::GET_CURSOR_IMAGE_AND_NAME => {
+            // Superset of GetCursorImage (opcode 25). Real X screen
+            // recorders (gpu-screen-recorder, …) call this to grab the
+            // cursor; with no reply they block forever in poll().
+            // TODO: plumb the active cursor's name atom through
+            // `ActiveCursorImage`; until then report it as unnamed
+            // (atom 0 / empty name — a valid X state), which is all the
+            // recorders need (they consume the image).
+            let reply = match backend.get_active_cursor_image() {
+                Some(img) => x11xfixes::encode_get_cursor_image_and_name_reply(
+                    byte_order,
+                    sequence,
+                    img.x,
+                    img.y,
+                    img.width,
+                    img.height,
+                    img.hot_x,
+                    img.hot_y,
+                    img.serial,
+                    0,
+                    &[],
+                    img.bgra_bytes.as_ref(),
+                ),
+                None => {
+                    x11xfixes::encode_get_cursor_image_and_name_empty_reply(byte_order, sequence)
+                }
+            };
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
         x11xfixes::CREATE_REGION => {
             if let Some((region, rects)) = x11xfixes::parse_create_region(body) {
                 if xfixes_region_xid_already_taken(state, region)
