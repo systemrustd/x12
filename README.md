@@ -9,6 +9,12 @@ indirect GLX, the DDX driver ABI, endian-swapped clients, and so on).
 
 See [`docs/high-level-design.md`](docs/high-level-design.md) for the full design and scope.
 
+## Name
+
+The `yserver` name is the 'working' name as it was the first idea that popped into my head when
+starting the project. But there are multiple projects on GitHub with this name (but none for X11 servers),
+the name is subject to change. Not a priority now.
+
 ## Status
 
 `yserver` (standalone DRM/KMS) can now run full MATE/XFCE/Cinnamon desktops.
@@ -105,3 +111,7 @@ Some convenience keybinds are available:
 We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol completeness.
 
 Latest pass numbers per scenario live in [`docs/test-status.md`](docs/test-status.md).
+
+## License
+
+This project is licensed under the MIT license. Please check [LICENSE](LICENSE).
