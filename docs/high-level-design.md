@@ -2,17 +2,11 @@
 
 A modern X11 server written from scratch in Rust. Drives DRM/KMS
 directly via Vulkan; runs real desktop environments on modern
-Linux (with planned FreeBSD support). Not a clone of Xorg.
-
-For current per-hardware state, see [`status.md`](status.md). For
-the user-facing summary of what runs and how to build/run it, see
-[`../README.md`](../README.md).
+Linux (with planned FreeBSD support).
 
 ## Goals
 
-- Run real X11 desktop environments and window managers (MATE,
-  XFCE, Cinnamon validated; LXQt and similar lightweight desktops
-  targeted).
+- Run real X11 desktop environments and window managers.
 - Support modern graphics hardware through DRM/KMS and Vulkan,
   with no driver ABI for third-party hardware modules. Primary
   target is Linux; FreeBSD (incl. GhostBSD) is a planned secondary
@@ -22,12 +16,8 @@ the user-facing summary of what runs and how to build/run it, see
   default.
 - Per-output presentation (refresh rate, modes) with multiple
   physical outputs as first-class.
-- Provide a nested backend (`ynest`) for development and tests
-  under an existing X11 session.
 - Implement the modern X11 desktop contract that GTK, Qt, SDL,
   GLFW, Electron, and similar actively used software depend on.
-- Keep the implementation auditable: declarative protocol parsing
-  in a dedicated crate, no handwritten unsafe wire decoders.
 - Single-threaded core (no `Arc<Mutex<ServerState>>`, no
   per-client pump threads) so the protocol invariants stay
   obvious.
@@ -86,23 +76,28 @@ dumps drawables.
 
 Two backends, selected at binary level.
 
+- `yserver` — standalone DRM/KMS. Opens `/dev/dri/card*`,
+    acquires DRM master, drives atomic modesetting, owns the
+    console. This is the production target.
 - `ynest` — nested X11 backend. Runs under an existing X11 (or
   Xwayland) display, treats the parent server as a single output.
   Used for protocol development and regression coverage where
-  hardware isn't needed.
-- `yserver` — standalone DRM/KMS. Opens `/dev/dri/card*`,
-  acquires DRM master, drives atomic modesetting, owns the
-  console. This is the production target.
+  hardware isn't needed. Development of `ynest` has stopped for now.
 
 The standalone backend uses **Vulkan directly** for rendering
-and dmabuf export. No EGL, no GBM, no Mesa GL. No
-`logind`/`seatd`/`libseat` integration — the server expects to be
-launched on a free VT with direct access to `/dev/dri/*` and
-`/dev/input/*`. Modes are set via DRM atomic; pageflips drive
-retirement.
+and dmabuf export. No EGL, no GBM, no Mesa GL. Modes are set via
+DRM atomic; pageflips drive retirement.
 
-Input on both backends: `libinput` reads on a dedicated thread,
-which posts cooked events into the core loop's channel.
+It runs in two session modes. The preferred mode uses
+**libseat/seatd**: the seat manager opens `/dev/dri/*` and
+`/dev/input/*`, so the server runs without root and cooperates
+with VT switching. A fallback **direct** mode runs on a free VT
+with direct device access and no seat manager.
+
+Input: `libinput` posts cooked events into the core loop's
+channel — serviced on the core thread under libseat, on a
+dedicated input thread in direct mode. (`ynest` takes its input
+from the parent X server instead.)
 
 ## Target platforms
 
