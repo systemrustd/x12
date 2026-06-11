@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "yserver"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ash",
  "crossbeam-channel",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "yserver-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "yserver-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
 ]
