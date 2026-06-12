@@ -404,6 +404,8 @@ pub fn process_request(
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
         // ── MIT-SCREEN-SAVER extension dispatcher ──
         150 => handle_screen_saver_request(state, backend, client_id, sequence, header, body),
+        // ── XC-MISC extension dispatcher ──
+        152 => handle_xcmisc_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -23223,6 +23225,212 @@ fn emit_xi2_device_changed_bootstrap(
     Ok(())
 }
 
+/// Largest contiguous free run in `[max(base,1) .. base|mask]`,
+/// given the SORTED+DEDUPED occupied ids in that range. Returns
+/// Xorg's exact exhaustion wire shape `(0, 1)` when nothing is free
+/// (dix/resource.c:733-737 zeroes min/max; the reply encodes
+/// max-min+1 = 1; libxcb treats start 0 as exhausted). Largest-gap
+/// is an implementation choice — the protocol promises only "a
+/// contiguous range of unused IDs" (spec "GetXIDRange algorithm").
+fn largest_free_xid_gap(base: u32, mask: u32, used_sorted: &[u32]) -> (u32, u32) {
+    let lo = base.max(1); // XID 0 is never allocatable
+    let hi = base | mask;
+    let mut best_start = 0u32;
+    let mut best_len = 0u64;
+    let mut cursor = lo;
+    for &u in used_sorted {
+        if u < lo {
+            continue;
+        }
+        if u > hi {
+            break;
+        }
+        if u > cursor {
+            let len = u64::from(u - cursor);
+            if len > best_len {
+                best_len = len;
+                best_start = cursor;
+            }
+        }
+        cursor = cursor.max(u.saturating_add(1));
+    }
+    if cursor <= hi {
+        let len = u64::from(hi - cursor) + 1;
+        if len > best_len {
+            best_len = len;
+            best_start = cursor;
+        }
+    }
+    if best_len == 0 {
+        (0, 1)
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        (best_start, best_len as u32) // len ≤ hi - lo + 1 ≤ hi ≤ u32::MAX
+    }
+}
+
+#[cfg(test)]
+mod largest_free_xid_gap_tests {
+    use super::largest_free_xid_gap;
+
+    #[test]
+    fn largest_free_xid_gap_cases() {
+        let base = 0x0010_0000u32;
+        let mask = 0x000F_FFFFu32;
+        let hi = base | mask;
+        // empty range → whole range (lo = base since base != 0)
+        assert_eq!(largest_free_xid_gap(base, mask, &[]), (base, mask + 1));
+        // one used id at the start → gap after it
+        assert_eq!(largest_free_xid_gap(base, mask, &[base]), (base + 1, mask));
+        // split: small gap low, big gap high → picks the big one
+        let used: Vec<u32> = (base..base + 10).chain([base + 12]).collect();
+        assert_eq!(
+            largest_free_xid_gap(base, mask, &used),
+            (base + 13, hi - (base + 13) + 1)
+        );
+        // fully exhausted → Xorg wire shape (0, 1)
+        let all: Vec<u32> = (base..=hi).collect(); // NOTE: 1M entries — fine in a test
+        assert_eq!(largest_free_xid_gap(base, mask, &all), (0, 1));
+        // base 0 (hypothetical) excludes XID 0
+        assert_eq!(largest_free_xid_gap(0, 0xFF, &[]), (1, 0xFF));
+    }
+}
+
+/// XC-MISC (major opcode 152) — XID recycling for long-lived clients.
+/// Spec docs/superpowers/specs/2026-06-12-xcmisc-design.md; Xorg ref
+/// Xext/xcmisc.c. Length validation lives here because the top-level
+/// exact-length table is core-opcode-only.
+fn handle_xcmisc_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    match minor {
+        // GetVersion — req 8 bytes (client version, ignored).
+        0 => {
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let mut buf: Vec<u8> = Vec::with_capacity(32);
+            x11::write_xcmisc_get_version_reply(&mut buf, byte_order, sequence)?;
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            Ok(write_to_client(client, client_id, &buf))
+        }
+        // GetXIDRange — req 4 bytes (header only).
+        1 => {
+            if !body.is_empty() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let Some((base, mask)) = state
+                .clients
+                .get(&client_id.0)
+                .map(|c| (c.resource_id_base, c.resource_id_mask))
+            else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let used = state.used_xids_in(base, mask);
+            let (start_id, count) = largest_free_xid_gap(base, mask, &used);
+            log::info!(
+                "client {} XC-MISC GetXIDRange → start=0x{start_id:x} count={count} \
+                 ({} ids in use)",
+                client_id.0,
+                used.len(),
+            );
+            let mut buf: Vec<u8> = Vec::with_capacity(32);
+            x11::write_xcmisc_get_xid_range_reply(&mut buf, byte_order, sequence, start_id, count)?;
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            Ok(write_to_client(client, client_id, &buf))
+        }
+        // GetXIDList — req 8 bytes: count(4).
+        2 => {
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let want = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let Some((base, mask)) = state
+                .clients
+                .get(&client_id.0)
+                .map(|c| (c.resource_id_base, c.resource_id_mask))
+            else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // Clamp to the range size — never allocate
+            // client-controlled gigabytes (explicit Xorg deviation,
+            // spec "Edge cases"; Xorg would BadAlloc instead).
+            let limit = u64::from(want).min(u64::from(mask) + 1);
+            let mut ids: Vec<u32> = Vec::new();
+            let lo = base.max(1);
+            let hi = base | mask;
+            let mut id = lo;
+            while ids.len() < limit as usize {
+                if !state.xid_occupied(id) {
+                    ids.push(id);
+                }
+                if id == hi {
+                    break;
+                }
+                id += 1;
+            }
+            log::info!(
+                "client {} XC-MISC GetXIDList want={want} → {} ids",
+                client_id.0,
+                ids.len(),
+            );
+            let mut buf: Vec<u8> = Vec::with_capacity(32 + ids.len() * 4);
+            x11::write_xcmisc_get_xid_list_reply(&mut buf, byte_order, sequence, &ids)?;
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            Ok(write_to_client(client, client_id, &buf))
+        }
+        other => emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(other),
+            header.opcode,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -40885,5 +41093,158 @@ mod tests {
             s.contains("GLX_SGIX_fbconfig"),
             "glx_extension_string must contain GLX_SGIX_fbconfig when supported"
         );
+    }
+
+    // NOTE: the 3rd argument is the SEQUENCE number, not a client id —
+    // every request in these tests comes from ClientId(1).
+    fn send_xcmisc(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        seq: u16,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(seq),
+            RequestHeader {
+                opcode: 152,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    #[test]
+    fn xcmisc_get_version_replies_1_1() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // GetVersion body: client major(2), minor(2) — values ignored.
+        let body = [0u8, 0, 0, 0];
+        send_xcmisc(&mut state, &mut backend, 1, 0, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "fixed 32-byte reply, got {bytes:02x?}");
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(&bytes[2..4], &1u16.to_le_bytes(), "sequence");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "major=1");
+        assert_eq!(&bytes[10..12], &1u16.to_le_bytes(), "minor=1");
+    }
+
+    #[test]
+    fn xcmisc_bad_length_and_unknown_minor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // GetVersion with wrong body size → BadLength.
+        send_xcmisc(&mut state, &mut backend, 1, 0, &[0u8; 8]);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+        assert_eq!(bytes[10], 152, "major opcode");
+        assert_eq!(&bytes[8..10], &0u16.to_le_bytes(), "minor 0 echoed");
+        // Unknown minor 3 → BadRequest (Xorg dispatcher default).
+        send_xcmisc(&mut state, &mut backend, 2, 3, &[]);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_REQUEST);
+        assert_eq!(&bytes[8..10], &3u16.to_le_bytes(), "minor 3 echoed");
+    }
+
+    #[test]
+    fn xcmisc_advertised_in_query_and_list_extensions() {
+        // QueryExtension "XC-MISC" → present with major 152; covered via
+        // extension_query_reply + advertised_extension_names directly
+        // (cheaper than wire round-trips; they are what the handlers use).
+        let mut backend = RecordingBackend::new();
+        let reply = extension_query_reply("XC-MISC", &mut backend);
+        assert_eq!(reply, Some((152, 0, 0)));
+        assert!(advertised_extension_names(&mut backend).contains(&"XC-MISC"));
+    }
+
+    #[test]
+    fn xcmisc_get_xid_range_skips_used_ids() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Give the test client a realistic base/mask (install_client
+        // defaults to base=0, mask=u32::MAX).
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0010_0000;
+            c.resource_id_mask = 0x000F_FFFF;
+        }
+        // Occupy the low end of the range.
+        for i in 0..4u32 {
+            state
+                .resources
+                .create_cursor(ClientId(1), ResourceId(0x0010_0000 + i));
+        }
+        send_xcmisc(&mut state, &mut backend, 1, 1, &[]);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 1);
+        let start = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(start, 0x0010_0004, "range starts after the used prefix");
+        assert_eq!(count, 0x000F_FFFF - 4 + 1);
+        // Wrong length → BadLength.
+        send_xcmisc(&mut state, &mut backend, 2, 1, &[0u8; 4]);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+    }
+
+    #[test]
+    fn xcmisc_get_xid_list_returns_free_ids() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0010_0000;
+            c.resource_id_mask = 0x000F_FFFF;
+        }
+        // Occupy ids 0,2 in the range; ask for 4 ids.
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x0010_0000));
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x0010_0002));
+        send_xcmisc(&mut state, &mut backend, 1, 2, &4u32.to_le_bytes());
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32 + 16, "32 header + 4 ids");
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(count, 4);
+        let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(length, 4, "reply length in words = id count");
+        let ids: Vec<u32> = bytes[32..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![0x0010_0001, 0x0010_0003, 0x0010_0004, 0x0010_0005],
+            "skips occupied 0x...0 and 0x...2"
+        );
+        // Huge count is clamped to the RANGE size, not allocated. Shrink
+        // the client's range first so the reply stays ~1 KiB — a 1M-id
+        // reply would block the test's unread socketpair (write_or_buffer
+        // does a synchronous write; OUTBOUND_CAP would trip the
+        // disconnect path).
+        state.clients.get_mut(&1).unwrap().resource_id_mask = 0xFF;
+        send_xcmisc(&mut state, &mut backend, 2, 2, &u32::MAX.to_le_bytes());
+        let bytes = read_all_available(&mut peer);
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(count, 0x100 - 2, "256-id range minus 2 occupied");
+        // BadLength on wrong size.
+        send_xcmisc(&mut state, &mut backend, 3, 2, &[]);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
     }
 }

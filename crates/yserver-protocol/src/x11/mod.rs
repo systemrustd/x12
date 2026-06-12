@@ -5597,6 +5597,60 @@ pub fn write_render_query_version_reply(
     writer.write_all(&out)
 }
 
+/// XC-MISC GetVersion reply — fixed 32 bytes, version 1.1 (Xorg
+/// echoes its own version regardless of the client's ask).
+/// `major`/`minor` are u16 on the wire (unlike RENDER QueryVersion's
+/// u32).
+pub fn write_xcmisc_get_version_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // reply length
+    write_u16(byte_order, &mut out, 1); // major
+    write_u16(byte_order, &mut out, 1); // minor
+    out.extend_from_slice(&[0u8; 20]); // pad to 32 bytes
+    writer.write_all(&out)
+}
+
+/// XC-MISC GetXIDRange reply — fixed 32 bytes.
+pub fn write_xcmisc_get_xid_range_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    start_id: u32,
+    count: u32,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // reply length
+    write_u32(byte_order, &mut out, start_id);
+    write_u32(byte_order, &mut out, count);
+    out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
+    writer.write_all(&out)
+}
+
+/// XC-MISC GetXIDList reply — 32-byte header + ids (1 word each).
+pub fn write_xcmisc_get_xid_list_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    ids: &[u32],
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(byte_order, &mut out, sequence.0);
+    let n = u32::try_from(ids.len()).map_err(|_| io::Error::other("id list too long"))?;
+    write_u32(byte_order, &mut out, n); // reply length in words = id count
+    write_u32(byte_order, &mut out, n); // count
+    out.extend_from_slice(&[0u8; 20]); // pad to 32 bytes
+    for id in ids {
+        write_u32(byte_order, &mut out, *id);
+    }
+    writer.write_all(&out)
+}
+
 pub mod error {
     pub const BAD_REQUEST: u8 = 1;
     pub const BAD_VALUE: u8 = 2;
