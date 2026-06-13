@@ -113,10 +113,6 @@ xserver-command=/usr/local/bin/yserver
 
 The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
 
-Known limitation: **VT switching does not work** in a lightdm-launched session
-yet — yserver runs rootful without a logind session there, so it can't use
-libseat for VT control ([#10](https://github.com/joske/yserver/issues/10)).
-
 ## Use directly on TTY
 
 ```sh
@@ -126,14 +122,11 @@ just startx
 
 which will start yserver and then execute your `~/.xinitrc` (or fall back to `/etc/X11/xinit/xinitrc`)
 
-    If you are using libseat, you can switch VT, but if you use direct, you CAN NOT switch VT when yserver is running. Zap the server, or log out of your session otherwise.
-
-
 Some convenience keybinds are available:
 
 - Ctrl-Alt-Backspace: zap the server, return to console
 - Ctrl-Alt-Enter: create a screenshot/scanout of the framebuffer in CWD
-- Ctrl-Alt-F12: dump all drawables as PPM files to CWD
+- Ctrl-Alt-D: dump all drawables as PPM files to CWD
 
 ## Regression coverage with xts5 and rendercheck
 
