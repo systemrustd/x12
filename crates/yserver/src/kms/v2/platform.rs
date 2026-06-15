@@ -512,11 +512,11 @@ pub(crate) struct PlatformBackend {
     // Input side
     input_ctx: Option<crate::input::SendContext>,
 
-    /// Stage 5 Task 6.1: inner epoll FD aggregating per-batch
+    /// Stage 5 Task 6.1: inner poll FD aggregating per-batch
     /// sync_file FDs for deferred PRESENT completion. Exposed via
     /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
-    pub(crate) present_completion_epfd: nix::sys::epoll::Epoll,
+    pub(crate) present_completion_epfd: crate::kms::v2::completion_poller::CompletionPoller,
 
     /// Stage 5 Task 6.1: eventfd used to wake the main loop when a
     /// PRESENT completion is enqueued. Registered with
@@ -784,27 +784,21 @@ impl PlatformBackend {
                 }
             };
 
-        // Stage 5 Task 6.1: backend-internal epoll FD + wakeup
+        // Stage 5 Task 6.1: backend-internal poll FD + wakeup
         // eventfd for deferred PRESENT completion. The eventfd lives
-        // inside the epfd under `WAKEUP_EVENTFD_TOKEN`; per-entry
-        // sync_file FDs join the epfd later via the enqueue path.
-        let present_completion_epfd =
-            nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
-                .map_err(|e| io::Error::other(format!("epoll_create1: {e}")))?;
+        // inside the poll set under `WAKEUP_EVENTFD_TOKEN`; per-entry
+        // sync_file FDs join later via the enqueue path.
         let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
             0,
             nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
         )
         .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
-        present_completion_epfd
-            .add(
-                &wakeup_eventfd,
-                nix::sys::epoll::EpollEvent::new(
-                    nix::sys::epoll::EpollFlags::EPOLLIN,
-                    WAKEUP_EVENTFD_TOKEN,
-                ),
-            )
-            .map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
+
+        // Backend-internal readiness set (epoll/kqueue). The wakeup
+        // eventfd joins it under WAKEUP_EVENTFD_TOKEN; per-batch
+        // sync_file FDs are added later via the enqueue path.
+        let present_completion_epfd = crate::kms::v2::completion_poller::CompletionPoller::new()?;
+        present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
 
         let submit_group = SubmitGroup::new();
 
@@ -850,23 +844,17 @@ impl PlatformBackend {
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
-        let present_completion_epfd =
-            nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
-                .expect("test epoll");
         let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
             0,
             nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
         )
         .expect("test eventfd");
+
+        let present_completion_epfd =
+            crate::kms::v2::completion_poller::CompletionPoller::new().expect("test poller");
         present_completion_epfd
-            .add(
-                &wakeup_eventfd,
-                nix::sys::epoll::EpollEvent::new(
-                    nix::sys::epoll::EpollFlags::EPOLLIN,
-                    WAKEUP_EVENTFD_TOKEN,
-                ),
-            )
-            .expect("test epoll_ctl");
+            .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
+            .expect("test poller register");
         Self {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
@@ -1272,7 +1260,7 @@ impl PlatformBackend {
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.
         fds.push((
-            self.present_completion_epfd.0.as_raw_fd(),
+            self.present_completion_epfd.as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
         fds
