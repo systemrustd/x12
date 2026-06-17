@@ -2999,12 +2999,12 @@ impl RenderEngine {
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
         target: DrawableId,
-        function: yserver_core::backend::GcFunction,
+        function: x12_core::backend::GcFunction,
         opaque_alpha: bool,
         fg: u32,
         rects: &[Rectangle16],
     ) -> Result<(), RenderError> {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
 
         // N9 order: empty-input fast-paths → renderer_failed →
         // flush_render_batch → preflight → cache ensure → open →
@@ -9728,7 +9728,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn logic_fill_xor_applies_per_pixel() {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
 
         let Some(mut platform) = live_platform() else {
             eprintln!("no VkContext available — skipping");
@@ -9944,7 +9944,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
 
         let Some(mut platform) = live_platform() else {
             eprintln!("no VkContext available — skipping");
@@ -10025,7 +10025,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn logic_fill_r8_not_family_matches_x11_bytes() {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
 
         let Some(mut platform) = live_platform() else {
             eprintln!("no VkContext available — skipping");

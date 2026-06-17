@@ -14,7 +14,7 @@ use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
-use yserver_core::{
+use x12_core::{
     backend::Backend,
     core_loop::{self, Message, poll_tokens::ClientIdAllocator},
     resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
@@ -23,7 +23,7 @@ use yserver_core::{
 
 fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend) {
     if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
-        root.host_xid = yserver_core::backend::WindowHandle::from_raw(backend.window_id());
+        root.host_xid = x12_core::backend::WindowHandle::from_raw(backend.window_id());
     }
     state
         .resources
@@ -227,7 +227,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the same amount — wedging menu close paths that ungrab with
     // saved press timestamps.
     crate::clock::init(state.start_instant);
-    state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
+    state.dpms = x12_core::server::DpmsState::new(backend.dpms_capable());
     state.glx_tfp_supported = backend.supports_dmabuf_export();
     install_backend_root_bindings(&mut state, &backend);
 
@@ -434,7 +434,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // shutdown drain — events must reach clients before we tear down
     // the socket.
     for entry in backend.take_shutdown_present_events() {
-        yserver_core::core_loop::process_request::fire_present_completion_events(
+        x12_core::core_loop::process_request::fire_present_completion_events(
             &mut state, &entry,
         );
     }
@@ -649,7 +649,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 #[cfg(test)]
 mod tests {
     use super::install_backend_root_bindings;
-    use yserver_core::{
+    use x12_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,

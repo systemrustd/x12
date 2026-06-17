@@ -28,7 +28,7 @@ use std::{
 use x12_protocol::x11::{
     CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
 };
-use yserver_core::{
+use x12_core::{
     backend::{
         ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode,
         params::{ArcMode, CapStyle, JoinStyle, LineStyle},

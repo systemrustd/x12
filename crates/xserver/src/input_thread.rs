@@ -31,7 +31,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 #[cfg(target_os = "freebsd")]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use yserver_core::{
+use x12_core::{
     core_loop::{
         CoreSender, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
         SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP,
@@ -737,7 +737,7 @@ mod tests {
         LINUX_KEY_BACKSPACE, LINUX_KEY_D, LINUX_KEY_ENTER, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
-    use yserver_core::core_loop::channel;
+    use x12_core::core_loop::channel;
 
     #[test]
     fn maps_relative_motion_to_clamped_absolute() {

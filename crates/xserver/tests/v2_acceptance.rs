@@ -24,7 +24,7 @@
 
 use x12_protocol::x11::ClipRectangles;
 use yserver::kms::v2::KmsBackendV2;
-use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
+use x12_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
 
 /// Acceptance sequence:
 /// 1. create_pixmap (depth=32, 8×8)
@@ -614,7 +614,7 @@ fn v2_fill_tiled_xor_with_reversed_tile_matches_solid_xor() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_root_fill_with_include_inferiors_matches_top_level_result() {
-    use yserver_core::{
+    use x12_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
@@ -1119,7 +1119,7 @@ fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_subwindow_resize_clears_old_paint() {
-    use yserver_core::{
+    use x12_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
@@ -1478,7 +1478,7 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -1562,7 +1562,7 @@ fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
-    use yserver_core::{
+    use x12_core::{
         backend::WindowHandle,
         host_x11::{HostSubwindowConfig, HostSubwindowVisual},
     };
@@ -1647,7 +1647,7 @@ fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -1839,7 +1839,7 @@ fn v2_set_redirected_target_routes_fill_to_backing() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -1961,7 +1961,7 @@ fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2012,7 +2012,7 @@ fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_allocate_redirected_backing_is_idempotent() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2042,7 +2042,7 @@ fn v2_allocate_redirected_backing_is_idempotent() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_name_window_pixmap_returns_existing_backing() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2073,7 +2073,7 @@ fn v2_name_window_pixmap_returns_existing_backing() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_name_window_pixmap_without_redirect_errors_not_found() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2099,7 +2099,7 @@ fn v2_name_window_pixmap_without_redirect_errors_not_found() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2143,7 +2143,7 @@ fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_redirect_seed_uses_parent_content_at_w_position() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2220,7 +2220,7 @@ fn v2_redirect_seed_uses_parent_content_at_w_position() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_release_redirected_backing_survives_named_alias() {
-    use yserver_core::backend::WindowHandle;
+    use x12_core::backend::WindowHandle;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2273,7 +2273,7 @@ fn v2_release_redirected_backing_survives_named_alias() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_automatic_redirect_backing_is_scene_participating() {
-    use yserver_core::backend::{PixmapHandle, WindowHandle};
+    use x12_core::backend::{PixmapHandle, WindowHandle};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -2371,7 +2371,7 @@ fn v2_automatic_redirect_backing_is_scene_participating() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_mode_flip_preserves_backing_and_aliases() {
-    use yserver_core::backend::{PixmapHandle, WindowHandle};
+    use x12_core::backend::{PixmapHandle, WindowHandle};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -3054,7 +3054,7 @@ fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
     // by the host_x11/ynest path; KMS dispatch goes
     // `handle_change_gc -> resolve_draw_state ->
     // backend.apply_clip_state(&ClipState::Pixmap)`.
-    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+    use x12_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
     let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
     b.apply_clip_state(
         None,
@@ -3134,13 +3134,13 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
         b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
             .expect("copy_area");
         b.enqueue_present_completion(
-            yserver_core::backend::CompletedPresentEvent {
+            x12_core::backend::CompletedPresentEvent {
                 client_id: x12_protocol::x11::ClientId(0),
                 serial,
                 host_xid: src.as_raw(),
                 dst_host_xid: cow.as_raw(),
                 options: 0,
-                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                wake: x12_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             cow.as_raw(),
         );
@@ -3173,7 +3173,7 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
-    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    use x12_core::backend::{CompletedPresentEvent, PresentWake};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -3213,7 +3213,7 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
-    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    use x12_core::backend::{CompletedPresentEvent, PresentWake};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -3252,7 +3252,7 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_disable_output_flushes_pending_batches_before_drain_all() {
-    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    use x12_core::backend::{CompletedPresentEvent, PresentWake};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -3318,7 +3318,7 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
 #[test]
 #[ignore = "lavapipe vk"]
 fn submit_group_flushes_before_non_cow_present_completion_signal() {
-    use yserver_core::backend::{Backend, CompletedPresentEvent, PresentWake};
+    use x12_core::backend::{Backend, CompletedPresentEvent, PresentWake};
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -3415,7 +3415,7 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
 #[test]
 #[ignore = "lavapipe vk"]
 fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
-    use yserver_core::backend::Backend;
+    use x12_core::backend::Backend;
 
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -3605,7 +3605,7 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     // Register the Composite Overlay Window so that copy_area to the
     // COW xid routes through engine.cow_copy_area (opens cow_batch).
     b.get_overlay_window(None).expect("get_overlay_window");
-    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let cow_xid = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
 
     // Source pixmap (small: 8×8, depth 32).
     let src = b.create_pixmap(None, 32, 8, 8).expect("src pixmap");
@@ -5053,7 +5053,7 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
     // Both calls must accumulate into the same open frame.
     be.engine_logic_fill_for_tests(
         dst,
-        yserver_core::backend::GcFunction::Xor,
+        x12_core::backend::GcFunction::Xor,
         /* opaque_alpha */ true,
         0xFF00FF,
         &rects,
@@ -5061,7 +5061,7 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
     .expect("first logic_fill");
     be.engine_logic_fill_for_tests(
         dst,
-        yserver_core::backend::GcFunction::And,
+        x12_core::backend::GcFunction::And,
         true,
         0x00FF00,
         &rects,
@@ -5981,7 +5981,7 @@ fn v2_read_depth1_pixmap_declines_depth32() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_two_fills_then_get_image_returns_second_fill() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -6072,7 +6072,7 @@ fn v2_two_fills_then_get_image_returns_second_fill() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_compose_then_fill_then_get_image_returns_second_fill() {
-    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
     let mut b = match KmsBackendV2::for_tests_with_vk_live_scene() {
         Ok(b) => b,

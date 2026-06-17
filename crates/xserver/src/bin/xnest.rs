@@ -71,7 +71,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match yserver_core::nested::run(args.display, args.width, args.height) {
+    match x12_core::nested::run(args.display, args.width, args.height) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log::error!("ynest: {err}");

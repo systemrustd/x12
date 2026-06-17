@@ -44,7 +44,7 @@ use std::{
 };
 
 use ash::vk;
-use yserver_core::backend::BackendFdKind;
+use x12_core::backend::BackendFdKind;
 
 use crate::{
     drm,
@@ -2770,7 +2770,7 @@ mod tests {
         // required to exercise the inner-epoll FD.
         let p = PlatformBackend::for_tests();
         let fds = p.poll_fds();
-        let present_kind = yserver_core::backend::BackendFdKind::PresentCompletion;
+        let present_kind = x12_core::backend::BackendFdKind::PresentCompletion;
         assert!(
             fds.iter().any(|(_, k)| *k == present_kind),
             "platform.poll_fds() must report a PresentCompletion FD"

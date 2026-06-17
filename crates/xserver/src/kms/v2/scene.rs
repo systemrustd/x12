@@ -4594,7 +4594,7 @@ mod tests {
         core.top_level_order.push(0xA1);
 
         // COW host xid @ (0, 0), 800×600 — matches PlatformBackend::for_tests output.
-        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_xid: u32 = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
             &mut windows_v2,
@@ -4677,7 +4677,7 @@ mod tests {
         let platform = PlatformBackend::for_tests();
         let mut windows_v2 = super::super::backend::WindowsV2Map::new();
 
-        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_xid: u32 = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
             &mut windows_v2,
@@ -4910,7 +4910,7 @@ mod tests {
         // PlatformBackend::for_tests output extent). This stands in for
         // GetOverlayWindow having created the windows_v2 entry +
         // top_level_order slot (Task 2.2).
-        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_xid: u32 = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
             &mut windows_v2,

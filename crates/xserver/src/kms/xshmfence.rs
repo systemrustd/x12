@@ -121,7 +121,7 @@ impl std::fmt::Debug for FenceMapping {
     }
 }
 
-impl yserver_core::backend::XshmfenceHandle for FenceMapping {
+impl x12_core::backend::XshmfenceHandle for FenceMapping {
     fn trigger(&self) -> std::io::Result<()> {
         self.trigger_io()
     }

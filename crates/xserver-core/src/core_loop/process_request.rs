@@ -685,7 +685,7 @@ fn activate_redirect_backing_for(
             // tray diag once the redirect-backing race is fixed.
             if std::env::var_os("YSERVER_TRAY_DEBUG").is_some() {
                 log::info!(
-                    target: "yserver_core::core_loop::tray",
+                    target: "x12_core::core_loop::tray",
                     "TRAY redirect-alloc win=0x{:x} backing={w_width}x{w_height}d{w_depth} mode={mode:?}",
                     window.0,
                 );
@@ -5406,7 +5406,7 @@ fn handle_damage_request(
                     .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
                 if seed_initial_damage {
                     log::trace!(
-                        target: "yserver_core::core_loop::damage_fanout",
+                        target: "x12_core::core_loop::damage_fanout",
                         "damage_create_seed_full: damage=0x{:x} drawable=0x{:x} level={}",
                         damage,
                         drawable,
@@ -14808,7 +14808,7 @@ fn handle_configure_window(
         if geometry_changed && let Some(mode) = effective_redirect_mode_for_window(state, window_id)
         {
             log::trace!(
-                target: "yserver_core::core_loop::damage_fanout",
+                target: "x12_core::core_loop::damage_fanout",
                 "configure_damage_emit: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} mode={:?} mask=0x{:x}",
                 window_id.0,
                 geometry.x,
@@ -14823,7 +14823,7 @@ fn handle_configure_window(
             let _dropped = accumulate_damage_full_to_state(state, window_id);
         } else {
             log::trace!(
-                target: "yserver_core::core_loop::damage_fanout",
+                target: "x12_core::core_loop::damage_fanout",
                 "configure_damage_skip: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} geometry_changed={} mask=0x{:x}",
                 window_id.0,
                 geometry.x,
@@ -19810,7 +19810,7 @@ fn copy_area_effective_dst_rects(
             .collect();
         if current.is_empty() {
             log::debug!(
-                target: "yserver_core::core_loop",
+                target: "x12_core::core_loop",
                 "copy_area clip empty after GC clip dst=0x{:x} req=({},{}) {}x{} subwindow_mode={:?} gc_clip_rects={:?}",
                 dst_id.0,
                 req.dst_x,
@@ -19882,7 +19882,7 @@ fn copy_area_effective_dst_rects(
         if current.is_empty() {
             let redirect_mode = effective_redirect_mode_for_window(state, dst_id);
             log::debug!(
-                target: "yserver_core::core_loop",
+                target: "x12_core::core_loop",
                 "copy_area clip empty after ClipByChildren dst=0x{:x} req=({},{}) {}x{} subwindow_mode={:?} \
                  redirect_mode={:?} gc_clip_rects={:?} child_rects={:?}",
                 dst_id.0,

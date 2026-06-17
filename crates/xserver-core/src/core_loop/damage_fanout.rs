@@ -146,7 +146,7 @@ pub fn log_clip_by_children_debug(
         }
     }
     log::info!(
-        target: "yserver_core::core_loop::tray",
+        target: "x12_core::core_loop::tray",
         "TRAY {op} win=0x{:x} geom={}x{}@{},{} {:?} redirect={} requested={} clipped={} children={{{}}}",
         drawable.0,
         w.width,
@@ -501,7 +501,7 @@ fn accumulate_at_level(
     // - "no entry for W" (paint handler isn't calling accumulate at
     //   all for that path — hypothesis 1).
     // Logged unconditionally at trace; enable with
-    // `yserver_core::core_loop::damage_fanout=trace` in `RUST_LOG`.
+    // `x12_core::core_loop::damage_fanout=trace` in `RUST_LOG`.
     let fired_count = damage_ids
         .iter()
         .filter(|id| {

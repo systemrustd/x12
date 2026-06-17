@@ -35,7 +35,7 @@ use input::{
     AccelProfile, ClickMethod, Device, DragLockState, ScrollButtonLockState, ScrollMethod,
     SendEventsMode, TapButtonMap,
 };
-use yserver_core::{
+use x12_core::{
     core_loop::message::{
         BitFlags2, BoolSetting, FloatSetting, LibinputConfigSnapshot, OneHot2, OneHot3, U32Setting,
     },

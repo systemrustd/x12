@@ -14,7 +14,7 @@ use yserver::kms::{
     v2::KmsBackendV2,
     vk::{device::VkContext, dri3::DmabufExport},
 };
-use yserver_core::backend::Backend;
+use x12_core::backend::Backend;
 
 #[test]
 #[ignore = "requires a Vulkan device"]
@@ -327,7 +327,7 @@ fn export_sync_file_write_scope_is_idle_on_fresh_buffer() {
 #[ignore = "requires a Vulkan device"]
 fn dri3_export_promotes_server_owned_pixmap() {
     use std::os::fd::AsRawFd;
-    use yserver_core::backend::Backend;
+    use x12_core::backend::Backend;
 
     let mut backend = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -507,7 +507,7 @@ fn export_only_entry_is_cleaned_up_at_free_pixmap() {
 #[test]
 #[ignore = "requires a Vulkan device"]
 fn exported_drawable_write_then_flush_runs_sync_publish() {
-    use yserver_core::backend::Backend;
+    use x12_core::backend::Backend;
 
     let mut backend = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,

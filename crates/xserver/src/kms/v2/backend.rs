@@ -27,7 +27,7 @@ use x12_protocol::x11::{
     AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
     ResourceId, xfixes,
 };
-use yserver_core::{
+use x12_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, OriginContext, PictureHandle,
@@ -278,7 +278,7 @@ pub struct KmsBackendV2 {
     /// socket is torn down. Populated only by `disable_output`;
     /// drained by `take_shutdown_present_events`.
     pub(crate) pending_completed_events_on_shutdown:
-        Vec<yserver_core::backend::CompletedPresentEvent>,
+        Vec<x12_core::backend::CompletedPresentEvent>,
 
     /// Stage 5 Phase A — canonical cursor xid → immutable record map.
     /// Inserted by `create_cursor` / `create_glyph_cursor` /
@@ -368,7 +368,7 @@ pub struct KmsBackendV2 {
     /// Core-channel sender for emitting Shutdown/Dump messages from the
     /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
     /// after the channel is created in `lib.rs`.
-    input_sender: Option<yserver_core::core_loop::CoreSender>,
+    input_sender: Option<x12_core::core_loop::CoreSender>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
@@ -507,7 +507,7 @@ impl KmsBackendV2 {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
         let reply = self.get_image(None, host_xid, format, x, y, width, height, plane_mask)?;
         Ok(reply.map(|r| {
             assert!(r.len() >= 32, "v2 GetImage reply missing 32-byte header");
@@ -1556,7 +1556,7 @@ impl KmsBackendV2 {
         &self,
         backing_xid: u32,
     ) -> Option<crate::kms::core::AliasEntry> {
-        let handle = yserver_core::backend::PixmapHandle::from_raw(backing_xid)?;
+        let handle = x12_core::backend::PixmapHandle::from_raw(backing_xid)?;
         self.core.alias_registry.get(handle).copied()
     }
 
@@ -2356,9 +2356,9 @@ impl KmsBackendV2 {
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
-    pub fn randr_outputs(&self) -> Vec<yserver_core::randr::RandrOutput> {
+    pub fn randr_outputs(&self) -> Vec<x12_core::randr::RandrOutput> {
         use std::collections::HashMap;
-        use yserver_core::randr::RandrOutput;
+        use x12_core::randr::RandrOutput;
         let n = self.platform.outputs.len();
         let mut mode_ids: HashMap<(u16, u16, u32), u32> = HashMap::new();
         #[allow(clippy::cast_possible_truncation)]
@@ -2849,7 +2849,7 @@ impl KmsBackendV2 {
     #[doc(hidden)]
     pub fn drain_completed_present_events_for_tests(
         &mut self,
-    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
         self.drain_completed_present_events_impl()
     }
 
@@ -3568,7 +3568,7 @@ impl KmsBackendV2 {
     pub fn engine_logic_fill_for_tests(
         &mut self,
         dst_xid: u32,
-        function: yserver_core::backend::GcFunction,
+        function: x12_core::backend::GcFunction,
         opaque_alpha: bool,
         fg: u32,
         rects: &[crate::kms::cpu_types::Rectangle16],
@@ -3664,7 +3664,7 @@ impl KmsBackendV2 {
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
         use x12_protocol::x11::ClientId;
-        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+        use x12_core::backend::{CompletedPresentEvent, PresentWake};
 
         let Some(dst_id) = self.store.lookup(dst_xid) else {
             return false;
@@ -3873,7 +3873,7 @@ impl KmsBackendV2 {
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
         use x12_protocol::x11::ClientId;
-        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+        use x12_core::backend::{CompletedPresentEvent, PresentWake};
 
         let cow_id = match self.cow_id {
             Some(id) => id,
@@ -3908,7 +3908,7 @@ impl KmsBackendV2 {
     /// fan them out to clients before tearing down the socket.
     pub fn take_shutdown_present_events(
         &mut self,
-    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
         std::mem::take(&mut self.pending_completed_events_on_shutdown)
     }
 
@@ -3930,7 +3930,7 @@ impl KmsBackendV2 {
     fn fire_pending_present_entry(
         &mut self,
         entry: crate::kms::v2::present_completion::PendingPresentEntry,
-    ) -> yserver_core::backend::CompletedPresentEvent {
+    ) -> x12_core::backend::CompletedPresentEvent {
         use crate::kms::v2::present_completion::PinnedWake;
 
         match &entry.wake_pin {
@@ -4069,7 +4069,7 @@ impl KmsBackendV2 {
 
     fn force_drain_all_present_batches(
         &mut self,
-    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
         let mut completed = Vec::new();
         while let Some(batch) = self.pending_present_batches.pop_front() {
             self.unregister_present_batch_fd(&batch);
@@ -4088,7 +4088,7 @@ impl KmsBackendV2 {
     /// Arc-pinned handles and returns the public event payloads.
     fn drain_completed_present_events_impl(
         &mut self,
-    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
         self.drain_engine_present_batches();
         // Drain the wakeup_eventfd to clear it. nix's EventFd::read
         // returns Ok(u64) with the accumulated counter; Err(EAGAIN)
@@ -4429,7 +4429,7 @@ impl KmsBackendV2 {
     ///
     /// Caller is `run_suspend`.
     fn synthesize_held_releases(&mut self, state: &mut ServerState) {
-        use yserver_core::core_loop::{
+        use x12_core::core_loop::{
             key_fanout::key_event_fanout_to_state, pointer_fanout::pointer_event_fanout_to_state,
         };
 
@@ -4566,7 +4566,7 @@ impl KmsBackendV2 {
                     break;
                 }
                 let time_ms = crate::clock::server_time_ms();
-                let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
+                let mut scroll_buf: Vec<x12_core::core_loop::HostInputEvent> = Vec::new();
                 for ev in evs {
                     // Hotkeys are irrelevant mid-suspend; just update input
                     // state via the normal mapping + fanout so down_keys and
@@ -4576,12 +4576,12 @@ impl KmsBackendV2 {
                     if let crate::input::InputEvent::DeviceAdded(info) = ev {
                         self.on_host_input(
                             state,
-                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                            x12_core::core_loop::HostInputEvent::DeviceAdded(info),
                         );
                     } else if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
                         self.on_host_input(
                             state,
-                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                            x12_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
                         );
                     } else if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev
                     {
@@ -4794,7 +4794,7 @@ impl KmsBackendV2 {
     /// dispatch failure (Risk #7).
     fn request_exit(&self) {
         if let Some(s) = &self.input_sender {
-            let _ = s.send(yserver_core::core_loop::Message::Shutdown);
+            let _ = s.send(x12_core::core_loop::Message::Shutdown);
         } else {
             log::error!("kms: request_exit: no input_sender — cannot signal shutdown");
         }
@@ -5101,7 +5101,7 @@ impl KmsBackendV2 {
         let root_container_host = self.core.window_id;
         let resolve_host_to_nested = |host: u32, xid_map: &HostXidMap| -> Option<ResourceId> {
             if host == root_container_host {
-                Some(yserver_core::resources::ROOT_WINDOW)
+                Some(x12_core::resources::ROOT_WINDOW)
             } else {
                 xid_map.get(&host).copied()
             }
@@ -5118,14 +5118,14 @@ impl KmsBackendV2 {
         );
 
         if let (Some(from), Some(to)) = (prev_id, new_id) {
-            let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
+            let events = x12_core::crossings::normal_mode_crossings(server_state, from, to);
             log::trace!(
                 target: "yserver::kms::v2::pointer",
                 "upw: normal_mode_crossings(from={}, to={}) → {} events",
                 from.0, to.0, events.len()
             );
             for ev in events {
-                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
+                let win_host_xid = if ev.window == x12_core::resources::ROOT_WINDOW {
                     self.core.window_id
                 } else {
                     server_state
@@ -5135,8 +5135,8 @@ impl KmsBackendV2 {
                         .unwrap_or(new_xid)
                 };
                 let kind = match ev.kind {
-                    yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
-                    yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
+                    x12_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
+                    x12_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
                 log::trace!(
                     target: "yserver::kms::v2::pointer",
@@ -5304,7 +5304,7 @@ impl KmsBackendV2 {
             .and_then(|prev| self.core.xid_map.get(&prev).copied());
         if let (Some(focus), Some(grab)) = (focus_id, grab_id) {
             let events =
-                yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
+                x12_core::crossings::implicit_grab_crossings(server_state, focus, grab);
             for ev in events {
                 let win_host_xid = server_state
                     .resources
@@ -5312,8 +5312,8 @@ impl KmsBackendV2 {
                     .and_then(|w| w.host_xid.map(|h| h.as_raw()))
                     .unwrap_or(host_xid);
                 let kind = match ev.kind {
-                    yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
-                    yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
+                    x12_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
+                    x12_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
                 self.emit_crossing(
                     win_host_xid,
@@ -5572,8 +5572,8 @@ impl KmsBackendV2 {
     }
 
     fn property_value_by_name<'a>(
-        state: &'a yserver_core::server::ServerState,
-        window: &'a yserver_core::resources::Window,
+        state: &'a x12_core::server::ServerState,
+        window: &'a x12_core::resources::Window,
         name: &str,
     ) -> Option<&'a PropertyValue> {
         window.properties.iter().find_map(|(atom, value)| {
@@ -5586,7 +5586,7 @@ impl KmsBackendV2 {
     }
 
     fn atom_list_from_property(value: &PropertyValue) -> Option<Vec<AtomId>> {
-        if !matches!(value.format, yserver_core::properties::PropertyFormat::F32)
+        if !matches!(value.format, x12_core::properties::PropertyFormat::F32)
             || !value.data.len().is_multiple_of(4)
         {
             return None;
@@ -5601,8 +5601,8 @@ impl KmsBackendV2 {
     }
 
     fn window_stack_hint(
-        state: &yserver_core::server::ServerState,
-        window: &yserver_core::resources::Window,
+        state: &x12_core::server::ServerState,
+        window: &x12_core::resources::Window,
     ) -> Option<TopLevelStackHint> {
         let mut bottom = false;
         let mut top = false;
@@ -5647,7 +5647,7 @@ impl KmsBackendV2 {
         }
 
         if let Some(value) = Self::property_value_by_name(state, window, "WM_TRANSIENT_FOR")
-            && value.format == yserver_core::properties::PropertyFormat::F32
+            && value.format == x12_core::properties::PropertyFormat::F32
             && value.data.len() >= 4
         {
             let target =
@@ -5666,7 +5666,7 @@ impl KmsBackendV2 {
 
     fn apply_top_level_stack_hint(
         &mut self,
-        state: &yserver_core::server::ServerState,
+        state: &x12_core::server::ServerState,
         host_xid: u32,
     ) {
         if !self.core.top_level_order.contains(&host_xid) {
@@ -5674,7 +5674,7 @@ impl KmsBackendV2 {
         }
         let Some(window_id) = state
             .resources
-            .children(yserver_core::resources::ROOT_WINDOW)
+            .children(x12_core::resources::ROOT_WINDOW)
             .iter()
             .copied()
             .find(|id| {
@@ -5753,7 +5753,7 @@ impl KmsBackendV2 {
         if rects.is_empty()
             || !matches!(
                 self.core.current_subwindow_mode,
-                yserver_core::backend::SubwindowMode::ClipByChildren,
+                x12_core::backend::SubwindowMode::ClipByChildren,
             )
             || !self.windows_v2.contains_key(&host_xid)
         {
@@ -5934,7 +5934,7 @@ impl KmsBackendV2 {
     }
 
     fn fill_solid_rects(&mut self, target: PaintTarget, fg: u32, rects: &[Rectangle16]) {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
         if rects.is_empty() {
             return;
         }
@@ -6064,7 +6064,7 @@ impl KmsBackendV2 {
         id: DrawableId,
         extent: ash::vk::Extent2D,
         depth: u8,
-        function: yserver_core::backend::GcFunction,
+        function: x12_core::backend::GcFunction,
         plane_mask: u32,
         fg: u32,
         rects: &[Rectangle16],
@@ -6115,7 +6115,7 @@ impl KmsBackendV2 {
         }
         self.telemetry.record_paint_submit();
         self.trace_simple(
-            if matches!(function, yserver_core::backend::GcFunction::Copy) {
+            if matches!(function, x12_core::backend::GcFunction::Copy) {
                 SubmitKind::FillBatch
             } else {
                 SubmitKind::LogicFill
@@ -6137,7 +6137,7 @@ impl KmsBackendV2 {
         dst_id: DrawableId,
         src_rect: ash::vk::Rect2D,
         dst_pos: ash::vk::Offset2D,
-        function: yserver_core::backend::GcFunction,
+        function: x12_core::backend::GcFunction,
         plane_mask: u32,
         depth: u8,
     ) {
@@ -6255,7 +6255,7 @@ impl KmsBackendV2 {
         transfer_h: u16,
         data: &[u8],
         depth: u8,
-        function: yserver_core::backend::GcFunction,
+        function: x12_core::backend::GcFunction,
         plane_mask: u32,
     ) {
         let width = data_width;
@@ -6350,13 +6350,13 @@ impl KmsBackendV2 {
         fg: u32,
         rects: &[Rectangle16],
     ) {
-        use yserver_core::backend::{FillState, GcFunction};
+        use x12_core::backend::{FillState, GcFunction};
         if rects.is_empty() {
             return;
         }
         let include_inferiors = matches!(
             self.core.current_subwindow_mode,
-            yserver_core::backend::SubwindowMode::IncludeInferiors,
+            x12_core::backend::SubwindowMode::IncludeInferiors,
         ) && (self.windows_v2.contains_key(&host_xid)
             || host_xid == self.core.window_id);
         let inferior_work = if include_inferiors {
@@ -6406,9 +6406,9 @@ impl KmsBackendV2 {
         target: PaintTarget,
         fg: u32,
         rects: &[Rectangle16],
-        fill: &yserver_core::backend::FillState,
+        fill: &x12_core::backend::FillState,
     ) {
-        use yserver_core::backend::FillState;
+        use x12_core::backend::FillState;
 
         if rects.is_empty() {
             return;
@@ -6582,7 +6582,7 @@ impl KmsBackendV2 {
         }
         self.telemetry.record_paint_submit();
         self.trace_simple(
-            if matches!(function, yserver_core::backend::GcFunction::Copy) {
+            if matches!(function, x12_core::backend::GcFunction::Copy) {
                 SubmitKind::FillBatch
             } else {
                 SubmitKind::LogicFill
@@ -7098,7 +7098,7 @@ impl KmsBackendV2 {
         y: i32,
         chars: &[char],
     ) -> io::Result<()> {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
         let saved_function = self.core.current_function;
         self.core.current_function = GcFunction::Copy;
         if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
@@ -7841,7 +7841,7 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
             targets.push(DumpTarget {
                 label: format!(
                     "cow-0x{:x}",
-                    yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0
+                    x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0
                 ),
                 id: cow_id,
                 depth: d.depth,
@@ -8502,12 +8502,12 @@ fn write_z_pixmap_pixel(bytes: &mut [u8], depth: u8, width: u32, x: usize, y: us
 }
 
 fn apply_gc_function(
-    function: yserver_core::backend::GcFunction,
+    function: x12_core::backend::GcFunction,
     src: u32,
     dst: u32,
     mask: u32,
 ) -> u32 {
-    use yserver_core::backend::GcFunction;
+    use x12_core::backend::GcFunction;
     let op = match function {
         GcFunction::Clear => 0,
         GcFunction::And => src & dst,
@@ -8627,7 +8627,7 @@ impl KmsBackendV2 {
     /// seat disable callback).
     fn handle_core_hotkey(&mut self, hk: crate::input::hotkey::Hotkey) {
         use crate::input::hotkey::Hotkey;
-        use yserver_core::core_loop::Message;
+        use x12_core::core_loop::Message;
         match hk {
             Hotkey::Zap => {
                 log::warn!("kms: Ctrl-Alt-Backspace — requesting shutdown (zap)");
@@ -8751,7 +8751,7 @@ impl Backend for KmsBackendV2 {
         // into `pending_pointer_events`, which we drain to the
         // pointer fanout after each call so the buffer stays empty
         // between events (matches v1's contract).
-        use yserver_core::core_loop::{
+        use x12_core::core_loop::{
             HostInputEvent, key_fanout::key_event_fanout_to_state,
             pointer_fanout::pointer_event_fanout_to_state,
         };
@@ -8794,7 +8794,7 @@ impl Backend for KmsBackendV2 {
                 // 137 = the XI extension's runtime major opcode (mirrors
                 // nested.rs / process_request.rs XI2_MAJOR_OPCODE).
                 let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
                         state, 137,
                     );
                 return;
@@ -8803,7 +8803,7 @@ impl Backend for KmsBackendV2 {
                 log::info!("xi-device: removed node={device_node}");
                 state.xi_clear_touchpad(&device_node);
                 let _dropped =
-                    yserver_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
+                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
                         state, 137,
                     );
                 return;
@@ -9239,7 +9239,7 @@ impl Backend for KmsBackendV2 {
         self.vt_switching_armed
     }
 
-    fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
+    fn set_input_sender(&mut self, sender: x12_core::core_loop::CoreSender) {
         self.input_sender = Some(sender);
     }
 
@@ -9412,8 +9412,8 @@ impl Backend for KmsBackendV2 {
             }
         };
         let time_ms = crate::clock::server_time_ms();
-        let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
-        let mut pending_motion: Option<yserver_core::core_loop::HostInputEvent> = None;
+        let mut scroll_buf: Vec<x12_core::core_loop::HostInputEvent> = Vec::new();
+        let mut pending_motion: Option<x12_core::core_loop::HostInputEvent> = None;
         // Did libinput surface a device add/remove this service? If so, a
         // sibling device's libseat open may be DEFERRED by a lagging udev ACL
         // — arm a bounded retry window below. project_mouse_hotplug_lost_wakeup.
@@ -9430,7 +9430,7 @@ impl Backend for KmsBackendV2 {
                 // motion first so the cursor's last position is
                 // delivered chronologically before the hotkey effect.
                 if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
+                    x12_core::core_loop::handle_host_input(state, self, m);
                 }
                 self.handle_core_hotkey(hk);
                 continue;
@@ -9440,24 +9440,24 @@ impl Backend for KmsBackendV2 {
             if let crate::input::InputEvent::DeviceAdded(info) = ev {
                 device_change = true;
                 if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
+                    x12_core::core_loop::handle_host_input(state, self, m);
                 }
-                yserver_core::core_loop::handle_host_input(
+                x12_core::core_loop::handle_host_input(
                     state,
                     self,
-                    yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                    x12_core::core_loop::HostInputEvent::DeviceAdded(info),
                 );
                 continue;
             }
             if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
                 device_change = true;
                 if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
+                    x12_core::core_loop::handle_host_input(state, self, m);
                 }
-                yserver_core::core_loop::handle_host_input(
+                x12_core::core_loop::handle_host_input(
                     state,
                     self,
-                    yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                    x12_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
                 );
                 continue;
             }
@@ -9472,10 +9472,10 @@ impl Backend for KmsBackendV2 {
                 }
                 if !scroll_buf.is_empty() {
                     if let Some(m) = pending_motion.take() {
-                        yserver_core::core_loop::handle_host_input(state, self, m);
+                        x12_core::core_loop::handle_host_input(state, self, m);
                     }
                     for host_ev in scroll_buf.drain(..) {
-                        yserver_core::core_loop::handle_host_input(state, self, host_ev);
+                        x12_core::core_loop::handle_host_input(state, self, host_ev);
                     }
                 }
                 continue;
@@ -9487,21 +9487,21 @@ impl Backend for KmsBackendV2 {
             };
             let host = input_state.map(ev, time_ms);
             match host {
-                yserver_core::core_loop::HostInputEvent::PointerMotion { .. } => {
+                x12_core::core_loop::HostInputEvent::PointerMotion { .. } => {
                     pending_motion = Some(host);
                 }
                 non_motion => {
                     if let Some(m) = pending_motion.take() {
-                        yserver_core::core_loop::handle_host_input(state, self, m);
+                        x12_core::core_loop::handle_host_input(state, self, m);
                     }
-                    yserver_core::core_loop::handle_host_input(state, self, non_motion);
+                    x12_core::core_loop::handle_host_input(state, self, non_motion);
                 }
             }
         }
         // Flush trailing motion at the end of the dispatch batch so the
         // core sees the last cursor position before the next epoll wait.
         if let Some(m) = pending_motion.take() {
-            yserver_core::core_loop::handle_host_input(state, self, m);
+            x12_core::core_loop::handle_host_input(state, self, m);
         }
         if device_change {
             // A device add/remove just landed. The libseat open of a freshly
@@ -9543,8 +9543,8 @@ impl Backend for KmsBackendV2 {
     fn apply_device_config(
         &mut self,
         device_node: &str,
-        change: yserver_core::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), yserver_core::xinput::libinput_props::DeviceConfigError> {
+        change: x12_core::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), x12_core::xinput::libinput_props::DeviceConfigError> {
         // Libseat mode: route through the on-core libinput context's
         // device map, where `DeviceAdded` stashed the live handle.
         if let Some(ctx) = self.core_libinput.as_mut() {
@@ -9614,17 +9614,17 @@ impl Backend for KmsBackendV2 {
                 match ev {
                     crate::input::InputEvent::DeviceAdded(info) => {
                         seeded += 1;
-                        yserver_core::core_loop::handle_host_input(
+                        x12_core::core_loop::handle_host_input(
                             state,
                             self,
-                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
+                            x12_core::core_loop::HostInputEvent::DeviceAdded(info),
                         );
                     }
                     crate::input::InputEvent::DeviceRemoved { device_node } => {
-                        yserver_core::core_loop::handle_host_input(
+                        x12_core::core_loop::handle_host_input(
                             state,
                             self,
-                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
+                            x12_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
                         );
                     }
                     _ => {}
@@ -10489,7 +10489,7 @@ impl Backend for KmsBackendV2 {
                 )
             }
         };
-        let xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let xid = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         // Defensive: if a stale mapping somehow survives a prior
         // teardown (decref's PendingFence path detaches xid for us,
         // but a synchronous-destroy path could race), detach first
@@ -10524,7 +10524,7 @@ impl Backend for KmsBackendV2 {
         // hit-testing / paint resolution the same way any top-level
         // window does. The xid is the well-known protocol xid; v2
         // keys windows_v2 on host xid directly.
-        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_host_xid = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         let rank = self.alloc_window_stack_rank();
         let geom = WindowGeometryV2 {
             x: 0,
@@ -10577,7 +10577,7 @@ impl Backend for KmsBackendV2 {
             // so any in-flight build_scene observer sees a consistent
             // "COW gone" view (no dangling top_level_order entry that
             // would re-emit a CompositeDraw against the dead xid).
-            let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            let cow_host_xid = x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
             self.core.top_level_order.retain(|&x| x != cow_host_xid);
             self.windows_v2.remove(&cow_host_xid);
             self.scene.mark_scene_structure_dirty();
@@ -10603,7 +10603,7 @@ impl Backend for KmsBackendV2 {
         // The COW's host xid is the well-known protocol xid once
         // get_overlay_window has materialized; None otherwise.
         if self.cow_id.is_some() {
-            Some(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+            Some(x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
         } else {
             None
         }
@@ -10724,7 +10724,7 @@ impl Backend for KmsBackendV2 {
         // keeps the storage alive until glXDestroyPixmap.
         let export_id = self.store.lookup(host_xid);
 
-        if let Some(handle) = yserver_core::backend::PixmapHandle::from_raw(host_xid)
+        if let Some(handle) = x12_core::backend::PixmapHandle::from_raw(host_xid)
             && self.core.alias_registry.get(handle).is_some()
         {
             if self.core.alias_registry.decref(handle)
@@ -11466,7 +11466,7 @@ impl Backend for KmsBackendV2 {
         // intersect_with_current_clip_live).
         if matches!(
             self.core.current_clip,
-            yserver_core::backend::ClipState::Pixmap { .. }
+            x12_core::backend::ClipState::Pixmap { .. }
         ) {
             let local = Rectangle16 {
                 x: dst_x,
@@ -11477,7 +11477,7 @@ impl Backend for KmsBackendV2 {
             let runs = self.intersect_with_current_clip_live(&[local]);
             // Mask runs honor function/plane-mask via the CPU path
             // (Copy through apply_gc_function = src — bitwise exact).
-            use yserver_core::backend::GcFunction;
+            use x12_core::backend::GcFunction;
             let function = self.core.current_function;
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
@@ -11516,7 +11516,7 @@ impl Backend for KmsBackendV2 {
             return Ok(());
         }
         let post_gc_clip: Vec<ash::vk::Rect2D> =
-            if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
+            if let x12_core::backend::ClipState::Rectangles { origin, rects } =
                 &self.core.current_clip
             {
                 let clip_rects: Vec<ash::vk::Rect2D> = rects
@@ -11556,7 +11556,7 @@ impl Backend for KmsBackendV2 {
         // (not in `windows_v2`) also bypass child subtraction.
         let sub_rects: Vec<ash::vk::Rect2D> = if matches!(
             self.core.current_subwindow_mode,
-            yserver_core::backend::SubwindowMode::ClipByChildren,
+            x12_core::backend::SubwindowMode::ClipByChildren,
         ) && self.windows_v2.contains_key(&dst_host_xid)
         {
             let child_rects: Vec<ash::vk::Rect2D> = self
@@ -11624,7 +11624,7 @@ impl Backend for KmsBackendV2 {
         // (or a partial plane mask) takes the CPU read-modify-write
         // path. NoOp = spec-correct no-op.
         {
-            use yserver_core::backend::GcFunction;
+            use x12_core::backend::GcFunction;
             let function = self.core.current_function;
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
@@ -11918,7 +11918,7 @@ impl Backend for KmsBackendV2 {
         // non-Copy or partial plane-mask takes the CPU
         // read-modify-write path; NoOp is a spec no-op.
         {
-            use yserver_core::backend::GcFunction;
+            use x12_core::backend::GcFunction;
             let function = self.core.current_function;
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
@@ -11931,7 +11931,7 @@ impl Backend for KmsBackendV2 {
             }
             let pixmap_clip = matches!(
                 self.core.current_clip,
-                yserver_core::backend::ClipState::Pixmap { .. }
+                x12_core::backend::ClipState::Pixmap { .. }
             );
             if pixmap_clip {
                 // Bitmap clip-mask: intersect the put rect with the
@@ -14741,21 +14741,21 @@ impl Backend for KmsBackendV2 {
     fn dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
-    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
+    ) -> Option<std::sync::Arc<dyn x12_core::backend::XshmfenceHandle>> {
         self.dri3_xshmfences
             .get(&fence_xid)
             .cloned()
-            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
+            .map(|arc| arc as std::sync::Arc<dyn x12_core::backend::XshmfenceHandle>)
     }
 
     fn dri3_syncobj_handle(
         &self,
         syncobj_xid: u32,
-    ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
+    ) -> Option<std::sync::Arc<dyn x12_core::backend::SyncobjHandle>> {
         self.dri3_sync_resources
             .get(&syncobj_xid)
             .cloned()
-            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
+            .map(|arc| arc as std::sync::Arc<dyn x12_core::backend::SyncobjHandle>)
     }
 
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
@@ -14818,10 +14818,10 @@ impl Backend for KmsBackendV2 {
     /// the already-submitted copy, relying on same-queue ordering.
     fn enqueue_present_completion(
         &mut self,
-        event: yserver_core::backend::CompletedPresentEvent,
+        event: x12_core::backend::CompletedPresentEvent,
         dst_host_xid: u32,
     ) {
-        use yserver_core::backend::PresentWake;
+        use x12_core::backend::PresentWake;
 
         use crate::kms::v2::present_completion::{
             PendingPresentBatch, PendingPresentEntry, PinnedWake, PresentBatchWait,
@@ -14962,7 +14962,7 @@ impl Backend for KmsBackendV2 {
     /// body before the events are returned to the caller.
     fn drain_completed_present_events(
         &mut self,
-    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
         self.drain_completed_present_events_impl()
     }
 
@@ -15014,7 +15014,7 @@ impl Backend for KmsBackendV2 {
         Ok(reply)
     }
 
-    fn get_active_cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
+    fn get_active_cursor_image(&self) -> Option<x12_core::backend::ActiveCursorImage> {
         // Stage 5 — unblock protocol-audit #14 (`GetCursorImage`
         // returns 0×0). Source the bytes from the
         // currently-effective `Arc<CursorRecord>` and stamp the
@@ -15025,7 +15025,7 @@ impl Backend for KmsBackendV2 {
         let x = self.core.cursor_x as i16;
         #[allow(clippy::cast_possible_truncation)]
         let y = self.core.cursor_y as i16;
-        Some(yserver_core::backend::ActiveCursorImage {
+        Some(x12_core::backend::ActiveCursorImage {
             width: record.width,
             height: record.height,
             hot_x: record.hot_x,
@@ -15103,7 +15103,7 @@ impl Backend for KmsBackendV2 {
         // ("as if the user had instantaneously moved the pointer").
         self.on_host_input(
             state,
-            yserver_core::core_loop::HostInputEvent::PointerMotion { x, y, time: 0 },
+            x12_core::core_loop::HostInputEvent::PointerMotion { x, y, time: 0 },
         );
     }
 
@@ -15731,7 +15731,7 @@ mod tests {
         v2::{platform::PlatformBackend, store::Storage},
     };
     use std::collections::HashMap;
-    use yserver_core::{
+    use x12_core::{
         backend::Backend,
         properties::{PropertyFormat, PropertyValue},
         server::ServerState,
@@ -15742,7 +15742,7 @@ mod tests {
             apply_gc_function, apply_z_plane_mask, depth_plane_mask, read_z_pixmap_pixel,
             write_z_pixmap_pixel, z_to_xy_planes,
         };
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
 
         #[test]
         fn depth_plane_mask_truncates_to_depth() {
@@ -15924,13 +15924,13 @@ mod tests {
         assert!(b.next_wakeup().is_none());
 
         b.enqueue_present_completion(
-            yserver_core::backend::CompletedPresentEvent {
+            x12_core::backend::CompletedPresentEvent {
                 client_id: x12_protocol::x11::ClientId(0),
                 serial: 1,
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
                 options: 0,
-                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                wake: x12_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             0x1001,
         );
@@ -15970,13 +15970,13 @@ mod tests {
         b.scene.scene_structure_dirty = true;
 
         b.enqueue_present_completion(
-            yserver_core::backend::CompletedPresentEvent {
+            x12_core::backend::CompletedPresentEvent {
                 client_id: x12_protocol::x11::ClientId(0),
                 serial: 1,
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
                 options: 0,
-                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                wake: x12_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             0x1001,
         );
@@ -16242,7 +16242,7 @@ mod tests {
     #[test]
     fn v2_picture_record_lifecycle_exercises_every_value_mask_bit() {
         use crate::kms::core::PictureFilter;
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         // Pre-create a fake drawable xid so render_create_picture's
@@ -16365,7 +16365,7 @@ mod tests {
         use ash::vk;
 
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         // The `for_tests` fixture has no VkContext, so the
@@ -16599,7 +16599,7 @@ mod tests {
     /// teardown also drops the engine-side picture_paint slot.
     #[test]
     fn v2_set_picture_clip_rectangles_pre_shifts_by_origin() {
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16668,7 +16668,7 @@ mod tests {
     /// painting.
     #[test]
     fn v2_set_picture_clip_rectangles_empty_list_is_empty_clip_not_no_clip() {
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16734,7 +16734,7 @@ mod tests {
     /// stale scissors behind.
     #[test]
     fn change_picture_clip_origin_repositions_stored_rects() {
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16793,7 +16793,7 @@ mod tests {
     /// geometry back into picture-local coords.
     #[test]
     fn v2_set_picture_drawable_origin_persists_on_record() {
-        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+        use x12_core::backend::{AnyHandle, Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16834,7 +16834,7 @@ mod tests {
     /// have no drawable to anchor to.
     #[test]
     fn v2_set_picture_drawable_origin_no_op_on_solidfill() {
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
         // Color is fixed-size 8 bytes (BGRA u16×4).
@@ -16866,7 +16866,7 @@ mod tests {
     /// always return BadMatch even for legitimate clipped pictures.
     #[test]
     fn v2_picture_client_clip_rects_returns_set_clip() {
-        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+        use x12_core::backend::{AnyHandle, Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16913,7 +16913,7 @@ mod tests {
     /// only.
     #[test]
     fn v2_picture_client_clip_rects_window_backed_picture_with_nonzero_origin() {
-        use yserver_core::backend::{AnyHandle, Backend, WindowHandle};
+        use x12_core::backend::{AnyHandle, Backend, WindowHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let window_xid = 0xAA04_BB04;
@@ -16964,7 +16964,7 @@ mod tests {
     /// then emits BadMatch on the caller (no region to extract).
     #[test]
     fn v2_picture_client_clip_rects_returns_some_none_when_no_clip_set() {
-        use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
+        use x12_core::backend::{AnyHandle, Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let drawable =
@@ -16990,7 +16990,7 @@ mod tests {
     /// BadPicture path for sourceless pictures.
     #[test]
     fn v2_picture_client_clip_rects_outer_none_on_solidfill() {
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
         let mut color = [0u8; 8];
@@ -17189,7 +17189,7 @@ mod tests {
         // will fail since the underlying drawable xid isn't in
         // the store, so the engine call short-circuits before
         // anything reaches Vk, but the parser still walks).
-        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        use x12_core::backend::{AnyHandle, PixmapHandle};
         let dst_drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0x4242_4242).expect("PixmapHandle"));
         let dst_pic = b
@@ -17348,7 +17348,7 @@ mod tests {
     fn poly_fill_rectangle_honours_gc_clip() {
         use crate::kms::cpu_types::Rectangle16;
         use x12_protocol::x11::ClipRectangles;
-        use yserver_core::backend::ClipState;
+        use x12_core::backend::ClipState;
 
         let mut b = KmsBackendV2::for_tests();
         // Two 4×8 clip rects side-by-side starting at (5, 5), with
@@ -17405,7 +17405,7 @@ mod tests {
     /// `engine.logic_fill` rather than the pre-3f.2 short-circuit.
     #[test]
     fn gxcopy_planemask_diverts_to_logic_fill() {
-        use yserver_core::backend::GcFunction;
+        use x12_core::backend::GcFunction;
         let mut b = KmsBackendV2::for_tests();
         b.core.current_function = GcFunction::Xor;
 
@@ -17435,7 +17435,7 @@ mod tests {
     /// `clear_clip_rectangles` returns to `None`.
     #[test]
     fn set_clip_pixmap_stores_pixmap_clip() {
-        use yserver_core::backend::ClipState;
+        use x12_core::backend::ClipState;
         let mut b = KmsBackendV2::for_tests();
         b.set_clip_pixmap(None, 0xABCD_EF01, 12, 34).expect("ok");
         match &b.core.current_clip {
@@ -17458,7 +17458,7 @@ mod tests {
 
     #[test]
     fn apply_clip_state_preserves_cached_pixmap_mask_after_free_and_origin_change() {
-        use yserver_core::backend::{ClipState, PixmapHandle};
+        use x12_core::backend::{ClipState, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
@@ -17492,7 +17492,7 @@ mod tests {
     /// degenerates to `FillState::Solid`.
     #[test]
     fn set_gc_fill_tiled_stores_fill_state() {
-        use yserver_core::backend::FillState;
+        use x12_core::backend::FillState;
         let mut b = KmsBackendV2::for_tests();
         b.set_gc_fill_tiled(None, 0xDEAD_BEEF, 5, 7).expect("ok");
         match &b.core.current_fill {
@@ -17525,7 +17525,7 @@ mod tests {
     /// real-app smoke matrix triage.
     #[test]
     fn cursor_paths_do_not_log_gaps() {
-        use yserver_core::backend::{FontHandle, PictureHandle, PixmapHandle};
+        use x12_core::backend::{FontHandle, PictureHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0001).unwrap();
@@ -17576,7 +17576,7 @@ mod tests {
     /// windows inherit the new sprite via the parent-chain walk.
     #[test]
     fn define_cursor_records_per_window_and_root_sticky() {
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use x12_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0010).unwrap();
@@ -17635,7 +17635,7 @@ mod tests {
     /// becomes the fallback when no chain entry binds one.
     #[test]
     fn effective_cursor_walks_parent_chain() {
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use x12_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0011).unwrap();
@@ -17713,7 +17713,7 @@ mod tests {
     #[test]
     fn cursor_record_versions_monotonic() {
         use std::sync::Arc;
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use x12_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let default_xid = b.default_cursor_xid.expect("default cursor xid set");
@@ -17753,7 +17753,7 @@ mod tests {
     #[test]
     fn create_anim_cursor_snapshots_frames() {
         use std::time::Duration;
-        use yserver_core::backend::{Backend, CursorHandle, PixmapHandle};
+        use x12_core::backend::{Backend, CursorHandle, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0030).unwrap();
@@ -17800,7 +17800,7 @@ mod tests {
     /// to the same cursor preserves the running frame index.
     #[test]
     fn effective_cursor_arms_and_clears_animation() {
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use x12_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
@@ -17873,7 +17873,7 @@ mod tests {
     #[test]
     fn cwa_on_redirected_window_does_not_clear_backing() {
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
 
@@ -17981,7 +17981,7 @@ mod tests {
     #[test]
     fn cwa_on_non_redirected_window_does_not_clear_storage() {
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
 
@@ -18063,7 +18063,7 @@ mod tests {
     #[test]
     fn cwa_on_descendant_routed_to_redirected_ancestor_does_not_clear() {
         use x12_protocol::x11::ResourceId;
-        use yserver_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
+        use x12_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
 
         let mut state = ServerState::new();
         let mut backend = KmsBackendV2::for_tests();
@@ -18162,7 +18162,7 @@ mod tests {
     #[test]
     fn copy_area_clip_by_children_skips_manually_redirected_child() {
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
 
@@ -18310,7 +18310,7 @@ mod tests {
     #[test]
     fn copy_area_clip_by_children_still_subtracts_automatic_child_in_v2() {
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::Backend;
+        use x12_core::backend::Backend;
 
         let mut b = KmsBackendV2::for_tests();
 
@@ -18502,7 +18502,7 @@ mod tests {
     /// keycode flips the Shift bit in the cooked state.
     #[test]
     fn cook_host_key_fills_coords_and_modifier_state() {
-        use yserver_core::host_x11::HostKeyEvent;
+        use x12_core::host_x11::HostKeyEvent;
         let mut b = KmsBackendV2::for_tests();
         b.core.cursor_x = 100.0;
         b.core.cursor_y = 200.0;
@@ -18539,7 +18539,7 @@ mod tests {
     /// wrong repeatedly because the LED gave no feedback).
     #[test]
     fn caps_lock_toggle_drives_led_bits() {
-        use yserver_core::host_x11::HostKeyEvent;
+        use x12_core::host_x11::HostKeyEvent;
         let mut b = KmsBackendV2::for_tests();
         assert_eq!(b.current_led_bits(), 0, "fresh state: all lock LEDs off");
         // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
@@ -18576,7 +18576,7 @@ mod tests {
     /// switch, no switcher UI).
     #[test]
     fn query_pointer_mask_includes_live_keyboard_modifiers() {
-        use yserver_core::{backend::Backend, host_x11::HostKeyEvent};
+        use x12_core::{backend::Backend, host_x11::HostKeyEvent};
         let mut b = KmsBackendV2::for_tests();
         // 50 == evdev KEY_LEFTSHIFT — proven to flip a modifier bit in
         // the test keymap by `cook_host_key_fills_coords_and_modifier_state`.
@@ -18607,7 +18607,7 @@ mod tests {
     /// motion sees the new mask.
     #[test]
     fn process_pointer_button_state_field_is_pre_press() {
-        use yserver_core::{host_x11::PointerEventKind, server::ServerState};
+        use x12_core::{host_x11::PointerEventKind, server::ServerState};
         let mut b = KmsBackendV2::for_tests();
         let state = ServerState::new();
         // BTN_LEFT press → detail=1, button bit = 0x0100.
@@ -18659,7 +18659,7 @@ mod tests {
     /// test window ("Expected event not received" en masse).
     #[test]
     fn warp_pointer_root_moves_cursor_and_fans_out_motion() {
-        use yserver_core::server::ServerState;
+        use x12_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
         Backend::warp_pointer_root(&mut b, &mut state, 123, 45);
@@ -18677,7 +18677,7 @@ mod tests {
     /// reports 800×600 from PlatformBackend::for_tests.
     #[test]
     fn process_pointer_absolute_clamps_to_output() {
-        use yserver_core::server::ServerState;
+        use x12_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
         let state = ServerState::new();
         // Inside extent.
@@ -18708,7 +18708,7 @@ mod tests {
     /// re-clamp.
     #[test]
     fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
-        use yserver_core::server::ServerState;
+        use x12_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
@@ -18908,7 +18908,7 @@ mod tests {
     /// pointer fanout.
     #[test]
     fn on_host_input_does_not_log_gap() {
-        use yserver_core::{core_loop::HostInputEvent, server::ServerState};
+        use x12_core::{core_loop::HostInputEvent, server::ServerState};
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
         // PointerMotion → process_pointer_absolute → no panic, no gap.
@@ -18935,7 +18935,7 @@ mod tests {
     /// the load-bearing observable is the geometry record.
     #[test]
     fn create_subwindow_records_parent_and_bg_pixel() {
-        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+        use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
         let mut b = KmsBackendV2::for_tests();
         let parent = WindowHandle::from_raw(0x1234_5678).unwrap();
         let child = b
@@ -18968,7 +18968,7 @@ mod tests {
 
     #[test]
     fn copy_from_parent_child_inherits_argb_parent_depth() {
-        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+        use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
         let mut b = KmsBackendV2::for_tests();
         b.windows_v2.insert(
@@ -19006,7 +19006,7 @@ mod tests {
 
     #[test]
     fn depth_only_visual_preserves_argb_top_level_depth() {
-        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+        use x12_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
         let mut b = KmsBackendV2::for_tests();
         let child = b
@@ -19201,7 +19201,7 @@ mod tests {
     #[test]
     fn desktop_window_type_moves_to_bottom() {
         use x12_protocol::x11::ResourceId;
-        use yserver_core::resources::ROOT_WINDOW;
+        use x12_core::resources::ROOT_WINDOW;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -19237,7 +19237,7 @@ mod tests {
     #[test]
     fn dialog_hint_raises_when_window_becomes_top_level() {
         use x12_protocol::x11::ResourceId;
-        use yserver_core::resources::ROOT_WINDOW;
+        use x12_core::resources::ROOT_WINDOW;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -19424,7 +19424,7 @@ mod tests {
         let child = b.windows_v2.get_mut(&0x200).expect("child geom");
         child.width = 15;
         child.height = 10;
-        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::ClipByChildren;
+        b.core.current_subwindow_mode = x12_core::backend::SubwindowMode::ClipByChildren;
 
         let out = b.clip_fill_rects_by_subwindow_mode(
             0x100,
@@ -19453,7 +19453,7 @@ mod tests {
         let mut b = KmsBackendV2::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
-        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::IncludeInferiors;
+        b.core.current_subwindow_mode = x12_core::backend::SubwindowMode::IncludeInferiors;
 
         let src = [Rectangle16 {
             x: 0,
@@ -19951,7 +19951,7 @@ mod tests {
     /// than e.g. silently returning Ok).
     #[test]
     fn set_window_scene_participation_false_clears_window_damage() {
-        use yserver_core::backend::WindowHandle;
+        use x12_core::backend::WindowHandle;
         let mut b = KmsBackendV2::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         // Seed presentation damage so the store actually has work
@@ -20004,7 +20004,7 @@ mod tests {
     /// scene-structure state untouched.
     #[test]
     fn set_window_scene_participation_fires_scene_structure_damage_rect() {
-        use yserver_core::backend::WindowHandle;
+        use x12_core::backend::WindowHandle;
         let mut b = KmsBackendV2::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
         // Sanity: pre-flip rect lookup is non-None (Test 2 requires
@@ -20037,7 +20037,7 @@ mod tests {
     #[test]
     fn set_backing_scene_participation_flips_flag_no_damage() {
         use crate::kms::v2::store::{DrawableKind, Storage};
-        use yserver_core::backend::PixmapHandle;
+        use x12_core::backend::PixmapHandle;
         let mut b = KmsBackendV2::for_tests();
         let b_id = b
             .store
@@ -20100,7 +20100,7 @@ mod tests {
     /// scene drops W; whatever's underneath must redraw).
     #[test]
     fn manual_redirect_path_marks_scene_structure_damage() {
-        use yserver_core::backend::WindowHandle;
+        use x12_core::backend::WindowHandle;
         let mut b = KmsBackendV2::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
@@ -20136,7 +20136,7 @@ mod tests {
     /// final assertion proves the SECOND call set it independently.
     #[test]
     fn unredirect_restores_participation_and_marks_damage() {
-        use yserver_core::backend::WindowHandle;
+        use x12_core::backend::WindowHandle;
         let mut b = KmsBackendV2::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
@@ -20314,7 +20314,7 @@ mod tests {
         // Pre-flight: COW xid is NOT in the store yet.
         assert!(
             b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .lookup(x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
                 .is_none(),
             "COW xid must not resolve before GetOverlayWindow",
         );
@@ -20325,7 +20325,7 @@ mod tests {
         assert!(b.cow_id.is_some(), "backend.cow_id must be set after GET");
         assert!(
             b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .lookup(x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
                 .is_some(),
             "COW xid must resolve in the store after GetOverlayWindow",
         );
@@ -20440,7 +20440,7 @@ mod tests {
         );
         assert!(
             b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .lookup(x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
                 .is_some(),
             "COW xid still resolves while refcount > 0",
         );
@@ -20471,7 +20471,7 @@ mod tests {
         );
         assert!(
             b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
+                .lookup(x12_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
                 .is_none(),
             "COW xid must NOT resolve after the final release — \
              the store has destroyed (or detached) the entry so a \
@@ -21243,7 +21243,7 @@ mod tests {
     /// - `backend.store.lookup(host_xid)` returns a real
     ///   `DrawableId`.
     fn seed_v2_window(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         xid: x12_protocol::x11::ResourceId,
         parent: x12_protocol::x11::ResourceId,
@@ -21253,7 +21253,7 @@ mod tests {
         height: u16,
     ) {
         use x12_protocol::x11::{ClientId, CreateWindowRequest};
-        use yserver_core::resources::ROOT_WINDOW;
+        use x12_core::resources::ROOT_WINDOW;
         state.resources.create_window(
             ClientId(14),
             CreateWindowRequest {
@@ -21266,13 +21266,13 @@ mod tests {
                 height,
                 border_width: 0,
                 class: 1,
-                visual: yserver_core::resources::ROOT_VISUAL,
+                visual: x12_core::resources::ROOT_VISUAL,
                 ..Default::default()
             },
         );
         let host_xid = synth_host_xid(xid);
         if let Some(w) = state.resources.window_mut(xid) {
-            w.host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
+            w.host_xid = x12_core::backend::WindowHandle::from_raw(host_xid);
         }
         // v2 backend's windows_v2 + store mirror.
         let parent_host = if parent == ROOT_WINDOW {
@@ -21318,7 +21318,7 @@ mod tests {
     /// reconciliation predicates in production code see the
     /// "backing already present" state.
     fn seed_v2_redirected_backing(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         xid: x12_protocol::x11::ResourceId,
     ) {
@@ -21354,8 +21354,8 @@ mod tests {
         // Mirror on the resource layer so the production
         // reconciliation predicates see a backing present.
         if let Some(w) = state.resources.window_mut(xid) {
-            w.redirected_backing = Some(yserver_core::resources::RedirectedBacking {
-                host_pixmap: yserver_core::backend::PixmapHandle::from_raw(backing_xid)
+            w.redirected_backing = Some(x12_core::resources::RedirectedBacking {
+                host_pixmap: x12_core::backend::PixmapHandle::from_raw(backing_xid)
                     .expect("non-zero PixmapHandle"),
                 width,
                 height,
@@ -21380,7 +21380,7 @@ mod tests {
     /// dispatcher (the v2 backend can't call `handle_reparent_window`
     /// directly — it's `fn`-private to the core_loop module).
     fn dispatch_reparent_window_v2(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         window: x12_protocol::x11::ResourceId,
         parent: x12_protocol::x11::ResourceId,
@@ -21388,7 +21388,7 @@ mod tests {
         y: i16,
     ) {
         use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
-        use yserver_core::{backend::Backend, core_loop::process_request};
+        use x12_core::{backend::Backend, core_loop::process_request};
 
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(&window.0.to_le_bytes());
@@ -21413,7 +21413,7 @@ mod tests {
     }
 
     fn dispatch_configure_window_v2(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         window: x12_protocol::x11::ResourceId,
         x: Option<i16>,
@@ -21421,7 +21421,7 @@ mod tests {
         border_width: Option<u16>,
     ) {
         use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
-        use yserver_core::{backend::Backend, core_loop::process_request};
+        use x12_core::{backend::Backend, core_loop::process_request};
 
         let mut mask = 0u16;
         if x.is_some() {
@@ -21465,14 +21465,14 @@ mod tests {
     }
 
     fn dispatch_poly_fill_rectangle_v2(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         drawable: x12_protocol::x11::ResourceId,
         gc: x12_protocol::x11::ResourceId,
         rects: &[Rectangle16],
     ) {
         use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
-        use yserver_core::{backend::Backend, core_loop::process_request};
+        use x12_core::{backend::Backend, core_loop::process_request};
 
         let mut body = Vec::with_capacity(8 + rects.len() * 8);
         body.extend_from_slice(&drawable.0.to_le_bytes());
@@ -21501,7 +21501,7 @@ mod tests {
     }
 
     fn create_live_v2_window(
-        state: &mut yserver_core::server::ServerState,
+        state: &mut x12_core::server::ServerState,
         backend: &mut KmsBackendV2,
         xid: x12_protocol::x11::ResourceId,
         parent: x12_protocol::x11::ResourceId,
@@ -21509,9 +21509,9 @@ mod tests {
         y: i16,
         width: u16,
         height: u16,
-    ) -> yserver_core::backend::WindowHandle {
+    ) -> x12_core::backend::WindowHandle {
         use x12_protocol::x11::ClientId;
-        use yserver_core::{
+        use x12_core::{
             backend::Backend,
             host_x11::HostSubwindowVisual,
             resources::{ROOT_VISUAL, ROOT_WINDOW},
@@ -21535,7 +21535,7 @@ mod tests {
         );
 
         let host_parent = if parent == ROOT_WINDOW {
-            yserver_core::backend::WindowHandle::from_raw(backend.core.window_id).expect("root")
+            x12_core::backend::WindowHandle::from_raw(backend.core.window_id).expect("root")
         } else {
             state
                 .resources
@@ -21582,9 +21582,9 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn process_request_root_fill_include_inferiors_matches_top_level_after_move() {
         use x12_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
-        use yserver_core::resources::ROOT_WINDOW;
+        use x12_core::resources::ROOT_WINDOW;
 
-        let mut state = yserver_core::server::ServerState::new();
+        let mut state = x12_core::server::ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
@@ -21597,7 +21597,7 @@ mod tests {
             .resources
             .window_mut(ROOT_WINDOW)
             .expect("root")
-            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+            .host_xid = x12_core::backend::WindowHandle::from_raw(backend.core.window_id);
 
         let top = ResourceId(0x2000);
         let gc = ResourceId(0x2001);
@@ -21725,7 +21725,7 @@ mod tests {
     fn root_get_image_reads_scanout_pixels_not_root_storage() {
         use ash::vk;
         use x12_protocol::x11::ResourceId;
-        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use x12_core::{resources::ROOT_WINDOW, server::ServerState};
 
         let mut state = ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
@@ -21740,7 +21740,7 @@ mod tests {
             .resources
             .window_mut(ROOT_WINDOW)
             .expect("root")
-            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+            .host_xid = x12_core::backend::WindowHandle::from_raw(backend.core.window_id);
 
         let (root_w, root_h) = {
             let root = state.resources.window(ROOT_WINDOW).expect("root window");
@@ -21813,14 +21813,14 @@ mod tests {
     /// have a real `ClientState` to operate on. Uses
     /// `resource_id_mask = u32::MAX` so the fixture xids are
     /// trivially in-range.
-    fn install_client_for_v2(state: &mut yserver_core::server::ServerState, id: u32) {
+    fn install_client_for_v2(state: &mut x12_core::server::ServerState, id: u32) {
         use std::{
             collections::{HashMap, HashSet, VecDeque},
             os::unix::net::UnixStream,
             sync::{Arc, Mutex, atomic::AtomicU16},
         };
         use x12_protocol::x11::ClientByteOrder;
-        use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
+        use x12_core::{resources::ROOT_WINDOW, server::ClientState};
         let (a, _b) = UnixStream::pair().unwrap();
         state.clients.insert(
             id,
@@ -21847,7 +21847,7 @@ mod tests {
     #[test]
     fn resolve_paint_target_after_reparent_out_routes_to_new_redirected_ancestor() {
         use x12_protocol::x11::{ClientId, ResourceId};
-        use yserver_core::{
+        use x12_core::{
             resources::ROOT_WINDOW,
             server::{CompositeRedirectMode, RedirectRecord, ServerState},
         };
@@ -22089,7 +22089,7 @@ mod tests {
     /// path without touching fanout behaviour.
     #[test]
     fn down_keys_maintained_on_key_press_and_release() {
-        use yserver_core::{
+        use x12_core::{
             core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
         };
         let mut b = KmsBackendV2::for_tests();
@@ -22150,7 +22150,7 @@ mod tests {
     /// by its corresponding `process_pointer_button(released)` call.
     #[test]
     fn synthesize_held_releases_clears_down_keys_and_button_mask() {
-        use yserver_core::server::ServerState;
+        use x12_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
 
@@ -22482,7 +22482,7 @@ mod tests {
     #[test]
     fn anim_tick_advances_wraps_and_stays_monotonic() {
         use std::time::{Duration, Instant};
-        use yserver_core::backend::{Backend, CursorHandle};
+        use x12_core::backend::{Backend, CursorHandle};
 
         let mut b = KmsBackendV2::for_tests();
         // Insert records directly with DISTINCT bytes per frame —
@@ -22538,7 +22538,7 @@ mod tests {
     fn anim_deadline_gated_on_outputs_active() {
         use crate::seat::state::SeatState;
         use std::time::{Duration, Instant};
-        use yserver_core::backend::{Backend, PixmapHandle};
+        use x12_core::backend::{Backend, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0060).unwrap();
@@ -22608,7 +22608,7 @@ mod tests {
     #[test]
     fn xfixes_cursor_image_follows_animation_frames() {
         use std::time::{Duration, Instant};
-        use yserver_core::backend::{Backend, CursorHandle};
+        use x12_core::backend::{Backend, CursorHandle};
 
         let mut b = KmsBackendV2::for_tests();
         // Insert records directly with DISTINCT bytes per frame —

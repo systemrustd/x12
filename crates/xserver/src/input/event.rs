@@ -3,7 +3,7 @@
 //! Deliberately minimal: keycodes, pointer deltas, button + state.
 //! No keysym translation — that's xkbcommon's job and lives in C.
 
-use yserver_core::core_loop::DeviceInfo;
+use x12_core::core_loop::DeviceInfo;
 
 #[derive(Debug, Clone)]
 pub enum InputEvent {

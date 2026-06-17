@@ -9,7 +9,7 @@
 
 use std::{os::fd::OwnedFd, sync::Arc};
 
-use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
+use x12_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
 use crate::kms::v2::platform::{FenceTicket, PresentCompletionSignal};
 
@@ -71,7 +71,7 @@ pub(crate) enum PinnedWake {
 mod tests {
     use super::*;
     use x12_protocol::x11::ClientId;
-    use yserver_core::backend::PresentWake;
+    use x12_core::backend::PresentWake;
 
     /// Smoke test that the types compile + can be constructed.
     /// Real semantics tested in `KmsBackendV2` integration tests.

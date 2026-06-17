@@ -61,7 +61,7 @@ impl Drop for OwnedSemaphore {
     }
 }
 
-impl yserver_core::backend::SyncobjHandle for OwnedSemaphore {
+impl x12_core::backend::SyncobjHandle for OwnedSemaphore {
     fn signal(&self, value: u64) -> std::io::Result<()> {
         self.signal_vk(value)
             .map_err(|e| std::io::Error::other(format!("vkSignalSemaphore: {e:?}")))

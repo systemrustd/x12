@@ -656,7 +656,7 @@ pub(crate) struct RecordedLogicFill {
     pub(crate) dst_extent: vk::Extent2D,
     pub(crate) dst_format: vk::Format,
     pub(crate) dst_old_layout: vk::ImageLayout,
-    pub(crate) logic_mode: yserver_core::backend::GcFunction,
+    pub(crate) logic_mode: x12_core::backend::GcFunction,
     pub(crate) opaque_alpha: bool,
     pub(crate) color: [f32; 4],
     pub(crate) rects: Vec<vk::Rect2D>, // pre-clamped at append, non-empty
@@ -1222,7 +1222,7 @@ mod op_tests {
             dst_extent: vk::Extent2D::default(),
             dst_format: vk::Format::B8G8R8A8_UNORM,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
-            logic_mode: yserver_core::backend::GcFunction::Copy,
+            logic_mode: x12_core::backend::GcFunction::Copy,
             opaque_alpha: false,
             color: [0.0; 4],
             rects: Vec::new(),

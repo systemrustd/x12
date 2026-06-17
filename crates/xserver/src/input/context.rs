@@ -31,7 +31,7 @@ use input::{
     },
 };
 use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
-use yserver_core::{
+use x12_core::{
     core_loop::{
         DeviceInfo,
         message::{LibinputConfigSnapshot, device_node_from_sysname},
