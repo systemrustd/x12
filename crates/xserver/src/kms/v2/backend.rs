@@ -23,10 +23,6 @@ use std::{
 };
 
 use ash::vk;
-use x12_protocol::x11::{
-    AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
-    ResourceId, xfixes,
-};
 use x12_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
@@ -41,6 +37,10 @@ use x12_core::{
     properties::PropertyValue,
     resources::{ARGB_COLORMAP, ARGB_VISUAL},
     server::ServerState,
+};
+use x12_protocol::x11::{
+    AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
+    ResourceId, xfixes,
 };
 
 use crate::{
@@ -277,8 +277,7 @@ pub struct KmsBackendV2 {
     /// and handed to `lib.rs::run` for client fan-out before the
     /// socket is torn down. Populated only by `disable_output`;
     /// drained by `take_shutdown_present_events`.
-    pub(crate) pending_completed_events_on_shutdown:
-        Vec<x12_core::backend::CompletedPresentEvent>,
+    pub(crate) pending_completed_events_on_shutdown: Vec<x12_core::backend::CompletedPresentEvent>,
 
     /// Stage 5 Phase A — canonical cursor xid → immutable record map.
     /// Inserted by `create_cursor` / `create_glyph_cursor` /
@@ -3663,8 +3662,8 @@ impl KmsBackendV2 {
         synthetic_serial: u32,
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
-        use x12_protocol::x11::ClientId;
         use x12_core::backend::{CompletedPresentEvent, PresentWake};
+        use x12_protocol::x11::ClientId;
 
         let Some(dst_id) = self.store.lookup(dst_xid) else {
             return false;
@@ -3872,8 +3871,8 @@ impl KmsBackendV2 {
         synthetic_serial: u32,
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
-        use x12_protocol::x11::ClientId;
         use x12_core::backend::{CompletedPresentEvent, PresentWake};
+        use x12_protocol::x11::ClientId;
 
         let cow_id = match self.cow_id {
             Some(id) => id,
@@ -4067,9 +4066,7 @@ impl KmsBackendV2 {
         }
     }
 
-    fn force_drain_all_present_batches(
-        &mut self,
-    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
+    fn force_drain_all_present_batches(&mut self) -> Vec<x12_core::backend::CompletedPresentEvent> {
         let mut completed = Vec::new();
         while let Some(batch) = self.pending_present_batches.pop_front() {
             self.unregister_present_batch_fd(&batch);
@@ -5303,8 +5300,7 @@ impl KmsBackendV2 {
             .prev_pointer_window
             .and_then(|prev| self.core.xid_map.get(&prev).copied());
         if let (Some(focus), Some(grab)) = (focus_id, grab_id) {
-            let events =
-                x12_core::crossings::implicit_grab_crossings(server_state, focus, grab);
+            let events = x12_core::crossings::implicit_grab_crossings(server_state, focus, grab);
             for ev in events {
                 let win_host_xid = server_state
                     .resources
@@ -5664,11 +5660,7 @@ impl KmsBackendV2 {
         }
     }
 
-    fn apply_top_level_stack_hint(
-        &mut self,
-        state: &x12_core::server::ServerState,
-        host_xid: u32,
-    ) {
+    fn apply_top_level_stack_hint(&mut self, state: &x12_core::server::ServerState, host_xid: u32) {
         if !self.core.top_level_order.contains(&host_xid) {
             return;
         }
@@ -8794,18 +8786,14 @@ impl Backend for KmsBackendV2 {
                 // 137 = the XI extension's runtime major opcode (mirrors
                 // nested.rs / process_request.rs XI2_MAJOR_OPCODE).
                 let _dropped =
-                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(state, 137);
                 return;
             }
             HostInputEvent::DeviceRemoved { device_node } => {
                 log::info!("xi-device: removed node={device_node}");
                 state.xi_clear_touchpad(&device_node);
                 let _dropped =
-                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(
-                        state, 137,
-                    );
+                    x12_core::core_loop::fanout::emit_xi2_device_changed_slave_pointer(state, 137);
                 return;
             }
         }
@@ -14960,9 +14948,7 @@ impl Backend for KmsBackendV2 {
     /// signalled (or all batches when `platform.renderer_failed`).
     /// Wake signals fire via the Arc-pinned handle inside the impl
     /// body before the events are returned to the caller.
-    fn drain_completed_present_events(
-        &mut self,
-    ) -> Vec<x12_core::backend::CompletedPresentEvent> {
+    fn drain_completed_present_events(&mut self) -> Vec<x12_core::backend::CompletedPresentEvent> {
         self.drain_completed_present_events_impl()
     }
 
@@ -17347,8 +17333,8 @@ mod tests {
     #[test]
     fn poly_fill_rectangle_honours_gc_clip() {
         use crate::kms::cpu_types::Rectangle16;
-        use x12_protocol::x11::ClipRectangles;
         use x12_core::backend::ClipState;
+        use x12_protocol::x11::ClipRectangles;
 
         let mut b = KmsBackendV2::for_tests();
         // Two 4×8 clip rects side-by-side starting at (5, 5), with
@@ -18062,8 +18048,8 @@ mod tests {
     /// then disappear.
     #[test]
     fn cwa_on_descendant_routed_to_redirected_ancestor_does_not_clear() {
-        use x12_protocol::x11::ResourceId;
         use x12_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut backend = KmsBackendV2::for_tests();
@@ -19200,8 +19186,8 @@ mod tests {
     /// property arrives.
     #[test]
     fn desktop_window_type_moves_to_bottom() {
-        use x12_protocol::x11::ResourceId;
         use x12_core::resources::ROOT_WINDOW;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -19236,8 +19222,8 @@ mod tests {
     /// register_top_level transition.
     #[test]
     fn dialog_hint_raises_when_window_becomes_top_level() {
-        use x12_protocol::x11::ResourceId;
         use x12_core::resources::ROOT_WINDOW;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -20692,31 +20678,27 @@ mod tests {
     }
 
     /// xshmfence-path of `dri3_fence_from_fd`: mmap an xshmfence
-    /// (synthesised via `memfd_create` + `ftruncate`), feed the
+    /// (synthesised via `shm_open` + `ftruncate`), feed the
     /// fd in, assert it landed in `dri3_xshmfences` (not
     /// `dri3_sync_resources`) and that `trigger()` flips the
     /// state to signalled.
     #[test]
     fn dri3_fence_from_fd_xshmfence_path_triggers() {
         // The xshmfence module exposes the C alloc/map helpers;
-        // build a fresh shm fd via `xshmfence_alloc_shm` directly
-        // through libc-equivalent shape (memfd_create). To keep
-        // the test self-contained without pulling libxshmfence
-        // alloc, we synthesise a memfd that's at least page-sized
-        // and let `FenceMapping::map` mmap it — libxshmfence's
-        // map_shm only requires the fd be at least one page.
+        // build a fresh shm fd via `shm_open` (UUID-based, works
+        // on both Linux and macOS — no Linux-only memfd_create).
+        // To keep the test self-contained without pulling
+        // libxshmfence alloc, we synthesise an shm fd that's at
+        // least page-sized and let `FenceMapping::map` mmap it —
+        // libxshmfence's map_shm only requires the fd be at least
+        // one page.
         use std::os::fd::{FromRawFd, OwnedFd};
-        #[cfg(target_os = "linux")]
-        let raw_result =
-            unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_dri3_test".as_ptr(), 0u32) };
-        #[cfg(not(target_os = "linux"))]
-        let raw_result = i64::from(unsafe { libc::memfd_create(c"yserver_dri3_test".as_ptr(), 0) });
-        if raw_result < 0 {
-            eprintln!("skip: memfd_create unavailable");
+        let raw = x12_core::unix_fd::create_shm_fd("yserver_dri3_test");
+        if raw < 0 {
+            eprintln!("skip: shm_open unavailable");
             return;
         }
-        let raw = i32::try_from(raw_result).expect("fd fits i32");
-        // Size the memfd to one page so map_shm succeeds.
+        // Size the shm fd to one page so map_shm succeeds.
         let page_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page: libc::off_t = if page_raw > 0 {
             page_raw as libc::off_t
@@ -21252,8 +21234,8 @@ mod tests {
         width: u16,
         height: u16,
     ) {
-        use x12_protocol::x11::{ClientId, CreateWindowRequest};
         use x12_core::resources::ROOT_WINDOW;
+        use x12_protocol::x11::{ClientId, CreateWindowRequest};
         state.resources.create_window(
             ClientId(14),
             CreateWindowRequest {
@@ -21387,8 +21369,8 @@ mod tests {
         x: i16,
         y: i16,
     ) {
-        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
         use x12_core::{backend::Backend, core_loop::process_request};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(&window.0.to_le_bytes());
@@ -21420,8 +21402,8 @@ mod tests {
         y: Option<i16>,
         border_width: Option<u16>,
     ) {
-        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
         use x12_core::{backend::Backend, core_loop::process_request};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut mask = 0u16;
         if x.is_some() {
@@ -21471,8 +21453,8 @@ mod tests {
         gc: x12_protocol::x11::ResourceId,
         rects: &[Rectangle16],
     ) {
-        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
         use x12_core::{backend::Backend, core_loop::process_request};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut body = Vec::with_capacity(8 + rects.len() * 8);
         body.extend_from_slice(&drawable.0.to_le_bytes());
@@ -21510,12 +21492,12 @@ mod tests {
         width: u16,
         height: u16,
     ) -> x12_core::backend::WindowHandle {
-        use x12_protocol::x11::ClientId;
         use x12_core::{
             backend::Backend,
             host_x11::HostSubwindowVisual,
             resources::{ROOT_VISUAL, ROOT_WINDOW},
         };
+        use x12_protocol::x11::ClientId;
 
         state.resources.create_window(
             ClientId(14),
@@ -21581,8 +21563,8 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn process_request_root_fill_include_inferiors_matches_top_level_after_move() {
-        use x12_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
         use x12_core::resources::ROOT_WINDOW;
+        use x12_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
 
         let mut state = x12_core::server::ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk() {
@@ -21724,8 +21706,8 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn root_get_image_reads_scanout_pixels_not_root_storage() {
         use ash::vk;
-        use x12_protocol::x11::ResourceId;
         use x12_core::{resources::ROOT_WINDOW, server::ServerState};
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
@@ -21819,8 +21801,8 @@ mod tests {
             os::unix::net::UnixStream,
             sync::{Arc, Mutex, atomic::AtomicU16},
         };
-        use x12_protocol::x11::ClientByteOrder;
         use x12_core::{resources::ROOT_WINDOW, server::ClientState};
+        use x12_protocol::x11::ClientByteOrder;
         let (a, _b) = UnixStream::pair().unwrap();
         state.clients.insert(
             id,
@@ -21846,11 +21828,11 @@ mod tests {
 
     #[test]
     fn resolve_paint_target_after_reparent_out_routes_to_new_redirected_ancestor() {
-        use x12_protocol::x11::{ClientId, ResourceId};
         use x12_core::{
             resources::ROOT_WINDOW,
             server::{CompositeRedirectMode, RedirectRecord, ServerState},
         };
+        use x12_protocol::x11::{ClientId, ResourceId};
 
         // Phase 2 root-cause pin: build a tree mirroring the live
         // mate-panel case (root → mate-panel, root → nm-applet),
@@ -22089,9 +22071,7 @@ mod tests {
     /// path without touching fanout behaviour.
     #[test]
     fn down_keys_maintained_on_key_press_and_release() {
-        use x12_core::{
-            core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
-        };
+        use x12_core::{core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState};
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
 

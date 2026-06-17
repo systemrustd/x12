@@ -70,8 +70,8 @@ pub(crate) enum PinnedWake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x12_protocol::x11::ClientId;
     use x12_core::backend::PresentWake;
+    use x12_protocol::x11::ClientId;
 
     /// Smoke test that the types compile + can be constructed.
     /// Real semantics tested in `KmsBackendV2` integration tests.

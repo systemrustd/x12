@@ -434,9 +434,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // shutdown drain — events must reach clients before we tear down
     // the socket.
     for entry in backend.take_shutdown_present_events() {
-        x12_core::core_loop::process_request::fire_present_completion_events(
-            &mut state, &entry,
-        );
+        x12_core::core_loop::process_request::fire_present_completion_events(&mut state, &entry);
     }
 
     // 2026-05-31: destroy every drawable's Vk handles before

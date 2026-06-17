@@ -10,11 +10,11 @@ mod common;
 use std::sync::Arc;
 
 use ash::vk;
+use x12_core::backend::Backend;
 use yserver::kms::{
     v2::KmsBackendV2,
     vk::{device::VkContext, dri3::DmabufExport},
 };
-use x12_core::backend::Backend;
 
 #[test]
 #[ignore = "requires a Vulkan device"]

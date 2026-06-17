@@ -34,7 +34,12 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
     msg.msg_control = cmsg_buf.as_mut_ptr().cast();
     msg.msg_controllen = cmsg_buf.len() as _;
 
-    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    // macOS lacks MSG_CMSG_CLOEXEC — set FD_CLOEXEC on fds below instead.
+    #[cfg(target_os = "linux")]
+    let recv_flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let recv_flags = 0i32;
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, recv_flags) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -62,6 +67,14 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
                         (&raw mut fd).cast(),
                         std::mem::size_of::<libc::c_int>(),
                     );
+                }
+                // macOS doesn't have MSG_CMSG_CLOEXEC — set manually.
+                #[cfg(not(target_os = "linux"))]
+                unsafe {
+                    let flags = libc::fcntl(fd as libc::c_int, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd as libc::c_int, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
                 }
                 fds.push(fd as RawFd);
             }
