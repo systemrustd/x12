@@ -1,19 +1,18 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/yserver",
-  "crates/yserver-core",
-  "crates/yserver-protocol",
+  "crates/*",
 ]
 
 [workspace.package]
-version = "1.1.1"
+version = "0.1.0"
 edition = "2024"
-repository = ""
+repository = "https://github.com/systemrustd/x12"
 license = "MIT"
 
 [workspace.dependencies]
-ash = "0.38"
+# FIXME: use latest ash, as it hasn't had a release since 2024
+ash = { git = "https://github.com/ash-rs/ash" } 
 crossbeam-channel = "0.5"
 drm = "0.15"
 env_logger = "0.11"
@@ -39,8 +38,8 @@ nix = { version = "0.31", features = [
 signal-hook = "0.4"
 thiserror = "2"
 xkbcommon = "0.9"
-yserver-core = { path = "crates/yserver-core" }
-yserver-protocol = { path = "crates/yserver-protocol" }
+x12-core = { path = "crates/xserver-core" }
+x12-protocol = { path = "crates/xserver-protocol" }
 
 [workspace.lints.clippy]
 # X11 protocol encoders and request handlers naturally take many
@@ -65,4 +64,16 @@ too_many_arguments = "allow"
 # Rust call chains and produces [unknown] frames. Frame pointers
 # (~1-2% runtime cost) make the unwind path infallible.
 [profile.release]
-debug = true
+debug = "line-tables-only" 
+split-debuginfo = "packed"
+lto = "thin"
+opt-level = 3
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+opt-level = 1
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 3

@@ -1,0 +1,40 @@
+[package]
+name = "x12-xserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "xserver"
+path = "src/lib.rs"
+
+[dependencies]
+x12-core.workspace = true
+x12-protocol.workspace = true
+crossbeam-channel.workspace = true
+env_logger.workspace = true
+log.workspace = true
+libc.workspace = true
+drm.workspace = true
+input.workspace = true
+nix.workspace = true
+signal-hook.workspace = true
+freetype-rs.workspace = true
+xkbcommon.workspace = true
+fontconfig = "0.11.0"
+ash.workspace = true
+gpu-allocator.workspace = true
+thiserror.workspace = true
+libseat = "0.2.4"
+
+[[bin]]
+name = "xnest"
+path = "src/bin/xnest.rs"
+
+[[bin]]
+name = "xserver"
+path = "src/bin/xserver.rs"
+
+[lints]
+workspace = true
