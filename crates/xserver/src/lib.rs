@@ -1,26 +1,37 @@
 pub mod clock;
+#[cfg(target_os = "linux")]
 pub mod drm;
+#[cfg(any(target_os = "linux", feature = "libinput"))]
 pub mod input;
+#[cfg(target_os = "linux")]
 pub mod input_thread;
+#[cfg(target_os = "linux")]
 pub mod kms;
 pub mod launch;
+#[cfg(target_os = "linux")]
 pub mod present;
+#[cfg(target_os = "linux")]
 mod seat;
 pub mod version;
 
-use std::{fs, io, path::PathBuf, thread};
+use std::io;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::{fs, path::PathBuf, thread};
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use x12_core::core_loop::{self, Message, poll_tokens::ClientIdAllocator};
 use x12_core::{
     backend::Backend,
-    core_loop::{self, Message, poll_tokens::ClientIdAllocator},
     resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
     server::ServerState,
 };
 
+#[allow(dead_code)]
 fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend) {
     if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
         root.host_xid = x12_core::backend::WindowHandle::from_raw(backend.window_id());
@@ -40,10 +51,8 @@ fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend)
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
-
     log::info!("yserver: startup");
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
@@ -453,19 +462,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 
 /// Build a `KmsBackendV2` in either libseat or Direct mode depending on
 /// `seat`. This is the single decision point for the mode branch.
-///
-/// **Libseat mode** (`seat == Seat::Libseat`):
-/// - Opens the DRM card through the seat (FATAL on failure — once libseat
-///   has the session, direct device opens won't get DRM master).
-/// - Builds a `crate::input::Context` on the core thread via
-///   `Context::new_libseat` (FATAL on failure for the same reason).
-/// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
-///
-/// **Direct mode** (`seat == Seat::Direct`):
-/// - Calls `KmsBackendV2::open(device_path, console_guard)` — the
-///   direct-device path, with optional VT_PROCESS arming when a real
-///   controlling console is present.
-/// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn build_kms_backend_v2(
     seat: crate::seat::Seat,
     device_path: &str,
@@ -503,6 +500,7 @@ fn build_kms_backend_v2(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_drm_device() -> io::Result<String> {
     if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
         return Ok(explicit);
@@ -644,6 +642,34 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     Ok(kq)
 }
 
+// ── macOS / other Unix stubs ──
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub fn run(_opts: launch::LaunchOptions) -> io::Result<()> {
+    log::info!("yserver: KMS backend not available on this platform");
+    Err(io::Error::other(
+        "KMS/DRM backend is only supported on Linux and FreeBSD",
+    ))
+}
+
+/// macOS: block termination signals and return a pipe fd for signal relay.
+/// On macOS signalfd/kqueue aren't used the same way; we return a pipe
+/// stub so the signal thread has something to poll on (it will just sit
+/// idle — real signal handling is done via libc signal handlers).
+#[allow(dead_code)]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn block_termination_signals() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1i32; 2];
+    // SAFETY: writing two stack-local ints for the pipe fds.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // We only need the read end for polling; close the write end.
+    unsafe { libc::close(fds[1]) };
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::install_backend_root_bindings;
@@ -653,6 +679,7 @@ mod tests {
         server::ServerState,
     };
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
         let mut state = ServerState::new();

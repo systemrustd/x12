@@ -96,7 +96,17 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
 pub fn create_shm_fd(name_prefix: &str) -> RawFd {
     let uuid = uuid::Uuid::new_v4();
     // shm_open requires a name starting with '/' and containing no other '/'.
-    let name = format!("/{}-{}", name_prefix, uuid.as_hyphenated());
+    // macOS limits names to PSHMNAMLEN=31 chars, so use the first 16 chars
+    // of the simple UUID (no hyphens) plus a short prefix.
+    let short_uuid = &uuid.as_simple().to_string()[..16];
+    // Keep prefix short enough that total fits within 31 chars after '/':
+    // "/" + prefix + "-" + 16-char-uuid ≤ 31 → prefix ≤ 13 chars.
+    let prefix = if name_prefix.len() > 10 {
+        &name_prefix[..10]
+    } else {
+        name_prefix
+    };
+    let name = format!("/{}-{}", prefix, short_uuid);
     let name_c = match std::ffi::CString::new(name) {
         Ok(c) => c,
         Err(_) => return -1,
@@ -129,18 +139,23 @@ pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Res
         iov_base: bytes.as_ptr() as *mut _,
         iov_len: bytes.len(),
     };
-    // CMSG_SPACE(sizeof(int)) on Linux x86_64 is 24 bytes; allocate that.
-    let mut cmsg_buf = [0u8; 24];
+    // Platform-specific cmsg buffer: CMSG_SPACE(sizeof(int)) differs —
+    // Linux x86_64 = 24 bytes, macOS arm64 = 16 bytes.
+    let cmsg_len_val = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) };
+    let cmsg_space_val = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
+    let mut cmsg_buf: Vec<u8> = vec![0u8; cmsg_space_val as usize];
     let mut msg: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
     msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len() as _;
+    // macOS requires msg_controllen to exactly equal cmsg_len, not the
+    // full buffer size (Linux accepts either).
+    msg.msg_controllen = cmsg_len_val as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        (*cmsg).cmsg_len = cmsg_len_val as _;
         std::ptr::copy_nonoverlapping(
             (&raw const fd).cast(),
             libc::CMSG_DATA(cmsg),

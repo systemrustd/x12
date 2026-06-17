@@ -1,5 +1,14 @@
-use std::{env, process::ExitCode};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::env;
+use std::process::ExitCode;
 
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn main() -> ExitCode {
+    eprintln!("yserver: KMS backend requires Linux or FreeBSD");
+    ExitCode::FAILURE
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

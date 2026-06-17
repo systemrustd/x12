@@ -7,7 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, RawFd},
+        fd::{FromRawFd, RawFd},
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::UnixListener,
@@ -322,7 +322,8 @@ enum Occupancy {
 /// never-accepting listener in the world-writable socket dir, must not
 /// hang the launch). EAGAIN ⇒ backlog full ⇒ the display IS occupied.
 fn probe(path: &Path) -> Occupancy {
-    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket};
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
+    use std::os::fd::AsRawFd;
 
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -332,15 +333,23 @@ fn probe(path: &Path) -> Occupancy {
     if !meta.file_type().is_socket() {
         return Occupancy::NonSocket;
     }
-    let fd = match socket(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
-    ) {
+    let fd = match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
         Ok(fd) => fd,
         Err(_) => return Occupancy::Opaque,
     };
+    // Set NONBLOCK + CLOEXEC manually (rustix SocketFlags constants
+    // are feature-gated on some platforms).
+    let raw = fd.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let fd_flags = libc::fcntl(raw, libc::F_GETFD);
+        if fd_flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+        }
+    }
     let addr = match SocketAddrUnix::new(path) {
         Ok(a) => a,
         Err(_) => return Occupancy::Opaque,
@@ -348,11 +357,16 @@ fn probe(path: &Path) -> Occupancy {
     match connect(&fd, &addr) {
         Ok(()) => Occupancy::Live,
         // Nonblocking AF_UNIX connect outcomes:
-        Err(e) => match e.raw_os_error() {
-            Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Occupancy::Live, // backlog full
-            Some(libc::ECONNREFUSED) => Occupancy::Stale,
-            _ => Occupancy::Opaque,
-        },
+        Err(e) => {
+            let code = e.raw_os_error();
+            if code == libc::EAGAIN || code == libc::EINPROGRESS {
+                Occupancy::Live // backlog full
+            } else if code == libc::ECONNREFUSED {
+                Occupancy::Stale
+            } else {
+                Occupancy::Opaque
+            }
+        }
     }
     // fd is an OwnedFd — closed on drop.
 }
