@@ -24,9 +24,11 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use nix::sys::termios::{
-    ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, SpecialCharacterIndices, Termios,
-    tcgetattr, tcsetattr,
+// Raw libc termios — direct field access needed for VT console setup.
+// rustix's Termios is opaque and doesn't expose fields for this use case.
+use libc::{
+    CREAD, CS8, IGNBRK, IGNPAR, ISTRIP, PARMRK, TCSANOW, VMIN, VTIME, tcgetattr, tcsetattr,
+    termios as Termios,
 };
 
 // linux/vt.h
@@ -132,7 +134,11 @@ impl ConsoleGuard {
             return Err(io::Error::last_os_error());
         }
 
-        let saved_termios = tcgetattr(&fd).map_err(io::Error::from)?;
+        let mut saved_termios: Termios = unsafe { std::mem::zeroed() };
+        // SAFETY: valid fd, writing into a stack-local libc struct.
+        if unsafe { tcgetattr(raw_fd, &mut saved_termios) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
 
         // Stop the kernel from feeding characters to the TTY. Prefer K_OFF
         // (no events at all on the VT); fall back to K_RAW for older
@@ -163,16 +169,16 @@ impl ConsoleGuard {
 
         // Belt-and-suspenders: raw-ish termios so any stray bytes that do
         // reach the TTY don't get cooked. Mirrors xf86OpenConsole.
-        let mut new_t = saved_termios.clone();
-        new_t.input_flags =
-            (InputFlags::IGNPAR | InputFlags::IGNBRK) & !InputFlags::PARMRK & !InputFlags::ISTRIP;
-        new_t.output_flags = OutputFlags::empty();
-        new_t.control_flags = ControlFlags::CREAD | ControlFlags::CS8;
-        new_t.local_flags = LocalFlags::empty();
-        new_t.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-        new_t.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-        if let Err(err) = tcsetattr(&fd, SetArg::TCSANOW, &new_t) {
-            log::warn!("yserver: tcsetattr failed: {err}");
+        let mut new_t = saved_termios;
+        new_t.c_iflag = (IGNPAR | IGNBRK) & !(PARMRK | ISTRIP);
+        new_t.c_oflag = 0;
+        new_t.c_cflag = CREAD | CS8;
+        new_t.c_lflag = 0;
+        new_t.c_cc[VTIME as usize] = 0;
+        new_t.c_cc[VMIN as usize] = 1;
+        // SAFETY: valid fd, termios is a valid struct.
+        if unsafe { tcsetattr(raw_fd, TCSANOW, &new_t) } < 0 {
+            log::warn!("yserver: tcsetattr failed: {}", io::Error::last_os_error());
         }
 
         log::info!("yserver: console takeover via KDSKBMODE={used_mode} + KD_GRAPHICS");
@@ -285,8 +291,12 @@ impl Drop for ConsoleGuard {
                 io::Error::last_os_error()
             );
         }
-        if let Err(err) = tcsetattr(&self.fd, SetArg::TCSANOW, &self.saved_termios) {
-            log::warn!("yserver: tcsetattr restore failed: {err}");
+        // SAFETY: valid fd, termios is a valid struct.
+        if unsafe { tcsetattr(raw_fd, TCSANOW, &self.saved_termios) } < 0 {
+            log::warn!(
+                "yserver: tcsetattr restore failed: {}",
+                io::Error::last_os_error()
+            );
         }
 
         log::info!("yserver: console state restored");

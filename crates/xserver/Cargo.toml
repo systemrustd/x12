@@ -19,8 +19,10 @@ libc.workspace = true
 drm.workspace = true
 input = { workspace = true, optional = true }
 nix.workspace = true
+rustix.workspace = true
 signal-hook.workspace = true
 skrifa.workspace = true
+harfrust.workspace = true
 xkbcommon.workspace = true
 fontconfig = { workspace = true, optional = true }
 libseat = { workspace = true, optional = true }

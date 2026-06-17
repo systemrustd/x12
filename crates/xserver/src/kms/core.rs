@@ -75,9 +75,9 @@ pub struct XkbState(pub xkbcommon::xkb::State);
 unsafe impl Send for XkbState {}
 
 // ───────────────────────────────────────────────────────────────
-// Font protocol state (FontLoader + FontState + helpers).
+// Font protocol state (FontLoader + FontState + FontDb).
 // Pure protocol-domain: resolves X11 font names to FreeType faces
-// via fontconfig. No Vulkan / GPU types reach in here.
+// via skrifa-based font discovery. No Vulkan / GPU types reach in here.
 // ───────────────────────────────────────────────────────────────
 
 pub(crate) struct FontState {
@@ -191,14 +191,295 @@ pub(crate) enum FontResolution {
         path: std::path::PathBuf,
         entry_name: String,
     },
-    /// Matched the built-ins element (alias set or fontconfig
-    /// catalog): resolve via fontconfig.
+    /// Matched the built-ins element (alias set or FontDb
+    /// catalog): resolve via skrifa-based FontDb.
     BuiltIn,
+}
+
+/// skrifa-based font database — replaces fontconfig for font discovery.
+/// Scans standard system font directories at startup and caches metadata
+/// (family, subfamily, weight, slant, spacing, face index) for each font
+/// file found. Used by `FontLoader` for catalog building and font matching.
+struct FontDb {
+    entries: Vec<FontDbEntry>,
+}
+
+struct FontDbEntry {
+    path: std::path::PathBuf,
+    family: String,
+    subfamily: String,
+    weight: u16,
+    slant: i32,
+    spacing: i32,
+    face_index: i32,
+}
+
+impl FontDb {
+    fn new() -> io::Result<Self> {
+        let mut db = Self {
+            entries: Vec::new(),
+        };
+        db.scan_system_fonts()?;
+        Ok(db)
+    }
+
+    /// Scan standard system font directories for .ttf/.otf/.ttc/.otc files.
+    fn scan_system_fonts(&mut self) -> io::Result<()> {
+        let dirs = Self::system_font_dirs();
+        for dir in &dirs {
+            if let Err(e) = self.scan_dir(dir) {
+                log::debug!("FontDb: scanning {dir:?}: {e}");
+            }
+        }
+        log::info!("FontDb: {} fonts indexed", self.entries.len());
+        Ok(())
+    }
+
+    /// Platform-specific font directories.
+    fn system_font_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push("/System/Library/Fonts".into());
+            dirs.push("/Library/Fonts".into());
+            if let Some(home) = std::env::var_os("HOME") {
+                dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            dirs.push("/usr/share/fonts".into());
+            // Also scan the X11 misc/75dpi/100dpi dirs for bitmap fonts.
+            for x11_dir in &[
+                "/usr/share/fonts/misc",
+                "/usr/share/fonts/X11/misc",
+                "/usr/share/fonts/75dpi",
+                "/usr/share/fonts/X11/75dpi",
+                "/usr/share/fonts/100dpi",
+                "/usr/share/fonts/X11/100dpi",
+            ] {
+                dirs.push((*x11_dir).into());
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                dirs.push(std::path::PathBuf::from(home).join(".fonts"));
+                dirs.push(std::path::PathBuf::from(home).join(".local/share/fonts"));
+            }
+        }
+        dirs
+    }
+
+    fn scan_dir(&mut self, dir: &std::path::Path) -> io::Result<()> {
+        use std::io::Read;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = self.scan_dir(&path);
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            let ext_lower = ext.to_lowercase();
+            if !matches!(
+                ext_lower.as_str(),
+                "ttf" | "otf" | "ttc" | "otc" | "pfb" | "pfa"
+            ) {
+                continue;
+            }
+            match self.index_font(&path) {
+                Ok(()) => {}
+                Err(e) => {
+                    log::trace!("FontDb: skipping {}: {e}", path.display());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_font(&mut self, path: &std::path::Path) -> io::Result<()> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+
+        // Try as a single font first.
+        if let Ok(font) = skrifa::FontRef::new(&data) {
+            if let Some(entry) = Self::read_font_metadata(path, &font, 0) {
+                self.entries.push(entry);
+            }
+            return Ok(());
+        }
+
+        // Try as a font collection (ttc/otc).
+        if let Ok(collection) = skrifa::raw::FileRef::new(&data) {
+            if let Ok(count) = collection.font_count() {
+                for i in 0..count {
+                    if let Ok(Some(font)) = collection.get(i) {
+                        if let Some(entry) = Self::read_font_metadata(path, &font, i as i32) {
+                            self.entries.push(entry);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        Err(io::Error::other("not a valid font"))
+    }
+
+    fn read_font_metadata(
+        path: &std::path::Path,
+        font: &skrifa::FontRef,
+        face_index: i32,
+    ) -> Option<FontDbEntry> {
+        let family = font
+            .localized_strings()
+            .family()
+            .english()
+            .or_default()
+            .to_string();
+        if family.is_empty() {
+            return None;
+        }
+        let subfamily = font
+            .localized_strings()
+            .subfamily()
+            .english()
+            .or_default()
+            .to_string();
+
+        // Read OS/2 table for weight, and determine slant/spacing.
+        let weight: u16 = font.os2().ok().map(|o| o.us_weight_class()).unwrap_or(400);
+
+        // Italic detection: check head table macStyle bit 1.
+        let slant: i32 = if font.head().ok().is_some_and(|h| (h.mac_style() & 2) != 0) {
+            100
+        } else if subfamily.to_lowercase().contains("italic")
+            || subfamily.to_lowercase().contains("oblique")
+        {
+            100
+        } else {
+            0
+        };
+
+        // Monospace detection: check post table isFixedPitch.
+        let spacing: i32 = if font.post().ok().is_some_and(|p| p.is_fixed_pitch() != 0) {
+            100
+        } else {
+            0
+        };
+
+        Some(FontDbEntry {
+            path: path.to_path_buf(),
+            family,
+            subfamily,
+            weight,
+            slant,
+            spacing,
+            face_index,
+        })
+    }
+
+    /// Match a font by family name and optional style. Returns the
+    /// (path, face_index) for the best match.
+    fn match_font(&self, family: &str, style: Option<&str>) -> Option<(std::path::PathBuf, i32)> {
+        let family_lower = family.to_lowercase();
+
+        // Score entries: exact family match gets higher score,
+        // then weight by style match.
+        let mut best: Option<(&FontDbEntry, u32)> = None;
+        for entry in &self.entries {
+            let entry_family = entry.family.to_lowercase();
+            let family_score = if entry_family == family_lower {
+                1000
+            } else if entry_family.starts_with(&family_lower) {
+                500
+            } else if entry_family.contains(&family_lower) {
+                200
+            } else {
+                continue;
+            };
+
+            let style_score = if let Some(style) = style {
+                let es = entry.subfamily.to_lowercase();
+                if es.contains(&style.to_lowercase()) {
+                    100
+                } else {
+                    0
+                }
+            } else {
+                50
+            };
+
+            // Prefer monospace fonts when the query family suggests it.
+            let mono_bonus: u32 = if family_lower.contains("mono") && entry.spacing == 100 {
+                200
+            } else {
+                0
+            };
+
+            let score = family_score + style_score + mono_bonus;
+            match best {
+                None => best = Some((entry, score)),
+                Some((_, prev)) if score > prev => best = Some((entry, score)),
+                _ => {}
+            }
+        }
+
+        best.map(|(e, _)| (e.path.clone(), e.face_index))
+    }
+
+    /// Build an XLFD catalog from the font database, matching the
+    /// same format fontconfig used to produce. Entries are
+    /// deduplicated by (family, foundry, weight, slant, spacing).
+    fn build_catalog(&self) -> Vec<String> {
+        // Aliases the loader handles directly without an XLFD parse pass.
+        let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+        let mut seen: std::collections::HashSet<(String, String, u16, i32, i32)> =
+            std::collections::HashSet::new();
+
+        for entry in &self.entries {
+            let family_lower = entry.family.to_lowercase();
+            // "foundry" defaults to "misc" since skrifa doesn't expose vendor ID easily.
+            let foundry = "misc".to_string();
+            let weight = entry.weight;
+            let slant = entry.slant;
+            let spacing = entry.spacing;
+
+            let key = (family_lower, foundry.to_lowercase(), weight, slant, spacing);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            let family_x = sanitize_xlfd_field(&entry.family);
+            let foundry_x = sanitize_xlfd_field(&foundry);
+            let weight_x = xlfd_weight(weight);
+            let slant_x = xlfd_slant(slant);
+            let spacing_x = xlfd_spacing(spacing);
+
+            for &px in &[8u32, 10, 12, 14, 16, 18, 24] {
+                let avg_width = (px * 6).clamp(1, 999);
+                for &charset in &["iso8859-1", "iso10646-1"] {
+                    entries.push(format!(
+                        "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
+                        px * 10,
+                    ));
+                }
+            }
+        }
+
+        entries
+    }
 }
 
 pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
-    pub(crate) fc: fontconfig::Fontconfig,
+    pub(crate) font_db: FontDb,
     pub(crate) catalog: Vec<String>,
     /// Current font path, element order significant. Elements are
     /// directories (with fonts.dir) or the literal "built-ins".
@@ -207,21 +488,20 @@ pub(crate) struct FontLoader {
     pub(crate) path_dirs: Vec<Option<FontDir>>,
 }
 
-/// Built-in alias names that always resolve via fontconfig — the
+/// Built-in alias names that always resolve via FontDb — the
 /// compatibility layer that keeps `fixed`/`cursor` working no matter
 /// what the font path holds (mirrors Xorg's built-ins FPE).
 pub(crate) const BUILTIN_ALIASES: &[&str] = &["fixed", "cursor", "nil2"];
 
 impl FontLoader {
     pub(crate) fn new() -> io::Result<Self> {
-        let fc = fontconfig::Fontconfig::new()
-            .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
-        let catalog = build_font_catalog(&fc);
-        log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
+        let font_db = FontDb::new()?;
+        let catalog = font_db.build_catalog();
+        log::info!("font catalog: {} XLFDs from skrifa font db", catalog.len());
         let mut loader = Self {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
-            fc,
+            font_db,
             catalog,
             font_path: Vec::new(),
             path_dirs: Vec::new(),
@@ -526,43 +806,29 @@ impl FontLoader {
         &self,
         name: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        // Resolve the X11 font name to a file path via fontconfig. We can't
-        // rely on the high-level `Fontconfig::find`: when the requested family
-        // doesn't exist, fontconfig falls back to the *system default* (often
-        // a proportional sans-serif), which makes xterm/wmaker render with
-        // wrong metrics. Build the pattern ourselves and chain "monospace" as
-        // a secondary family — fontconfig prefers the first listed family but
-        // falls through the chain before reaching its system default.
+        // Resolve the X11 font name to a file path via our skrifa-based
+        // FontDb. Parse the name for family/style/pixel_size hints, then
+        // search the database for the best match.
         let (family, style, xlfd_px) = if Self::is_xlfd_pattern(name) {
             Self::parse_xlfd(name)
         } else {
             (Some(name.to_string()), None, None)
         };
         let query_family = family.as_deref().unwrap_or("monospace");
+        let query_style = style.as_deref();
 
-        let cfamily = std::ffi::CString::new(query_family)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
-
-        let mut pat = fontconfig::Pattern::new(&self.fc);
-        pat.add_string(fontconfig::FC_FAMILY, &cfamily);
-        if query_family != "monospace" {
-            pat.add_string(fontconfig::FC_FAMILY, c"monospace");
-        }
-        let cstyle_storage;
-        if let Some(style) = style.as_deref() {
-            cstyle_storage = std::ffi::CString::new(style)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
-            pat.add_string(fontconfig::FC_STYLE, &cstyle_storage);
-        }
-        let matched = pat.font_match();
-        let path = matched.filename().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
+        let (path, face_index) = self
+            .font_db
+            .match_font(query_family, query_style)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
+            })?;
+        let face = self.library.new_face(&path, face_index).map_err(|e| {
+            io::Error::other(format!(
+                "freetype new_face({}) failed: {e:?}",
+                path.display()
+            ))
         })?;
-        let face_index: isize = matched.face_index().unwrap_or(0) as isize;
-        let face = self
-            .library
-            .new_face(path, face_index)
-            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
 
         // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
         if let Some(px) = xlfd_px {
@@ -1066,11 +1332,10 @@ fn compute_font_metrics(
     (metrics, char_info_cache)
 }
 
-/// Map a fontconfig integer `weight` (`FC_WEIGHT_*`) to the X11 XLFD
-/// weight name. Buckets follow the canonical fontconfig→XLFD mapping
-/// used by Xft and traditional X font path synthesis.
-pub(crate) fn xlfd_weight(w: i32) -> &'static str {
-    match w {
+/// Map a CSS/fontconfig integer `weight` to the X11 XLFD weight name.
+/// Accepts both `i32` (fontconfig legacy) and `u16` (skrifa/OS2).
+pub(crate) fn xlfd_weight(w: impl Into<i32>) -> &'static str {
+    match w.into() {
         ..=49 => "thin",
         50..=74 => "light",
         75..=89 => "book",
@@ -1082,8 +1347,8 @@ pub(crate) fn xlfd_weight(w: i32) -> &'static str {
 }
 
 /// Map a fontconfig integer `slant` to the single-letter XLFD slant.
-pub(crate) fn xlfd_slant(s: i32) -> &'static str {
-    match s {
+pub(crate) fn xlfd_slant(s: impl Into<i32>) -> &'static str {
+    match s.into() {
         100 => "i", // italic
         110 => "o", // oblique
         _ => "r",   // roman
@@ -1091,91 +1356,20 @@ pub(crate) fn xlfd_slant(s: i32) -> &'static str {
 }
 
 /// Map a fontconfig integer `spacing` to the single-letter XLFD spacing.
-pub(crate) fn xlfd_spacing(s: i32) -> &'static str {
-    match s {
+pub(crate) fn xlfd_spacing(s: impl Into<i32>) -> &'static str {
+    match s.into() {
         100 => "m", // monospaced
         110 => "c", // charcell
         _ => "p",   // proportional
     }
 }
 
-/// Make a fontconfig string safe to drop into a single XLFD field:
+/// Make a font name safe to drop into a single XLFD field:
 /// dashes are field separators in XLFDs, so any embedded `-` is
 /// replaced with a space. XLFD is case-insensitive but conventionally
 /// lowercase.
 pub(crate) fn sanitize_xlfd_field(s: &str) -> String {
     s.replace('-', " ").to_lowercase()
-}
-
-/// Enumerate the installed font set via fontconfig and synthesise one
-/// XLFD per (face × pixel-size × charset) combination. Every entry is
-/// a real font that `FontLoader::open_font` can resolve back to a
-/// `FreeType::Face` — there are no stub XLFDs.
-///
-/// Charsets are limited to `iso8859-1` and `iso10646-1` because those
-/// two are the universal subset every scalable font supports through
-/// FreeType's char-by-char lookup. Locale-specific charsets (jisx*,
-/// gb2312*, ksc*) need real fonts on disk to satisfy properly; rather
-/// than stub them, we let libXt warn "Missing charset X" and proceed
-/// with the iso* coverage that's guaranteed real.
-pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
-    const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
-    const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
-
-    let pat = fontconfig::Pattern::new(fc);
-    let mut objs = fontconfig::ObjectSet::new(fc);
-    objs.add(fontconfig::FC_FAMILY);
-    objs.add(fontconfig::FC_FOUNDRY);
-    objs.add(fontconfig::FC_WEIGHT);
-    objs.add(fontconfig::FC_SLANT);
-    objs.add(fontconfig::FC_SPACING);
-    let set = fontconfig::list_fonts(&pat, Some(&objs));
-
-    // Aliases the loader handles directly without an XLFD parse pass.
-    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
-    let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
-
-    for font in set.iter() {
-        let Some(family) = font.get_string(fontconfig::FC_FAMILY) else {
-            continue;
-        };
-        let foundry = font.get_string(fontconfig::FC_FOUNDRY).unwrap_or("misc");
-        let weight = font.get_int(fontconfig::FC_WEIGHT).unwrap_or(80);
-        let slant = font.get_int(fontconfig::FC_SLANT).unwrap_or(0);
-        let spacing = font.get_int(fontconfig::FC_SPACING).unwrap_or(0);
-
-        let key = (
-            family.to_lowercase(),
-            foundry.to_lowercase(),
-            weight,
-            slant,
-            spacing,
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-
-        let foundry_x = sanitize_xlfd_field(foundry);
-        let family_x = sanitize_xlfd_field(family);
-        let weight_x = xlfd_weight(weight);
-        let slant_x = xlfd_slant(slant);
-        let spacing_x = xlfd_spacing(spacing);
-
-        for &px in PIXEL_SIZES {
-            // Average width estimate: ~0.6 × pixel size, in 1/10 px.
-            // Approximation only — clients filter by name pattern, not
-            // by this field, and QueryFont returns the real widths.
-            let avg_width = (px * 6).clamp(1, 999);
-            for &charset in CHARSETS {
-                entries.push(format!(
-                    "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
-                    px * 10,
-                ));
-            }
-        }
-    }
-
-    entries
 }
 
 // ───────────────────────────────────────────────────────────────

@@ -322,7 +322,7 @@ enum Occupancy {
 /// never-accepting listener in the world-writable socket dir, must not
 /// hang the launch). EAGAIN ⇒ backlog full ⇒ the display IS occupied.
 fn probe(path: &Path) -> Occupancy {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket};
 
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -333,25 +333,26 @@ fn probe(path: &Path) -> Occupancy {
         return Occupancy::NonSocket;
     }
     let fd = match socket(
-        AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
         None,
     ) {
         Ok(fd) => fd,
         Err(_) => return Occupancy::Opaque,
     };
-    let addr = match UnixAddr::new(path) {
+    let addr = match SocketAddrUnix::new(path) {
         Ok(a) => a,
         Err(_) => return Occupancy::Opaque,
     };
-    match connect(fd.as_raw_fd(), &addr) {
+    match connect(&fd, &addr) {
         Ok(()) => Occupancy::Live,
         // Nonblocking AF_UNIX connect outcomes:
-        Err(nix::errno::Errno::EAGAIN) => Occupancy::Live, // backlog full
-        Err(nix::errno::Errno::EINPROGRESS) => Occupancy::Live,
-        Err(nix::errno::Errno::ECONNREFUSED) => Occupancy::Stale,
-        Err(_) => Occupancy::Opaque,
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Occupancy::Live, // backlog full
+            Some(libc::ECONNREFUSED) => Occupancy::Stale,
+            _ => Occupancy::Opaque,
+        },
     }
     // fd is an OwnedFd — closed on drop.
 }
