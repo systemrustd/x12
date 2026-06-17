@@ -5283,7 +5283,7 @@ fn handle_mit_shm_create_segment(
             MIT_SHM_MAJOR_OPCODE,
         );
     }
-    let fd = unsafe { libc::memfd_create(c"yserver-shm".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = crate::unix_fd::create_shm_fd("yserver-shm");
     if fd < 0 {
         return emit_x11_error_with_minor(
             state,

@@ -1560,7 +1560,7 @@ unsafe impl Sync for MitShmSegment {}
 
 impl MitShmSegment {
     /// Map an attached file descriptor. Caller must have verified the FD
-    /// references a regular file or memfd; we `fstat` to learn the size.
+    /// references a regular file or shm fd; we `fstat` to learn the size.
     ///
     /// On success, takes ownership of `fd` and will close it on `Drop`.
     pub fn from_fd(owner: ClientId, fd: libc::c_int, read_only: bool) -> std::io::Result<Self> {
@@ -4970,10 +4970,11 @@ mod tests {
         );
         expect.push(id_damage);
 
-        // 14. mit_shm_segments — requires a real fd; use memfd_create
+        // 14. mit_shm_segments — requires a real fd; use shm_open (UUID-based,
+        // works on both Linux and macOS — no Linux-only memfd_create/MFD_CLOEXEC).
         let id_shm = base + 14;
-        let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "memfd_create failed");
+        let fd = crate::unix_fd::create_shm_fd("xcmisc-test-shm");
+        assert!(fd >= 0, "create_shm_fd failed");
         let rc = unsafe { libc::ftruncate(fd, 4096) };
         assert_eq!(rc, 0, "ftruncate failed");
         let shm_seg = MitShmSegment::from_fd(owner, fd, false).expect("MitShmSegment::from_fd");

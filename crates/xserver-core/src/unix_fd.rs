@@ -72,9 +72,44 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
     Ok((n as usize, fds))
 }
 
+/// Create a POSIX shared-memory file descriptor.
+///
+/// Uses `shm_open` with a UUID-based name so it works on both Linux and
+/// macOS (XQuartz-style). The name is immediately `shm_unlink`'d so the
+/// memory is freed when all references to the fd are closed.
+/// `FD_CLOEXEC` is set via `fcntl` (macOS has no `MFD_CLOEXEC`).
+///
+/// Returns the raw fd on success, or -1 on failure.
+pub fn create_shm_fd(name_prefix: &str) -> RawFd {
+    let uuid = uuid::Uuid::new_v4();
+    // shm_open requires a name starting with '/' and containing no other '/'.
+    let name = format!("/{}-{}", name_prefix, uuid.as_hyphenated());
+    let name_c = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let fd = unsafe {
+        libc::shm_open(
+            name_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    if fd >= 0 {
+        // Unlink immediately so the shm is cleaned up when all fds close.
+        unsafe { libc::shm_unlink(name_c.as_ptr()) };
+        // Set close-on-exec (macOS has no MFD_CLOEXEC — use fcntl instead).
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        }
+    }
+    fd
+}
+
 /// Send `bytes` together with `fd` over `stream` using `sendmsg(2)` so
 /// the receiving end gets the FD via `SCM_RIGHTS`. Used by
-/// MIT-SHM::CreateSegment to pass a server-allocated `memfd_create`
+/// MIT-SHM::CreateSegment to pass a server-allocated shm fd
 /// descriptor back to the client in its reply.
 pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<()> {
     let mut iov = libc::iovec {

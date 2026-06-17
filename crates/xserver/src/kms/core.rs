@@ -25,15 +25,15 @@ use std::{
     io,
 };
 
+use x12_protocol::x11::{
+    CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
+};
 use yserver_core::{
     backend::{
         ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode,
         params::{ArcMode, CapStyle, JoinStyle, LineStyle},
     },
     host_x11::{HostPointerEvent, HostXidMap},
-};
-use x12_protocol::x11::{
-    CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
 };
 
 use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};

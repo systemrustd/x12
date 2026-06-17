@@ -22,9 +22,9 @@
 
 #![cfg(target_os = "linux")]
 
+use x12_protocol::x11::ClipRectangles;
 use yserver::kms::v2::KmsBackendV2;
 use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
-use x12_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
 /// 1. create_pixmap (depth=32, 8×8)

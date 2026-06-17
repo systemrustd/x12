@@ -48,14 +48,10 @@ fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
     let parent = pending.parent;
     if pending.was_mapped {
         let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            x12_protocol::x11::encode_unmap_notify_event(
-                buf, seq, order, window, window, false,
-            );
+            x12_protocol::x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
         });
         let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            x12_protocol::x11::encode_unmap_notify_event(
-                buf, seq, order, parent, window, false,
-            );
+            x12_protocol::x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
         });
     }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {

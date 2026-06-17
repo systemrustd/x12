@@ -1,9 +1,9 @@
 //! Minimal FFI to `libxshmfence` — the shared-memory + futex
 //! fence protocol Mesa's `loader_dri3` uses for `FenceFromFD`.
 //!
-//! Mesa's `xshmfence_alloc_shm` creates a memfd-backed shared
+//! Mesa's `xshmfence_alloc_shm` creates an shm-backed shared
 //! 4-byte counter; `xshmfence_share_fd` (now removed in favour of
-//! the existing memfd) hands the fd to the X server via DRI3
+//! the existing shm fd) hands the fd to the X server via DRI3
 //! `FenceFromFD`. Server side: `xshmfence_map_shm` mmaps the fd,
 //! `xshmfence_trigger` writes 1 + futex_wake. Mesa's wait side
 //! futexes on the same physical page — wakes immediately.
@@ -43,7 +43,7 @@ pub struct FenceMapping {
 }
 
 impl FenceMapping {
-    /// Map a memfd-backed xshmfence. The fd is duplicated by
+    /// Map an shm-backed xshmfence. The fd is duplicated by
     /// `xshmfence_map_shm` internally; the caller's fd is unaffected.
     /// Returns `None` if the fd isn't an xshmfence (e.g. a real
     /// sync_file).
