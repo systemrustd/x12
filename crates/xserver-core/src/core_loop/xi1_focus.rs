@@ -13,7 +13,7 @@
 //! client-disconnect teardown all funnel through
 //! [`revert_unviewable_focus`] / [`revert_focus_for_dying_subtree`].
 
-use yserver_protocol::x11::{ClientId, ResourceId};
+use x12_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
     core_loop::fanout::fanout_event_to_clients,
@@ -718,7 +718,7 @@ mod tests {
         os::unix::net::UnixStream,
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
-    use yserver_protocol::x11::{ClientByteOrder, ClientId, CreateWindowRequest};
+    use x12_protocol::x11::{ClientByteOrder, ClientId, CreateWindowRequest};
 
     const DEV: u16 = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
 

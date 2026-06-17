@@ -4,7 +4,7 @@
 
 use std::os::{fd::OwnedFd, unix::net::UnixStream};
 
-use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+use x12_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
 use crate::host_x11::HostKeyEvent;
 

@@ -71,7 +71,7 @@ pub(crate) enum PinnedWake {
 mod tests {
     use super::*;
     use yserver_core::backend::PresentWake;
-    use yserver_protocol::x11::ClientId;
+    use x12_protocol::x11::ClientId;
 
     /// Smoke test that the types compile + can be constructed.
     /// Real semantics tested in `KmsBackendV2` integration tests.

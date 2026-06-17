@@ -12,7 +12,7 @@
 //! 6 remaining axes, every event but the last carrying
 //! `XI1_MORE_EVENTS` in its deviceid byte.
 
-use yserver_protocol::x11::{ClientId, ResourceId};
+use x12_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
     core_loop::fanout::fanout_event_to_clients,
@@ -97,8 +97,8 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn encode_state_notify_chain(
     buf: &mut Vec<u8>,
-    order: yserver_protocol::x11::ClientByteOrder,
-    seq: yserver_protocol::x11::SequenceNumber,
+    order: x12_protocol::x11::ClientByteOrder,
+    seq: x12_protocol::x11::SequenceNumber,
     deviceid: u16,
     time: u32,
     dev_state: &Xi1DeviceInputState,
@@ -194,7 +194,7 @@ mod tests {
         os::unix::net::UnixStream,
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
-    use yserver_protocol::x11::{ClientByteOrder, CreateWindowRequest};
+    use x12_protocol::x11::{ClientByteOrder, CreateWindowRequest};
 
     const POINTER: u16 = crate::xinput::DEVICEID_SLAVE_POINTER;
     const KEYBOARD: u16 = crate::xinput::DEVICEID_SLAVE_KEYBOARD;

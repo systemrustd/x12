@@ -21,7 +21,7 @@
 
 use std::{io, sync::Mutex};
 
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
+use x12_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::{
     backend::{

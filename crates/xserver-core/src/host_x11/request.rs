@@ -17,7 +17,7 @@ use std::io::{self, ErrorKind, Write};
 
 use super::pump::HostStream;
 
-use yserver_protocol::x11::{self, ClipRectangles, FontMetrics};
+use x12_protocol::x11::{self, ClipRectangles, FontMetrics};
 
 use crate::backend::{
     AnyHandle, CursorHandle, FontHandle, GlyphSetHandle, PictureHandle, PixmapHandle, WindowHandle,
@@ -189,7 +189,7 @@ impl HostX11Backend {
         &mut self,
         host_xid: u32,
         kind: u8,
-        rects: &[yserver_protocol::x11::xfixes::RegionRect],
+        rects: &[x12_protocol::x11::xfixes::RegionRect],
     ) -> io::Result<()> {
         let Some(bytes) = build_shape_rectangles(self.shape_opcode, host_xid, kind, rects) else {
             return Ok(());
@@ -2373,7 +2373,7 @@ fn build_xfixes_change_cursor_by_name(
     let length_units = u16::try_from(3 + padded_name / 4).ok()?;
     let mut out = Vec::with_capacity(12 + padded_name);
     out.push(opcode);
-    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
+    out.push(x12_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
     write_u16(&mut out, length_units);
     write_u32(&mut out, host_cursor_xid);
     write_u16(&mut out, nbytes);
@@ -2390,15 +2390,15 @@ fn build_shape_rectangles(
     host_shape_opcode: Option<u8>,
     host_xid: u32,
     kind: u8,
-    rects: &[yserver_protocol::x11::xfixes::RegionRect],
+    rects: &[x12_protocol::x11::xfixes::RegionRect],
 ) -> Option<Vec<u8>> {
     let opcode = host_shape_opcode?;
     let length_units = u16::try_from(4 + rects.len() * 2).ok()?;
     let mut out = Vec::with_capacity(16 + rects.len() * 8);
     out.push(opcode);
-    out.push(yserver_protocol::x11::shape::RECTANGLES);
+    out.push(x12_protocol::x11::shape::RECTANGLES);
     write_u16(&mut out, length_units);
-    out.push(yserver_protocol::x11::shape::OP_SET);
+    out.push(x12_protocol::x11::shape::OP_SET);
     out.push(kind);
     out.push(0); // ordering = Unsorted
     out.push(0); // pad
@@ -2454,7 +2454,7 @@ fn write_list_fonts(
 #[cfg(test)]
 mod tests {
     use super::{build_shape_rectangles, xkb_minor_has_reply};
-    use yserver_protocol::x11::xfixes::RegionRect;
+    use x12_protocol::x11::xfixes::RegionRect;
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {

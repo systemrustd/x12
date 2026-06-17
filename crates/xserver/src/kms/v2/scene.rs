@@ -63,7 +63,7 @@ use std::{
 };
 
 use ash::vk;
-use yserver_protocol::x11::xfixes;
+use x12_protocol::x11::xfixes;
 
 use super::{
     platform::{FenceTicket, PlatformBackend},
@@ -3634,7 +3634,7 @@ mod tests {
     /// below — diagnosed 2026-05-30 on non-composited MATE.
     #[test]
     fn build_scene_clips_window_to_shape_bounding() {
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use x12_protocol::x11::xfixes::RegionRect;
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();

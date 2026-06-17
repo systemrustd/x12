@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use yserver_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
+use x12_protocol::x11::{AtomId, ClientByteOrder, SequenceNumber};
 
 use crate::core_loop::DeviceInfo;
 

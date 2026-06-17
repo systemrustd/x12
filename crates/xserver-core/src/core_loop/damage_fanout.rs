@@ -9,7 +9,7 @@
 //! collection in a single `&mut ServerState` borrow scope, then
 //! encodes + writes via `client_io::write_or_buffer`.
 
-use yserver_protocol::x11::{ClientId, ResourceId, SequenceNumber, damage as x11damage, xfixes};
+use x12_protocol::x11::{ClientId, ResourceId, SequenceNumber, damage as x11damage, xfixes};
 
 use crate::{core_loop::fanout::fanout_event_to_clients, server::ServerState};
 
@@ -677,7 +677,7 @@ fn accumulate_at_level(
 
 fn encode_damage_notify(
     buf: &mut Vec<u8>,
-    byte_order: yserver_protocol::x11::ClientByteOrder,
+    byte_order: x12_protocol::x11::ClientByteOrder,
     seq: SequenceNumber,
     n: &PendingNotify,
     timestamp: u32,
@@ -748,7 +748,7 @@ mod tests {
             atomic::{AtomicU16, Ordering},
         },
     };
-    use yserver_protocol::x11::{ClientByteOrder, CreatePixmapRequest, CreateWindowRequest};
+    use x12_protocol::x11::{ClientByteOrder, CreatePixmapRequest, CreateWindowRequest};
 
     fn make_test_writer() -> Arc<Mutex<UnixStream>> {
         // Pair of sockets; we keep the read end alive in the same

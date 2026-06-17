@@ -6671,7 +6671,7 @@ fn resolve_force_opaque_pict_format(
     src: &ResolvedSource,
     pict_format: u32,
 ) -> bool {
-    use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    use x12_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
     match src {
         ResolvedSource::Drawable(id) => {
             if pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32 {
@@ -6820,7 +6820,7 @@ fn swizzle_class_for(format: vk::Format, depth: u8) -> SwizzleClass {
 /// `pict_format == 0` falls back to the depth+format heuristic
 /// for engine-internal callers without picture context.
 fn dst_has_alpha_for_pict_format(format: vk::Format, depth: u8, pict_format: u32) -> bool {
-    use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    use x12_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
     // R8_UNORM dst is an A8 mask — alpha-only by definition,
     // pict_format can't override that.
     if format == vk::Format::R8_UNORM {
@@ -6850,7 +6850,7 @@ fn dst_has_alpha_for_pict_format(format: vk::Format, depth: u8, pict_format: u32
 /// internal engine paths that don't carry a Picture identity
 /// (composite_glyphs synthesized A8 masks, trapezoid traps).
 fn swizzle_class_for_pict_format(format: vk::Format, depth: u8, pict_format: u32) -> SwizzleClass {
-    use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    use x12_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
     // R8_UNORM is alpha-only by construction — pict_format can't
     // override that. Same for the legacy depth-24 BGRA8 case.
     if format == vk::Format::R8_UNORM {
@@ -11781,7 +11781,7 @@ mod tests {
     /// transparent black against the wallpaper.
     #[test]
     fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format() {
-        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+        use x12_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
 
         let mut store = DrawableStore::new();
         // Depth-32 storage (would normally sample with real α).
@@ -11863,7 +11863,7 @@ mod tests {
     /// unconditionally → xRGB32 destination treated as ARGB.
     #[test]
     fn render_composite_dst_has_alpha_honors_xrgb32_pict_format() {
-        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+        use x12_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
 
         // pict_format=0 (no picture context — engine-internal callers
         // synthesizing draws) → depth heuristic.
@@ -11912,7 +11912,7 @@ mod tests {
     /// transparent.
     #[test]
     fn render_composite_swizzle_class_for_pict_format_xrgb32_is_no_alpha() {
-        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+        use x12_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
 
         // pict_format=0 falls back to depth heuristic.
         assert_eq!(

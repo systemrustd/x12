@@ -38,7 +38,7 @@ use yserver_core::{
     resources::{ARGB_COLORMAP, ARGB_VISUAL},
     server::ServerState,
 };
-use yserver_protocol::x11::{
+use x12_protocol::x11::{
     AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
     ResourceId, xfixes,
 };
@@ -3664,7 +3664,7 @@ impl KmsBackendV2 {
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
         use yserver_core::backend::{CompletedPresentEvent, PresentWake};
-        use yserver_protocol::x11::ClientId;
+        use x12_protocol::x11::ClientId;
 
         let Some(dst_id) = self.store.lookup(dst_xid) else {
             return false;
@@ -3873,7 +3873,7 @@ impl KmsBackendV2 {
     ) -> bool {
         use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
         use yserver_core::backend::{CompletedPresentEvent, PresentWake};
-        use yserver_protocol::x11::ClientId;
+        use x12_protocol::x11::ClientId;
 
         let cow_id = match self.cow_id {
             Some(id) => id,
@@ -12894,13 +12894,13 @@ impl Backend for KmsBackendV2 {
     fn picture_client_clip_rects(
         &mut self,
         host_pic: u32,
-    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+    ) -> Option<Option<Vec<x12_protocol::x11::xfixes::RegionRect>>> {
         let record = self.core.pictures.get(&host_pic)?;
         match record {
             PictureRecord::Drawable { clip, .. } => Some(clip.as_ref().map(|rects| {
                 rects
                     .iter()
-                    .map(|r| yserver_protocol::x11::xfixes::RegionRect {
+                    .map(|r| x12_protocol::x11::xfixes::RegionRect {
                         x: r.x,
                         y: r.y,
                         width: r.width,
@@ -15250,10 +15250,10 @@ impl Backend for KmsBackendV2 {
                         }
                         let name_atom = intern_atom(pname);
                         let v: u32 = match value {
-                            yserver_protocol::x11::FontPropValue::Card(c) => *c,
+                            x12_protocol::x11::FontPropValue::Card(c) => *c,
                             #[allow(clippy::cast_sign_loss)]
-                            yserver_protocol::x11::FontPropValue::Int(i) => *i as u32,
-                            yserver_protocol::x11::FontPropValue::Str(s) => intern_atom(s),
+                            x12_protocol::x11::FontPropValue::Int(i) => *i as u32,
+                            x12_protocol::x11::FontPropValue::Str(s) => intern_atom(s),
                         };
                         props.extend_from_slice(&name_atom.to_le_bytes());
                         props.extend_from_slice(&v.to_le_bytes());
@@ -15278,10 +15278,10 @@ impl Backend for KmsBackendV2 {
         for (idx, (name, metrics)) in entries.iter().enumerate() {
             let remaining = u32::try_from(total - idx - 1).unwrap_or(0);
             let mut buf = Vec::new();
-            yserver_protocol::x11::write_list_fonts_with_info_reply(
+            x12_protocol::x11::write_list_fonts_with_info_reply(
                 &mut buf,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
-                yserver_protocol::x11::SequenceNumber(0),
+                x12_protocol::x11::ClientByteOrder::LittleEndian,
+                x12_protocol::x11::SequenceNumber(0),
                 metrics,
                 name,
                 remaining,
@@ -15289,10 +15289,10 @@ impl Backend for KmsBackendV2 {
             replies.push(buf);
         }
         let mut term = Vec::new();
-        yserver_protocol::x11::write_list_fonts_with_info_terminator(
+        x12_protocol::x11::write_list_fonts_with_info_terminator(
             &mut term,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            yserver_protocol::x11::SequenceNumber(0),
+            x12_protocol::x11::ClientByteOrder::LittleEndian,
+            x12_protocol::x11::SequenceNumber(0),
         )?;
         replies.push(term);
         Ok(replies)
@@ -15925,7 +15925,7 @@ mod tests {
 
         b.enqueue_present_completion(
             yserver_core::backend::CompletedPresentEvent {
-                client_id: yserver_protocol::x11::ClientId(0),
+                client_id: x12_protocol::x11::ClientId(0),
                 serial: 1,
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
@@ -15971,7 +15971,7 @@ mod tests {
 
         b.enqueue_present_completion(
             yserver_core::backend::CompletedPresentEvent {
-                client_id: yserver_protocol::x11::ClientId(0),
+                client_id: x12_protocol::x11::ClientId(0),
                 serial: 1,
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
@@ -16184,7 +16184,7 @@ mod tests {
     /// mutates KmsCore's xid_map; xid_map() reflects the new entry.
     #[test]
     fn v2_register_top_level_updates_xid_map() {
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
         let mut b = KmsBackendV2::for_tests();
         b.register_top_level(None, ResourceId(0x4242), 0x0040_1234)
             .expect("register_top_level");
@@ -17348,7 +17348,7 @@ mod tests {
     fn poly_fill_rectangle_honours_gc_clip() {
         use crate::kms::cpu_types::Rectangle16;
         use yserver_core::backend::ClipState;
-        use yserver_protocol::x11::ClipRectangles;
+        use x12_protocol::x11::ClipRectangles;
 
         let mut b = KmsBackendV2::for_tests();
         // Two 4×8 clip rects side-by-side starting at (5, 5), with
@@ -18063,7 +18063,7 @@ mod tests {
     #[test]
     fn cwa_on_descendant_routed_to_redirected_ancestor_does_not_clear() {
         use yserver_core::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut backend = KmsBackendV2::for_tests();
@@ -19201,7 +19201,7 @@ mod tests {
     #[test]
     fn desktop_window_type_moves_to_bottom() {
         use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -19237,7 +19237,7 @@ mod tests {
     #[test]
     fn dialog_hint_raises_when_window_becomes_top_level() {
         use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
@@ -21231,7 +21231,7 @@ mod tests {
     /// Mirrors the production "high bit set" convention used by the
     /// sibling core tests so the v2 windows_v2 keys never collide
     /// with low-numbered nested xids.
-    fn synth_host_xid(xid: yserver_protocol::x11::ResourceId) -> u32 {
+    fn synth_host_xid(xid: x12_protocol::x11::ResourceId) -> u32 {
         0x8000_0000 | xid.0
     }
 
@@ -21245,15 +21245,15 @@ mod tests {
     fn seed_v2_window(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        xid: yserver_protocol::x11::ResourceId,
-        parent: yserver_protocol::x11::ResourceId,
+        xid: x12_protocol::x11::ResourceId,
+        parent: x12_protocol::x11::ResourceId,
         x: i16,
         y: i16,
         width: u16,
         height: u16,
     ) {
         use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+        use x12_protocol::x11::{ClientId, CreateWindowRequest};
         state.resources.create_window(
             ClientId(14),
             CreateWindowRequest {
@@ -21320,7 +21320,7 @@ mod tests {
     fn seed_v2_redirected_backing(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        xid: yserver_protocol::x11::ResourceId,
+        xid: x12_protocol::x11::ResourceId,
     ) {
         let host_xid = synth_host_xid(xid);
         let backing_xid = 0x9000_0000 | xid.0;
@@ -21369,7 +21369,7 @@ mod tests {
     /// the window itself isn't in the store).
     fn backing_drawable_id(
         backend: &KmsBackendV2,
-        xid: yserver_protocol::x11::ResourceId,
+        xid: x12_protocol::x11::ResourceId,
     ) -> Option<crate::kms::v2::store::DrawableId> {
         let host_xid = synth_host_xid(xid);
         let w_id = backend.store.lookup(host_xid)?;
@@ -21382,13 +21382,13 @@ mod tests {
     fn dispatch_reparent_window_v2(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        window: yserver_protocol::x11::ResourceId,
-        parent: yserver_protocol::x11::ResourceId,
+        window: x12_protocol::x11::ResourceId,
+        parent: x12_protocol::x11::ResourceId,
         x: i16,
         y: i16,
     ) {
         use yserver_core::{backend::Backend, core_loop::process_request};
-        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(&window.0.to_le_bytes());
@@ -21415,13 +21415,13 @@ mod tests {
     fn dispatch_configure_window_v2(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        window: yserver_protocol::x11::ResourceId,
+        window: x12_protocol::x11::ResourceId,
         x: Option<i16>,
         y: Option<i16>,
         border_width: Option<u16>,
     ) {
         use yserver_core::{backend::Backend, core_loop::process_request};
-        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut mask = 0u16;
         if x.is_some() {
@@ -21467,12 +21467,12 @@ mod tests {
     fn dispatch_poly_fill_rectangle_v2(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        drawable: yserver_protocol::x11::ResourceId,
-        gc: yserver_protocol::x11::ResourceId,
+        drawable: x12_protocol::x11::ResourceId,
+        gc: x12_protocol::x11::ResourceId,
         rects: &[Rectangle16],
     ) {
         use yserver_core::{backend::Backend, core_loop::process_request};
-        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+        use x12_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
 
         let mut body = Vec::with_capacity(8 + rects.len() * 8);
         body.extend_from_slice(&drawable.0.to_le_bytes());
@@ -21503,8 +21503,8 @@ mod tests {
     fn create_live_v2_window(
         state: &mut yserver_core::server::ServerState,
         backend: &mut KmsBackendV2,
-        xid: yserver_protocol::x11::ResourceId,
-        parent: yserver_protocol::x11::ResourceId,
+        xid: x12_protocol::x11::ResourceId,
+        parent: x12_protocol::x11::ResourceId,
         x: i16,
         y: i16,
         width: u16,
@@ -21515,11 +21515,11 @@ mod tests {
             host_x11::HostSubwindowVisual,
             resources::{ROOT_VISUAL, ROOT_WINDOW},
         };
-        use yserver_protocol::x11::ClientId;
+        use x12_protocol::x11::ClientId;
 
         state.resources.create_window(
             ClientId(14),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: xid,
                 parent,
@@ -21582,7 +21582,7 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn process_request_root_fill_include_inferiors_matches_top_level_after_move() {
         use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
+        use x12_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
 
         let mut state = yserver_core::server::ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk() {
@@ -21725,7 +21725,7 @@ mod tests {
     fn root_get_image_reads_scanout_pixels_not_root_storage() {
         use ash::vk;
         use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
@@ -21820,7 +21820,7 @@ mod tests {
             sync::{Arc, Mutex, atomic::AtomicU16},
         };
         use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
-        use yserver_protocol::x11::ClientByteOrder;
+        use x12_protocol::x11::ClientByteOrder;
         let (a, _b) = UnixStream::pair().unwrap();
         state.clients.insert(
             id,
@@ -21850,7 +21850,7 @@ mod tests {
             resources::ROOT_WINDOW,
             server::{CompositeRedirectMode, RedirectRecord, ServerState},
         };
-        use yserver_protocol::x11::{ClientId, ResourceId};
+        use x12_protocol::x11::{ClientId, ResourceId};
 
         // Phase 2 root-cause pin: build a tree mirroring the live
         // mate-panel case (root → mate-panel, root → nm-applet),

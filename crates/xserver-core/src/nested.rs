@@ -12,7 +12,7 @@ use std::{
 };
 
 use log::{error, info};
-use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
+use x12_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
 use crate::{
     backend::{Backend, WindowHandle},
@@ -1177,7 +1177,7 @@ mod tests {
             union_regions,
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
-        use yserver_protocol::x11::{
+        use x12_protocol::x11::{
             ClientId, CreatePixmapRequest, ResourceId, shape, xfixes::RegionRect,
         };
 
@@ -1346,7 +1346,7 @@ mod tests {
             resources::ROOT_WINDOW,
             server::{ClientState, ServerState},
         };
-        use yserver_protocol::x11::ClientByteOrder;
+        use x12_protocol::x11::ClientByteOrder;
 
         const STRUCTURE_NOTIFY_MASK: u32 = 0x0002_0000;
 

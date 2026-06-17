@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use yserver_protocol::x11::ResourceId;
+use x12_protocol::x11::ResourceId;
 
 /// Path the Present scheduler picked for a queued frame. Phase 4.2.3
 /// only exercises `Copy`; `Flip` / `DirectScanout` arrive in 4.2.4.

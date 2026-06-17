@@ -12,7 +12,7 @@
 //! mirrors it across clients), so the helper picks the first non-ROOT
 //! focus it sees. When every client is rooted, the event is dropped.
 
-use yserver_protocol::x11::{self, ClientId, ResourceId};
+use x12_protocol::x11::{self, ClientId, ResourceId};
 
 use crate::{
     core_loop::fanout::{fanout_event_to_clients, subscribers_by_id},
@@ -707,7 +707,7 @@ mod tests {
     use crate::server::{
         ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ScreenSaverActive, ServerState,
     };
-    use yserver_protocol::x11::ClientId;
+    use x12_protocol::x11::ClientId;
 
     use crate::server::ClientState;
     use std::{
@@ -716,7 +716,7 @@ mod tests {
         os::unix::net::UnixStream,
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
 
     // Duplicated from process_request.rs::tests. If you change one,
     // change both. A shared test_fixtures module is the right home
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn key_event_fires_neg_transition_alarm_when_prior_idle_crosses_threshold() {
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         // User idle for 90s, NegativeTransition alarm at 60s.
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
@@ -1166,7 +1166,7 @@ mod tests {
         // PRIMARY assertion is AlarmNotify (type=84) on the client's
         // outbound stream; cache + state are secondary checks.
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);

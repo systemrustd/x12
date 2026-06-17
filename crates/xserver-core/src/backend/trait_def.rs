@@ -12,7 +12,7 @@
 
 use std::{any::Any, io};
 
-use yserver_protocol::x11::{AtomId, ClipRectangles, FontMetrics, xfixes};
+use x12_protocol::x11::{AtomId, ClipRectangles, FontMetrics, xfixes};
 
 use crate::{
     backend::{
@@ -24,7 +24,7 @@ use crate::{
     server::ServerState,
 };
 
-use yserver_protocol::x11::ResourceId;
+use x12_protocol::x11::ResourceId;
 
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
@@ -138,7 +138,7 @@ impl PresentCaps {
 /// `Arc`-pinned handle before returning this struct.
 #[derive(Debug, Clone)]
 pub struct CompletedPresentEvent {
-    pub client_id: yserver_protocol::x11::ClientId,
+    pub client_id: x12_protocol::x11::ClientId,
     pub serial: u32,
     pub host_xid: u32,
     pub dst_host_xid: u32,
@@ -1932,7 +1932,7 @@ mod present_completion_trait_tests {
         let mut backend = crate::backend::recording::RecordingBackend::new();
         backend.enqueue_present_completion(
             CompletedPresentEvent {
-                client_id: yserver_protocol::x11::ClientId(0),
+                client_id: x12_protocol::x11::ClientId(0),
                 serial: 1,
                 host_xid: 0,
                 dst_host_xid: 0,

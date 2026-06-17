@@ -22,7 +22,7 @@
 use std::{collections::HashSet, io, os::fd::OwnedFd};
 
 use log::{debug, trace};
-use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
+use x12_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
 
 use crate::{
     backend::{Backend, OriginContext, params::FillState},
@@ -426,7 +426,7 @@ fn mirror_shape_to_host_state(
     window: ResourceId,
     kind: u8,
 ) {
-    use yserver_protocol::x11::shape as x11shape;
+    use x12_protocol::x11::shape as x11shape;
     // Mirror Bounding, Clip, AND Input shapes to the backend. Pre-fix
     // (2026-05-26 adapta-nokto investigation): only Bounding/Clip were
     // mirrored, so the backend's `core.shape_input` never reflected a
@@ -461,8 +461,8 @@ fn mirror_shape_to_host_state(
 fn drawable_full_rect_xfixes(
     state: &ServerState,
     drawable: ResourceId,
-) -> yserver_protocol::x11::xfixes::RegionRect {
-    use yserver_protocol::x11::xfixes;
+) -> x12_protocol::x11::xfixes::RegionRect {
+    use x12_protocol::x11::xfixes;
     if let Some(window) = state.resources.window(drawable) {
         return xfixes::RegionRect {
             x: 0,
@@ -488,8 +488,8 @@ fn drawable_full_rect_xfixes(
 }
 
 fn normalize_region_rects(
-    rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
-) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+    rects: Vec<x12_protocol::x11::xfixes::RegionRect>,
+) -> Vec<x12_protocol::x11::xfixes::RegionRect> {
     crate::nested::normalize_region_rects(rects)
 }
 
@@ -506,7 +506,7 @@ fn clip_fill_rects_by_children(
     dst_drawable: ResourceId,
     rects: &[u8],
 ) -> Vec<u8> {
-    use yserver_protocol::x11::xfixes;
+    use x12_protocol::x11::xfixes;
 
     let child_rects = crate::core_loop::damage_fanout::mapped_child_clip_rects(state, dst_drawable);
     if child_rects.is_empty() {
@@ -543,7 +543,7 @@ fn clip_fill_rects_by_children(
     out
 }
 
-fn format_region_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> String {
+fn format_region_rects(rects: &[x12_protocol::x11::xfixes::RegionRect]) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::from("[");
@@ -1278,7 +1278,7 @@ fn destroy_window_subtree(
     drop_selections_owned_by_windows(
         state,
         &order,
-        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_WINDOW_DESTROY,
+        x12_protocol::x11::xfixes::SELECTION_NOTIFY_WINDOW_DESTROY,
     );
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
@@ -1338,7 +1338,7 @@ fn handle_render_request(
         nested::{ChangePictureAttr, change_picture_translate_xids},
         resources::{ARGB_VISUAL, GlyphSetState, PictureState},
     };
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2121,7 +2121,7 @@ fn handle_randr_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
+    use x12_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
     let byte_order = state
         .clients
@@ -2541,7 +2541,7 @@ fn handle_sync_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, sync as x11sync};
+    use x12_protocol::x11::{ClientByteOrder, sync as x11sync};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2909,9 +2909,9 @@ fn handle_sync_request(
 fn apply_alarm_attributes(
     state: &ServerState,
     alarm: &mut crate::server::SyncAlarm,
-    attrs: &yserver_protocol::x11::sync::AlarmAttributes,
+    attrs: &x12_protocol::x11::sync::AlarmAttributes,
 ) {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     if let Some(counter) = attrs.counter {
         alarm.counter = counter;
     }
@@ -2955,7 +2955,7 @@ fn handle_xinerama_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, error, read_u32, xinerama as xin};
+    use x12_protocol::x11::{ClientByteOrder, error, read_u32, xinerama as xin};
 
     const XINERAMA_MAJOR_OPCODE: u8 = 151;
 
@@ -3095,7 +3095,7 @@ fn handle_xinerama_request(
 /// Human-friendly name for a SYNC counter id (system counters land
 /// here; client-allocated counters fall through to `<client>`).
 fn sync_counter_name(counter: u32) -> &'static str {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     match counter {
         x11sync::SERVERTIME_COUNTER => "SERVERTIME",
         x11sync::IDLETIME_COUNTER => "IDLETIME",
@@ -3107,7 +3107,7 @@ fn sync_counter_name(counter: u32) -> &'static str {
 
 /// Human-friendly name for a SYNC alarm test type.
 fn sync_test_type_name(test_type: u32) -> &'static str {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     match test_type {
         x11sync::TEST_POSITIVE_TRANSITION => "PosTransition",
         x11sync::TEST_NEGATIVE_TRANSITION => "NegTransition",
@@ -3119,7 +3119,7 @@ fn sync_test_type_name(test_type: u32) -> &'static str {
 
 /// Human-friendly name for a SYNC alarm state.
 fn sync_alarm_state_name(state: u8) -> &'static str {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     match state {
         x11sync::ALARM_STATE_ACTIVE => "Active",
         x11sync::ALARM_STATE_INACTIVE => "Inactive",
@@ -3137,7 +3137,7 @@ pub(crate) fn evaluate_alarms_for_counter(
     old: i64,
     new: i64,
 ) {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     let candidates: Vec<u32> = state
         .sync_alarms
         .iter()
@@ -3252,7 +3252,7 @@ fn handle_shape_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, shape as x11shape};
+    use x12_protocol::x11::{ClientByteOrder, shape as x11shape};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -3510,7 +3510,7 @@ fn handle_xfixes_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, xfixes as x11xfixes};
+    use x12_protocol::x11::{ClientByteOrder, xfixes as x11xfixes};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -3558,7 +3558,7 @@ fn handle_xfixes_request(
                 let key = (
                     client_id.0,
                     ResourceId(req.window),
-                    yserver_protocol::x11::AtomId(req.selection),
+                    x12_protocol::x11::AtomId(req.selection),
                 );
                 if req.event_mask == 0 {
                     state.xfixes_selection_masks.remove(&key);
@@ -4056,9 +4056,9 @@ fn handle_xfixes_request(
                     }
                     state.resources.set_clip_rectangles(
                         client_id,
-                        yserver_protocol::x11::SetClipRectanglesRequest {
+                        x12_protocol::x11::SetClipRectanglesRequest {
                             gc: gc_id,
-                            clip: yserver_protocol::x11::ClipRectangles {
+                            clip: x12_protocol::x11::ClipRectangles {
                                 ordering: 0, // Unsorted; matches xfixes region semantics.
                                 x_origin: req.x_origin,
                                 y_origin: req.y_origin,
@@ -4225,7 +4225,7 @@ fn handle_composite_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, composite as x11composite};
+    use x12_protocol::x11::{ClientByteOrder, composite as x11composite};
     const COMPOSITE_MAJOR_OPCODE: u8 = 144;
     let byte_order = state
         .clients
@@ -4689,7 +4689,7 @@ fn handle_mit_shm_request(
     body: &[u8],
     attached_fd: Option<OwnedFd>,
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::mit_shm as shm;
+    use x12_protocol::x11::mit_shm as shm;
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     let minor = header.data;
     debug!(
@@ -4855,10 +4855,10 @@ fn handle_mit_shm_create_pixmap(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
-    req: yserver_protocol::x11::mit_shm::CreatePixmapRequest,
+    req: x12_protocol::x11::mit_shm::CreatePixmapRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
-    use yserver_protocol::x11::mit_shm as shm;
+    use x12_protocol::x11::mit_shm as shm;
     debug!(
         "client {} #{} MIT-SHM::CreatePixmap pid=0x{:x} drawable=0x{:x} {}x{} d{}",
         client_id.0, sequence.0, req.pid, req.drawable, req.width, req.height, req.depth,
@@ -5000,10 +5000,10 @@ fn handle_mit_shm_put_image(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
-    req: yserver_protocol::x11::mit_shm::PutImageRequest,
+    req: x12_protocol::x11::mit_shm::PutImageRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
-    use yserver_protocol::x11::mit_shm as shm;
+    use x12_protocol::x11::mit_shm as shm;
     // MIT-SHM PutImage perf-cliff diagnostic (2026-05-28 cinnamon
     // telemetry: single op130 calls at 100-128ms blocking the core
     // loop for ~6-8 vsync intervals). Section-time so we can pin
@@ -5147,9 +5147,9 @@ fn handle_mit_shm_get_image(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
-    req: yserver_protocol::x11::mit_shm::GetImageRequest,
+    req: x12_protocol::x11::mit_shm::GetImageRequest,
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::mit_shm as shm;
+    use x12_protocol::x11::mit_shm as shm;
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
     {
         let Some(segment) = state.mit_shm_segments.get(&req.shmseg) else {
@@ -5268,10 +5268,10 @@ fn handle_mit_shm_create_segment(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
-    req: yserver_protocol::x11::mit_shm::CreateSegmentRequest,
+    req: x12_protocol::x11::mit_shm::CreateSegmentRequest,
 ) -> io::Result<RequestOutcome> {
     const MIT_SHM_MAJOR_OPCODE: u8 = 130;
-    use yserver_protocol::x11::mit_shm as shm;
+    use x12_protocol::x11::mit_shm as shm;
     if req.size == 0 {
         return emit_x11_error_with_minor(
             state,
@@ -5338,7 +5338,7 @@ fn handle_mit_shm_create_segment(
     state.mit_shm_segments.insert(req.shmseg, segment);
     let send_res = match state.clients.get_mut(&client_id.0) {
         Some(client) => {
-            let reply = yserver_protocol::x11::mit_shm::encode_create_segment_reply(
+            let reply = x12_protocol::x11::mit_shm::encode_create_segment_reply(
                 client.byte_order,
                 sequence,
             );
@@ -5358,7 +5358,7 @@ fn handle_damage_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::damage as x11damage;
+    use x12_protocol::x11::damage as x11damage;
     let minor = header.data;
     match minor {
         x11damage::QUERY_VERSION => {
@@ -5598,7 +5598,7 @@ fn handle_xtest_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::xtest as x11xtest;
+    use x12_protocol::x11::xtest as x11xtest;
     let minor = header.data;
     match minor {
         x11xtest::GET_VERSION => {
@@ -5679,11 +5679,11 @@ fn handle_xtest_request(
 fn dispatch_fake_input_with_body(
     state: &mut ServerState,
     backend: &mut dyn Backend,
-    fi: yserver_protocol::x11::xtest::FakeInput,
+    fi: x12_protocol::x11::xtest::FakeInput,
     body: &[u8],
 ) {
     use crate::{core_loop::HostInputEvent, host_x11::HostKeyEvent};
-    use yserver_protocol::x11::xtest as x11xtest;
+    use x12_protocol::x11::xtest as x11xtest;
 
     // XTestFakeDevice{Key,Button,Motion}Event arrive with the XI 1.x
     // wire event codes instead of the core FAKE_* codes. Route them
@@ -5714,7 +5714,7 @@ fn dispatch_fake_input_with_body(
             crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET
             | crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET => {
                 let pressed = offset == crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET;
-                let fake = yserver_protocol::x11::xtest::FakeInput {
+                let fake = x12_protocol::x11::xtest::FakeInput {
                     event_type: if pressed {
                         x11xtest::FAKE_BUTTON_PRESS
                     } else {
@@ -5966,7 +5966,7 @@ pub(crate) fn apply_dpms_transition(
 /// + byte-order + per-client write_or_buffer handling.
 pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     use crate::nested::DPMS_MAJOR_OPCODE;
-    use yserver_protocol::x11::dpms as x11dpms;
+    use x12_protocol::x11::dpms as x11dpms;
     if state.dpms.selected_by.is_empty() {
         return;
     }
@@ -6048,7 +6048,7 @@ pub(crate) fn emit_screen_saver_notify(
     forced: bool,
 ) {
     use crate::nested::MIT_SCREEN_SAVER_FIRST_EVENT;
-    use yserver_protocol::x11::screensaver as x11ss;
+    use x12_protocol::x11::screensaver as x11ss;
     let (active_state, deliver_mask) = match notify_state {
         ScreenSaverActive::Off => (x11ss::SCREEN_SAVER_OFF, x11ss::SCREEN_SAVER_NOTIFY_MASK),
         ScreenSaverActive::On => (x11ss::SCREEN_SAVER_ON, x11ss::SCREEN_SAVER_NOTIFY_MASK),
@@ -6123,7 +6123,7 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
     prior_global_idle_ms: i64,
     prior_device_idle_ms: i64,
 ) {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     // Suspend gate (Xorg WaitFor.c:519). When XScreenSaverSuspend is
     // held, the unified timer is not armed in either direction —
     // including the input-wake firing of Negative-* alarms. Without
@@ -6181,7 +6181,7 @@ fn handle_dpms_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use crate::nested::DPMS_MAJOR_OPCODE;
-    use yserver_protocol::x11::{ClientByteOrder, dpms as x11dpms};
+    use x12_protocol::x11::{ClientByteOrder, dpms as x11dpms};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -6387,7 +6387,7 @@ fn handle_screen_saver_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use crate::nested::MIT_SCREEN_SAVER_MAJOR_OPCODE;
-    use yserver_protocol::x11::{ClientByteOrder, screensaver as x11ss};
+    use x12_protocol::x11::{ClientByteOrder, screensaver as x11ss};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -6586,7 +6586,7 @@ fn handle_present_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, present as x11present};
+    use x12_protocol::x11::{ClientByteOrder, present as x11present};
     const PRESENT_MAJOR_OPCODE: u8 = 145;
     let byte_order = state
         .clients
@@ -7247,7 +7247,7 @@ fn notify_msc_satisfied(current_msc: u64, target_msc: u64, divisor: u64, remaind
 /// inputs become load-bearing.
 fn present_path_for(
     state: &ServerState,
-    req: &yserver_protocol::x11::present::PixmapRequest,
+    req: &x12_protocol::x11::present::PixmapRequest,
     caps: &crate::backend::PresentCaps,
 ) -> crate::present_scheduler::PresentPath {
     let inputs = build_path_selector_inputs(
@@ -7264,7 +7264,7 @@ fn present_path_for(
 /// `PresentPixmapSynced` (v1.4) variant. Same selector, same inputs.
 fn present_path_for_synced(
     state: &ServerState,
-    req: &yserver_protocol::x11::present::PixmapSyncedRequest,
+    req: &x12_protocol::x11::present::PixmapSyncedRequest,
     caps: &crate::backend::PresentCaps,
 ) -> crate::present_scheduler::PresentPath {
     let inputs = build_path_selector_inputs(
@@ -7325,7 +7325,7 @@ pub fn fire_present_completion_events(
     event: &crate::backend::CompletedPresentEvent,
 ) {
     use crate::backend::PresentWake;
-    use yserver_protocol::x11::present as x11present;
+    use x12_protocol::x11::present as x11present;
 
     /// PRESENT major opcode.
     const PRESENT_MAJOR_OPCODE: u8 = 145;
@@ -7437,9 +7437,9 @@ pub fn fire_present_completion_events(
 fn fire_present_configure_notify_for_window(
     state: &mut ServerState,
     window_id: ResourceId,
-    geometry: yserver_protocol::x11::Geometry,
+    geometry: x12_protocol::x11::Geometry,
 ) {
-    use yserver_protocol::x11::present as x11present;
+    use x12_protocol::x11::present as x11present;
     const PRESENT_MAJOR_OPCODE: u8 = 145;
 
     let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
@@ -7488,13 +7488,13 @@ fn fire_present_configure_notify_for_window(
 
 fn fire_present_notify_msc_complete_events(
     state: &mut ServerState,
-    byte_order: yserver_protocol::x11::ClientByteOrder,
+    byte_order: x12_protocol::x11::ClientByteOrder,
     extension_major: u8,
     window: u32,
     serial: u32,
     current_msc: u64,
 ) {
-    use yserver_protocol::x11::present as x11present;
+    use x12_protocol::x11::present as x11present;
     const COMPLETE_NOTIFY_MASK: u32 = 0x2;
 
     let window = ResourceId(window);
@@ -7547,7 +7547,7 @@ fn handle_dri3_request(
     body: &[u8],
     attached_fd: Option<OwnedFd>,
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, dri3 as x11dri3};
+    use x12_protocol::x11::{ClientByteOrder, dri3 as x11dri3};
     const DRI3_MAJOR_OPCODE: u8 = 147;
     let byte_order = state
         .clients
@@ -7667,7 +7667,7 @@ fn handle_dri3_request(
                     );
                     state.resources.create_pixmap(
                         client_id,
-                        yserver_protocol::x11::CreatePixmapRequest {
+                        x12_protocol::x11::CreatePixmapRequest {
                             pixmap: ResourceId(req.pixmap),
                             drawable: ResourceId(req.drawable),
                             width: req.width,
@@ -7777,7 +7777,7 @@ fn handle_dri3_request(
                     // what handle_create_pixmap does.
                     state.resources.create_pixmap(
                         client_id,
-                        yserver_protocol::x11::CreatePixmapRequest {
+                        x12_protocol::x11::CreatePixmapRequest {
                             pixmap: ResourceId(req.pixmap),
                             drawable: ResourceId(req.window),
                             width: req.width,
@@ -7829,7 +7829,7 @@ fn handle_dri3_request(
             };
             let host_xid = match state
                 .resources
-                .pixmap(yserver_protocol::x11::ResourceId(pixmap))
+                .pixmap(x12_protocol::x11::ResourceId(pixmap))
                 .and_then(|p| p.host_xid.map(|h| h.as_raw()))
             {
                 Some(h) => h,
@@ -7906,7 +7906,7 @@ fn handle_dri3_request(
             };
             let host_xid = match state
                 .resources
-                .pixmap(yserver_protocol::x11::ResourceId(pixmap))
+                .pixmap(x12_protocol::x11::ResourceId(pixmap))
                 .and_then(|p| p.host_xid.map(|h| h.as_raw()))
             {
                 Some(h) => h,
@@ -8245,7 +8245,7 @@ fn handle_dri3_request(
 /// defaults when Mesa's `loader_dri3` queries directly against the X
 /// window XID without ever going through `CreateGLXWindow`.
 fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
-    use yserver_protocol::x11::glx as g;
+    use x12_protocol::x11::glx as g;
     // GLX_TEXTURE_TARGET_EXT, GLX_Y_INVERTED_EXT and GLX_FBCONFIG_ID
     // are the three Mesa actually consults; everything else is
     // optional decoration. EXT atom values per glx.rs (glxext.h verified).
@@ -8301,8 +8301,8 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
 /// the visuals our setup-reply advertises (ROOT_VISUAL depth-24
 /// TrueColor RGB, ARGB_VISUAL depth-32 TrueColor RGBA), each in
 /// double-buffered and single-buffered flavours.
-fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConfig> {
-    use yserver_protocol::x11::glx::VisualConfig;
+fn synthesise_glx_visual_configs() -> Vec<x12_protocol::x11::glx::VisualConfig> {
+    use x12_protocol::x11::glx::VisualConfig;
     // X11 visual class 4 == TrueColor, matching the class we put in the
     // setup-reply visual list.
     const TRUE_COLOR: u32 = 4;
@@ -8341,21 +8341,21 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
 /// `GLX_SGIX_fbconfig` is always appended (the three VendorPrivate
 /// dispatch arms are fully implemented — advertise-after-implement).
 fn glx_extension_string(tfp_supported: bool) -> String {
-    let mut s = String::from(yserver_protocol::x11::glx::SERVER_EXTENSIONS);
+    let mut s = String::from(x12_protocol::x11::glx::SERVER_EXTENSIONS);
     // GLX_SGIX_fbconfig: always present — GetFBConfigsSGIX /
     // CreateContextWithConfigSGIX / CreateGLXPixmapWithConfigSGIX are
     // fully dispatched (VendorPrivate arms above).
     s.push(' ');
-    s.push_str(yserver_protocol::x11::glx::SGIX_FBCONFIG_EXTENSION);
+    s.push_str(x12_protocol::x11::glx::SGIX_FBCONFIG_EXTENSION);
     if tfp_supported {
         s.push(' ');
-        s.push_str(yserver_protocol::x11::glx::TFP_EXTENSION);
+        s.push_str(x12_protocol::x11::glx::TFP_EXTENSION);
     }
     s
 }
 
 fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
-    use yserver_protocol::x11::glx as g;
+    use x12_protocol::x11::glx as g;
     let mut out = Vec::with_capacity(4);
     let depth = 24;
     let stencil = 8;
@@ -8447,7 +8447,7 @@ fn handle_x_resource_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, x_resource as x11xres};
+    use x12_protocol::x11::{ClientByteOrder, x_resource as x11xres};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -8521,7 +8521,7 @@ fn handle_glx_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::{ClientByteOrder, glx as x11glx};
+    use x12_protocol::x11::{ClientByteOrder, glx as x11glx};
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -8726,7 +8726,7 @@ fn handle_glx_request(
                 if minor == x11glx::CREATE_PIXMAP
                     && state
                         .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
+                        .pixmap(x12_protocol::x11::ResourceId(req.x_window))
                         .is_none()
                 {
                     debug!(
@@ -8739,7 +8739,7 @@ fn handle_glx_request(
                         client_id,
                         sequence,
                         crate::nested::GLX_FIRST_ERROR
-                            + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                            + x12_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
                         req.x_window,
                         u16::from(header.data),
                         crate::nested::GLX_MAJOR_OPCODE,
@@ -8754,7 +8754,7 @@ fn handle_glx_request(
                 let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
                     state
                         .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
+                        .pixmap(x12_protocol::x11::ResourceId(req.x_window))
                         .and_then(|p| p.host_xid.map(|h| h.as_raw()))
                 } else {
                     None
@@ -9012,7 +9012,7 @@ fn handle_glx_request(
                             client_id,
                             sequence,
                             crate::nested::GLX_FIRST_ERROR
-                                + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                                + x12_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
                             glx_drawable,
                             u16::from(header.data),
                             crate::nested::GLX_MAJOR_OPCODE,
@@ -9112,7 +9112,7 @@ fn handle_glx_request(
                         // Validate that the X pixmap exists.
                         if state
                             .resources
-                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
+                            .pixmap(x12_protocol::x11::ResourceId(req.pixmap))
                             .is_none()
                         {
                             debug!(
@@ -9125,7 +9125,7 @@ fn handle_glx_request(
                                 client_id,
                                 sequence,
                                 crate::nested::GLX_FIRST_ERROR
-                                    + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
+                                    + x12_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP,
                                 req.pixmap,
                                 u16::from(header.data),
                                 crate::nested::GLX_MAJOR_OPCODE,
@@ -9135,7 +9135,7 @@ fn handle_glx_request(
                         // semantics as CREATE_PIXMAP — see comment there).
                         let acquire_host_xid = state
                             .resources
-                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
+                            .pixmap(x12_protocol::x11::ResourceId(req.pixmap))
                             .and_then(|p| p.host_xid.map(|h| h.as_raw()));
 
                         state.glx_drawables.insert(
@@ -9216,7 +9216,7 @@ fn handle_glx_request(
                         client_id,
                         sequence,
                         crate::nested::GLX_FIRST_ERROR
-                            + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
+                            + x12_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
                         0,
                         u16::from(header.data),
                         crate::nested::GLX_MAJOR_OPCODE,
@@ -9236,7 +9236,7 @@ fn handle_glx_request(
                 client_id,
                 sequence,
                 crate::nested::GLX_FIRST_ERROR
-                    + yserver_protocol::x11::glx::ERROR_GLX_BAD_RENDER_REQUEST,
+                    + x12_protocol::x11::glx::ERROR_GLX_BAD_RENDER_REQUEST,
                 0,
                 u16::from(header.data),
                 crate::nested::GLX_MAJOR_OPCODE,
@@ -9305,7 +9305,7 @@ fn xi1_event_class_device(class: u32) -> u16 {
 /// Standard 32-byte all-zero XI1 reply (status/count fields read as
 /// Success / empty in every minor's reply layout).
 fn xi1_zero_reply(
-    byte_order: yserver_protocol::x11::ClientByteOrder,
+    byte_order: x12_protocol::x11::ClientByteOrder,
     sequence: SequenceNumber,
 ) -> Vec<u8> {
     let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
@@ -9414,7 +9414,7 @@ fn handle_xi2_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -13203,8 +13203,8 @@ fn handle_xi2_request(
                 let bytes = body.get(off..off + 4)?;
                 let arr = [bytes[0], bytes[1], bytes[2], bytes[3]];
                 Some(match byte_order {
-                    yserver_protocol::x11::ClientByteOrder::LittleEndian => u32::from_le_bytes(arr),
-                    yserver_protocol::x11::ClientByteOrder::BigEndian => u32::from_be_bytes(arr),
+                    x12_protocol::x11::ClientByteOrder::LittleEndian => u32::from_le_bytes(arr),
+                    x12_protocol::x11::ClientByteOrder::BigEndian => u32::from_be_bytes(arr),
                 })
             };
             for i in 0..class_count {
@@ -13351,10 +13351,10 @@ fn handle_xi2_request(
                                 let mut out = *ev_bytes;
                                 out[0] |= 0x80; // send_event
                                 let seq_bytes = match order {
-                                    yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                    x12_protocol::x11::ClientByteOrder::LittleEndian => {
                                         seq.0.to_le_bytes()
                                     }
-                                    yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                    x12_protocol::x11::ClientByteOrder::BigEndian => {
                                         seq.0.to_be_bytes()
                                     }
                                 };
@@ -15818,8 +15818,8 @@ fn handle_get_font_path(
     }
     let units = u32::try_from((buf.len() - 32) / 4).unwrap_or(0);
     let len_bytes = match byte_order {
-        yserver_protocol::x11::ClientByteOrder::LittleEndian => units.to_le_bytes(),
-        yserver_protocol::x11::ClientByteOrder::BigEndian => units.to_be_bytes(),
+        x12_protocol::x11::ClientByteOrder::LittleEndian => units.to_le_bytes(),
+        x12_protocol::x11::ClientByteOrder::BigEndian => units.to_be_bytes(),
     };
     buf[4..8].copy_from_slice(&len_bytes);
     Ok(write_to_client(client, client_id, &buf))
@@ -18791,7 +18791,7 @@ fn handle_get_image(
     let byte_order = state
         .clients
         .get(&client_id.0)
-        .map_or(yserver_protocol::x11::ClientByteOrder::LittleEndian, |c| {
+        .map_or(x12_protocol::x11::ClientByteOrder::LittleEndian, |c| {
             c.byte_order
         });
     let host_xid = if req.drawable == ROOT_WINDOW {
@@ -18868,7 +18868,7 @@ fn patch_get_image_reply_header(
 #[cfg(test)]
 mod get_image_reply_tests {
     use super::patch_get_image_reply_header;
-    use yserver_protocol::x11::{ClientByteOrder, SequenceNumber};
+    use x12_protocol::x11::{ClientByteOrder, SequenceNumber};
 
     #[test]
     fn patch_get_image_reply_header_honors_big_endian() {
@@ -19770,7 +19770,7 @@ fn copy_area_effective_dst_rects(
     state: &crate::server::ServerState,
     dst_id: ResourceId,
     draw_state: &crate::backend::DrawState,
-    req: &yserver_protocol::x11::CopyAreaRequest,
+    req: &x12_protocol::x11::CopyAreaRequest,
 ) -> Vec<CopyAreaSubRect> {
     let mut current: Vec<CopyAreaSubRect> = vec![CopyAreaSubRect {
         x: req.dst_x,
@@ -21027,7 +21027,7 @@ fn handle_set_selection_owner(
     fanout_xfixes_selection_notify(
         state,
         selection,
-        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_SET_OWNER,
+        x12_protocol::x11::xfixes::SELECTION_NOTIFY_SET_OWNER,
         window.0,
         current_time,
         resolved_time,
@@ -21119,7 +21119,7 @@ pub(crate) fn fanout_xfixes_selection_client_close_for_client(
     drop_selections_owned_by_windows(
         state,
         &client_windows,
-        yserver_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
+        x12_protocol::x11::xfixes::SELECTION_NOTIFY_CLIENT_CLOSE,
     );
 }
 
@@ -21131,7 +21131,7 @@ fn fanout_xfixes_selection_notify(
     timestamp: u32,
     selection_timestamp: u32,
 ) {
-    use yserver_protocol::x11::xfixes as x11xfixes;
+    use x12_protocol::x11::xfixes as x11xfixes;
 
     let mask_bit = 1u32 << subtype;
     // Snapshot matching subscriptions before mutating `state.clients`
@@ -21216,7 +21216,7 @@ fn handle_convert_selection(
                 state,
                 &[rt],
                 &template,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                x12_protocol::x11::ClientByteOrder::LittleEndian,
             );
         }
         debug!(
@@ -21234,7 +21234,7 @@ fn handle_send_event(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
     // The 32-byte event template inside SendEvent is in the *sender's*
     // byte order. Note: the request body's typed prefix (destination +
     // event_mask) was already swapped to LE by request_swap; only the
@@ -21824,7 +21824,7 @@ fn handle_get_property(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -22370,7 +22370,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
         let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
-            let crossing = yserver_protocol::x11::CrossingEvent {
+            let crossing = x12_protocol::x11::CrossingEvent {
                 sequence: seq,
                 time: server_time,
                 root: ROOT_WINDOW,
@@ -23347,7 +23347,7 @@ fn handle_xcmisc_request(
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -23480,7 +23480,7 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
 
-    use yserver_protocol::x11::{
+    use x12_protocol::x11::{
         ClientByteOrder, ClientId, CreateGcRequest, CreatePixmapRequest, CreateWindowRequest,
         RequestHeader, ResourceId, SequenceNumber, screensaver as x11screensaver, sync as x11sync,
     };
@@ -23938,7 +23938,7 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 0,
                 window: ResourceId(0x1100),
@@ -24814,7 +24814,7 @@ mod tests {
         // value IS the exact wire length, for variable minors it is the
         // spec minimum (payload-carrying variable requests build their
         // own header — see xi2_header_for_body).
-        use yserver_protocol::x11::request_lengths::{LenSpec, xi_request_length};
+        use x12_protocol::x11::request_lengths::{LenSpec, xi_request_length};
         let length_units = match xi_request_length(minor) {
             Some(LenSpec::Fixed(n) | LenSpec::AtLeast(n)) => n,
             None => 1,
@@ -26874,7 +26874,7 @@ mod tests {
     fn seed_test_window(state: &mut ServerState, owner: u32, xid: u32) {
         state.resources.create_window(
             ClientId(owner),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(xid),
                 parent: ROOT_WINDOW,
@@ -27034,7 +27034,7 @@ mod tests {
         seed_test_window(&mut state, 2, grandparent_xid);
         state.resources.create_window(
             ClientId(2),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(parent_xid),
                 parent: ResourceId(grandparent_xid),
@@ -27050,7 +27050,7 @@ mod tests {
         );
         state.resources.create_window(
             ClientId(2),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(child_xid),
                 parent: ResourceId(parent_xid),
@@ -27264,7 +27264,7 @@ mod tests {
     /// yserver dropped these whenever the grab window held the focus.
     #[test]
     fn same_window_grab_focus_emits_nonlinear_pair() {
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const CLIENT: u32 = 71;
         const WIN: u32 = 0x0370_0006;
@@ -27314,7 +27314,7 @@ mod tests {
 
     #[test]
     fn focus_move_to_child_uses_inferior_detail_for_parent_focus_out() {
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const CLIENT: u32 = 52;
         const TOP: u32 = 0x0350_0006;
@@ -27422,7 +27422,7 @@ mod tests {
     #[test]
     fn window_host_xid_prefers_resolved_host_mapping() {
         use crate::backend::WindowHandle;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const CLIENT: u32 = 55;
         const WIN: u32 = 0x0360_0008;
@@ -27875,7 +27875,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 145,
-                data: yserver_protocol::x11::present::SELECT_INPUT,
+                data: x12_protocol::x11::present::SELECT_INPUT,
                 length_units: 4,
             },
             &select_body,
@@ -27897,7 +27897,7 @@ mod tests {
             SequenceNumber(2),
             RequestHeader {
                 opcode: 145,
-                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                data: x12_protocol::x11::present::NOTIFY_MSC,
                 length_units: 10,
             },
             &notify_body,
@@ -27911,11 +27911,11 @@ mod tests {
         assert_eq!(event[1], 145, "Present extension major opcode");
         assert_eq!(
             u16::from_le_bytes([event[8], event[9]]),
-            u16::from(yserver_protocol::x11::present::EVENT_COMPLETE_NOTIFY)
+            u16::from(x12_protocol::x11::present::EVENT_COMPLETE_NOTIFY)
         );
         assert_eq!(
             event[10],
-            yserver_protocol::x11::present::COMPLETE_KIND_NOTIFY_MSC
+            x12_protocol::x11::present::COMPLETE_KIND_NOTIFY_MSC
         );
         assert_eq!(
             u32::from_le_bytes([event[12], event[13], event[14], event[15]]),
@@ -27934,7 +27934,7 @@ mod tests {
     #[test]
     fn present_pixmap_update_region_emits_damage_on_destination_window() {
         use crate::server::DamageObject;
-        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
+        use x12_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
 
         const CLIENT: u32 = 14;
         const WINDOW_XID: u32 = 0x00e0_0103;
@@ -28026,7 +28026,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 145,
-                data: yserver_protocol::x11::present::PIXMAP,
+                data: x12_protocol::x11::present::PIXMAP,
                 length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
             &body,
@@ -28047,7 +28047,7 @@ mod tests {
     #[test]
     fn present_pixmap_copy_uses_update_region_rects_as_copy_clips() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
+        use x12_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
 
         const CLIENT: u32 = 15;
         const WINDOW_XID: u32 = 0x00e0_0203;
@@ -28129,7 +28129,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 145,
-                data: yserver_protocol::x11::present::PIXMAP,
+                data: x12_protocol::x11::present::PIXMAP,
                 length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
             &body,
@@ -28177,7 +28177,7 @@ mod tests {
     #[test]
     fn present_pixmap_copy_without_update_uses_dst_offset_not_src_offset() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+        use x12_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
 
         const CLIENT: u32 = 16;
         const WINDOW_XID: u32 = 0x00e0_0303;
@@ -28236,7 +28236,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 145,
-                data: yserver_protocol::x11::present::PIXMAP,
+                data: x12_protocol::x11::present::PIXMAP,
                 length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
             &body,
@@ -28615,7 +28615,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             1,
-            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
 
@@ -28678,7 +28678,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             1,
-            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
         dispatch_composite_minor(
@@ -28686,7 +28686,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             2,
-            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
 
@@ -28723,7 +28723,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             1,
-            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
         assert!(
@@ -28741,7 +28741,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             2,
-            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
             &[],
         );
         assert!(
@@ -28780,7 +28780,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             1,
-            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
 
@@ -28790,7 +28790,7 @@ mod tests {
             &mut backend,
             ClientId(1),
             2,
-            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            x12_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
             &[],
         );
         let cow = state
@@ -28832,8 +28832,8 @@ mod tests {
         // after `RedirectSubwindows` + activation but before the
         // resize). 100x50 → resize target 100x75.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(1),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 32,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -28945,8 +28945,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(1),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 32,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29054,8 +29054,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(1),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 32,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29164,8 +29164,8 @@ mod tests {
         // resource record carries width/height/depth that
         // `activate_redirect_backing_for` snapshots.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(1),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29190,7 +29190,7 @@ mod tests {
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
                 mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
+                owner: x12_protocol::x11::ClientId(1),
             },
         );
 
@@ -29314,8 +29314,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(1),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29340,7 +29340,7 @@ mod tests {
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
                 mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
+                owner: x12_protocol::x11::ClientId(1),
             },
         );
 
@@ -29383,8 +29383,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29409,7 +29409,7 @@ mod tests {
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
                 mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                owner: x12_protocol::x11::ClientId(CLIENT_ID),
             },
         );
 
@@ -29484,8 +29484,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -29570,8 +29570,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -29810,8 +29810,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -29895,8 +29895,8 @@ mod tests {
 
         for xid in [GUARD_XID, FOCUSED_XID] {
             state.resources.create_window(
-                yserver_protocol::x11::ClientId(CLIENT_ID),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::ClientId(CLIENT_ID),
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(xid),
                     parent: ROOT_WINDOW,
@@ -29980,8 +29980,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -30017,7 +30017,7 @@ mod tests {
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&[0u8; 2]);
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131, // doesn't matter — dispatcher is bypassed
             data: 42,    // XIChangeCursor minor
             // XIChangeCursor is Fixed(4): 4 header + window(4) + cursor(4)
@@ -30126,7 +30126,7 @@ mod tests {
         body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
         body.extend_from_slice(&[0u8; 2]); // pad
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 51, // XIGrabDevice
             length_units: 7,
@@ -30180,7 +30180,7 @@ mod tests {
         assert_eq!(kgrab.grab_window, ResourceId(WINDOW_XID));
 
         // Ungrab both — XIUngrabDevice body: time(4) deviceid(2) pad(2).
-        let ungrab_header = yserver_protocol::x11::RequestHeader {
+        let ungrab_header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 52,
             // XIUngrabDevice is Fixed(3): 4 header + time(4) + deviceid(2)
@@ -30248,8 +30248,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -30281,7 +30281,7 @@ mod tests {
         body.extend_from_slice(&[1, 1, 1, 0]);
         body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
         body.extend_from_slice(&[0u8; 2]);
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 51,
             length_units: 7,
@@ -30383,7 +30383,7 @@ mod tests {
             }
             b
         }
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 54,
             // XIPassiveGrabDevice is AtLeast(8) and has no exact-length
@@ -30479,7 +30479,7 @@ mod tests {
             }
             b
         }
-        let ungrab_header = yserver_protocol::x11::RequestHeader {
+        let ungrab_header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 55,
             // XIPassiveUngrabDevice is AtLeast(5), no exact gate. 5 is the
@@ -30548,7 +30548,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 8]); // mask (2 words)
         body.extend_from_slice(&0u32.to_le_bytes()); // modifier 0
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 54,
             length_units: 10,
@@ -30615,7 +30615,7 @@ mod tests {
         body.push(0); // mode = AsyncDevice
         body.push(0); // pad
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -30671,7 +30671,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -30687,7 +30687,7 @@ mod tests {
         );
         state.resources.create_window(
             ClientId(TARGET_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(TARGET_WIN),
                 parent: ROOT_WINDOW,
@@ -30734,7 +30734,7 @@ mod tests {
         body.push(2); // mode = ReplayDevice
         body.push(0); // pad
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -30812,7 +30812,7 @@ mod tests {
         for (xid, host_xid) in [(GRAB_WIN, HOST_GRAB_XID), (SIBLING_WIN, HOST_SIBLING_XID)] {
             state.resources.create_window(
                 ClientId(GRAB_CLIENT_ID),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(xid),
                     parent: ROOT_WINDOW,
@@ -30960,7 +30960,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -30976,7 +30976,7 @@ mod tests {
         );
         state.resources.create_window(
             ClientId(TARGET_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(TARGET_WIN),
                 parent: ROOT_WINDOW,
@@ -31032,7 +31032,7 @@ mod tests {
         body.extend_from_slice(&2u16.to_le_bytes());
         body.push(2); // mode = ReplayDevice
         body.push(0); // pad
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -31150,7 +31150,7 @@ mod tests {
         for (client, win) in [(GRAB_CLIENT_ID, GRAB_WIN), (TARGET_CLIENT_ID, TARGET_WIN)] {
             state.resources.create_window(
                 ClientId(client),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(win),
                     parent: ROOT_WINDOW,
@@ -31214,7 +31214,7 @@ mod tests {
         body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
         body.push(0); // mode = AsyncDevice
         body.push(0); // pad
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -31326,7 +31326,7 @@ mod tests {
         for (client, win) in [(GRAB_CLIENT_ID, GRAB_WIN), (TARGET_CLIENT_ID, TARGET_WIN)] {
             state.resources.create_window(
                 ClientId(client),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(win),
                     parent: ROOT_WINDOW,
@@ -31388,7 +31388,7 @@ mod tests {
         body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
         body.push(1); // mode = XISyncDevice
         body.push(0); // pad
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -31462,7 +31462,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(TARGET_WIN),
                 parent: ROOT_WINDOW,
@@ -31519,7 +31519,7 @@ mod tests {
         body.push(2); // mode = ReplayDevice
         body.push(0); // pad
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -31568,7 +31568,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(TARGET_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(TARGET_WIN),
                 parent: ROOT_WINDOW,
@@ -31648,7 +31648,7 @@ mod tests {
         body.push(2); // mode = ReplayDevice
         body.push(0); // pad
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 53,
             length_units: 3,
@@ -31699,7 +31699,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -31821,7 +31821,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -31837,7 +31837,7 @@ mod tests {
         );
         state.resources.create_window(
             ClientId(CHILD_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(CHILD_WIN),
                 parent: ResourceId(GRAB_WIN),
@@ -31955,7 +31955,7 @@ mod tests {
         // the pointer away from it onto the desktop.
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -31972,7 +31972,7 @@ mod tests {
         // nemo-desktop's window — covers where the pointer ends up.
         state.resources.create_window(
             ClientId(OTHER_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(OTHER_WIN),
                 parent: ROOT_WINDOW,
@@ -32091,7 +32091,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(GRAB_CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -32180,7 +32180,7 @@ mod tests {
     #[test]
     fn xi_query_pointer_reports_held_button_in_xi2_button_mask() {
         use crate::{backend::Backend, resources::ROOT_VISUAL};
-        use yserver_protocol::x11::ClientByteOrder;
+        use x12_protocol::x11::ClientByteOrder;
 
         const CLIENT_ID: u32 = 1;
         const WINDOW_XID: u32 = 0x0020_0070;
@@ -32200,8 +32200,8 @@ mod tests {
             backend.query_pointer_mask = 0x0100;
 
             state.resources.create_window(
-                yserver_protocol::x11::ClientId(CLIENT_ID),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::ClientId(CLIENT_ID),
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(WINDOW_XID),
                     parent: ROOT_WINDOW,
@@ -32225,7 +32225,7 @@ mod tests {
             body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
             body.extend_from_slice(&0u16.to_le_bytes()); // pad
 
-            let header = yserver_protocol::x11::RequestHeader {
+            let header = x12_protocol::x11::RequestHeader {
                 opcode: 131,
                 data: 40, // XIQueryPointer
                 length_units: 3,
@@ -32284,7 +32284,7 @@ mod tests {
     /// modal grab and ungrab, same server timestamp).
     #[test]
     fn xi_query_pointer_reports_keyboard_mods_in_modifier_info() {
-        use yserver_protocol::x11::ClientByteOrder;
+        use x12_protocol::x11::ClientByteOrder;
 
         const CLIENT_ID: u32 = 1;
         for order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
@@ -32302,7 +32302,7 @@ mod tests {
             body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
             body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
             body.extend_from_slice(&0u16.to_le_bytes()); // pad
-            let header = yserver_protocol::x11::RequestHeader {
+            let header = x12_protocol::x11::RequestHeader {
                 opcode: 131,
                 data: 40, // XIQueryPointer
                 length_units: 3,
@@ -32387,7 +32387,7 @@ mod tests {
 
         // Focused app window with a core KeyPress selection.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(APP),
+            x12_protocol::x11::ClientId(APP),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(APP_WIN),
@@ -32449,7 +32449,7 @@ mod tests {
             None,
             ClientId(WM),
             SequenceNumber(2),
-            yserver_protocol::x11::RequestHeader {
+            x12_protocol::x11::RequestHeader {
                 opcode: 131,
                 data: 51, // XIGrabDevice
                 length_units: 6,
@@ -32481,7 +32481,7 @@ mod tests {
             None,
             ClientId(WM),
             SequenceNumber(3),
-            yserver_protocol::x11::RequestHeader {
+            x12_protocol::x11::RequestHeader {
                 opcode: 131,
                 data: 52, // XIUngrabDevice
                 length_units: 3,
@@ -32524,7 +32524,7 @@ mod tests {
 
         // XIGetClientPointer body: window(4).
         let body = 0u32.to_le_bytes().to_vec();
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 131,
             data: 45, // XIGetClientPointer
             length_units: 2,
@@ -32574,8 +32574,8 @@ mod tests {
 
         for xid in [FOCUS_WIN, PREV_WIN] {
             state.resources.create_window(
-                yserver_protocol::x11::ClientId(CLIENT_ID),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::ClientId(CLIENT_ID),
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(xid),
                     parent: ROOT_WINDOW,
@@ -32682,7 +32682,7 @@ mod tests {
             state: 0,
         });
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 35,
             data: 5, // ReplayKeyboard
             length_units: 2,
@@ -32762,7 +32762,7 @@ mod tests {
             });
         }
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 35,
             data: 5, // ReplayKeyboard
             length_units: 2,
@@ -32815,7 +32815,7 @@ mod tests {
             set_body.push(0);
         }
 
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 140, // XFIXES major (dispatcher reads minor from header.data)
             data: 23,    // SET_CURSOR_NAME
             length_units: 3,
@@ -32846,7 +32846,7 @@ mod tests {
 
         // GetCursorName body: cursor(4).
         let get_body = CURSOR_XID.to_le_bytes().to_vec();
-        let get_header = yserver_protocol::x11::RequestHeader {
+        let get_header = x12_protocol::x11::RequestHeader {
             opcode: 140,
             data: 24, // GET_CURSOR_NAME
             length_units: 2,
@@ -32959,7 +32959,7 @@ mod tests {
             b.extend_from_slice(&[0u8; 2]); // pad
             b
         }
-        let header = yserver_protocol::x11::RequestHeader {
+        let header = x12_protocol::x11::RequestHeader {
             opcode: 140, // RANDR major (placeholder; dispatcher reads minor from header.data)
             data: 21,    // RR_SET_CRTC_CONFIG
             length_units: 7,
@@ -33034,8 +33034,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(PARENT_XID),
                 parent: ROOT_WINDOW,
@@ -33050,8 +33050,8 @@ mod tests {
             },
         );
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(CHILD_XID),
                 parent: ResourceId(PARENT_XID),
@@ -33124,7 +33124,7 @@ mod tests {
 
     #[test]
     fn damage_create_on_viewable_window_seeds_full_damage() {
-        use yserver_protocol::x11::{RequestHeader, damage as x11damage};
+        use x12_protocol::x11::{RequestHeader, damage as x11damage};
 
         const CLIENT_ID: u32 = 1;
         const WINDOW_XID: u32 = 0x0010_0100;
@@ -33136,7 +33136,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -33224,8 +33224,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -33346,8 +33346,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(WINDOW_XID),
                 parent: ROOT_WINDOW,
@@ -33419,8 +33419,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 32,
                 window: ResourceId(WINDOW_XID),
                 parent: crate::resources::ROOT_WINDOW,
@@ -33451,7 +33451,7 @@ mod tests {
             (ResourceId(WINDOW_XID), false),
             crate::server::RedirectRecord {
                 mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                owner: x12_protocol::x11::ClientId(CLIENT_ID),
             },
         );
 
@@ -33500,7 +33500,7 @@ mod tests {
     #[test]
     fn xfixes_subtract_region_partial_overlap_returns_remaining_bands() {
         use crate::server::XFixesRegion;
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use x12_protocol::x11::xfixes::RegionRect;
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         // Region A: a 100x100 square at the origin.
@@ -33541,7 +33541,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 140, // XFIXES major
-                data: yserver_protocol::x11::xfixes::SUBTRACT_REGION,
+                data: x12_protocol::x11::xfixes::SUBTRACT_REGION,
                 length_units: 4,
             },
             &body,
@@ -33600,7 +33600,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 143, // DAMAGE major
-                data: yserver_protocol::x11::damage::SUBTRACT,
+                data: x12_protocol::x11::damage::SUBTRACT,
                 length_units: 4,
             },
             &body,
@@ -33612,7 +33612,7 @@ mod tests {
     #[test]
     fn damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears() {
         use crate::server::{DamageObject, XFixesRegion};
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use x12_protocol::x11::xfixes::RegionRect;
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         let damaged_rect = RegionRect {
@@ -33669,7 +33669,7 @@ mod tests {
     #[test]
     fn damage_subtract_with_no_repair_canonicalizes_parts_region() {
         use crate::server::{DamageObject, XFixesRegion};
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use x12_protocol::x11::xfixes::RegionRect;
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
@@ -33732,7 +33732,7 @@ mod tests {
     #[test]
     fn damage_subtract_with_repair_returns_intersection_and_subtracts_from_damage() {
         use crate::server::{DamageObject, XFixesRegion};
-        use yserver_protocol::x11::xfixes::RegionRect;
+        use x12_protocol::x11::xfixes::RegionRect;
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         // Damage: 100x100 at origin.
@@ -33827,7 +33827,7 @@ mod tests {
     #[test]
     fn damage_subtract_with_remaining_nonempty_damage_rereports_immediately() {
         use crate::server::{DamageObject, XFixesRegion};
-        use yserver_protocol::x11::{CreateWindowRequest, damage as x11damage, xfixes::RegionRect};
+        use x12_protocol::x11::{CreateWindowRequest, damage as x11damage, xfixes::RegionRect};
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
@@ -33926,7 +33926,7 @@ mod tests {
             server::{CompositeRedirectMode, DamageObject, RedirectRecord},
         };
         use std::io::Read;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
         const MARCO: u32 = 14;
         const FRAME_XID: u32 = 0x0010_0001;
         const DAMAGE_XID: u32 = 0x0010_0002;
@@ -34078,7 +34078,7 @@ mod tests {
             server::{CompositeRedirectMode, DamageObject, RedirectRecord},
         };
         use std::io::Read;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const MARCO: u32 = 14;
         const CHILD_XID: u32 = 0x0010_0101;
@@ -34174,7 +34174,7 @@ mod tests {
             server::{CompositeRedirectMode, DamageObject, RedirectRecord},
         };
         use std::io::Read;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const MARCO: u32 = 14;
         const FRAME_XID: u32 = 0x0010_0201;
@@ -34287,7 +34287,7 @@ mod tests {
     #[test]
     fn set_selection_owner_emits_xfixes_set_owner_notify_to_subscribers() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
 
         const CLIPBOARD_MGR: u32 = 7;
         const APP: u32 = 9;
@@ -34305,7 +34305,7 @@ mod tests {
         // validation gate (`dix/selection.c:169-173`).
         state.resources.create_window(
             ClientId(APP),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(OWNER_WIN),
                 parent: crate::resources::ROOT_WINDOW,
@@ -34411,7 +34411,7 @@ mod tests {
     #[test]
     fn destroy_window_owning_selection_fires_window_destroy_notify_and_clears_ownership() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
         const SUBSCRIBER_ID: u32 = 8;
         const OWNER_ID: u32 = 10;
         const SUBSCRIBER_WIN: u32 = 0x0080_0001;
@@ -34529,7 +34529,7 @@ mod tests {
     #[test]
     fn client_disconnect_owning_selection_fires_client_close_notify_and_clears_ownership() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const SUBSCRIBER_ID: u32 = 11;
         const OWNER_ID: u32 = 12;
         const SUBSCRIBER_WIN: u32 = 0x00b0_0001;
@@ -34544,7 +34544,7 @@ mod tests {
         // `selection_owner_target_id` walks that mapping.
         state.resources.create_window(
             ClientId(OWNER_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(OWNER_WIN),
                 parent: crate::resources::ROOT_WINDOW,
@@ -34630,7 +34630,7 @@ mod tests {
     #[test]
     fn set_selection_owner_no_clear_when_same_client_moves_between_own_windows() {
         use std::io::Read;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
         const APP: u32 = 50;
         const WIN_A: u32 = 0x0050_0001;
         const WIN_B: u32 = 0x0050_0002;
@@ -34701,7 +34701,7 @@ mod tests {
     #[test]
     fn set_selection_owner_clear_event_uses_resolved_time_when_client_sends_zero() {
         use std::{io::Read, thread, time::Duration};
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
         const PRIOR_OWNER: u32 = 51;
         const NEW_OWNER: u32 = 52;
         const PRIOR_WIN: u32 = 0x0051_0001;
@@ -34828,7 +34828,7 @@ mod tests {
         assert_eq!(buf[0], 0, "first byte = error class");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_WINDOW,
+            x12_protocol::x11::error::BAD_WINDOW,
             "expected BadWindow (3) for unknown window xid; got {}",
             buf[1],
         );
@@ -34887,7 +34887,7 @@ mod tests {
         assert_eq!(buf[0], 0, "first byte = error class");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_ATOM,
+            x12_protocol::x11::error::BAD_ATOM,
             "expected BadAtom (5) for an unknown selection atom; got {}",
             buf[1],
         );
@@ -34912,7 +34912,7 @@ mod tests {
     #[test]
     fn set_selection_owner_with_future_time_is_silently_ignored() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
         const SUBSCRIBER_ID: u32 = 30;
         const OWNER_ID: u32 = 31;
         const SUBSCRIBER_WIN: u32 = 0x0030_0001;
@@ -34986,7 +34986,7 @@ mod tests {
     #[test]
     fn set_selection_owner_with_stale_time_is_silently_ignored() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
         const SUBSCRIBER_ID: u32 = 32;
         const PRIOR_OWNER_ID: u32 = 33;
         const NEW_OWNER_ID: u32 = 34;
@@ -35079,7 +35079,7 @@ mod tests {
     #[test]
     fn create_region_from_picture_with_sourceless_picture_returns_bad_picture() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const APP: u32 = 84;
         const PICTURE_XID: u32 = 0x0084_0001;
         const REGION_XID: u32 = 0x0084_0002;
@@ -35142,7 +35142,7 @@ mod tests {
     #[test]
     fn create_region_from_picture_with_unknown_picture_returns_bad_picture() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const APP: u32 = 85;
         const UNKNOWN_PIC: u32 = 0x0085_dead;
         const REGION_XID: u32 = 0x0085_0001;
@@ -35192,7 +35192,7 @@ mod tests {
     #[test]
     fn create_region_from_window_with_unknown_window_returns_bad_window() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const APP: u32 = 82;
         const REGION_XID: u32 = 0x0082_0001;
         const UNKNOWN_WIN: u32 = 0x0082_ffff;
@@ -35228,7 +35228,7 @@ mod tests {
         peer.read_exact(&mut buf).expect("error reply delivered");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_WINDOW,
+            x12_protocol::x11::error::BAD_WINDOW,
             "expected BadWindow (3) for unknown window xid; got {}",
             buf[1],
         );
@@ -35252,7 +35252,7 @@ mod tests {
     #[test]
     fn create_region_from_window_with_invalid_kind_returns_bad_value() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
         const APP: u32 = 83;
         const REGION_XID: u32 = 0x0083_0001;
         const WIN_XID: u32 = 0x0083_0002;
@@ -35306,7 +35306,7 @@ mod tests {
         peer.read_exact(&mut buf).expect("error reply delivered");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_VALUE,
+            x12_protocol::x11::error::BAD_VALUE,
             "expected BadValue (2) for kind={INVALID_KIND}; got {}",
             buf[1],
         );
@@ -35332,7 +35332,7 @@ mod tests {
     #[test]
     fn create_region_with_in_use_xid_returns_bad_id_choice() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const APP: u32 = 80;
         const REGION_XID: u32 = 0x0080_0001;
 
@@ -35377,7 +35377,7 @@ mod tests {
         assert_eq!(buf[0], 0, "first byte = error class");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_ID_CHOICE,
+            x12_protocol::x11::error::BAD_ID_CHOICE,
             "expected BadIDChoice (14) when reusing an existing region xid; got {}",
             buf[1],
         );
@@ -35403,7 +35403,7 @@ mod tests {
     #[test]
     fn create_region_from_gc_with_in_use_xid_returns_bad_id_choice() {
         use std::io::Read;
-        use yserver_protocol::x11::{
+        use x12_protocol::x11::{
             ClipRectangles, CreateGcRequest, CreateWindowRequest, SetClipRectanglesRequest,
             xfixes as x11xfixes,
         };
@@ -35468,7 +35468,7 @@ mod tests {
         rect_bytes.extend_from_slice(&5u16.to_le_bytes());
         rect_bytes.extend_from_slice(&5u16.to_le_bytes());
         state.resources.set_clip_rectangles(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(GC_XID),
                 clip: ClipRectangles {
@@ -35513,7 +35513,7 @@ mod tests {
         peer.read_exact(&mut buf).expect("error reply delivered");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_ID_CHOICE,
+            x12_protocol::x11::error::BAD_ID_CHOICE,
             "CreateRegionFromGC must gate on LEGAL_NEW_RESOURCE before \
              copying the GC's clip; got error code {}",
             buf[1],
@@ -35533,7 +35533,7 @@ mod tests {
     /// → wrong area shadowed/repainted.
     #[test]
     fn create_region_from_gc_copies_clip_rects_without_origin_translation() {
-        use yserver_protocol::x11::{
+        use x12_protocol::x11::{
             ClipRectangles, CreateGcRequest, CreateWindowRequest, SetClipRectanglesRequest,
             xfixes as x11xfixes,
         };
@@ -35609,7 +35609,7 @@ mod tests {
         rect_bytes.extend_from_slice(&RECT_W.to_le_bytes());
         rect_bytes.extend_from_slice(&RECT_H.to_le_bytes());
         state.resources.set_clip_rectangles(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(GC_XID),
                 clip: ClipRectangles {
@@ -35671,7 +35671,7 @@ mod tests {
     #[test]
     fn select_selection_input_with_invalid_window_returns_bad_window() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
 
         const CLIENT: u32 = 21;
         const UNKNOWN_WIN: u32 = 0x00ff_eeee;
@@ -35707,7 +35707,7 @@ mod tests {
         assert_eq!(buf[0], 0, "first byte = error class");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_WINDOW,
+            x12_protocol::x11::error::BAD_WINDOW,
             "expected BadWindow (3) for unknown window xid; got {}",
             buf[1],
         );
@@ -35725,7 +35725,7 @@ mod tests {
     #[test]
     fn select_selection_input_with_mask_outside_known_bits_returns_bad_value() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
 
         const CLIENT: u32 = 22;
         const WIN: u32 = 0x0150_0001;
@@ -35780,7 +35780,7 @@ mod tests {
         assert_eq!(buf[0], 0, "first byte = error class");
         assert_eq!(
             buf[1],
-            yserver_protocol::x11::error::BAD_VALUE,
+            x12_protocol::x11::error::BAD_VALUE,
             "expected BadValue (2) for mask with bits outside \
              SelectionAllEvents (0b111); got {}",
             buf[1],
@@ -35804,7 +35804,7 @@ mod tests {
     #[test]
     fn destroy_window_owning_selection_carries_prior_last_time_changed_in_selection_timestamp() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
         const SUBSCRIBER_ID: u32 = 15;
         const OWNER_ID: u32 = 16;
         const SUBSCRIBER_WIN: u32 = 0x00f0_0001;
@@ -35917,7 +35917,7 @@ mod tests {
     #[test]
     fn set_selection_owner_emits_one_event_per_subscription_when_client_has_two_windows() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
         const SUBSCRIBER: u32 = 13;
         const APP: u32 = 14;
         const WIN_A: u32 = 0x00d0_0001;
@@ -35933,7 +35933,7 @@ mod tests {
         // validation gate.
         state.resources.create_window(
             ClientId(APP),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(OWNER_WIN),
                 parent: crate::resources::ROOT_WINDOW,
@@ -36000,7 +36000,7 @@ mod tests {
     #[test]
     fn set_selection_owner_skips_subscribers_whose_mask_excludes_set_owner() {
         use std::io::Read;
-        use yserver_protocol::x11::xfixes as x11xfixes;
+        use x12_protocol::x11::xfixes as x11xfixes;
 
         const SUBSCRIBER: u32 = 5;
         const APP: u32 = 6;
@@ -36055,7 +36055,7 @@ mod tests {
         // 100×100 pixmap as the source.
         state.resources.create_pixmap(
             ClientId(1),
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
                 pixmap: ResourceId(0x700),
                 drawable: crate::resources::ROOT_WINDOW,
@@ -36094,7 +36094,7 @@ mod tests {
     #[test]
     fn copy_area_fully_clipped_still_emits_graphics_expose_event() {
         use std::io::Read;
-        use yserver_protocol::x11::{CreateGcRequest, CreateWindowRequest};
+        use x12_protocol::x11::{CreateGcRequest, CreateWindowRequest};
 
         const FRAME_XID: u32 = 0x0010_0001;
         const FRAME_HOST: u32 = 0x0040_0001;
@@ -36116,7 +36116,7 @@ mod tests {
         // (0, 0). Any CopyArea(dst=frame, 0,0 100x100) gets fully
         // clipped by the child.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(FRAME_XID),
@@ -36146,7 +36146,7 @@ mod tests {
             w.map_state = crate::resources::MapState::Viewable;
         }
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(CHILD_XID),
@@ -36171,7 +36171,7 @@ mod tests {
         }
         state.resources.create_pixmap(
             ClientId(1),
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 pixmap: ResourceId(SRC_PIXMAP_XID),
                 drawable: ROOT_WINDOW,
                 width: 100,
@@ -36294,7 +36294,7 @@ mod tests {
     #[test]
     fn copy_area_into_window_with_mapped_child_excludes_child_area() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::{CreateGcRequest, CreateWindowRequest};
+        use x12_protocol::x11::{CreateGcRequest, CreateWindowRequest};
 
         const FRAME_XID: u32 = 0x0010_0001;
         const FRAME_HOST: u32 = 0x0040_0001;
@@ -36313,7 +36313,7 @@ mod tests {
         // present). Mirrors the post-Reparent + post-Map + post-
         // activate_redirect_backing state.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(FRAME_XID),
@@ -36344,7 +36344,7 @@ mod tests {
         }
         // CC: child of frame, viewable, at (11, 41) sized 975×600.
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(CHILD_XID),
@@ -36370,7 +36370,7 @@ mod tests {
         // Source pixmap (depth-24, same depth as frame).
         state.resources.create_pixmap(
             ClientId(1),
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 pixmap: ResourceId(SRC_PIXMAP_XID),
                 drawable: ROOT_WINDOW,
                 width: 997,
@@ -36511,11 +36511,11 @@ mod tests {
     #[test]
     fn copy_area_clip_by_children_ignores_input_only_child() {
         use crate::resources::{MapState, WindowClass};
-        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        use x12_protocol::x11::{CreateWindowRequest, ResourceId};
 
         let mut state = ServerState::new();
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(0x0020_0001),
@@ -36531,7 +36531,7 @@ mod tests {
             },
         );
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             CreateWindowRequest {
                 depth: 0,
                 window: ResourceId(0x0020_0002),
@@ -36555,7 +36555,7 @@ mod tests {
             assert_eq!(child.class, WindowClass::InputOnly);
         }
 
-        let rect = yserver_protocol::x11::CopyAreaRequest {
+        let rect = x12_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
             dst: ResourceId(0x0020_0001),
             gc: ResourceId(0x1),
@@ -36603,7 +36603,7 @@ mod tests {
             resources::{MapState, WindowClass},
             server::{CompositeRedirectMode, RedirectRecord},
         };
-        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+        use x12_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
 
         let mut state = ServerState::new();
         let parent_xid = ResourceId(0x0021_0003);
@@ -36658,7 +36658,7 @@ mod tests {
             },
         );
 
-        let rect = yserver_protocol::x11::CopyAreaRequest {
+        let rect = x12_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
             dst: parent_xid,
             gc: ResourceId(0x1),
@@ -36700,7 +36700,7 @@ mod tests {
             resources::{MapState, WindowClass},
             server::{CompositeRedirectMode, RedirectRecord},
         };
-        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+        use x12_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
 
         let mut state = ServerState::new();
         let parent_xid = ResourceId(0x0022_0001);
@@ -36751,7 +36751,7 @@ mod tests {
             },
         );
 
-        let rect = yserver_protocol::x11::CopyAreaRequest {
+        let rect = x12_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
             dst: parent_xid,
             gc: ResourceId(0x1),
@@ -36806,7 +36806,7 @@ mod tests {
             resources::{PictureKind, PictureState},
             server::DamageObject,
         };
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const COMPOSITOR: u32 = 7;
         const WIN_XID: u32 = 0x0020_0001;
@@ -36910,7 +36910,7 @@ mod tests {
     #[test]
     fn render_picture_damage_drawable_prefers_named_window_pixmap_owner() {
         use crate::{backend::PixmapHandle, resources::NamedCompositePixmap};
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         const CLIENT: u32 = 7;
         const WINDOW_XID: u32 = 0x0030_0001;
@@ -36993,7 +36993,7 @@ mod tests {
         width: u16,
         height: u16,
     ) {
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
         state.resources.create_window(
             ClientId(14),
             CreateWindowRequest {
@@ -39126,8 +39126,8 @@ mod tests {
         // Create the grab window WITHOUT EnterWindowMask selected
         // (mirrors xts's fresh CreateWindow).
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -39225,8 +39225,8 @@ mod tests {
         let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -39314,8 +39314,8 @@ mod tests {
         let _backend = RecordingBackend::new();
 
         state.resources.create_window(
-            yserver_protocol::x11::ClientId(CLIENT_ID),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::ClientId(CLIENT_ID),
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: ResourceId(GRAB_WIN),
                 parent: ROOT_WINDOW,
@@ -39452,7 +39452,7 @@ mod tests {
             );
             assert_eq!(
                 buf[1],
-                yserver_protocol::x11::error::BAD_WINDOW,
+                x12_protocol::x11::error::BAD_WINDOW,
                 "{label}: expected BadWindow (3) for freed xid; got error code {}",
                 buf[1],
             );
@@ -39533,19 +39533,19 @@ mod tests {
             (
                 0x0001,
                 BAD_PIX,
-                yserver_protocol::x11::error::BAD_PIXMAP,
+                x12_protocol::x11::error::BAD_PIXMAP,
                 "CWBackPixmap",
             ),
             (
                 0x2000,
                 BAD_CMAP,
-                yserver_protocol::x11::error::BAD_COLORMAP,
+                x12_protocol::x11::error::BAD_COLORMAP,
                 "CWColormap",
             ),
             (
                 0x4000,
                 BAD_CURS,
-                yserver_protocol::x11::error::BAD_CURSOR,
+                x12_protocol::x11::error::BAD_CURSOR,
                 "CWCursor",
             ),
         ];
@@ -39561,7 +39561,7 @@ mod tests {
             let win = WIN + i as u32;
             state.resources.create_window(
                 ClientId(app_id),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(win),
                     parent: crate::resources::ROOT_WINDOW,
@@ -39660,7 +39660,7 @@ mod tests {
         ] {
             state.resources.create_window(
                 ClientId(APP),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(id),
                     parent: ResourceId(parent),
@@ -39681,7 +39681,7 @@ mod tests {
             (
                 "InputOnly + CWBorderWidth → BadMatch",
                 build_configure_body(INPUT_ONLY, CW_BORDER_WIDTH, &[1u16.to_le_bytes()]),
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
             (
                 "CWSibling without CWStackMode → BadMatch",
@@ -39698,27 +39698,27 @@ mod tests {
                         .collect::<Vec<_>>()
                         .as_slice(),
                 ),
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
             (
                 "CWSibling with non-sibling → BadMatch",
                 build_configure_body_u32(SIB_A, CW_SIBLING | CW_STACK_MODE, ORPHAN, 0),
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
             (
                 "CWSibling with unknown xid → BadWindow",
                 build_configure_body_u32(SIB_A, CW_SIBLING | CW_STACK_MODE, BAD_SIB, 0),
-                yserver_protocol::x11::error::BAD_WINDOW,
+                x12_protocol::x11::error::BAD_WINDOW,
             ),
             (
                 "CWWidth=0 → BadValue",
                 build_configure_body(SIB_A, CW_WIDTH, &[0u16.to_le_bytes()]),
-                yserver_protocol::x11::error::BAD_VALUE,
+                x12_protocol::x11::error::BAD_VALUE,
             ),
             (
                 "CWHeight=0 → BadValue",
                 build_configure_body(SIB_A, CW_HEIGHT, &[0u16.to_le_bytes()]),
-                yserver_protocol::x11::error::BAD_VALUE,
+                x12_protocol::x11::error::BAD_VALUE,
             ),
             (
                 "CWX alone → no error (MOVE_WIN path)",
@@ -39815,7 +39815,7 @@ mod tests {
         ] {
             state.resources.create_window(
                 ClientId(APP),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(id),
                     parent: ResourceId(parent),
@@ -39839,7 +39839,7 @@ mod tests {
                 PARENT_IPI,
                 1,
                 0,
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
             (
                 "class InputOnly + non-zero border_width",
@@ -39847,7 +39847,7 @@ mod tests {
                 PARENT_IPO,
                 2,
                 1,
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
             (
                 "class InputOnly + non-zero depth",
@@ -39855,7 +39855,7 @@ mod tests {
                 PARENT_IPO,
                 2,
                 0,
-                yserver_protocol::x11::error::BAD_MATCH,
+                x12_protocol::x11::error::BAD_MATCH,
             ),
         ];
 
@@ -40053,7 +40053,7 @@ mod tests {
 
     #[test]
     fn fbconfigs_emit_bind_to_texture_pairs_in_xorg_order() {
-        use yserver_protocol::x11::glx as g;
+        use x12_protocol::x11::glx as g;
         let configs = synthesise_glx_fb_configs(true);
         // All configs same length (wire encoder requirement).
         let len = configs[0].len();
@@ -40117,7 +40117,7 @@ mod tests {
 
     #[test]
     fn fbconfigs_omit_bind_to_texture_when_tfp_unsupported() {
-        use yserver_protocol::x11::glx as g;
+        use x12_protocol::x11::glx as g;
         let configs = synthesise_glx_fb_configs(false);
         assert!(
             configs
@@ -40136,7 +40136,7 @@ mod tests {
     #[test]
     fn glx_create_pixmap_records_x_drawable_and_destroy_clears_it() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
@@ -40148,7 +40148,7 @@ mod tests {
         let host_xid_raw: u32 = 0xdead_0001;
         state.resources.create_pixmap(
             client_id,
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
                 pixmap: ResourceId(x_pixmap_xid),
                 drawable: ROOT_WINDOW,
@@ -40253,7 +40253,7 @@ mod tests {
     #[test]
     fn glx_destroy_releases_export_even_after_free_pixmap() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
@@ -40265,7 +40265,7 @@ mod tests {
         let host_xid_raw: u32 = 0xdead_0002;
         state.resources.create_pixmap(
             client_id,
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
                 pixmap: ResourceId(x_pixmap_xid),
                 drawable: ROOT_WINDOW,
@@ -40367,7 +40367,7 @@ mod tests {
     /// must reply with a GLXBadPixmap error rather than silently inserting.
     #[test]
     fn glx_create_pixmap_with_missing_x_pixmap_returns_glx_bad_pixmap() {
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -40413,7 +40413,7 @@ mod tests {
             .expect("GLXBadPixmap error packet must be delivered");
         assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
         let expected_code =
-            crate::nested::GLX_FIRST_ERROR + yserver_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP;
+            crate::nested::GLX_FIRST_ERROR + x12_protocol::x11::glx::ERROR_GLX_BAD_PIXMAP;
         assert_eq!(
             buf[1], expected_code,
             "expected GLXBadPixmap ({}), got {}",
@@ -40430,7 +40430,7 @@ mod tests {
     /// `GLXUnsupportedPrivateRequest` (preservation of the fallthrough).
     #[test]
     fn bind_tex_image_ext_is_dispatched_not_rejected() {
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -40443,9 +40443,9 @@ mod tests {
         let host_xid_raw: u32 = 0xdead_1330;
         state.resources.create_pixmap(
             client_id,
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
-                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                pixmap: x12_protocol::x11::ResourceId(x_pixmap_xid),
                 drawable: ROOT_WINDOW,
                 width: 32,
                 height: 32,
@@ -40453,7 +40453,7 @@ mod tests {
         );
         assert!(
             state.resources.set_pixmap_host_xid(
-                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                x12_protocol::x11::ResourceId(x_pixmap_xid),
                 crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
             ),
             "set_pixmap_host_xid must succeed"
@@ -40555,7 +40555,7 @@ mod tests {
             .expect("GLXUnsupportedPrivateRequest error packet must be delivered");
         assert_eq!(buf2[0], 0, "byte 0 must be 0 (Error class)");
         let expected_unsupported = crate::nested::GLX_FIRST_ERROR
-            + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST;
+            + x12_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST;
         assert_eq!(
             buf2[1], expected_unsupported,
             "expected GLXUnsupportedPrivateRequest ({expected_unsupported}), got {}",
@@ -40582,7 +40582,7 @@ mod tests {
     #[test]
     fn bind_release_tex_image_do_not_touch_lifetime_refcount() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
@@ -40594,9 +40594,9 @@ mod tests {
         let host_xid_raw: u32 = 0xdead_1331;
         state.resources.create_pixmap(
             client_id,
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
-                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                pixmap: x12_protocol::x11::ResourceId(x_pixmap_xid),
                 drawable: ROOT_WINDOW,
                 width: 32,
                 height: 32,
@@ -40604,7 +40604,7 @@ mod tests {
         );
         assert!(
             state.resources.set_pixmap_host_xid(
-                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                x12_protocol::x11::ResourceId(x_pixmap_xid),
                 crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
             ),
             "set_pixmap_host_xid must succeed"
@@ -40871,7 +40871,7 @@ mod tests {
     ///   [4..8]  pad1 = 0
     ///   [8..12] screen = 0
     fn build_get_fb_configs_sgix_body(screen: u32) -> Vec<u8> {
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
         let mut body = Vec::new();
         body.extend_from_slice(&x11glx::VENDOR_CODE_GET_FB_CONFIGS_SGIX.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes()); // pad1
@@ -40884,7 +40884,7 @@ mod tests {
     /// return a non-empty GetFBConfigs reply (real configs, not a stub).
     #[test]
     fn get_fb_configs_sgix_is_dispatched_not_rejected() {
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -40939,7 +40939,7 @@ mod tests {
     /// (65541) must insert a `GlxContext` entry (no reply, no error).
     #[test]
     fn create_context_with_config_sgix_inserts_context() {
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -41017,7 +41017,7 @@ mod tests {
     #[test]
     fn create_glx_pixmap_with_config_sgix_inserts_drawable_and_acquires() {
         use crate::backend::recording::RecordedCall;
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -41029,9 +41029,9 @@ mod tests {
         let host_xid_raw: u32 = 0xdead_5542;
         state.resources.create_pixmap(
             client_id,
-            yserver_protocol::x11::CreatePixmapRequest {
+            x12_protocol::x11::CreatePixmapRequest {
                 depth: 24,
-                pixmap: yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                pixmap: x12_protocol::x11::ResourceId(x_pixmap_xid),
                 drawable: ROOT_WINDOW,
                 width: 64,
                 height: 64,
@@ -41039,7 +41039,7 @@ mod tests {
         );
         assert!(
             state.resources.set_pixmap_host_xid(
-                yserver_protocol::x11::ResourceId(x_pixmap_xid),
+                x12_protocol::x11::ResourceId(x_pixmap_xid),
                 crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
             ),
             "set_pixmap_host_xid must succeed"
@@ -41125,7 +41125,7 @@ mod tests {
     fn glx_extension_string_contains_sgix_fbconfig() {
         // glx_extension_string() is a private fn; mirror its logic here.
         // The base SERVER_EXTENSIONS + SGIX_FBCONFIG_EXTENSION.
-        use yserver_protocol::x11::glx as x11glx;
+        use x12_protocol::x11::glx as x11glx;
         let mut s = String::from(x11glx::SERVER_EXTENSIONS);
         s.push(' ');
         s.push_str(x11glx::SGIX_FBCONFIG_EXTENSION);

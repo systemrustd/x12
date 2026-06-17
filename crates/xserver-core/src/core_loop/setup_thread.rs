@@ -31,7 +31,7 @@ use std::{
 use crossbeam_channel::bounded;
 use log::{debug, warn};
 
-use yserver_protocol::x11::{self, ClientId};
+use x12_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
@@ -234,7 +234,7 @@ mod tests {
         io::{Read, Write},
         time::Instant,
     };
-    use yserver_protocol::x11::ClientByteOrder;
+    use x12_protocol::x11::ClientByteOrder;
 
     /// Hand-encode a minimal little-endian SetupRequest with empty auth.
     fn write_setup_request(s: &mut UnixStream) -> io::Result<()> {

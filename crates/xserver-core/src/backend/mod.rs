@@ -21,7 +21,7 @@ pub use trait_def::{
     HostSocketStatus, PresentCaps, PresentWake, SyncobjHandle, XshmfenceHandle,
 };
 
-use yserver_protocol::x11::ClientId;
+use x12_protocol::x11::ClientId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OriginContext {

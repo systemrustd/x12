@@ -15,7 +15,7 @@
 
 use std::{collections::HashSet, sync::atomic::Ordering};
 
-use yserver_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
+use x12_protocol::x11::{self, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
     core_loop::client_io::{self, WriteOutcome},
@@ -112,7 +112,7 @@ pub fn client_target_id(state: &ServerState, client_id: ClientId) -> Option<Clie
 #[must_use]
 pub fn selection_owner_target_id(
     state: &ServerState,
-    selection: yserver_protocol::x11::AtomId,
+    selection: x12_protocol::x11::AtomId,
 ) -> Option<(ResourceId, ClientId)> {
     let owner_window = state.selections.get(&selection)?.0;
     let owner_client = state.resources.window_owner(owner_window)?;
@@ -617,7 +617,7 @@ pub fn fanout_raw_event_to_clients(
     event: &[u8; 32],
     template_byte_order: ClientByteOrder,
 ) -> Vec<ClientId> {
-    use yserver_protocol::x11::wire_swap;
+    use x12_protocol::x11::wire_swap;
     let mut disconnected = Vec::new();
     let mut seen = HashSet::new();
     let event_type = event[0] & 0x7f;

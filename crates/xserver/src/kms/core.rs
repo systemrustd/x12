@@ -32,7 +32,7 @@ use yserver_core::{
     },
     host_x11::{HostPointerEvent, HostXidMap},
 };
-use yserver_protocol::x11::{
+use x12_protocol::x11::{
     CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
 };
 

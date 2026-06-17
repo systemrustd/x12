@@ -17,16 +17,20 @@ env_logger.workspace = true
 log.workspace = true
 libc.workspace = true
 drm.workspace = true
-input.workspace = true
+input = { workspace = true, optional = true }
 nix.workspace = true
 signal-hook.workspace = true
-freetype-rs.workspace = true
+skrifa.workspace = true
 xkbcommon.workspace = true
-fontconfig = "0.11.0"
+fontconfig = { workspace = true, optional = true }
+libseat = { workspace = true, optional = true }
 ash.workspace = true
 gpu-allocator.workspace = true
 thiserror.workspace = true
-libseat = "0.2.4"
+
+[features]
+default = []
+libinput = ["input"]
 
 [[bin]]
 name = "xnest"

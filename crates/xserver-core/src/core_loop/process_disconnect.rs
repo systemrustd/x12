@@ -8,7 +8,7 @@
 //! when `process_request` reports `RequestOutcome::Disconnect` for a
 //! peer that overflowed its outbound buffer.
 
-use yserver_protocol::x11::{ClientId, ResourceId};
+use x12_protocol::x11::{ClientId, ResourceId};
 
 use crate::{
     backend::Backend,
@@ -48,21 +48,21 @@ fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
     let parent = pending.parent;
     if pending.was_mapped {
         let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            yserver_protocol::x11::encode_unmap_notify_event(
+            x12_protocol::x11::encode_unmap_notify_event(
                 buf, seq, order, window, window, false,
             );
         });
         let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            yserver_protocol::x11::encode_unmap_notify_event(
+            x12_protocol::x11::encode_unmap_notify_event(
                 buf, seq, order, parent, window, false,
             );
         });
     }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-        yserver_protocol::x11::encode_destroy_notify_event(buf, seq, order, window, window);
+        x12_protocol::x11::encode_destroy_notify_event(buf, seq, order, window, window);
     });
     let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-        yserver_protocol::x11::encode_destroy_notify_event(buf, seq, order, parent, window);
+        x12_protocol::x11::encode_destroy_notify_event(buf, seq, order, parent, window);
     });
 }
 
@@ -534,7 +534,7 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
 
-    use yserver_protocol::x11::{
+    use x12_protocol::x11::{
         ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
     };
 

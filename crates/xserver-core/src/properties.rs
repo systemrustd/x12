@@ -1,4 +1,4 @@
-use yserver_protocol::x11::AtomId;
+use x12_protocol::x11::AtomId;
 
 pub const MAX_PROPERTY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -189,7 +189,7 @@ mod tests {
 
     mod apply_change_tests {
         use super::*;
-        use yserver_protocol::x11::AtomId;
+        use x12_protocol::x11::AtomId;
 
         fn val(t: u32, f: PropertyFormat, data: Vec<u8>) -> PropertyValue {
             PropertyValue {
@@ -445,7 +445,7 @@ mod tests {
 
     mod slice_for_get_tests {
         use super::*;
-        use yserver_protocol::x11::AtomId;
+        use x12_protocol::x11::AtomId;
 
         #[test]
         fn absent_property_returns_none_metadata() {

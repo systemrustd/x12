@@ -15,7 +15,7 @@ use std::{
 };
 
 use log::debug;
-use yserver_protocol::x11::ResourceId;
+use x12_protocol::x11::ResourceId;
 
 use crate::backend::{OriginContext, PixmapHandle, WindowHandle};
 
@@ -490,7 +490,7 @@ impl HostX11Backend {
         // Wire layout: opcode(1) minor(1) length(2 = 3) window(4) pixmap(4)
         let mut out = [0u8; 12];
         out[0] = major;
-        out[1] = yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP;
+        out[1] = x12_protocol::x11::composite::NAME_WINDOW_PIXMAP;
         out[2..4].copy_from_slice(&3u16.to_le_bytes());
         out[4..8].copy_from_slice(&host_window.as_raw().to_le_bytes());
         out[8..12].copy_from_slice(&host_pixmap.to_le_bytes());
@@ -1336,7 +1336,7 @@ mod tests {
         collections::{HashMap, VecDeque},
         os::unix::net::UnixStream,
     };
-    use yserver_protocol::x11::ClientId;
+    use x12_protocol::x11::ClientId;
 
     fn dummy_backend() -> HostX11Backend {
         let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
@@ -1649,7 +1649,7 @@ mod tests {
     /// the core is the only writer.
     #[test]
     fn register_top_level_populates_xid_map() {
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
         let mut backend = dummy_backend();
         let nested_id = ResourceId(0x100);
         // The wire side flushes through the dummy stream's peer; the

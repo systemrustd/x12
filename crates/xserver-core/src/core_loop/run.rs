@@ -235,9 +235,9 @@ const MAX_REQUESTS_PER_ITER: usize = 32;
 /// channel's waker (one atomic CAS per push-back) and the local
 /// VecDeque avoids that overhead.
 struct DeferredRequest {
-    id: yserver_protocol::x11::ClientId,
-    sequence: yserver_protocol::x11::SequenceNumber,
-    header: yserver_protocol::x11::RequestHeader,
+    id: x12_protocol::x11::ClientId,
+    sequence: x12_protocol::x11::SequenceNumber,
+    header: x12_protocol::x11::RequestHeader,
     body: Vec<u8>,
     attached_fd: Option<OwnedFd>,
 }
@@ -252,12 +252,12 @@ struct DeferredRequest {
 fn process_request_inline(
     state: &mut ServerState,
     backend: &mut dyn Backend,
-    id: yserver_protocol::x11::ClientId,
-    sequence: yserver_protocol::x11::SequenceNumber,
-    header: yserver_protocol::x11::RequestHeader,
+    id: x12_protocol::x11::ClientId,
+    sequence: x12_protocol::x11::SequenceNumber,
+    header: x12_protocol::x11::RequestHeader,
     body: &[u8],
     attached_fd: Option<OwnedFd>,
-) -> Option<yserver_protocol::x11::ClientId> {
+) -> Option<x12_protocol::x11::ClientId> {
     // Half-closed-socket / post-disconnect guard. The `Message::Request`
     // channel preserves arrival order — when a client crashes (e.g.
     // mate-appearance-properties cratering with the keyring locked) and
@@ -856,7 +856,7 @@ pub(crate) fn handle_host_container_resize(
     ev: crate::host_x11::HostConfigureEvent,
 ) {
     use std::sync::atomic::Ordering;
-    use yserver_protocol::x11::{self, SequenceNumber, randr as x11randr};
+    use x12_protocol::x11::{self, SequenceNumber, randr as x11randr};
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
@@ -918,7 +918,7 @@ pub(crate) fn handle_host_container_resize(
     // RANDR ScreenChangeNotify / CrtcChangeNotify / OutputChangeNotify
     // fanout. Snapshot the subscribers first so the per-client mut
     // borrow on `state.clients` in the inner loop doesn't conflict.
-    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+    let subscribers: Vec<(u32, x12_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
         .map(|((owner, window), mask)| (*owner, *window, *mask))
@@ -1009,14 +1009,14 @@ pub(crate) fn handle_host_container_resize(
 fn reconcile_client_writable_interest(
     registry: &mio::Registry,
     state: &mut ServerState,
-) -> Vec<yserver_protocol::x11::ClientId> {
+) -> Vec<x12_protocol::x11::ClientId> {
     let mut to_disconnect = Vec::new();
     for (id, client) in state.clients.iter_mut() {
         if !client.outbound.is_empty() {
             match client_io::drain_outbound(client) {
                 Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
                 Ok(WriteOutcome::Disconnect) | Err(_) => {
-                    to_disconnect.push(yserver_protocol::x11::ClientId(*id));
+                    to_disconnect.push(x12_protocol::x11::ClientId(*id));
                     continue;
                 }
             }
@@ -1033,7 +1033,7 @@ fn reconcile_client_writable_interest(
         };
         match registry.reregister(
             &mut SourceFd(&raw),
-            client_token(yserver_protocol::x11::ClientId(*id)),
+            client_token(x12_protocol::x11::ClientId(*id)),
             interest,
         ) {
             Ok(()) => client.watching_writable = needs_writable,
@@ -1051,7 +1051,7 @@ fn reconcile_client_writable_interest(
 
 fn handle_setup_allocate(
     state: &mut ServerState,
-    id: yserver_protocol::x11::ClientId,
+    id: x12_protocol::x11::ClientId,
     response_tx: crossbeam_channel::Sender<SetupAllocateResponse>,
 ) {
     let _ = id;
@@ -1231,7 +1231,7 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
     state: &mut ServerState,
     _backend: &mut dyn crate::backend::Backend,
 ) {
-    use yserver_protocol::x11::sync as x11sync;
+    use x12_protocol::x11::sync as x11sync;
     // Suspend gate (Xorg WaitFor.c:519 unified-timer rule) — mirrors
     // `idletime_alarm_deadline`. Skip the whole evaluator when any
     // client holds XScreenSaverSuspend; otherwise an unrelated wake
@@ -1295,11 +1295,11 @@ fn handle_client_setup_complete(
     sender: &CoreSender,
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
-    id: yserver_protocol::x11::ClientId,
+    id: x12_protocol::x11::ClientId,
     stream: UnixStream,
     resource_id_base: u32,
     resource_id_mask: u32,
-    byte_order: yserver_protocol::x11::ClientByteOrder,
+    byte_order: x12_protocol::x11::ClientByteOrder,
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
@@ -1414,7 +1414,7 @@ mod tests {
             os::{fd::AsRawFd, unix::net::UnixStream},
             sync::{Arc, Mutex, atomic::AtomicU16},
         };
-        use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
+        use x12_protocol::x11::{ClientByteOrder, ClientId as Cid};
 
         let poll = Poll::new().unwrap();
         // We just need a real fd registered with the poller.
@@ -1864,7 +1864,7 @@ mod tests {
     #[test]
     fn idletime_evaluator_fires_pos_transition_when_deadline_elapsed() {
         use std::time::Duration;
-        use yserver_protocol::x11::{ClientId, sync as x11sync};
+        use x12_protocol::x11::{ClientId, sync as x11sync};
         let mut state = ServerState::new();
         // Pre-arm: a PositiveTransition alarm at 60_000ms, last_activity 61s ago.
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);

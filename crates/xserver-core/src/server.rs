@@ -10,7 +10,7 @@ use std::{
 };
 
 use log::trace;
-use yserver_protocol::x11::{
+use x12_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
 };
 
@@ -1240,7 +1240,7 @@ impl ServerState {
     /// landed still returns a sensible "any device" idle.
     #[must_use]
     pub fn idletime_baseline(&self, counter: u32) -> Instant {
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         match counter {
             x11sync::IDLETIME_DEVICE_VCP => self
                 .per_device_last_activity
@@ -1279,7 +1279,7 @@ impl ServerState {
     /// deadline is in the future.
     #[must_use]
     pub fn idletime_alarm_deadline(&self) -> Option<std::time::Instant> {
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         if !self.screensaver.suspend_counts.is_empty() {
             return None;
         }
@@ -3189,7 +3189,7 @@ mod tests {
 
     #[test]
     fn unmap_notify_fanout_reaches_only_subscribed_clients() {
-        use yserver_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
+        use x12_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
 
         // Client A: StructureNotify on window 0x100.
         let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
@@ -3314,7 +3314,7 @@ mod tests {
             let target_window = ResourceId(0x0020_0002);
             s.resources.create_window(
                 ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: grab_window,
                     parent: crate::resources::ROOT_WINDOW,
@@ -3330,7 +3330,7 @@ mod tests {
             );
             s.resources.create_window(
                 ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: target_window,
                     parent: crate::resources::ROOT_WINDOW,
@@ -3461,7 +3461,7 @@ mod tests {
             let child_window = ResourceId(0x0010_0003);
             s.resources.create_window(
                 ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: grab_window,
                     parent: crate::resources::ROOT_WINDOW,
@@ -3477,7 +3477,7 @@ mod tests {
             );
             s.resources.create_window(
                 ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: child_window,
                     parent: grab_window,
@@ -3609,7 +3609,7 @@ mod tests {
             let child_window = ResourceId(0x0010_0011);
             s.resources.create_window(
                 ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: grab_window,
                     parent: crate::resources::ROOT_WINDOW,
@@ -3625,7 +3625,7 @@ mod tests {
             );
             s.resources.create_window(
                 ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: child_window,
                     parent: grab_window,
@@ -3870,7 +3870,7 @@ mod tests {
             // Top-level window so pointer_target_at returns the same id.
             s.resources.create_window(
                 ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
+                x12_protocol::x11::CreateWindowRequest {
                     depth: 24,
                     window: ResourceId(0x0010_0002),
                     parent: crate::resources::ROOT_WINDOW,
@@ -4148,7 +4148,7 @@ mod tests {
         // child has no ButtonPress mask, root does. The event must propagate
         // up to root.
         use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
         add_test_client(&mut state, 1, 0x0010_0000);
@@ -4199,7 +4199,7 @@ mod tests {
         // Click at (10, 20) inside a child positioned at (50, 60) on root —
         // should translate to (60, 80) when delivered to root.
         use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
         add_test_client(&mut state, 1, 0x0010_0000);
@@ -4243,7 +4243,7 @@ mod tests {
     fn pointer_propagation_stops_at_first_subscriber() {
         // Both child and root subscribe; event delivered to child (first hit).
         use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
         add_test_client(&mut state, 1, 0x0010_0000);
@@ -4292,7 +4292,7 @@ mod tests {
     #[test]
     fn pointer_propagation_returns_none_when_nothing_subscribes() {
         use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
         add_test_client(&mut state, 1, 0x0010_0000);
@@ -4324,7 +4324,7 @@ mod tests {
     #[test]
     fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
         use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
-        use yserver_protocol::x11::CreateWindowRequest;
+        use x12_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
 
@@ -4368,7 +4368,7 @@ mod tests {
     #[test]
     fn cow_with_non_empty_input_shape_descends_into_stage() {
         use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
+        use x12_protocol::x11::{CreateWindowRequest, xfixes};
 
         let mut state = ServerState::new();
 
@@ -4640,7 +4640,7 @@ mod tests {
         let baseline = Instant::now();
         state.dpms.last_activity = baseline;
         assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_COUNTER),
+            state.idletime_baseline(x12_protocol::x11::sync::IDLETIME_COUNTER),
             baseline
         );
     }
@@ -4654,12 +4654,12 @@ mod tests {
         state.dpms.last_activity = global;
         state.per_device_last_activity.insert(2, pointer);
         assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCP),
+            state.idletime_baseline(x12_protocol::x11::sync::IDLETIME_DEVICE_VCP),
             pointer
         );
         // VCK has no per-device entry; falls back to global.
         assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCK),
+            state.idletime_baseline(x12_protocol::x11::sync::IDLETIME_DEVICE_VCK),
             global
         );
     }
@@ -4680,7 +4680,7 @@ mod tests {
     #[test]
     fn idletime_alarm_deadline_picks_smallest_active_pos_alarm() {
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         let baseline = std::time::Instant::now();
         state.dpms.last_activity = baseline;
@@ -4719,7 +4719,7 @@ mod tests {
         // Negative-* alarms only fire on input wake, not on a positive
         // deadline. They must not be considered when computing the
         // poll-deadline `.min()`.
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         state.sync_alarms.insert(
             1,
@@ -4738,7 +4738,7 @@ mod tests {
 
     #[test]
     fn idletime_alarm_deadline_ignores_inactive_alarms() {
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         state.sync_alarms.insert(
             1,
@@ -4764,7 +4764,7 @@ mod tests {
         // alarm must NOT contribute a past-instant to the poll-deadline
         // (which would spin the poll loop with Duration::ZERO).
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         // Already idle for 90s; alarm threshold is 60s — quiescent.
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
@@ -4792,7 +4792,7 @@ mod tests {
         // SaverSuspend inhibits both the DPMS cascade AND IDLETIME
         // alarms so fullscreen video (Firefox / mpv / vlc) doesn't
         // blank the screen.
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         state.screensaver.suspend_counts.insert(ClientId(99), 1);
         state.sync_alarms.insert(
@@ -4821,7 +4821,7 @@ mod tests {
             backend::{GlyphSetHandle, PictureHandle},
             resources::{GlyphSetState, PictureKind, PictureState, ROOT_VISUAL},
         };
-        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+        use x12_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
 
         let mut state = ServerState::new();
         let owner = ClientId(1);

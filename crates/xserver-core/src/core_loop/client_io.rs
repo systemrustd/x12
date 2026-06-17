@@ -141,7 +141,7 @@ mod tests {
         os::unix::net::UnixStream,
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
-    use yserver_protocol::x11::{ClientByteOrder, ResourceId};
+    use x12_protocol::x11::{ClientByteOrder, ResourceId};
 
     fn make_client(writer: UnixStream) -> ClientState {
         ClientState {

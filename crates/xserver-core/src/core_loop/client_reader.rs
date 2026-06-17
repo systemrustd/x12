@@ -33,7 +33,7 @@ use std::{
 use crossbeam_channel::{Receiver, TryRecvError};
 use log::warn;
 
-use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
+use x12_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 
 use crate::{
     core_loop::{message::Message, sender::CoreSender},

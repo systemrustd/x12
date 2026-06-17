@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use yserver_protocol::x11::{
+use x12_protocol::x11::{
     AtomId, ChangeWindowAttributesRequest, ClientId, ClipRectangles, ConfigureWindowRequest,
     CreateGcRequest, CreatePixmapRequest, CreateWindowRequest, FontMetrics, GcChange,
     ReparentWindowRequest, ResourceId, SetClipRectanglesRequest,
@@ -77,7 +77,7 @@ pub struct Colormap {
     /// frees the entry. Server-allocated default colormaps
     /// (`ROOT_COLORMAP`, `ARGB_COLORMAP`) use `ClientId(0)` as the
     /// sentinel owner — they outlive every client connection.
-    pub owner: yserver_protocol::x11::ClientId,
+    pub owner: x12_protocol::x11::ClientId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,7 +279,7 @@ impl Default for ResourceTable {
                 id: ROOT_COLORMAP,
                 visual: ROOT_VISUAL,
                 host_colormap_xid: None,
-                owner: yserver_protocol::x11::ClientId(0),
+                owner: x12_protocol::x11::ClientId(0),
             },
         );
         colormaps.insert(
@@ -288,7 +288,7 @@ impl Default for ResourceTable {
                 id: ARGB_COLORMAP,
                 visual: ARGB_VISUAL,
                 host_colormap_xid: None,
-                owner: yserver_protocol::x11::ClientId(0),
+                owner: x12_protocol::x11::ClientId(0),
             },
         );
 
@@ -411,7 +411,7 @@ impl ResourceTable {
 
     pub fn create_colormap(
         &mut self,
-        owner: yserver_protocol::x11::ClientId,
+        owner: x12_protocol::x11::ClientId,
         id: ResourceId,
         visual: ResourceId,
     ) {
@@ -2226,14 +2226,14 @@ impl ResourceTable {
         self.cursors.contains_key(&id.0)
     }
 
-    pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: yserver_protocol::x11::AtomId) {
+    pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: x12_protocol::x11::AtomId) {
         if let Some(c) = self.cursors.get_mut(&id.0) {
             c.name_atom = Some(atom);
         }
     }
 
     #[must_use]
-    pub fn cursor_name_atom(&self, id: ResourceId) -> Option<yserver_protocol::x11::AtomId> {
+    pub fn cursor_name_atom(&self, id: ResourceId) -> Option<x12_protocol::x11::AtomId> {
         self.cursors.get(&id.0)?.name_atom
     }
 
@@ -2862,7 +2862,7 @@ pub struct Cursor {
     /// `None` (until first `SetCursorName`) reports as X11 `None` atom
     /// (xid 0) on get, matching Xorg `xfixes/cursor.c`'s
     /// `pCursor->name == 0` initial state.
-    pub name_atom: Option<yserver_protocol::x11::AtomId>,
+    pub name_atom: Option<x12_protocol::x11::AtomId>,
     /// True iff this cursor was created by RENDER `CreateAnimCursor`.
     /// Consulted to reject nested animated cursors with `BadMatch`
     /// (Xorg `render/animcur.c:316` refuses them). Set on EVERY
@@ -2875,7 +2875,7 @@ pub struct Cursor {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use yserver_protocol::x11::{ChangeWindowAttributesRequest, ClientId, CreateWindowRequest};
+    use x12_protocol::x11::{ChangeWindowAttributesRequest, ClientId, CreateWindowRequest};
 
     fn make_window(table: &mut ResourceTable, id: u32) {
         table.create_window(
@@ -4341,7 +4341,7 @@ mod tests {
             empty_create_gc_request(ResourceId(0x500), ROOT_WINDOW),
         );
         t.set_clip_rectangles(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(0x500),
                 clip: ClipRectangles {
@@ -4356,7 +4356,7 @@ mod tests {
 
         let mut clear = empty_change_gc(ResourceId(0x500));
         clear.clip_mask = Some(None);
-        t.change_gc(yserver_protocol::x11::ClientId(1), clear);
+        t.change_gc(x12_protocol::x11::ClientId(1), clear);
 
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_none());
     }
@@ -4389,7 +4389,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.function = Some(GcFunction::Xor.protocol_value());
         chg.plane_mask = Some(0x00ff_00ff);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // Copy GCFunction (1<<0) + GCPlaneMask (1<<1).
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_0003);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4406,7 +4406,7 @@ mod tests {
         chg.line_style = Some(LineStyle::OnOffDash.protocol_value());
         chg.cap_style = Some(CapStyle::Round.protocol_value());
         chg.join_style = Some(JoinStyle::Bevel.protocol_value());
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // line_style (1<<5) | cap_style (1<<6) | join_style (1<<7) = 0xE0
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_00E0);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4423,7 +4423,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_rule = Some(FillRule::Winding.protocol_value());
         chg.subwindow_mode = Some(SubwindowMode::IncludeInferiors.protocol_value());
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // fill_rule (1<<9) | subwindow_mode (1<<15) = 0x8200
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_8200);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4439,7 +4439,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.graphics_exposures = Some(false);
         chg.dash_offset = Some(7);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // graphics_exposures (1<<16) | dash_offset (1<<20) = 0x0011_0000
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0011_0000);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4455,7 +4455,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.dashes = Some(9);
         chg.arc_mode = Some(ArcMode::Chord.protocol_value());
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // dashes (1<<21) | arc_mode (1<<22) = 0x00600000
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0060_0000);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4470,7 +4470,7 @@ mod tests {
         install_dummy_gc(&mut t, 0x501);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.function = Some(GcFunction::Xor.protocol_value());
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0);
         let dst = t.gc(ResourceId(0x501)).unwrap();
         assert_eq!(dst.function, GcFunction::Copy);
@@ -4516,7 +4516,7 @@ mod tests {
         chg.tile = Some(ResourceId(0x600));
         chg.tile_x_origin = Some(3);
         chg.tile_y_origin = Some(5);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.fill {
             FillState::Tiled { pixmap, origin } => {
@@ -4535,7 +4535,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_style = Some(FillStyle::Stippled.protocol_value());
         chg.stipple = Some(ResourceId(0x600));
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.fill {
             FillState::Stippled { pixmap, origin } => {
@@ -4552,7 +4552,7 @@ mod tests {
         install_dummy_gc(&mut t, 0x500);
         let rect_bytes = vec![0u8, 0, 0, 0, 10, 0, 10, 0];
         t.set_clip_rectangles(
-            yserver_protocol::x11::ClientId(1),
+            x12_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(0x500),
                 clip: ClipRectangles {
@@ -4566,7 +4566,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.clip_x_origin = Some(11);
         chg.clip_y_origin = Some(13);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.clip {
             ClipState::Rectangles { origin, rects } => {
@@ -4591,7 +4591,7 @@ mod tests {
         chg.clip_mask = Some(Some(ResourceId(0x600)));
         chg.clip_x_origin = Some(2);
         chg.clip_y_origin = Some(3);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.clip {
             ClipState::Pixmap { origin, pixmap } => {
@@ -4616,7 +4616,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_style = Some(FillStyle::Tiled.protocol_value());
         chg.tile = Some(ResourceId(0x600));
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         // Freeing the source pixmap must not clear the GC's retained tile.
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
@@ -4639,7 +4639,7 @@ mod tests {
         chg.stipple = Some(ResourceId(0x600));
         chg.tile_x_origin = Some(9);
         chg.tile_y_origin = Some(17);
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         assert_eq!(
@@ -4658,7 +4658,7 @@ mod tests {
         install_pixmap_with_host_xid(&mut t, 0x600, 0xcafe);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.clip_mask = Some(Some(ResourceId(0x600)));
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         assert_eq!(
@@ -4682,7 +4682,7 @@ mod tests {
         chg.clip_mask = Some(Some(ResourceId(0x601)));
         chg.tile = Some(ResourceId(0x602));
         chg.stipple = Some(ResourceId(0x603));
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
 
         let _ = t.free_pixmap(ResourceId(0x601));
         let _ = t.free_pixmap(ResourceId(0x602));
@@ -4706,7 +4706,7 @@ mod tests {
         install_font_with_host_xid(&mut t, 0x700, 0x4242);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.font = Some(ResourceId(0x700));
-        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
+        t.change_gc(x12_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         let f = state.font.expect("font handle");
         assert_eq!(f.as_raw(), 0x4242);

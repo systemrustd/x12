@@ -24,7 +24,7 @@
 
 use yserver::kms::v2::KmsBackendV2;
 use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
-use yserver_protocol::x11::ClipRectangles;
+use x12_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
 /// 1. create_pixmap (depth=32, 8×8)
@@ -348,7 +348,7 @@ fn v2_composite_glyphs_clip_intersects_picture() {
     // on the server's PictFormat catalogue; the backend's
     // render_create_glyphset matches on ynest_format constants).
     let gs = b
-        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .render_create_glyphset(None, x12_protocol::x11::RENDER_FMT_A8)
         .expect("glyphset")
         .expect("Some");
 
@@ -3135,7 +3135,7 @@ fn v2_drain_force_fires_all_pending_on_renderer_failed() {
             .expect("copy_area");
         b.enqueue_present_completion(
             yserver_core::backend::CompletedPresentEvent {
-                client_id: yserver_protocol::x11::ClientId(0),
+                client_id: x12_protocol::x11::ClientId(0),
                 serial,
                 host_xid: src.as_raw(),
                 dst_host_xid: cow.as_raw(),
@@ -3188,7 +3188,7 @@ fn v2_present_pixmap_enqueues_pending_and_defers_emission() {
     let before = std::time::Instant::now();
     b.enqueue_present_completion(
         CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
+            client_id: x12_protocol::x11::ClientId(0),
             serial: 1,
             host_xid: src_pix.as_raw(),
             dst_host_xid: cow_pix.as_raw(),
@@ -3227,7 +3227,7 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
         .expect("copy");
     b.enqueue_present_completion(
         CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
+            client_id: x12_protocol::x11::ClientId(0),
             serial: 2,
             host_xid: src_pix.as_raw(),
             dst_host_xid: cow_pix.as_raw(),
@@ -3267,7 +3267,7 @@ fn v2_disable_output_flushes_pending_batches_before_drain_all() {
         .expect("copy");
     b.enqueue_present_completion(
         CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
+            client_id: x12_protocol::x11::ClientId(0),
             serial: 1,
             host_xid: src.as_raw(),
             dst_host_xid: cow.as_raw(),
@@ -3367,7 +3367,7 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
     // for_tests_with_vk(), so this exercise the non-COW fallback.
     b.enqueue_present_completion(
         CompletedPresentEvent {
-            client_id: yserver_protocol::x11::ClientId(0),
+            client_id: x12_protocol::x11::ClientId(0),
             serial: 99,
             host_xid: dst_xid,
             dst_host_xid: dst_xid,
@@ -3814,7 +3814,7 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
         .expect("render_create_picture")
         .expect("Some(PictureHandle)");
     let gs = b
-        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .render_create_glyphset(None, x12_protocol::x11::RENDER_FMT_A8)
         .expect("glyphset")
         .expect("Some");
 
@@ -4264,7 +4264,7 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
         .expect("render_create_picture")
         .expect("Some(PictureHandle)");
     let gs = be
-        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .render_create_glyphset(None, x12_protocol::x11::RENDER_FMT_A8)
         .expect("glyphset")
         .expect("Some");
 

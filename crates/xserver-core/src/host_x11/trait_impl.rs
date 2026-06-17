@@ -5,7 +5,7 @@
 
 use std::io;
 
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
+use x12_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::backend::{
     AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle,

@@ -15,7 +15,7 @@
 //! demotes it to a plain field on `HostX11Backend` and at that point
 //! the helper takes `&HostXidMap`.
 
-use yserver_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
+use x12_protocol::x11::{self, ClientId, ResourceId, SequenceNumber};
 
 use crate::{
     core_loop::fanout::{
@@ -1502,7 +1502,7 @@ fn translate_host_event(
 fn active_grab_target(
     state: &ServerState,
 ) -> Option<(
-    yserver_protocol::x11::ResourceId,
+    x12_protocol::x11::ResourceId,
     ClientId,
     i32,
     i32,
@@ -1585,7 +1585,7 @@ fn release_passive_grab_on_button_release(state: &mut ServerState, kind: Pointer
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
-        state.pointer_confine_to = yserver_protocol::x11::ResourceId(0);
+        state.pointer_confine_to = x12_protocol::x11::ResourceId(0);
         // Xorg DeactivatePointerGrab: releasing the grab also releases
         // the sync holds it placed (a sync keyboard_mode froze the
         // keyboard on this grab's behalf — XGrabButton-19).
@@ -1607,7 +1607,7 @@ fn try_match_passive_grab(
     event: HostPointerEvent,
 ) -> Option<(
     crate::server::PassiveButtonGrab,
-    yserver_protocol::x11::ResourceId,
+    x12_protocol::x11::ResourceId,
 )> {
     let (hit_window, _, _) = state
         .root_pointer_target_at(event.root_x, event.root_y)
@@ -1664,8 +1664,8 @@ fn xi2_raw_evtype(kind: PointerEventKind) -> Option<u16> {
 
 fn compute_xi2_targets(
     state: &ServerState,
-    target: yserver_protocol::x11::ResourceId,
-    top_level_id: yserver_protocol::x11::ResourceId,
+    target: x12_protocol::x11::ResourceId,
+    top_level_id: x12_protocol::x11::ResourceId,
     xi2_evtype: u16,
     xi2_raw_evtype: Option<u16>,
 ) -> (Vec<ClientId>, Vec<ClientId>) {
@@ -1716,13 +1716,13 @@ fn compute_xi2_targets(
 #[allow(clippy::too_many_arguments)]
 fn encode_pointer_event(
     buf: &mut Vec<u8>,
-    order: yserver_protocol::x11::ClientByteOrder,
+    order: x12_protocol::x11::ClientByteOrder,
     kind: PointerEventKind,
     seq: SequenceNumber,
     detail: u8,
     time: u32,
-    target_window: yserver_protocol::x11::ResourceId,
-    child: yserver_protocol::x11::ResourceId,
+    target_window: x12_protocol::x11::ResourceId,
+    child: x12_protocol::x11::ResourceId,
     event: HostPointerEvent,
     event_x: i16,
     event_y: i16,
@@ -1770,7 +1770,7 @@ fn encode_pointer_event(
                 time,
                 root: ROOT_WINDOW,
                 event: target_window,
-                child: yserver_protocol::x11::ResourceId(event.child),
+                child: x12_protocol::x11::ResourceId(event.child),
                 root_x: event.root_x,
                 root_y: event.root_y,
                 event_x,
@@ -1788,7 +1788,7 @@ fn encode_pointer_event(
                 time,
                 root: ROOT_WINDOW,
                 event: target_window,
-                child: yserver_protocol::x11::ResourceId(event.child),
+                child: x12_protocol::x11::ResourceId(event.child),
                 root_x: event.root_x,
                 root_y: event.root_y,
                 event_x,
@@ -1813,7 +1813,7 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
 mod tests {
     use super::*;
     use crate::server::{ScreenSaverActive, ServerState};
-    use yserver_protocol::x11::ClientId;
+    use x12_protocol::x11::ClientId;
 
     /// AllowSome state machine pins (Xorg dix/events.c semantics):
     /// grab activation freezes ONCE; FreezeNextEvent re-arms; trips to
@@ -1893,7 +1893,7 @@ mod tests {
     // long-term; tracked as a follow-up.
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
         use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::ClientByteOrder;
+        use x12_protocol::x11::ClientByteOrder;
         let (a, b) = UnixStream::pair().unwrap();
         state.clients.insert(
             id,
@@ -1965,7 +1965,7 @@ mod tests {
     /// stayed frozen forever (cursor moves, clicks dead).
     #[test]
     fn passive_sync_grab_on_foreign_window_delivers_to_grab_client_and_freezes() {
-        use yserver_protocol::x11::ResourceId;
+        use x12_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
         let grab_window = ResourceId(0x0020_0001); // app client's top-level
@@ -1976,7 +1976,7 @@ mod tests {
 
         state.resources.create_window(
             ClientId(2),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: grab_window,
                 parent: crate::resources::ROOT_WINDOW,
@@ -1992,7 +1992,7 @@ mod tests {
         );
         state.resources.create_window(
             ClientId(2),
-            yserver_protocol::x11::CreateWindowRequest {
+            x12_protocol::x11::CreateWindowRequest {
                 depth: 24,
                 window: child_window,
                 parent: grab_window,
@@ -2239,7 +2239,7 @@ mod tests {
     #[test]
     fn pointer_event_fires_neg_transition_alarm_when_prior_idle_crosses_threshold() {
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         // User idle for 90s, NegativeTransition alarm at 60s.
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
@@ -2289,7 +2289,7 @@ mod tests {
     #[test]
     fn pointer_event_fires_neg_transition_alarm_on_per_device_idletime_vcp() {
         use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
+        use x12_protocol::x11::sync as x11sync;
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);

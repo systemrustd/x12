@@ -7,7 +7,7 @@
 //! the relevant fields to its shared GC before issuing the draw.
 
 use crate::backend::{FontHandle, PixmapHandle};
-use yserver_protocol::x11::ClipRectangles;
+use x12_protocol::x11::ClipRectangles;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LineStyle {

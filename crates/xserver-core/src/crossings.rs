@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 
-use yserver_protocol::x11::ResourceId;
+use x12_protocol::x11::ResourceId;
 
 use crate::server::ServerState;
 
@@ -576,7 +576,7 @@ fn lowest_common_ancestor(a: &[ResourceId], b: &[ResourceId]) -> Option<Resource
 mod tests {
     use super::*;
 
-    use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+    use x12_protocol::x11::{ClientId, CreateWindowRequest};
 
     use crate::{
         resources::{ROOT_VISUAL, ROOT_WINDOW},

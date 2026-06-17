@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use yserver_protocol::x11::randr as proto;
+use x12_protocol::x11::randr as proto;
 
 /// One RANDR output (1 connector, 1 CRTC, 1 mode in the current model).
 #[derive(Debug, Clone)]

@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mio::Token;
-use yserver_protocol::x11::ClientId;
+use x12_protocol::x11::ClientId;
 
 pub use super::sender::NOTIFY_TOKEN;
 
